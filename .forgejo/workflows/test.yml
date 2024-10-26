@@ -1,0 +1,6 @@
+on: [push]
+jobs:
+  test:
+    runs-on: builder
+    steps:
+      - run: echo All Good
