@@ -1,13 +1,22 @@
-use vos::shell;
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "std"), no_main)]
 
-#[cfg(not(target_arch = "wasm32"))]
-#[tokio::main]
-async fn main() {
-    println!("Started");
-    let (input, out) = shell::io::setup(shell::io::Cfg {});
-    let sh = shell::Session::new(input);
-    sh.process_input_stream(Box::pin(out)).await;
+use embassy_time as _;
+use vos::os::Os;
+
+fn main() {
+    #[cfg(feature = "std")]
+    env_logger::init();
+    #[cfg(feature = "web")]
+    wasm_logger::init(Default::default());
+
+    Os::boot(Default::default());
 }
 
-#[cfg(target_arch = "wasm32")]
-fn main() {}
+#[cfg(feature = "rv")]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe {
+        core::arch::asm!("unimp", options(noreturn));
+    }
+}

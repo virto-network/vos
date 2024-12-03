@@ -1,14 +1,26 @@
-#[cfg(feature = "shell")]
-pub mod shell;
+#![feature(impl_trait_in_assoc_type)]
+#![allow(async_fn_in_trait)]
+#![cfg_attr(not(test), no_std)]
+
+// although we include alloc core OS components should avoid doing allocations
+extern crate alloc;
+
+#[cfg(any(feature = "os-std", feature = "os-web", feature = "os-rv"))]
+pub mod os;
+pub use log;
 pub use vos_macro::bin;
 
-// JS entry point
-#[cfg(all(target_arch = "wasm32", feature = "shell"))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(start))]
-pub async fn _main() {
-    wasm_logger::init(Default::default());
-    log::debug!("worker started");
-    let (input, out) = shell::io::setup(shell::io::Cfg {});
-    let sh = shell::Session::new(input);
-    sh.process_input_stream(Box::pin(out)).await;
+pub mod prelude {
+    pub use alloc::borrow::Cow;
+    pub use alloc::boxed::Box;
+    pub use alloc::string::String;
+    pub use alloc::vec::Vec;
+    pub use log;
 }
+
+#[cfg(feature = "rv")]
+#[global_allocator]
+static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
+#[cfg(feature = "std")]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;

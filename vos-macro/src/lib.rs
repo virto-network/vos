@@ -42,19 +42,33 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let storage_name = &storage.ident;
 
     let expanded = quote! {
-        #[cfg_attr(not(feature = "std"), no_std)]
+        extern crate alloc;
+        mod prelude {
+            pub use alloc::vec::Vec;
+            pub use alloc::string::String;
+            pub use alloc::boxed::Box;
+            pub use vos::log;
+        }
+
         pub mod #mod_name {
+            use super::prelude::*;
+
             #storage
 
             #(#impl_blocks)*
 
             #(#tests)*
+        }
 
-            impl #storage_name {
-                pub fn deploy() -> Self {
-                    Self::new_default()
-                }
-            }
+        fn main() {
+            // instantiate and configure
+            let bin = #mod_name::#storage_name::new();
+            // read stdin or file for incoming messages
+            // let msg = parse_msg(stdin())
+            // let out = match msg {
+            //     #((#name, args) => bin.#name(args))*
+            // }
+            // write(out)
         }
     };
 

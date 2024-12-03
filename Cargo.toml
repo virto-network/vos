@@ -1,26 +1,42 @@
+[workspace]
+members = [
+  "vos-macro",
+  "programs/echo",
+]
+
 [package]
 name = "vos"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-channel = { version = "2.3.1", default-features = false, optional = true }
-futures-util = { version = "0.3.30", default-features = false, features = ["sink"], optional = true }
+# defmt = "0.3.8"
+embassy-executor = { version = "0.6.1", features = ["nightly"] }
+embassy-sync = "0.6.0"
+embassy-time = "0.3.2"
+embedded-alloc = "0.6.0"
+embedded-io-async = "0.6.1"
+heapless = { version = "0.8.0", features = ["serde"] }
 log = "0.4.22"
-serde = { version = "1.0.209", default-features = false }
+serde = { version = "1.0.209", default-features = false, features = ["derive", "alloc"] }
+static_cell = "2.1.0"
 vos-macro = { path = "./vos-macro" }
+wasmi = { version = "0.39.1", default-features = false }
 # Native
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # axum = { version = "0.7.7", default-features = false }
+env_logger = { version = "0.11.5", optional = true }
+# critical-section = { version = "1.1", optional = true }
 matrix-sdk = { version = "0.7.1", default-features = false, features = ["native-tls", "e2e-encryption", "sqlite"], optional = true }
-tokio = { version = "1.41.0", features = ["rt", "rt-multi-thread", "macros"] }
+# tokio = { version = "1.41.0", features = ["rt", "rt-multi-thread", "macros"] }
+mimalloc = { version = "0.1.43", optional = true }
 
 # JS
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2.93", default-features = false }
-wasm-bindgen-futures = { version = "0.4.42", default-features = false }
-wasm-logger = { version = "0.2.0", default-features = false }
-serde-wasm-bindgen = "0.6.5"
+wasm-bindgen = { version = "0.2.93", default-features = false, optional = true }
+wasm-bindgen-futures = { version = "0.4.42", default-features = false, optional = true }
+wasm-logger = { version = "0.2.0", default-features = false, optional = true }
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3.69"
 features = [
@@ -29,6 +45,7 @@ features = [
   "DedicatedWorkerGlobalScope",
   "MessageEvent",
 ]
+optional = true
 [target.'cfg(target_arch = "wasm32")'.dependencies.matrix-sdk]
 version = "0.7.1"
 default-features = false
@@ -41,12 +58,54 @@ features = [
 optional = true
 
 [features]
-default = ["shell"]
-shell = [
-  "dep:async-channel",
-  "dep:futures-util",
-  "dep:matrix-sdk",
+default = ["std"]
+# default = ["std"]
+std = ["os-std"]
+os-std = [
+  # "critical-section/std",
+  "embassy-executor/arch-std",
+  "embassy-executor/executor-thread",
+  "embassy-executor/log",
+  "embassy-executor/integrated-timers",
+  "embassy-sync/std",
+  "embassy-time/std",
+  "wasmi/std",
+
+  "dep:env_logger",
+  "dep:mimalloc"
 ]
+
+web = ["os-web"]
+os-web = [
+  "embassy-executor/arch-wasm",
+  "embassy-executor/executor-thread",
+  "embassy-executor/log",
+  "embassy-executor/integrated-timers",
+
+  # "critical-section?/std",
+  "embassy-time/wasm",
+  # "getrandom/js",
+  "dep:web-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "dep:wasm-logger",
+  "dep:serde-wasm-bindgen",
+]
+
+rv = ["os-rv"]
+os-rv = [
+ "embassy-executor/arch-riscv32",
+ "embassy-executor/executor-thread",
+ "embassy-executor/integrated-timers",
+ "embassy-executor/log",
+]
+
+# default = ["shell-std"]
+# shell-std = [
+  # "dep:async-channel",
+  # "dep:futures-util",
+  # "dep:matrix-sdk",
+# ]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -1,19 +1,23 @@
+#![no_std]
+
 #[vos::bin]
-pub mod echo {
+mod echo {
     #[vos(storage)]
-    struct Echo {
+    #[derive(Default)]
+    pub struct Echo {
         counter: usize,
     }
 
     impl Echo {
         #[vos(constructor)]
-        fn new() -> Self {
-            Echo { counter: 0 }
+        pub fn new() -> Self {
+            Default::default()
         }
 
         #[vos(message)]
-        fn echo(&self, msg: String) -> String {
-            self.count += 1;
+        pub fn echo(&mut self, msg: String) -> String {
+            self.counter += 1;
+            log::info!("echo called {} time(s)", self.counter);
             msg
         }
     }
