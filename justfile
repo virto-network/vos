@@ -1,4 +1,4 @@
-NIGHTLY := "nightly-2024-11-01"
+NIGHTLY := "nightly"
 
 default:
     RUST_BACKTRACE=1 RUST_LOG=debug cargo +{{NIGHTLY}} run

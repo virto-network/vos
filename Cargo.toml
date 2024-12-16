@@ -2,6 +2,7 @@
 members = [
   "vos-macro",
   "programs/echo",
+  "programs/http-server",
 ]
 
 [package]
