@@ -18,6 +18,7 @@ embedded-alloc = "0.6.0"
 embedded-io-async = "0.6.1"
 heapless = { version = "0.8.0", features = ["serde"] }
 log = "0.4.22"
+nu-engine = { version = "0.100.0", default-features = false }
 serde = { version = "1.0.209", default-features = false, features = ["derive", "alloc"] }
 static_cell = "2.1.0"
 vos-macro = { path = "./vos-macro" }
