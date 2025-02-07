@@ -37,23 +37,18 @@ pub mod net {
 
     #[cfg(feature = "std")]
     pub type Stack = edge_net::std::Stack;
-    pub type Socket = <<Stack as TcpBind>::Accept<'static> as TcpAccept>::Socket<'static>;
+    pub type Connection = <Stack as TcpBind>::Accept<'static>;
+    pub type Socket = <Connection as TcpAccept>::Socket<'static>;
 
     pub const STACK: Stack = Stack::new();
     pub const fn stack() -> &'static Stack {
         &STACK
     }
 
-    pub async fn listen(port: u16) -> Result<(SocketAddr, Socket), ()> {
+    pub async fn bind(port: u16) -> Result<Connection, ()> {
         pub const ADDR: [u8; 4] = [0, 0, 0, 0];
         log::debug!("Listening on port {port}");
-        stack()
-            .bind((ADDR, port).into())
-            .await
-            .map_err(|_| ())?
-            .accept()
-            .await
-            .map_err(|_| ())
+        stack().bind((ADDR, port).into()).await.map_err(|_| ())
     }
 }
 

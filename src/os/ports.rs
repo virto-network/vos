@@ -17,12 +17,15 @@ pub mod ssh;
 #[embassy_executor::task]
 pub async fn handle_connections(s: SendSpawner, ports: Config) {
     let mut ports = ports.configure().await;
-    // loop {
-    let io = ports.next_connection().await.expect("connected");
-    if let Err(e) = s.spawn(shell::new_session(io)) {
-        log::warn!("Couldn't connect shell. {:?}", e);
+    loop {
+        if let Err(e) = ports.next_connection().await {
+            log::warn!("{e:?}");
+            continue;
+        };
+        if let Err(e) = s.spawn(shell::new_session(super::Pipe::new())) {
+            log::warn!("Couldn't connect shell. {:?}", e);
+        }
     }
-    // }
 }
 
 /// A system service that connects clients to a shell that runs applications
@@ -31,7 +34,7 @@ pub trait SystemPort {
     type Error: Into<ConnectionError>;
 
     async fn configure(cfg: Option<Self::Cfg>) -> Self;
-    async fn accept_connection(&mut self) -> Result<super::Pipe, Self::Error>;
+    async fn accept_connection(&mut self) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]
@@ -56,7 +59,7 @@ pub struct Ports {
     ssh: ssh::Port,
 }
 impl Ports {
-    async fn next_connection(&mut self) -> Result<super::Pipe, ConnectionError> {
+    async fn next_connection(&mut self) -> Result<(), ConnectionError> {
         (self.ssh.accept_connection(),)
             .race()
             .await
