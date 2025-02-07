@@ -1,4 +1,5 @@
 use crate::os::{self, net};
+use core::str::FromStr;
 use serde::Deserialize;
 use static_cell::StaticCell;
 use zssh::{ed25519_dalek::SigningKey, Transport, TransportError};
@@ -16,7 +17,10 @@ impl super::SystemPort for Port {
     async fn configure(cfg: Option<Self::Cfg>) -> Self {
         let cfg = cfg.unwrap_or_default();
         let (_, socket) = net::listen(cfg.port).await.expect("tcp listen");
-        Transport::new(PACKET_BUF.init([0u8; 1024]), Ssh::new(cfg, socket))
+        Transport::new(
+            PACKET_BUF.init([0u8; 1024]),
+            Ssh::new(cfg, socket, os::rng().await),
+        )
     }
 
     async fn accept_connection(&mut self) -> Result<os::Pipe, Self::Error> {
@@ -41,20 +45,16 @@ impl Default for Config {
 
 pub struct Ssh {
     socket: net::Socket,
-    rng: os::Rng,
     sk: zssh::SecretKey,
+    rng: os::Rng,
 }
 
 impl Ssh {
-    fn new(cfg: Config, socket: net::Socket) -> Self {
+    fn new(cfg: Config, socket: net::Socket, rng: os::Rng) -> Self {
         let sk = zssh::SecretKey::Ed25519 {
             secret_key: SigningKey::from_bytes(&cfg.pk),
         };
-        Ssh {
-            socket,
-            rng: todo!(),
-            sk,
-        }
+        Ssh { socket, sk, rng }
     }
 }
 
@@ -62,24 +62,25 @@ impl zssh::Behavior for Ssh {
     type Command = ();
     type Random = os::Rng;
     type Stream = net::Socket;
-    type User = ();
+    type User = os::UserId;
+
     fn stream(&mut self) -> &mut Self::Stream {
         &mut self.socket
     }
-
     fn random(&mut self) -> &mut Self::Random {
         &mut self.rng
     }
-
     fn host_secret_key(&self) -> &zssh::SecretKey {
         &self.sk
     }
 
     fn allow_user(&mut self, username: &str, auth_method: &zssh::AuthMethod) -> Option<Self::User> {
         let zssh::AuthMethod::PublicKey(pk) = auth_method else {
+            log::trace!("ssh connection without credentials");
             return None;
         };
-        Some(())
+        log::debug!("ssh {username} connecting with public key {pk:?}");
+        Some(os::UserId::from_str(username).ok()?)
     }
 
     fn parse_command(&mut self, command: &str) -> Self::Command {

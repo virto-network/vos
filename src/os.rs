@@ -1,24 +1,29 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-use core::cell::LazyCell;
 use embassy_executor::{Executor, SendSpawner, SpawnToken};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, once_lock::OnceLock,
+};
 use heapless::String;
 use pacman::Cmd;
 use serde::Deserialize;
 use static_cell::StaticCell;
 
-pub type RawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+pub type RawMutex = CriticalSectionRawMutex;
 pub type Channel<T, const N: usize = 1> = embassy_sync::channel::Channel<RawMutex, T, N>;
 pub type Sender<'c, T, const N: usize = 1> = embassy_sync::channel::Sender<'c, RawMutex, T, N>;
 pub type Receiver<'c, T, const N: usize = 1> = embassy_sync::channel::Receiver<'c, RawMutex, T, N>;
 pub type Signal<T> = embassy_sync::signal::Signal<RawMutex, T>;
 pub type Pipe<const N: usize = 1024> = embassy_sync::pipe::Pipe<RawMutex, N>;
 pub type UserId = String<16>;
-
 pub type Rng = rand::rngs::StdRng;
-// TODO
-pub const RNG: LazyCell<Rng> = LazyCell::new(|| <Rng as rand::SeedableRng>::from_seed([0; 32]));
+
+static RNG: OnceLock<Mutex<RawMutex, Rng>> = OnceLock::new();
+pub async fn rng() -> Rng {
+    let mut rng = RNG.get().await.lock().await;
+    <Rng as rand::SeedableRng>::from_rng(&mut *rng).expect("rng from os::RNG")
+}
 
 pub mod pacman;
 pub mod ports;
@@ -81,8 +86,8 @@ impl Default for Config {
 }
 
 impl Os {
+    // pub fn boot(cfg: Config) -> &'static Self {
     pub fn boot(cfg: Config) {
-        // pub fn boot(cfg: Config) -> &'static Self {
         static OS: StaticCell<Os> = StaticCell::new();
         let os = OS.init(Os {
             session_mgr: Worker::new(),
@@ -90,6 +95,9 @@ impl Os {
             sys_bus: Channel::new(),
         });
         log::debug!("Booting up");
+        log::trace!("Seeding randomness");
+        RNG.init(Mutex::new(<Rng as rand::SeedableRng>::from_seed([0; 32])))
+            .expect("rng seeded");
 
         os.session_mgr
             .run(|s| ports::handle_connections(s, cfg.system_ports));
