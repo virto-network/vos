@@ -1,115 +1,129 @@
 use crate::os::{self, net};
-use core::str::FromStr;
-use edge_net::nal::TcpAccept;
+use edge_net::nal::{TcpAccept, TcpSplit};
+use futures_concurrency::future::Race;
 use serde::Deserialize;
-use zssh::{ed25519_dalek::SigningKey, Transport, TransportError};
+use sunset::SignKey;
+use sunset_embassy::ProgressHolder;
 
 use super::ConnectionError;
 
-const BUF_SIZE: usize = 16 * 1024;
-
 pub struct Port {
     conn: net::Connection,
-    key: [u8; 32],
+    key: SignKey,
 }
 
 impl super::SystemPort for Port {
     type Cfg = Config;
-    type Error = TransportError<Ssh>;
+    type Error = ConnectionError;
 
     async fn configure(cfg: Option<Self::Cfg>) -> Self {
         let cfg = cfg.unwrap_or_default();
         let conn = net::bind(cfg.port).await.expect("bind ssh port");
-        Self { conn, key: cfg.key }
+        Self {
+            conn,
+            key: SignKey::Ed25519(cfg.key),
+        }
     }
 
     async fn accept_connection(&mut self) -> Result<(), Self::Error> {
-        let (addr, socket) = self.conn.accept().await.expect("tcp connect");
+        let (addr, mut socket) = self.conn.accept().await.expect("tcp connect");
         log::trace!("connected to peer {addr}");
-        let mut buf = [0u8; BUF_SIZE];
-        let mut t = Transport::new(&mut buf, Ssh::new(&self.key, socket, os::rng().await));
 
-        let mut chan = t.accept().await?;
-        log::trace!("ssh client request {:?}", chan.request());
-        match chan.request() {
-            zssh::Request::Shell => {}
-            zssh::Request::Exec(_) => {}
-        }
-        chan.write_all_stderr(b"not implemented yet\n").await?;
-        chan.exit(1).await
+        let mut rx_buf = [0; 1024 * 4];
+        let mut tx_buf = [0; 1024 * 2];
+        let srv = sunset_embassy::SSHServer::new(&mut rx_buf, &mut tx_buf).expect("ssh server");
+        let session_chan = os::Channel::<sunset::ChanHandle>::new();
+
+        let conn = async {
+            loop {
+                let mut ph = ProgressHolder::new();
+                match srv.progress(&mut ph).await? {
+                    sunset::ServEvent::Hostkeys(hk) => hk.hostkeys(&[&self.key])?,
+                    sunset::ServEvent::PasswordAuth(a) => {
+                        log::trace!("password auth");
+                        a.allow()?;
+                    }
+                    sunset::ServEvent::PubkeyAuth(a) => {
+                        log::trace!("pubkey auth");
+                        a.allow()?;
+                    }
+                    sunset::ServEvent::FirstAuth(a) => {
+                        let user = a.username()?;
+                        log::trace!("first auth for '{user}'");
+                        a.allow()?;
+                    }
+                    sunset::ServEvent::OpenSession(session) => {
+                        log::trace!("open session");
+                        let ch = session.accept()?;
+                        session_chan.send(ch).await;
+                    }
+                    sunset::ServEvent::SessionShell(req) => {
+                        log::trace!("shell request");
+                        let _c = req.channel()?;
+                        req.succeed()?;
+                    }
+                    sunset::ServEvent::SessionExec(req) => {
+                        log::trace!("exec command");
+                        let _c = req.channel()?;
+                        req.succeed()?;
+                    }
+                    sunset::ServEvent::SessionPty(req) => {
+                        log::trace!("requested pty");
+                        let _c = req.channel()?;
+                        req.succeed()?;
+                    }
+                    sunset::ServEvent::Defunct => todo!(),
+                };
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, ConnectionError>(())
+        };
+        let session = async {
+            loop {
+                let ch = session_chan.receive().await;
+                let mut io = srv.stdio(ch).await?;
+                let mut line_buf = [0; 1024];
+                let mut term = noline::builder::EditorBuilder::from_slice(&mut line_buf)
+                    .build_async(&mut io)
+                    .await
+                    .map_err(|e| {
+                        log::debug!("noline {e:?}");
+                        ConnectionError
+                    })?;
+                match term.readline(">", &mut io).await {
+                    Ok(prompt) => {
+                        log::debug!("prompt {prompt}")
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok::<_, ConnectionError>(())
+        };
+        let srv = async {
+            let (mut rsock, mut wsock) = socket.split();
+            srv.run(&mut rsock, &mut wsock).await?;
+            Ok(())
+        };
+        (conn, session, srv).race().await
     }
 }
 
 #[derive(Deserialize)]
 pub struct Config {
-    key: [u8; 32],
     port: u16,
+    key: ed25519_dalek::SigningKey,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
-            key: [0; 32],
             port: 2222,
+            key: TryFrom::try_from(&[0; 32]).expect("256bit long"),
         }
     }
 }
 
-pub struct Ssh {
-    socket: net::Socket,
-    sk: zssh::SecretKey,
-    rng: os::Rng,
-}
-
-impl Ssh {
-    fn new(pk: &[u8; 32], socket: net::Socket, rng: os::Rng) -> Self {
-        let sk = zssh::SecretKey::Ed25519 {
-            secret_key: SigningKey::from_bytes(&pk),
-        };
-        Ssh { socket, sk, rng }
-    }
-}
-
-impl zssh::Behavior for Ssh {
-    type Command = ();
-    type Random = os::Rng;
-    type Stream = net::Socket;
-    type User = os::UserId;
-
-    fn stream(&mut self) -> &mut Self::Stream {
-        &mut self.socket
-    }
-    fn random(&mut self) -> &mut Self::Random {
-        &mut self.rng
-    }
-    fn host_secret_key(&self) -> &zssh::SecretKey {
-        &self.sk
-    }
-    fn server_id(&self) -> &'static str {
-        "SSH-2.0-VOS_0.1"
-    }
-    fn allow_shell(&self) -> bool {
-        true
-    }
-
-    fn allow_user(&mut self, username: &str, auth_method: &zssh::AuthMethod) -> Option<Self::User> {
-        let zssh::AuthMethod::PublicKey(zssh::PublicKey::Ed25519 { public_key: pk }) = auth_method
-        else {
-            log::trace!("ssh connection without credentials");
-            return None;
-        };
-        let user = os::UserId::from_str(username).ok()?;
-        log::debug!("ssh {user} connecting with ed25519 {:?}", pk.as_bytes());
-        Some(user)
-    }
-
-    fn parse_command(&mut self, command: &str) -> Self::Command {
-        log::trace!("ssh parsing command {command}");
-        ()
-    }
-}
-
-impl From<TransportError<Ssh>> for ConnectionError {
-    fn from(err: TransportError<Ssh>) -> Self {
+impl From<sunset::Error> for ConnectionError {
+    fn from(err: sunset::Error) -> Self {
         log::trace!("ssh error: {err:?}");
         ConnectionError
     }

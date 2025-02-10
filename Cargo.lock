@@ -48,6 +48,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -201,6 +202,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f38fa22307249f86fb7fad906fcae77f2564caeb56d7209103c551cd1cf4798f"
 
 [[package]]
+name = "ascii"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
+
+[[package]]
 name = "assign"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -279,6 +286,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.98",
+]
+
+[[package]]
+name = "atomic-polyfill"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
+dependencies = [
+ "critical-section",
 ]
 
 [[package]]
@@ -1078,7 +1094,7 @@ dependencies = [
  "base64 0.13.1",
  "edge-nal",
  "embassy-futures",
- "embassy-sync",
+ "embassy-sync 0.6.2",
  "embassy-time",
  "embedded-io-async",
  "heapless",
@@ -1096,7 +1112,7 @@ dependencies = [
  "domain",
  "edge-nal",
  "embassy-futures",
- "embassy-sync",
+ "embassy-sync 0.6.2",
  "embassy-time",
  "heapless",
  "log",
@@ -1210,6 +1226,19 @@ name = "embassy-futures"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f878075b9794c1e4ac788c95b728f26aa6366d32eeb10c7051389f898f7d067"
+
+[[package]]
+name = "embassy-sync"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd938f25c0798db4280fcd8026bf4c2f48789aebf8f77b6e5cf8a7693ba114ec"
+dependencies = [
+ "cfg-if",
+ "critical-section",
+ "embedded-io-async",
+ "futures-util",
+ "heapless",
+]
 
 [[package]]
 name = "embassy-sync"
@@ -2898,6 +2927,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "noline"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8100b250810ea78c34882c7bc511ebf9ce8b284ef34486e23f2779b6a7e2e345"
+dependencies = [
+ "embedded-io",
+ "embedded-io-async",
+ "num_enum",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3376,6 +3416,12 @@ checksum = "77957b295656769bb8ad2b6a6b09d897d94f05c41b069aede1fcdaa675eaea04"
 dependencies = [
  "zerocopy",
 ]
+
+[[package]]
+name = "pretty-hex"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc83ee4a840062f368f9096d80077a9841ec117e17e7f700df81958f1451254"
 
 [[package]]
 name = "proc-macro-crate"
@@ -4295,6 +4341,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
 
 [[package]]
+name = "snafu"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "223891c85e2a29c3fe8fb900c1fae5e69c2e42415e3177752e8718475efa5019"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03c3c6b7927ffe7ecaa769ee0e3994da3b8cafc8f444578982c83ecb161af917"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.98",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4369,6 +4436,58 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sunset"
+version = "0.2.0"
+source = "git+https://github.com/mkj/sunset.git?branch=main#b1d2c836f1893a7b880937a3fbe1313fb7978f5c"
+dependencies = [
+ "aes",
+ "ascii",
+ "chacha20",
+ "cipher",
+ "ctr",
+ "curve25519-dalek",
+ "digest",
+ "ed25519-dalek",
+ "embedded-io",
+ "getrandom 0.2.15",
+ "heapless",
+ "hmac",
+ "log",
+ "poly1305",
+ "pretty-hex",
+ "rand_core",
+ "sha2",
+ "signature",
+ "snafu",
+ "subtle",
+ "sunset-sshwire-derive",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "sunset-embassy"
+version = "0.2.0"
+source = "git+https://github.com/mkj/sunset.git?branch=main#b1d2c836f1893a7b880937a3fbe1313fb7978f5c"
+dependencies = [
+ "atomic-polyfill",
+ "embassy-futures",
+ "embassy-sync 0.5.0",
+ "embedded-io-async",
+ "log",
+ "pin-utils",
+ "sunset",
+]
+
+[[package]]
+name = "sunset-sshwire-derive"
+version = "0.2.0"
+source = "git+https://github.com/mkj/sunset.git?branch=main#b1d2c836f1893a7b880937a3fbe1313fb7978f5c"
+dependencies = [
+ "virtue",
+]
 
 [[package]]
 name = "supports-color"
@@ -4992,6 +5111,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "virtue"
+version = "0.0.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b6826a786a78cf1bb0937507b5551fb6f827d66269a24b00af0de247b19bbc7"
+
+[[package]]
 name = "vodozemac"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5033,9 +5158,10 @@ name = "vos"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ed25519-dalek",
  "edge-net",
  "embassy-executor",
- "embassy-sync",
+ "embassy-sync 0.6.2",
  "embassy-time",
  "embedded-alloc",
  "embedded-io-async",
@@ -5045,19 +5171,21 @@ dependencies = [
  "log",
  "matrix-sdk",
  "mimalloc",
+ "noline",
  "nu-engine",
  "nu-parser",
  "rand",
  "serde",
  "serde-wasm-bindgen",
  "static_cell",
+ "sunset",
+ "sunset-embassy",
  "vos-macro",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-logger",
  "wasmi",
  "web-sys",
- "zssh",
 ]
 
 [[package]]
@@ -5762,20 +5890,4 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.98",
-]
-
-[[package]]
-name = "zssh"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19463c1944842efd88582d606f9ea1060a80a233b76b94924a48e0324f0d434c"
-dependencies = [
- "chacha20",
- "constant_time_eq",
- "ed25519-dalek",
- "embedded-io-async",
- "poly1305",
- "rand",
- "sha2",
- "x25519-dalek",
 ]
