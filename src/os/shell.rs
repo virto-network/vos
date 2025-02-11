@@ -152,8 +152,8 @@ mod interpreter {
             Self
         }
 
-        pub fn eval(&mut self, prompt: &str) -> Result<(), ()> {
-            Ok(())
+        pub fn eval(&mut self, prompt: &str) -> Result<super::DataStream, ()> {
+            Ok(super::DataStream::Empty)
         }
     }
 }

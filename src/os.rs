@@ -34,11 +34,12 @@ pub mod net {
     pub use core::net::*;
     pub use edge_net::*;
     use nal::{TcpAccept, TcpBind};
+    mod dummy;
 
     #[cfg(feature = "std")]
     pub type Stack = edge_net::std::Stack;
     #[cfg(not(feature = "std"))]
-    pub type Stack = (); // TODO
+    pub type Stack = dummy::Stack; // TODO
     pub type Connection = <Stack as TcpBind>::Accept<'static>;
     pub type Socket = <Connection as TcpAccept>::Socket<'static>;
 

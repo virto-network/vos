@@ -42,27 +42,41 @@ pub struct PortError;
 
 type CfgFor<T> = Option<<T as SystemPort>::Cfg>;
 
+// TODO macro generated?
+
 #[derive(Deserialize, Default)]
 pub struct Config {
+    #[cfg(feature = "port-ssh")]
     pub ssh: CfgFor<ssh::Port>,
+    #[cfg(feature = "port-http")]
     pub http: CfgFor<http::Port>,
 }
 impl Config {
     async fn configure(self) -> Ports {
         Ports {
+            #[cfg(feature = "port-ssh")]
             ssh: ssh::Port::configure(self.ssh).await,
+            #[cfg(feature = "port-http")]
             http: http::Port::configure(self.http).await,
         }
     }
 }
 
 pub struct Ports {
+    #[cfg(feature = "port-ssh")]
     ssh: ssh::Port,
+    #[cfg(feature = "port-http")]
     http: http::Port,
 }
 impl Ports {
     async fn next_connection(&mut self) -> Result<(), PortError> {
-        (self.ssh.accept_connection(), self.http.accept_connection())
+        (
+            core::future::pending::<Result<(), PortError>>(),
+            #[cfg(feature = "port-ssh")]
+            self.ssh.accept_connection(),
+            #[cfg(feature = "port-http")]
+            self.http.accept_connection(),
+        )
             .race()
             .await
             .map_err(PortError::from)

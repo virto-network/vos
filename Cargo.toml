@@ -107,9 +107,10 @@ os-web = [
 
 rv = ["os-rv"]
 os-rv = [
- "embassy-executor/arch-riscv32",
- "embassy-executor/executor-thread",
- "embassy-executor/log",
+  "embassy-executor/arch-riscv32",
+  "embassy-executor/executor-thread",
+  "embassy-executor/log",
+  "rand/std_rng",
 ]
 
 port-http = ["edge-net/io"]
