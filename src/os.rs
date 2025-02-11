@@ -37,6 +37,8 @@ pub mod net {
 
     #[cfg(feature = "std")]
     pub type Stack = edge_net::std::Stack;
+    #[cfg(not(feature = "std"))]
+    pub type Stack = (); // TODO
     pub type Connection = <Stack as TcpBind>::Accept<'static>;
     pub type Socket = <Connection as TcpAccept>::Socket<'static>;
 

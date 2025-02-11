@@ -5,7 +5,7 @@ use serde::Deserialize;
 use sunset::SignKey;
 use sunset_embassy::ProgressHolder;
 
-use super::ConnectionError;
+use super::PortError;
 
 pub struct Port {
     conn: net::Connection,
@@ -14,7 +14,7 @@ pub struct Port {
 
 impl super::SystemPort for Port {
     type Cfg = Config;
-    type Error = ConnectionError;
+    type Error = PortError;
 
     async fn configure(cfg: Option<Self::Cfg>) -> Self {
         let cfg = cfg.unwrap_or_default();
@@ -76,7 +76,7 @@ impl super::SystemPort for Port {
                 };
             }
             #[allow(unreachable_code)]
-            Ok::<_, ConnectionError>(())
+            Ok::<_, PortError>(())
         };
         let session = async {
             loop {
@@ -88,7 +88,7 @@ impl super::SystemPort for Port {
                     .await
                     .map_err(|e| {
                         log::debug!("noline {e:?}");
-                        ConnectionError
+                        PortError
                     })?;
                 match term.readline(">", &mut io).await {
                     Ok(prompt) => {
@@ -97,7 +97,7 @@ impl super::SystemPort for Port {
                     Err(_) => break,
                 }
             }
-            Ok::<_, ConnectionError>(())
+            Ok::<_, PortError>(())
         };
         let srv = async {
             let (mut rsock, mut wsock) = socket.split();
@@ -122,9 +122,9 @@ impl Default for Config {
     }
 }
 
-impl From<sunset::Error> for ConnectionError {
+impl From<sunset::Error> for PortError {
     fn from(err: sunset::Error) -> Self {
         log::trace!("ssh error: {err:?}");
-        ConnectionError
+        PortError
     }
 }

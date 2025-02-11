@@ -32,6 +32,7 @@ wasmi = { version = "0.39.1", default-features = false }
 sunset = { version = "0.2", git = "https://github.com/mkj/sunset.git", branch = "main", optional = true }
 sunset-embassy = { version = "0.2", git = "https://github.com/mkj/sunset.git", branch = "main", optional = true }
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["zeroize", "serde"], optional = true }
+
 # Native
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # axum = { version = "0.7.7", default-features = false }
@@ -71,6 +72,7 @@ optional = true
 default = ["std"]
 std = ["os-std"]
 os-std = [
+  "port-http",
   "port-ssh",
   "nu",
   # "critical-section/std",
@@ -110,6 +112,7 @@ os-rv = [
  "embassy-executor/log",
 ]
 
+port-http = ["edge-net/io"]
 port-ssh = ["dep:sunset", "dep:sunset-embassy", "dep:ed25519-dalek"]
 nu = ["dep:nu-engine", "dep:nu-parser"]
 
