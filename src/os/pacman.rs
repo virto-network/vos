@@ -1,5 +1,11 @@
+use embedded_io_async::Read;
 use heapless::{FnvIndexMap, String, Vec};
 use serde::Deserialize;
+
+pub async fn load(_action: &str) -> Result<impl Read, ()> {
+    // TODO
+    Ok(&[0u8; 0][..])
+}
 
 type Registry = ();
 
@@ -59,7 +65,7 @@ pub struct PkgInfo {
 
 /// A program
 pub struct Bin {
-    cmd: Cmd,
+    action: Action,
     ty: BinType,
 }
 #[derive(Copy, Clone)]
@@ -74,24 +80,24 @@ impl Bin {
 }
 
 #[derive(Deserialize)]
-pub struct Cmd<const ARGS: usize = 0> {
+pub struct Action<const ARGS: usize = 0> {
     name: Id,
     args: Vec<String<32>, { ARGS }>,
     ns: Option<Id>,
 }
 
-impl<const ARGS: usize> Cmd<ARGS> {
+impl<const ARGS: usize> Action<ARGS> {
     pub fn new(name: &str) -> Self {
-        Cmd {
+        Action {
             name: name.try_into().unwrap(),
             args: Vec::new(),
             ns: None,
         }
     }
 
-    pub fn with_args<const A: usize>(self, args: &[&str]) -> Cmd<A> {
+    pub fn with_args<const A: usize>(self, args: &[&str]) -> Action<A> {
         let args = args.iter().filter_map(|a| (*a).try_into().ok()).collect();
-        Cmd {
+        Action {
             name: self.name,
             args,
             ns: self.ns,

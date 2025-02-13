@@ -28,10 +28,11 @@ rand = { version = "0.8.5", default-features = false }
 serde = { version = "1.0.209", default-features = false, features = ["derive", "alloc"] }
 static_cell = { version = "2.1.0", features = ["nightly"] }
 vos-macro = { path = "./vos-macro" }
-wasmi = { version = "0.39.1", default-features = false }
+# wasmi = { version = "0.39.1", default-features = false }
 sunset = { version = "0.2", git = "https://github.com/mkj/sunset.git", branch = "main", optional = true }
 sunset-embassy = { version = "0.2", git = "https://github.com/mkj/sunset.git", branch = "main", optional = true }
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["zeroize", "serde"], optional = true }
+wasmtime = "29.0.1"
 
 # Native
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -83,7 +84,7 @@ os-std = [
   "embassy-sync/std",
   "embassy-time/std",
   "rand/std_rng",
-  "wasmi/std",
+  # "wasmi/std",
 
   "dep:env_logger",
   "dep:mimalloc"

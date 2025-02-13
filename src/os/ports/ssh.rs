@@ -8,7 +8,7 @@ use sunset_embassy::ProgressHolder;
 use super::PortError;
 
 pub struct Port {
-    conn: net::Connection,
+    conn: net::TcpConnection,
     key: SignKey,
 }
 

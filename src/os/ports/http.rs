@@ -6,7 +6,7 @@ use embedded_io_async::{Read, Write};
 use serde::Deserialize;
 
 pub struct Port {
-    port: net::Connection,
+    port: net::TcpConnection,
     srv: http::io::server::Server,
 }
 
