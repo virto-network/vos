@@ -1,8 +1,7 @@
-NIGHTLY := "nightly"
+NIGHTLY := shell("cat rust-toolchain")
 
 default:
     RUST_BACKTRACE=1 RUST_LOG=debug cargo +{{NIGHTLY}} run
-        
 build-js:
     # cargo clean --release --target wasm32-unknown-unknown
     @mkdir -p dist; rm -f dist/*
