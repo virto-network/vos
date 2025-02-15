@@ -1,9 +1,9 @@
 use super::{PortError, SystemPort};
-use crate::os::net::{self, http, nal::WithTimeout};
+use crate::net::{self, http, nal::WithTimeout};
 use core::fmt;
 use edge_net::nal::TcpSplit;
 use embedded_io_async::{Read, Write};
-use serde::Deserialize;
+use miniserde::Deserialize;
 
 pub struct Port {
     port: net::TcpConnection,

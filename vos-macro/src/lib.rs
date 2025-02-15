@@ -42,16 +42,9 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let storage_name = &storage.ident;
 
     let expanded = quote! {
-        extern crate alloc;
-        mod prelude {
-            pub use alloc::vec::Vec;
-            pub use alloc::string::String;
-            pub use alloc::boxed::Box;
-            pub use vos::log;
-        }
-
+        use vos::bin_prelude::*;
         pub mod #mod_name {
-            use super::prelude::*;
+            use super::*;
 
             #storage
 
@@ -60,15 +53,17 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#tests)*
         }
 
-        fn main() {
-            // instantiate and configure
-            let bin = #mod_name::#storage_name::new();
-            // read stdin or file for incoming messages
-            // let msg = parse_msg(stdin())
-            // let out = match msg {
-            //     #((#name, args) => bin.#name(args))*
-            // }
-            // write(out)
+        fn main() -> io::Result<()> {
+            use io::AsyncRead;
+            async fn _run() -> io::Result<()> {
+                // instantiate and configure
+                let bin = #mod_name::#storage_name::new();
+                let mut output = Vec::new();
+                io::stdin().read_to_end(&mut output).await?;
+                // TODO
+                Ok(())
+            }
+            runtime::block_on(async { _run().await })
         }
     };
 

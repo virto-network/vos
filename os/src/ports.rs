@@ -4,7 +4,7 @@
 use super::shell;
 use embassy_executor::SendSpawner;
 use futures_concurrency::future::Race as _;
-use serde::Deserialize;
+use miniserde::Deserialize;
 
 #[cfg(feature = "port-http")]
 pub mod http;
@@ -29,7 +29,7 @@ pub async fn handle_connections(s: SendSpawner, ports: Config) {
 
 /// A system service that connects clients to a shell that runs applications
 pub trait SystemPort {
-    type Cfg: for<'de> Deserialize<'de> + Default;
+    type Cfg: Deserialize + Default;
     type Error: Into<PortError>;
 
     async fn configure(cfg: Option<Self::Cfg>) -> Self;

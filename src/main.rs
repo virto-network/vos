@@ -1,7 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "std"), no_main)]
 
-use embassy_time as _;
 use vos::os::Os;
 
 fn main() {

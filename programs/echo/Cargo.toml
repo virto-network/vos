@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-vos = { path = "../..", default-features = false }
+vos = { path = "../..", features = ["bin"] }

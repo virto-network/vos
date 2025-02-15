@@ -1,6 +1,7 @@
+use crate::Action;
 use embedded_io_async::Read;
 use heapless::{FnvIndexMap, String, Vec};
-use serde::Deserialize;
+use miniserde::Deserialize;
 
 pub async fn load(_action: &str) -> Result<impl Read, ()> {
     // TODO
@@ -76,31 +77,5 @@ pub enum BinType {
 impl Bin {
     pub fn ty(&self) -> BinType {
         self.ty
-    }
-}
-
-#[derive(Deserialize)]
-pub struct Action<const ARGS: usize = 0> {
-    name: Id,
-    args: Vec<String<32>, { ARGS }>,
-    ns: Option<Id>,
-}
-
-impl<const ARGS: usize> Action<ARGS> {
-    pub fn new(name: &str) -> Self {
-        Action {
-            name: name.try_into().unwrap(),
-            args: Vec::new(),
-            ns: None,
-        }
-    }
-
-    pub fn with_args<const A: usize>(self, args: &[&str]) -> Action<A> {
-        let args = args.iter().filter_map(|a| (*a).try_into().ok()).collect();
-        Action {
-            name: self.name,
-            args,
-            ns: self.ns,
-        }
     }
 }

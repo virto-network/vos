@@ -1,8 +1,8 @@
 use embassy_executor::SendSpawner;
-use serde::Deserialize;
+use miniserde::Deserialize;
 
 use super::{Actuator, DataTy, Pipe, Receiver};
-use crate::os::pacman;
+use crate::pacman;
 // use heapless::{String, Vec};
 
 #[embassy_executor::task]

@@ -1,7 +1,7 @@
-use crate::os::{self, net};
+use crate::{CfgBytes, CfgString, Channel, net};
 use edge_net::nal::{TcpAccept, TcpSplit};
 use futures_concurrency::future::Race;
-use serde::Deserialize;
+use miniserde::Deserialize;
 use sunset::SignKey;
 use sunset_embassy::ProgressHolder;
 
@@ -19,9 +19,10 @@ impl super::SystemPort for Port {
     async fn configure(cfg: Option<Self::Cfg>) -> Self {
         let cfg = cfg.unwrap_or_default();
         let conn = net::bind(cfg.port).await.expect("bind ssh port");
+        let key = TryFrom::try_from(&*cfg.key).expect("key with correct size");
         Self {
             conn,
-            key: SignKey::Ed25519(cfg.key),
+            key: SignKey::Ed25519(key),
         }
     }
 
@@ -32,7 +33,7 @@ impl super::SystemPort for Port {
         let mut rx_buf = [0; 1024 * 4];
         let mut tx_buf = [0; 1024 * 2];
         let srv = sunset_embassy::SSHServer::new(&mut rx_buf, &mut tx_buf).expect("ssh server");
-        let session_chan = os::Channel::<sunset::ChanHandle>::new();
+        let session_chan = Channel::<sunset::ChanHandle>::new();
 
         let conn = async {
             loop {
@@ -111,13 +112,13 @@ impl super::SystemPort for Port {
 #[derive(Deserialize)]
 pub struct Config {
     port: u16,
-    key: ed25519_dalek::SigningKey,
+    key: CfgBytes,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             port: 2222,
-            key: TryFrom::try_from(&[0; 32]).expect("256bit long"),
+            key: CfgBytes(heapless::Vec::from_slice(&[0; 32]).unwrap()),
         }
     }
 }

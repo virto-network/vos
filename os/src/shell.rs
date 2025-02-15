@@ -1,22 +1,22 @@
-use crate::os;
+use crate::{Channel, Pipe};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use chrono::{DateTime, FixedOffset};
 use core::cell::RefCell;
 
 pub const MAX_CONNECTIONS: usize = 2;
 #[embassy_executor::task(pool_size = MAX_CONNECTIONS)]
-pub async fn new_session(io: os::Pipe) {
+pub async fn new_session(io: Pipe) {
     let sh = Shell::new(io);
     sh.process_prompt().await;
 }
 
 pub struct Shell {
     engine: RefCell<interpreter::Engine>,
-    io: os::Pipe,
+    io: Pipe,
 }
 
 impl Shell {
-    pub fn new(io: os::Pipe) -> Self {
+    pub fn new(io: Pipe) -> Self {
         Shell {
             engine: interpreter::Engine::new().into(),
             io,
@@ -44,8 +44,8 @@ impl Shell {
 pub enum DataStream {
     Empty,
     Value(Value),
-    ValueStream(os::Channel<Value>),
-    ByteStream(os::Pipe),
+    ValueStream(Channel<Value>),
+    ByteStream(Pipe),
 }
 
 pub enum Value {

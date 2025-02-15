@@ -1,28 +1,31 @@
+#![feature(iter_array_chunks)]
+#![feature(impl_trait_in_assoc_type)]
+#![allow(async_fn_in_trait)]
+#![cfg_attr(not(test), no_std)]
+
+// although we include alloc core OS components should avoid doing allocations
+extern crate alloc;
+
+// #[cfg(feature = "std")]
+// extern crate std;
+
+#[cfg(feature = "rv")]
+#[global_allocator]
+static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
 #[cfg(feature = "std")]
-extern crate std;
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use core::str::FromStr;
 use embassy_executor::{Executor, SendSpawner, SpawnToken};
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, once_lock::OnceLock,
-};
+use embassy_sync::{mutex::Mutex, once_lock::OnceLock};
+use embassy_time as _;
 use futures_concurrency::future::Race;
-use heapless::String;
-use serde::Deserialize;
+use miniserde::Deserialize;
 use static_cell::{ConstStaticCell, StaticCell};
+use types::*;
 
-pub use sensors::OsSensor;
-pub type RawMutex = CriticalSectionRawMutex;
-pub type Channel<T, const N: usize = 1> = embassy_sync::channel::Channel<RawMutex, T, N>;
-pub type Sender<'c, T, const N: usize = 1> = embassy_sync::channel::Sender<'c, RawMutex, T, N>;
-pub type Receiver<'c, T, const N: usize = 1> = embassy_sync::channel::Receiver<'c, RawMutex, T, N>;
-pub type Signal<T> = embassy_sync::signal::Signal<RawMutex, T>;
-pub type Pipe<const N: usize = 1024> = embassy_sync::pipe::Pipe<RawMutex, N>;
-pub type Action = String<32>;
-pub type UserId = String<16>;
-pub type Descriptor = u32;
-pub type Rng = rand::rngs::StdRng;
-
-static RNG: OnceLock<Mutex<RawMutex, Rng>> = OnceLock::new();
+static RNG: OnceLock<Mutex<types::RawMutex, Rng>> = OnceLock::new();
 pub async fn rng() -> Rng {
     let mut rng = RNG.get().await.lock().await;
     <Rng as rand::SeedableRng>::from_rng(&mut *rng).expect("rng from os::RNG")
@@ -32,6 +35,7 @@ pub mod pacman;
 pub mod ports;
 mod sensors;
 pub mod shell;
+mod types;
 pub mod vm;
 
 pub mod net {
@@ -170,14 +174,14 @@ impl<const N: usize> Planner<N> {
 #[derive(Deserialize)]
 pub struct SystemConfig {
     /// System service that can handle authentication
-    pub auth_action: pacman::Action,
+    pub auth_action: CfgString,
     pub system_ports: ports::Config,
     pub vm: vm::Config,
 }
 impl Default for SystemConfig {
     fn default() -> Self {
         SystemConfig {
-            auth_action: pacman::Action::new("auth"),
+            auth_action: CfgString(Action::from_str("auth").unwrap()),
             system_ports: Default::default(),
             vm: Default::default(),
         }

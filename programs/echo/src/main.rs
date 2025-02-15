@@ -1,5 +1,3 @@
-#![no_std]
-
 #[vos::bin]
 mod echo {
     #[vos(storage)]
