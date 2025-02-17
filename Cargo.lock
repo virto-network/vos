@@ -3823,6 +3823,7 @@ name = "vos"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "futures-concurrency",
  "log",
  "miniserde",
  "vos-macro",

@@ -1,7 +1,9 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::ImplItemFn;
-use syn::{parse_macro_input, Attribute, ImplItem, Item, ItemImpl, ItemMod};
+use syn::{
+    parse2, parse_macro_input, Attribute, ImplItem, Item, ItemImpl, ItemMod, Pat, PatIdent, Type,
+};
+use syn::{FnArg, Ident};
 
 #[proc_macro_attribute]
 pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -13,6 +15,7 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut storage_struct = None;
     let mut impl_blocks = Vec::new();
     let mut tests = Vec::new();
+    let mut methods = Vec::new();
 
     for item in content {
         match item {
@@ -25,9 +28,8 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             Item::Impl(i) => {
                 // Process impl block and its methods
-                if let Some(processed_impl) = process_impl_block(i) {
-                    impl_blocks.push(processed_impl);
-                }
+                let processed_impl = process_impl_block(i, &mut methods);
+                impl_blocks.push(processed_impl);
             }
             Item::Mod(m) => {
                 if m.ident == "tests" {
@@ -40,6 +42,7 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let storage = storage_struct.expect("Contract must have a storage struct");
     let storage_name = &storage.ident;
+    let bin_impl = impl_bin(mod_name, storage_name, &methods);
 
     let expanded = quote! {
         use vos::bin_prelude::*;
@@ -50,42 +53,122 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #(#impl_blocks)*
 
+            #bin_impl
+
             #(#tests)*
         }
 
-        fn main() -> io::Result<()> {
-            use io::AsyncRead;
-            async fn _run() -> io::Result<()> {
-                // instantiate and configure
-                let bin = #mod_name::#storage_name::new();
-                let mut output = Vec::new();
-                io::stdin().read_to_end(&mut output).await?;
-                // TODO
-                Ok(())
-            }
-            runtime::block_on(async { _run().await })
+        fn main() {
+            logger::init();
+            runtime::block_on(async {
+                protocol::run::<#mod_name::#storage_name>(
+                    ::std::env::args(),
+                    io::stdin(),
+                    io::stdout(),
+                ).await.inspect_err(|e| log::error!("{e:?}"))
+            });
         }
     };
 
     TokenStream::from(expanded)
 }
 
-fn process_impl_block(mut impl_block: ItemImpl) -> Option<ItemImpl> {
-    let mut has_contract_methods = false;
+struct MethodInfo {
+    name: Ident,
+    args: Vec<(Ident, Type)>,
+}
 
+fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<ItemImpl> {
+    let signatures = methods
+        .iter()
+        .map(|m| {
+            let name = format!("{module} {}", m.name);
+            let args = m.args.iter().map(|a| {
+                let arg = a.0.to_string();
+                quote! {
+                    args.push(protocol::Flag {
+                        long: #arg.into(),
+                        short: None,
+                        arg: None,
+                        required: true,
+                        desc: "".into(),
+                        var_id: None,
+                        default_value: None,
+                    })
+                }
+            });
+
+            quote! {{
+                let mut args = Vec::new();
+                { #(#args)* };
+                sig.push(protocol::ActionSignature {
+                    sig: protocol::SignatureDetail {
+                        name: #name.into(),
+                        description: String::new(),
+                        extra_description: String::new(),
+                        search_terms: Vec::new(),
+                        required_positional: Vec::new(),
+                        optional_positional: Vec::new(),
+                        rest_positional: None,
+                        named: args,
+                        input_output_types: Vec::new(),
+                        allow_variants_without_examples: true,
+                        is_filter: false,
+                        creates_scope: false,
+                        allows_unknown_args: true,
+                        category: protocol::Value::String("Misc".into()),
+                    },
+                    examples: Vec::new(),
+                });
+            }}
+        })
+        .collect::<Vec<_>>();
+    let out = quote! {
+        impl protocol::Bin for #data {
+            fn signature() -> Vec<protocol::ActionSignature> {
+                let mut sig = Vec::new();
+                #(#signatures)*
+                sig
+            }
+        }
+    };
+    parse2(out).ok()
+}
+
+fn process_impl_block(mut impl_block: ItemImpl, methods: &mut Vec<MethodInfo>) -> ItemImpl {
     // Process each method in the impl block
     impl_block.items = impl_block
         .items
         .into_iter()
         .map(|item| {
-            if let ImplItem::Fn(method) = item {
+            if let ImplItem::Fn(mut method) = item {
                 if has_vos_attr(&method.attrs, "message") {
-                    has_contract_methods = true;
-                    process_message_method(method)
+                    method.attrs.retain(|a| !is_vos_attr(a));
+                    let args = method
+                        .sig
+                        .inputs
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            FnArg::Receiver(_) => None,
+                            FnArg::Typed(a) => {
+                                if let Pat::Ident(PatIdent { ident, .. }) = &*a.pat {
+                                    Some((ident.to_owned(), *a.ty.to_owned()))
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    methods.push(MethodInfo {
+                        name: method.sig.ident.clone(),
+                        args,
+                    });
+                    ImplItem::Fn(method)
                 } else if has_vos_attr(&method.attrs, "constructor") {
-                    has_contract_methods = true;
-                    process_constructor_method(method)
+                    method.attrs.retain(|a| !is_vos_attr(a));
+                    ImplItem::Fn(method)
                 } else {
+                    // other.push(&method);
                     ImplItem::Fn(method)
                 }
             } else {
@@ -93,22 +176,7 @@ fn process_impl_block(mut impl_block: ItemImpl) -> Option<ItemImpl> {
             }
         })
         .collect();
-
-    if has_contract_methods {
-        Some(impl_block)
-    } else {
-        None
-    }
-}
-
-fn process_message_method(mut method: ImplItemFn) -> ImplItem {
-    method.attrs.retain(|attr| !is_vos_attr(attr));
-    ImplItem::Fn(method)
-}
-
-fn process_constructor_method(mut method: ImplItemFn) -> ImplItem {
-    method.attrs.retain(|attr| !is_vos_attr(attr));
-    ImplItem::Fn(method)
+    impl_block
 }
 
 fn is_vos_attr(attr: &Attribute) -> bool {
