@@ -1,4 +1,4 @@
-///! Minimal(quick'n dirty) implementation of the nu plugin protocol
+//! Minimal(quick'n dirty) implementation of the nu plugin protocol
 ///! https://www.nushell.sh/contributor-book/plugins.html
 use miniserde::{
     json::{self, Number},
@@ -82,11 +82,11 @@ async fn handle_io<B: Bin>(
     let mut count = 0;
     let mut line = String::new();
     loop {
+        count += 1;
         let req = read_line(&mut input, &mut line).await?;
-        log::error!("-> '{req}'");
+        log::debug!("stdin line: '{req}'");
         ensure!(!req.is_empty(), Error::Protocol);
         let req = json::from_str::<Req>(&req)?;
-        count += 1;
 
         match req {
             Req {
@@ -115,7 +115,6 @@ async fn handle_io<B: Bin>(
                                 )),
                                 ..Default::default()
                             };
-                            log::error!("{signature:?}");
                             respond(&mut out, signature).await?;
                         }
                         Value::Object(object) => todo!(),
@@ -139,13 +138,12 @@ async fn handle_io<B: Bin>(
     }
 }
 
-#[inline]
 async fn respond(out: &mut impl io::AsyncWrite, msg: impl Into<Response>) -> io::Result<()> {
     let msg = msg.into();
-    log::error!(">>>>> {msg:?}");
     let msg = json::to_string(&msg);
     out.write_all(msg.as_bytes()).await?;
-    out.write(b"\n").await;
+    out.write(b"\n").await?;
+    out.flush().await?;
     Ok(())
 }
 
@@ -217,7 +215,6 @@ mod req {
                     struct Map<'a> { out: &'a mut Option<$name>, val: $name }
                     impl<'a> miniserde::de::Map for Map<'a> {
                         fn key(&mut self, k: &str) -> miniserde::Result<&mut dyn miniserde::de::Visitor> {
-
                             match k {
                                 $(stringify!($variant) => { Ok(Deserialize::begin(&mut self.val.$variant)) },)*
                                 _ => Err(miniserde::Error),
@@ -299,26 +296,23 @@ mod res {
             fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
             impl Serialize for $name {
                 fn begin(&self) -> miniserde::ser::Fragment {
-                    struct Stream<'a> {
+                    struct Serializer<'a>{
                         data: &'a $name,
-                        prop: u8,
+                        done: bool,
                     }
-                    impl<'a> miniserde::ser::Map for Stream<'a> {
+                    impl<'a> miniserde::ser::Map for Serializer<'a> {
                         fn next(&mut self) -> Option<(Cow<str>, &dyn Serialize)> {
-                            let p = self.prop;
-                            self.prop = p + 1;
-log::error!("----|-->> {p:?}");                            match p {
-                                $(
-                                ${index()} => self.data
-                                    .$variant
-                                    .as_ref()
-                                    .map(|p| {log::error!("----|||-->> {p:?}");(Cow::Borrowed(stringify!($variant)), p as &dyn Serialize)}),
-                                )*
-                                _ => None,
-                            }
+                            if self.done { return None }
+                            // a "fake enum" should only have one *Some* propery
+                            // we check properties one by one and return the first with data
+                            $(if let Some(p) = self.data.$variant.as_ref() {
+                                self.done = true;
+                                return Some((Cow::Borrowed(stringify!($variant)), p as &dyn Serialize));
+                            };)*
+                            None
                         }
                     }
-                    miniserde::ser::Fragment::Map(Box::new(Stream { data: self, prop: 0 }))
+                    miniserde::ser::Fragment::Map(Box::new(Serializer { data: self, done: false }))
                 }
             }
         }
