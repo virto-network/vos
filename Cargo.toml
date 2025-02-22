@@ -2,7 +2,7 @@
 members = [
   "vos-macro",
   "os",
-  "programs/echo",
+  "programs/demo",
   "programs/http-server",
 ]
 

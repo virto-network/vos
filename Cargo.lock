@@ -806,6 +806,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+ "vos",
+]
+
+[[package]]
 name = "deranged"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -891,13 +898,6 @@ dependencies = [
  "heapless",
  "octseq",
  "time",
-]
-
-[[package]]
-name = "echo"
-version = "0.1.0"
-dependencies = [
- "vos",
 ]
 
 [[package]]

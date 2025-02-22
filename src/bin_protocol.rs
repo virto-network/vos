@@ -4,7 +4,6 @@ use miniserde::{
     json::{self, Number},
     Deserialize, Serialize,
 };
-use res::{Call, Response};
 use wstd::{
     io,
     time::{Duration, Timer},
@@ -22,18 +21,10 @@ pub trait Bin {
     fn signature() -> Vec<ActionSignature>;
 }
 
-macro_rules! ensure {
-    ($cond:expr, $err:expr) => {
-        if !$cond {
-            return Err($err);
-        }
-    };
-}
-
 pub async fn run<B: Bin>(
     args: impl Iterator<Item = String>,
-    mut input: impl io::AsyncRead,
-    mut out: impl io::AsyncWrite,
+    input: impl io::AsyncRead,
+    out: impl io::AsyncWrite,
 ) -> Result<(), Error> {
     use futures_concurrency::future::Race;
 
@@ -46,14 +37,11 @@ pub async fn run<B: Bin>(
         }
     }
 
-    // miniserde only supports json
-    out.write_all(b"\x04json").await?;
-
     let timeout = async {
         Timer::after(Duration::from_millis(2000)).wait().await;
         Ok(())
     };
-    (timeout, handle_io::<B>(input, out)).race().await
+    (timeout, nu_protocol::<B>(input, out)).race().await
 }
 
 #[derive(Debug)]
@@ -61,84 +49,132 @@ pub enum Error {
     Serde,
     Io,
     Protocol,
+    NotSupported,
 }
 impl From<io::Error> for Error {
-    fn from(value: io::Error) -> Self {
+    fn from(_value: io::Error) -> Self {
         Error::Io
     }
 }
 impl From<miniserde::Error> for Error {
-    fn from(value: miniserde::Error) -> Self {
+    fn from(_value: miniserde::Error) -> Self {
         Error::Serde
     }
 }
 
 /// handle nu engine messages and respond accordingly
-async fn handle_io<B: Bin>(
+async fn nu_protocol<B: Bin>(
     mut input: impl io::AsyncRead,
     mut out: impl io::AsyncWrite,
 ) -> Result<(), Error> {
     use req::Request as Req;
-    let mut count = 0;
+
+    // miniserde only supports json
+    out.write_all(b"\x04json").await?;
+    // say hello first
+    respond(
+        &mut out,
+        Hello {
+            protocol: "nu-plugin".into(),
+            version: NU_VERSION.into(),
+            features: vec![],
+        },
+    )
+    .await?;
+
     let mut line = String::new();
     loop {
-        count += 1;
         let req = read_line(&mut input, &mut line).await?;
         log::debug!("stdin line: '{req}'");
-        ensure!(!req.is_empty(), Error::Protocol);
+        if req.is_empty() || req == "\"Goodbye\"" {
+            return Ok(());
+        }
         let req = json::from_str::<Req>(&req)?;
 
         match req {
             Req {
-                Hello: Some(hello), ..
+                Hello: Some(_hello),
+                ..
             } => {
-                ensure!(count == 1, Error::Protocol);
-                respond(&mut out, hello).await?;
+                // TODO Already said hello, could check protocol versions though
             }
             Req {
                 Call: Some(call), ..
-            } => match call {
-                Value::Array(a) => {
-                    let Value::Number(Number::U64(call_id)) = a.get(0).ok_or(Error::Protocol)?
-                    else {
-                        return Err(Error::Protocol);
-                    };
-                    match a.get(1).ok_or(Error::Protocol)? {
-                        Value::String(s) if s == "Signature" => {
-                            let signature = Response {
-                                CallResponse: Some((
-                                    *call_id,
-                                    Call {
-                                        Signature: Some(B::signature()),
-                                        ..Default::default()
-                                    },
-                                )),
-                                ..Default::default()
-                            };
-                            respond(&mut out, signature).await?;
-                        }
-                        Value::Object(object) => todo!(),
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
+            } => handle_call_request::<B>(&mut out, &call).await?,
             Req {
                 EngineCallResponse: Some(r),
                 ..
-            } => {}
+            } => {
+                log::error!("Unsopported {r:?}")
+            }
             Req {
                 Signal: Some(r), ..
-            } => {}
-            Req {
-                Goodbye: Some(s), ..
-            } => {}
-            _ => {}
+            } => {
+                log::error!("Unsopported {r:?}")
+            }
+            _ => return Err(Error::Protocol),
         };
     }
 }
 
-async fn respond(out: &mut impl io::AsyncWrite, msg: impl Into<Response>) -> io::Result<()> {
+async fn handle_call_request<B: Bin>(
+    mut out: &mut impl io::AsyncWrite,
+    call: &Value,
+) -> Result<(), Error> {
+    use res::{Call, Metadata, Response};
+    let Value::Array(call) = call else {
+        return Err(Error::Protocol);
+    };
+    let Value::Number(Number::U64(call_id)) = call.get(0).ok_or(Error::Protocol)? else {
+        return Err(Error::Protocol);
+    };
+    match call.get(1).ok_or(Error::Protocol)? {
+        Value::String(s) if s == "Signature" => {
+            respond(
+                &mut out,
+                Response {
+                    CallResponse: Some((
+                        *call_id,
+                        Call {
+                            Signature: Some(B::signature()),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        Value::String(s) if s == "Metadata" => {
+            respond(
+                &mut out,
+                Response {
+                    CallResponse: Some((
+                        *call_id,
+                        Metadata {
+                            version: VERSION.into(),
+                        }
+                        .into(),
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        Value::Object(call) => match call.first_key_value() {
+            Some((k, Value::Object(v))) if k == "Run" => {
+                log::error!("calling {:?},{:?}", v.get("name"), v.get("call"));
+                return Err(Error::NotSupported);
+            }
+            Some((k, Value::Object(_))) if k == "CustomValueOp" => return Err(Error::NotSupported),
+            Some(_) | None => return Err(Error::Protocol),
+        },
+        _ => {}
+    };
+    Ok(())
+}
+
+async fn respond(out: &mut impl io::AsyncWrite, msg: impl Into<res::Response>) -> io::Result<()> {
     let msg = msg.into();
     let msg = json::to_string(&msg);
     out.write_all(msg.as_bytes()).await?;
@@ -168,7 +204,7 @@ async fn read_line(reader: &mut impl io::AsyncRead, out: &mut String) -> io::Res
 struct Hello {
     protocol: String,
     version: String,
-    features: Vec<String>,
+    features: Vec<Value>,
 }
 
 macro_rules! variant_conversion {
@@ -241,50 +277,48 @@ mod req {
             Call,
             EngineCallResponse,
             Signal-,
-            Goodbye-,
         }
     }
 
-    de_enum! {
-        pub enum CallType {
-            Metadata-,
-            Signature-,
-            Run,
-            CustomValueOp-,
-        }
-    }
+    // de_enum! {
+    //     pub enum CallType {
+    //         Metadata-,
+    //         Signature-,
+    //         Run,
+    //         CustomValueOp-,
+    //     }
+    // }
 
-    #[derive(Deserialize, Debug)]
-    pub struct Run {
-        pub name: String,
-        pub call: CallBody,
-        pub input: PipelineData,
-    }
+    // #[derive(Deserialize, Debug)]
+    // pub struct Run {
+    //     pub name: String,
+    //     pub call: CallBody,
+    //     pub input: PipelineData,
+    // }
 
-    #[derive(Deserialize, Debug)]
-    pub struct CallBody {
-        pub head: Value,
-        pub positional: Vec<Value>,
-        pub named: Vec<(String, Value)>,
-    }
+    // #[derive(Deserialize, Debug)]
+    // pub struct CallBody {
+    //     pub head: Value,
+    //     pub positional: Vec<Value>,
+    //     pub named: Vec<(String, Value)>,
+    // }
 
-    de_enum! {
-        pub enum PipelineData {
-            Empty-,
-            Value-,
-            // ListStream,
-            // ByteStream,
-        }
-    }
+    // de_enum! {
+    //     pub enum PipelineData {
+    //         Empty-,
+    //         Value-,
+    //         // ListStream,
+    //         // ByteStream,
+    //     }
+    // }
     type Call = Value;
-    // type Call = (u32, CallType);
-    type Empty = String;
-    type EngineCallResponse = (u64, ());
-    type Metadata = String;
-    type Signature = String;
     type Signal = String;
-    type Goodbye = String;
-    type CustomValueOp = Value;
+    type EngineCallResponse = (u64, ());
+    // type Call = (u32, CallType);
+    // type Empty = String;
+    // type Metadata = String;
+    // type Signature = String;
+    // type CustomValueOp = Value;
 }
 
 mod res {
@@ -356,9 +390,9 @@ mod res {
     type Empty = String;
 
     #[derive(Debug, Serialize)]
-    struct EngineCall {}
+    pub struct EngineCall {}
     #[derive(Debug, Serialize)]
-    struct Data {}
+    pub struct Data {}
     type End = u64;
     type Drop = u64;
     type Ack = u64;
@@ -366,12 +400,12 @@ mod res {
     type Signature = Vec<ActionSignature>;
 
     #[derive(Debug, Serialize)]
-    struct Metadata {
-        version: String,
+    pub struct Metadata {
+        pub version: String,
     }
     // https://docs.rs/nu-protocol/latest/nu_protocol/struct.LabeledError.html
     #[derive(Debug, Serialize)]
-    struct Error {
+    pub struct Error {
         msg: String,
     }
     //---------------------

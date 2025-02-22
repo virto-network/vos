@@ -61,11 +61,13 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         fn main() {
             logger::init();
             runtime::block_on(async {
-                protocol::run::<#mod_name::#storage_name>(
+                if let Err(e) = protocol::run::<#mod_name::#storage_name>(
                     ::std::env::args(),
                     io::stdin(),
                     io::stdout(),
-                ).await.inspect_err(|e| log::error!("{e:?}"))
+                ).await {
+                    log::error!("{e:?}");
+                }
             });
         }
     };

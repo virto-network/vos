@@ -1,12 +1,12 @@
 #[vos::bin]
-mod echo {
+mod demo {
     #[vos(storage)]
     #[derive(Default)]
-    pub struct Echo {
+    pub struct Demo {
         counter: usize,
     }
 
-    impl Echo {
+    impl Demo {
         #[vos(constructor)]
         pub fn new() -> Self {
             Default::default()
