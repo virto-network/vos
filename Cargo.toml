@@ -21,7 +21,7 @@ futures-concurrency = { version = "7.6.3", default-features = false }
 log = "0.4.22"
 env_logger = { version = "0.11.5", default-features = false }
 miniserde = { version = "0.1.41", default-features = false }
-wstd = "0.5"
+wstd = { version = "0.5", default-features = false }
 
 [features]
 default = ["std"]

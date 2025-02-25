@@ -1,16 +1,15 @@
 #![feature(macro_metavar_expr)]
 #![allow(async_fn_in_trait)]
+use miniserde::Serialize;
 /// Minimal(quick'n dirty) implementation of the nu plugin protocol
 /// https://www.nushell.sh/contributor-book/plugins.html
 use miniserde::json::{self, Number};
-use miniserde::Serialize;
-use nu_types::{Hello, Response};
-use wstd::{
-    io,
-    time::{Duration, Timer},
-};
+use types::{Hello, Response};
+use wstd::io;
 
-pub use nu_types::{ActionSignature, Flag, NuType, SignatureDetail};
+mod types;
+
+pub use types::{ActionSignature, Flag, NuType, SignatureDetail};
 
 const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
@@ -25,8 +24,6 @@ pub async fn run<B: Bin>(
     input: impl io::AsyncRead,
     out: impl io::AsyncWrite,
 ) {
-    use futures_concurrency::future::Race;
-
     let mut args = args.skip(1);
     match args.next() {
         Some(flag) if flag == "--stdio" => {}
@@ -35,15 +32,9 @@ pub async fn run<B: Bin>(
         }
     }
 
-    let timeout = async {
-        Timer::after(Duration::from_millis(2000)).wait().await;
-    };
-    let handle_io = async {
-        if let Err(e) = nu_protocol::<B>(input, out).await {
-            log::error!("{e:?}");
-        }
-    };
-    (timeout, handle_io).race().await
+    if let Err(e) = nu_protocol::<B>(input, out).await {
+        log::error!("{e:?}");
+    }
 }
 
 #[derive(Debug)]
@@ -70,22 +61,19 @@ async fn nu_protocol<B: Bin>(
     mut input: impl io::AsyncRead,
     mut out: impl io::AsyncWrite,
 ) -> Result<(), Error> {
-    use nu_types::Request as Req;
+    use types::Request as Req;
 
     // miniserde only supports json
     out.write_all(b"\x04json").await?;
     // say hello first
-    respond(
-        &mut out,
-        Response {
-            Hello: Some(Hello {
-                protocol: "nu-plugin".into(),
-                version: NU_VERSION.into(),
-                features: vec![],
-            }),
-            ..Default::default()
-        },
-    )
+    respond(&mut out, Response {
+        Hello: Some(Hello {
+            protocol: "nu-plugin".into(),
+            version: NU_VERSION.into(),
+            features: vec![],
+        }),
+        ..Default::default()
+    })
     .await?;
 
     let mut line = String::new();
@@ -122,7 +110,7 @@ async fn handle_call_request<B: Bin>(
     mut out: &mut impl io::AsyncWrite,
     call: json::Value,
 ) -> Result<(), Error> {
-    use nu_types::{CallType, Metadata, Response, Value};
+    use types::{CallType, Metadata, Response, Value};
     // we expect calls to come in a 2 element array
     let Value::Array(mut call) = call else {
         return Err(Error::CallInvalidInput);
@@ -132,37 +120,25 @@ async fn handle_call_request<B: Bin>(
     };
     match call.remove(0) {
         Value::String(s) if s == "Signature" => {
-            respond(
-                &mut out,
-                Response {
-                    CallResponse: Some((
-                        call_id,
-                        CallType {
-                            Signature: Some(B::signature()),
-                            ..Default::default()
-                        },
-                    )),
+            respond(&mut out, Response {
+                CallResponse: Some((call_id, CallType {
+                    Signature: Some(B::signature()),
                     ..Default::default()
-                },
-            )
+                })),
+                ..Default::default()
+            })
             .await?;
         }
         Value::String(s) if s == "Metadata" => {
-            respond(
-                &mut out,
-                Response {
-                    CallResponse: Some((
-                        call_id,
-                        CallType {
-                            Metadata: Some(Metadata {
-                                version: VERSION.into(),
-                            }),
-                            ..Default::default()
-                        },
-                    )),
+            respond(&mut out, Response {
+                CallResponse: Some((call_id, CallType {
+                    Metadata: Some(Metadata {
+                        version: VERSION.into(),
+                    }),
                     ..Default::default()
-                },
-            )
+                })),
+                ..Default::default()
+            })
             .await?;
         }
         Value::Object(mut call) => match call.pop_first() {
@@ -176,19 +152,13 @@ async fn handle_call_request<B: Bin>(
                         log::error!("program returned {:?}", json::to_string(&output))
                     }
                     Err(msg) => {
-                        respond(
-                            out,
-                            Response {
-                                CallResponse: Some((
-                                    call_id,
-                                    CallType {
-                                        Error: Some(nu_types::Error { msg }),
-                                        ..Default::default()
-                                    },
-                                )),
+                        respond(out, Response {
+                            CallResponse: Some((call_id, CallType {
+                                Error: Some(types::Error { msg }),
                                 ..Default::default()
-                            },
-                        )
+                            })),
+                            ..Default::default()
+                        })
                         .await?;
                     }
                 }
@@ -274,267 +244,4 @@ async fn read_line(reader: &mut impl io::AsyncRead, out: &mut String) -> io::Res
         out.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     Ok(std::mem::take(out))
-}
-
-// miniserde doesn't support enums with data or skipping options so we simulate an enum with a struct
-// https://github.com/dtolnay/miniserde/issues/60
-macro_rules! fake_enum {
-    (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
-        #[derive(Default, Debug)]
-        #[allow(non_snake_case)]
-        pub struct $name { $(pub $variant: Option<$variant>),* }
-    };
-}
-macro_rules! ser_enum {
-    (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
-        fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
-        impl Serialize for $name {
-            fn begin(&self) -> miniserde::ser::Fragment {
-                struct Serializer<'a>{
-                    data: &'a $name,
-                    done: bool,
-                }
-                impl<'a> miniserde::ser::Map for Serializer<'a> {
-                    fn next(&mut self) -> Option<(Cow<str>, &dyn Serialize)> {
-                        if self.done { return None }
-                        // a "fake enum" should only have one *Some* propery
-                        // we check properties one by one and return the first with data
-                        $(if let Some(p) = self.data.$variant.as_ref() {
-                            self.done = true;
-                            return Some((Cow::Borrowed(stringify!($variant)), p as &dyn Serialize));
-                        };)*
-                        None
-                    }
-                }
-                miniserde::ser::Fragment::Map(Box::new(Serializer { data: self, done: false }))
-            }
-        }
-    }
-}
-macro_rules! de_enum {
-    (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
-        fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
-        impl Deserialize for $name {
-            fn begin(out: &mut Option<Self>) -> &mut dyn miniserde::de::Visitor {
-                miniserde::make_place!(Place);
-                impl miniserde::de::Visitor for Place<$name> {
-                    fn map(&mut self) -> miniserde::Result<Box<dyn miniserde::de::Map + '_>> {
-                        Ok(Box::new(Map {
-                            out: &mut self.out,
-                            val: $name { ..Default::default() },
-                        }))
-                    }
-                }
-                struct Map<'a> { out: &'a mut Option<$name>, val: $name }
-                impl<'a> miniserde::de::Map for Map<'a> {
-                    fn key(&mut self, k: &str) -> miniserde::Result<&mut dyn miniserde::de::Visitor> {
-                        match k {
-                            $(stringify!($variant) => { Ok(Deserialize::begin(&mut self.val.$variant)) },)*
-                            _ => Err(miniserde::Error),
-                        }
-                    }
-                    fn finish(&mut self) -> miniserde::Result<()> {
-                        let substitute = $name { ..Default::default() };
-                        *self.out = Some(std::mem::replace(&mut self.val, substitute));
-                        Ok(())
-                    }
-                }
-                Place::new(out)
-            }
-        }
-    }
-}
-
-pub mod nu_types {
-    use miniserde::{
-        json::{self, Number},
-        Deserialize, Serialize,
-    };
-    use std::borrow::Cow;
-    // using arbitrary json value as replacement for nu's Value and other types
-    // https://www.nushell.sh/contributor-book/plugin_protocol_reference.html#value-types
-    pub type Value = miniserde::json::Value;
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct Hello {
-        pub protocol: String,
-        pub version: String,
-        pub features: Vec<Value>,
-    }
-
-    de_enum! {
-        pub enum Request {
-            Hello,
-            Call,
-            EngineCallResponse,
-            Signal-,
-        }
-    }
-
-    type Call = Value;
-    type Signal = String;
-    type EngineCallResponse = (u64, ());
-
-    ser_enum! {
-        pub enum Response {
-            Hello,
-            CallResponse,
-            EngineCall,
-            // Option,
-            Data,
-            End-,
-            Drop-,
-            Ack-,
-        }
-    }
-    type CallResponse = (u64, CallType);
-    ser_enum! {
-        pub enum CallType {
-            Metadata,
-            Signature,
-            Error,
-        }
-    }
-    #[derive(Debug, Serialize)]
-    pub struct EngineCall {}
-    #[derive(Debug, Serialize)]
-    pub struct Data {}
-    type End = u64;
-    type Drop = u64;
-    type Ack = u64;
-    pub type Signature = Vec<ActionSignature>;
-
-    #[derive(Debug, Serialize)]
-    pub struct Metadata {
-        pub version: String,
-    }
-    // https://docs.rs/nu-protocol/latest/nu_protocol/struct.LabeledError.html
-    #[derive(Debug, Serialize)]
-    pub struct Error {
-        pub msg: String,
-    }
-
-    //--------------------------
-
-    #[derive(Debug)]
-    pub enum NuType {
-        Binary(json::Array),
-        Bool(bool),
-        Date(String),
-        Duration(String),
-        Filesize(String),
-        Float(f64),
-        Int(i64),
-        List(json::Array),
-        Nothing,
-        Number(u64),
-        Record(json::Object),
-        String(String),
-        Glob(String),
-        Table(json::Object),
-    }
-
-    impl TryFrom<NuType> for Vec<u8> {
-        type Error = ();
-        fn try_from(value: NuType) -> Result<Self, Self::Error> {
-            let NuType::Binary(value) = value else {
-                return Err(());
-            };
-            value
-                .into_iter()
-                .map(|v| {
-                    let Value::Number(Number::U64(n)) = v else {
-                        return None;
-                    };
-                    u8::try_from(n).ok()
-                })
-                .collect::<Option<_>>()
-                .ok_or(())
-        }
-    }
-    impl TryFrom<NuType> for bool {
-        type Error = ();
-        fn try_from(value: NuType) -> Result<Self, Self::Error> {
-            let NuType::Bool(value) = value else {
-                return Err(());
-            };
-            Ok(value)
-        }
-    }
-    impl TryFrom<NuType> for String {
-        type Error = ();
-        fn try_from(value: NuType) -> Result<Self, Self::Error> {
-            let NuType::String(value) = value else {
-                return Err(());
-            };
-            Ok(value)
-        }
-    }
-    impl TryFrom<NuType> for u64 {
-        type Error = ();
-        fn try_from(value: NuType) -> Result<Self, Self::Error> {
-            let NuType::Number(value) = value else {
-                return Err(());
-            };
-            Ok(value)
-        }
-    }
-
-    //--------------------------
-
-    #[derive(Debug, Serialize)]
-    pub struct ActionSignature {
-        pub sig: SignatureDetail,
-        pub examples: Vec<BinExample>,
-    }
-    #[derive(Debug, Serialize)]
-    pub struct SignatureDetail {
-        pub name: String,
-        pub description: String,
-        pub extra_description: String,
-        pub search_terms: Vec<String>,
-        pub required_positional: Vec<PositionalArg>,
-        pub optional_positional: Vec<PositionalArg>,
-        pub rest_positional: Option<PositionalArg>,
-        pub named: Vec<Flag>,
-        pub input_output_types: Vec<(Type, Type)>,
-        pub allow_variants_without_examples: bool,
-        pub is_filter: bool,
-        pub creates_scope: bool,
-        pub allows_unknown_args: bool,
-        pub category: Category,
-    }
-    #[derive(Debug, Serialize)]
-    pub struct Flag {
-        pub long: String,
-        pub short: Option<String>, // char
-        pub arg: Option<SyntaxShape>,
-        pub required: bool,
-        pub desc: String,
-        pub var_id: Option<VarId>,
-        pub default_value: Option<Value>,
-    }
-    #[derive(Debug, Serialize)]
-    pub struct BinExample {
-        pub example: String,
-        pub description: String,
-        pub result: Option<String>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct PositionalArg {
-        pub name: String,
-        pub desc: String,
-        pub shape: SyntaxShape,
-        pub var_id: Option<VarId>,
-        pub default_value: Option<Value>,
-    }
-
-    // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Type.html
-    type Type = Value;
-    // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Category.html
-    type Category = String;
-    // https://docs.rs/nu-protocol/latest/nu_protocol/enum.SyntaxShape.html
-    type SyntaxShape = json::Value;
-    type VarId = usize;
 }

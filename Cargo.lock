@@ -2226,7 +2226,6 @@ dependencies = [
 name = "nu-protocol-wasi"
 version = "0.1.0"
 dependencies = [
- "futures-concurrency",
  "log",
  "miniserde",
  "wstd",
@@ -4650,8 +4649,6 @@ dependencies = [
  "http",
  "itoa",
  "pin-project-lite",
- "serde",
- "serde_json",
  "slab",
  "wasi 0.14.1+wasi-0.2.3",
  "wstd-macro",
