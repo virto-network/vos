@@ -1,9 +1,10 @@
 [workspace]
 members = [
-  "vos-macro",
   "os",
-  "programs/demo",
-  "programs/http-server",
+  "wink",
+  "wink-macro",
+  "wink-examples/demo",
+  "nu-protocol-wasi",
 ]
 
 [package]
@@ -12,23 +13,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-futures-concurrency = { workspace = true }
-log = { workspace = true }
-miniserde = { workspace = true }
-env_logger = { version = "0.11.5", default-features = false, optional = true }
-os = { path = "./os", package = "vos-os", optional = true }
-# bin
-vos-macro = { path = "./vos-macro", optional = true }
-wstd = { version = "0.5.1", optional = true }
+os = { path = "./os", package = "vos-os" }
+env_logger = { workspace = true }
 
 [workspace.dependencies]
 futures-concurrency = { version = "7.6.3", default-features = false }
 log = "0.4.22"
+env_logger = { version = "0.11.5", default-features = false }
 miniserde = { version = "0.1.41", default-features = false }
+wstd = "0.5"
 
 [features]
-bin = ["dep:vos-macro", "dep:wstd", "dep:env_logger"]
-std = ["os-std"]
-os-std = ["os/std", "env_logger/default"]
-os-rv = ["os/rv"]
-os-web = ["os/web"]
+default = ["std"]
+std = ["os/std", "env_logger/default"]
+rv = ["os/rv"]
+web = ["os/web"]

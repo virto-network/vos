@@ -1,3 +1,4 @@
+#![feature(macro_metavar_expr)]
 #![allow(async_fn_in_trait)]
 /// Minimal(quick'n dirty) implementation of the nu plugin protocol
 /// https://www.nushell.sh/contributor-book/plugins.html

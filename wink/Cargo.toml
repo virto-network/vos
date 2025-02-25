@@ -1,0 +1,12 @@
+[package]
+name = "wink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "../nu-protocol-wasi", package = "nu-protocol-wasi" }
+wink-macro = { path = "../wink-macro" }
+env_logger = { workspace = true }
+log = { workspace = true }
+miniserde = { workspace = true }
+wstd = { workspace = true }

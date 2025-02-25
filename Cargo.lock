@@ -504,12 +504,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b396d1f76d455557e1218ec8066ae14bba60b4b36ecd55577ba979f5db7ecaa"
 
 [[package]]
-name = "const-sha1"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8a42181e0652c2997ae4d217f25b63c5337a52fd2279736e97b832fa0a3cff"
-
-[[package]]
 name = "cordyceps"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,12 +785,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-encoding"
-version = "2.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "575f75dfd25738df5b91b8e43e14d44bda14637a58fae779fd2b064f8bf3e010"
-
-[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -809,7 +797,7 @@ dependencies = [
 name = "demo"
 version = "0.1.0"
 dependencies = [
- "vos",
+ "wink",
 ]
 
 [[package]]
@@ -1610,7 +1598,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
- "serde",
  "stable_deref_trait",
 ]
 
@@ -1650,16 +1637,6 @@ dependencies = [
  "bytes",
  "fnv",
  "itoa",
-]
-
-[[package]]
-name = "http-server"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "picoserve",
- "serde",
- "wstd",
 ]
 
 [[package]]
@@ -1839,12 +1816,6 @@ name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
-
-[[package]]
-name = "lhash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744a4c881f502e98c2241d2e5f50040ac73b30194d64452bb6260393b53f0dc9"
 
 [[package]]
 name = "libc"
@@ -2252,6 +2223,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-protocol-wasi"
+version = "0.1.0"
+dependencies = [
+ "futures-concurrency",
+ "log",
+ "miniserde",
+ "wstd",
+]
+
+[[package]]
 name = "nu-system"
 version = "0.101.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2433,23 +2414,6 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
-name = "picoserve"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4086ade38e021293486610bdfd6a520d24e942264c535b297366e234f2feb9be"
-dependencies = [
- "const-sha1",
- "data-encoding",
- "embedded-io-async",
- "futures-util",
- "heapless",
- "lhash",
- "ryu",
- "serde",
- "serde-json-core",
-]
 
 [[package]]
 name = "pin-project"
@@ -3090,17 +3054,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02fc4265df13d6fa1d00ecff087228cc0a2b5f3c0e87e258d8b94a156e984c70"
 dependencies = [
  "serde_derive",
-]
-
-[[package]]
-name = "serde-json-core"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b81787e655bd59cecadc91f7b6b8651330b2be6c33246039a65e5cd6f4e0828"
-dependencies = [
- "heapless",
- "ryu",
- "serde",
 ]
 
 [[package]]
@@ -3823,20 +3776,7 @@ name = "vos"
 version = "0.1.0"
 dependencies = [
  "env_logger",
- "futures-concurrency",
- "log",
- "miniserde",
- "vos-macro",
  "vos-os",
- "wstd",
-]
-
-[[package]]
-name = "vos-macro"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 2.0.98",
 ]
 
 [[package]]
@@ -4645,6 +4585,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "wink"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "miniserde",
+ "nu-protocol-wasi",
+ "wink-macro",
+ "wstd",
+]
+
+[[package]]
+name = "wink-macro"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 2.0.98",
+]
+
+[[package]]
 name = "winnow"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4682,14 +4642,16 @@ dependencies = [
 
 [[package]]
 name = "wstd"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26293c0587d2203a141282311221f9ba0048425a04b21d9fcff8fc62fc8ecd75"
+checksum = "6515b13373b9dfbbe62e4426972253a15b74d93b1e2e95f92bbb2801c239a1d3"
 dependencies = [
  "futures-core",
  "http",
  "itoa",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "slab",
  "wasi 0.14.1+wasi-0.2.3",
  "wstd-macro",
@@ -4697,9 +4659,9 @@ dependencies = [
 
 [[package]]
 name = "wstd-macro"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a8316f91fc3e508b03fdc979dec4ceeddb29744fc1c2c2ed825e00159f96f9"
+checksum = "23d1758ed5cdf081802c60bc000a9cb90db8bcdf140fa8a7251a22b32af37d7b"
 dependencies = [
  "quote",
  "syn 2.0.98",

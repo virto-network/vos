@@ -1,0 +1,10 @@
+[package]
+name = "nu-protocol-wasi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures-concurrency = { workspace = true }
+log = { workspace = true }
+miniserde = { workspace = true }
+wstd = { workspace = true }

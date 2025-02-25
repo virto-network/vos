@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "std"), no_main)]
 
-use vos::os::Os;
+use os::Os;
 
 fn main() {
     #[cfg(feature = "std")]

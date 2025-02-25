@@ -20,9 +20,9 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in content {
         match item {
             Item::Struct(s) => {
-                if has_vos_attr(&s.attrs, "storage") {
+                if has_wink_attr(&s.attrs, "storage") {
                     let mut storage = s;
-                    storage.attrs.retain(|attr| !is_vos_attr(attr));
+                    storage.attrs.retain(|attr| !is_wink_attr(attr));
                     storage_struct = Some(storage);
                 }
             }
@@ -42,14 +42,13 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    let storage = storage_struct.expect("Contract must have a storage struct");
+    let storage = storage_struct.expect("Program must have a storage struct");
     let storage_name = &storage.ident;
     let bin_impl = impl_bin(mod_name, storage_name, &methods);
 
     let expanded = quote! {
-        use vos::bin_prelude::*;
         pub mod #mod_name {
-            use super::*;
+            use wink::prelude::*;
 
             #storage
 
@@ -61,12 +60,12 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         fn main() {
-            logger::init();
-            runtime::block_on(
-                protocol::run::<#mod_name::#storage_name>(
+            wink::logger::init();
+            wink::runtime::block_on(
+                wink::protocol::run::<#mod_name::#storage_name>(
                     ::std::env::args(),
-                    io::stdin(),
-                    io::stdout(),
+                    wink::io::stdin(),
+                    wink::io::stdout(),
                 )
             );
         }
@@ -90,7 +89,7 @@ fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<Item
             let args = m.args.iter().map(|a| {
                 let arg = a.0.to_string();
                 quote! {
-                    args.push(protocol::Flag {
+                    args.push(wink::protocol::Flag {
                         long: #arg.into(),
                         short: None,
                         arg: None,
@@ -128,8 +127,8 @@ fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<Item
             quote! {{
                 let mut args = Vec::new();
                 { #(#args)* };
-                sig.push(protocol::ActionSignature {
-                    sig: protocol::SignatureDetail {
+                sig.push(wink::protocol::ActionSignature {
+                    sig: wink::protocol::SignatureDetail {
                         name: #name.into(),
                         description: String::new(),
                         extra_description: String::new(),
@@ -152,13 +151,13 @@ fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<Item
         .collect::<Vec<_>>();
 
     let out = quote! {
-        impl protocol::Bin for #data {
-            fn signature() -> Vec<protocol::ActionSignature> {
+        impl wink::protocol::Bin for #data {
+            fn signature() -> Vec<wink::protocol::ActionSignature> {
                 let mut sig = Vec::new();
                 #(#signatures)*
                 sig
             }
-            async fn call(&mut self, cmd: &str, mut args: Vec<protocol::NuType>) -> Result<Box<dyn Serialize>, String> {
+            async fn call(&mut self, cmd: &str, mut args: Vec<wink::protocol::NuType>) -> Result<Box<dyn Serialize>, String> {
                 match cmd {
                     #(#cmds)*
                     _ => Err("Not Found".into()),
@@ -179,8 +178,8 @@ fn process_impl_block(
         .into_iter()
         .map(|item| {
             let item = if let ImplItem::Fn(mut method) = item {
-                if has_vos_attr(&method.attrs, "message") {
-                    method.attrs.retain(|a| !is_vos_attr(a));
+                if has_wink_attr(&method.attrs, "message") {
+                    method.attrs.retain(|a| !is_wink_attr(a));
                     let args = method
                         .sig
                         .inputs
@@ -209,8 +208,8 @@ fn process_impl_block(
                         returns_result: has_result_return(&method.sig.output),
                     });
                     ImplItem::Fn(method)
-                } else if has_vos_attr(&method.attrs, "constructor") {
-                    method.attrs.retain(|a| !is_vos_attr(a));
+                } else if has_wink_attr(&method.attrs, "constructor") {
+                    method.attrs.retain(|a| !is_wink_attr(a));
                     ImplItem::Fn(method)
                 } else {
                     // other.push(&method);
@@ -225,18 +224,18 @@ fn process_impl_block(
     Ok(impl_block)
 }
 
-fn is_vos_attr(attr: &Attribute) -> bool {
+fn is_wink_attr(attr: &Attribute) -> bool {
     if let Some(ident) = attr.path().get_ident() {
-        ident == "vos"
+        ident == "wink"
     } else {
         false
     }
 }
 
-fn has_vos_attr(attrs: &[Attribute], name: &str) -> bool {
+fn has_wink_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| {
         if let Some(ident) = attr.path().get_ident() {
-            if ident == "vos" {
+            if ident == "wink" {
                 if let Ok(meta) = attr.meta.require_list() {
                     let content = meta.tokens.to_string();
                     return content.contains(name);
