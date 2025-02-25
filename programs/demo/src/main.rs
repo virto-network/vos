@@ -7,11 +7,6 @@ mod demo {
     }
 
     impl Demo {
-        #[vos(constructor)]
-        pub fn new() -> Self {
-            Default::default()
-        }
-
         #[vos(message)]
         pub fn echo(&mut self, msg: String) -> String {
             self.counter += 1;

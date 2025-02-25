@@ -1,47 +1,48 @@
-//! Minimal(quick'n dirty) implementation of the nu plugin protocol
-///! https://www.nushell.sh/contributor-book/plugins.html
-use miniserde::{
-    json::{self, Number},
-    Deserialize, Serialize,
-};
+#![allow(async_fn_in_trait)]
+/// Minimal(quick'n dirty) implementation of the nu plugin protocol
+/// https://www.nushell.sh/contributor-book/plugins.html
+use miniserde::json::{self, Number};
+use miniserde::Serialize;
+use nu_types::{Hello, Response};
 use wstd::{
     io,
     time::{Duration, Timer},
 };
 
-// using arbitrary json value as replacement for nu's Value and other types
-// https://www.nushell.sh/contributor-book/plugin_protocol_reference.html#value-types
-pub use json::Value;
-pub use res::{ActionSignature, Flag, SignatureDetail};
+pub use nu_types::{ActionSignature, Flag, NuType, SignatureDetail};
 
-const NU_VERSION: &str = "0.101.0";
+const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
 
-pub trait Bin {
+pub trait Bin: Default {
     fn signature() -> Vec<ActionSignature>;
+    async fn call(&mut self, cmd: &str, args: Vec<NuType>) -> Result<Box<dyn Serialize>, String>;
 }
 
 pub async fn run<B: Bin>(
     args: impl Iterator<Item = String>,
     input: impl io::AsyncRead,
     out: impl io::AsyncWrite,
-) -> Result<(), Error> {
+) {
     use futures_concurrency::future::Race;
 
     let mut args = args.skip(1);
     match args.next() {
         Some(flag) if flag == "--stdio" => {}
         Some(_) | None => {
-            log::error!("unexpected flags");
-            return Ok(());
+            return log::error!("unexpected flags");
         }
     }
 
     let timeout = async {
         Timer::after(Duration::from_millis(2000)).wait().await;
-        Ok(())
     };
-    (timeout, nu_protocol::<B>(input, out)).race().await
+    let handle_io = async {
+        if let Err(e) = nu_protocol::<B>(input, out).await {
+            log::error!("{e:?}");
+        }
+    };
+    (timeout, handle_io).race().await
 }
 
 #[derive(Debug)]
@@ -50,6 +51,7 @@ pub enum Error {
     Io,
     Protocol,
     NotSupported,
+    CallInvalidInput,
 }
 impl From<io::Error> for Error {
     fn from(_value: io::Error) -> Self {
@@ -67,17 +69,20 @@ async fn nu_protocol<B: Bin>(
     mut input: impl io::AsyncRead,
     mut out: impl io::AsyncWrite,
 ) -> Result<(), Error> {
-    use req::Request as Req;
+    use nu_types::Request as Req;
 
     // miniserde only supports json
     out.write_all(b"\x04json").await?;
     // say hello first
     respond(
         &mut out,
-        Hello {
-            protocol: "nu-plugin".into(),
-            version: NU_VERSION.into(),
-            features: vec![],
+        Response {
+            Hello: Some(Hello {
+                protocol: "nu-plugin".into(),
+                version: NU_VERSION.into(),
+                features: vec![],
+            }),
+            ..Default::default()
         },
     )
     .await?;
@@ -85,7 +90,7 @@ async fn nu_protocol<B: Bin>(
     let mut line = String::new();
     loop {
         let req = read_line(&mut input, &mut line).await?;
-        log::debug!("stdin line: '{req}'");
+        log::error!("stdin line: '{req}'");
         if req.is_empty() || req == "\"Goodbye\"" {
             return Ok(());
         }
@@ -95,23 +100,18 @@ async fn nu_protocol<B: Bin>(
             Req {
                 Hello: Some(_hello),
                 ..
-            } => {
-                // TODO Already said hello, could check protocol versions though
+            } => { // TODO Already said hello, could check protocol versions though
             }
             Req {
                 Call: Some(call), ..
-            } => handle_call_request::<B>(&mut out, &call).await?,
+            } => handle_call_request::<B>(&mut out, call).await?,
             Req {
-                EngineCallResponse: Some(r),
+                EngineCallResponse: Some(_r),
                 ..
-            } => {
-                log::error!("Unsopported {r:?}")
-            }
+            } => return Err(Error::NotSupported),
             Req {
-                Signal: Some(r), ..
-            } => {
-                log::error!("Unsopported {r:?}")
-            }
+                Signal: Some(_r), ..
+            } => return Err(Error::NotSupported),
             _ => return Err(Error::Protocol),
         };
     }
@@ -119,23 +119,24 @@ async fn nu_protocol<B: Bin>(
 
 async fn handle_call_request<B: Bin>(
     mut out: &mut impl io::AsyncWrite,
-    call: &Value,
+    call: json::Value,
 ) -> Result<(), Error> {
-    use res::{Call, Metadata, Response};
-    let Value::Array(call) = call else {
-        return Err(Error::Protocol);
+    use nu_types::{CallType, Metadata, Response, Value};
+    // we expect calls to come in a 2 element array
+    let Value::Array(mut call) = call else {
+        return Err(Error::CallInvalidInput);
     };
-    let Value::Number(Number::U64(call_id)) = call.get(0).ok_or(Error::Protocol)? else {
-        return Err(Error::Protocol);
+    let Value::Number(Number::U64(call_id)) = call.swap_remove(0) else {
+        return Err(Error::CallInvalidInput);
     };
-    match call.get(1).ok_or(Error::Protocol)? {
+    match call.remove(0) {
         Value::String(s) if s == "Signature" => {
             respond(
                 &mut out,
                 Response {
                     CallResponse: Some((
-                        *call_id,
-                        Call {
+                        call_id,
+                        CallType {
                             Signature: Some(B::signature()),
                             ..Default::default()
                         },
@@ -150,21 +151,46 @@ async fn handle_call_request<B: Bin>(
                 &mut out,
                 Response {
                     CallResponse: Some((
-                        *call_id,
-                        Metadata {
-                            version: VERSION.into(),
-                        }
-                        .into(),
+                        call_id,
+                        CallType {
+                            Metadata: Some(Metadata {
+                                version: VERSION.into(),
+                            }),
+                            ..Default::default()
+                        },
                     )),
                     ..Default::default()
                 },
             )
             .await?;
         }
-        Value::Object(call) => match call.first_key_value() {
-            Some((k, Value::Object(v))) if k == "Run" => {
-                log::error!("calling {:?},{:?}", v.get("name"), v.get("call"));
-                return Err(Error::NotSupported);
+        Value::Object(mut call) => match call.pop_first() {
+            Some((k, Value::Object(call))) if k == "Run" => {
+                let (cmd_name, args) = parse_call(call).ok_or(Error::CallInvalidInput)?;
+                log::error!("calling {cmd_name} with {args:?}");
+                // TODO restore/persist program state
+                let mut program = B::default();
+                match program.call(&cmd_name, args).await {
+                    Ok(output) => {
+                        log::error!("program returned {:?}", json::to_string(&output))
+                    }
+                    Err(msg) => {
+                        respond(
+                            out,
+                            Response {
+                                CallResponse: Some((
+                                    call_id,
+                                    CallType {
+                                        Error: Some(nu_types::Error { msg }),
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Some((k, Value::Object(_))) if k == "CustomValueOp" => return Err(Error::NotSupported),
             Some(_) | None => return Err(Error::Protocol),
@@ -174,8 +200,57 @@ async fn handle_call_request<B: Bin>(
     Ok(())
 }
 
-async fn respond(out: &mut impl io::AsyncWrite, msg: impl Into<res::Response>) -> io::Result<()> {
-    let msg = msg.into();
+fn parse_call(mut call: json::Object) -> Option<(String, Vec<NuType>)> {
+    use json::Value;
+    let Value::String(cmd_name) = call.remove("name")? else {
+        return None;
+    };
+    // For now we asume all programs are "program sub-command"
+    let (_, cmd_name) = cmd_name.split_once(' ')?;
+    let Value::Object(mut args) = call.remove("call")? else {
+        return None;
+    };
+    // our macro assumes named arguments
+    let Value::Array(args) = args.remove("named")? else {
+        return None;
+    };
+    let mut parsed_args = Vec::with_capacity(args.len());
+    for arg in args {
+        let Value::Array(mut arg) = arg else {
+            return None;
+        };
+        let Value::String(_name) = arg.swap_remove(0) else {
+            return None;
+        };
+        let Value::Object(mut val) = arg.remove(0) else {
+            return None;
+        };
+        let (ty, Value::Object(mut val)) = val.pop_first()? else {
+            return None;
+        };
+        let ty = match (ty.as_str(), val.remove("val")) {
+            ("Binary", Some(Value::Array(val))) => NuType::Binary(val),
+            ("Bool", Some(Value::Bool(val))) => NuType::Bool(val),
+            ("Date", Some(Value::String(val))) => NuType::Date(val),
+            ("Duration", Some(Value::String(val))) => NuType::Duration(val),
+            ("Filesize", Some(Value::String(val))) => NuType::Filesize(val),
+            ("Float", Some(Value::Number(Number::F64(val)))) => NuType::Float(val),
+            ("Int", Some(Value::Number(Number::I64(val)))) => NuType::Int(val),
+            ("List", Some(Value::Array(val))) => NuType::List(val),
+            ("Nothing", Some(Value::Null)) => NuType::Nothing,
+            ("Number", Some(Value::Number(Number::U64(val)))) => NuType::Number(val),
+            ("Record", Some(Value::Object(val))) => NuType::Record(val),
+            ("String", Some(Value::String(val))) => NuType::String(val),
+            ("Glob", Some(Value::String(val))) => NuType::Glob(val),
+            ("Table", Some(Value::Object(val))) => NuType::Table(val),
+            _ => return None,
+        };
+        parsed_args.push(ty);
+    }
+    Some((cmd_name.into(), parsed_args))
+}
+
+async fn respond(out: &mut impl io::AsyncWrite, msg: Response) -> io::Result<()> {
     let msg = json::to_string(&msg);
     out.write_all(msg.as_bytes()).await?;
     out.write(b"\n").await?;
@@ -200,76 +275,91 @@ async fn read_line(reader: &mut impl io::AsyncRead, out: &mut String) -> io::Res
     Ok(std::mem::take(out))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Hello {
-    protocol: String,
-    version: String,
-    features: Vec<Value>,
-}
-
-macro_rules! variant_conversion {
-    // hack to skip impl From for types that already implement it
-    ($name:ident, $variant:ident -$(optional $o:tt)?) => {};
-    ($name:ident, $variant:ident) => {
-        #[allow(non_snake_case)]
-        impl From<$variant> for $name {
-            fn from($variant: $variant) -> Self {
-                $name {
-                    $variant: Some($variant),
-                    ..Default::default()
-                }
-            }
-        }
-    };
-}
+// miniserde doesn't support enums with data or skipping options so we simulate an enum with a struct
+// https://github.com/dtolnay/miniserde/issues/60
 macro_rules! fake_enum {
     (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
         #[derive(Default, Debug)]
         #[allow(non_snake_case)]
         pub struct $name { $(pub $variant: Option<$variant>),* }
-        $(variant_conversion!{$name, $variant $(-$($o)?)?})*
     };
 }
-
-mod req {
-    use miniserde::{make_place, Deserialize};
-
-    macro_rules! de_enum {
-        (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
-            fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
-            impl Deserialize for $name {
-                fn begin(out: &mut Option<Self>) -> &mut dyn miniserde::de::Visitor {
-                    make_place!(Place);
-                    impl miniserde::de::Visitor for Place<$name> {
-                        fn map(&mut self) -> miniserde::Result<Box<dyn miniserde::de::Map + '_>> {
-                            Ok(Box::new(Map {
-                                out: &mut self.out,
-                                val: $name { ..Default::default() },
-                            }))
-                        }
-                    }
-                    struct Map<'a> { out: &'a mut Option<$name>, val: $name }
-                    impl<'a> miniserde::de::Map for Map<'a> {
-                        fn key(&mut self, k: &str) -> miniserde::Result<&mut dyn miniserde::de::Visitor> {
-                            match k {
-                                $(stringify!($variant) => { Ok(Deserialize::begin(&mut self.val.$variant)) },)*
-                                _ => Err(miniserde::Error),
-                            }
-                        }
-                        fn finish(&mut self) -> miniserde::Result<()> {
-                            let substitute = $name { ..Default::default() };
-                            *self.out = Some(std::mem::replace(&mut self.val, substitute));
-                            Ok(())
-                        }
-                    }
-                    Place::new(out)
+macro_rules! ser_enum {
+    (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
+        fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
+        impl Serialize for $name {
+            fn begin(&self) -> miniserde::ser::Fragment {
+                struct Serializer<'a>{
+                    data: &'a $name,
+                    done: bool,
                 }
+                impl<'a> miniserde::ser::Map for Serializer<'a> {
+                    fn next(&mut self) -> Option<(Cow<str>, &dyn Serialize)> {
+                        if self.done { return None }
+                        // a "fake enum" should only have one *Some* propery
+                        // we check properties one by one and return the first with data
+                        $(if let Some(p) = self.data.$variant.as_ref() {
+                            self.done = true;
+                            return Some((Cow::Borrowed(stringify!($variant)), p as &dyn Serialize));
+                        };)*
+                        None
+                    }
+                }
+                miniserde::ser::Fragment::Map(Box::new(Serializer { data: self, done: false }))
             }
         }
     }
+}
+macro_rules! de_enum {
+    (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
+        fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
+        impl Deserialize for $name {
+            fn begin(out: &mut Option<Self>) -> &mut dyn miniserde::de::Visitor {
+                miniserde::make_place!(Place);
+                impl miniserde::de::Visitor for Place<$name> {
+                    fn map(&mut self) -> miniserde::Result<Box<dyn miniserde::de::Map + '_>> {
+                        Ok(Box::new(Map {
+                            out: &mut self.out,
+                            val: $name { ..Default::default() },
+                        }))
+                    }
+                }
+                struct Map<'a> { out: &'a mut Option<$name>, val: $name }
+                impl<'a> miniserde::de::Map for Map<'a> {
+                    fn key(&mut self, k: &str) -> miniserde::Result<&mut dyn miniserde::de::Visitor> {
+                        match k {
+                            $(stringify!($variant) => { Ok(Deserialize::begin(&mut self.val.$variant)) },)*
+                            _ => Err(miniserde::Error),
+                        }
+                    }
+                    fn finish(&mut self) -> miniserde::Result<()> {
+                        let substitute = $name { ..Default::default() };
+                        *self.out = Some(std::mem::replace(&mut self.val, substitute));
+                        Ok(())
+                    }
+                }
+                Place::new(out)
+            }
+        }
+    }
+}
 
-    type Hello = super::Hello;
-    type Value = super::Value;
+pub mod nu_types {
+    use miniserde::{
+        json::{self, Number},
+        Deserialize, Serialize,
+    };
+    use std::borrow::Cow;
+    // using arbitrary json value as replacement for nu's Value and other types
+    // https://www.nushell.sh/contributor-book/plugin_protocol_reference.html#value-types
+    pub type Value = miniserde::json::Value;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct Hello {
+        pub protocol: String,
+        pub version: String,
+        pub features: Vec<Value>,
+    }
 
     de_enum! {
         pub enum Request {
@@ -280,80 +370,9 @@ mod req {
         }
     }
 
-    // de_enum! {
-    //     pub enum CallType {
-    //         Metadata-,
-    //         Signature-,
-    //         Run,
-    //         CustomValueOp-,
-    //     }
-    // }
-
-    // #[derive(Deserialize, Debug)]
-    // pub struct Run {
-    //     pub name: String,
-    //     pub call: CallBody,
-    //     pub input: PipelineData,
-    // }
-
-    // #[derive(Deserialize, Debug)]
-    // pub struct CallBody {
-    //     pub head: Value,
-    //     pub positional: Vec<Value>,
-    //     pub named: Vec<(String, Value)>,
-    // }
-
-    // de_enum! {
-    //     pub enum PipelineData {
-    //         Empty-,
-    //         Value-,
-    //         // ListStream,
-    //         // ByteStream,
-    //     }
-    // }
     type Call = Value;
     type Signal = String;
     type EngineCallResponse = (u64, ());
-    // type Call = (u32, CallType);
-    // type Empty = String;
-    // type Metadata = String;
-    // type Signature = String;
-    // type CustomValueOp = Value;
-}
-
-mod res {
-    use miniserde::{json, Serialize};
-    use std::borrow::Cow;
-    // miniserde doesn't support enums with data or skipping options
-    macro_rules! ser_enum {
-        (pub enum $name:ident { $($variant:ident $(-$(optional $o:tt)?)?,)* }) => {
-            fake_enum!(pub enum $name { $($variant $(-$($o)?)?,)* });
-            impl Serialize for $name {
-                fn begin(&self) -> miniserde::ser::Fragment {
-                    struct Serializer<'a>{
-                        data: &'a $name,
-                        done: bool,
-                    }
-                    impl<'a> miniserde::ser::Map for Serializer<'a> {
-                        fn next(&mut self) -> Option<(Cow<str>, &dyn Serialize)> {
-                            if self.done { return None }
-                            // a "fake enum" should only have one *Some* propery
-                            // we check properties one by one and return the first with data
-                            $(if let Some(p) = self.data.$variant.as_ref() {
-                                self.done = true;
-                                return Some((Cow::Borrowed(stringify!($variant)), p as &dyn Serialize));
-                            };)*
-                            None
-                        }
-                    }
-                    miniserde::ser::Fragment::Map(Box::new(Serializer { data: self, done: false }))
-                }
-            }
-        }
-    }
-
-    type Hello = super::Hello;
-    type Value = super::Value;
 
     ser_enum! {
         pub enum Response {
@@ -367,28 +386,14 @@ mod res {
             Ack-,
         }
     }
-
-    type CallResponse = (u64, Call);
+    type CallResponse = (u64, CallType);
     ser_enum! {
-        pub enum Call {
-            Signature,
+        pub enum CallType {
             Metadata,
+            Signature,
             Error,
-            // Ordering,
-            PipelineData,
         }
     }
-
-    ser_enum! {
-        pub enum PipelineData {
-            Empty,
-            Value,
-            // ListStream,
-            // ByteStream,
-        }
-    }
-    type Empty = String;
-
     #[derive(Debug, Serialize)]
     pub struct EngineCall {}
     #[derive(Debug, Serialize)]
@@ -396,8 +401,7 @@ mod res {
     type End = u64;
     type Drop = u64;
     type Ack = u64;
-
-    type Signature = Vec<ActionSignature>;
+    pub type Signature = Vec<ActionSignature>;
 
     #[derive(Debug, Serialize)]
     pub struct Metadata {
@@ -406,9 +410,76 @@ mod res {
     // https://docs.rs/nu-protocol/latest/nu_protocol/struct.LabeledError.html
     #[derive(Debug, Serialize)]
     pub struct Error {
-        msg: String,
+        pub msg: String,
     }
-    //---------------------
+
+    //--------------------------
+
+    #[derive(Debug)]
+    pub enum NuType {
+        Binary(json::Array),
+        Bool(bool),
+        Date(String),
+        Duration(String),
+        Filesize(String),
+        Float(f64),
+        Int(i64),
+        List(json::Array),
+        Nothing,
+        Number(u64),
+        Record(json::Object),
+        String(String),
+        Glob(String),
+        Table(json::Object),
+    }
+
+    impl TryFrom<NuType> for Vec<u8> {
+        type Error = ();
+        fn try_from(value: NuType) -> Result<Self, Self::Error> {
+            let NuType::Binary(value) = value else {
+                return Err(());
+            };
+            value
+                .into_iter()
+                .map(|v| {
+                    let Value::Number(Number::U64(n)) = v else {
+                        return None;
+                    };
+                    u8::try_from(n).ok()
+                })
+                .collect::<Option<_>>()
+                .ok_or(())
+        }
+    }
+    impl TryFrom<NuType> for bool {
+        type Error = ();
+        fn try_from(value: NuType) -> Result<Self, Self::Error> {
+            let NuType::Bool(value) = value else {
+                return Err(());
+            };
+            Ok(value)
+        }
+    }
+    impl TryFrom<NuType> for String {
+        type Error = ();
+        fn try_from(value: NuType) -> Result<Self, Self::Error> {
+            let NuType::String(value) = value else {
+                return Err(());
+            };
+            Ok(value)
+        }
+    }
+    impl TryFrom<NuType> for u64 {
+        type Error = ();
+        fn try_from(value: NuType) -> Result<Self, Self::Error> {
+            let NuType::Number(value) = value else {
+                return Err(());
+            };
+            Ok(value)
+        }
+    }
+
+    //--------------------------
 
     #[derive(Debug, Serialize)]
     pub struct ActionSignature {
@@ -459,9 +530,9 @@ mod res {
     }
 
     // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Type.html
-    type Type = json::Value;
+    type Type = Value;
     // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Category.html
-    type Category = json::Value;
+    type Category = String;
     // https://docs.rs/nu-protocol/latest/nu_protocol/enum.SyntaxShape.html
     type SyntaxShape = json::Value;
     type VarId = usize;
