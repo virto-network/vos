@@ -15,7 +15,7 @@ const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
 
 pub trait Bin: Default {
-    fn signature() -> Vec<ActionSignature>;
+    fn signature() -> &'static [ActionSignature];
     async fn call(&mut self, cmd: &str, args: Vec<NuType>) -> Result<Box<dyn Serialize>, String>;
 }
 

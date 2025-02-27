@@ -123,7 +123,7 @@ pub struct Data {}
 type End = u64;
 type Drop = u64;
 type Ack = u64;
-pub type Signature = Vec<ActionSignature>;
+pub type Signature = &'static [ActionSignature];
 
 #[derive(Debug, Serialize)]
 pub struct Metadata {
@@ -206,19 +206,19 @@ impl TryFrom<NuType> for u64 {
 #[derive(Debug, Serialize)]
 pub struct ActionSignature {
     pub sig: SignatureDetail,
-    pub examples: Vec<BinExample>,
+    pub examples: [BinExample; 0],
 }
 #[derive(Debug, Serialize)]
 pub struct SignatureDetail {
     pub name: String,
-    pub description: String,
-    pub extra_description: String,
-    pub search_terms: Vec<String>,
-    pub required_positional: Vec<PositionalArg>,
-    pub optional_positional: Vec<PositionalArg>,
+    pub description: &'static str,
+    pub extra_description: &'static str,
+    pub search_terms: [&'static str; 0],
+    pub required_positional: [PositionalArg; 0],
+    pub optional_positional: [PositionalArg; 0],
     pub rest_positional: Option<PositionalArg>,
     pub named: Vec<Flag>,
-    pub input_output_types: Vec<(Type, Type)>,
+    pub input_output_types: [(Type, Type); 0],
     pub allow_variants_without_examples: bool,
     pub is_filter: bool,
     pub creates_scope: bool,
@@ -227,11 +227,11 @@ pub struct SignatureDetail {
 }
 #[derive(Debug, Serialize)]
 pub struct Flag {
-    pub long: String,
-    pub short: Option<String>, // char
+    pub long: &'static str,
+    pub short: Option<&'static str>, // char
     pub arg: Option<SyntaxShape>,
     pub required: bool,
-    pub desc: String,
+    pub desc: &'static str,
     pub var_id: Option<VarId>,
     pub default_value: Option<Value>,
 }
@@ -254,7 +254,7 @@ pub struct PositionalArg {
 // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Type.html
 type Type = Value;
 // https://docs.rs/nu-protocol/latest/nu_protocol/enum.Category.html
-type Category = String;
+type Category = &'static str;
 // https://docs.rs/nu-protocol/latest/nu_protocol/enum.SyntaxShape.html
-type SyntaxShape = json::Value;
+type SyntaxShape = &'static str;
 type VarId = usize;

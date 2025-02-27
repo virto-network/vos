@@ -1,63 +1,56 @@
 use proc_macro::{Span, TokenStream};
 use quote::quote;
 use syn::{
-    parse2, parse_macro_input, Attribute, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, LitStr,
-    Pat, PatIdent, ReturnType, Type, TypePath,
+    parse2, parse_macro_input, spanned::Spanned, Attribute, FnArg, Ident, ImplItem, Item,
+    ItemConst, ItemImpl, ItemMod, LitStr, Pat, PatIdent, ReturnType, Type, TypePath,
 };
 
 #[proc_macro_attribute]
 pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemMod);
     let mod_name = &input.ident;
+    let mut content = input.content.expect("Module must have a body").1;
 
-    let content = input.content.expect("Module must have a body").1;
-
-    let mut storage_struct = None;
-    let mut impl_blocks = Vec::new();
-    let mut tests = Vec::new();
     let mut methods = Vec::new();
-
-    for item in content {
-        match item {
-            Item::Struct(s) => {
-                if has_wink_attr(&s.attrs, "storage") {
-                    let mut storage = s;
-                    storage.attrs.retain(|attr| !is_wink_attr(attr));
-                    storage_struct = Some(storage);
+    let storage_name = {
+        let mut storage_struct = None;
+        if let Err(e) = content.iter_mut().try_for_each(|item| {
+            match item {
+                Item::Struct(ty) => {
+                    if has_wink_attr(&ty.attrs, "storage") {
+                        if storage_struct.is_none() {
+                            ty.attrs.retain(|attr| !is_wink_attr(attr));
+                            storage_struct = Some(ty);
+                        } else {
+                            return Err(syn::Error::new(
+                                ty.span(),
+                                "Multiple storage items declared",
+                            ));
+                        }
+                    }
                 }
-            }
-            Item::Impl(i) => {
-                let processed_impl = match process_impl_block(i, &mut methods) {
-                    Ok(block) => block,
-                    Err(e) => return e.to_compile_error().into(),
-                };
-                impl_blocks.push(processed_impl);
-            }
-            Item::Mod(m) => {
-                if m.ident == "tests" {
-                    tests.push(m);
-                }
-            }
-            _ => {}
+                Item::Impl(i) => process_impl_block(i, &mut methods)?,
+                _ => {}
+            };
+            Ok(())
+        }) {
+            return e.into_compile_error().into();
         }
-    }
+        storage_struct.expect("foo").ident.clone()
+    };
 
-    let storage = storage_struct.expect("Program must have a storage struct");
-    let storage_name = &storage.ident;
-    let bin_impl = impl_bin(mod_name, storage_name, &methods);
+    let metadata = metadata(mod_name, &methods);
+    let bin_impl = impl_bin(&storage_name, &methods);
 
     let expanded = quote! {
         pub mod #mod_name {
             use wink::prelude::*;
-
-            #storage
-
-            #(#impl_blocks)*
-
             #bin_impl
 
-            #(#tests)*
+            #(#content)*
         }
+
+        #metadata
 
         fn main() {
             wink::logger::init();
@@ -77,85 +70,84 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 struct MethodInfo {
     name: Ident,
     args: Vec<(Ident, Type)>,
+    doc: Option<String>,
     is_async: bool,
     returns_result: bool,
 }
 
-fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<ItemImpl> {
-    let mut cmds = Vec::new();
-    let signatures = methods
+fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
+    let (idents, cmds) = methods
         .iter()
         .map(|m| {
-            let args = m.args.iter().map(|a| {
-                let arg = a.0.to_string();
+            let args = m.args.iter().map(|(id, ty)| {
+                let name = id.to_string();
+                quote!(wink::Arg {
+                    name: #name,
+                    ty: stringify!(#ty),
+                })
+            });
+            let name = m.name.to_string();
+            let name_up = Ident::new(&name.to_uppercase(), Span::mixed_site().into());
+            let desc = m.doc.clone().unwrap_or_default();
+            let const_cmd = parse2::<ItemConst>(quote! {
+                const #name_up: wink::Cmd = wink::Cmd {
+                    name: #name,
+                    desc: #desc,
+                    args: &[#(#args),*],
+                };
+            })
+            .expect("const");
+            (name_up, const_cmd)
+        })
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    let name = mod_name.to_string();
+    parse2(quote! {
+        mod __meta {
+            use std::sync::OnceLock;
+
+            #(#cmds)*
+            pub const CMDS: &[&wink::Cmd] = &[#(&#idents),*];
+            static NU_SIGNATURE: OnceLock<Vec<wink::protocol::ActionSignature>> = OnceLock::new();
+            pub fn signature() -> &'static [wink::protocol::ActionSignature] {
+                let sig = NU_SIGNATURE.get_or_init(||  wink::to_nu_signature(#name, CMDS));
+                sig.as_slice()
+            }
+        }
+    })
+    .expect("meta mod")
+}
+
+fn impl_bin(data: &Ident, methods: &[MethodInfo]) -> Option<ItemImpl> {
+    let cmds = methods
+        .iter()
+        .map(|m| {
+            let name = m.name.clone();
+            let cmd = LitStr::new(&format!("{name}"), Span::mixed_site().into());
+            let wait = if m.is_async {
+                quote!( .await )
+            } else {
+                quote!()
+            };
+            let result = if m.returns_result {
+                quote!( .map_err(|e| format!("{e:?}"))? )
+            } else {
+                quote!()
+            };
+            let args = m.args.iter().enumerate().map(|(i, (_, ty))| {
                 quote! {
-                    args.push(wink::protocol::Flag {
-                        long: #arg.into(),
-                        short: None,
-                        arg: None,
-                        required: true,
-                        desc: "".into(),
-                        var_id: None,
-                        default_value: None,
-                    })
+                    #ty::try_from(args.remove(#i)).expect("supported type"),
                 }
             });
-
-            {
-                let name = m.name.clone();
-                let cmd = LitStr::new(&format!("{name}"), Span::mixed_site().into());
-                let wait = if m.is_async {
-                    quote!( .await )
-                } else {
-                    quote!()
-                };
-                let result = if m.returns_result {
-                    quote!( .map_err(|e| format!("{e:?}"))? )
-                } else {
-                    quote!()
-                };
-                let args = m.args.iter().enumerate().map(|(i, (_, ty))| {
-                    quote! {
-                        #ty::try_from(args.remove(#i)).expect("supported type"),
-                    }
-                });
-                cmds.push(quote! {
-                    #cmd => Ok(Box::new(self.#name(#(#args)*)#wait #result) as Box<dyn Serialize>),
-                });
+            quote! {
+                #cmd => Ok(Box::new(self.#name(#(#args)*)#wait #result) as Box<dyn Serialize>),
             }
-            let name = format!("{module} {}", m.name);
-            quote! {{
-                let mut args = Vec::new();
-                { #(#args)* };
-                sig.push(wink::protocol::ActionSignature {
-                    sig: wink::protocol::SignatureDetail {
-                        name: #name.into(),
-                        description: String::new(),
-                        extra_description: String::new(),
-                        search_terms: Vec::new(),
-                        required_positional: Vec::new(),
-                        optional_positional: Vec::new(),
-                        rest_positional: None,
-                        named: args,
-                        input_output_types: Vec::new(),
-                        allow_variants_without_examples: true,
-                        is_filter: false,
-                        creates_scope: false,
-                        allows_unknown_args: true,
-                        category: "Misc".into(),
-                    },
-                    examples: Vec::new(),
-                });
-            }}
         })
         .collect::<Vec<_>>();
 
     let out = quote! {
         impl wink::protocol::Bin for #data {
-            fn signature() -> Vec<wink::protocol::ActionSignature> {
-                let mut sig = Vec::new();
-                #(#signatures)*
-                sig
+            fn signature() -> &'static [wink::protocol::ActionSignature] {
+                super::__meta::signature()
             }
             async fn call(&mut self, cmd: &str, mut args: Vec<wink::protocol::NuType>) -> Result<Box<dyn Serialize>, String> {
                 match cmd {
@@ -168,60 +160,59 @@ fn impl_bin(module: &Ident, data: &Ident, methods: &[MethodInfo]) -> Option<Item
     parse2(out).ok()
 }
 
-fn process_impl_block(
-    mut impl_block: ItemImpl,
-    methods: &mut Vec<MethodInfo>,
-) -> syn::Result<ItemImpl> {
-    // Process each method in the impl block
-    impl_block.items = impl_block
-        .items
-        .into_iter()
-        .map(|item| {
-            let item = if let ImplItem::Fn(mut method) = item {
-                if has_wink_attr(&method.attrs, "message") {
-                    method.attrs.retain(|a| !is_wink_attr(a));
-                    let args = method
-                        .sig
-                        .inputs
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            FnArg::Receiver(_) => None,
-                            FnArg::Typed(a) => {
-                                if let Pat::Ident(PatIdent { ident, .. }) = &*a.pat {
-                                    Some((ident.to_owned(), *a.ty.to_owned()))
-                                } else {
-                                    None
-                                }
+fn process_impl_block(impl_block: &mut ItemImpl, methods: &mut Vec<MethodInfo>) -> syn::Result<()> {
+    // Process each method in the impl block to extract needed data
+    for item in impl_block.items.iter_mut() {
+        if let ImplItem::Fn(ref mut method) = item {
+            if has_wink_attr(&method.attrs, "message") {
+                method.attrs.retain(|a| !is_wink_attr(a));
+
+                let args = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        FnArg::Receiver(_) => None,
+                        FnArg::Typed(a) => {
+                            if let Pat::Ident(PatIdent { ident, .. }) = &*a.pat {
+                                Some((ident.to_owned(), *a.ty.to_owned()))
+                            } else {
+                                None
                             }
-                        })
-                        .collect::<Vec<_>>();
-                    if let Some((ident, _)) = args.iter().find(|(_, ty)| !is_allowed_arg(ty)) {
-                        return Err(syn::Error::new(
-                            ident.span(),
-                            format!("Allowed types are: {}", ALLOWED_ARG_TYPES.join(", ")),
-                        ));
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                let extract_doc = |a: &syn::Attribute| {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(doc),
+                        ..
+                    }) = &a.meta.require_name_value().unwrap().value
+                    {
+                        doc.value().trim().into()
+                    } else {
+                        unreachable!()
                     }
-                    methods.push(MethodInfo {
-                        name: method.sig.ident.clone(),
-                        args,
-                        is_async: method.sig.asyncness.is_some(),
-                        returns_result: has_result_return(&method.sig.output),
-                    });
-                    ImplItem::Fn(method)
-                } else if has_wink_attr(&method.attrs, "constructor") {
-                    method.attrs.retain(|a| !is_wink_attr(a));
-                    ImplItem::Fn(method)
-                } else {
-                    // other.push(&method);
-                    ImplItem::Fn(method)
-                }
-            } else {
-                item
-            };
-            Ok(item)
-        })
-        .collect::<syn::Result<_>>()?;
-    Ok(impl_block)
+                };
+                let doc = method
+                    .attrs
+                    .iter()
+                    .find(|a| a.path().is_ident("doc"))
+                    .map(extract_doc);
+
+                methods.push(MethodInfo {
+                    name: method.sig.ident.clone(),
+                    args,
+                    doc,
+                    is_async: method.sig.asyncness.is_some(),
+                    returns_result: has_result_return(&method.sig.output),
+                });
+            } else if has_wink_attr(&method.attrs, "constructor") {
+                method.attrs.retain(|a| !is_wink_attr(a));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_wink_attr(attr: &Attribute) -> bool {
@@ -244,11 +235,6 @@ fn has_wink_attr(attrs: &[Attribute], name: &str) -> bool {
         }
         false
     })
-}
-
-const ALLOWED_ARG_TYPES: [&str; 4] = ["String", "bool", "u64", "Vec<u8>"];
-fn is_allowed_arg(ty: &Type) -> bool {
-    is_ty_one_of(ty, ALLOWED_ARG_TYPES)
 }
 
 fn has_result_return(return_type: &ReturnType) -> bool {
