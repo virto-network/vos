@@ -10,3 +10,4 @@ env_logger = { workspace = true }
 log = { workspace = true }
 miniserde = { workspace = true }
 wstd = { workspace = true }
+pico-args = "0.5.0"

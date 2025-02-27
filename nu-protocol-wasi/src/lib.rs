@@ -19,24 +19,6 @@ pub trait Bin: Default {
     async fn call(&mut self, cmd: &str, args: Vec<NuType>) -> Result<Box<dyn Serialize>, String>;
 }
 
-pub async fn run<B: Bin>(
-    args: impl Iterator<Item = String>,
-    input: impl io::AsyncRead,
-    out: impl io::AsyncWrite,
-) {
-    let mut args = args.skip(1);
-    match args.next() {
-        Some(flag) if flag == "--stdio" => {}
-        Some(_) | None => {
-            return log::error!("unexpected flags");
-        }
-    }
-
-    if let Err(e) = nu_protocol::<B>(input, out).await {
-        log::error!("{e:?}");
-    }
-}
-
 #[derive(Debug)]
 pub enum Error {
     Serde,
@@ -56,8 +38,8 @@ impl From<miniserde::Error> for Error {
     }
 }
 
-/// handle nu engine messages and respond accordingly
-async fn nu_protocol<B: Bin>(
+/// Handle nu engine messages and respond accordingly
+pub async fn nu_protocol<B: Bin>(
     mut input: impl io::AsyncRead,
     mut out: impl io::AsyncWrite,
 ) -> Result<(), Error> {

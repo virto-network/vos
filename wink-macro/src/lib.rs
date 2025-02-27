@@ -53,14 +53,7 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #metadata
 
         fn main() {
-            wink::logger::init();
-            wink::runtime::block_on(
-                wink::protocol::run::<#mod_name::#storage_name>(
-                    ::std::env::args(),
-                    wink::io::stdin(),
-                    wink::io::stdout(),
-                )
-            );
+            wink::run::<#mod_name::#storage_name>();
         }
     };
 
