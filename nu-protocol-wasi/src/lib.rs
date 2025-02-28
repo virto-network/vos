@@ -1,11 +1,11 @@
 #![feature(macro_metavar_expr)]
 #![allow(async_fn_in_trait)]
+use embedded_io_async as io;
 use miniserde::Serialize;
 /// Minimal(quick'n dirty) implementation of the nu plugin protocol
 /// https://www.nushell.sh/contributor-book/plugins.html
 use miniserde::json::{self, Number};
 use types::{Hello, Response};
-use wstd::io;
 
 mod types;
 
@@ -27,21 +27,16 @@ pub enum Error {
     NotSupported,
     CallInvalidInput,
 }
-impl From<io::Error> for Error {
-    fn from(_value: io::Error) -> Self {
+impl<E: io::Error> From<E> for Error {
+    fn from(_value: E) -> Self {
         Error::Io
-    }
-}
-impl From<miniserde::Error> for Error {
-    fn from(_value: miniserde::Error) -> Self {
-        Error::Serde
     }
 }
 
 /// Handle nu engine messages and respond accordingly
 pub async fn nu_protocol<B: Bin>(
-    mut input: impl io::AsyncRead,
-    mut out: impl io::AsyncWrite,
+    mut input: impl io::Read,
+    mut out: impl io::Write,
 ) -> Result<(), Error> {
     use types::Request as Req;
 
@@ -65,7 +60,7 @@ pub async fn nu_protocol<B: Bin>(
         if req.is_empty() || req == "\"Goodbye\"" {
             return Ok(());
         }
-        let req = json::from_str::<Req>(&req)?;
+        let req = json::from_str::<Req>(&req).map_err(|_| Error::Serde)?;
 
         match req {
             Req {
@@ -89,7 +84,7 @@ pub async fn nu_protocol<B: Bin>(
 }
 
 async fn handle_call_request<B: Bin>(
-    mut out: &mut impl io::AsyncWrite,
+    mut out: &mut impl io::Write,
     call: json::Value,
 ) -> Result<(), Error> {
     use types::{CallType, Metadata, Response, Value};
@@ -203,7 +198,7 @@ fn parse_call(mut call: json::Object) -> Option<(String, Vec<NuType>)> {
     Some((cmd_name.into(), parsed_args))
 }
 
-async fn respond(out: &mut impl io::AsyncWrite, msg: Response) -> io::Result<()> {
+async fn respond<W: io::Write>(out: &mut W, msg: Response) -> Result<(), W::Error> {
     let msg = json::to_string(&msg);
     out.write_all(msg.as_bytes()).await?;
     out.write(b"\n").await?;
@@ -211,7 +206,7 @@ async fn respond(out: &mut impl io::AsyncWrite, msg: Response) -> io::Result<()>
     Ok(())
 }
 
-async fn read_line(reader: &mut impl io::AsyncRead, out: &mut String) -> io::Result<String> {
+async fn read_line<R: io::Read>(reader: &mut R, out: &mut String) -> Result<String, R::Error> {
     let mut buf = [0u8; 128];
     loop {
         if let Some(i) = out.chars().position(|b| b == '\n' || b == '\r') {

@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 log = { workspace = true }
 miniserde = { workspace = true }
-wstd = { workspace = true }
+embedded-io-async = { workspace = true }
