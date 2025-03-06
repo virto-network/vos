@@ -1,0 +1,10 @@
+[package]
+name = "simple-http-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+edge-nal = { workspace = true }
+edge-http = { version = "0.5", default-features = false, features = ["io"] }
+embedded-io-async = { workspace = true }
+form_urlencoded = "1.2.1"
