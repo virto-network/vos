@@ -4,7 +4,8 @@ members = [
   "wink",
   "wink-macro",
   "wink-examples/demo",
-  "nu-protocol-wasi",
+  "support/nu-protocol",
+  "support/simple-http-server",
 ]
 
 [package]
