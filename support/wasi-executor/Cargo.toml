@@ -1,0 +1,7 @@
+[package]
+name = "wasi-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embassy-executor = { workspace = true }
