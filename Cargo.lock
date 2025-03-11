@@ -1348,6 +1348,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0d2fde1f7b3d48b8395d5f2de76c18a528bd6a9cdde438df747bfcba3e05d6f"
 
 [[package]]
+name = "form_urlencoded"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13624c2627564efccf4934284bdd98cbaa14e79b0b5a141218e507b3a823456"
+dependencies = [
+ "percent-encoding",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1626,17 +1635,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
-]
-
-[[package]]
-name = "http"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f16ca2af56261c99fba8bac40a10251ce8188205a4c448fbb745a2e4daa76fea"
-dependencies = [
- "bytes",
- "fnv",
- "itoa",
 ]
 
 [[package]]
@@ -2152,7 +2150,7 @@ dependencies = [
  "log",
  "nu-glob",
  "nu-path",
- "nu-protocol",
+ "nu-protocol 0.101.0",
  "nu-utils",
  "terminal_size",
 ]
@@ -2175,7 +2173,7 @@ dependencies = [
  "log",
  "nu-engine",
  "nu-path",
- "nu-protocol",
+ "nu-protocol 0.101.0",
  "nu-utils",
  "serde_json",
 ]
@@ -2189,6 +2187,15 @@ dependencies = [
  "dirs",
  "omnipath",
  "pwd",
+]
+
+[[package]]
+name = "nu-protocol"
+version = "0.1.0"
+dependencies = [
+ "embedded-io-async",
+ "log",
+ "miniserde",
 ]
 
 [[package]]
@@ -2220,15 +2227,6 @@ dependencies = [
  "thiserror 2.0.11",
  "typetag",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "nu-protocol-wasi"
-version = "0.1.0"
-dependencies = [
- "log",
- "miniserde",
- "wstd",
 ]
 
 [[package]]
@@ -2413,6 +2411,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "percent-encoding"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3148f5046208a5d56bcfc03053e3ca6334e51da8dfb19b6cdc8b306fae3283e"
 
 [[package]]
 name = "pico-args"
@@ -3149,6 +3153,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "simple-http-server"
+version = "0.1.0"
+dependencies = [
+ "edge-http",
+ "edge-nal",
+ "embedded-io-async",
+ "form_urlencoded",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3833,11 +3847,27 @@ checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
 name = "wasi"
-version = "0.14.1+wasi-0.2.3"
+version = "0.14.2+wasi-0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad7df608df60a1c33e247881838b0f809512086e3e3bb1c18323b77eeb1f844e"
+checksum = "9683f9a5a998d873c0d21fcbe3c083009670149a8fab228644b8bd36b2c48cb3"
 dependencies = [
  "wit-bindgen-rt",
+]
+
+[[package]]
+name = "wasi-executor"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+]
+
+[[package]]
+name = "wasi-net"
+version = "0.1.0"
+dependencies = [
+ "edge-nal",
+ "embedded-io-async",
+ "wasi 0.14.2+wasi-0.2.4",
 ]
 
 [[package]]
@@ -4593,13 +4623,20 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 name = "wink"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
+ "embassy-executor",
+ "embassy-time",
+ "embedded-io-async",
  "env_logger",
  "log",
  "miniserde",
- "nu-protocol-wasi",
+ "nu-protocol 0.1.0",
  "pico-args",
+ "simple-http-server",
+ "static_cell",
+ "wasi-executor",
+ "wasi-net",
  "wink-macro",
- "wstd",
 ]
 
 [[package]]
@@ -4644,31 +4681,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.221.3",
-]
-
-[[package]]
-name = "wstd"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6515b13373b9dfbbe62e4426972253a15b74d93b1e2e95f92bbb2801c239a1d3"
-dependencies = [
- "futures-core",
- "http",
- "itoa",
- "pin-project-lite",
- "slab",
- "wasi 0.14.1+wasi-0.2.3",
- "wstd-macro",
-]
-
-[[package]]
-name = "wstd-macro"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d1758ed5cdf081802c60bc000a9cb90db8bcdf140fa8a7251a22b32af37d7b"
-dependencies = [
- "quote",
- "syn 2.0.98",
 ]
 
 [[package]]

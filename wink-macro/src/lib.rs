@@ -40,20 +40,60 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let metadata = metadata(mod_name, &methods);
-    let bin_impl = impl_bin(&storage_name, &methods);
+    let bin_impl = impl_bin(mod_name, &storage_name, &methods);
 
     let expanded = quote! {
         pub mod #mod_name {
             use wink::prelude::*;
-            #bin_impl
-
             #(#content)*
         }
+
+        #bin_impl
 
         #metadata
 
         fn main() {
-            wink::run::<#mod_name::#storage_name>();
+            use wink::RunMode;
+            wink::logger::init();
+            let rt = wink::async_runtime();
+
+            match RunMode::from_args() {
+                Some(RunMode::Nu) => rt.run(|s| s.must_spawn(run_as_nu_plugin())),
+                #[cfg(feature = "stand-alone")]
+                Some(RunMode::StandAloneHttp(port)) => rt.run(|s| s.must_spawn(run_as_http_server(port))),
+                _ => {}
+            }
+        }
+
+        // From embassy executor macro
+        static POOL: wink::executor::_export::TaskPoolRef = wink::executor::_export::TaskPoolRef::new();
+
+        fn run_as_nu_plugin() -> wink::executor::SpawnToken<impl Sized> {
+            unsafe {
+                POOL.get::<_, 1>()._spawn_async_fn(move || async {
+                    let mgr = __bin::BIN_MANAGER;
+                    let mut nu = wink::protocol::NuPlugin::new(
+                        mgr.get().expect("Manager"),
+                        wink::io::stdio()
+                    );
+                    if let Err(e) = nu.handle_io().await {
+                        wink::prelude::log::error!("Nu protocol: {e:?}");
+                    }
+                })
+            }
+        }
+
+        #[cfg(feature = "stand-alone")]
+        fn run_as_http_server(port: u16) -> wink::executor::SpawnToken<impl Sized> {
+            unsafe {
+                POOL.get::<_, 1>()._spawn_async_fn(move || async move {
+                    let mgr = __bin::BIN_MANAGER;
+                    let mgr = mgr.get().expect("Manager");
+                    if let Err(e) = wink::http::serve(port, &mgr).await {
+                        wink::prelude::log::error!("Http server: {e:?}");
+                    }
+                })
+            }
         }
     };
 
@@ -110,7 +150,7 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
     .expect("meta mod")
 }
 
-fn impl_bin(data: &Ident, methods: &[MethodInfo]) -> Option<ItemImpl> {
+fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
     let cmds = methods
         .iter()
         .map(|m| {
@@ -137,20 +177,44 @@ fn impl_bin(data: &Ident, methods: &[MethodInfo]) -> Option<ItemImpl> {
         })
         .collect::<Vec<_>>();
 
-    let out = quote! {
-        impl wink::protocol::Bin for #data {
-            fn signature() -> &'static [wink::protocol::ActionSignature] {
-                super::__meta::signature()
+    parse2(quote! {
+        mod __bin {
+            use std::future::Future;
+            use wink::prelude::Serialize;
+
+            pub const BIN_MANAGER: std::cell::OnceCell<Manager> = std::cell::OnceCell::new();
+
+            pub struct Manager;
+            impl wink::protocol::BinManager for &Manager {
+                type Bin = super::#mod_name::#data;
+                fn bin_signature() -> &'static [wink::protocol::ActionSignature] {
+                    super::__meta::signature()
+                }
+                async fn get_bin(&self) -> Result<Self::Bin, impl wink::io::Error> {
+                    // TODO
+                    Ok::<_, std::io::Error>(Default::default())
+                }
+                async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl wink::io::Error> {
+                    // TODO
+                    Ok::<_, std::io::Error>(())
+                }
             }
-            async fn call(&mut self, cmd: &str, mut args: Vec<wink::protocol::NuType>) -> Result<Box<dyn Serialize>, String> {
-                match cmd {
-                    #(#cmds)*
-                    _ => Err("Not Found".into()),
+
+            impl wink::protocol::Bin for super::#mod_name::#data {
+                async fn call(
+                    &mut self,
+                    cmd: &str,
+                    mut args: Vec<wink::protocol::NuType>
+                ) -> Result<Box<dyn Serialize>, String> {
+                    match cmd {
+                        #(#cmds)*
+                        _ => Err("Not Found".into()),
+                    }
                 }
             }
         }
-    };
-    parse2(out).ok()
+    })
+    .expect("impl bin")
 }
 
 fn process_impl_block(impl_block: &mut ItemImpl, methods: &mut Vec<MethodInfo>) -> syn::Result<()> {

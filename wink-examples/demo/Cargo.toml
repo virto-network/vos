@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 wink = { path = "../../wink" }
+
+[features]
+dev = ["stand-alone"]
+stand-alone = ["wink/stand-alone"]

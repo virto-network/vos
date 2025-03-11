@@ -4,10 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-protocol = { path = "../nu-protocol-wasi", package = "nu-protocol-wasi" }
+protocol = { path = "../support/nu-protocol", package = "nu-protocol" }
 wink-macro = { path = "../wink-macro" }
 env_logger = { workspace = true }
 log = { workspace = true }
 miniserde = { workspace = true }
-wstd = { workspace = true }
 pico-args = "0.5.0"
+
+embassy-executor = { workspace = true }
+static_cell = { workspace = true }
+embedded-io-async = { workspace = true, features = ["std"] }
+critical-section = { version = "1.2.0", features = ["std"] }
+wasi-executor = { path = "../support/wasi-executor" }
+
+wasi-net = { path = "../support/wasi-net", optional = true }
+simple-http-server = { path = "../support/simple-http-server", optional = true }
+embassy-time = { workspace = true, features = ["std"], optional = true }
+
+[features]
+stand-alone = ["simple-http-server", "wasi-net", "embassy-time"]

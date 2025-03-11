@@ -1,3 +1,7 @@
+use static_cell::StaticCell;
+use wasi_executor::Executor;
+
+pub use embassy_executor as executor;
 pub use env_logger as logger;
 pub use pico_args as args;
 pub use protocol;
@@ -6,36 +10,66 @@ pub use wink_macro::bin;
 pub mod prelude {
     pub use log;
     pub use miniserde::{Deserialize, Serialize, json};
-    pub use wstd::prelude::*;
 }
 
-pub fn run<Bin: protocol::Bin>() {
-    logger::init();
-    if let Err(e) = match run_mode() {
-        RunMode::Nu => wstd::runtime::block_on(async {
-            protocol::nu_protocol::<Bin>(wstd::io::stdin(), wstd::io::stdout())
-                .await
-                .map_err(|e| format!("Nu protocol: {e:?}"))
-        }),
-        RunMode::StandAloneHttp(port) => {
-            wstd::runtime::block_on(async { http::serve(port).await.map_err(|e| format!("{e:?}")) })
-        }
-    } {
-        log::error!("{e}")
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+
+pub fn async_runtime() -> &'static mut Executor {
+    EXECUTOR.init(Executor::new())
+}
+
+#[cfg(feature = "stand-alone")]
+pub mod http {
+    use embassy_time as _;
+    use miniserde::json;
+    use protocol::Bin;
+    use simple_http_server::{Error, HttpError, simple_serve};
+
+    pub async fn serve(port: u16, mgr: &impl protocol::BinManager) -> Result<(), Error> {
+        let stack = wasi_net::Stack::new();
+        let _res = simple_serve(
+            stack,
+            port,
+            move |path, _params, _headers, _maybe_body| async move {
+                let mut bin = mgr.get_bin().await.unwrap();
+                let (_bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
+                let res = match bin.call(cmd, vec![]).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        log::warn!("Bin response: {err}");
+                        return Err(simple_http_server::HttpError::Internal);
+                    }
+                };
+                // Ok(json::to_string(&res).as_bytes())
+                Ok(b"Hello world".as_slice())
+            },
+        )
+        .await?;
+        Ok(())
     }
 }
 
-enum RunMode {
+pub enum RunMode {
     Nu,
+    #[cfg(feature = "stand-alone")]
     StandAloneHttp(u16),
 }
-
-fn run_mode() -> RunMode {
-    let mut args = pico_args::Arguments::from_env();
-    if args.contains("--stdio") {
-        return RunMode::Nu;
+impl RunMode {
+    pub fn from_args() -> Option<Self> {
+        let mut args = pico_args::Arguments::from_env();
+        if args.contains("--stdio") {
+            return Some(RunMode::Nu);
+        }
+        #[cfg(feature = "stand-alone")]
+        {
+            let port = args
+                .opt_value_from_str("--port")
+                .expect("--port")
+                .unwrap_or(8080);
+            return Some(RunMode::StandAloneHttp(port));
+        }
+        None
     }
-    RunMode::StandAloneHttp(0)
 }
 
 pub struct Cmd {
@@ -85,8 +119,28 @@ pub fn to_nu_signature(ns: &str, cmds: &[&Cmd]) -> Vec<protocol::ActionSignature
         .collect()
 }
 
-mod http {
-    pub async fn serve(_port: u16) -> Result<(), ()> {
-        Ok(())
+pub mod io {
+    pub use embedded_io_async::{Error, ErrorType, Read, Write};
+
+    pub fn stdio() -> StdIo {
+        StdIo
+    }
+
+    pub struct StdIo;
+
+    impl Read for StdIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            todo!()
+        }
+    }
+
+    impl Write for StdIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            todo!()
+        }
+    }
+
+    impl ErrorType for StdIo {
+        type Error = std::io::Error;
     }
 }
