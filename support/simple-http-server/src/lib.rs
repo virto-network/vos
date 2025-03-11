@@ -1,5 +1,8 @@
+#![feature(type_alias_impl_trait)]
+
+pub use edge_http::Headers;
 use edge_http::{
-    Headers, Method,
+    Method,
     io::{
         Body,
         server::{self, Connection, DefaultServer},
@@ -8,19 +11,16 @@ use edge_http::{
 use edge_nal::{TcpAccept, TcpBind, TcpSplit};
 use embedded_io_async::{BufRead, Read, Write};
 pub use form_urlencoded::parse as parse_urlencoded;
-use std::{fmt, mem, net::Ipv4Addr};
+use std::{cell::RefCell, fmt, marker::PhantomData, mem, net::Ipv4Addr};
 
+pub type MaybeBody<'s, 'b, S> = Option<&'b mut Body<'b, SocketFor<'s, S>>>;
 type SocketFor<'s, S> = <<S as TcpBind>::Accept<'s> as TcpAccept>::Socket<'s>;
-type MaybeBody<'s, 'b, S> = Option<&'b mut Body<'b, SocketFor<'s, S>>>;
 type Path<'a> = &'a str;
 type Query<'a> = form_urlencoded::Parse<'a>;
 
-pub async fn simple_serve<S, F, Res>(
-    stack: S,
-    port: u16,
-    handler: fn(Path, Query, &Headers, MaybeBody<S>) -> F,
-) -> Result<(), Error>
+pub async fn simple_serve<H, S, F, Res>(stack: S, port: u16, handler: H) -> Result<(), Error>
 where
+    H: FnMut(Path, Query, &Headers, MaybeBody<S>) -> F,
     S: TcpBind,
     F: Future<Output = Result<Res, HttpError>>,
     Res: BufRead,
@@ -31,7 +31,9 @@ where
         .map_err(|_| Error::Io)?;
 
     let mut server = DefaultServer::new();
-    server.run(None, socket, Handler(handler)).await?;
+    server
+        .run(None, socket, Handler(RefCell::new(handler), PhantomData))
+        .await?;
     Ok(())
 }
 
@@ -61,12 +63,11 @@ pub enum HttpError {
     Internal,
 }
 
-type HandlerFn<S, F> = fn(Path<'_>, Query<'_>, &Headers, MaybeBody<'_, '_, S>) -> F;
+struct Handler<H, S, F, Res>(RefCell<H>, PhantomData<(S, F, Res)>);
 
-struct Handler<S: TcpBind, F>(HandlerFn<S, F>);
-
-impl<S, F, Res> server::Handler for Handler<S, F>
+impl<H, S, F, Res> server::Handler for Handler<H, S, F, Res>
 where
+    H: FnMut(Path, Query, &Headers, MaybeBody<S>) -> F,
     S: TcpBind,
     F: Future<Output = Result<Res, HttpError>>,
     Res: BufRead,
@@ -99,7 +100,7 @@ where
         let (path, query) = h.path.split_once('?').unwrap_or_else(|| (h.path, ""));
         let query = parse_urlencoded(query.as_bytes());
 
-        let mut res = match self.0(path, query, headers, body).await {
+        let mut res = match self.0.borrow_mut()(path, query, headers, body).await {
             Ok(res) => res,
             Err(e) => {
                 let status = match e {
