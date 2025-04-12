@@ -27,11 +27,12 @@ pub mod http {
 
     pub async fn serve(port: u16, mgr: &impl protocol::BinManager) -> Result<(), Error> {
         let stack = wasi_net::Stack::new();
+        let bin = mgr.get_bin().await.unwrap();
         let _res = simple_serve(
-            stack,
+            &stack,
             port,
-            move |path, _params, _headers, _maybe_body| async move {
-                let mut bin = mgr.get_bin().await.unwrap();
+            bin,
+            async |bin, path, _params, _headers, _maybe_body| {
                 let (_bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
                 let res = match bin.call(cmd, vec![]).await {
                     Ok(res) => res,
