@@ -25,7 +25,7 @@ pub mod http {
     use protocol::Bin;
     use simple_http_server::{Error, HttpError, simple_serve};
 
-    pub async fn serve(port: u16, mgr: &impl protocol::BinManager) -> Result<(), Error> {
+    pub async fn serve(port: u16, mgr: impl protocol::BinManager) -> Result<(), Error> {
         let stack = wasi_net::Stack::new();
         let bin = mgr.get_bin().await.unwrap();
         let _res = simple_serve(
@@ -48,6 +48,19 @@ pub mod http {
         .await?;
         Ok(())
     }
+
+    pub async fn run_server(port: u16, mgr: impl protocol::BinManager) {
+        if let Err(e) = serve(port, mgr).await {
+            log::error!("Http server: {e:?}");
+        }
+    }
+}
+
+pub async fn run_nu_plugin(mgr: impl protocol::BinManager) {
+    let mut nu = protocol::NuPlugin::new(mgr, io::stdio());
+    if let Err(e) = nu.handle_io().await {
+        log::error!("Nu protocol: {e:?}");
+    }
 }
 
 pub enum RunMode {
@@ -69,6 +82,7 @@ impl RunMode {
                 .unwrap_or(8080);
             return Some(RunMode::StandAloneHttp(port));
         }
+        #[cfg(not(feature = "stand-alone"))]
         None
     }
 }

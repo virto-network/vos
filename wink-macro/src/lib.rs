@@ -53,47 +53,48 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #metadata
 
         fn main() {
-            use wink::RunMode;
             wink::logger::init();
             let rt = wink::async_runtime();
+            let mgr = __bin::get_manager();
 
-            match RunMode::from_args() {
-                Some(RunMode::Nu) => rt.run(|s| s.must_spawn(run_as_nu_plugin())),
+            match wink::RunMode::from_args() {
+                Some(wink::RunMode::Nu) => rt.run(|s| s.must_spawn(nu_plugin_task(&mgr))),
                 #[cfg(feature = "stand-alone")]
-                Some(RunMode::StandAloneHttp(port)) => rt.run(|s| s.must_spawn(run_as_http_server(port))),
+                Some(wink::RunMode::StandAloneHttp(port)) => rt.run(|s| s.must_spawn(http_server_task(&mgr, port))),
                 _ => {}
             }
         }
 
-        // From embassy executor macro
-        static POOL: wink::executor::_export::TaskPoolRef = wink::executor::_export::TaskPoolRef::new();
-
-        fn run_as_nu_plugin() -> wink::executor::SpawnToken<impl Sized> {
-            unsafe {
-                POOL.get::<_, 1>()._spawn_async_fn(move || async {
-                    let mgr = __bin::BIN_MANAGER;
-                    let mut nu = wink::protocol::NuPlugin::new(
-                        mgr.get().expect("Manager"),
-                        wink::io::stdio()
-                    );
-                    if let Err(e) = nu.handle_io().await {
-                        wink::prelude::log::error!("Nu protocol: {e:?}");
-                    }
-                })
+        fn nu_plugin_task(mgr: &'static __bin::Manager) -> wink::executor::SpawnToken<impl Sized> {
+            trait _EmbassyInternalTaskTrait {
+                type Fut: ::core::future::Future + 'static;
+                fn construct(mgr: &'static __bin::Manager) -> Self::Fut;
             }
+            impl _EmbassyInternalTaskTrait for () {
+                type Fut = impl core::future::Future + 'static;
+                fn construct(mgr: &'static __bin::Manager) -> Self::Fut {
+                    wink::run_nu_plugin(mgr)
+                }
+            }
+            static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
+                wink::executor::raw::TaskPool::new();
+            unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(mgr)) }
         }
-
         #[cfg(feature = "stand-alone")]
-        fn run_as_http_server(port: u16) -> wink::executor::SpawnToken<impl Sized> {
-            unsafe {
-                POOL.get::<_, 1>()._spawn_async_fn(move || async move {
-                    let mgr = __bin::BIN_MANAGER;
-                    let mgr = mgr.get().expect("Manager");
-                    if let Err(e) = wink::http::serve(port, &mgr).await {
-                        wink::prelude::log::error!("Http server: {e:?}");
-                    }
-                })
+        fn http_server_task(mgr: &'static __bin::Manager, port: u16) -> wink::executor::SpawnToken<impl Sized> {
+            trait _EmbassyInternalTaskTrait {
+                type Fut: ::core::future::Future + 'static;
+                fn construct(mgr: &'static __bin::Manager, port: u16) -> Self::Fut;
             }
+            impl _EmbassyInternalTaskTrait for () {
+                type Fut = impl core::future::Future + 'static;
+                fn construct(mgr: &'static __bin::Manager, port: u16) -> Self::Fut {
+                    wink::http::run_server(port, mgr)
+                }
+            }
+            static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
+                wink::executor::raw::TaskPool::new();
+            unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(mgr, port)) }
         }
     };
 
@@ -182,7 +183,10 @@ fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::Item
             use std::future::Future;
             use wink::prelude::Serialize;
 
-            pub const BIN_MANAGER: std::cell::OnceCell<Manager> = std::cell::OnceCell::new();
+            pub static BIN_MANAGER: std::sync::OnceLock<Manager> = std::sync::OnceLock::new();
+            pub fn get_manager() -> &'static Manager {
+                BIN_MANAGER.get_or_init(|| Manager)
+            }
 
             pub struct Manager;
             impl wink::protocol::BinManager for &Manager {

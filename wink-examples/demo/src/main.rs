@@ -1,3 +1,5 @@
+#![feature(impl_trait_in_assoc_type)]
+
 #[wink::bin]
 mod demo {
     use std::collections::BTreeMap;

@@ -20,7 +20,7 @@ os = { path = "./os", package = "vos-os" }
 env_logger = { workspace = true }
 
 [workspace.dependencies]
-embassy-executor = { version = "0.7" }
+embassy-executor = { version = "0.7", features = ["nightly"] }
 embassy-sync = "0.6"
 embassy-time = "0.4"
 embedded-io-async = "0.6"
