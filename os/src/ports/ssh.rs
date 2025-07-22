@@ -3,7 +3,7 @@ use edge_net::nal::{TcpAccept, TcpSplit};
 use futures_concurrency::future::Race;
 use miniserde::Deserialize;
 use sunset::SignKey;
-use sunset_embassy::ProgressHolder;
+use sunset_async::ProgressHolder;
 
 use super::PortError;
 
@@ -32,7 +32,7 @@ impl super::SystemPort for Port {
 
         let mut rx_buf = [0; 1024 * 4];
         let mut tx_buf = [0; 1024 * 2];
-        let srv = sunset_embassy::SSHServer::new(&mut rx_buf, &mut tx_buf).expect("ssh server");
+        let srv = sunset_async::SSHServer::new(&mut rx_buf, &mut tx_buf);
         let session_chan = Channel::<sunset::ChanHandle>::new();
 
         let conn = async {
@@ -60,20 +60,22 @@ impl super::SystemPort for Port {
                     }
                     sunset::ServEvent::SessionShell(req) => {
                         log::trace!("shell request");
-                        let _c = req.channel()?;
+                        let _c = req.channel();
                         req.succeed()?;
                     }
                     sunset::ServEvent::SessionExec(req) => {
                         log::trace!("exec command");
-                        let _c = req.channel()?;
+                        let _c = req.channel();
                         req.succeed()?;
                     }
                     sunset::ServEvent::SessionPty(req) => {
                         log::trace!("requested pty");
-                        let _c = req.channel()?;
+                        let _c = req.channel();
                         req.succeed()?;
                     }
                     sunset::ServEvent::Defunct => todo!(),
+                    sunset::ServEvent::SessionSubsystem(serv_exec_request) => todo!(),
+                    sunset::ServEvent::PollAgain => todo!(),
                 };
             }
             #[allow(unreachable_code)]
