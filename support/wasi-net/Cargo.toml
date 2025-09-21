@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 edge-nal = { workspace = true }
 embedded-io-async = { workspace = true, features = ["std"] }
-wasi = "0.14.2"
+wasi = { workspace = true }
+wasi-executor = { path = "../wasi-executor" }

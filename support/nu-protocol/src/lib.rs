@@ -9,7 +9,7 @@ use types::{Hello, Response};
 
 mod types;
 
-pub use types::{ActionSignature, Flag, NuType, SignatureDetail};
+pub use types::{CmdSignature, Flag, NuType, SignatureDetail};
 
 const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
@@ -17,7 +17,7 @@ const VERSION: &str = "0.1.0";
 pub trait BinManager {
     type Bin: Bin;
 
-    fn bin_signature() -> &'static [ActionSignature];
+    fn bin_signature() -> &'static [CmdSignature];
 
     async fn get_bin(&self) -> Result<Self::Bin, impl io::Error>;
     async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl io::Error>;

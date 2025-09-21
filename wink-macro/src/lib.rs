@@ -54,13 +54,12 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         fn main() {
             wink::logger::init();
-            let rt = wink::async_runtime();
             let mgr = __bin::get_manager();
 
             match wink::RunMode::from_args() {
-                Some(wink::RunMode::Nu) => rt.run(|s| s.must_spawn(nu_plugin_task(&mgr))),
+                Some(wink::RunMode::Nu) => wink::run(|s| s.must_spawn(nu_plugin_task(&mgr))),
                 #[cfg(feature = "stand-alone")]
-                Some(wink::RunMode::StandAloneHttp(port)) => rt.run(|s| s.must_spawn(http_server_task(&mgr, port))),
+                Some(wink::RunMode::StandAloneHttp(port)) => wink::run(|s| s.must_spawn(http_server_task(&mgr, port))),
                 _ => {}
             }
         }
@@ -141,8 +140,8 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
 
             #(#cmds)*
             pub const CMDS: &[&wink::Cmd] = &[#(&#idents),*];
-            static NU_SIGNATURE: OnceLock<Vec<wink::protocol::ActionSignature>> = OnceLock::new();
-            pub fn signature() -> &'static [wink::protocol::ActionSignature] {
+            static NU_SIGNATURE: OnceLock<Vec<wink::protocol::CmdSignature>> = OnceLock::new();
+            pub fn signature() -> &'static [wink::protocol::CmdSignature] {
                 let sig = NU_SIGNATURE.get_or_init(||  wink::to_nu_signature(#name, CMDS));
                 sig.as_slice()
             }
@@ -191,7 +190,7 @@ fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::Item
             pub struct Manager;
             impl wink::protocol::BinManager for &Manager {
                 type Bin = super::#mod_name::#data;
-                fn bin_signature() -> &'static [wink::protocol::ActionSignature] {
+                fn bin_signature() -> &'static [wink::protocol::CmdSignature] {
                     super::__meta::signature()
                 }
                 async fn get_bin(&self) -> Result<Self::Bin, impl wink::io::Error> {

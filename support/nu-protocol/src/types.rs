@@ -123,7 +123,7 @@ pub struct Data {}
 type End = u64;
 type Drop = u64;
 type Ack = u64;
-pub type Signature = &'static [ActionSignature];
+pub type Signature = &'static [CmdSignature];
 
 #[derive(Debug, Serialize)]
 pub struct Metadata {
@@ -204,7 +204,7 @@ impl TryFrom<NuType> for u64 {
 //--------------------------
 
 #[derive(Debug, Serialize)]
-pub struct ActionSignature {
+pub struct CmdSignature {
     pub sig: SignatureDetail,
     pub examples: [BinExample; 0],
 }

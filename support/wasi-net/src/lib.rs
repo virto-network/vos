@@ -15,6 +15,7 @@ use wasi::{
         tcp_create_socket::create_tcp_socket,
     },
 };
+use wasi_executor::wait_pollable;
 
 pub struct Stack;
 impl Stack {
@@ -47,23 +48,16 @@ impl TcpBind for Stack {
         };
 
         socket.start_bind(&network, addr).map_err(to_io_err)?;
-        let p = socket.subscribe();
-        wait_pollable(&p).await;
+        let poll = socket.subscribe();
+        wait_pollable(&poll).await;
         socket.finish_bind().map_err(to_io_err)?;
 
         socket.start_listen().map_err(to_io_err)?;
-        wait_pollable(&p).await;
+        wait_pollable(&poll).await;
         socket.finish_listen().map_err(to_io_err)?;
 
-        Ok(Acceptor { socket, poll: p })
+        Ok(Acceptor { socket, poll })
     }
-}
-
-// TODO: integrate with executor ?
-async fn wait_pollable(p: &Pollable) {
-    use std::task::Poll::*;
-    let poll = p.ready().then_some(Ready(())).unwrap_or(Pending);
-    poll_fn(|_| poll).await;
 }
 
 pub struct Acceptor {
@@ -79,7 +73,9 @@ impl TcpAccept for Acceptor {
         Self: 'a;
 
     async fn accept(&self) -> Result<(SocketAddr, Self::Socket<'_>), Self::Error> {
+        println!("accepting");
         wait_pollable(&self.poll).await;
+        println!("accept pollable");
         let (socket, input, output) = match self.socket.accept().map_err(to_io_err) {
             Ok(accepted) => accepted,
             Err(e) => return Err(e),
@@ -125,15 +121,23 @@ impl TcpShutdown for TcpSocket {
             edge_nal::Close::Write => tcp::ShutdownType::Send,
             edge_nal::Close::Both => tcp::ShutdownType::Both,
         };
+        println!("[net] closing socket");
         self.socket.shutdown(what).map_err(to_io_err)
     }
 
     async fn abort(&mut self) -> Result<(), Self::Error> {
+        println!("[net] aborting socket");
         Ok(())
     }
 }
 impl ErrorType for TcpSocket {
     type Error = io::Error;
+}
+impl Drop for TcpSocket {
+    fn drop(&mut self) {
+        println!("droping socket {}", self.socket.is_listening());
+        let _ = self.close(edge_nal::Close::Both);
+    }
 }
 
 impl TcpSplit for TcpSocket {
@@ -166,6 +170,7 @@ impl TcpReader {
 }
 impl Readable for TcpReader {
     async fn readable(&mut self) -> Result<(), Self::Error> {
+        println!("readable");
         let subscription = self.subscription.get_or_init(|| self.input.subscribe());
         wait_pollable(subscription).await;
         Ok(())
@@ -173,6 +178,7 @@ impl Readable for TcpReader {
 }
 impl Read for TcpReader {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        println!("reading");
         let read = loop {
             self.readable().await?;
             match self.input.read(buf.len() as u64) {

@@ -18,12 +18,13 @@ pub type MaybeBody<'conn, 'stack, 'buf, S> = Option<&'conn mut Body<'buf, Socket
 pub type Path<'h> = &'h str;
 pub type Query<'h> = form_urlencoded::Parse<'h>;
 
+/// Lightweight handler for GET and POST requests
 pub async fn simple_serve<Cx, H, S, Res>(
     stack: &S,
     port: u16,
     cx: Cx,
     handler: H,
-) -> Result<(), Error>
+) -> Result<(), Error<S::Error>>
 where
     for<'c> H: AsyncFn(
         &mut Cx,
@@ -33,13 +34,14 @@ where
         MaybeBody<'c, '_, '_, S>,
     ) -> Result<Res, HttpError>,
     S: TcpBind,
-    Res: BufRead,
+    Res: BufRead + fmt::Debug,
 {
     let socket = stack
         .bind((Ipv4Addr::new(0, 0, 0, 0), port).into())
         .await
-        .map_err(|_| Error::Io)?;
+        .map_err(Error::Io)?;
 
+    println!("[server] starting server");
     let mut server = DefaultServer::new();
     server
         .run(None, socket, Handler {
@@ -48,20 +50,22 @@ where
             types: PhantomData,
         })
         .await?;
+
+    println!("[server] closing server");
     Ok(())
 }
 
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<E> {
     BadRequest,
     ConnectionClosed,
-    Io,
+    Io(E),
 }
-impl<E> From<edge_http::io::Error<E>> for Error {
+impl<E> From<edge_http::io::Error<E>> for Error<E> {
     fn from(value: edge_http::io::Error<E>) -> Self {
         match value {
             edge_http::io::Error::ConnectionClosed => Self::ConnectionClosed,
-            edge_http::io::Error::Io(_) => Self::Io,
+            edge_http::io::Error::Io(e) => Self::Io(e),
             _ => Self::BadRequest,
         }
     }
@@ -93,10 +97,10 @@ where
         MaybeBody<'c, '_, '_, S>,
     ) -> Result<Res, HttpError>,
     S: TcpBind,
-    Res: BufRead,
+    Res: BufRead + fmt::Debug,
 {
     type Error<E>
-        = Error
+        = Error<E>
     where
         E: fmt::Debug;
 
@@ -108,6 +112,7 @@ where
     where
         T: Read + Write + TcpSplit,
     {
+        println!("starting handler");
         let (h, body) = conn.split();
         let body = match h.method {
             Method::Get => None,
@@ -124,6 +129,7 @@ where
 
         let (path, query) = h.path.split_once('?').unwrap_or_else(|| (h.path, ""));
         let query = parse_urlencoded(query.as_bytes());
+        println!("[http] req {} {}", h.method, path);
         let mut res = {
             let mut cx = self.cx.borrow_mut();
             match self.handler.borrow_mut()(cx.deref_mut(), path, query, headers, body).await {
@@ -138,12 +144,15 @@ where
                         HttpError::UnsupportedType => 415,
                         HttpError::Internal => 500,
                     };
+                    println!("[http] init err response {}", &status);
                     conn.initiate_response(status, None, &[]).await?;
-                    conn.complete().await?;
+                    conn.complete_err("").await?;
+                    println!("[http] complete err response");
                     return Ok(());
                 }
             }
         };
+        println!("[http] response {:?}", &res);
         conn.initiate_response(200, None, &[]).await?;
         while let Ok(buf) = res.fill_buf().await {
             if buf.is_empty() {

@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 embassy-executor = { workspace = true }
+wasi = { workspace = true }

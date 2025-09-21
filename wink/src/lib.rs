@@ -1,10 +1,10 @@
 use static_cell::StaticCell;
-use wasi_executor::Executor;
 
 pub use embassy_executor as executor;
 pub use env_logger as logger;
 pub use pico_args as args;
 pub use protocol;
+pub use wasi_executor::run;
 pub use wink_macro::bin;
 
 pub mod prelude {
@@ -12,44 +12,51 @@ pub mod prelude {
     pub use miniserde::{Deserialize, Serialize, json};
 }
 
-static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+// static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
-pub fn async_runtime() -> &'static mut Executor {
-    EXECUTOR.init(Executor::new())
-}
+// pub fn async_runtime() -> &'static mut Executor {
+//     EXECUTOR.init(Executor::new())
+// }
 
 #[cfg(feature = "stand-alone")]
 pub mod http {
     use embassy_time as _;
-    use miniserde::json;
-    use protocol::Bin;
+    // use miniserde::json;
+    use protocol::{Bin, BinManager};
     use simple_http_server::{Error, HttpError, simple_serve};
 
-    pub async fn serve(port: u16, mgr: impl protocol::BinManager) -> Result<(), Error> {
+    pub async fn serve<B: BinManager>(port: u16, mgr: B) -> Result<(), Error<std::io::Error>> {
         let stack = wasi_net::Stack::new();
-        let bin = mgr.get_bin().await.unwrap();
-        let _res = simple_serve(
+        let signature = B::bin_signature();
+        let bin = mgr.get_bin().await.expect("Bin instantiated");
+        simple_serve(
             &stack,
             port,
             bin,
             async |bin, path, _params, _headers, _maybe_body| {
+                println!("[wink][handler] got: {path}");
                 let (_bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
+                println!("calling: '{cmd}'");
+                signature
+                    .iter()
+                    .find(|c| c.sig.name == cmd)
+                    .ok_or(HttpError::NotFound)?;
                 let res = match bin.call(cmd, vec![]).await {
                     Ok(res) => res,
                     Err(err) => {
-                        log::warn!("Bin response: {err}");
-                        return Err(simple_http_server::HttpError::Internal);
+                        // log::warn!("Bin response: {err}");
+                        println!("Bin response: {err}");
+                        return Err(HttpError::Internal);
                     }
                 };
                 // Ok(json::to_string(&res).as_bytes())
                 Ok(b"Hello world".as_slice())
             },
         )
-        .await?;
-        Ok(())
+        .await
     }
 
-    pub async fn run_server(port: u16, mgr: impl protocol::BinManager) {
+    pub async fn run_server<B: BinManager>(port: u16, mgr: B) {
         if let Err(e) = serve(port, mgr).await {
             log::error!("Http server: {e:?}");
         }
@@ -79,7 +86,7 @@ impl RunMode {
             let port = args
                 .opt_value_from_str("--port")
                 .expect("--port")
-                .unwrap_or(8080);
+                .unwrap_or(8888);
             return Some(RunMode::StandAloneHttp(port));
         }
         #[cfg(not(feature = "stand-alone"))]
@@ -98,9 +105,9 @@ pub struct Arg {
     pub ty: &'static str,
 }
 
-pub fn to_nu_signature(ns: &str, cmds: &[&Cmd]) -> Vec<protocol::ActionSignature> {
+pub fn to_nu_signature(ns: &str, cmds: &[&Cmd]) -> Vec<protocol::CmdSignature> {
     cmds.iter()
-        .map(|cmd| protocol::ActionSignature {
+        .map(|cmd| protocol::CmdSignature {
             sig: protocol::SignatureDetail {
                 name: format!("{ns} {}", cmd.name),
                 description: cmd.desc,
