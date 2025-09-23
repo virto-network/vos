@@ -6,7 +6,7 @@ pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
 pub use wasi_executor::run;
-pub use wink_macro::bin;
+pub use wink_macro::{bin, main};
 
 pub mod prelude {
     pub use log;

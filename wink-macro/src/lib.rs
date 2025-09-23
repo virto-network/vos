@@ -6,6 +6,44 @@ use syn::{
 };
 
 #[proc_macro_attribute]
+pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as syn::ItemFn);
+
+    // Rename the user's function to avoid conflicts
+    let renamed_fn = Ident::new("__wink_main", Span::mixed_site().into());
+    input.sig.ident = renamed_fn.clone();
+
+    let expanded = quote! {
+        #input
+
+        fn main() {
+            wink::logger::init();
+            wink::run(|s|
+                s.must_spawn(embassy_task(wink::Arguments::from_env()))
+            );
+
+            fn embassy_task(args: wink::Arguments) -> wink::executor::SpawnToken<impl Sized> {
+                trait _EmbassyInternalTaskTrait {
+                    type Fut: ::core::future::Future + 'static;
+                    fn construct(args: wink::Arguments) -> Self::Fut;
+                }
+                impl _EmbassyInternalTaskTrait for () {
+                    type Fut = impl core::future::Future + 'static;
+                    fn construct(args: wink::Arguments) -> Self::Fut {
+                        #renamed_fn(args)
+                    }
+                }
+                static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
+                    wink::executor::raw::TaskPool::new();
+                unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(args)) }
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_attribute]
 pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemMod);
     let mod_name = &input.ident;
@@ -52,36 +90,15 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #metadata
 
-        async fn __main(args: wink::Arguments) {
+        #[wink::main]
+        async fn main(args: wink::Arguments) {
             let mgr = __bin::get_manager();
             match wink::RunMode::from_args(args) {
                 Some(wink::RunMode::Nu) => wink::run_nu_plugin(mgr).await,
+                #[cfg(feature = "stand-alone")]
                 Some(wink::RunMode::StandAloneHttp(port)) => wink::http::run_server(port, mgr).await,
                 _ => {}
             };
-        }
-
-        fn main() {
-            wink::logger::init();
-            wink::run(|s|
-                s.must_spawn(embassy_task(wink::Arguments::from_env()))
-            );
-
-            fn embassy_task(args: wink::Arguments) -> wink::executor::SpawnToken<impl Sized> {
-                trait _EmbassyInternalTaskTrait {
-                    type Fut: ::core::future::Future + 'static;
-                    fn construct(args: wink::Arguments) -> Self::Fut;
-                }
-                impl _EmbassyInternalTaskTrait for () {
-                    type Fut = impl core::future::Future + 'static;
-                    fn construct(args: wink::Arguments) -> Self::Fut {
-                        __main(args)
-                    }
-                }
-                static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
-                    wink::executor::raw::TaskPool::new();
-                unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(args)) }
-            }
         }
 
     };
