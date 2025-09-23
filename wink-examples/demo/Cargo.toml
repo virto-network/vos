@@ -7,5 +7,5 @@ edition = "2021"
 wink = { path = "../../wink" }
 
 [features]
-dev = ["stand-alone"]
-stand-alone = ["wink/stand-alone"]
+dev = ["http"]
+http = ["wink/http"]

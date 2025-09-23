@@ -95,8 +95,8 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let mgr = __bin::get_manager();
             match wink::RunMode::from_args(args) {
                 Some(wink::RunMode::Nu) => wink::run_nu_plugin(mgr).await,
-                #[cfg(feature = "stand-alone")]
-                Some(wink::RunMode::StandAloneHttp(port)) => wink::http::run_server(port, mgr).await,
+                #[cfg(feature = "http")]
+                Some(wink::RunMode::HttpServer(port)) => wink::http::run_server(port, mgr).await,
                 _ => {}
             };
         }

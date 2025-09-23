@@ -22,4 +22,4 @@ simple-http-server = { path = "../support/simple-http-server", optional = true }
 embassy-time = { workspace = true, features = ["std"], optional = true }
 
 [features]
-stand-alone = ["simple-http-server", "wasi-net", "embassy-time"]
+http = ["simple-http-server", "wasi-net", "embassy-time"]

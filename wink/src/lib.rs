@@ -13,7 +13,7 @@ pub mod prelude {
     pub use miniserde::{Deserialize, Serialize, json};
 }
 
-#[cfg(feature = "stand-alone")]
+#[cfg(feature = "http")]
 pub mod http {
     use embassy_time as _;
     // use miniserde::json;
@@ -67,21 +67,21 @@ pub async fn run_nu_plugin(mgr: impl protocol::BinManager) {
 
 pub enum RunMode {
     Nu,
-    #[cfg(feature = "stand-alone")]
-    StandAloneHttp(u16),
+    #[cfg(feature = "http")]
+    HttpServer(u16),
 }
 impl RunMode {
     pub fn from_args(mut args: Arguments) -> Option<Self> {
         if args.contains("--stdio") {
             return Some(RunMode::Nu);
         }
-        #[cfg(feature = "stand-alone")]
+        #[cfg(feature = "http")]
         {
             let port = args
                 .opt_value_from_str("--port")
                 .expect("--port")
                 .unwrap_or(8888);
-            return Some(RunMode::StandAloneHttp(port));
+            return Some(RunMode::HttpServer(port));
         }
         #[cfg(not(feature = "stand-alone"))]
         None
