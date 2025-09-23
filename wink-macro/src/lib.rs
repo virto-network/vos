@@ -52,49 +52,38 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #metadata
 
+        async fn __main(args: wink::Arguments) {
+            let mgr = __bin::get_manager();
+            match wink::RunMode::from_args(args) {
+                Some(wink::RunMode::Nu) => wink::run_nu_plugin(mgr).await,
+                Some(wink::RunMode::StandAloneHttp(port)) => wink::http::run_server(port, mgr).await,
+                _ => {}
+            };
+        }
+
         fn main() {
             wink::logger::init();
-            let mgr = __bin::get_manager();
+            wink::run(|s|
+                s.must_spawn(embassy_task(wink::Arguments::from_env()))
+            );
 
-            match wink::RunMode::from_args() {
-                Some(wink::RunMode::Nu) => wink::run(|s| s.must_spawn(nu_plugin_task(&mgr))),
-                #[cfg(feature = "stand-alone")]
-                Some(wink::RunMode::StandAloneHttp(port)) => wink::run(|s| s.must_spawn(http_server_task(&mgr, port))),
-                _ => {}
+            fn embassy_task(args: wink::Arguments) -> wink::executor::SpawnToken<impl Sized> {
+                trait _EmbassyInternalTaskTrait {
+                    type Fut: ::core::future::Future + 'static;
+                    fn construct(args: wink::Arguments) -> Self::Fut;
+                }
+                impl _EmbassyInternalTaskTrait for () {
+                    type Fut = impl core::future::Future + 'static;
+                    fn construct(args: wink::Arguments) -> Self::Fut {
+                        __main(args)
+                    }
+                }
+                static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
+                    wink::executor::raw::TaskPool::new();
+                unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(args)) }
             }
         }
 
-        fn nu_plugin_task(mgr: &'static __bin::Manager) -> wink::executor::SpawnToken<impl Sized> {
-            trait _EmbassyInternalTaskTrait {
-                type Fut: ::core::future::Future + 'static;
-                fn construct(mgr: &'static __bin::Manager) -> Self::Fut;
-            }
-            impl _EmbassyInternalTaskTrait for () {
-                type Fut = impl core::future::Future + 'static;
-                fn construct(mgr: &'static __bin::Manager) -> Self::Fut {
-                    wink::run_nu_plugin(mgr)
-                }
-            }
-            static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
-                wink::executor::raw::TaskPool::new();
-            unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(mgr)) }
-        }
-        #[cfg(feature = "stand-alone")]
-        fn http_server_task(mgr: &'static __bin::Manager, port: u16) -> wink::executor::SpawnToken<impl Sized> {
-            trait _EmbassyInternalTaskTrait {
-                type Fut: ::core::future::Future + 'static;
-                fn construct(mgr: &'static __bin::Manager, port: u16) -> Self::Fut;
-            }
-            impl _EmbassyInternalTaskTrait for () {
-                type Fut = impl core::future::Future + 'static;
-                fn construct(mgr: &'static __bin::Manager, port: u16) -> Self::Fut {
-                    wink::http::run_server(port, mgr)
-                }
-            }
-            static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
-                wink::executor::raw::TaskPool::new();
-            unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(mgr, port)) }
-        }
     };
 
     TokenStream::from(expanded)

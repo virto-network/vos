@@ -3,6 +3,7 @@ use static_cell::StaticCell;
 pub use embassy_executor as executor;
 pub use env_logger as logger;
 pub use pico_args as args;
+pub use pico_args::Arguments;
 pub use protocol;
 pub use wasi_executor::run;
 pub use wink_macro::bin;
@@ -11,12 +12,6 @@ pub mod prelude {
     pub use log;
     pub use miniserde::{Deserialize, Serialize, json};
 }
-
-// static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-
-// pub fn async_runtime() -> &'static mut Executor {
-//     EXECUTOR.init(Executor::new())
-// }
 
 #[cfg(feature = "stand-alone")]
 pub mod http {
@@ -76,8 +71,7 @@ pub enum RunMode {
     StandAloneHttp(u16),
 }
 impl RunMode {
-    pub fn from_args() -> Option<Self> {
-        let mut args = pico_args::Arguments::from_env();
+    pub fn from_args(mut args: Arguments) -> Option<Self> {
         if args.contains("--stdio") {
             return Some(RunMode::Nu);
         }
