@@ -1,4 +1,4 @@
-# wasi-io
+# wasync-io
 
 Async I/O primitives for WASI environments, providing async stdin/stdout and networking using WASI streams and pollables.
 
@@ -23,7 +23,7 @@ This crate provides async I/O functionality for WASI (WebAssembly System Interfa
 ### Standard I/O
 
 ```rust
-use wasi_io::{stdio, Read, Write};
+use wasync_io::{stdio, Read, Write};
 
 async fn stdio_example() -> Result<(), std::io::Error> {
     let mut stdio = stdio();
@@ -43,7 +43,7 @@ async fn stdio_example() -> Result<(), std::io::Error> {
 ### Networking (with `net` feature)
 
 ```rust
-use wasi_io::net::Stack;
+use wasync_io::net::Stack;
 use edge_nal::{TcpBind, TcpAccept};
 use std::net::SocketAddr;
 
@@ -65,7 +65,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wasi-io = { path = "path/to/wasi-io", features = ["net"] }
+wasync-io = { path = "path/to/wasync-io", features = ["net"] }
 ```
 
 ## How it works
@@ -75,7 +75,7 @@ The crate uses WASI's native I/O interfaces:
 ### Standard I/O
 1. **WASI Streams**: Uses `wasi::cli::stdin::get_stdin()` and `wasi::cli::stdout::get_stdout()`
 2. **Pollables**: Creates pollable subscriptions for async I/O events
-3. **Embassy Integration**: Integrates with `wasi-executor` for proper async task scheduling
+3. **Embassy Integration**: Integrates with `wasync` for proper async task scheduling
 4. **Resource Management**: Implements proper Drop to ensure WASI resources are cleaned up in correct order
 
 ### Networking (net feature)
@@ -88,17 +88,17 @@ The crate uses WASI's native I/O interfaces:
 
 ```
 ┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   App Code  │ -> │   wasi-io    │ -> │  WASI Streams   │
+│   App Code  │ -> │  wasync-io   │ -> │  WASI Streams   │
 │             │    │  (StdIo)     │    │ (stdin/stdout)  │
 └─────────────┘    └──────────────┘    └─────────────────┘
                            |
 ┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   App Code  │ -> │ wasi-io::net │ -> │  WASI Sockets   │
+│   App Code  │ -> │wasync-io::net│ -> │  WASI Sockets   │
 │             │    │   (Stack)    │    │    (TCP)        │
 └─────────────┘    └──────────────┘    └─────────────────┘
                            |
                    ┌──────────────┐
-                   │ wasi-executor│
+                   │    wasync    │
                    │  (Pollables) │
                    └──────────────┘
 ```
@@ -107,15 +107,15 @@ The crate uses WASI's native I/O interfaces:
 
 This crate consolidates I/O functionality for WASI environments:
 
-- **wasi-io**: Async stdin/stdout and optional networking for WASI (this crate)
-- **wasi-executor**: Embassy executor integration for WASI pollables
-- **wasi-io::net**: Networking module (formerly separate `wasi-net` crate)
+- **wasync-io**: Async stdin/stdout and optional networking for WASI (this crate)
+- **wasync**: Embassy executor integration for WASI pollables
+- **wasync-io::net**: Networking module (formerly separate `wasi-net` crate)
 
 ## Dependencies
 
 - `embedded-io-async`: Provides the async I/O traits
 - `wasi`: WASI bindings for stream and socket operations
-- `wasi-executor`: Integration with embassy executor via pollables
+- `wasync`: Integration with embassy executor via pollables
 - `edge-nal`: Networking abstraction layer (optional, with `net` feature)
 
 ## WASI Resource Management

@@ -6,7 +6,7 @@ use wasi::{
     cli::stdout::get_stdout,
     io::streams::{InputStream, OutputStream, StreamError},
 };
-use wasi_executor::wait_pollable;
+use wasync::wait_pollable;
 
 #[cfg(feature = "net")]
 pub mod net;

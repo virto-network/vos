@@ -14,7 +14,7 @@ use wasi::{
         tcp_create_socket::create_tcp_socket,
     },
 };
-use wasi_executor::wait_pollable;
+use wasync::wait_pollable;
 
 pub struct Stack;
 impl Stack {

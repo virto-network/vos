@@ -1,5 +1,5 @@
 [package]
-name = "wasi-io"
+name = "wasync-io"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,6 +11,6 @@ log = ["dep:log"]
 [dependencies]
 embedded-io-async = { workspace = true, features = ["std"] }
 wasi = { workspace = true }
-wasi-executor = { path = "../wasi-executor" }
+wasync = { path = "../wasync" }
 edge-nal = { workspace = true, optional = true }
 log = { workspace = true, features = ["std"], optional = true }

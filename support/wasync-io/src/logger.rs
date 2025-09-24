@@ -2,12 +2,12 @@
 //!
 //! Provides a buffered logger optimized for single-threaded WASI environments.
 //! All log messages are written to stderr with `UnsafeCell` for zero-overhead
-//! interior mutability and `wasi_executor::block_on` for sync/async bridging.
+//! interior mutability and `wasync::block_on` for sync/async bridging.
 //!
 //! # Examples
 //!
 //! ```rust
-//! use wasi_io::log::{init_logger, init_logger_from_env};
+//! use wasync_io::log::{init_logger, init_logger_from_env};
 //! use log::{info, LevelFilter};
 //!
 //! // Default debug level
@@ -90,14 +90,14 @@ impl Log for WasiLogger {
 
         let message = self.format_record(record);
 
-        // Use wasi_executor::block_on to execute the async write synchronously
+        // Use wasync::block_on to execute the async write synchronously
         // Ignore errors in logging to avoid crashing the application
-        let _ = wasi_executor::block_on(self.write_message_async(message));
+        let _ = wasync::block_on(self.write_message_async(message));
     }
 
     fn flush(&self) {
-        // Use wasi_executor::block_on to flush the writer
-        let _ = wasi_executor::block_on(async {
+        // Use wasync::block_on to flush the writer
+        let _ = wasync::block_on(async {
             let writer = unsafe { &mut *self.writer.get() };
             let _ = writer.flush().await;
         });

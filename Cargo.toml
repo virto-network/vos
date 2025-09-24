@@ -8,8 +8,8 @@ members = [
   "wink-examples/async-io",
   "support/nu-protocol",
   "support/simple-http-server",
-  "support/wasi-executor",
-  "support/wasi-io",
+  "support/wasync",
+  "support/wasync-io",
 ]
 
 [package]

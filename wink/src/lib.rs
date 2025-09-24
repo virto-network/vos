@@ -2,9 +2,9 @@ pub use embassy_executor as executor;
 pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
-pub use wasi_executor::run;
-pub use wasi_io as io;
-pub use wasi_io::logger;
+pub use wasync::run;
+pub use wasync_io as io;
+pub use wasync_io::logger;
 pub use wink_macro::{bin, main};
 
 pub mod prelude {
@@ -20,7 +20,7 @@ pub mod http {
     use simple_http_server::{Error, HttpError, simple_serve};
 
     pub async fn serve<B: BinManager>(port: u16, mgr: B) -> Result<(), Error<std::io::Error>> {
-        let stack = wasi_io::net::Stack::new();
+        let stack = wasync_io::net::Stack::new();
         let signature = B::bin_signature();
         let bin = mgr.get_bin().await.expect("Bin instantiated");
         simple_serve(

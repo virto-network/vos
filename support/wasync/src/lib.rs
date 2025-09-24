@@ -110,7 +110,7 @@ pub async fn wait_pollable(pollable: &Pollable) {
 /// # Examples
 ///
 /// ```rust
-/// use wasi_executor::block_on;
+/// use wasync::block_on;
 /// use some_async_crate::async_operation;
 ///
 /// let result = block_on(async {
