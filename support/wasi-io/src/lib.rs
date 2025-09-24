@@ -202,6 +202,189 @@ pub fn stdio() -> Combined<StdIn, StdOut> {
     combine(stdin(), stdout())
 }
 
+/// Copy data from a reader to a writer.
+pub async fn copy<R: Read, W: Write<Error = R::Error>>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<u64, R::Error> {
+    let mut buf_reader = BufReader::<_, DEFAULT_BUF_LEN>::new(reader);
+    let mut total_copied = 0u64;
+
+    loop {
+        let buf = buf_reader.fill_buf().await?;
+        if buf.is_empty() {
+            break; // EOF reached
+        }
+
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let bytes_written = writer.write(remaining).await?;
+            remaining = &remaining[bytes_written..];
+        }
+
+        let consumed = buf.len();
+        buf_reader.consume(consumed);
+        total_copied += consumed as u64;
+    }
+
+    Ok(total_copied)
+}
+
+pub const DEFAULT_BUF_LEN: usize = 8192;
+
+pub struct BufReader<R: Read, const N: usize = DEFAULT_BUF_LEN> {
+    inner: R,
+    buf: [u8; N],
+    pos: usize,
+    cap: usize,
+}
+
+impl<R: Read, const N: usize> BufReader<R, N> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: [0; N],
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    pub async fn fill_buf(&mut self) -> Result<&[u8], R::Error> {
+        if self.pos >= self.cap {
+            self.cap = self.inner.read(&mut self.buf).await?;
+            self.pos = 0;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+
+    pub fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.cap);
+    }
+
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read, const N: usize> Read for BufReader<R, N> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let available = self.fill_buf().await?;
+        let to_copy = available.len().min(buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.consume(to_copy);
+        Ok(to_copy)
+    }
+}
+
+impl<R: Read, const N: usize> ErrorType for BufReader<R, N> {
+    type Error = R::Error;
+}
+
+pub struct BufWriter<W: Write, const N: usize = DEFAULT_BUF_LEN> {
+    inner: W,
+    buf: [u8; N],
+    pos: usize,
+}
+
+impl<W: Write, const N: usize> BufWriter<W, N> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: [0; N],
+            pos: 0,
+        }
+    }
+
+    pub fn with_capacity(inner: W) -> Self {
+        Self::new(inner)
+    }
+
+    pub async fn flush(&mut self) -> Result<(), W::Error> {
+        if self.pos > 0 {
+            let pos = self.pos;
+            self.pos = 0; // Reset position before async operation
+            let mut buf = &self.buf[..pos];
+            while !buf.is_empty() {
+                let written = self.inner.write(buf).await?;
+                buf = &buf[written..];
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    pub async fn into_inner(mut self) -> Result<W, W::Error> {
+        self.flush().await?;
+        let inner = unsafe { std::ptr::read(&self.inner) };
+        std::mem::forget(self);
+        Ok(inner)
+    }
+
+    pub fn buffer(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+
+    pub fn capacity(&self) -> usize {
+        N
+    }
+}
+
+impl<W: Write, const N: usize> Write for BufWriter<W, N> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        // If the buffer would overflow
+        if self.pos + buf.len() > N {
+            // Flush the existing buffer first
+            if self.pos > 0 {
+                let pos = self.pos;
+                self.pos = 0; // Reset position before async operation
+                let mut flush_buf = &self.buf[..pos];
+                while !flush_buf.is_empty() {
+                    let written = self.inner.write(flush_buf).await?;
+                    flush_buf = &flush_buf[written..];
+                }
+            }
+
+            // If the new data is larger than our buffer, write it directly
+            if buf.len() >= N {
+                return self.inner.write(buf).await;
+            }
+        }
+
+        // Copy data to our buffer
+        let to_copy = buf.len().min(N - self.pos);
+        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&buf[..to_copy]);
+        self.pos += to_copy;
+
+        Ok(to_copy)
+    }
+}
+
+impl<W: Write, const N: usize> ErrorType for BufWriter<W, N> {
+    type Error = W::Error;
+}
+
+impl<W: Write, const N: usize> Drop for BufWriter<W, N> {
+    fn drop(&mut self) {
+        // Note: We can't flush here because drop is not async
+        // Users should call flush() explicitly before dropping
+    }
+}
+
 // Utility types for split/combine functionality
 
 /// Split a type that implements both Read and Write into separate reader and writer halves
