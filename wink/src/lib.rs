@@ -21,7 +21,7 @@ pub mod http {
     use simple_http_server::{Error, HttpError, simple_serve};
 
     pub async fn serve<B: BinManager>(port: u16, mgr: B) -> Result<(), Error<std::io::Error>> {
-        let stack = wasi_net::Stack::new();
+        let stack = wasi_io::net::Stack::new();
         let signature = B::bin_signature();
         let bin = mgr.get_bin().await.expect("Bin instantiated");
         simple_serve(

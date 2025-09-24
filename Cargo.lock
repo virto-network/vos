@@ -3875,15 +3875,6 @@ dependencies = [
 name = "wasi-io"
 version = "0.1.0"
 dependencies = [
- "embedded-io-async",
- "wasi 0.14.2+wasi-0.2.4",
- "wasi-executor",
-]
-
-[[package]]
-name = "wasi-net"
-version = "0.1.0"
-dependencies = [
  "edge-nal",
  "embedded-io-async",
  "wasi 0.14.2+wasi-0.2.4",
@@ -4656,7 +4647,6 @@ dependencies = [
  "static_cell",
  "wasi-executor",
  "wasi-io",
- "wasi-net",
  "wink-macro",
 ]
 

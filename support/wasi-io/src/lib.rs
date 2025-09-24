@@ -7,6 +7,9 @@ use wasi::{
 };
 use wasi_executor::wait_pollable;
 
+#[cfg(feature = "net")]
+pub mod net;
+
 pub fn stdio() -> StdIo {
     StdIo::new()
 }

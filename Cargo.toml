@@ -9,7 +9,6 @@ members = [
   "support/nu-protocol",
   "support/simple-http-server",
   "support/wasi-executor",
-  "support/wasi-net",
   "support/wasi-io",
 ]
 

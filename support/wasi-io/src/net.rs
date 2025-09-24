@@ -2,7 +2,6 @@ use edge_nal::{Readable, TcpAccept, TcpBind, TcpShutdown, TcpSplit};
 use embedded_io_async::{ErrorType, Read, Write};
 use std::{
     cell::OnceCell,
-    future::poll_fn,
     io::{self, ErrorKind},
     net::{SocketAddr, SocketAddrV4},
 };

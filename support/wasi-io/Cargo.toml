@@ -3,7 +3,12 @@ name = "wasi-io"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+net = ["dep:edge-nal"]
+
 [dependencies]
 embedded-io-async = { workspace = true, features = ["std"] }
 wasi = { workspace = true }
 wasi-executor = { path = "../wasi-executor" }
+edge-nal = { workspace = true, optional = true }
