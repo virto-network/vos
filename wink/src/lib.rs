@@ -6,6 +6,7 @@ pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
 pub use wasi_executor::run;
+pub use wasi_io as io;
 pub use wink_macro::{bin, main};
 
 pub mod prelude {
@@ -133,9 +134,4 @@ pub fn to_nu_signature(ns: &str, cmds: &[&Cmd]) -> Vec<protocol::CmdSignature> {
             examples: [],
         })
         .collect()
-}
-
-pub mod io {
-    pub use embedded_io_async::{Error, ErrorType, Read, Write};
-    pub use wasi_io::{StdIo, stdio};
 }
