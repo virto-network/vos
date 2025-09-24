@@ -11,6 +11,9 @@ use wasi_executor::wait_pollable;
 #[cfg(feature = "net")]
 pub mod net;
 
+#[cfg(feature = "log")]
+pub mod logger;
+
 pub struct StdIn {
     stream: InputStream,
     subscription: OnceCell<wasi::io::streams::Pollable>,

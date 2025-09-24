@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["log"]
 net = ["dep:edge-nal"]
+log = ["dep:log"]
 
 [dependencies]
 embedded-io-async = { workspace = true, features = ["std"] }
 wasi = { workspace = true }
 wasi-executor = { path = "../wasi-executor" }
 edge-nal = { workspace = true, optional = true }
+log = { workspace = true, features = ["std"], optional = true }

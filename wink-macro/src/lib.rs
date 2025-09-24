@@ -17,7 +17,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #input
 
         fn main() {
-            wink::logger::init();
+            wink::logger::init(wink::logger::level_from_env()).expect("logger initialized");
             wink::run(|s|
                 s.must_spawn(embassy_task(wink::Arguments::from_env()))
             );

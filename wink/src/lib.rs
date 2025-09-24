@@ -1,12 +1,10 @@
-use static_cell::StaticCell;
-
 pub use embassy_executor as executor;
-pub use env_logger as logger;
 pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
 pub use wasi_executor::run;
 pub use wasi_io as io;
+pub use wasi_io::logger;
 pub use wink_macro::{bin, main};
 
 pub mod prelude {
@@ -84,7 +82,7 @@ impl RunMode {
                 .unwrap_or(8888);
             return Some(RunMode::HttpServer(port));
         }
-        #[cfg(not(feature = "stand-alone"))]
+        #[cfg(not(feature = "http"))]
         None
     }
 }
