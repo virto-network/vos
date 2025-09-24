@@ -3,7 +3,6 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     future::poll_fn,
-    mem::MaybeUninit,
     task::{Poll, Waker},
 };
 use wasi::io::poll::Pollable;
@@ -13,7 +12,7 @@ thread_local! {
 }
 
 #[unsafe(export_name = "__pender")]
-fn __pender(context: *mut ()) {
+fn __pender(_context: *mut ()) {
     println!("pender...")
 }
 
@@ -23,7 +22,17 @@ pub fn run(init: impl FnOnce(Spawner)) {
     loop {
         println!("...polling");
         unsafe { exec.poll() };
-        IO.with_borrow_mut(|io| io.wait())
+
+        // Check if we have any pollables to wait on
+        let has_pollables = IO.with_borrow(|io| !io.pollables.is_empty());
+
+        if has_pollables {
+            IO.with_borrow_mut(|io| io.wait())
+        } else {
+            // No pollables and executor finished polling - exit
+            println!("No pollables, exiting");
+            break;
+        }
     }
 }
 
@@ -59,6 +68,14 @@ impl WasiIo {
                 .collect::<Vec<&Pollable>>()
         };
         println!("waiting {} ~~", pollables.len());
+
+        // If there are no pollables to wait on, just return
+        // This allows the executor to continue running without blocking
+        if pollables.is_empty() {
+            println!("~~ no pollables to wait on");
+            return;
+        }
+
         let ready = wasi::io::poll::poll(pollables.as_slice());
         let len = ready.len();
         for i in ready {

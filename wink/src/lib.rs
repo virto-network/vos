@@ -137,26 +137,5 @@ pub fn to_nu_signature(ns: &str, cmds: &[&Cmd]) -> Vec<protocol::CmdSignature> {
 
 pub mod io {
     pub use embedded_io_async::{Error, ErrorType, Read, Write};
-
-    pub fn stdio() -> StdIo {
-        StdIo
-    }
-
-    pub struct StdIo;
-
-    impl Read for StdIo {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            todo!()
-        }
-    }
-
-    impl Write for StdIo {
-        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            todo!()
-        }
-    }
-
-    impl ErrorType for StdIo {
-        type Error = std::io::Error;
-    }
+    pub use wasi_io::{StdIo, stdio};
 }

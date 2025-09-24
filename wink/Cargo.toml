@@ -16,6 +16,7 @@ static_cell = { workspace = true }
 embedded-io-async = { workspace = true, features = ["std"] }
 critical-section = { version = "1.2.0", features = ["std"] }
 wasi-executor = { path = "../support/wasi-executor" }
+wasi-io = { path = "../support/wasi-io" }
 
 wasi-net = { path = "../support/wasi-net", optional = true }
 simple-http-server = { path = "../support/simple-http-server", optional = true }

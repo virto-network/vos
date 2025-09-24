@@ -5,10 +5,12 @@ members = [
   "wink-macro",
   "wink-examples/demo",
   "wink-examples/simple-main",
+  "wink-examples/async-io",
   "support/nu-protocol",
   "support/simple-http-server",
   "support/wasi-executor",
   "support/wasi-net",
+  "support/wasi-io",
 ]
 
 [package]
