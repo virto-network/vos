@@ -29,9 +29,6 @@ pub mod io;
 #[cfg(feature = "net")]
 pub mod net;
 
-#[cfg(feature = "log")]
-pub mod logger;
-
 #[cfg(feature = "fs")]
 pub mod fs;
 
@@ -68,14 +65,14 @@ impl Drop for ContextGuard {
 
 #[unsafe(export_name = "__pender")]
 fn __pender(_context: *mut ()) {
-    println!("pender...")
+    log::trace!("embassy executor requesting wake");
 }
 
 pub fn run(init: impl FnOnce(Spawner)) {
     let exec = Box::leak(Box::new(raw::Executor::new(&mut ())));
     init(exec.spawner());
     loop {
-        println!("...polling");
+        log::trace!("executor cycle: polling tasks");
         unsafe { exec.poll() };
 
         // Check if we have any pollables to wait on for the main executor context
@@ -89,7 +86,7 @@ pub fn run(init: impl FnOnce(Spawner)) {
             IO.with_borrow_mut(|io| io.wait())
         } else {
             // No pollables and executor finished polling - exit
-            println!("No pollables, exiting");
+            log::debug!("executor shutdown: no pending I/O operations");
             break;
         }
     }
@@ -98,7 +95,7 @@ pub fn run(init: impl FnOnce(Spawner)) {
 pub async fn wait_pollable(pollable: &Pollable) {
     poll_fn(|cx| {
         if pollable.ready() {
-            println!("pollable ready");
+            log::trace!("I/O operation completed synchronously");
             return Poll::Ready(());
         }
         let context_id = CURRENT_CONTEXT.with_borrow(|ctx| *ctx);
@@ -163,6 +160,7 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
             Poll::Ready(result) => {
                 // Clean up any remaining pollables from this context
                 IO.with_borrow_mut(|io| io.cleanup_context(context_id));
+
                 return result;
             }
             Poll::Pending => {
@@ -198,12 +196,16 @@ impl WasiIo {
         };
 
         if pollables_for_context.is_empty() {
-            println!("~~ no pollables to wait on for context {}", context_id);
+            log::trace!("context {}: no pending I/O operations", context_id);
             return;
         }
 
         let pollables: Vec<&Pollable> = pollables_for_context.iter().map(|(_, p)| *p).collect();
-        println!("waiting {} ~~ for context {}", pollables.len(), context_id);
+        log::trace!(
+            "context {}: blocking on {} I/O operations",
+            context_id,
+            pollables.len()
+        );
 
         let ready = wasi::io::poll::poll(pollables.as_slice());
         let len = ready.len();
@@ -213,7 +215,11 @@ impl WasiIo {
                 waker.wake();
             }
         }
-        println!("~~ waited {} for context {}", len, context_id);
+        log::trace!(
+            "context {}: {} I/O operations completed, resuming tasks",
+            context_id,
+            len
+        );
     }
 
     fn cleanup_context(&mut self, context_id: u64) {

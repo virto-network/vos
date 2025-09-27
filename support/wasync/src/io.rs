@@ -1,6 +1,6 @@
-use crate::wait_pollable;
+use crate::{block_on, wait_pollable};
 pub use embedded_io_async::{Error, ErrorType, Read, Seek, SeekFrom, Write};
-use std::{cell::OnceCell, io};
+use std::{cell::OnceCell, fmt, io};
 use wasi::{
     cli::stderr::get_stderr,
     cli::stdin::get_stdin,
@@ -377,8 +377,22 @@ impl<W: Write, const N: usize> ErrorType for BufWriter<W, N> {
 
 impl<W: Write, const N: usize> Drop for BufWriter<W, N> {
     fn drop(&mut self) {
-        // Note: We can't flush here because drop is not async
-        // Users should call flush() explicitly before dropping
+        block_on(async {
+            let _ = self.flush().await;
+        })
+    }
+}
+
+impl<W: Write, const N: usize> std::fmt::Write for BufWriter<W, N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        block_on(async {
+            let mut remaining = s.as_bytes();
+            while !remaining.is_empty() {
+                let written = self.write(s.as_bytes()).await.map_err(|_| fmt::Error)?;
+                remaining = &remaining[written..];
+            }
+            self.flush().await.map_err(|_| fmt::Error)
+        })
     }
 }
 

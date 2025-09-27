@@ -14,10 +14,16 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     input.sig.ident = renamed_fn.clone();
 
     let expanded = quote! {
+        use wink::log;
+
         #input
 
         fn main() {
-            wink::logger::init(wink::logger::level_from_env()).expect("logger initialized");
+            wink::logger::init(
+                wink::io::BufWriter::<_, 8192>::new(wink::io::stderr()),
+                wink::logger::level_from_env()
+            ).expect("logger initialized");
+
             wink::run(|s|
                 s.must_spawn(embassy_task(wink::Arguments::from_env()))
             );

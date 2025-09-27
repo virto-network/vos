@@ -1,16 +1,19 @@
 pub use embassy_executor as executor;
+pub use log;
 pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
 #[cfg(feature = "net")]
 pub use wasync::net;
-pub use wasync::{fs, io, logger, run, wasi};
+pub use wasync::{fs, io, run, wasi};
 pub use wink_macro::{bin, main};
 
 pub mod prelude {
     pub use log;
     pub use miniserde::{Deserialize, Serialize, json};
 }
+
+pub mod logger;
 
 #[cfg(feature = "http")]
 pub mod http {
