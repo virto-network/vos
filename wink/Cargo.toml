@@ -17,4 +17,5 @@ simple-http-server = { path = "../support/simple-http-server", optional = true }
 embassy-time = { workspace = true, features = ["std"], optional = true }
 
 [features]
-http = ["simple-http-server", "wasync/net", "embassy-time"]
+net = ["wasync/net"]
+http = ["net", "dep:simple-http-server", "dep:embassy-time"]

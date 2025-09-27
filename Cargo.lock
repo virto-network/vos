@@ -886,6 +886,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-http"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f9b24aa48b6e43e6316a02bed8291f8a856cb6d4e63a2f533d35d74d04141d"
+dependencies = [
+ "base64 0.13.1",
+ "edge-nal",
+ "embassy-futures",
+ "embassy-sync 0.7.2",
+ "embassy-time",
+ "embedded-io-async",
+ "heapless",
+ "httparse",
+ "sha1_smol",
+]
+
+[[package]]
 name = "edge-mdns"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -942,7 +959,7 @@ checksum = "332617901071e8b09bf0435173597d76bd476ed0b74279f2b1d34068ff15c6b4"
 dependencies = [
  "edge-captive",
  "edge-dhcp",
- "edge-http",
+ "edge-http 0.5.1",
  "edge-mdns",
  "edge-mqtt",
  "edge-nal",
@@ -3073,7 +3090,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 name = "simple-http-server"
 version = "0.1.0"
 dependencies = [
- "edge-http",
+ "edge-http 0.6.1",
  "edge-nal",
  "embedded-io-async",
  "form_urlencoded",
