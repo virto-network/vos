@@ -11,10 +11,8 @@ miniserde = { workspace = true }
 pico-args = "0.5.0"
 
 embassy-executor = { workspace = true }
-static_cell = { workspace = true }
-critical-section = { version = "1.2.0", features = ["std"] }
 wasync = { path = "../support/wasync" }
-wasync-io = { path = "../support/wasync-io" }
+wasync-io = { path = "../support/wasync-io", features = ["log", "fs"] }
 
 simple-http-server = { path = "../support/simple-http-server", optional = true }
 embassy-time = { workspace = true, features = ["std"], optional = true }

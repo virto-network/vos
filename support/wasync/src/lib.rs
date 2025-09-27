@@ -21,6 +21,8 @@ use std::{
 };
 use wasi::io::poll::Pollable;
 
+pub use wasi;
+
 // Context ID for tracking which execution context owns which pollables
 const MAIN_EXECUTOR_CONTEXT: u64 = 0;
 

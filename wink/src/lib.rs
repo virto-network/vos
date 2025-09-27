@@ -3,6 +3,7 @@ pub use pico_args as args;
 pub use pico_args::Arguments;
 pub use protocol;
 pub use wasync::run;
+pub use wasync::wasi;
 pub use wasync_io as io;
 pub use wasync_io::logger;
 pub use wink_macro::{bin, main};
