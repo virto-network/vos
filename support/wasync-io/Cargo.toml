@@ -7,6 +7,7 @@ edition = "2024"
 default = ["log"]
 net = ["dep:edge-nal"]
 log = ["dep:log"]
+fs = []
 
 [dependencies]
 embedded-io-async = { workspace = true, features = ["std"] }

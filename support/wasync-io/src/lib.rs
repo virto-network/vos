@@ -1,4 +1,4 @@
-pub use embedded_io_async::{Error, ErrorType, Read, Write};
+pub use embedded_io_async::{Error, ErrorType, Read, Seek, SeekFrom, Write};
 use std::{cell::OnceCell, io};
 use wasi::{
     cli::stderr::get_stderr,
@@ -13,6 +13,9 @@ pub mod net;
 
 #[cfg(feature = "log")]
 pub mod logger;
+
+#[cfg(feature = "fs")]
+pub mod fs;
 
 pub struct StdIn {
     stream: InputStream,

@@ -17,13 +17,14 @@ This crate provides async I/O functionality for WASI (WebAssembly System Interfa
 ### Optional Features
 
 - **`net`**: Enables TCP networking functionality using WASI sockets
+- **`fs`**: Enables filesystem operations with full Read/Write/Seek support using WASI filesystem APIs
 
 ## Usage
 
 ### Standard I/O
 
 ```rust
-use wasync_io::{stdio, Read, Write};
+use wasync_io::{Read, Write, Seek, SeekFrom};
 
 async fn stdio_example() -> Result<(), std::io::Error> {
     let mut stdio = stdio();
@@ -61,11 +62,42 @@ async fn server_example() -> Result<(), std::io::Error> {
 }
 ```
 
+### Filesystem (with `fs` feature)
+
+```rust
+use wasync_io::fs::{self, File};
+use wasync_io::{Read, Write};
+
+async fn filesystem_example() -> Result<(), std::io::Error> {
+    // Write a file using convenience function
+    let content = fs::read_to_string("hello.txt").await?;
+    
+    // Work with File directly
+    let mut file = File::create("output.txt").await?;
+    file.write(b"Hello from File struct").await?;
+    
+    // Read it back
+    let mut read_file = File::open("output.txt").await?;
+    let mut buffer = [0u8; 1024];
+    let bytes_read = read_file.read(&mut buffer).await?;
+    println!("Read {} bytes", bytes_read);
+    
+    Ok(())
+}
+```
+
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
+# For networking
 wasync-io = { path = "path/to/wasync-io", features = ["net"] }
+
+# For filesystem operations
+wasync-io = { path = "path/to/wasync-io", features = ["fs"] }
+
+# For both
+wasync-io = { path = "path/to/wasync-io", features = ["net", "fs"] }
 ```
 
 ## How it works
@@ -84,6 +116,12 @@ The crate uses WASI's native I/O interfaces:
 3. **Async TCP**: Provides async TCP client and server functionality
 4. **Resource Lifecycle**: Proper management of socket and stream resources
 
+### Filesystem (fs feature)
+1. **WASI Filesystem**: Uses `wasi::filesystem` APIs for file operations
+2. **Preopened Directories**: Works with WASI's preopened directory system for security
+3. **Async File I/O**: Provides async file read/write/seek with automatic position tracking
+4. **Simple API**: Minimal surface area with `File` struct and convenience functions
+
 ## Architecture
 
 ```
@@ -97,6 +135,11 @@ The crate uses WASI's native I/O interfaces:
 │             │    │   (Stack)    │    │    (TCP)        │
 └─────────────┘    └──────────────┘    └─────────────────┘
                            |
+┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
+│   App Code  │ -> │wasync-io::fs │ -> │WASI Filesystem  │
+│             │    │   (File)     │    │ (Descriptors)   │
+└─────────────┘    └──────────────┘    └─────────────────┘
+                           |
                    ┌──────────────┐
                    │    wasync    │
                    │  (Pollables) │
@@ -107,9 +150,10 @@ The crate uses WASI's native I/O interfaces:
 
 This crate consolidates I/O functionality for WASI environments:
 
-- **wasync-io**: Async stdin/stdout and optional networking for WASI (this crate)
+- **wasync-io**: Async stdin/stdout, optional networking, and filesystem for WASI (this crate)
 - **wasync**: Embassy executor integration for WASI pollables
 - **wasync-io::net**: Networking module (formerly separate `wasi-net` crate)
+- **wasync-io::fs**: Simple filesystem operations using WASI preopened directories
 
 ## Dependencies
 
