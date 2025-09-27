@@ -1,5 +1,6 @@
-use edge_nal::{Readable, TcpAccept, TcpBind, TcpShutdown, TcpSplit};
-use embedded_io_async::{ErrorType, Read, Write};
+use crate::io::{ErrorType, Read, Write};
+use crate::wait_pollable;
+pub use edge_nal::{Readable, TcpAccept, TcpBind, TcpShutdown, TcpSplit};
 use std::{
     cell::OnceCell,
     io::{self, ErrorKind},
@@ -14,7 +15,6 @@ use wasi::{
         tcp_create_socket::create_tcp_socket,
     },
 };
-use wasync::wait_pollable;
 
 pub struct Stack;
 impl Stack {

@@ -1,3 +1,4 @@
+use crate::wait_pollable;
 pub use embedded_io_async::{Error, ErrorType, Read, Seek, SeekFrom, Write};
 use std::{cell::OnceCell, io};
 use wasi::{
@@ -6,16 +7,6 @@ use wasi::{
     cli::stdout::get_stdout,
     io::streams::{InputStream, OutputStream, StreamError},
 };
-use wasync::wait_pollable;
-
-#[cfg(feature = "net")]
-pub mod net;
-
-#[cfg(feature = "log")]
-pub mod logger;
-
-#[cfg(feature = "fs")]
-pub mod fs;
 
 pub struct StdIn {
     stream: InputStream,

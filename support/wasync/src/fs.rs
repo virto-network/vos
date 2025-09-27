@@ -1,4 +1,4 @@
-use crate::{ErrorType, Read, Seek, Write};
+use crate::wait_pollable;
 use std::io;
 use wasi::{
     filesystem::{
@@ -9,7 +9,6 @@ use wasi::{
     },
     io::streams::StreamError,
 };
-use wasync::wait_pollable;
 
 type Result<T> = std::result::Result<T, io::Error>;
 
@@ -93,7 +92,7 @@ impl File {
     }
 }
 
-impl Read for File {
+impl crate::io::Read for File {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let stream = self
             .descriptor
@@ -120,7 +119,7 @@ impl Read for File {
     }
 }
 
-impl Write for File {
+impl crate::io::Write for File {
     async fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let stream = self
             .descriptor
@@ -158,13 +157,13 @@ impl Write for File {
     }
 }
 
-impl ErrorType for File {
+impl crate::io::ErrorType for File {
     type Error = io::Error;
 }
 
-impl Seek for File {
-    async fn seek(&mut self, pos: crate::SeekFrom) -> Result<u64> {
-        use crate::SeekFrom;
+impl crate::io::Seek for File {
+    async fn seek(&mut self, pos: crate::io::SeekFrom) -> Result<u64> {
+        use crate::io::SeekFrom;
 
         let new_position = match pos {
             SeekFrom::Start(offset) => offset,
@@ -216,6 +215,7 @@ impl Seek for File {
 /// - The file contents are not valid UTF-8
 /// - Any I/O error occurs during reading
 pub async fn read_to_string<P: AsRef<str>>(path: P) -> Result<String> {
+    use crate::io::Read;
     let mut file = File::open(path)?;
     let mut contents = String::new();
     let mut buf = [0u8; 4096];

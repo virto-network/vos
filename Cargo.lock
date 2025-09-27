@@ -4251,19 +4251,11 @@ dependencies = [
 name = "wasync"
 version = "0.1.0"
 dependencies = [
- "embassy-executor",
- "wasi 0.14.7+wasi-0.2.4",
-]
-
-[[package]]
-name = "wasync-io"
-version = "0.1.0"
-dependencies = [
  "edge-nal",
+ "embassy-executor",
  "embedded-io-async",
  "log",
  "wasi 0.14.7+wasi-0.2.4",
- "wasync",
 ]
 
 [[package]]
@@ -4822,7 +4814,6 @@ dependencies = [
  "pico-args",
  "simple-http-server",
  "wasync",
- "wasync-io",
  "wink-macro",
 ]
 

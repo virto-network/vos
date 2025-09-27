@@ -23,6 +23,18 @@ use wasi::io::poll::Pollable;
 
 pub use wasi;
 
+#[cfg(feature = "io")]
+pub mod io;
+
+#[cfg(feature = "net")]
+pub mod net;
+
+#[cfg(feature = "log")]
+pub mod logger;
+
+#[cfg(feature = "fs")]
+pub mod fs;
+
 // Context ID for tracking which execution context owns which pollables
 const MAIN_EXECUTOR_CONTEXT: u64 = 0;
 

@@ -9,7 +9,6 @@ members = [
   "support/nu-protocol",
   "support/simple-http-server",
   "support/wasync",
-  "support/wasync-io",
 ]
 
 [package]

@@ -6,3 +6,13 @@ edition = "2024"
 [dependencies]
 embassy-executor = { workspace = true }
 wasi = { workspace = true }
+
+embedded-io-async = { workspace = true, features = ["std"], optional = true }
+edge-nal = { workspace = true, optional = true }
+log = { workspace = true, features = ["std"], optional = true }
+
+[features]
+io = ["dep:embedded-io-async"]
+net = ["io", "dep:edge-nal"]
+log = ["io", "dep:log"]
+fs = ["io"]
