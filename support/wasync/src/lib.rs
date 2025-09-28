@@ -64,9 +64,7 @@ impl Drop for ContextGuard {
 }
 
 #[unsafe(export_name = "__pender")]
-fn __pender(_context: *mut ()) {
-    log::trace!("embassy executor requesting wake");
-}
+fn __pender(_context: *mut ()) {}
 
 pub fn run(init: impl FnOnce(Spawner)) {
     let exec = Box::leak(Box::new(raw::Executor::new(&mut ())));
@@ -83,7 +81,7 @@ pub fn run(init: impl FnOnce(Spawner)) {
         });
 
         if has_pollables {
-            IO.with_borrow_mut(|io| io.wait())
+            IO.with_borrow_mut(|io| io.wait_context(MAIN_EXECUTOR_CONTEXT))
         } else {
             // No pollables and executor finished polling - exit
             log::debug!("executor shutdown: no pending I/O operations");
@@ -182,10 +180,15 @@ impl WasiIo {
         }
     }
 
-    fn wait(&mut self) {
-        self.wait_context(MAIN_EXECUTOR_CONTEXT);
-    }
-
+    /// Wait for I/O operations to complete for a specific execution context.
+    ///
+    /// This method:
+    /// 1. Filters pollables belonging to the given context ID
+    /// 2. Uses WASI's poll() to wait for any of them to become ready
+    /// 3. Wakes the corresponding tasks when their I/O operations complete
+    ///
+    /// No logging occurs during this method to avoid recursive borrowing issues
+    /// when called from within the main executor loop.
     fn wait_context(&mut self, context_id: u64) {
         let pollables_for_context: Vec<(*const Pollable, &Pollable)> = unsafe {
             self.pollables
@@ -196,30 +199,18 @@ impl WasiIo {
         };
 
         if pollables_for_context.is_empty() {
-            log::trace!("context {}: no pending I/O operations", context_id);
             return;
         }
 
         let pollables: Vec<&Pollable> = pollables_for_context.iter().map(|(_, p)| *p).collect();
-        log::trace!(
-            "context {}: blocking on {} I/O operations",
-            context_id,
-            pollables.len()
-        );
 
         let ready = wasi::io::poll::poll(pollables.as_slice());
-        let len = ready.len();
         for i in ready {
             let (ptr, _) = pollables_for_context[i as usize];
             if let Some((waker, _)) = self.pollables.remove(&ptr) {
                 waker.wake();
             }
         }
-        log::trace!(
-            "context {}: {} I/O operations completed, resuming tasks",
-            context_id,
-            len
-        );
     }
 
     fn cleanup_context(&mut self, context_id: u64) {

@@ -19,3 +19,5 @@ embassy-time = { workspace = true, features = ["std"], optional = true }
 [features]
 net = ["wasync/net"]
 http = ["net", "dep:simple-http-server", "dep:embassy-time"]
+
+_log_internal = []

@@ -7,6 +7,26 @@
 use log::{LevelFilter, Log, Metadata, Record};
 use std::{cell::UnsafeCell, env, fmt};
 
+#[cfg(feature = "_log_internal")]
+const DEBUG_INTERNAL: bool = true;
+#[cfg(not(feature = "_log_internal"))]
+const DEBUG_INTERNAL: bool = false;
+const RUNTIME_CRATE: &str = "wasync";
+
+const fn crate_name() -> &'static str {
+    const PATH: &str = module_path!();
+    let bytes = PATH.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b':' {
+            let (prefix, _) = bytes.split_at(i);
+            return unsafe { std::str::from_utf8_unchecked(prefix) };
+        }
+        i += 1;
+    }
+    PATH
+}
+
 /// Initialize the logger with an optional minimum log level.
 ///
 /// Defaults to `Debug` level if `None`. Returns error if logger already initialized.
@@ -19,6 +39,7 @@ pub fn init(
 
     log::set_logger(Box::leak(Box::new(logger)))?;
     log::set_max_level(level);
+    log::trace!("Logger initialized with level {level}");
 
     Ok(())
 }
@@ -77,6 +98,12 @@ fn write_log_formatted(w: &mut impl fmt::Write, record: &Record) -> fmt::Result 
 
 impl<W: fmt::Write> Log for SimpleLogger<W> {
     fn enabled(&self, metadata: &Metadata) -> bool {
+        let target = metadata.target();
+        if !DEBUG_INTERNAL {
+            if target.starts_with(RUNTIME_CRATE) || target.starts_with(crate_name()) {
+                return false;
+            }
+        }
         metadata.level() <= self.level
     }
 

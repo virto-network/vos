@@ -126,11 +126,10 @@ impl crate::io::Write for File {
             .write_via_stream(self.position)
             .map_err(|e| io::Error::other(format!("Failed to create write stream: {:?}", e)))?;
 
-        loop {
+        let writable = loop {
             match stream.check_write() {
                 Ok(0) => {
-                    let subscription = stream.subscribe();
-                    wait_pollable(&subscription).await;
+                    wait_pollable(&stream.subscribe()).await;
                     continue;
                 }
                 Ok(available) => {
@@ -138,7 +137,7 @@ impl crate::io::Write for File {
                     match stream.write(&buf[0..writable]) {
                         Ok(()) => {
                             self.position += writable as u64;
-                            return Ok(writable);
+                            break writable;
                         }
                         Err(StreamError::Closed) => {
                             return Err(io::ErrorKind::BrokenPipe.into());
@@ -153,7 +152,14 @@ impl crate::io::Write for File {
                     return Err(io::Error::other(err.to_debug_string()));
                 }
             }
-        }
+        };
+
+        self.descriptor
+            .sync_data()
+            .map_err(wasi_error_to_io_error)?;
+        log::trace!("Synced {writable} bytes to disk");
+
+        Ok(writable)
     }
 }
 
