@@ -1,12 +1,12 @@
 #![feature(impl_trait_in_assoc_type)]
 
-use wink::{
+use writ::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
 };
 
-#[wink::main]
-async fn main(_args: wink::Arguments) {
+#[writ::main]
+async fn main(_args: writ::Arguments) {
     log::info!("🚀 Async filesystem showcase");
 
     cleanup_test_files().await;

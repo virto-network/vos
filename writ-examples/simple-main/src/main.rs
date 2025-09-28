@@ -1,8 +1,8 @@
 #![feature(impl_trait_in_assoc_type)]
 
-#[wink::main]
-async fn app_main(args: wink::Arguments) {
-    println!("Hello from wink::main!");
+#[writ::main]
+async fn app_main(args: writ::Arguments) {
+    println!("Hello from writ::main!");
     println!("Arguments received: {:?}", args);
 
     // Simple example of processing arguments

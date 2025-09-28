@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wink = { path = "../../wink" }
+writ = { path = "../../writ" }
 
 [features]
 dev = ["http"]
-http = ["wink/http"]
+http = ["writ/http"]

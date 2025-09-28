@@ -113,7 +113,7 @@ checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 name = "async-io"
 version = "0.1.0"
 dependencies = [
- "wink",
+ "writ",
 ]
 
 [[package]]
@@ -733,7 +733,7 @@ dependencies = [
 name = "demo"
 version = "0.1.0"
 dependencies = [
- "wink",
+ "writ",
 ]
 
 [[package]]
@@ -3124,7 +3124,7 @@ dependencies = [
 name = "simple-main"
 version = "0.1.0"
 dependencies = [
- "wink",
+ "writ",
 ]
 
 [[package]]
@@ -4844,29 +4844,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
 
 [[package]]
-name = "wink"
-version = "0.1.0"
-dependencies = [
- "embassy-executor",
- "embassy-time",
- "log",
- "miniserde",
- "nu-protocol 0.1.0",
- "pico-args",
- "simple-http-server",
- "wasync",
- "wink-macro",
-]
-
-[[package]]
-name = "wink-macro"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
 name = "winnow"
 version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4900,6 +4877,29 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.221.3",
+]
+
+[[package]]
+name = "writ"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-time",
+ "log",
+ "miniserde",
+ "nu-protocol 0.1.0",
+ "pico-args",
+ "simple-http-server",
+ "wasync",
+ "writ-macro",
+]
+
+[[package]]
+name = "writ-macro"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]

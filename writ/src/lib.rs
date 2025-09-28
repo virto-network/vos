@@ -6,11 +6,11 @@ pub use protocol;
 #[cfg(feature = "net")]
 pub use wasync::net;
 pub use wasync::{fs, io, run, wasi};
-pub use wink_macro::{bin, main};
+pub use writ_macro::{bin, main};
 
 pub mod prelude {
     pub use log;
-    pub use miniserde::{Deserialize, Serialize, json};
+    pub use miniserde::{json, Deserialize, Serialize};
 }
 
 pub mod logger;
@@ -20,7 +20,7 @@ pub mod http {
     use embassy_time as _;
     // use miniserde::json;
     use protocol::{Bin, BinManager};
-    use simple_http_server::{Error, HttpError, simple_serve};
+    use simple_http_server::{simple_serve, Error, HttpError};
 
     pub async fn serve<B: BinManager>(port: u16, mgr: B) -> Result<(), Error<std::io::Error>> {
         let stack = super::net::Stack::new();
@@ -31,7 +31,7 @@ pub mod http {
             port,
             bin,
             async |bin, path, _params, _headers, _maybe_body| {
-                println!("[wink][handler] got: {path}");
+                println!("[writ][handler] got: {path}");
                 let (_bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
                 println!("calling: '{cmd}'");
                 signature

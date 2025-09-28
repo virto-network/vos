@@ -1,11 +1,11 @@
 [workspace]
 members = [
   "os",
-  "wink",
-  "wink-macro",
-  "wink-examples/demo",
-  "wink-examples/simple-main",
-  "wink-examples/async-io",
+  "writ",
+  "writ-macro",
+  "writ-examples/demo",
+  "writ-examples/simple-main",
+  "writ-examples/async-io",
   "support/nu-protocol",
   "support/simple-http-server",
   "support/wasync",

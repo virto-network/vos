@@ -1,11 +1,11 @@
 [package]
-name = "wink"
+name = "writ"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 protocol = { path = "../support/nu-protocol", package = "nu-protocol" }
-wink-macro = { path = "../wink-macro" }
+writ-macro = { path = "../writ-macro" }
 log = { workspace = true }
 miniserde = { workspace = true }
 pico-args = "0.5.0"

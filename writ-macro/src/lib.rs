@@ -10,37 +10,37 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as syn::ItemFn);
 
     // Rename the user's function to avoid conflicts
-    let renamed_fn = Ident::new("__wink_main", Span::mixed_site().into());
+    let renamed_fn = Ident::new("__writ_main", Span::mixed_site().into());
     input.sig.ident = renamed_fn.clone();
 
     let expanded = quote! {
-        use wink::log;
+        use writ::log;
 
         #input
 
         fn main() {
-            wink::logger::init(
-                wink::io::BufWriter::<_, 8192>::new(wink::io::stderr()),
-                wink::logger::level_from_env()
+            writ::logger::init(
+                writ::io::BufWriter::<_, 8192>::new(writ::io::stderr()),
+                writ::logger::level_from_env()
             ).expect("logger initialized");
 
-            wink::run(|s|
-                s.must_spawn(embassy_task(wink::Arguments::from_env()))
+            writ::run(|s|
+                s.must_spawn(embassy_task(writ::Arguments::from_env()))
             );
 
-            fn embassy_task(args: wink::Arguments) -> wink::executor::SpawnToken<impl Sized> {
+            fn embassy_task(args: writ::Arguments) -> writ::executor::SpawnToken<impl Sized> {
                 trait _EmbassyInternalTaskTrait {
                     type Fut: ::core::future::Future + 'static;
-                    fn construct(args: wink::Arguments) -> Self::Fut;
+                    fn construct(args: writ::Arguments) -> Self::Fut;
                 }
                 impl _EmbassyInternalTaskTrait for () {
                     type Fut = impl core::future::Future + 'static;
-                    fn construct(args: wink::Arguments) -> Self::Fut {
+                    fn construct(args: writ::Arguments) -> Self::Fut {
                         #renamed_fn(args)
                     }
                 }
-                static POOL: wink::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
-                    wink::executor::raw::TaskPool::new();
+                static POOL: writ::executor::raw::TaskPool<<() as _EmbassyInternalTaskTrait>::Fut, 1> =
+                    writ::executor::raw::TaskPool::new();
                 unsafe { POOL._spawn_async_fn(move || <() as _EmbassyInternalTaskTrait>::construct(args)) }
             }
         }
@@ -61,9 +61,9 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Err(e) = content.iter_mut().try_for_each(|item| {
             match item {
                 Item::Struct(ty) => {
-                    if has_wink_attr(&ty.attrs, "storage") {
+                    if has_writ_attr(&ty.attrs, "storage") {
                         if storage_struct.is_none() {
-                            ty.attrs.retain(|attr| !is_wink_attr(attr));
+                            ty.attrs.retain(|attr| !is_writ_attr(attr));
                             storage_struct = Some(ty);
                         } else {
                             return Err(syn::Error::new(
@@ -88,7 +88,7 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         pub mod #mod_name {
-            use wink::prelude::*;
+            use writ::prelude::*;
             #(#content)*
         }
 
@@ -96,13 +96,13 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #metadata
 
-        #[wink::main]
-        async fn main(args: wink::Arguments) {
+        #[writ::main]
+        async fn main(args: writ::Arguments) {
             let mgr = __bin::get_manager();
-            match wink::RunMode::from_args(args) {
-                Some(wink::RunMode::Nu) => wink::run_nu_plugin(mgr).await,
+            match writ::RunMode::from_args(args) {
+                Some(writ::RunMode::Nu) => writ::run_nu_plugin(mgr).await,
                 #[cfg(feature = "http")]
-                Some(wink::RunMode::HttpServer(port)) => wink::http::run_server(port, mgr).await,
+                Some(writ::RunMode::HttpServer(port)) => writ::http::run_server(port, mgr).await,
                 _ => {}
             };
         }
@@ -126,7 +126,7 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
         .map(|m| {
             let args = m.args.iter().map(|(id, ty)| {
                 let name = id.to_string();
-                quote!(wink::Arg {
+                quote!(writ::Arg {
                     name: #name,
                     ty: stringify!(#ty),
                 })
@@ -135,7 +135,7 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
             let name_up = Ident::new(&name.to_uppercase(), Span::mixed_site().into());
             let desc = m.doc.clone().unwrap_or_default();
             let const_cmd = parse2::<ItemConst>(quote! {
-                const #name_up: wink::Cmd = wink::Cmd {
+                const #name_up: writ::Cmd = writ::Cmd {
                     name: #name,
                     desc: #desc,
                     args: &[#(#args),*],
@@ -151,10 +151,10 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
             use std::sync::OnceLock;
 
             #(#cmds)*
-            pub const CMDS: &[&wink::Cmd] = &[#(&#idents),*];
-            static NU_SIGNATURE: OnceLock<Vec<wink::protocol::CmdSignature>> = OnceLock::new();
-            pub fn signature() -> &'static [wink::protocol::CmdSignature] {
-                let sig = NU_SIGNATURE.get_or_init(||  wink::to_nu_signature(#name, CMDS));
+            pub const CMDS: &[&writ::Cmd] = &[#(&#idents),*];
+            static NU_SIGNATURE: OnceLock<Vec<writ::protocol::CmdSignature>> = OnceLock::new();
+            pub fn signature() -> &'static [writ::protocol::CmdSignature] {
+                let sig = NU_SIGNATURE.get_or_init(||  writ::to_nu_signature(#name, CMDS));
                 sig.as_slice()
             }
         }
@@ -192,7 +192,7 @@ fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::Item
     parse2(quote! {
         mod __bin {
             use std::future::Future;
-            use wink::prelude::Serialize;
+            use writ::prelude::Serialize;
 
             pub static BIN_MANAGER: std::sync::OnceLock<Manager> = std::sync::OnceLock::new();
             pub fn get_manager() -> &'static Manager {
@@ -200,26 +200,26 @@ fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::Item
             }
 
             pub struct Manager;
-            impl wink::protocol::BinManager for &Manager {
+            impl writ::protocol::BinManager for &Manager {
                 type Bin = super::#mod_name::#data;
-                fn bin_signature() -> &'static [wink::protocol::CmdSignature] {
+                fn bin_signature() -> &'static [writ::protocol::CmdSignature] {
                     super::__meta::signature()
                 }
-                async fn get_bin(&self) -> Result<Self::Bin, impl wink::io::Error> {
+                async fn get_bin(&self) -> Result<Self::Bin, impl writ::io::Error> {
                     // TODO
                     Ok::<_, std::io::Error>(Default::default())
                 }
-                async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl wink::io::Error> {
+                async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl writ::io::Error> {
                     // TODO
                     Ok::<_, std::io::Error>(())
                 }
             }
 
-            impl wink::protocol::Bin for super::#mod_name::#data {
+            impl writ::protocol::Bin for super::#mod_name::#data {
                 async fn call(
                     &mut self,
                     cmd: &str,
-                    mut args: Vec<wink::protocol::NuType>
+                    mut args: Vec<writ::protocol::NuType>
                 ) -> Result<Box<dyn Serialize>, String> {
                     match cmd {
                         #(#cmds)*
@@ -236,8 +236,8 @@ fn process_impl_block(impl_block: &mut ItemImpl, methods: &mut Vec<MethodInfo>) 
     // Process each method in the impl block to extract needed data
     for item in impl_block.items.iter_mut() {
         if let ImplItem::Fn(ref mut method) = item {
-            if has_wink_attr(&method.attrs, "message") {
-                method.attrs.retain(|a| !is_wink_attr(a));
+            if has_writ_attr(&method.attrs, "message") {
+                method.attrs.retain(|a| !is_writ_attr(a));
 
                 let args = method
                     .sig
@@ -279,26 +279,26 @@ fn process_impl_block(impl_block: &mut ItemImpl, methods: &mut Vec<MethodInfo>) 
                     is_async: method.sig.asyncness.is_some(),
                     returns_result: has_result_return(&method.sig.output),
                 });
-            } else if has_wink_attr(&method.attrs, "constructor") {
-                method.attrs.retain(|a| !is_wink_attr(a));
+            } else if has_writ_attr(&method.attrs, "constructor") {
+                method.attrs.retain(|a| !is_writ_attr(a));
             }
         }
     }
     Ok(())
 }
 
-fn is_wink_attr(attr: &Attribute) -> bool {
+fn is_writ_attr(attr: &Attribute) -> bool {
     if let Some(ident) = attr.path().get_ident() {
-        ident == "wink"
+        ident == "writ"
     } else {
         false
     }
 }
 
-fn has_wink_attr(attrs: &[Attribute], name: &str) -> bool {
+fn has_writ_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| {
         if let Some(ident) = attr.path().get_ident() {
-            if ident == "wink" {
+            if ident == "writ" {
                 if let Ok(meta) = attr.meta.require_list() {
                     let content = meta.tokens.to_string();
                     return content.contains(name);
