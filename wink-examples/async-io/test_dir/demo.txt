@@ -1,0 +1,2 @@
+Hello, async fs! 🦀
+Line 2

@@ -2,4 +2,4 @@
 target = "wasm32-wasip2"
 
 [target.wasm32-wasip2]
-runner = "wasmtime -Sinherit-network"
+runner = "wasmtime run --env RUST_LOG=trace --dir=test_dir"

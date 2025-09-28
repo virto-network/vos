@@ -1,59 +1,103 @@
 #![feature(impl_trait_in_assoc_type)]
 
-use wink::io::{Read, Write};
+use wink::{
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+};
 
 #[wink::main]
-async fn app_main(args: wink::Arguments) {
-    println!("Async IO Example - demonstrating wink's async stdin/stdout");
-    println!("Type something and press Enter (or Ctrl+D to exit):");
+async fn main(_args: wink::Arguments) {
+    log::info!("🚀 Async filesystem showcase");
 
-    let mut stdin = wink::io::stdin();
-    let mut stdout = wink::io::stdout();
-    let mut stderr = wink::io::stderr();
-    let mut buffer = [0u8; 1024];
+    cleanup_test_files().await;
+    test_basic_operations().await;
+    test_seek().await;
+    test_directory().await;
+    test_read_to_string().await;
 
-    loop {
-        println!("Waiting for input...");
-        let _ = stderr.write(b"[DEBUG] Ready to read from stdin\n").await;
+    log::info!("✅ All tests completed");
+}
 
-        match stdin.read(&mut buffer).await {
-            Ok(0) => {
-                println!("EOF reached, exiting.");
-                let _ = stderr.write(b"[INFO] EOF detected, shutting down\n").await;
-                break;
-            }
-            Ok(n) => {
-                println!("Read {} bytes", n);
-                let debug_msg = format!("[DEBUG] Processed {} bytes of input\n", n);
-                let _ = stderr.write(debug_msg.as_bytes()).await;
-
-                // Echo back what was read, with a prefix
-                let input = std::str::from_utf8(&buffer[..n]).unwrap_or("<invalid utf8>");
-
-                let response = format!("You typed: {}", input.trim());
-                let response_bytes = response.as_bytes();
-
-                match stdout.write(response_bytes).await {
-                    Ok(written) => {
-                        println!("Wrote {} bytes back", written);
-                    }
-                    Err(e) => {
-                        println!("Write error: {:?}", e);
-                        break;
-                    }
-                }
-
-                // Write a newline
-                let _ = stdout.write(b"\n").await;
-            }
-            Err(e) => {
-                println!("Read error: {:?}", e);
-                let error_msg = format!("[ERROR] Read failed: {:?}\n", e);
-                let _ = stderr.write(error_msg.as_bytes()).await;
-                break;
-            }
+async fn cleanup_test_files() {
+    let files = ["test_dir/demo.txt", "test_dir/seek_demo.txt"];
+    for file in &files {
+        if let Ok(f) = fs::File::create(file) {
+            let _ = f.set_len(0);
         }
     }
+}
 
-    println!("Async IO example completed!");
+async fn test_basic_operations() {
+    log::info!("📝 Basic file operations");
+
+    // Create and write
+    let mut file = fs::File::create("test_dir/demo.txt").expect("create failed");
+    let data = "Hello, async fs! 🦀\nLine 2\n";
+    let written = file.write(data.as_bytes()).await.expect("write failed");
+    file.sync_data().expect("sync failed");
+    log::info!("Wrote {} bytes", written);
+
+    // Read back
+    let mut file = fs::File::open("test_dir/demo.txt").expect("open failed");
+
+    // Check metadata before reading
+    let metadata = file.metadata().expect("metadata failed");
+    log::info!(
+        "Before read - File size: {} bytes, is_file: {}",
+        metadata.len(),
+        metadata.is_file()
+    );
+
+    let mut buffer = vec![0u8; 100];
+    let read = file.read(&mut buffer).await.expect("read failed");
+    let content = String::from_utf8_lossy(&buffer[..read]);
+    assert_eq!(content, data);
+}
+
+async fn test_seek() {
+    log::info!("🎯 Seek operations");
+
+    // Write test data
+    let mut file = fs::File::create("test_dir/seek_demo.txt").expect("create failed");
+    file.write(b"0123456789").await.expect("write failed");
+    file.sync_data().expect("sync failed");
+    drop(file);
+
+    // Seek and read
+    let mut file = fs::File::open("test_dir/seek_demo.txt").expect("open failed");
+    file.seek(SeekFrom::Start(3)).await.expect("seek failed");
+
+    let mut buffer = [0u8; 4];
+    let read = file.read(&mut buffer).await.expect("read failed");
+    let content = String::from_utf8_lossy(&buffer[..read]);
+    log::info!("Seeked to pos 3, read: '{}'", content);
+}
+
+async fn test_directory() {
+    log::info!("📁 Directory listing");
+
+    let mut entries = fs::read_dir("test_dir").expect("Test files");
+    let mut count = 0;
+    for entry in &mut entries {
+        let Ok(entry) = entry else { continue };
+        log::info!(
+            "  {} ({})",
+            entry.file_name(),
+            if entry.is_file() { "file" } else { "other" }
+        );
+        if entry.is_file() {
+            count += 1;
+        }
+    }
+    log::info!("Found {} files", count);
+}
+
+async fn test_read_to_string() {
+    log::info!("📖 read_to_string utility");
+
+    let content = fs::read_to_string("test_dir/demo.txt")
+        .await
+        .expect("read_to_string failed");
+    log::info!("Read {} chars from demo.txt", content.len());
+    log::info!("First line: '{}'", content.lines().next().unwrap_or(""));
 }
