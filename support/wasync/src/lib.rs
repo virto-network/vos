@@ -93,7 +93,6 @@ pub fn run(init: impl FnOnce(Spawner)) {
 pub async fn wait_pollable(pollable: &Pollable) {
     poll_fn(|cx| {
         if pollable.ready() {
-            log::trace!("I/O operation completed synchronously");
             return Poll::Ready(());
         }
         let context_id = CURRENT_CONTEXT.with_borrow(|ctx| *ctx);

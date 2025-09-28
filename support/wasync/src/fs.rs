@@ -1,4 +1,4 @@
-use crate::wait_pollable;
+use crate::{io::write_stream, wait_pollable};
 use std::io;
 use wasi::{
     filesystem::{
@@ -34,6 +34,7 @@ impl File {
     /// - Permission is denied
     /// - No preopen directory matches the path
     pub fn open(path: impl AsRef<str>) -> Result<Self> {
+        log::trace!("File::open called with path: {}", path.as_ref());
         OpenOptions::new().read(true).open(path)
     }
 
@@ -94,26 +95,40 @@ impl File {
 
 impl crate::io::Read for File {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        log::trace!(
+            "File::read starting at position {}, buffer size {}",
+            self.position,
+            buf.len()
+        );
         let stream = self
             .descriptor
             .read_via_stream(self.position)
             .map_err(|e| io::Error::other(format!("Failed to create read stream: {:?}", e)))?;
 
-        // Wait for stream to be readable
         let subscription = stream.subscribe();
-        wait_pollable(&subscription).await;
 
-        match stream.read(buf.len() as u64) {
-            Ok(data) if data.is_empty() => Ok(0),
-            Ok(data) => {
-                let bytes_read = data.len();
-                buf[0..bytes_read].copy_from_slice(&data);
-                self.position += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            Err(StreamError::Closed) => Ok(0),
-            Err(StreamError::LastOperationFailed(err)) => {
-                Err(io::Error::other(err.to_debug_string()))
+        loop {
+            log::trace!("Attempting to read from stream");
+            match stream.read(buf.len() as u64) {
+                Ok(data) if data.is_empty() => {
+                    log::trace!("Got empty data, waiting for pollable");
+                    wait_pollable(&subscription).await;
+                }
+                Ok(data) => {
+                    let bytes_read = data.len();
+                    log::trace!("Read {} bytes from stream", bytes_read);
+                    buf[0..bytes_read].copy_from_slice(&data);
+                    self.position += bytes_read as u64;
+                    return Ok(bytes_read);
+                }
+                Err(StreamError::Closed) => {
+                    log::trace!("Stream is closed, returning EOF");
+                    return Ok(0);
+                }
+                Err(StreamError::LastOperationFailed(err)) => {
+                    log::trace!("Stream read failed: {:?}", err);
+                    return Err(io::Error::other(err.to_debug_string()));
+                }
             }
         }
     }
@@ -125,41 +140,12 @@ impl crate::io::Write for File {
             .descriptor
             .write_via_stream(self.position)
             .map_err(|e| io::Error::other(format!("Failed to create write stream: {:?}", e)))?;
+        let subscription = stream.subscribe();
 
-        let writable = loop {
-            match stream.check_write() {
-                Ok(0) => {
-                    wait_pollable(&stream.subscribe()).await;
-                    continue;
-                }
-                Ok(available) => {
-                    let writable = (available as usize).min(buf.len());
-                    match stream.write(&buf[0..writable]) {
-                        Ok(()) => {
-                            self.position += writable as u64;
-                            break writable;
-                        }
-                        Err(StreamError::Closed) => {
-                            return Err(io::ErrorKind::BrokenPipe.into());
-                        }
-                        Err(StreamError::LastOperationFailed(err)) => {
-                            return Err(io::Error::other(err.to_debug_string()));
-                        }
-                    }
-                }
-                Err(StreamError::Closed) => return Err(io::ErrorKind::BrokenPipe.into()),
-                Err(StreamError::LastOperationFailed(err)) => {
-                    return Err(io::Error::other(err.to_debug_string()));
-                }
-            }
-        };
+        let written = write_stream(buf, &stream, &subscription).await?;
+        self.position += written as u64;
 
-        self.descriptor
-            .sync_data()
-            .map_err(wasi_error_to_io_error)?;
-        log::trace!("Synced {writable} bytes to disk");
-
-        Ok(writable)
+        Ok(written)
     }
 }
 
@@ -270,6 +256,20 @@ impl DirEntry {
     pub fn file_type(&self) -> wasi::filesystem::types::DescriptorType {
         self.entry.type_
     }
+
+    pub fn is_file(&self) -> bool {
+        matches!(
+            self.file_type(),
+            wasi::filesystem::types::DescriptorType::RegularFile
+        )
+    }
+
+    pub fn is_dir(&self) -> bool {
+        matches!(
+            self.file_type(),
+            wasi::filesystem::types::DescriptorType::Directory
+        )
+    }
 }
 
 /// Iterator over the entries in a directory.
@@ -311,32 +311,47 @@ impl Iterator for ReadDir {
 pub fn read_dir(path: impl AsRef<str>) -> Result<ReadDir> {
     let path = path.as_ref();
     let preopens = get_directories();
+    log::debug!(
+        "Reading dir '{path}' with preopens: {}",
+        preopens.iter().map(|p| p.1.as_str()).collect::<String>()
+    );
 
     for (descriptor, preopen_path) in preopens {
-        if path.starts_with(&preopen_path) {
-            let relative_path = path
-                .strip_prefix(&preopen_path)
-                .unwrap_or(path)
-                .trim_start_matches('/');
+        if !path.starts_with(&preopen_path) {
+            continue;
+        }
+        let relative_path = path
+            .strip_prefix(&preopen_path)
+            .unwrap_or(path)
+            .trim_start_matches('/');
 
-            let dir_descriptor = descriptor
-                .open_at(
-                    PathFlags::empty(),
-                    relative_path,
-                    OpenFlags::empty(),
-                    DescriptorFlags::READ,
-                )
-                .map_err(wasi_error_to_io_error)?;
-
-            let stream = dir_descriptor
+        if relative_path.is_empty() {
+            let stream = descriptor
                 .read_directory()
                 .map_err(wasi_error_to_io_error)?;
-
             return Ok(ReadDir {
                 stream,
                 base_path: path.to_string(),
             });
         }
+
+        let dir_descriptor = descriptor
+            .open_at(
+                PathFlags::SYMLINK_FOLLOW,
+                relative_path,
+                OpenFlags::DIRECTORY,
+                DescriptorFlags::empty(),
+            )
+            .map_err(wasi_error_to_io_error)?;
+
+        let stream = dir_descriptor
+            .read_directory()
+            .map_err(wasi_error_to_io_error)?;
+
+        return Ok(ReadDir {
+            stream,
+            base_path: path.to_string(),
+        });
     }
 
     Err(io::Error::new(
@@ -350,6 +365,7 @@ pub fn read_dir(path: impl AsRef<str>) -> Result<ReadDir> {
 /// This builder exposes the ability to configure how a [`File`] is opened and
 /// what operations are permitted on the open file. The [`File::open`] and
 /// [`File::create`] methods are aliases for commonly used options using this builder.
+#[derive(Default)]
 pub struct OpenOptions {
     read: bool,
     write: bool,
@@ -363,13 +379,7 @@ impl OpenOptions {
     ///
     /// All options are initially set to `false`.
     pub fn new() -> Self {
-        Self {
-            read: false,
-            write: false,
-            create: false,
-            truncate: false,
-            append: false,
-        }
+        Default::default()
     }
 
     /// Sets the option for read access.
@@ -426,7 +436,9 @@ impl OpenOptions {
     /// - The options are invalid (e.g., truncate without write)
     pub fn open(self, path: impl AsRef<str>) -> Result<File> {
         let path = path.as_ref();
+        log::trace!("OpenOptions::open called with path: {}", path);
         let preopens = get_directories();
+        log::trace!("Found {} preopen directories", preopens.len());
 
         for (descriptor, preopen_path) in preopens {
             if path.starts_with(&preopen_path) {
@@ -461,10 +473,14 @@ impl OpenOptions {
                     .map_err(wasi_error_to_io_error)?;
 
                 let position = if self.append {
-                    file_descriptor.stat().map_err(wasi_error_to_io_error)?.size
+                    let size = file_descriptor.stat().map_err(wasi_error_to_io_error)?.size;
+                    log::trace!("Append mode: setting position to file size {}", size);
+                    size
                 } else {
+                    log::trace!("Read mode: setting position to 0");
                     0
                 };
+                log::debug!("File opened successfully at position {}", position);
                 return Ok(File {
                     descriptor: file_descriptor,
                     position,

@@ -2,10 +2,8 @@ use crate::{block_on, wait_pollable};
 pub use embedded_io_async::{Error, ErrorType, Read, Seek, SeekFrom, Write};
 use std::{cell::OnceCell, fmt, io};
 use wasi::{
-    cli::stderr::get_stderr,
-    cli::stdin::get_stdin,
-    cli::stdout::get_stdout,
-    io::streams::{InputStream, OutputStream, StreamError},
+    cli::{stderr::get_stderr, stdin::get_stdin, stdout::get_stdout},
+    io::streams::{InputStream, OutputStream, Pollable, StreamError},
 };
 
 pub struct StdIn {
@@ -46,10 +44,8 @@ impl StdOut {
         }
     }
 
-    async fn writable(&self) -> Result<(), io::Error> {
-        let subscription = self.subscription.get_or_init(|| self.stream.subscribe());
-        wait_pollable(subscription).await;
-        Ok(())
+    fn subscription(&self) -> &Pollable {
+        self.subscription.get_or_init(|| self.stream.subscribe())
     }
 }
 
@@ -61,10 +57,8 @@ impl Stderr {
         }
     }
 
-    async fn writable(&self) -> Result<(), io::Error> {
-        let subscription = self.subscription.get_or_init(|| self.stream.subscribe());
-        wait_pollable(subscription).await;
-        Ok(())
+    fn subscription(&self) -> &Pollable {
+        self.subscription.get_or_init(|| self.stream.subscribe())
     }
 }
 
@@ -88,61 +82,55 @@ impl Read for StdIn {
     }
 }
 
-impl Write for StdOut {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        loop {
-            match self.stream.check_write() {
-                Ok(0) => {
-                    self.writable().await?;
-                    continue;
+pub(crate) async fn write_stream(
+    buf: &[u8],
+    stream: &OutputStream,
+    subscription: &Pollable,
+) -> Result<usize, io::Error> {
+    fn stream_err_to_io(err: StreamError) -> io::Error {
+        match err {
+            StreamError::LastOperationFailed(err) => io::Error::other(err.to_debug_string()),
+            StreamError::Closed => io::ErrorKind::BrokenPipe.into(),
+        }
+    }
+
+    let mut written = 0usize;
+    let mut remain = buf;
+    loop {
+        match stream.check_write() {
+            Ok(0) => {
+                wait_pollable(&subscription).await;
+            }
+            Ok(available) => {
+                let writable = (available as usize).min(remain.len());
+                if let Err(err) = stream.write(&remain[..writable]) {
+                    return Err(stream_err_to_io(err));
                 }
-                Ok(available) => {
-                    let writable = (available as usize).min(buf.len());
-                    match self.stream.write(&buf[0..writable]) {
-                        Ok(()) => return Ok(writable),
-                        Err(StreamError::Closed) => {
-                            return Err(io::ErrorKind::BrokenPipe.into());
-                        }
-                        Err(StreamError::LastOperationFailed(err)) => {
-                            return Err(io::Error::other(err.to_debug_string()));
-                        }
-                    }
-                }
-                Err(StreamError::Closed) => return Err(io::ErrorKind::BrokenPipe.into()),
-                Err(StreamError::LastOperationFailed(err)) => {
-                    return Err(io::Error::other(err.to_debug_string()));
+                written += writable;
+                remain = &remain[writable..];
+                if remain.is_empty() {
+                    break;
                 }
             }
+            Err(err) => return Err(stream_err_to_io(err)),
         }
+    }
+
+    stream.flush().map_err(stream_err_to_io)?;
+    wait_pollable(&subscription).await;
+
+    Ok(written)
+}
+
+impl Write for StdOut {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        write_stream(buf, &self.stream, self.subscription()).await
     }
 }
 
 impl Write for Stderr {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        loop {
-            match self.stream.check_write() {
-                Ok(0) => {
-                    self.writable().await?;
-                    continue;
-                }
-                Ok(available) => {
-                    let writable = (available as usize).min(buf.len());
-                    match self.stream.write(&buf[0..writable]) {
-                        Ok(()) => return Ok(writable),
-                        Err(StreamError::Closed) => {
-                            return Err(io::ErrorKind::BrokenPipe.into());
-                        }
-                        Err(StreamError::LastOperationFailed(err)) => {
-                            return Err(io::Error::other(err.to_debug_string()));
-                        }
-                    }
-                }
-                Err(StreamError::Closed) => return Err(io::ErrorKind::BrokenPipe.into()),
-                Err(StreamError::LastOperationFailed(err)) => {
-                    return Err(io::Error::other(err.to_debug_string()));
-                }
-            }
-        }
+        write_stream(buf, &self.stream, self.subscription()).await
     }
 }
 
