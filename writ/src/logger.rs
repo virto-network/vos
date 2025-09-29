@@ -99,10 +99,10 @@ fn write_log_formatted(w: &mut impl fmt::Write, record: &Record) -> fmt::Result 
 impl<W: fmt::Write> Log for SimpleLogger<W> {
     fn enabled(&self, metadata: &Metadata) -> bool {
         let target = metadata.target();
-        if !DEBUG_INTERNAL {
-            if target.starts_with(RUNTIME_CRATE) || target.starts_with(crate_name()) {
-                return false;
-            }
+        if !DEBUG_INTERNAL
+            && (target.starts_with(RUNTIME_CRATE) || target.starts_with(crate_name()))
+        {
+            return false;
         }
         metadata.level() <= self.level
     }

@@ -20,7 +20,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         fn main() {
             writ::logger::init(
-                writ::io::BufWriter::<_, 8192>::new(writ::io::stderr()),
+                writ::io::stderr(),
                 writ::logger::level_from_env()
             ).expect("logger initialized");
 

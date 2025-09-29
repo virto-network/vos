@@ -1,13 +1,10 @@
-use crate::{io::write_stream, wait_pollable};
+use crate::io::{read_stream, write_stream};
 use std::io;
-use wasi::{
-    filesystem::{
-        preopens::get_directories,
-        types::{
-            Descriptor, DescriptorFlags, DirectoryEntry, DirectoryEntryStream, OpenFlags, PathFlags,
-        },
+use wasi::filesystem::{
+    preopens::get_directories,
+    types::{
+        Descriptor, DescriptorFlags, DirectoryEntry, DirectoryEntryStream, OpenFlags, PathFlags,
     },
-    io::streams::StreamError,
 };
 
 type Result<T> = std::result::Result<T, io::Error>;
@@ -107,30 +104,9 @@ impl crate::io::Read for File {
 
         let subscription = stream.subscribe();
 
-        loop {
-            log::trace!("Attempting to read from stream");
-            match stream.read(buf.len() as u64) {
-                Ok(data) if data.is_empty() => {
-                    log::trace!("Got empty data, waiting for pollable");
-                    wait_pollable(&subscription).await;
-                }
-                Ok(data) => {
-                    let bytes_read = data.len();
-                    log::trace!("Read {} bytes from stream", bytes_read);
-                    buf[0..bytes_read].copy_from_slice(&data);
-                    self.position += bytes_read as u64;
-                    return Ok(bytes_read);
-                }
-                Err(StreamError::Closed) => {
-                    log::trace!("Stream is closed, returning EOF");
-                    return Ok(0);
-                }
-                Err(StreamError::LastOperationFailed(err)) => {
-                    log::trace!("Stream read failed: {:?}", err);
-                    return Err(io::Error::other(err.to_debug_string()));
-                }
-            }
-        }
+        let read = read_stream(buf, &stream, &subscription).await?;
+        self.position += read as u64;
+        Ok(read)
     }
 }
 

@@ -1,25 +1,20 @@
 #![feature(impl_trait_in_assoc_type)]
 
+use writ::io;
+
 #[writ::main]
-async fn app_main(args: writ::Arguments) {
-    println!("Hello from writ::main!");
-    println!("Arguments received: {:?}", args);
+async fn app_main(mut args: writ::Arguments) {
+    log::info!("A simple WASI task runnig async code");
+    log::debug!("Logs are written to stderr");
 
-    // Simple example of processing arguments
-    let mut args = args;
     if args.contains("--greet") {
-        if let Ok(Some(name)) = args.opt_value_from_str::<&str, String>("--name") {
-            println!("Hello, {}!", name);
-        } else {
-            println!("Hello, World!");
-        }
-    }
-
-    if args.contains("--help") {
+        println!("Please tell me your name:");
+        let mut name = String::new();
+        io::stdin().read_line(&mut name).await.expect("name");
+        println!("Hello {}!", name.trim_end());
+    } else {
         println!("Usage: simple-main [OPTIONS]");
         println!("Options:");
         println!("  --greet         Show greeting message");
-        println!("  --name <NAME>   Specify name for greeting");
-        println!("  --help          Show this help message");
     }
 }
