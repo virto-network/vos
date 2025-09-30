@@ -3118,6 +3118,7 @@ dependencies = [
  "edge-nal",
  "embedded-io-async",
  "form_urlencoded",
+ "log",
 ]
 
 [[package]]

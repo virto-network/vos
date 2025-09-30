@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+log = { workspace = true }
 edge-nal = { workspace = true }
 edge-http = { version = "0.6", default-features = false, features = ["io"] }
 embedded-io-async = { workspace = true }

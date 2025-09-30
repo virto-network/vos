@@ -41,7 +41,6 @@ where
         .await
         .map_err(Error::Io)?;
 
-    println!("[server] starting server");
     let mut server = DefaultServer::new();
     server
         .run(None, socket, Handler {
@@ -51,7 +50,7 @@ where
         })
         .await?;
 
-    println!("[server] closing server");
+    log::debug!("server closed");
     Ok(())
 }
 
@@ -106,13 +105,13 @@ where
 
     async fn handle<T, const N: usize>(
         &self,
-        _task_id: impl fmt::Display,
+        task_id: impl fmt::Display,
         conn: &mut Connection<'_, T, N>,
     ) -> Result<(), Self::Error<T::Error>>
     where
         T: Read + Write + TcpSplit,
     {
-        println!("starting handler");
+        log::trace!("received request({task_id})");
         let (h, body) = conn.split();
         let body = match h.method {
             Method::Get => None,
@@ -129,7 +128,7 @@ where
 
         let (path, query) = h.path.split_once('?').unwrap_or_else(|| (h.path, ""));
         let query = parse_urlencoded(query.as_bytes());
-        println!("[http] req {} {}", h.method, path);
+        log::trace!("Parsed headers and query for {} {}", h.method, path);
         let mut res = {
             let mut cx = self.cx.borrow_mut();
             match self.handler.borrow_mut()(cx.deref_mut(), path, query, headers, body).await {
@@ -144,15 +143,14 @@ where
                         HttpError::UnsupportedType => 415,
                         HttpError::Internal => 500,
                     };
-                    println!("[http] init err response {}", &status);
+                    log::debug!("Responding with error {}", &status);
                     conn.initiate_response(status, None, &[]).await?;
                     conn.complete_err("").await?;
-                    println!("[http] complete err response");
                     return Ok(());
                 }
             }
         };
-        println!("[http] response {:?}", &res);
+        log::trace!("Initiating successful response {:?}", &res);
         conn.initiate_response(200, None, &[]).await?;
         while let Ok(buf) = res.fill_buf().await {
             if buf.is_empty() {
@@ -163,6 +161,7 @@ where
             res.consume(len);
         }
         conn.complete().await?;
+        log::debug!("Response Ok ({task_id}");
         Ok(())
     }
 }

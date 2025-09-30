@@ -102,7 +102,10 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
             match writ::RunMode::from_args(args) {
                 Some(writ::RunMode::Nu) => writ::run_nu_plugin(mgr).await,
                 #[cfg(feature = "http")]
-                Some(writ::RunMode::HttpServer(port)) => writ::http::run_server(port, mgr).await,
+                Some(writ::RunMode::HttpServer(port)) => {
+                    log::debug!("Running http server on port {port}");
+                    writ::http::run_server(port, mgr).await
+                },
                 _ => {}
             };
         }

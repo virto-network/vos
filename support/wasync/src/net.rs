@@ -72,9 +72,8 @@ impl TcpAccept for Acceptor {
         Self: 'a;
 
     async fn accept(&self) -> Result<(SocketAddr, Self::Socket<'_>), Self::Error> {
-        println!("accepting");
+        log::trace!("Accepting connections");
         wait_pollable(&self.poll).await;
-        println!("accept pollable");
         let (socket, input, output) = match self.socket.accept().map_err(to_io_err) {
             Ok(accepted) => accepted,
             Err(e) => return Err(e),
@@ -84,6 +83,7 @@ impl TcpAccept for Acceptor {
         };
         let ip = addr.address;
         let address = SocketAddrV4::new([ip.0, ip.1, ip.2, ip.3].into(), addr.port).into();
+        log::trace!("Connected to peer {address}");
         Ok((address, TcpSocket {
             socket,
             reader: TcpReader::new(input),
@@ -120,12 +120,12 @@ impl TcpShutdown for TcpSocket {
             edge_nal::Close::Write => tcp::ShutdownType::Send,
             edge_nal::Close::Both => tcp::ShutdownType::Both,
         };
-        println!("[net] closing socket");
+        log::trace!("Closing socket {what:?}");
         self.socket.shutdown(what).map_err(to_io_err)
     }
 
     async fn abort(&mut self) -> Result<(), Self::Error> {
-        println!("[net] aborting socket");
+        log::trace!("Connection aborted");
         Ok(())
     }
 }
@@ -134,7 +134,7 @@ impl ErrorType for TcpSocket {
 }
 impl Drop for TcpSocket {
     fn drop(&mut self) {
-        println!("droping socket {}", self.socket.is_listening());
+        log::trace!("Droping socket - listening:{}", self.socket.is_listening());
         let _ = self.close(edge_nal::Close::Both);
     }
 }
@@ -169,15 +169,15 @@ impl TcpReader {
 }
 impl Readable for TcpReader {
     async fn readable(&mut self) -> Result<(), Self::Error> {
-        println!("readable");
         let subscription = self.subscription.get_or_init(|| self.input.subscribe());
         wait_pollable(subscription).await;
+        log::trace!("Socket readable");
         Ok(())
     }
 }
 impl Read for TcpReader {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        println!("reading");
+        log::trace!("Reading into buf of len {}", buf.len());
         let read = loop {
             self.readable().await?;
             match self.input.read(buf.len() as u64) {
@@ -191,6 +191,7 @@ impl Read for TcpReader {
         };
         let len = read.len();
         buf[0..len].copy_from_slice(&read);
+        log::trace!("Read {len} bytes");
         Ok(len)
     }
 }

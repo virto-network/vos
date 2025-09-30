@@ -10,7 +10,7 @@ pub use writ_macro::{bin, main};
 
 pub mod prelude {
     pub use log;
-    pub use miniserde::{json, Deserialize, Serialize};
+    pub use miniserde::{Deserialize, Serialize, json};
 }
 
 pub mod logger;
@@ -20,7 +20,7 @@ pub mod http {
     use embassy_time as _;
     // use miniserde::json;
     use protocol::{Bin, BinManager};
-    use simple_http_server::{simple_serve, Error, HttpError};
+    use simple_http_server::{Error, HttpError, simple_serve};
 
     pub async fn serve<B: BinManager>(port: u16, mgr: B) -> Result<(), Error<std::io::Error>> {
         let stack = super::net::Stack::new();
@@ -31,18 +31,16 @@ pub mod http {
             port,
             bin,
             async |bin, path, _params, _headers, _maybe_body| {
-                println!("[writ][handler] got: {path}");
-                let (_bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
-                println!("calling: '{cmd}'");
+                let (bin_name, cmd) = path.split_once('/').ok_or_else(|| HttpError::NotFound)?;
                 signature
                     .iter()
                     .find(|c| c.sig.name == cmd)
                     .ok_or(HttpError::NotFound)?;
+                log::debug!("Calling {bin_name} '{cmd}'");
                 let res = match bin.call(cmd, vec![]).await {
                     Ok(res) => res,
                     Err(err) => {
-                        // log::warn!("Bin response: {err}");
-                        println!("Bin response: {err}");
+                        log::warn!("Bin response: {err}");
                         return Err(HttpError::Internal);
                     }
                 };
