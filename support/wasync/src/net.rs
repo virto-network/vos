@@ -93,9 +93,9 @@ impl TcpAccept for Acceptor {
 }
 
 pub struct TcpSocket {
-    socket: tcp::TcpSocket,
     reader: TcpReader,
     writer: TcpWriter,
+    socket: tcp::TcpSocket,
 }
 
 impl Readable for TcpSocket {
@@ -131,12 +131,6 @@ impl TcpShutdown for TcpSocket {
 }
 impl ErrorType for TcpSocket {
     type Error = io::Error;
-}
-impl Drop for TcpSocket {
-    fn drop(&mut self) {
-        log::trace!("Droping socket - listening:{}", self.socket.is_listening());
-        let _ = self.close(edge_nal::Close::Both);
-    }
 }
 
 impl TcpSplit for TcpSocket {
@@ -199,6 +193,15 @@ impl ErrorType for TcpReader {
     type Error = io::Error;
 }
 
+impl Drop for TcpReader {
+    fn drop(&mut self) {
+        // Clean up subscription before dropping the stream
+        if let Some(subscription) = self.subscription.take() {
+            drop(subscription);
+        }
+    }
+}
+
 pub struct TcpWriter {
     output: OutputStream,
     subscription: OnceCell<Pollable>,
@@ -247,6 +250,15 @@ impl Write for TcpWriter {
 }
 impl ErrorType for TcpWriter {
     type Error = io::Error;
+}
+
+impl Drop for TcpWriter {
+    fn drop(&mut self) {
+        // Clean up subscription before dropping the stream
+        if let Some(subscription) = self.subscription.take() {
+            drop(subscription);
+        }
+    }
 }
 
 fn to_io_err(err: ErrorCode) -> io::Error {

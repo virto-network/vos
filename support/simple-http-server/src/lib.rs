@@ -134,18 +134,19 @@ where
             match self.handler.borrow_mut()(cx.deref_mut(), path, query, headers, body).await {
                 Ok(res) => res,
                 Err(e) => {
-                    let status = match e {
-                        HttpError::BadRequest => 400,
-                        HttpError::Unauthorized => 401,
-                        HttpError::Forbidden => 403,
-                        HttpError::NotFound => 404,
-                        HttpError::Timeout => 408,
-                        HttpError::UnsupportedType => 415,
-                        HttpError::Internal => 500,
+                    let (status, message) = match e {
+                        HttpError::BadRequest => (400, "Bad Request"),
+                        HttpError::Unauthorized => (401, "Unauthorized"),
+                        HttpError::Forbidden => (403, "Forbidden"),
+                        HttpError::NotFound => (404, "Not Found"),
+                        HttpError::Timeout => (408, "Request Timeout"),
+                        HttpError::UnsupportedType => (415, "Unsupported Media Type"),
+                        HttpError::Internal => (500, "Internal Server Error"),
                     };
+
                     log::debug!("Responding with error {}", &status);
-                    conn.initiate_response(status, None, &[]).await?;
-                    conn.complete_err("").await?;
+                    conn.initiate_response(status, Some(message), &[]).await?;
+                    conn.complete().await?;
                     return Ok(());
                 }
             }
