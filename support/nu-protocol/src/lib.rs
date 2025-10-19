@@ -1,7 +1,6 @@
 #![feature(macro_metavar_expr)]
 #![allow(async_fn_in_trait)]
 use embedded_io_async as io;
-use miniserde::Serialize;
 /// Minimal(quick'n dirty) implementation of the nu plugin protocol
 /// https://www.nushell.sh/contributor-book/plugins.html
 use miniserde::json::{self, Number};
@@ -13,19 +12,6 @@ pub use types::{CmdSignature, Flag, NuType, SignatureDetail};
 
 const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
-
-pub trait BinManager {
-    type Bin: Bin;
-
-    fn bin_signature() -> &'static [CmdSignature];
-
-    async fn get_bin(&self) -> Result<Self::Bin, impl io::Error>;
-    async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl io::Error>;
-}
-
-pub trait Bin {
-    async fn call(&mut self, cmd: &str, args: Vec<NuType>) -> Result<Box<dyn Serialize>, String>;
-}
 
 #[derive(Debug)]
 pub enum Error {
@@ -41,17 +27,25 @@ impl<E: io::Error> From<E> for Error {
     }
 }
 
-pub struct NuPlugin<Mgr, Io> {
-    mgr: Mgr,
+pub struct NuPlugin<Io, S> {
     io: Io,
+    signature: &'static [CmdSignature],
+    state: S,
 }
 
-impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
-    pub fn new(mgr: Mgr, io: Io) -> Self {
-        Self { mgr, io }
+impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
+    pub fn new(io: Io, signature: &'static [CmdSignature], state: S) -> Self {
+        Self {
+            io,
+            signature,
+            state,
+        }
     }
 
-    pub async fn handle_io(&mut self) -> Result<(), Error> {
+    pub async fn handle_io<F>(&mut self, call_fn: F) -> Result<(), Error>
+    where
+        F: AsyncFn(&mut S, &str, &[NuType]) -> Result<(), String> + Clone,
+    {
         use types::Request as Req;
 
         // miniserde only supports json
@@ -84,7 +78,7 @@ impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
                 }
                 Req {
                     Call: Some(call), ..
-                } => self.handle_call_request(call).await?,
+                } => self.handle_call_request(call_fn.clone(), call).await?,
                 Req {
                     EngineCallResponse: Some(_r),
                     ..
@@ -97,7 +91,11 @@ impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
         }
     }
 
-    async fn handle_call_request(&mut self, call: json::Value) -> Result<(), Error> {
+    async fn handle_call_request(
+        &mut self,
+        call_fn: impl AsyncFn(&mut S, &str, &[NuType]) -> Result<(), String>,
+        call: json::Value,
+    ) -> Result<(), Error> {
         use types::{CallType, Metadata, Response, Value};
         // we expect calls to come in a 2 element array
         let Value::Array(mut call) = call else {
@@ -110,7 +108,7 @@ impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
             Value::String(s) if s == "Signature" => {
                 respond(&mut self.io, Response {
                     CallResponse: Some((call_id, CallType {
-                        Signature: Some(Mgr::bin_signature()),
+                        Signature: Some(self.signature),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -134,8 +132,7 @@ impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
                     let (cmd_name, args) = parse_call(call).ok_or(Error::CallInvalidInput)?;
                     log::error!("calling {cmd_name} with {args:?}");
 
-                    let mut program = self.mgr.get_bin().await?;
-                    match program.call(&cmd_name, args).await {
+                    match call_fn(&mut self.state, &cmd_name, &args).await {
                         Ok(output) => {
                             log::error!("program returned {:?}", json::to_string(&output))
                         }
@@ -150,7 +147,6 @@ impl<Mgr: BinManager, Io: io::Read + io::Write> NuPlugin<Mgr, Io> {
                             .await?;
                         }
                     }
-                    self.mgr.save_bin(program).await?;
                 }
                 Some((k, Value::Object(_))) if k == "CustomValueOp" => {
                     return Err(Error::NotSupported);
