@@ -7,3 +7,6 @@ edition = "2024"
 log = { workspace = true }
 miniserde = { workspace = true }
 embedded-io-async = { workspace = true }
+
+[dev-dependencies]
+smol-macros = "0.1.1"
