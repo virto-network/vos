@@ -7,7 +7,7 @@ members = [
   "writ-examples/simple-main",
   "writ-examples/async-io",
   "support/nu-protocol",
-  "support/simple-http-server",
+  "support/simple-serve",
   "support/wasync",
 ]
 

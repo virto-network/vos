@@ -1,5 +1,5 @@
 [package]
-name = "simple-http-server"
+name = "simple-serve"
 version = "0.1.0"
 edition = "2024"
 
