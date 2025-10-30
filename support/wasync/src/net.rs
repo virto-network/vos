@@ -16,7 +16,9 @@ use wasi::{
     },
 };
 
+#[derive(Default)]
 pub struct Stack;
+
 impl Stack {
     pub const fn new() -> Self {
         Self
