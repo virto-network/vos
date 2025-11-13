@@ -193,7 +193,9 @@ pub fn stderr() -> BufWriter<Stderr> {
     BufWriter::new(Stderr::new())
 }
 
-pub fn stdio() -> Combined<BufReader<StdIn>, BufWriter<StdOut>> {
+pub type StdIo = Combined<BufReader<StdIn>, BufWriter<StdOut>>;
+
+pub fn stdio() -> StdIo {
     combine(stdin(), stdout())
 }
 
