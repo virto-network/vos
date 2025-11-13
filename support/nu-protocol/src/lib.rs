@@ -1,10 +1,15 @@
-#![feature(macro_metavar_expr)]
-#![allow(async_fn_in_trait)]
-use embedded_io_async as io;
+#![cfg_attr(not(test), no_std)]
 /// Minimal(quick'n dirty) implementation of the nu plugin protocol
 /// https://www.nushell.sh/contributor-book/plugins.html
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use embedded_io_async as io;
 use miniserde::json::{self, Number};
 use types::{Hello, Response};
+
+extern crate alloc;
 
 mod types;
 
@@ -86,7 +91,7 @@ impl<Io: io::Read + io::Write> NuPlugin<Io> {
             Hello: Some(Hello {
                 protocol: "nu-plugin".into(),
                 version: NU_VERSION.into(),
-                features: vec![],
+                features: Vec::new(),
             }),
             ..Default::default()
         })
@@ -265,7 +270,7 @@ async fn read_line<R: io::Read>(reader: &mut R, out: &mut String) -> Result<Stri
         }
         out.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
-    Ok(std::mem::take(out))
+    Ok(core::mem::take(out))
 }
 
 #[cfg(test)]

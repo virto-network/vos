@@ -1,8 +1,13 @@
+use alloc::{
+    borrow::Cow,
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use miniserde::{
     Deserialize, Serialize,
     json::{self, Number},
 };
-use std::borrow::Cow;
 // miniserde doesn't support enums with data or skipping options so we simulate an enum with a struct
 // https://github.com/dtolnay/miniserde/issues/60
 macro_rules! fake_enum {
@@ -62,7 +67,7 @@ macro_rules! de_enum {
                     }
                     fn finish(&mut self) -> miniserde::Result<()> {
                         let substitute = $name { ..Default::default() };
-                        *self.out = Some(std::mem::replace(&mut self.val, substitute));
+                        *self.out = Some(core::mem::replace(&mut self.val, substitute));
                         Ok(())
                     }
                 }
