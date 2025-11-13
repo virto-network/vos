@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-protocol = { path = "../support/nu-protocol", package = "nu-protocol" }
+nu-protocol = { path = "../support/nu-protocol" }
 writ-macro = { path = "../writ-macro" }
 log = { workspace = true }
 miniserde = { workspace = true }
@@ -13,11 +13,11 @@ pico-args = "0.5.0"
 embassy-executor = { workspace = true }
 wasync = { path = "../support/wasync", features = ["fs"]  }
 
-simple-http-server = { path = "../support/simple-http-server", optional = true }
+simple-serve = { path = "../support/simple-serve", optional = true }
 embassy-time = { workspace = true, features = ["std"], optional = true }
 
 [features]
 net = ["wasync/net"]
-http = ["net", "dep:simple-http-server", "dep:embassy-time"]
+http = ["net", "dep:simple-serve", "dep:embassy-time"]
 
 _log_internal = []
