@@ -114,6 +114,7 @@ ser_enum! {
         Metadata,
         Signature,
         Error,
+        PipelineData,
     }
 }
 #[derive(Debug, Serialize)]
@@ -153,6 +154,145 @@ pub enum NuType {
     String(String),
     Glob(String),
     Table(json::Object),
+}
+
+ser_enum! {
+    pub enum PipelineData {
+        Empty,
+        Value,
+        ListStream,
+    }
+}
+
+type Empty = ();
+type ListStream = Vec<Value>;
+
+impl PipelineData {
+    pub fn from_nu_types(values: Vec<NuType>) -> Self {
+        if values.is_empty() {
+            PipelineData {
+                Empty: Some(()),
+                Value: None,
+                ListStream: None,
+            }
+        } else if values.len() == 1 {
+            let mut values = values;
+            PipelineData {
+                Empty: None,
+                Value: Some(nu_type_to_value(values.remove(0))),
+                ListStream: None,
+            }
+        } else {
+            PipelineData {
+                Empty: None,
+                Value: None,
+                ListStream: Some(values.into_iter().map(nu_type_to_value).collect()),
+            }
+        }
+    }
+}
+
+fn nu_type_to_value(nu_type: NuType) -> Value {
+    match nu_type {
+        NuType::Binary(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Array(val));
+            obj.insert("Binary".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Bool(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Bool(val));
+            obj.insert("Bool".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Date(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::String(val));
+            obj.insert("Date".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Duration(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::String(val));
+            obj.insert("Duration".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Filesize(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::String(val));
+            obj.insert("Filesize".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Float(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Number(Number::F64(val)));
+            obj.insert("Float".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Int(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Number(Number::I64(val)));
+            obj.insert("Int".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::List(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Array(val));
+            obj.insert("List".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Nothing => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Null);
+            obj.insert("Nothing".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Number(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Number(Number::U64(val)));
+            obj.insert("Number".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Record(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Object(val));
+            obj.insert("Record".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::String(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::String(val));
+            obj.insert("String".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Glob(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::String(val));
+            obj.insert("Glob".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+        NuType::Table(val) => {
+            let mut obj = json::Object::new();
+            let mut inner = json::Object::new();
+            inner.insert("val".to_string(), Value::Object(val));
+            obj.insert("Table".to_string(), Value::Object(inner));
+            Value::Object(obj)
+        }
+    }
 }
 
 impl TryFrom<NuType> for Vec<u8> {

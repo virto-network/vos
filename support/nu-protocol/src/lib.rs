@@ -8,7 +8,7 @@ use types::{Hello, Response};
 
 mod types;
 
-pub use types::{CmdSignature, Flag, NuType, SignatureDetail};
+pub use types::{CmdSignature, Flag, NuType, PipelineData, SignatureDetail};
 
 const NU_VERSION: &str = "0.102.0";
 const VERSION: &str = "0.1.0";
@@ -27,27 +27,58 @@ impl<E: io::Error> From<E> for Error {
     }
 }
 
-pub struct NuPlugin<Io, S> {
+pub struct NuPlugin<Io> {
     io: Io,
     signature: &'static [CmdSignature],
-    state: S,
+    line_buffer: String,
 }
 
-impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
-    pub fn new(io: Io, signature: &'static [CmdSignature], state: S) -> Self {
+impl<Io: io::Read + io::Write> NuPlugin<Io> {
+    /// Respond to a Run call with a successful result
+    pub async fn respond_success(
+        &mut self,
+        call_id: u64,
+        output: Vec<NuType>,
+    ) -> Result<(), Error> {
+        use types::{CallType, PipelineData, Response};
+
+        // Convert output to PipelineData format
+        let pipeline_data = PipelineData::from_nu_types(output);
+
+        respond(&mut self.io, Response {
+            CallResponse: Some((call_id, CallType {
+                PipelineData: Some(pipeline_data),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Respond to a Run call with an error
+    pub async fn respond_error(&mut self, call_id: u64, msg: String) -> Result<(), Error> {
+        use types::{CallType, Response};
+
+        respond(&mut self.io, Response {
+            CallResponse: Some((call_id, CallType {
+                Error: Some(types::Error { msg }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .await?;
+        Ok(())
+    }
+    pub fn new(io: Io, signature: &'static [CmdSignature]) -> Self {
         Self {
             io,
             signature,
-            state,
+            line_buffer: String::new(),
         }
     }
 
-    pub async fn handle_io<F>(&mut self, call_fn: F) -> Result<(), Error>
-    where
-        F: AsyncFn(&mut S, &str, &[NuType]) -> Result<(), String> + Clone,
-    {
-        use types::Request as Req;
-
+    pub async fn inititial_handshake(&mut self) -> Result<(), Error> {
         // miniserde only supports json
         self.io.write_all(b"\x04json").await?;
         // say hello first
@@ -60,13 +91,17 @@ impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
             ..Default::default()
         })
         .await?;
+        Ok(())
+    }
 
-        let mut line = String::new();
+    pub async fn next_run_call(&mut self) -> Result<Option<(u64, String, Vec<NuType>)>, Error> {
+        use types::Request as Req;
+
         loop {
-            let req = read_line(&mut self.io, &mut line).await?;
+            let req = read_line(&mut self.io, &mut self.line_buffer).await?;
             log::error!("stdin line: '{req}'");
             if req.is_empty() || req == "\"Goodbye\"" {
-                return Ok(());
+                return Ok(None);
             }
             let req = json::from_str::<Req>(&req).map_err(|_| Error::Serde)?;
 
@@ -78,7 +113,13 @@ impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
                 }
                 Req {
                     Call: Some(call), ..
-                } => self.handle_call_request(call_fn.clone(), call).await?,
+                } => {
+                    // Respond to Signature and Metadata calls but keep looping for until the next Run call
+                    let Some(res) = self.handle_call_request(call).await? else {
+                        continue;
+                    };
+                    return Ok(Some(res));
+                }
                 Req {
                     EngineCallResponse: Some(_r),
                     ..
@@ -93,9 +134,8 @@ impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
 
     async fn handle_call_request(
         &mut self,
-        call_fn: impl AsyncFn(&mut S, &str, &[NuType]) -> Result<(), String>,
         call: json::Value,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<(u64, String, Vec<NuType>)>, Error> {
         use types::{CallType, Metadata, Response, Value};
         // we expect calls to come in a 2 element array
         let Value::Array(mut call) = call else {
@@ -114,6 +154,7 @@ impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
                     ..Default::default()
                 })
                 .await?;
+                Ok(None)
             }
             Value::String(s) if s == "Metadata" => {
                 respond(&mut self.io, Response {
@@ -126,36 +167,20 @@ impl<Io: io::Read + io::Write, S> NuPlugin<Io, S> {
                     ..Default::default()
                 })
                 .await?;
+                Ok(None)
             }
             Value::Object(mut call) => match call.pop_first() {
                 Some((k, Value::Object(call))) if k == "Run" => {
                     let (cmd_name, args) = parse_call(call).ok_or(Error::CallInvalidInput)?;
                     log::error!("calling {cmd_name} with {args:?}");
 
-                    match call_fn(&mut self.state, &cmd_name, &args).await {
-                        Ok(output) => {
-                            log::error!("program returned {:?}", json::to_string(&output))
-                        }
-                        Err(msg) => {
-                            respond(&mut self.io, Response {
-                                CallResponse: Some((call_id, CallType {
-                                    Error: Some(types::Error { msg }),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            })
-                            .await?;
-                        }
-                    }
+                    Ok(Some((call_id, cmd_name, args)))
                 }
-                Some((k, Value::Object(_))) if k == "CustomValueOp" => {
-                    return Err(Error::NotSupported);
-                }
-                Some(_) | None => return Err(Error::Protocol),
+                Some((k, Value::Object(_))) if k == "CustomValueOp" => Err(Error::NotSupported),
+                Some(_) | None => Err(Error::Protocol),
             },
-            _ => {}
-        };
-        Ok(())
+            _ => Err(Error::NotSupported),
+        }
     }
 }
 
@@ -250,15 +275,13 @@ mod tests {
     //! This test suite demonstrates the core functionality of the nu plugin protocol:
     //!
     //! ## High-Level Integration Tests
-    //! - `test_plugin_with_state_demonstration`: Shows how to create a NuPlugin with custom state,
-    //!   verifying that the plugin framework correctly holds and manages state that can be
-    //!   mutated by command handlers.
+    //! - `test_initial_handshake`: Tests the initial protocol handshake between nu and the plugin
+    //! - `test_next_run_call`: Tests receiving and parsing Run calls from nu
     //!
     //! ## Unit Tests
-    //! - Protocol message parsing and JSON serialization (`test_respond_function`)
-    //! - Type conversions between NuType variants and Rust types (`test_state_mutation`)
-    //! - Command argument parsing from protocol JSON (`test_parse_call_unit`)
-    //! - Plugin instantiation and basic structure (`test_plugin_creation`)
+    //! - Protocol message parsing and JSON serialization
+    //! - Command argument parsing from protocol JSON
+    //! - Plugin instantiation and basic structure
     //!
     //! The tests use a MockIo implementation to simulate stdin/stdout communication
     //! without requiring actual I/O operations, focusing on the core plugin framework
@@ -332,144 +355,156 @@ mod tests {
         }
     }
 
-    // Test state that will be mutated by our handler
-    #[derive(Debug, Default, PartialEq)]
-    struct TestState {
-        commands_called: Vec<String>,
-        total_args: usize,
-        last_error: Option<String>,
-    }
-
-    // Handler function for the integration test
-    async fn test_handler(
-        state: &mut TestState,
-        cmd_name: &str,
-        args: &[NuType],
-    ) -> Result<(), String> {
-        // Record every call to verify state mutation
-        state.commands_called.push(cmd_name.to_string());
-        state.total_args += args.len();
-
-        // Process different commands
-        match cmd_name {
-            "echo" => {
-                // Successful command processing
-                for arg in args {
-                    if let NuType::String(s) = arg {
-                        if s == "trigger-error" {
-                            state.last_error = Some("Intentional error".to_string());
-                            return Err("Intentional error".to_string());
-                        }
-                    }
-                }
-                Ok(())
-            }
-            "test" => {
-                // Another successful command
-                Ok(())
-            }
-            _ => {
-                // Unknown command
-                let error = format!("Unknown command: {}", cmd_name);
-                state.last_error = Some(error.clone());
-                Err(error)
-            }
-        }
-    }
-
     test! {
-        async fn test_handle_io_integration() {
-            // THE MAIN TEST: This tests the handle_io method which is the core public API
+        async fn test_next_run_call() {
+            // Test receiving and parsing Run calls
 
             let mut mock_io = MockIo::new();
 
-            // Set up complete protocol conversation
+            // Set up protocol conversation
             // 1. Nu sends hello
             mock_io.add_input(r#"{"Hello":{"protocol":"nu-plugin","version":"0.102.0","features":[]}}"#);
             mock_io.add_input("\n");
 
-            // 2. Nu requests signature
+            // 2. Nu requests signature (should be handled internally)
             mock_io.add_input(r#"{"Call":[1,"Signature"]}"#);
             mock_io.add_input("\n");
 
-            // 3. Nu requests metadata
+            // 3. Nu requests metadata (should be handled internally)
             mock_io.add_input(r#"{"Call":[2,"Metadata"]}"#);
             mock_io.add_input("\n");
 
-            // 4. Nu calls our command (successful)
+            // 4. Nu calls our command - this should be returned
             mock_io.add_input(r#"{"Call":[3,{"Run":{"name":"plugin echo","call":{"named":[["msg",{"String":{"val":"hello world"}}]]}}}]}"#);
             mock_io.add_input("\n");
 
-            // 5. Nu calls another command (also successful)
+            // 5. Another command
             mock_io.add_input(r#"{"Call":[4,{"Run":{"name":"plugin test","call":{"named":[["flag",{"Bool":{"val":true}}],["count",{"Int":{"val":42}}]]}}}]}"#);
             mock_io.add_input("\n");
 
             // 6. Goodbye
             mock_io.add_input("\"Goodbye\"\n");
 
-            // Create plugin with test state
             const EMPTY_SIGS: &[CmdSignature] = &[];
-            let initial_state = TestState {
-                commands_called: vec![],
-                total_args: 0,
-                last_error: None,
-            };
-            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS, initial_state);
+            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS);
 
-            // THIS IS THE KEY TEST: Call handle_io with our handler
-            let result = plugin.handle_io(test_handler).await;
+            // Initialize handshake first (plugin says hello to nu)
+            plugin.inititial_handshake().await.unwrap();
 
-            // Verify handle_io succeeded
-            assert!(result.is_ok(), "handle_io should succeed: {:?}", result);
+            // Track commands externally since plugin no longer manages state
+            let mut commands_called = Vec::new();
+            let mut total_args = 0;
 
-            // Verify IO outputs (protocol compliance)
+            // First call should return the echo command
+            // (Hello, Signature, and Metadata are handled internally)
+            let result = plugin.next_run_call().await;
+            assert!(result.is_ok(), "next_run_call should succeed: {:?}", result);
+
+            if let Ok(Some((call_id, cmd_name, args))) = result {
+                assert_eq!(call_id, 3);
+                assert_eq!(cmd_name, "echo");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], NuType::String(s) if s == "hello world"));
+                commands_called.push(cmd_name);
+                total_args += args.len();
+            } else {
+                panic!("Expected Some((call_id, cmd, args)), got {:?}", result);
+            }
+
+            // Second call should return the test command
+            let result = plugin.next_run_call().await;
+            assert!(result.is_ok(), "next_run_call should succeed: {:?}", result);
+
+            if let Ok(Some((call_id, cmd_name, args))) = result {
+                assert_eq!(call_id, 4);
+                assert_eq!(cmd_name, "test");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], NuType::Bool(true)));
+                assert!(matches!(&args[1], NuType::Int(42)));
+                commands_called.push(cmd_name);
+                total_args += args.len();
+            } else {
+                panic!("Expected Some((call_id, cmd, args)), got {:?}", result);
+            }
+
+            // Third call should return None (Goodbye)
+            let result = plugin.next_run_call().await;
+            assert!(result.is_ok(), "next_run_call should succeed: {:?}", result);
+            assert!(result.unwrap().is_none(), "Should return None for Goodbye");
+
+            // Verify we tracked the commands correctly
+            assert_eq!(commands_called, vec!["echo", "test"]);
+            assert_eq!(total_args, 3);
+
+            // Verify protocol messages were sent
             let output = plugin.io.get_output();
-            assert!(output.starts_with("\x04json"), "Should start with protocol marker");
-            assert!(output.contains(r#""Hello""#), "Should contain Hello response");
-            assert!(output.contains(r#""protocol":"nu-plugin""#), "Should contain protocol");
             assert!(output.contains(r#""Signature""#), "Should contain Signature response");
             assert!(output.contains(r#""Metadata""#), "Should contain Metadata response");
-            assert!(output.contains(r#""version":"0.1.0""#), "Should contain plugin version");
-
-            // Verify state mutations (the key integration test!)
-            assert_eq!(plugin.state.commands_called, vec!["echo", "test"], "Handler should have been called with both commands");
-            assert_eq!(plugin.state.total_args, 3, "Should have processed 3 total arguments (1 + 2)");
-            assert!(plugin.state.last_error.is_none(), "Should have no errors for successful commands");
         }
     }
 
     test! {
-        async fn test_handle_io_with_error() {
-            // Test handle_io with a command that triggers an error
+        async fn test_respond_success() {
+            // Test responding to a Run call with success
 
-            let mut mock_io = MockIo::new();
-
-            // Minimal protocol + error-triggering command
-            mock_io.add_input(r#"{"Hello":{"protocol":"nu-plugin","version":"0.102.0","features":[]}}"#);
-            mock_io.add_input("\n");
-
-            // Command that will trigger an error in our handler
-            mock_io.add_input(r#"{"Call":[5,{"Run":{"name":"plugin echo","call":{"named":[["msg",{"String":{"val":"trigger-error"}}]]}}}]}"#);
-            mock_io.add_input("\n");
-
-            mock_io.add_input("\"Goodbye\"\n");
+            let mock_io = MockIo::new();
 
             const EMPTY_SIGS: &[CmdSignature] = &[];
-            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS, TestState::default());
+            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS);
 
-            // Call handle_io - should succeed even though handler returns error
-            let result = plugin.handle_io(test_handler).await;
-            assert!(result.is_ok(), "handle_io should succeed even when handler fails");
+            // Test responding with a single value
+            let result = plugin.respond_success(123, vec![NuType::String("success".to_string())]).await;
+            assert!(result.is_ok(), "respond_success should succeed");
 
-            // Verify error was handled properly in protocol
             let output = plugin.io.get_output();
-            assert!(output.contains(r#""Error""#), "Should contain Error response");
-            assert!(output.contains(r#""Intentional error""#), "Should contain our error message");
+            assert!(output.contains(r#""CallResponse""#), "Should contain CallResponse");
+            assert!(output.contains(r#""PipelineData""#), "Should contain PipelineData");
+            assert!(output.contains(r#"123"#), "Should contain call_id");
+            assert!(output.contains(r#""String""#), "Should contain String type");
+            assert!(output.contains(r#""success""#), "Should contain the value");
+        }
+    }
 
-            // Verify state was still mutated even though handler returned error
-            assert_eq!(plugin.state.commands_called, vec!["echo"], "Handler should have been called");
-            assert_eq!(plugin.state.total_args, 1, "Should have processed 1 argument");
-            assert_eq!(plugin.state.last_error, Some("Intentional error".to_string()), "Should record the error");
+    test! {
+        async fn test_respond_error() {
+            // Test responding to a Run call with an error
+
+            let mock_io = MockIo::new();
+
+            const EMPTY_SIGS: &[CmdSignature] = &[];
+            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS);
+
+            // Test responding with an error
+            let result = plugin.respond_error(456, "Something went wrong".to_string()).await;
+            assert!(result.is_ok(), "respond_error should succeed");
+
+            let output = plugin.io.get_output();
+            assert!(output.contains(r#""CallResponse""#), "Should contain CallResponse");
+            assert!(output.contains(r#""Error""#), "Should contain Error");
+            assert!(output.contains(r#"456"#), "Should contain call_id");
+            assert!(output.contains(r#""Something went wrong""#), "Should contain error message");
+        }
+    }
+
+    test! {
+        async fn test_respond_empty() {
+            // Test responding with empty output (Nothing)
+
+            let mock_io = MockIo::new();
+
+            const EMPTY_SIGS: &[CmdSignature] = &[];
+            let mut plugin = NuPlugin::new(mock_io, EMPTY_SIGS);
+
+            // Test responding with empty output
+            let result = plugin.respond_success(789, vec![]).await;
+            assert!(result.is_ok(), "respond_success with empty should succeed");
+
+            let output = plugin.io.get_output();
+            assert!(output.contains(r#""CallResponse""#), "Should contain CallResponse");
+            assert!(output.contains(r#""PipelineData""#), "Should contain PipelineData");
+            assert!(output.contains(r#"789"#), "Should contain call_id");
+            // Empty PipelineData should serialize as null
+            assert!(output.contains(r#"null"#), "Should contain null for empty");
         }
     }
 }
