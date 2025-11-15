@@ -9,7 +9,6 @@ pub use pico_args::Arguments;
 pub use task::*;
 #[cfg(feature = "net")]
 pub use wasync::net;
-use wasync::wasi::clocks::wall_clock::now;
 pub use wasync::{fs, io, run, wasi};
 pub use writ_macro::{bin, main};
 
@@ -17,36 +16,20 @@ pub mod prelude {
     pub use log;
     pub use miniserde::{Deserialize, Serialize, json};
 }
-use wasi::clocks::wall_clock::Datetime;
 
 pub mod logger;
 pub mod protocol;
+pub mod storage;
 mod task;
 
-pub trait TaskStorage<S> {
-    type Error;
-    async fn initialize(name: &str) -> Result<Datetime, Self::Error>;
-    async fn update(name: &str, state: &S) -> Result<(), Self::Error>;
-    async fn restore(name: &str) -> Result<Option<(Datetime, S)>, Self::Error>;
-}
-
-pub struct NoStore;
-impl<S> TaskStorage<S> for NoStore {
-    type Error = ();
-    async fn initialize(_name: &str) -> Result<Datetime, Self::Error> {
-        Ok(now())
-    }
-    async fn update(name: &str, state: &S) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    async fn restore(name: &str) -> Result<Option<(Datetime, S)>, Self::Error> {
-        Ok(None)
-    }
+pub trait State: Sized {
+    const META: &'static Metadata;
+    type Storage: storage::TaskStorage<Self>;
 }
 
 impl State for json::Value {
     const META: &'static task::Metadata = &task::Metadata::simple_crud_task();
-    type Storage = NoStore;
+    type Storage = storage::NoStore;
 }
 
 #[derive(Debug)]

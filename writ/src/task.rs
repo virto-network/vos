@@ -1,15 +1,8 @@
-use crate::protocol::Protocol;
 use crate::wasi::clocks::wall_clock::Datetime;
-use crate::{TaskStorage, TyDef, json};
-use pico_args::Arguments;
+use crate::{State, TyDef, json, protocol::Protocol, storage::TaskStorage};
 use std::ascii::Char;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-
-pub trait State: Sized {
-    const META: &'static Metadata;
-    type Storage: TaskStorage<Self>;
-}
 
 type Error<S> = <<S as State>::Storage as TaskStorage<S>>::Error;
 
@@ -56,15 +49,14 @@ impl fmt::Debug for TaskName {
 /// let task = if let Some(task) = Task::resume().await? { taks } else {
 ///     Task::<Foo>::init(|_| Foo(true)).await?
 /// };
+/// let protocol = Protocol::detect();
 ///
-/// while let Some(action) = task.wait_for_action(Simple).await {
-///     let result = match action {
-///         Query(name, params) => task.run_to_completion(name, pararms).await,
+/// protocol.wait_for_actions(task.name(), async |action| {
+///     match action {
+///         Query(name, params) => task.run(name, pararms).await,
 ///         Command(name, params) => task.run_in_background(name, params).await,
-///     };
-///     task.finish(action, result).await;
-/// )
-/// }
+///     }
+/// }).await;
 /// # }
 /// ```
 pub struct Task<S = json::Value> {
@@ -116,21 +108,19 @@ impl<S: State> Task<S> {
 
     pub async fn run_to_completion(
         &self,
-        action_name: &str,
-        params: impl Iterator<Item = (String, String)>,
+        _action_name: &str,
+        _params: impl Iterator<Item = (String, String)>,
     ) -> Result<(), Error<S>> {
         todo!()
     }
 
     pub async fn run_in_background(
         &self,
-        action_name: &str,
-        params: impl Iterator<Item = (String, String)>,
+        _action_name: &str,
+        _params: impl Iterator<Item = (String, String)>,
     ) -> Result<(), Error<S>> {
         todo!()
     }
-
-    pub async fn finish<T>(&self, action: &Action, result: T) {}
 
     async fn update(&self) -> Result<(), Error<S>> {
         S::Storage::update(self.name.as_ref(), &self.state).await
@@ -140,6 +130,10 @@ impl<S: State> Task<S> {
 impl<S> Task<S> {
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     pub async fn wait_for_action(&self, protocol: Protocol) {
@@ -166,27 +160,6 @@ impl<S> Deref for Task<S> {
 impl<S> DerefMut for Task<S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.state
-    }
-}
-
-///
-pub enum Action {
-    Query(String, Box<dyn Iterator<Item = (String, String)>>),
-    Command(String, Box<dyn Iterator<Item = (String, String)>>),
-}
-impl Action {
-    fn name(&self) -> &str {
-        match self {
-            Action::Query(name, _) => name,
-            Action::Command(name, _) => name,
-        }
-    }
-
-    fn params(&self) -> &dyn Iterator<Item = (String, String)> {
-        match self {
-            Action::Query(_, iterator) => &*iterator,
-            Action::Command(_, iterator) => &*iterator,
-        }
     }
 }
 

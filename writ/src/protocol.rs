@@ -1,4 +1,7 @@
+use miniserde::json::Value;
 use pico_args::Arguments;
+
+use crate::State;
 
 pub enum Protocol {
     Simple,
@@ -17,18 +20,100 @@ impl Protocol {
             Protocol::Simple
         }
     }
+
+    pub fn detect() -> Self {
+        Self::from_args(Arguments::from_env())
+    }
+
+    pub async fn wait_for_actions<S: State>(
+        &self,
+        task_name: &str,
+        on_action: impl AsyncFnMut(Action) -> Result<(), ()>,
+    ) {
+        match self {
+            Protocol::Simple => todo!(),
+            Protocol::Nu => nu::wait_for_actions(task_name, S::META, on_action).await,
+            Protocol::HttpRpc(_) => todo!(),
+        };
+    }
+}
+
+///
+pub enum Action {
+    Query(
+        &'static str,
+        Box<dyn Iterator<Item = (&'static str, Value)>>,
+    ),
+    Command(
+        &'static str,
+        Box<dyn Iterator<Item = (&'static str, Value)>>,
+    ),
+}
+impl Action {
+    pub fn name(&self) -> &str {
+        match self {
+            Action::Query(name, _) => name,
+            Action::Command(name, _) => name,
+        }
+    }
+
+    pub fn params(&self) -> &dyn Iterator<Item = (&'static str, Value)> {
+        match self {
+            Action::Query(_, iterator) => &*iterator,
+            Action::Command(_, iterator) => &*iterator,
+        }
+    }
 }
 
 pub mod nu {
-    use crate::{Metadata, State, Task, io::stdio};
-    use nu_protocol::{CmdSignature, Flag, NuPlugin, SignatureDetail};
+    use crate::{Metadata, TyDef, io::stdio};
+    use miniserde::json;
+    use nu_protocol::{Args, CmdSignature, Flag, NuPlugin, SignatureDetail};
 
-    pub async fn run_plugin<S: State>(task: &mut crate::Task<S>) {
-        let signature = to_nu_signature(task.name(), Task::<S>::metadata());
-        let mut nu = NuPlugin::new(stdio(), &signature, &mut *task);
-        if let Err(e) = nu.handle_io(async |_, _, _| Ok(())).await {
-            log::error!("Nu protocol: {e:?}");
+    pub async fn wait_for_actions(
+        task_name: &str,
+        meta: &Metadata,
+        mut on_action: impl AsyncFnMut(super::Action) -> Result<(), ()>,
+    ) {
+        let signature = to_nu_signature(task_name, meta);
+        let mut nu = NuPlugin::new(stdio(), &signature);
+        nu.inititial_handshake()
+            .await
+            .expect("Nu initial handshake");
+
+        while let Some((call_id, name, params)) = nu.next_run_call().await.unwrap() {
+            let action = if let Some(ty) = verify_action_exists(&name, meta.queries) {
+                let params = verify_params(params, ty);
+                super::Action::Query(ty.name, params)
+            } else if let Some(ty) = verify_action_exists(&name, meta.commands) {
+                let params = verify_params(params, ty);
+                super::Action::Command(ty.name, params)
+            } else {
+                continue;
+            };
+            // TODO return and send values from handler
+            if let Err(_) = on_action(action).await {
+                log::warn!("{task_name}::{name} returned error");
+                let _ = nu.respond_error(call_id, "".into()).await;
+            } else {
+                let _ = nu.respond_success(call_id, Vec::new()).await;
+            }
         }
+    }
+
+    fn verify_action_exists<'a>(name: &str, def: &'a [TyDef]) -> Option<&'a TyDef> {
+        def.iter().find(|t| name == t.name)
+    }
+
+    fn verify_params(
+        mut params: Args,
+        ty: &TyDef,
+    ) -> Box<dyn Iterator<Item = (&str, json::Value)>> {
+        Box::new(
+            ty.args
+                .iter()
+                .filter_map(move |a| Some((a.name, params.remove(a.name)?))),
+        ) as Box<dyn Iterator<Item = _>>
     }
 
     pub fn to_nu_signature(ns: &str, meta: &Metadata) -> &'static [CmdSignature] {
@@ -77,10 +162,7 @@ pub mod http_rpc {
     // use miniserde::json;
     use simple_serve::{Action, Error, HttpError, Method};
 
-    pub async fn serve_task<T: Task>(
-        port: u16,
-        id: Option<T::Id>,
-    ) -> Result<(), Error<std::io::Error>> {
+    pub async fn serve_task(port: u16, name: &str) -> Result<(), Error<std::io::Error>> {
         let task = T::get_or_new(id).await;
         simple_serve::rpc(port, task, async |task, action| {
             // signature
