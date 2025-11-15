@@ -50,7 +50,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn task(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemMod);
     let mod_name = &input.ident;
     let mut content = input.content.expect("Module must have a body").1;
@@ -84,7 +84,7 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let metadata = metadata(mod_name, &methods);
-    let bin_impl = impl_bin(mod_name, &storage_name, &methods);
+    let task_impl = impl_task(mod_name, &storage_name, &methods);
 
     let expanded = quote! {
         pub mod #mod_name {
@@ -92,22 +92,22 @@ pub fn bin(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#content)*
         }
 
-        #bin_impl
+        #task_impl
 
         #metadata
 
         #[writ::main]
         async fn main(args: writ::Arguments) {
-            let mgr = __bin::get_manager();
-            match writ::RunMode::from_args(args) {
-                Some(writ::RunMode::Nu) => writ::run_nu_plugin(mgr).await,
-                #[cfg(feature = "http")]
-                Some(writ::RunMode::HttpServer(port)) => {
-                    log::debug!("Running http server on port {port}");
-                    writ::http::run_server(port, mgr).await
-                },
-                _ => {}
+            let task = if let Some(task) = writ::Task::resume().await.expect("Resume") { task } else {
+                writ::Task::init(async |_| #mod_name::#storage_name::default()).await.expect("Initialized")
             };
+            let protocol = writ::Protocol::detect();
+            protocol.wait_for_actions::<#mod_name::#storage_name>(task.name(), async |action| {
+                match action {
+                    writ::Action::Query(name, params) => task.run(name, params).await,
+                    writ::Action::Command(name, params) => task.run_in_background(name, params).await,
+                }
+            }).await;
         }
 
     };
@@ -124,7 +124,7 @@ struct MethodInfo {
 }
 
 fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
-    let (idents, cmds) = methods
+    let (idents, ty_defs) = methods
         .iter()
         .map(|m| {
             let args = m.args.iter().map(|(id, ty)| {
@@ -137,36 +137,37 @@ fn metadata(mod_name: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
             let name = m.name.to_string();
             let name_up = Ident::new(&name.to_uppercase(), Span::mixed_site().into());
             let desc = m.doc.clone().unwrap_or_default();
-            let const_cmd = parse2::<ItemConst>(quote! {
-                const #name_up: writ::Cmd = writ::Cmd {
+            let const_def = parse2::<ItemConst>(quote! {
+                const #name_up: writ::TyDef = writ::TyDef {
                     name: #name,
                     desc: #desc,
                     args: &[#(#args),*],
                 };
             })
             .expect("const");
-            (name_up, const_cmd)
+            (name_up, const_def)
         })
         .unzip::<_, _, Vec<_>, Vec<_>>();
     let name = mod_name.to_string();
     parse2(quote! {
         mod __meta {
-            use std::sync::OnceLock;
-
-            #(#cmds)*
-            pub const CMDS: &[&writ::Cmd] = &[#(&#idents),*];
-            static NU_SIGNATURE: OnceLock<Vec<writ::protocol::CmdSignature>> = OnceLock::new();
-            pub fn signature() -> &'static [writ::protocol::CmdSignature] {
-                let sig = NU_SIGNATURE.get_or_init(||  writ::to_nu_signature(#name, CMDS));
-                sig.as_slice()
+            #(#ty_defs)*
+            pub const fn metadata() -> writ::Metadata {
+                writ::Metadata {
+                    version: 0,
+                    default_name: writ::TaskName::from_str(#name),
+                    constructors: &[],
+                    queries: &[],
+                    commands: &[#(&#idents),*],
+                }
             }
         }
     })
     .expect("meta mod")
 }
 
-fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
-    let cmds = methods
+fn impl_task(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::ItemMod {
+    let _cmds = methods
         .iter()
         .map(|m| {
             let name = m.name.clone();
@@ -193,42 +194,10 @@ fn impl_bin(mod_name: &Ident, data: &Ident, methods: &[MethodInfo]) -> syn::Item
         .collect::<Vec<_>>();
 
     parse2(quote! {
-        mod __bin {
-            use std::future::Future;
-            use writ::prelude::Serialize;
-
-            pub static BIN_MANAGER: std::sync::OnceLock<Manager> = std::sync::OnceLock::new();
-            pub fn get_manager() -> &'static Manager {
-                BIN_MANAGER.get_or_init(|| Manager)
-            }
-
-            pub struct Manager;
-            impl writ::protocol::BinManager for &Manager {
-                type Bin = super::#mod_name::#data;
-                fn bin_signature() -> &'static [writ::protocol::CmdSignature] {
-                    super::__meta::signature()
-                }
-                async fn get_bin(&self) -> Result<Self::Bin, impl writ::io::Error> {
-                    // TODO
-                    Ok::<_, std::io::Error>(Default::default())
-                }
-                async fn save_bin(&mut self, bin: Self::Bin) -> Result<(), impl writ::io::Error> {
-                    // TODO
-                    Ok::<_, std::io::Error>(())
-                }
-            }
-
-            impl writ::protocol::Bin for super::#mod_name::#data {
-                async fn call(
-                    &mut self,
-                    cmd: &str,
-                    mut args: Vec<writ::protocol::NuType>
-                ) -> Result<Box<dyn Serialize>, String> {
-                    match cmd {
-                        #(#cmds)*
-                        _ => Err("Not Found".into()),
-                    }
-                }
+        mod __state {
+            impl writ::State for super::#mod_name::#data {
+                const META: &'static writ::Metadata = &super::__meta::metadata();
+                type Storage = writ::storage::NoStore;
             }
         }
     })

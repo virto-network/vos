@@ -1,7 +1,5 @@
-use miniserde::json::Value;
-use pico_args::Arguments;
-
 use crate::State;
+use pico_args::Arguments;
 
 pub enum Protocol {
     Simple,
@@ -28,7 +26,7 @@ impl Protocol {
     pub async fn wait_for_actions<S: State>(
         &self,
         task_name: &str,
-        on_action: impl AsyncFnMut(Action) -> Result<(), ()>,
+        on_action: impl AsyncFnMut(crate::Action) -> Result<(), ()>,
     ) {
         match self {
             Protocol::Simple => todo!(),
@@ -38,34 +36,7 @@ impl Protocol {
     }
 }
 
-///
-pub enum Action {
-    Query(
-        &'static str,
-        Box<dyn Iterator<Item = (&'static str, Value)>>,
-    ),
-    Command(
-        &'static str,
-        Box<dyn Iterator<Item = (&'static str, Value)>>,
-    ),
-}
-impl Action {
-    pub fn name(&self) -> &str {
-        match self {
-            Action::Query(name, _) => name,
-            Action::Command(name, _) => name,
-        }
-    }
-
-    pub fn params(&self) -> &dyn Iterator<Item = (&'static str, Value)> {
-        match self {
-            Action::Query(_, iterator) => &*iterator,
-            Action::Command(_, iterator) => &*iterator,
-        }
-    }
-}
-
-pub mod nu {
+mod nu {
     use crate::{Metadata, TyDef, io::stdio};
     use miniserde::json;
     use nu_protocol::{Args, CmdSignature, Flag, NuPlugin, SignatureDetail};
@@ -73,7 +44,7 @@ pub mod nu {
     pub async fn wait_for_actions(
         task_name: &str,
         meta: &Metadata,
-        mut on_action: impl AsyncFnMut(super::Action) -> Result<(), ()>,
+        mut on_action: impl AsyncFnMut(crate::Action) -> Result<(), ()>,
     ) {
         let signature = to_nu_signature(task_name, meta);
         let mut nu = NuPlugin::new(stdio(), &signature);
@@ -84,10 +55,10 @@ pub mod nu {
         while let Some((call_id, name, params)) = nu.next_run_call().await.unwrap() {
             let action = if let Some(ty) = verify_action_exists(&name, meta.queries) {
                 let params = verify_params(params, ty);
-                super::Action::Query(ty.name, params)
+                crate::Action::Query(ty.name, params)
             } else if let Some(ty) = verify_action_exists(&name, meta.commands) {
                 let params = verify_params(params, ty);
-                super::Action::Command(ty.name, params)
+                crate::Action::Command(ty.name, params)
             } else {
                 continue;
             };
@@ -101,8 +72,8 @@ pub mod nu {
         }
     }
 
-    fn verify_action_exists<'a>(name: &str, def: &'a [TyDef]) -> Option<&'a TyDef> {
-        def.iter().find(|t| name == t.name)
+    fn verify_action_exists<'a>(name: &str, def: &'a [&'a TyDef]) -> Option<&'a TyDef> {
+        def.into_iter().find(|t| name == t.name).map(|t| *t)
     }
 
     fn verify_params(
@@ -157,7 +128,7 @@ pub mod nu {
 }
 
 #[cfg(feature = "http")]
-pub mod http_rpc {
+mod http_rpc {
     use embassy_time as _;
     // use miniserde::json;
     use simple_serve::{Action, Error, HttpError, Method};

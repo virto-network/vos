@@ -106,10 +106,10 @@ impl<S: State> Task<S> {
         }))
     }
 
-    pub async fn run_to_completion(
+    pub async fn run(
         &self,
         _action_name: &str,
-        _params: impl Iterator<Item = (String, String)>,
+        _params: impl Iterator<Item = (&str, json::Value)>,
     ) -> Result<(), Error<S>> {
         todo!()
     }
@@ -117,7 +117,7 @@ impl<S: State> Task<S> {
     pub async fn run_in_background(
         &self,
         _action_name: &str,
-        _params: impl Iterator<Item = (String, String)>,
+        _params: impl Iterator<Item = (&str, json::Value)>,
     ) -> Result<(), Error<S>> {
         todo!()
     }
@@ -174,9 +174,9 @@ pub struct Stats {
 pub struct Metadata {
     pub version: u16,
     pub default_name: TaskName,
-    pub constructors: &'static [TyDef],
-    pub queries: &'static [TyDef],
-    pub commands: &'static [TyDef],
+    pub constructors: &'static [&'static TyDef],
+    pub queries: &'static [&'static TyDef],
+    pub commands: &'static [&'static TyDef],
 }
 
 impl Metadata {

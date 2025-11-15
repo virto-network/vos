@@ -1,6 +1,6 @@
 #![feature(impl_trait_in_assoc_type)]
 
-#[writ::bin]
+#[writ::task]
 mod demo {
     use std::collections::BTreeMap;
 
