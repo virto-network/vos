@@ -6,7 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use embedded_io_async as io;
-use miniserde::json::{self, Number};
+use miniserde::json::{self, Number, Value};
 use types::{Hello, Response};
 
 extern crate alloc;
@@ -31,6 +31,8 @@ impl<E: io::Error> From<E> for Error {
         Error::Io
     }
 }
+
+pub type Args = alloc::collections::BTreeMap<String, Value>;
 
 pub struct NuPlugin<Io> {
     io: Io,
@@ -99,7 +101,7 @@ impl<Io: io::Read + io::Write> NuPlugin<Io> {
         Ok(())
     }
 
-    pub async fn next_run_call(&mut self) -> Result<Option<(u64, String, Vec<NuType>)>, Error> {
+    pub async fn next_run_call(&mut self) -> Result<Option<(u64, String, Args)>, Error> {
         use types::Request as Req;
 
         loop {
@@ -140,7 +142,7 @@ impl<Io: io::Read + io::Write> NuPlugin<Io> {
     async fn handle_call_request(
         &mut self,
         call: json::Value,
-    ) -> Result<Option<(u64, String, Vec<NuType>)>, Error> {
+    ) -> Result<Option<(u64, String, Args)>, Error> {
         use types::{CallType, Metadata, Response, Value};
         // we expect calls to come in a 2 element array
         let Value::Array(mut call) = call else {
@@ -189,7 +191,29 @@ impl<Io: io::Read + io::Write> NuPlugin<Io> {
     }
 }
 
-fn parse_call(mut call: json::Object) -> Option<(String, Vec<NuType>)> {
+pub fn to_nu_type(ty: &str, val: json::Value) -> Option<NuType> {
+    use json::{Number, Value};
+    match (ty, val) {
+        ("Binary", Value::Array(val)) => Some(NuType::Binary(val)),
+        ("Bool", Value::Bool(val)) => Some(NuType::Bool(val)),
+        ("Date", Value::String(val)) => Some(NuType::Date(val)),
+        ("Duration", Value::String(val)) => Some(NuType::Duration(val)),
+        ("Filesize", Value::String(val)) => Some(NuType::Filesize(val)),
+        ("Float", Value::Number(Number::F64(val))) => Some(NuType::Float(val)),
+        ("Int", Value::Number(Number::I64(val))) => Some(NuType::Int(val)),
+        ("Int", Value::Number(Number::U64(val))) => Some(NuType::Int(val as i64)),
+        ("List", Value::Array(val)) => Some(NuType::List(val)),
+        ("Nothing", Value::Null) => Some(NuType::Nothing),
+        ("Number", Value::Number(Number::U64(val))) => Some(NuType::Number(val)),
+        ("Record", Value::Object(val)) => Some(NuType::Record(val)),
+        ("String", Value::String(val)) => Some(NuType::String(val)),
+        ("Glob", Value::String(val)) => Some(NuType::Glob(val)),
+        ("Table", Value::Object(val)) => Some(NuType::Table(val)),
+        _ => return None,
+    }
+}
+
+fn parse_call(mut call: json::Object) -> Option<(String, Args)> {
     use json::Value;
     let Value::String(cmd_name) = call.remove("name")? else {
         return None;
@@ -203,7 +227,7 @@ fn parse_call(mut call: json::Object) -> Option<(String, Vec<NuType>)> {
     let Value::Array(args) = args.remove("named")? else {
         return None;
     };
-    let mut parsed_args = Vec::with_capacity(args.len());
+    let mut arguments = Args::new();
     for arg in args {
         let Value::Array(mut arg) = arg else {
             return None;
@@ -217,27 +241,12 @@ fn parse_call(mut call: json::Object) -> Option<(String, Vec<NuType>)> {
         let (ty, Value::Object(mut val)) = val.pop_first()? else {
             return None;
         };
-        let ty = match (ty.as_str(), val.remove("val")) {
-            ("Binary", Some(Value::Array(val))) => NuType::Binary(val),
-            ("Bool", Some(Value::Bool(val))) => NuType::Bool(val),
-            ("Date", Some(Value::String(val))) => NuType::Date(val),
-            ("Duration", Some(Value::String(val))) => NuType::Duration(val),
-            ("Filesize", Some(Value::String(val))) => NuType::Filesize(val),
-            ("Float", Some(Value::Number(Number::F64(val)))) => NuType::Float(val),
-            ("Int", Some(Value::Number(Number::I64(val)))) => NuType::Int(val),
-            ("Int", Some(Value::Number(Number::U64(val)))) => NuType::Int(val as i64),
-            ("List", Some(Value::Array(val))) => NuType::List(val),
-            ("Nothing", Some(Value::Null)) => NuType::Nothing,
-            ("Number", Some(Value::Number(Number::U64(val)))) => NuType::Number(val),
-            ("Record", Some(Value::Object(val))) => NuType::Record(val),
-            ("String", Some(Value::String(val))) => NuType::String(val),
-            ("Glob", Some(Value::String(val))) => NuType::Glob(val),
-            ("Table", Some(Value::Object(val))) => NuType::Table(val),
-            _ => return None,
+        let Some(val) = val.remove("val") else {
+            return None;
         };
-        parsed_args.push(ty);
+        arguments.insert(ty, val);
     }
-    Some((cmd_name.into(), parsed_args))
+    Some((cmd_name.into(), arguments))
 }
 
 async fn respond<W: io::Write>(out: &mut W, msg: Response) -> Result<(), W::Error> {
