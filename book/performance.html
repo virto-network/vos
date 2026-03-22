@@ -1,0 +1,777 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Performance &amp; Scalability - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="performance--scalability"><a class="header" href="#performance--scalability">Performance &amp; Scalability</a></h1>
+<p>This chapter provides concrete performance analysis for Kunekt’s
+protocol stack. Every number is either measured, estimated from known
+properties of the underlying primitives, or clearly marked as
+uncertain. The goal is to give implementers a realistic understanding
+of where the performance boundaries are, what can be optimized, and
+what is fundamentally constrained.</p>
+<p>For the protocol layers referenced here, see
+<a href="./architecture.html">Architecture Overview</a>. For security properties
+and their costs, see <a href="./security-analysis.html">Security Analysis</a>.</p>
+<hr>
+<h2 id="1-performance-budget"><a class="header" href="#1-performance-budget">1. Performance Budget</a></h2>
+<p>A single collaborative operation — one user types a character, that
+edit reaches a remote peer and is applied — passes through every layer
+of the stack. The following table breaks down the latency contribution
+of each stage for a typical real-time editing session using 100ms
+operation batching.</p>
+<pre><code>Stage                                    Latency (estimate)
+─────────────────────────────────────────────────────────────
+CRDT operation generation (Automerge)    &lt; 1 ms
+Merkle-DAG node creation + CID          &lt; 1 ms
+  (Blake3 hash of serialized node)
+MLS epoch key encryption (AES-128-GCM)  1–5 ms
+Serialization + padding to bucket size  &lt; 1 ms
+Batching delay (configurable)           100 ms (default)
+─────────────────────────────────────────────────────────────
+Transport (direct WebSocket)            &lt; 50 ms
+Transport (Tor, 3-hop circuit)          200–500 ms
+Transport (Nym mixnet)                  1–5 s
+─────────────────────────────────────────────────────────────
+Remote: deserialize + decrypt + apply   1–5 ms
+─────────────────────────────────────────────────────────────
+Total end-to-end (direct)               ~150–160 ms
+Total end-to-end (Tor)                  ~300–600 ms
+Total end-to-end (Nym)                  ~1.1–5.1 s
+</code></pre>
+<p><strong>Key observations:</strong></p>
+<ul>
+<li>The protocol stack itself (CRDT + DAG + encryption + serialization)
+adds roughly 5ms. The dominant cost is always the transport layer.</li>
+<li>The batching delay is tunable. Reducing it to 50ms halves the
+local wait at the cost of doubling the number of DAG nodes (and
+therefore encryption operations, relay writes, and storage).</li>
+<li>Over Tor, the system is comfortably usable for collaborative
+editing. Users experience latency comparable to typing in a shared
+Google Doc over a slow connection.</li>
+<li>Over Nym, real-time keystroke-level collaboration is impractical.
+Nym is suited for asynchronous messaging (chat, comments, file
+sharing) where multi-second latency is acceptable.</li>
+</ul>
+<h3 id="anonymous-mode-overhead"><a class="header" href="#anonymous-mode-overhead">Anonymous mode overhead</a></h3>
+<p>When Phase 3 anonymous mode is active, proof generation adds to the
+latency — but only at session start, not per operation:</p>
+<pre><code>Session-start proof (ShowAuthorized):
+  Native Rust (Groth16):    300–900 ms
+  WASM (browser):           1.5–3.5 s
+  Mobile (ARM):             1–3 s
+
+Per-operation (session token validation):  &lt; 1 ms
+</code></pre>
+<p>The session token amortizes the proof cost over the session’s
+lifetime. See <a href="./security-analysis.html">Security Analysis</a>, section 2
+for the anonymity tradeoff this introduces.</p>
+<hr>
+<h2 id="2-sync-scalability"><a class="header" href="#2-sync-scalability">2. Sync Scalability</a></h2>
+<h3 id="group-size"><a class="header" href="#group-size">Group size</a></h3>
+<p>MLS uses a ratchet tree where key operations (Add, Remove, Update,
+Commit) require work proportional to the tree height: <strong>O(log n)</strong>
+where n is the number of members.</p>
+<pre><code>Members     Tree height     Commit cost (key derivations)
+──────────────────────────────────────────────────────────
+10          ~4              ~4
+100         ~7              ~7
+1,000       ~10             ~10
+10,000      ~14             ~14
+</code></pre>
+<p>The Commit message size also grows with tree height (each path node
+carries an encrypted key update), but the growth is logarithmic. For
+a group of 10,000 members, a Commit message is roughly 14 path nodes</p>
+<ul>
+<li>~200 bytes = ~2.8KB — well within the Nostr event size limit.</li>
+</ul>
+<p><strong>Practical limit:</strong> MLS group operations are viable up to roughly
+10,000 members. Beyond that, the cost is not the tree operations
+themselves but the Welcome message for new joiners (which contains the
+full ratchet tree state) and the increased likelihood of concurrent
+Commits causing epoch conflicts that require resolution.</p>
+<h3 id="document-size"><a class="header" href="#document-size">Document size</a></h3>
+<p>Automerge handles documents up to approximately 100MB in practice.
+Beyond that, memory consumption during merge operations becomes
+problematic on client devices. For Kunekt’s typical use cases:</p>
+<ul>
+<li>Chat history: grows linearly, effectively unbounded (messages are
+append-only, individual messages are small).</li>
+<li>Collaborative documents: practical limit around 10-50MB of
+Automerge state, depending on edit history complexity.</li>
+<li>Configuration and metadata documents: negligible size (&lt; 100KB).</li>
+</ul>
+<h3 id="dag-growth-rate"><a class="header" href="#dag-growth-rate">DAG growth rate</a></h3>
+<p>The number of DAG nodes produced depends on the batching interval and
+the number of active editors:</p>
+<pre><code>Batching     Editors     Nodes/hour     Nodes/day (8h active)
+──────────────────────────────────────────────────────────────
+100 ms       1           36,000         288,000
+100 ms       5           up to 180,000  up to 1,440,000
+500 ms       1           7,200          57,600
+500 ms       5           up to 36,000   up to 288,000
+1 s          1           3,600          28,800
+</code></pre>
+<p>“Up to” because concurrent editors may produce separate nodes within
+the same batch window. In practice, with reasonable batching and
+typical editing patterns (pauses between bursts), the actual rate is
+significantly lower than the theoretical maximum.</p>
+<h3 id="anti-entropy-cost"><a class="header" href="#anti-entropy-cost">Anti-entropy cost</a></h3>
+<p>The sync protocol exchanges root CIDs and then walks the DAG
+difference. The cost is proportional to the <strong>divergence</strong> between
+peers, not the total history size.</p>
+<ul>
+<li><strong>Short disconnection</strong> (minutes): a few hundred nodes to exchange.
+Sync completes in seconds even over Tor.</li>
+<li><strong>Long disconnection</strong> (days): potentially thousands of nodes.
+Still manageable — the data transfer is the bottleneck, not the
+comparison algorithm.</li>
+<li><strong>Cold sync</strong> (new joiner): the peer must fetch the entire DAG.
+For a space with 1 million nodes at ~500 bytes each, that is ~500MB.
+At Tor speeds (~200KB/s sustained), this takes roughly 40 minutes.</li>
+</ul>
+<p><strong>Mitigation for cold sync:</strong> DAG snapshot compaction (see Section 7).
+A compacted snapshot reduces the cold sync payload to the current
+document state plus a truncated recent history.</p>
+<hr>
+<h2 id="3-storage-costs"><a class="header" href="#3-storage-costs">3. Storage Costs</a></h2>
+<h3 id="per-node-overhead"><a class="header" href="#per-node-overhead">Per-node overhead</a></h3>
+<p>Each Merkle-DAG node stored on a Nostr relay consists of:</p>
+<pre><code>Component                        Size (bytes)
+──────────────────────────────────────────────
+CID (Blake3-256 hash)            36 (multihash format)
+Children CIDs (1-2 parents)      36–72
+Encrypted payload (padded)       variable, bucketed
+MLS epoch reference              32
+Padding to bucket size           variable
+Nostr event envelope             ~200 (JSON framing, signature, tags)
+──────────────────────────────────────────────
+Typical total per node           300–1,000 bytes
+</code></pre>
+<h3 id="space-storage-estimates"><a class="header" href="#space-storage-estimates">Space storage estimates</a></h3>
+<pre><code>Space type                Monthly data    With 3x replication
+───────────────────────────────────────────────────────────────
+Quiet chat (10 msgs/day)   ~15 KB/month    ~45 KB/month
+Active chat (100 msgs/day) ~1.5 MB/month   ~4.5 MB/month
+High-volume chat (1K/day)  ~15 MB/month    ~45 MB/month
+Light document editing     ~5 MB/month     ~15 MB/month
+Heavy document editing     ~50 MB/month    ~150 MB/month
+Config/metadata docs       &lt; 100 KB/month  &lt; 300 KB/month
+</code></pre>
+<p>These estimates assume average node sizes of ~500 bytes (chat) and
+~800 bytes (document edits with Automerge operation payloads).</p>
+<h3 id="relay-economics"><a class="header" href="#relay-economics">Relay economics</a></h3>
+<p>Nostr relay storage is generally free today. Most relays accept events
+without payment. This is unlikely to hold at scale — a single active
+Kunekt space producing 50MB/month of encrypted, opaque events provides
+no value to the relay operator (they cannot index or display it).</p>
+<p>Expected evolution:</p>
+<ul>
+<li>Free relays will impose size or rate limits.</li>
+<li>Paid relays (NIP-42 authenticated, or satoshi-per-event pricing)
+will become the norm for heavy use.</li>
+<li>Self-hosted relays remain an option for communities willing to run
+infrastructure.</li>
+</ul>
+<p>Storage costs should be budgeted at approximately the cost of
+equivalent cloud object storage ($0.02-0.05/GB/month) as a
+conservative baseline.</p>
+<hr>
+<h2 id="4-zk-proof-performance"><a class="header" href="#4-zk-proof-performance">4. ZK Proof Performance</a></h2>
+<p>Zero-knowledge proofs are the most computationally expensive
+operations in the protocol. They are also the most platform-sensitive
+— performance varies dramatically between native code and WASM.</p>
+<h3 id="proof-generation-times"><a class="header" href="#proof-generation-times">Proof generation times</a></h3>
+<pre><code>Proof type                  Native (Rust)   WASM (browser)   Mobile (ARM)
+──────────────────────────────────────────────────────────────────────────
+ShowAuthorized (Groth16)    300–900 ms      2–5 s            1–3 s
+  (membership + reputation
+   + rate limit + ban check)
+
+Callback processing         200–500 ms      1–3 s            0.5–2 s
+  (update zk-object state)
+
+BBS+ selective disclosure   50–100 ms       200–500 ms       100–300 ms
+  (cross-space credential)
+
+Merkle membership proof     200–400 ms      1–2 s            0.5–1.5 s
+  (tree depth 20)
+</code></pre>
+<h3 id="proof-verification-times"><a class="header" href="#proof-verification-times">Proof verification times</a></h3>
+<p>Verification is fast on all platforms — this is a key property of
+Groth16.</p>
+<pre><code>Proof type                  Verification time
+──────────────────────────────────────────────
+Groth16 (any circuit)       5–10 ms
+BBS+ disclosure             10–20 ms
+Merkle membership           5–10 ms
+</code></pre>
+<h3 id="circuit-sizes-estimated-constraint-counts"><a class="header" href="#circuit-sizes-estimated-constraint-counts">Circuit sizes (estimated constraint counts)</a></h3>
+<pre><code>Circuit                          Constraints (approx.)
+──────────────────────────────────────────────────────
+ShowAuthorized                   ~50,000–100,000
+  Pedersen commitment opening    ~5,000
+  Merkle path verification (d=20) ~20,000
+  Range proof (reputation ≥ T)   ~10,000
+  Nullifier derivation           ~5,000
+  Rate limit check               ~10,000
+
+Callback processing              ~30,000–60,000
+  Previous state opening         ~5,000
+  State transition               ~10,000
+  New state commitment           ~5,000
+  Merkle update proof            ~10,000
+</code></pre>
+<p>These are rough estimates. Actual constraint counts depend on the
+hash function used inside the circuit (Poseidon is ~250 constraints
+per hash vs. SHA-256 at ~25,000), the field arithmetic, and the
+specific Arkworks gadgets employed.</p>
+<h3 id="client-hardware-requirements"><a class="header" href="#client-hardware-requirements">Client hardware requirements</a></h3>
+<ul>
+<li><strong>Desktop/laptop (modern):</strong> All proofs are practical. ShowAuthorized
+at session start is imperceptible to the user (sub-second).</li>
+<li><strong>Modern smartphone (2022+):</strong> Session-start proofs are tolerable
+(1-3s). Per-operation proofs are not — they would add seconds of
+latency to every action.</li>
+<li><strong>Older smartphone / low-end devices:</strong> Session-start proofs may
+take 5-10s. The SDK should show a progress indicator. Delegating
+proof generation to a trusted companion device is an option but
+weakens the trust model.</li>
+<li><strong>WASM (browser):</strong> 2-5x slower than native due to runtime overhead
+and limited access to SIMD instructions. Acceptable for session-start
+proofs; too slow for per-operation proofs.</li>
+</ul>
+<hr>
+<h2 id="5-bandwidth"><a class="header" href="#5-bandwidth">5. Bandwidth</a></h2>
+<h3 id="per-operation-bandwidth"><a class="header" href="#per-operation-bandwidth">Per-operation bandwidth</a></h3>
+<p>Operations are padded to fixed bucket sizes to prevent payload size
+from leaking information about content (see
+<a href="./privacy-layers.html">Privacy Analysis</a>). The smallest bucket is 1KB.</p>
+<pre><code>Component                           Size
+─────────────────────────────────────────────
+Padded encrypted payload            1 KB (minimum bucket)
+Nostr event envelope                ~200 bytes
+Total per operation (outbound)      ~1.2 KB
+</code></pre>
+<p>For an active editor producing one batch per 100ms, outbound bandwidth
+is roughly <strong>12 KB/s</strong> (43 MB/hour). In practice, batches are only
+produced when the user is actively editing, so sustained bandwidth is
+much lower.</p>
+<h3 id="cover-traffic"><a class="header" href="#cover-traffic">Cover traffic</a></h3>
+<p>Cover traffic sends dummy messages at a constant rate to prevent
+traffic analysis from distinguishing active periods from idle periods.</p>
+<pre><code>Cover traffic rate     Bandwidth overhead
+───────────────────────────────────────────
+1 msg / 10 s           ~7 KB/min, ~420 KB/hour
+1 msg / 5 s            ~14 KB/min, ~840 KB/hour
+1 msg / 2 s            ~36 KB/min, ~2.1 MB/hour
+1 msg / 1 s            ~72 KB/min, ~4.3 MB/hour
+</code></pre>
+<p>The default configuration targets 1 dummy message per 5 seconds as a
+balance between anonymity and bandwidth. Users on constrained
+connections can reduce the rate at the cost of weaker traffic analysis
+resistance.</p>
+<h3 id="tor-circuit-overhead"><a class="header" href="#tor-circuit-overhead">Tor circuit overhead</a></h3>
+<p>Tor adds per-cell overhead across 3 hops:</p>
+<ul>
+<li>Cell size: 514 bytes (512 payload + 2 header).</li>
+<li>A 1KB application payload spans 2 cells.</li>
+<li>Each cell is encrypted 3 times (once per hop), but the on-wire
+size does not grow — each hop decrypts one layer.</li>
+<li>Circuit establishment: ~3-5 round trips, ~1-2s. Amortized across
+all operations on the circuit.</li>
+</ul>
+<h3 id="mls-key-management-bandwidth"><a class="header" href="#mls-key-management-bandwidth">MLS key management bandwidth</a></h3>
+<pre><code>Message type              Size             Frequency
+──────────────────────────────────────────────────────────
+MLS Commit               1–10 KB          Per key rotation
+  (varies with tree size)
+MLS Welcome (new member)  5–50 KB          Per member addition
+  (contains ratchet tree)
+MLS Proposal             ~200–500 bytes    Per membership change
+Root CID announcement    64–128 bytes      Per sync round
+</code></pre>
+<p>Key rotation frequency is configurable. More frequent rotation
+provides better forward secrecy but increases bandwidth. A rotation
+every 100 operations or every 10 minutes (whichever comes first) is a
+reasonable default.</p>
+<hr>
+<h2 id="6-scalability-limits"><a class="header" href="#6-scalability-limits">6. Scalability Limits</a></h2>
+<h3 id="where-does-the-system-break"><a class="header" href="#where-does-the-system-break">Where does the system break?</a></h3>
+<p>The following analysis identifies the practical ceiling for each
+dimension of scale and what constrains it.</p>
+<p><strong>Group size:</strong>
+MLS tree operations scale O(log n) and are practical to ~10,000
+members. The binding constraint is not computational cost but Welcome
+message size for new joiners (~50KB for a 10,000-member tree) and the
+probability of concurrent Commits. At 10,000 members with frequent
+key rotation, epoch conflicts become common enough to degrade
+performance. Mitigation: reduce key rotation frequency for large
+groups, or partition into sub-groups with a federation layer.</p>
+<p><strong>Concurrent editors:</strong>
+CRDT merge is correct at any scale — convergence is guaranteed
+regardless of the number of concurrent editors. The constraint is
+network bandwidth: each active editor produces ~12KB/s of outbound
+data, and each peer must receive and process all of it. For N active
+editors, each peer handles ~12N KB/s of inbound data.</p>
+<pre><code>Active editors    Inbound bandwidth per peer
+──────────────────────────────────────────────
+5                 ~60 KB/s
+20                ~240 KB/s
+50                ~600 KB/s
+100               ~1.2 MB/s
+</code></pre>
+<p>At 50+ concurrent active editors over Tor, bandwidth becomes
+strained. At 100+, the system is likely to experience noticeable lag
+as peers fall behind on processing. Practical limit for real-time
+editing: ~20-50 concurrent editors. For asynchronous collaboration
+(not all editing simultaneously), there is no meaningful limit.</p>
+<p><strong>Storage scalability:</strong>
+Content-addressed storage scales horizontally. Adding more Nostr
+relays (or other backends) increases both capacity and redundancy.
+The constraint is not storage capacity but retrieval — a peer must
+know which relays hold the nodes it needs. Relay discovery and
+selection is a protocol-level problem, not a storage-level one.</p>
+<p><strong>ZK proving:</strong>
+Proof generation is CPU-bound and single-threaded (Groth16 does not
+parallelize well). A client can generate roughly 1-3 ShowAuthorized
+proofs per second on modern hardware. This is sufficient for
+session-start proofs but would be a bottleneck if per-operation proofs
+were required. Future proof systems (Jolt, SP1) may relax this
+constraint.</p>
+<h3 id="bottleneck-analysis"><a class="header" href="#bottleneck-analysis">Bottleneck analysis</a></h3>
+<p>For most deployments, the system will hit limits in this order:</p>
+<ol>
+<li><strong>Transport latency</strong> (Tor/Nym) — the largest single contributor
+to user-perceived delay. Irreducible without relaxing anonymity.</li>
+<li><strong>Concurrent editor bandwidth</strong> — scales linearly with active
+editors. Mitigated by batching and compression.</li>
+<li><strong>Cold sync time</strong> — grows with total DAG history. Mitigated by
+snapshot compaction.</li>
+<li><strong>ZK proving on low-end devices</strong> — limits adoption of anonymous
+mode on constrained hardware. Mitigated by session tokens and
+future proving improvements.</li>
+<li><strong>MLS group size</strong> — logarithmic scaling is forgiving, but very
+large groups (&gt;10K) encounter operational friction.</li>
+</ol>
+<hr>
+<h2 id="7-optimization-strategies"><a class="header" href="#7-optimization-strategies">7. Optimization Strategies</a></h2>
+<h3 id="operation-batching"><a class="header" href="#operation-batching">Operation batching</a></h3>
+<p>Batching amortizes the per-operation overhead of encryption, DAG node
+creation, and relay transmission. Instead of one DAG node per
+keystroke, multiple CRDT operations are bundled into a single node.</p>
+<ul>
+<li><strong>Default batch interval:</strong> 100ms. Imperceptible to users, reduces
+node creation rate by 10-100x compared to per-keystroke granularity.</li>
+<li><strong>Adaptive batching:</strong> Increase the interval during high-frequency
+editing bursts; decrease during pauses. This smooths bandwidth
+without increasing perceived latency.</li>
+</ul>
+<h3 id="lazy-sync"><a class="header" href="#lazy-sync">Lazy sync</a></h3>
+<p>Peers should not sync documents they are not actively viewing.</p>
+<ul>
+<li>On space open: sync only the space’s metadata and unread message
+indicators.</li>
+<li>On document open: sync the full document DAG.</li>
+<li>On document close: stop syncing, retain the local state for offline
+access.</li>
+</ul>
+<p>This dramatically reduces bandwidth for users who are members of many
+spaces but actively use only a few at a time.</p>
+<h3 id="compression-before-encryption"><a class="header" href="#compression-before-encryption">Compression before encryption</a></h3>
+<p>CRDT operations (especially Automerge) contain redundant structure.
+Compressing the batch payload before encryption reduces the data that
+must be padded and transmitted.</p>
+<ul>
+<li>Expected compression ratio for Automerge operations: 2-4x (they
+contain repeated field names and structural overhead).</li>
+<li>Compression must happen before encryption — encrypted data is
+incompressible.</li>
+<li>Use a fast compressor (zstd or lz4) to avoid adding latency.</li>
+</ul>
+<h3 id="dag-snapshot-compaction"><a class="header" href="#dag-snapshot-compaction">DAG snapshot compaction</a></h3>
+<p>For long-lived spaces, the DAG can grow to millions of nodes. Cold
+sync (fetching the entire DAG) becomes impractical.</p>
+<p>Snapshot compaction produces a single DAG node containing the current
+Automerge document state, with all prior history pruned. The snapshot
+node becomes the new root, and old nodes can be garbage collected
+from relays.</p>
+<ul>
+<li><strong>Tradeoff:</strong> Compaction destroys per-operation history. Users can
+no longer inspect individual edits from before the snapshot.</li>
+<li><strong>Frequency:</strong> Compact when DAG size exceeds a threshold (e.g.,
+100,000 nodes or 50MB).</li>
+<li><strong>MLS interaction:</strong> The snapshot must be encrypted with the current
+epoch key. Members who were present before the snapshot but left
+before it was created cannot access the compacted state (forward
+secrecy is preserved).</li>
+</ul>
+<h3 id="connection-pooling"><a class="header" href="#connection-pooling">Connection pooling</a></h3>
+<p>Tor circuit establishment takes 1-2 seconds. Reusing circuits across
+multiple operations avoids this cost.</p>
+<ul>
+<li>Maintain a pool of 2-3 established Tor circuits.</li>
+<li>Route operations for different spaces through different circuits
+(to avoid linking spaces at the relay level).</li>
+<li>Rotate circuits periodically (every 10 minutes) to limit the
+window for traffic analysis.</li>
+</ul>
+<h3 id="incremental-proving-future"><a class="header" href="#incremental-proving-future">Incremental proving (future)</a></h3>
+<p>Nova recursive proofs allow a new proof to “fold in” the previous
+proof rather than re-proving the full statement from scratch. Applied
+to zk-promises:</p>
+<ul>
+<li>The first ShowAuthorized proof is full cost (~700ms).</li>
+<li>Subsequent proofs (after a state change like a reputation update)
+fold the delta into the previous proof: estimated ~50-200ms.</li>
+<li>This could make per-batch proofs practical, eliminating the need
+for session tokens and improving per-operation anonymity.</li>
+</ul>
+<p>This is speculative — Nova integration with Arkworks is not yet
+mature, and the interaction with the zk-promises circuit structure
+has not been validated.</p>
+<h3 id="client-side-caching"><a class="header" href="#client-side-caching">Client-side caching</a></h3>
+<p>Peers should cache DAG nodes locally to avoid redundant relay fetches.</p>
+<ul>
+<li>Cache keyed by CID (content-addressed, so cache entries never go
+stale).</li>
+<li>LRU eviction with a configurable cache size (default: 100MB).</li>
+<li>On sync: check the local cache before fetching from a relay. For
+spaces with multiple relays, this avoids fetching the same node
+from each relay during replication checks.</li>
+</ul>
+<hr>
+<h2 id="8-benchmarking-plan"><a class="header" href="#8-benchmarking-plan">8. Benchmarking Plan</a></h2>
+<p>The following measurements must be collected before production release,
+across the target platforms (native Linux/macOS/Windows, WASM in
+modern browsers, Android, iOS).</p>
+<h3 id="end-to-end-latency"><a class="header" href="#end-to-end-latency">End-to-end latency</a></h3>
+<p>Measure the time from CRDT operation creation on Peer A to operation
+application on Peer B.</p>
+<pre><code>Scenario                              Target          Platforms
+──────────────────────────────────────────────────────────────────
+Single edit, direct transport         &lt; 200 ms        All
+Single edit, Tor transport            &lt; 700 ms        All
+Batch (100ms window), direct          &lt; 250 ms        All
+Batch (100ms window), Tor             &lt; 750 ms        All
+Session start (with ZK proof), Tor    &lt; 2 s           Native
+Session start (with ZK proof), Tor    &lt; 5 s           WASM
+</code></pre>
+<h3 id="sync-performance"><a class="header" href="#sync-performance">Sync performance</a></h3>
+<pre><code>Scenario                              Target          Notes
+──────────────────────────────────────────────────────────────────
+Incremental sync (100 new nodes)      &lt; 5 s (Tor)     After short disconnect
+Incremental sync (10,000 nodes)       &lt; 60 s (Tor)    After long disconnect
+Cold sync (100,000 nodes)             &lt; 10 min (Tor)  New joiner, no snapshot
+Cold sync (snapshot)                  &lt; 30 s (Tor)    New joiner, with snapshot
+</code></pre>
+<h3 id="zk-proof-generation"><a class="header" href="#zk-proof-generation">ZK proof generation</a></h3>
+<pre><code>Circuit                    Native target   WASM target    Mobile target
+──────────────────────────────────────────────────────────────────────────
+ShowAuthorized             &lt; 1 s           &lt; 5 s          &lt; 3 s
+Callback processing        &lt; 500 ms        &lt; 3 s          &lt; 2 s
+BBS+ selective disclosure  &lt; 100 ms        &lt; 500 ms       &lt; 300 ms
+Merkle membership          &lt; 400 ms        &lt; 2 s          &lt; 1.5 s
+</code></pre>
+<h3 id="bandwidth-usage"><a class="header" href="#bandwidth-usage">Bandwidth usage</a></h3>
+<p>Measure per-user bandwidth (inbound + outbound) for defined activity
+profiles:</p>
+<pre><code>Profile                     Target (Tor)        Measurement period
+──────────────────────────────────────────────────────────────────────
+Idle (cover traffic only)   &lt; 1 MB/hour         1 hour
+Light chat (10 msgs/hour)   &lt; 2 MB/hour         1 hour
+Active chat (100 msgs/hour) &lt; 10 MB/hour        1 hour
+Active editing (1 editor)   &lt; 50 MB/hour        1 hour
+Active editing (10 editors) &lt; 150 MB/hour       1 hour
+</code></pre>
+<h3 id="storage-growth"><a class="header" href="#storage-growth">Storage growth</a></h3>
+<p>Track per-space storage on relay and on local device:</p>
+<pre><code>Profile                     Relay storage/month   Local cache/month
+──────────────────────────────────────────────────────────────────────
+Quiet chat space            &lt; 100 KB              &lt; 100 KB
+Active chat space           &lt; 5 MB                &lt; 5 MB
+Active document space       &lt; 100 MB              &lt; 100 MB
+</code></pre>
+<h3 id="what-to-do-with-the-results"><a class="header" href="#what-to-do-with-the-results">What to do with the results</a></h3>
+<p>Benchmarks that exceed targets should be investigated for:</p>
+<ol>
+<li><strong>Algorithmic inefficiency</strong> — can the operation be done with fewer
+steps?</li>
+<li><strong>Unnecessary serialization/deserialization</strong> — are we copying data
+that could be passed by reference?</li>
+<li><strong>Suboptimal batching</strong> — are we creating more DAG nodes than
+necessary?</li>
+<li><strong>Transport overhead</strong> — are we making more round trips than
+necessary?</li>
+<li><strong>Platform-specific issues</strong> — is WASM performance limited by a
+specific operation (e.g., big-integer arithmetic)?</li>
+</ol>
+<p>Results should be published as part of the protocol specification so
+that independent implementations can validate their performance
+against the reference.</p>
+<hr>
+<h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
+<p>Kunekt’s performance profile is dominated by the transport layer.
+The protocol stack itself — CRDTs, Merkle-DAGs, MLS encryption — adds
+single-digit milliseconds per operation. The anonymity layer (Tor or
+Nym) adds hundreds of milliseconds to seconds. ZK proofs are expensive
+but amortized over sessions.</p>
+<p>The system is practical for real-time collaboration over Tor with up
+to ~20-50 concurrent editors. Over Nym, it is suited for asynchronous
+communication. Group sizes up to ~10,000 members are feasible with
+MLS’s logarithmic scaling. Storage scales horizontally through
+content-addressed replication across multiple backends.</p>
+<p>The primary optimization levers are batching (reduce per-operation
+overhead), lazy sync (reduce unnecessary bandwidth), snapshot
+compaction (reduce cold sync time), and connection pooling (reduce
+Tor circuit setup cost). Longer-term, advances in ZK proving
+(incremental proofs, faster proof systems) could eliminate the
+session-token compromise and enable true per-operation anonymity.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="security-analysis.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="glossary.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="security-analysis.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="glossary.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,645 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Nostr Integration - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="nostr-integration"><a class="header" href="#nostr-integration">Nostr Integration</a></h1>
+<blockquote>
+<p>How Nostr fits into Kunekt’s architecture — and where the two
+protocols complement vs conflict.</p>
+</blockquote>
+<h2 id="nostr-in-30-seconds"><a class="header" href="#nostr-in-30-seconds">Nostr in 30 seconds</a></h2>
+<p>Nostr is a protocol where clients publish signed JSON events to relays.
+Relays store and forward events. Identity is a keypair. The protocol
+is deliberately simple: no consensus, no blockchain, no P2P — just
+clients and dumb relay servers.</p>
+<p>Key properties:</p>
+<ul>
+<li>Events are signed, timestamped, tagged JSON blobs</li>
+<li>Relays are interchangeable — use many, trust none</li>
+<li>Identity = secp256k1 keypair (same as Bitcoin)</li>
+<li>No group encryption, no CRDTs, no conflict resolution</li>
+<li>Massive deployed infrastructure (thousands of relays, millions of users)</li>
+</ul>
+<h2 id="where-nostr-fits-in-kunekt"><a class="header" href="#where-nostr-fits-in-kunekt">Where Nostr fits in Kunekt</a></h2>
+<pre><code>Kunekt stack                    Nostr role
+──────────────────────────────────────────────
+Application (CRDTs, docs)       —
+ZK layer (credentials, proofs)  —
+Encryption (MLS group keys)     —
+Sync (Merkle-CRDT)              —
+Storage / Relay                 ← Nostr relays here
+Transport                       ← Nostr WebSocket transport here
+Discovery                       ← Nostr social graph here
+</code></pre>
+<h3 id="1-nostr-relays-as-a-storage-backend"><a class="header" href="#1-nostr-relays-as-a-storage-backend">1. Nostr relays as a storage backend</a></h3>
+<p>Kunekt needs places to store encrypted DAG nodes so peers can fetch
+them asynchronously. Nostr relays are exactly this — dumb servers
+that store blobs and serve them on request.</p>
+<p>A Kunekt DAG node maps to a Nostr event:</p>
+<pre><code>Nostr event (kind = 30078 or custom)
+├── pubkey: space relay key (or ephemeral key for anonymity)
+├── content: encrypted DAG node (opaque base64 blob)
+├── tags:
+│   ├── ["d", "&lt;CID hex&gt;"]           ← content address
+│   ├── ["space", "&lt;space-id&gt;"]      ← for relay filtering
+│   └── ["parent", "&lt;parent CID&gt;"]   ← optional, for DAG traversal
+└── sig: signature
+</code></pre>
+<p>This gives Kunekt instant access to the entire Nostr relay network
+without deploying any custom infrastructure.</p>
+<p><strong>Trade-offs:</strong></p>
+<ul>
+<li>Nostr events require a signature (pubkey visible). For anonymous
+mode, use an ephemeral relay-specific key per space — unlinkable
+to the user’s identity. The relay sees a pubkey but can’t link it
+to a person.</li>
+<li>Nostr relays may filter/reject events they don’t understand.
+Using standardized replaceable event kinds (NIP-78: application-
+specific data) helps.</li>
+<li>Nostr events have size limits (~64KB per event on most relays).
+Large DAG nodes need chunking.</li>
+</ul>
+<h3 id="2-nostr-as-a-discovery-layer"><a class="header" href="#2-nostr-as-a-discovery-layer">2. Nostr as a discovery layer</a></h3>
+<p>How do peers find each other? How does a new member discover which
+relays hold a space’s data? Nostr’s social graph and relay hint
+system solve this:</p>
+<ul>
+<li><strong>Space announcement:</strong> A space publishes its relay hints and
+public parameters as a Nostr event (e.g. NIP-78 or a custom kind).
+Members subscribe to this event to discover relay endpoints.</li>
+<li><strong>Invite links via Nostr:</strong> Instead of out-of-band invite URLs,
+share a Nostr event containing encrypted invite parameters. The
+recipient’s Nostr client can hand off to their Kunekt-capable app.</li>
+<li><strong>Relay list synchronization:</strong> Members publish their preferred
+relay lists (NIP-65). Kunekt uses this to know where to push/pull
+DAG nodes for best connectivity.</li>
+</ul>
+<h3 id="3-nostr-for-root-cid-gossip"><a class="header" href="#3-nostr-for-root-cid-gossip">3. Nostr for root CID gossip</a></h3>
+<p>During real-time collaboration, peers need to announce new root CIDs
+so others know to sync. Nostr’s subscription model (REQ filters) is
+a natural pubsub channel:</p>
+<ul>
+<li>Each space has a “sync” event kind</li>
+<li>When a peer records a new DAG node, it publishes a Nostr event
+with the new root CID</li>
+<li>Other peers subscribed to that space’s filter receive it instantly
+via WebSocket</li>
+<li>They then fetch the actual DAG nodes (from the same or different
+relays)</li>
+</ul>
+<p>This separates <strong>notification</strong> (lightweight, via Nostr pubsub) from
+<strong>data transfer</strong> (heavier, via DAG node fetch).</p>
+<h3 id="4-bridge-to-nostr-social-features"><a class="header" href="#4-bridge-to-nostr-social-features">4. Bridge to Nostr social features</a></h3>
+<p>Nostr already has a social layer — profiles, follows, DMs, communities
+(NIP-72). Kunekt can bridge to this:</p>
+<ul>
+<li><strong>Profile link:</strong> A Kunekt user can optionally link their Nostr
+identity (for public-facing social features) while keeping their
+Kunekt space identities anonymous. The link is one-directional
+and voluntary.</li>
+<li><strong>Public spaces as Nostr communities:</strong> A non-anonymous Kunekt
+space could expose its content as Nostr events, making it
+readable by standard Nostr clients. The CRDT state is rendered
+to a Nostr-compatible event stream.</li>
+<li><strong>DMs as Kunekt spaces:</strong> Nostr DMs (NIP-44) are 1:1 encrypted.
+A Kunekt 2-person space provides richer semantics (shared
+documents, history, offline merge) while using Nostr relays for
+transport.</li>
+</ul>
+<hr>
+<h2 id="where-they-conflict"><a class="header" href="#where-they-conflict">Where they conflict</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Concern</th><th>Nostr</th><th>Kunekt</th><th>Tension</th></tr>
+</thead>
+<tbody>
+<tr><td>Identity model</td><td>Pubkey on every event</td><td>Anonymous by default</td><td>Nostr events always have a pubkey — need ephemeral keys for anonymity</td></tr>
+<tr><td>Event structure</td><td>Signed JSON, immutable</td><td>Encrypted DAG nodes, mutable state via CRDTs</td><td>Kunekt content is opaque to Nostr; relays can’t index/filter by content</td></tr>
+<tr><td>Metadata</td><td>Tags are plaintext</td><td>Minimal metadata exposure</td><td>Space IDs and CIDs in tags are visible to relays</td></tr>
+<tr><td>Relay trust</td><td>Relays see plaintext events</td><td>Relays see only encrypted blobs</td><td>OK for Kunekt — relays are untrusted storage</td></tr>
+<tr><td>Sync model</td><td>Timestamp-based filters</td><td>DAG-based anti-entropy</td><td>Nostr can’t do efficient Merkle-CRDT sync natively — it’s just storage</td></tr>
+<tr><td>Group comms</td><td>No native group encryption</td><td>MLS group keys</td><td>Nostr communities are public; Kunekt spaces are private by default</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="the-shared-space-key-problem"><a class="header" href="#the-shared-space-key-problem">The shared space key problem</a></h3>
+<p>The naive idea: “the space has one Nostr keypair, all members sign
+with it.” But who holds that key? If one member holds it, they’re
+a gatekeeper — centralization. If you distribute it, how?</p>
+<p><strong>Option A: MLS-derived signing key (simplest, recommended for Phase 1)</strong></p>
+<p>MLS already gives every current member a shared epoch secret. Derive
+the Nostr signing key deterministically from it:</p>
+<pre><code>nostr_sk = KDF(mls_epoch_secret, "nostr-relay-signing")
+</code></pre>
+<p>Every member independently derives the same key. Any member can sign
+events. No coordination needed to post.</p>
+<p>Properties:</p>
+<ul>
+<li>✅ No single keyholder — every member can sign</li>
+<li>✅ Key rotates automatically when MLS epoch changes (member join/leave)</li>
+<li>✅ Removed members lose the key (new epoch, new derived key)</li>
+<li>✅ Fully offline — no interaction needed to sign</li>
+<li>⚠️ Any member can impersonate the space — but this is fine.
+The Nostr signature only authorizes <em>relay storage</em>, not content
+authenticity. Content integrity is verified at the Merkle-CRDT
+layer (CID verification) and authorization at the ZK layer.</li>
+<li>⚠️ A malicious member could spam the relay with garbage events
+signed by the space key. Mitigation: the relay can rate-limit
+per pubkey, and other members ignore events with invalid CIDs.</li>
+</ul>
+<p><strong>Option B: Threshold Schnorr signatures (stronger, Phase 3+)</strong></p>
+<p>t-of-n threshold Schnorr (e.g. FROST) over secp256k1. The space has
+a public key, but no single member holds the corresponding secret.
+Any t members can cooperatively produce a valid signature.</p>
+<p>Properties:</p>
+<ul>
+<li>✅ No single member can sign alone — stronger abuse resistance</li>
+<li>❌ Requires t members to be online simultaneously to sign</li>
+<li>❌ Conflicts with offline-first — can’t post if fewer than t peers
+are reachable</li>
+<li>❌ Adds a coordination round per event (defeats the “no coordination”
+property)</li>
+</ul>
+<p>Verdict: too heavy for general use. Could be useful for high-stakes
+operations (e.g. signing a space’s public announcement or a governance
+result) but not for routine DAG node publishing.</p>
+<p><strong>Option C: Per-member ephemeral keys (no shared key at all)</strong></p>
+<p>Each member generates a fresh throwaway Nostr keypair per space
+(or per session). Events from the same space come from different
+pubkeys. No shared key needed.</p>
+<p>Properties:</p>
+<ul>
+<li>✅ No key management complexity</li>
+<li>✅ Fully offline, no coordination</li>
+<li>✅ A compromised member only exposes their own ephemeral key</li>
+<li>⚠️ Relay sees N distinct pubkeys → learns group size</li>
+<li>⚠️ Can correlate events from the same member within a session</li>
+</ul>
+<p>Mitigation for group size leakage: rotate keys frequently (per-batch)
+and add dummy pubkeys posting cover traffic.</p>
+<p><strong>Option D: Blind-signed ephemeral keys (best anonymity, Phase 3+)</strong></p>
+<p>The space (via MLS group action) blind-signs members’ ephemeral
+Nostr pubkeys. A member generates a fresh keypair, gets it
+blind-signed by the group, then presents the signature to the relay
+as proof of authorization. The relay verifies the space authorized
+this pubkey but can’t link it to a specific member.</p>
+<pre><code>Member → generates (ek_pub, ek_sk)
+Member → blinds ek_pub → sends to group
+Group  → blind-signs → returns blind signature
+Member → unblinds → has signature on ek_pub
+Member → presents (ek_pub, sig) to relay
+Relay  → verifies sig against space pubkey → accepts events from ek_pub
+</code></pre>
+<p>Properties:</p>
+<ul>
+<li>✅ Relay can’t link ephemeral keys to members</li>
+<li>✅ Relay can’t count members (keys rotate, overlap is invisible)</li>
+<li>✅ Space controls authorization without knowing who gets which key</li>
+<li>⚠️ Blind signing requires an MLS group operation (but can batch —
+sign N keys at once during epoch change)</li>
+<li>⚠️ More complex cryptography</li>
+</ul>
+<p><strong>Recommendation:</strong></p>
+<ul>
+<li>Phase 1-2: Option A (MLS-derived key). Simple, works offline,
+good enough when relays are semi-trusted storage.</li>
+<li>Phase 3+: Option D (blind-signed ephemeral keys) for anonymous
+mode. Option C as a simpler fallback when blind signing isn’t
+available.</li>
+</ul>
+<h3 id="metadata-leakage-what-nostr-relays-learn-and-how-to-fight-it"><a class="header" href="#metadata-leakage-what-nostr-relays-learn-and-how-to-fight-it">Metadata leakage: what Nostr relays learn and how to fight it</a></h3>
+<p>This is the real concern. Even with encrypted content, Nostr relays
+observe significant metadata. Here’s the full threat model:</p>
+<p><strong>What the relay sees:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Data point</th><th>What it reveals</th><th>Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>Pubkey on events</td><td>Which space (or member) is posting</td><td>High</td></tr>
+<tr><td>Event timestamps</td><td>When activity happens</td><td>High</td></tr>
+<tr><td>Event sizes</td><td>Type of operation (chat msg vs large edit)</td><td>Medium</td></tr>
+<tr><td>Tags (CIDs, parent CIDs)</td><td>DAG structure, causal relationships</td><td>High</td></tr>
+<tr><td>IP addresses of posters</td><td>Physical location of members</td><td>Critical</td></tr>
+<tr><td>IP addresses of subscribers</td><td>Who is reading which space</td><td>Critical</td></tr>
+<tr><td>Subscription filters</td><td>Which CIDs/tags a client wants</td><td>High</td></tr>
+<tr><td>Event count per pubkey</td><td>Activity volume</td><td>Medium</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Layer 1: Opaque deterministic tags (relay can filter, learns nothing)</strong></p>
+<p>Instead of putting raw CIDs in tags, derive opaque tag values that
+only space members can reconstruct:</p>
+<pre><code>tag_value = HMAC(epoch_tag_key, CID)
+where epoch_tag_key = KDF(mls_epoch_secret, "nostr-tag-key")
+</code></pre>
+<p>A member wanting to fetch CID <code>abc123</code> computes
+<code>HMAC(epoch_tag_key, "abc123")</code> and sends that as the REQ filter.
+The relay matches it exactly — efficient server-side filtering —
+but the tag value is meaningless to the relay.</p>
+<p>When the epoch changes, all tag values change. The relay can’t
+correlate events across epochs.</p>
+<p>Limitations: the relay can still count events per epoch, observe
+timing, and see which opaque tags are queried together.</p>
+<p><strong>Layer 2: Uniform envelopes</strong></p>
+<p>All events from a space are padded to one of a few fixed size
+buckets (e.g. 1KB, 4KB, 16KB). The relay can’t distinguish a
+chat message from a document edit from a cover traffic dummy.</p>
+<p><strong>Layer 3: Timing defenses</strong></p>
+<ul>
+<li><strong>Batched posting:</strong> Don’t publish events immediately. Buffer
+operations and publish at fixed intervals (every 5s, 30s,
+configurable per space). This hides per-operation timing.</li>
+<li><strong>Jitter:</strong> Add random delay (0-2s) to each batch. Prevents
+fingerprinting by exact timing.</li>
+<li><strong>Cover traffic:</strong> Periodically publish dummy events
+(indistinguishable from real ones). This maintains constant
+event rate even when no real activity happens.</li>
+</ul>
+<p><strong>Layer 4: Network anonymity</strong></p>
+<p>IP address is the most critical leak. Mitigations:</p>
+<ul>
+<li><strong>Tor:</strong> Route all relay connections through Tor. The relay sees
+a Tor exit node, not the member’s IP. Practical today.</li>
+<li><strong>Mix network (Nym):</strong> Stronger than Tor — adds timing
+obfuscation on top of routing anonymity. Higher latency.</li>
+<li><strong>Relay hopping:</strong> Don’t always connect to the same relay.
+Spread reads and writes across many relays. No single relay
+sees the full picture.</li>
+<li><strong>Proxy relays:</strong> A Kunekt-aware proxy that aggregates traffic
+from many users/spaces before forwarding to public Nostr relays.
+The public relay sees the proxy’s IP and can’t distinguish
+individual users.</li>
+</ul>
+<p><strong>Layer 5: Read privacy</strong></p>
+<p>Subscribing to events is as revealing as posting them. The relay
+learns what a client is interested in.</p>
+<ul>
+<li><strong>Bulk download:</strong> Instead of filtering by specific tags,
+download all events from the space’s pubkey (or all events in a
+time range) and filter client-side. Wasteful but reveals nothing
+about what you specifically need.</li>
+<li><strong>Multi-relay split:</strong> Subscribe to different tag ranges on
+different relays. No single relay sees your full interest set.</li>
+<li><strong>PIR (future):</strong> If a relay supports Private Information
+Retrieval, the client can fetch specific events without the
+relay knowing which ones. This requires relay-side support
+(not standard Nostr today).</li>
+</ul>
+<p><strong>Putting it together: privacy levels for Nostr integration</strong></p>
+<pre><code>Level       Technique stack                        Relay learns
+──────────────────────────────────────────────────────────────
+Minimal     Raw tags + direct connection           Everything
+            (good for public/semi-public spaces)
+
+Standard    Opaque tags + uniform sizes +          Event count,
+            batched posting + Tor                  timing (blurred),
+            (default for private spaces)           nothing about
+                                                   content or members
+
+Maximum     Opaque tags + uniform sizes +          Almost nothing:
+            cover traffic + mix network +          constant-rate
+            bulk download + relay hopping          opaque blobs from
+            (for high-risk spaces)                 an anonymous source
+</code></pre>
+<h3 id="what-we-cant-fix-nostrs-structural-limits"><a class="header" href="#what-we-cant-fix-nostrs-structural-limits">What we can’t fix (Nostr’s structural limits)</a></h3>
+<p>Some metadata leaks are inherent to the Nostr relay model:</p>
+<ol>
+<li>
+<p><strong>Relays must store data.</strong> A malicious relay can retain events
+forever, even after “deletion.” Content-addressed encrypted blobs
+mitigate this (the relay has ciphertext it can’t read), but the
+metadata accumulates.</p>
+</li>
+<li>
+<p><strong>Relays can correlate connections.</strong> Even with Tor, a relay
+running traffic analysis over long periods might correlate
+subscription patterns. Mix networks help but add latency.</p>
+</li>
+<li>
+<p><strong>Relay collusion.</strong> If multiple relays collude, they can combine
+their views. Using many relays helps only if they don’t cooperate.</p>
+</li>
+<li>
+<p><strong>No plausible deniability.</strong> A relay knows <em>something</em> is being
+stored. It can’t be denied that a space exists (though the relay
+doesn’t know it’s a “space” — just opaque events).</p>
+</li>
+</ol>
+<p><strong>Acceptance:</strong> Nostr relays are an <em>opportunistic</em> transport — use
+them for their convenience and deployed infrastructure, but don’t
+rely on them for privacy guarantees. The privacy guarantees come
+from Kunekt’s own layers (encryption, ZK, anonymity network).
+Nostr relays are untrusted storage that we make as little use of
+their metadata exposure as possible.</p>
+<hr>
+<h2 id="integration-levels"><a class="header" href="#integration-levels">Integration levels</a></h2>
+<p>Kunekt can integrate Nostr at different depths:</p>
+<h3 id="level-1-nostr-relays-as-dumb-storage-minimal-integration"><a class="header" href="#level-1-nostr-relays-as-dumb-storage-minimal-integration">Level 1: Nostr relays as dumb storage (minimal integration)</a></h3>
+<ul>
+<li>Kunekt treats Nostr relays as key-value stores</li>
+<li><code>put(CID, encrypted_blob)</code> → publish Nostr event</li>
+<li><code>get(CID)</code> → REQ with tag filter</li>
+<li>No awareness of Nostr social features</li>
+<li>Works today with existing relays</li>
+</ul>
+<h3 id="level-2-nostr-as-transport--discovery-medium-integration"><a class="header" href="#level-2-nostr-as-transport--discovery-medium-integration">Level 2: Nostr as transport + discovery (medium integration)</a></h3>
+<ul>
+<li>Root CID gossip via Nostr subscriptions</li>
+<li>Relay hints via NIP-65</li>
+<li>Invite sharing via Nostr events</li>
+<li>Space announcements as Nostr events</li>
+<li>Still anonymous internally</li>
+</ul>
+<h3 id="level-3-nostr-social-bridge-deep-integration"><a class="header" href="#level-3-nostr-social-bridge-deep-integration">Level 3: Nostr social bridge (deep integration)</a></h3>
+<ul>
+<li>Optional Nostr identity linkage</li>
+<li>Public spaces readable by Nostr clients</li>
+<li>Kunekt-enhanced DMs replacing NIP-44</li>
+<li>Cross-protocol social graph</li>
+<li>Privacy is opt-out for public-facing features</li>
+</ul>
+<h3 id="recommendation-start-at-level-1-grow-to-level-2"><a class="header" href="#recommendation-start-at-level-1-grow-to-level-2">Recommendation: Start at Level 1, grow to Level 2</a></h3>
+<p>Level 1 is trivial to implement and gives Kunekt access to thousands
+of deployed relays immediately. Level 2 adds real utility (discovery,
+gossip) without compromising privacy. Level 3 is optional and only
+makes sense for spaces that choose to be public.</p>
+<hr>
+<h2 id="implementation-sketch"><a class="header" href="#implementation-sketch">Implementation sketch</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>/// Nostr relay as a Kunekt storage backend
+impl&lt;H: Hasher, P: Payload&gt; Store&lt;H, P&gt; for NostrRelayStore {
+    type Error = RelayError;
+
+    fn get(&amp;self, cid: &amp;Cid&lt;H&gt;) -&gt; Result&lt;Option&lt;DagNode&lt;H, P&gt;&gt;, Self::Error&gt; {
+        // REQ ["REQ", sub_id, {"#d": [cid_hex], "kinds": [30078]}]
+        // Deserialize from Nostr event content field
+    }
+
+    fn put(&amp;mut self, cid: Cid&lt;H&gt;, node: DagNode&lt;H, P&gt;) -&gt; Result&lt;(), Self::Error&gt; {
+        // Serialize node, create Nostr event kind 30078
+        // Tag with ["d", cid_hex]
+        // Sign with space relay key
+        // Publish to relay
+    }
+
+    fn contains(&amp;self, cid: &amp;Cid&lt;H&gt;) -&gt; Result&lt;bool, Self::Error&gt; {
+        // REQ with COUNT (NIP-45) or just try to fetch
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>The entire Nostr integration is a <code>Store</code> implementation. The rest
+of Kunekt (CRDTs, sync, encryption, ZK) is completely unaware that
+Nostr exists underneath. This is the power of the layered design.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="building-blocks.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="privacy-layers.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="building-blocks.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="privacy-layers.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

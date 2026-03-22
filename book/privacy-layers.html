@@ -1,0 +1,531 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Privacy Analysis by Layer - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="privacy-analysis"><a class="header" href="#privacy-analysis">Privacy Analysis</a></h1>
+<p>Encrypted content is table stakes. The real leaks are in metadata,
+timing, access patterns, and structural information. This document
+maps every layer of the protocol, identifies what leaks, and
+proposes countermeasures — these directly inform the
+<a href="./roadmap.html">development phases</a> and choice of
+<a href="./building-blocks.html">building blocks</a>.</p>
+<p>The goal: <strong>any application built on Kunekt should be private by default
+at every layer</strong>, not just at the payload level.</p>
+<hr>
+<h2 id="1-transport-layer--who-talks-to-whom"><a class="header" href="#1-transport-layer--who-talks-to-whom">1. Transport Layer — “Who talks to whom”</a></h2>
+<h3 id="what-leaks"><a class="header" href="#what-leaks">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>IP addresses</td><td>Physical identity / location</td></tr>
+<tr><td>Connection timing</td><td>When a user is active</td></tr>
+<tr><td>Peer graph</td><td>Who syncs with whom</td></tr>
+<tr><td>Traffic volume</td><td>How active a user/space is</td></tr>
+<tr><td>Connection duration</td><td>Session patterns</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures"><a class="header" href="#countermeasures">Countermeasures</a></h3>
+<p><strong>Mix networks.</strong> Route all sync traffic through a mix network (like
+Nym or Loopix). Messages are batched, padded to uniform size, delayed
+randomly, and routed through multiple mix nodes. An observer sees
+uniform-looking traffic with no clear sender-receiver link.</p>
+<p><strong>Onion routing.</strong> Lighter than a full mix network. Wrap sync messages
+in multiple encryption layers (like Tor). Each relay peels one layer
+and forwards. The destination sees the message but not the origin.</p>
+<p><strong>Noise padding.</strong> Even without a mix net, peers can pad all messages
+to fixed sizes and send cover traffic (empty encrypted DAG nodes) at
+regular intervals. This hides when real edits happen.</p>
+<p><strong>Peer-to-peer relay via untrusted intermediaries.</strong> Peers don’t
+connect directly — they publish encrypted blobs to a shared pool
+(relay, DHT, DA layer) and other peers pull from it. No direct
+peer-to-peer connections means no peer graph to observe.</p>
+<blockquote>
+<p><strong>ZK opportunity:</strong> A peer could prove “I am authorized to use this
+relay” without revealing which space or user they are. Anonymous
+relay authentication via ZK credentials.</p>
+</blockquote>
+<hr>
+<h2 id="2-sync-layer--what-changed-and-when"><a class="header" href="#2-sync-layer--what-changed-and-when">2. Sync Layer — “What changed and when”</a></h2>
+<h3 id="what-leaks-1"><a class="header" href="#what-leaks-1">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>DAG structure</td><td>Causal relationships between edits</td></tr>
+<tr><td>Root CID broadcasts</td><td>Activity timing per document</td></tr>
+<tr><td>Number of DAG nodes</td><td>Edit frequency</td></tr>
+<tr><td>Node sizes</td><td>Type/size of operations</td></tr>
+<tr><td>Sync request patterns</td><td>Which peers are behind / ahead</td></tr>
+<tr><td>CID queries</td><td>What a peer is looking for</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures-1"><a class="header" href="#countermeasures-1">Countermeasures</a></h3>
+<p><strong>Encrypted DAG topology.</strong> Currently, CIDs and parent-child links are
+in plaintext (so untrusted relays can assist with traversal). Instead:</p>
+<ul>
+<li>Encrypt the children list inside the node payload</li>
+<li>Use a <strong>Private Information Retrieval (PIR)</strong> protocol to fetch nodes
+from storage without revealing which CIDs you’re requesting</li>
+<li>Trade-off: relays can no longer help with DAG walking — peers must
+fetch nodes one at a time (or in batches with PIR)</li>
+</ul>
+<p><strong>Uniform node sizes.</strong> Pad all DAG nodes to a fixed size before
+encryption. This hides whether an operation is a single character
+insert or a large paste.</p>
+<p><strong>Batched sync.</strong> Instead of broadcasting a new root CID after every
+edit, batch operations and sync periodically (e.g. every 5 seconds).
+This hides per-keystroke timing.</p>
+<p><strong>Dummy operations.</strong> Periodically inject no-op DAG nodes (encrypted,
+indistinguishable from real ones). Prevents traffic analysis from
+revealing when a user is actively editing vs idle.</p>
+<blockquote>
+<p><strong>ZK opportunity: Private set reconciliation.</strong> During sync, two
+peers need to discover which DAG nodes they’re each missing. Currently
+this involves walking the DAG and checking CIDs. With ZK, peers could
+perform <strong>private set intersection</strong> — each proves “I have nodes with
+these properties” without revealing the actual CIDs. This prevents a
+malicious peer from learning what you have or don’t have.</p>
+</blockquote>
+<blockquote>
+<p><strong>ZK opportunity: Proof of sync correctness.</strong> A relay or DA layer
+could verify that a submitted DAG node is well-formed (valid CID,
+valid parent references) without seeing the plaintext. The submitter
+provides a ZK proof that the encrypted blob, when decrypted, would
+produce a node whose hash matches the claimed CID.</p>
+</blockquote>
+<hr>
+<h2 id="3-encryption-layer--who-is-in-the-group"><a class="header" href="#3-encryption-layer--who-is-in-the-group">3. Encryption Layer — “Who is in the group”</a></h2>
+<h3 id="what-leaks-2"><a class="header" href="#what-leaks-2">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>MLS group ID</td><td>Links all messages to one group</td></tr>
+<tr><td>MLS Welcome messages</td><td>When new members join</td></tr>
+<tr><td>MLS Commit messages</td><td>When membership changes</td></tr>
+<tr><td>Key package uploads</td><td>A member’s public key exists</td></tr>
+<tr><td>Epoch numbers</td><td>How many membership changes occurred</td></tr>
+<tr><td>Group size</td><td>Number of members</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures-2"><a class="header" href="#countermeasures-2">Countermeasures</a></h3>
+<p><strong>Anonymous group membership.</strong> Instead of MLS where each member has a
+known leaf in the ratchet tree, use a scheme where membership is proven
+via ZK proof. A member proves “I know a secret that is committed in
+this group’s membership Merkle root” without revealing which member
+they are.</p>
+<p><strong>Unlinkable key rotation.</strong> When keys rotate, the new key package
+should not be linkable to the old one. Use re-randomizable keys
+(similar to how zk-promises re-randomizes tickets).</p>
+<p><strong>Hidden group size.</strong> Pad the membership structure to hide the actual
+number of members. A group of 5 looks identical to a group of 50.</p>
+<blockquote>
+<p><strong>ZK opportunity: Anonymous group credentials.</strong> A user proves “I am
+a member of space X” without revealing their identity within the group.
+This is core to enabling anonymous posting, anonymous moderation
+(zk-promises), and anonymous transactions within a space.</p>
+<p>Construction: The space maintains a Merkle tree of member commitments.
+To act, a member proves in ZK:</p>
+<ol>
+<li>“I know a secret <code>s</code> such that <code>Com(s)</code> is a leaf in the membership tree”</li>
+<li>“My serial number <code>sn = PRF(s, nonce)</code> has not been used before” (prevents double-spending/actions)</li>
+<li>Any predicate on their private state (reputation, rate limit, etc.)</li>
+</ol>
+</blockquote>
+<hr>
+<h2 id="4-storage-layer--what-is-accessed-and-when"><a class="header" href="#4-storage-layer--what-is-accessed-and-when">4. Storage Layer — “What is accessed and when”</a></h2>
+<h3 id="what-leaks-3"><a class="header" href="#what-leaks-3">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>Read patterns</td><td>Which CIDs a peer requests</td></tr>
+<tr><td>Write patterns</td><td>When a peer stores new data</td></tr>
+<tr><td>Access frequency</td><td>How active a space/document is</td></tr>
+<tr><td>Storage location choice</td><td>Which backend a peer trusts</td></tr>
+<tr><td>Data retention</td><td>How long data persists</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures-3"><a class="header" href="#countermeasures-3">Countermeasures</a></h3>
+<p><strong>Private Information Retrieval (PIR).</strong> When fetching a DAG node from
+a storage backend, the backend should not learn which CID was requested.
+PIR protocols let a client fetch an item from a database without the
+server knowing which item was fetched.</p>
+<ul>
+<li><strong>Computational PIR</strong> — server does work proportional to DB size per
+query. Practical for moderate databases.</li>
+<li><strong>Multi-server PIR</strong> — split the storage across non-colluding servers.
+Much faster, but requires trust assumption.</li>
+</ul>
+<p><strong>Oblivious RAM (ORAM).</strong> For local storage, if the device could be
+compromised, ORAM hides access patterns even from someone observing
+disk I/O.</p>
+<p><strong>Write-only append.</strong> For remote storage, only ever append — never
+update or delete. This prevents the storage backend from learning about
+the relationship between old and new versions.</p>
+<blockquote>
+<p><strong>ZK opportunity: Proof of storage.</strong> A storage backend proves “I am
+faithfully storing your encrypted blob and have not tampered with it”
+using a proof of storage / proof of retrievability. The user doesn’t
+have to trust the backend or fetch the data back to verify.</p>
+</blockquote>
+<blockquote>
+<p><strong>ZK opportunity: Private storage access control.</strong> A user proves
+they have access to a storage bucket without revealing who they are
+or which space the data belongs to. The storage backend serves the
+data without knowing anything about the requester.</p>
+</blockquote>
+<hr>
+<h2 id="5-identity-layer--who-am-i-across-spaces"><a class="header" href="#5-identity-layer--who-am-i-across-spaces">5. Identity Layer — “Who am I across spaces”</a></h2>
+<h3 id="what-leaks-4"><a class="header" href="#what-leaks-4">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>Reused keys across spaces</td><td>Same person in multiple groups</td></tr>
+<tr><td>Consistent behavior patterns</td><td>Stylometric identification</td></tr>
+<tr><td>Timing correlation</td><td>Same person active in multiple spaces simultaneously</td></tr>
+<tr><td>Device fingerprints</td><td>Hardware/software identity</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures-4"><a class="header" href="#countermeasures-4">Countermeasures</a></h3>
+<p><strong>Per-space identities.</strong> Each space gets a fresh keypair. No
+cryptographic linkage between identities across spaces.</p>
+<p><strong>Anonymous credentials.</strong> Use ZK-based credentials (like those in
+zk-promises) to prove properties without revealing identity:</p>
+<ul>
+<li>“I am over 18” without revealing age or name</li>
+<li>“I have reputation &gt; 100 in some space” without revealing which</li>
+<li>“I have not been banned from any space” without listing spaces</li>
+</ul>
+<p><strong>Cross-space reputation portability.</strong> A user proves “I have good
+standing in at least 3 spaces” without revealing which spaces. This
+enables trust bootstrapping without identity linkage.</p>
+<blockquote>
+<p><strong>ZK opportunity: Selective disclosure credentials.</strong> Build on
+anonymous credentials (CL signatures, BBS+ signatures) to create
+a universal identity layer where users hold credentials and selectively
+disclose attributes via ZK proofs.</p>
+<p>Example: To join a new space, prove “I hold a valid KryptOS credential
+issued in the last year, I have not been banned from more than 2
+spaces, and my aggregate reputation is above threshold X.” The space
+learns nothing else about you.</p>
+</blockquote>
+<hr>
+<h2 id="6-application-layer--what-are-users-doing"><a class="header" href="#6-application-layer--what-are-users-doing">6. Application Layer — “What are users doing”</a></h2>
+<h3 id="what-leaks-5"><a class="header" href="#what-leaks-5">What leaks</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Signal</th><th>What it reveals</th></tr>
+</thead>
+<tbody>
+<tr><td>Document types</td><td>What kind of app (chat, doc, kanban…)</td></tr>
+<tr><td>Operation structure</td><td>CRDT operation shapes reveal app semantics</td></tr>
+<tr><td>Interaction patterns</td><td>Turn-taking in chat, cursor movement</td></tr>
+<tr><td>File sizes</td><td>Type of content (text vs image vs video)</td></tr>
+<tr><td>Feature usage</td><td>Which app features a user engages with</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="countermeasures-5"><a class="header" href="#countermeasures-5">Countermeasures</a></h3>
+<p><strong>Uniform operation encoding.</strong> All CRDT operations, regardless of
+document type, are serialized to a uniform envelope before encryption.
+An observer can’t distinguish a chat message from a code edit.</p>
+<p><strong>Application-level padding.</strong> Pad payloads to discrete size buckets
+so that a chat message and a paragraph insert look the same.</p>
+<p><strong>Batched multi-document operations.</strong> When a user edits multiple
+documents, bundle the operations into a single encrypted batch.
+Prevents correlating “user edited doc A and doc B at the same time.”</p>
+<hr>
+<h2 id="7-transaction-layer--private-value-exchange"><a class="header" href="#7-transaction-layer--private-value-exchange">7. Transaction Layer — “Private value exchange”</a></h2>
+<p>Kunekt spaces aren’t just for documents. If the protocol supports
+private collaboration, it can also support private transactions:</p>
+<p><strong>Private payments within spaces.</strong> Members pay each other without
+revealing amounts or parties to outsiders. Combine Kunekt’s encrypted
+channels with a shielded transaction protocol.</p>
+<p><strong>Anonymous marketplace.</strong> A space acts as a marketplace. Buyers and
+sellers interact via anonymous credentials. ZK proofs verify payment
+and delivery without revealing identities.</p>
+<p><strong>Private voting / governance.</strong> Space members vote on proposals.
+ZK proofs ensure one-member-one-vote, tallies are correct, but
+individual votes are secret.</p>
+<blockquote>
+<p><strong>ZK opportunity: Private state channels.</strong> Two or more parties in a
+space run a private state channel for transactions. Each state update
+is a CRDT operation encrypted via MLS. Settlement proofs (ZK) can be
+posted to a chain without revealing the channel’s content.</p>
+</blockquote>
+<hr>
+<h2 id="how-this-maps-to-the-roadmap"><a class="header" href="#how-this-maps-to-the-roadmap">How this maps to the roadmap</a></h2>
+<p>Each layer’s countermeasures are addressed in a specific development
+phase. Content encryption (Phase 1) and IP hiding (Phase 2) come
+first. Anonymous identity (Phase 3) and full metadata protection
+(Phase 4) follow. See <a href="./roadmap.html">Development Phases</a> for details
+and <a href="./building-blocks.html">Building Blocks</a> for which existing
+technologies implement each countermeasure.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="nostr.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="private-economy.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="nostr.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="private-economy.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

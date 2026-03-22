@@ -1,0 +1,809 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Security Analysis &amp; Open Questions - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="security-analysis--open-questions"><a class="header" href="#security-analysis--open-questions">Security Analysis &amp; Open Questions</a></h1>
+<p>This chapter assesses Kunekt’s security properties honestly: what the
+protocol achieves, what it does not, and what remains unresolved. Every
+claim is tied to the specific mechanism that provides it, and every
+limitation is stated plainly with its implications.</p>
+<p>For the threat model and adversary definitions, see
+<a href="./threat-model.html">Threat Model &amp; Design Principles</a>. This chapter
+builds on that foundation by evaluating the protocol’s actual security
+posture.</p>
+<hr>
+<h2 id="1-security-properties-achieved"><a class="header" href="#1-security-properties-achieved">1. Security Properties Achieved</a></h2>
+<p>Each property states a claim, identifies the mechanism that provides
+it, and notes the conditions under which it holds.</p>
+<h3 id="content-confidentiality"><a class="header" href="#content-confidentiality">Content confidentiality</a></h3>
+<p><strong>Claim:</strong> Only current members of a space can read document content.</p>
+<p><strong>Mechanism:</strong> MLS (RFC 9420) group ratchet. Every DAG node payload is
+encrypted with the symmetric key derived from the current MLS epoch
+secret before leaving the local peer. The epoch key is known only to
+members who have processed the relevant MLS Commit or Welcome message.</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the MLS key schedule is secure
+(standard assumption for RFC 9420), (b) AES-128-GCM is semantically
+secure, and (c) no current member leaks plaintext. Condition (c) is
+fundamental — any member who can read content can copy it. The protocol
+cannot prevent screenshot-level exfiltration.</p>
+<p>See <a href="./encryption.html">Encryption</a>, sections 1 and 4.</p>
+<h3 id="data-integrity"><a class="header" href="#data-integrity">Data integrity</a></h3>
+<p><strong>Claim:</strong> Tampered data is detected and rejected by any peer.</p>
+<p><strong>Mechanism:</strong> Content addressing. Every Merkle-DAG node’s identity is
+the cryptographic hash (Blake3 or SHA-256) of its serialized contents.
+A peer that receives a node recomputes the hash and compares it to the
+claimed CID. Any modification — to the payload, the children list, or
+the framing — produces a different hash and is rejected.</p>
+<p><strong>Conditions:</strong> Holds as long as the hash function is collision-resistant.
+For Blake3-256 and SHA-256, this is a standard assumption.</p>
+<p>See <a href="./sync.html">Sync</a>, section 2.</p>
+<h3 id="forward-secrecy"><a class="header" href="#forward-secrecy">Forward secrecy</a></h3>
+<p><strong>Claim:</strong> Compromising a member’s current epoch key does not expose
+content from previous epochs.</p>
+<p><strong>Mechanism:</strong> MLS key schedule. Each epoch derives its keys from a
+one-way key derivation function. The <code>init_secret</code> from epoch N seeds
+epoch N+1, but epoch N+1’s secret cannot be reversed to recover epoch
+N’s keys. Old epoch secrets are deleted from device memory after
+ratcheting.</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the KDF is one-way (HKDF-SHA256,
+standard assumption), (b) old epoch keys are deleted from device
+storage after ratcheting, and (c) the device is not compromised while
+old keys are still in memory.</p>
+<p><strong>Nuance for CRDTs:</strong> Forward secrecy protects the <em>operation history</em>
+(individual DAG nodes from past epochs), not the <em>CRDT state</em>. The
+current state reflects all past operations and is available to any
+current member. A new member joining at epoch N cannot decrypt DAG
+nodes from epochs 0 through N-1, but can see the materialized document
+state that resulted from those operations. This is deliberate — see
+<a href="./encryption.html">Encryption</a>, section 7 for the full discussion.</p>
+<h3 id="post-compromise-security"><a class="header" href="#post-compromise-security">Post-compromise security</a></h3>
+<p><strong>Claim:</strong> After a compromised member is removed and keys are rotated,
+the attacker cannot read new content.</p>
+<p><strong>Mechanism:</strong> MLS Commit on member removal. The ratchet tree path from
+the removed member’s leaf to the root is re-keyed. The new epoch secret
+is derived from values the removed member does not possess (the
+UpdatePath encrypted to remaining members only).</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the MLS ratchet tree update is
+secure (standard assumption for RFC 9420), and (b) at least one
+remaining member is honest and processes the removal Commit.</p>
+<h3 id="anonymity-within-group"><a class="header" href="#anonymity-within-group">Anonymity within group</a></h3>
+<p><strong>Claim:</strong> In anonymous mode (Phase 3), members perform actions without
+revealing which member they are, even to other members and moderators.</p>
+<p><strong>Mechanism:</strong> zk-promises <code>ShowAuthorized</code> proof. The member proves in
+zero knowledge: “I know a secret committed in this space’s membership
+Merkle tree, my reputation is above threshold, I am not banned, and my
+rate limit is not exhausted.” The proof reveals none of these values —
+only that the statement is true.</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the Groth16 proof system is
+zero-knowledge and sound, (b) the membership Merkle tree is correctly
+maintained, and (c) side channels (timing, writing style, behavioral
+patterns) do not leak identity. Condition (c) is outside the protocol’s
+control — see Section 2 and the <a href="./threat-model.html">threat model</a>,
+section 5.</p>
+<h3 id="unlinkability-across-spaces"><a class="header" href="#unlinkability-across-spaces">Unlinkability across spaces</a></h3>
+<p><strong>Claim:</strong> A user’s identity in Space A cannot be cryptographically
+linked to their identity in Space B.</p>
+<p><strong>Mechanism:</strong> Per-space key derivation. Each space gets a fresh keypair
+derived from the root secret with the space identifier as context:
+<code>space_secret = HKDF(root_secret, "kunekt/space/" || space_id)</code>.
+There is no shared public key, credential, or identifier across spaces.</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the HKDF derivation is secure
+(the space secret reveals nothing about the root secret or other space
+secrets), and (b) the user does not voluntarily link identities through
+application-level behavior (e.g., sharing the same username in
+multiple spaces).</p>
+<p>See <a href="./identity.html">Identity</a>, section 1.</p>
+<h3 id="accountability-without-identity"><a class="header" href="#accountability-without-identity">Accountability without identity</a></h3>
+<p><strong>Claim:</strong> Bad actors can be penalized (reputation reduced, rate-limited,
+banned) without anyone learning who they are.</p>
+<p><strong>Mechanism:</strong> zk-promises callbacks. A moderator issues a callback
+against an anonymous post’s ticket. The callback is published to the
+bulletin board (a CRDT document). The poster — and only the poster —
+recognizes their ticket during their next <code>ScanOne</code> pass. They must
+process the callback (update their private zk-object state) before
+producing their next valid <code>ShowAuthorized</code> proof. If they fail to
+process it, their proof is invalid and their next action is rejected.</p>
+<p><strong>Conditions:</strong> Holds as long as (a) the bulletin board is available
+and consistent (all members see the same callbacks), (b) the zk-promises
+cryptographic construction is sound, and (c) the user eventually comes
+online to process the callback.</p>
+<p>See <a href="./zk-promises.html">Anonymous Moderation</a>.</p>
+<h3 id="censorship-resistance"><a class="header" href="#censorship-resistance">Censorship resistance</a></h3>
+<p><strong>Claim:</strong> No single entity can prevent content from being stored and
+replicated.</p>
+<p><strong>Mechanism:</strong> Multiple independent storage backends (Nostr relays,
+local databases, DA layers), content-addressed data (any source can
+serve any node), and offline-first design (peers retain local copies).
+A peer publishes to multiple relays. A single relay refusing events
+does not prevent other relays from serving them. Even if all remote
+storage is unavailable, local editing continues and syncs when any
+peer or relay becomes reachable.</p>
+<p><strong>Conditions:</strong> Holds as long as at least one relay or peer is reachable
+and honest. If an adversary controls all relays a space uses
+simultaneously, remote sync stalls (though local operation continues).</p>
+<hr>
+<h2 id="2-known-limitations"><a class="header" href="#2-known-limitations">2. Known Limitations</a></h2>
+<p>These are not bugs — they are constraints inherent to the design, known
+tradeoffs, or areas where the current implementation accepts a weaker
+guarantee in exchange for practicality.</p>
+<h3 id="mls-ordering-requirement"><a class="header" href="#mls-ordering-requirement">MLS ordering requirement</a></h3>
+<p><strong>Problem:</strong> MLS Commits must be applied in a total order. If two
+members simultaneously issue a Commit at the same epoch, the group
+cannot apply both — each produces a different next epoch with a
+different ratchet tree. CRDTs, by design, do not provide total ordering.</p>
+<p><strong>Current solution:</strong> Deterministic conflict resolution based on CID
+comparison. When concurrent Commits are detected in the Merkle-DAG
+(a fork), the Commit with the lexicographically lower CID wins. The
+losing Commit’s Proposals are re-proposed in the next epoch. Because
+CIDs are deterministic hashes, every peer reaches the same resolution
+independently.</p>
+<p><strong>Risk:</strong> This resolution strategy is a protocol-level design that has
+not been formally verified. While it is deterministic and has been
+reasoned about carefully (see <a href="./encryption.html">Encryption</a>, section 3),
+subtle edge cases may exist — particularly around n-way forks, rapid
+concurrent Commits, or interactions between MLS group state and CRDT
+convergence. Formal verification of this mechanism is a priority for
+the first security audit.</p>
+<h3 id="trusted-setup-groth16"><a class="header" href="#trusted-setup-groth16">Trusted setup (Groth16)</a></h3>
+<p><strong>Problem:</strong> The zk-promises framework uses Groth16 proofs, which
+require a per-circuit trusted setup ceremony. The setup produces a
+structured reference string (SRS) that must be generated honestly. If
+the setup is compromised (the toxic waste is not destroyed), an
+attacker can forge proofs — they could bypass reputation checks, ignore
+rate limits, or evade bans.</p>
+<p><strong>Impact:</strong> Soundness of the anonymous moderation system. A forged
+<code>ShowAuthorized</code> proof would allow unauthorized actions. A forged
+callback-processing proof would allow ignoring moderation penalties.</p>
+<p><strong>Mitigation:</strong> Use multi-party computation (MPC) for the setup
+ceremony, where soundness holds as long as at least one participant is
+honest. Long-term, migrate to a universal setup system (PLONK, Marlin)
+that eliminates the per-circuit trusted setup entirely. This migration
+is planned but not yet scheduled.</p>
+<h3 id="bulletin-board-availability"><a class="header" href="#bulletin-board-availability">Bulletin board availability</a></h3>
+<p><strong>Problem:</strong> The zk-promises protocol requires the bulletin board to be
+available and consistent. If the bulletin board is partitioned (some
+members see different versions), moderation enforcement becomes
+inconsistent — a user might produce a valid proof on one partition that
+would be invalid on another.</p>
+<p><strong>Current implementation:</strong> The bulletin board is a CRDT document in the
+space, synced via Merkle-CRDT like everything else. CRDTs guarantee
+eventual consistency, so partitions are temporary. However, during a
+partition, a user on one side might act without having processed a
+callback that exists on the other side. When the partition heals and the
+bulletin boards merge, the inconsistency is resolved — but the
+unauthorized action has already occurred.</p>
+<p><strong>Impact:</strong> Moderation enforcement may lag during network partitions.
+In practice, this means a penalized user might get a few extra actions
+through before the penalty takes effect. The CRDT merge will eventually
+make the penalty visible everywhere.</p>
+<p><strong>Mitigation for high-stakes spaces:</strong> Anchor the bulletin board to a
+blockchain or DA layer with stronger consistency guarantees. This
+trades latency for consistency.</p>
+<h3 id="timing-side-channels"><a class="header" href="#timing-side-channels">Timing side channels</a></h3>
+<p><strong>Problem:</strong> Even with batching and uniform envelope sizes, a
+sufficiently powerful adversary observing all network links may
+correlate activity patterns. A user who is active in Space A and
+Space B at correlated times might be linkable across spaces through
+timing analysis, despite per-space key isolation.</p>
+<p><strong>Current defenses (by phase):</strong></p>
+<ul>
+<li>Phase 2: Tor hides IP addresses but does not prevent timing
+correlation by a global passive adversary.</li>
+<li>Phase 4: Nym mix network with cover traffic. Messages are batched,
+delayed, and mixed. Cover traffic maintains a constant rate even
+during idle periods.</li>
+</ul>
+<p><strong>Residual risk:</strong> Cover traffic reduces but does not eliminate timing
+leakage. The tradeoff is bandwidth: more cover traffic means better
+anonymity but higher bandwidth cost. The optimal rate depends on the
+anonymity set size and the adversary’s resources — this is an active
+research area with no definitive answer.</p>
+<h3 id="client-side-proof-generation-cost"><a class="header" href="#client-side-proof-generation-cost">Client-side proof generation cost</a></h3>
+<p><strong>Problem:</strong> ZK proof generation (Groth16 via Arkworks) is
+CPU-intensive. The <code>ShowAuthorized</code> proof takes approximately 300-900ms
+on modern desktop hardware (native Rust). In WASM (browser), this
+increases to approximately 1.5-3.5 seconds due to WASM runtime
+overhead and the lack of SIMD optimization in most WASM environments.</p>
+<p><strong>Impact:</strong> Per-operation proofs are impractical. The protocol uses
+session tokens (prove once at session start, then use a short-lived
+token) to amortize the cost. This weakens anonymity within a session
+— operations from the same session token are linkable to each other
+(though not to a specific member).</p>
+<p><strong>Future direction:</strong> Newer proof systems designed for client-side
+efficiency (Jolt, SP1, Binius) may reduce proving time to under 100ms,
+making per-batch proofs practical. This is being evaluated but no
+commitment has been made.</p>
+<p>Low-power devices (phones, IoT) are disproportionately affected. The
+<code>no_std</code> core of <code>merkle-crdt</code> runs on constrained devices, but the ZK
+layer (Arkworks, <code>std</code>-only) does not. Devices without ZK capability
+must delegate proof generation to a more powerful peer or skip anonymous
+mode entirely.</p>
+<h3 id="key-recovery-is-hard"><a class="header" href="#key-recovery-is-hard">Key recovery is hard</a></h3>
+<p><strong>Problem:</strong> There is no server holding a copy of the user’s keys. If
+all devices holding the root secret are lost and no recovery method was
+set up, the user permanently loses access to every space, all stored
+data, and all accumulated reputation.</p>
+<p><strong>Current approach:</strong> The SDK supports four recovery methods (social
+recovery via Shamir’s Secret Sharing, encrypted cloud backup, hardware
+security key, mnemonic phrase) and prompts users to set up recovery
+during onboarding. See <a href="./identity.html">Identity</a>, section 3.</p>
+<p><strong>Residual risk:</strong> Recovery requires proactive setup. Users who dismiss
+the recovery prompt and later lose their device have no recourse.
+Unlike centralized services, there is no “account recovery” department
+to contact. This is an inherent tradeoff of decentralized identity and
+must be communicated clearly to users.</p>
+<h3 id="quantum-vulnerability"><a class="header" href="#quantum-vulnerability">Quantum vulnerability</a></h3>
+<p><strong>Problem:</strong> All current cryptographic primitives used by Kunekt are
+vulnerable to quantum computers:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Primitive</th><th>Used by</th><th>Quantum attack</th></tr>
+</thead>
+<tbody>
+<tr><td>ECDH (X25519)</td><td>MLS key agreement</td><td>Shor’s algorithm</td></tr>
+<tr><td>Ed25519</td><td>MLS signatures, Nostr signing</td><td>Shor’s algorithm</td></tr>
+<tr><td>secp256k1</td><td>Nostr event signing</td><td>Shor’s algorithm</td></tr>
+<tr><td>Groth16 (pairing-based)</td><td>zk-promises proofs</td><td>Quantum speedup for discrete log</td></tr>
+<tr><td>BBS+ (pairing-based)</td><td>Cross-space credentials</td><td>Shor’s algorithm</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Impact:</strong> A quantum computer capable of running Shor’s algorithm at
+sufficient scale could break key agreement (decrypting all content),
+forge signatures (impersonating any member), and forge ZK proofs
+(bypassing all anonymous moderation).</p>
+<p><strong>Current status:</strong> Practically relevant quantum computers do not exist
+as of this writing. Post-quantum alternatives for group key agreement
+(ML-KEM) are standardized (NIST FIPS 203), but post-quantum ZK proof
+systems and pairing-based credential schemes are still in early research.</p>
+<p><strong>Planned mitigation:</strong> Phase 6 includes a post-quantum migration path:
+hybrid mode (classical + post-quantum proofs during transition) and
+hash-based signatures for long-term data authenticity. The migration
+path for ZK proofs is less clear — lattice-based ZK systems are
+actively researched but not yet mature enough for production.</p>
+<p><strong>Harvest-now-decrypt-later risk:</strong> An adversary recording encrypted
+traffic today could decrypt it in the future with a quantum computer.
+MLS forward secrecy limits the window (each epoch’s key is independent),
+but all content from a given epoch is vulnerable if the epoch key is
+recovered via quantum attack on the ECDH exchange.</p>
+<hr>
+<h2 id="3-open-research-questions"><a class="header" href="#3-open-research-questions">3. Open Research Questions</a></h2>
+<p>These are questions that do not have known solutions and require
+further research, experimentation, or advances in the field.</p>
+<h3 id="can-mls-work-without-any-ordering-requirement"><a class="header" href="#can-mls-work-without-any-ordering-requirement">Can MLS work without any ordering requirement?</a></h3>
+<p>MLS (RFC 9420) was designed with an ordering service (Delivery Service)
+in mind. Kunekt’s CID-based conflict resolution provides a
+deterministic tiebreaker for concurrent Commits, but this is a
+pragmatic workaround, not a fundamental solution. Active research
+directions include:</p>
+<ul>
+<li><strong>Decentralized MLS (dMLS):</strong> Academic work on removing the ordering
+requirement from MLS entirely, replacing sequential epochs with a
+DAG-based epoch structure. This aligns naturally with Merkle-CRDTs
+but is not yet standardized.</li>
+<li><strong>TreeKEM variants:</strong> Modified tree ratchet schemes that tolerate
+concurrent updates without conflict. Some proposals exist in the
+literature but have not been implemented at scale.</li>
+<li><strong>CRDT-native group encryption:</strong> Designing a group key agreement
+protocol from scratch for CRDT environments, where concurrent
+key updates are commutative by construction. This is speculative
+but would eliminate the MLS ordering problem entirely.</li>
+</ul>
+<h3 id="can-zk-promises-proof-generation-be-fast-enough-for-per-operation-proofs"><a class="header" href="#can-zk-promises-proof-generation-be-fast-enough-for-per-operation-proofs">Can zk-promises proof generation be fast enough for per-operation proofs?</a></h3>
+<p>Current proving time (~700ms native, ~3s WASM) forces the use of
+session tokens, which weaken per-operation anonymity. Reducing proving
+time to under 50ms would allow per-batch proofs (one proof per 100ms
+edit batch), significantly improving anonymity guarantees.</p>
+<p>Promising directions:</p>
+<ul>
+<li><strong>Jolt:</strong> A zkVM that achieves fast prover times by leveraging
+lookup arguments. Could reduce the circuit-specific overhead of
+zk-promises.</li>
+<li><strong>SP1:</strong> A zkVM targeting developer experience and prover
+efficiency, with explicit WASM support.</li>
+<li><strong>Hardware acceleration:</strong> GPU-based or FPGA-based proof generation
+for native clients.</li>
+<li><strong>Incremental proving:</strong> Reuse parts of the previous proof when the
+zk-object state changes by only one field (e.g., reputation
+decremented by 10). This could reduce subsequent proofs to a small
+delta computation.</li>
+</ul>
+<h3 id="is-there-a-practical-pir-scheme-for-nostr-relay-scale-databases"><a class="header" href="#is-there-a-practical-pir-scheme-for-nostr-relay-scale-databases">Is there a practical PIR scheme for Nostr relay-scale databases?</a></h3>
+<p>Private Information Retrieval would allow peers to fetch DAG nodes from
+relays without the relay learning which CIDs were requested. Current
+PIR schemes face a fundamental tension:</p>
+<ul>
+<li><strong>Single-server computational PIR:</strong> The server must perform work
+proportional to the entire database size per query. For a relay with
+millions of events, this is seconds per query — impractical for
+real-time sync.</li>
+<li><strong>Multi-server PIR:</strong> Fast, but requires multiple non-colluding
+servers. This weakens the trust model (the servers must not share
+data).</li>
+<li><strong>SimplePIR and derivatives:</strong> Recent schemes reduce server
+computation significantly, but still require substantial client-side
+preprocessing. Feasibility at Nostr relay scale (millions of events,
+hundreds of concurrent clients) has not been demonstrated.</li>
+</ul>
+<p>An alternative approach: <strong>keyword PIR</strong> or <strong>batch PIR</strong> tailored to
+the access pattern (fetching DAG nodes by CID, which is essentially
+a key-value lookup). This is a more constrained problem than general
+PIR and may admit more efficient solutions.</p>
+<h3 id="can-recursive-snarks-practically-verify-entire-dag-histories"><a class="header" href="#can-recursive-snarks-practically-verify-entire-dag-histories">Can recursive SNARKs practically verify entire DAG histories?</a></h3>
+<p>Phase 6 envisions using recursive proofs (Nova, SuperNova) so that
+each DAG node carries an incrementally updated proof that the entire
+history is valid. A new peer would verify one proof instead of walking
+the entire DAG.</p>
+<p>Open questions:</p>
+<ul>
+<li><strong>Proof accumulation overhead:</strong> Each new DAG node must fold in the
+previous proof. What is the per-node overhead? If it exceeds the
+batching interval (100ms), recursive proofs are impractical for
+real-time collaboration.</li>
+<li><strong>Circuit complexity:</strong> The recursive circuit must verify both the
+CRDT operation validity and the previous proof. For complex CRDT
+types (Automerge), the circuit size may be prohibitive.</li>
+<li><strong>Concurrent branches:</strong> Nova assumes a sequential chain of proofs.
+A Merkle-DAG has concurrent branches. Merging two branches requires
+combining two independent proof chains, which is not natively
+supported by Nova’s folding scheme. SuperNova or other multi-circuit
+folding schemes may help.</li>
+</ul>
+<h3 id="how-to-prevent-credential-accumulation-attacks"><a class="header" href="#how-to-prevent-credential-accumulation-attacks">How to prevent credential accumulation attacks?</a></h3>
+<p>Cross-space reputation (Phase 3) allows users to prove “I have good
+standing in N spaces.” An attacker with N Sybil identities could
+accumulate credentials across manufactured spaces and present
+convincing aggregate proofs.</p>
+<p>The fundamental challenge: preventing Sybil attacks without a
+centralized identity oracle is an open problem. Kunekt’s planned
+mitigations (rate-limited credential issuance, social vouching, optional
+proof-of-personhood) raise the cost of attacks but do not eliminate
+them. The question of what level of Sybil resistance is “good enough”
+for practical anonymous reputation systems remains unresolved.</p>
+<p>See <a href="./identity.html">Identity</a>, section 4 for the current approach.</p>
+<h3 id="what-is-the-optimal-cover-traffic-rate"><a class="header" href="#what-is-the-optimal-cover-traffic-rate">What is the optimal cover traffic rate?</a></h3>
+<p>Cover traffic (constant-rate dummy messages) is the primary defense
+against timing analysis by a global passive adversary. Too little
+cover traffic and real activity stands out. Too much and bandwidth
+costs become prohibitive.</p>
+<p>The optimal rate depends on:</p>
+<ul>
+<li>The anonymity set size (how many users are sending cover traffic).</li>
+<li>The adversary’s observation capability (fraction of network links
+monitored).</li>
+<li>The application’s activity pattern (bursty vs. continuous).</li>
+<li>The user’s bandwidth constraints (mobile vs. desktop).</li>
+</ul>
+<p>This is fundamentally a game-theoretic problem. There is no single
+“correct” rate. Practical systems typically choose conservative
+defaults and allow users to adjust, but the interaction between
+individual user settings and collective anonymity is not well
+understood.</p>
+<hr>
+<h2 id="4-comparison-of-security-properties"><a class="header" href="#4-comparison-of-security-properties">4. Comparison of Security Properties</a></h2>
+<p>The following table compares Kunekt’s security properties against
+established secure communication systems. Each cell indicates whether
+the property is achieved (Yes), not achieved (No), partially achieved
+(Partial), or not applicable (N/A).</p>
+<pre><code>Property                    Kunekt          Signal       Matrix (E2EE)   Briar
+                            (Phase 3+)
+──────────────────────────────────────────────────────────────────────────────
+Content confidentiality     Yes             Yes          Yes             Yes
+  Mechanism                 MLS group key   Signal       Megolm session  Per-contact
+                                            Protocol     keys            channel keys
+
+Data integrity              Yes             Yes          Yes             Yes
+  Mechanism                 CID (hash)      MAC          MAC/signature   MAC
+
+Forward secrecy             Yes             Yes          Partial¹        Yes
+  Mechanism                 MLS epoch       Double       Megolm limited  Bramble
+                            ratchet         ratchet      ratchet         transport
+
+Post-compromise security    Yes             Yes          Partial²        Yes
+  Mechanism                 MLS removal +   Ratchet      Re-establish    New channel
+                            key rotation    reset        session         on compromise
+
+Group encryption            Yes (O(log n))  No³          Yes (O(n))      No⁴
+  Mechanism                 MLS ratchet     Pairwise     Megolm (sender  Pairwise
+                            tree            for groups   key per member)
+
+Anonymity within group      Yes⁵            No           No              N/A⁶
+  Mechanism                 zk-promises     Members      Members         1:1 only
+                            ZK proofs       identified   identified
+
+Unlinkability across        Yes             No           No              Partial⁷
+  groups/spaces             Per-space keys  One identity One identity    Per-contact
+                                                                         identity
+
+Metadata protection         Yes (Phase 4)   Partial⁸     No⁹             Yes¹⁰
+  Mechanism                 Tor/Nym +       Sealed       Server sees     Tor + no
+                            cover traffic   sender       metadata        server
+
+Decentralization            Yes             No¹¹         Partial¹²       Yes
+  Mechanism                 P2P + relays    Signal       Federated       P2P
+                            (no trust)      servers      servers
+
+Offline editing             Yes             No¹³         No¹³            Yes¹⁴
+  Mechanism                 CRDTs merge     Queue until  Queue until     Queue until
+                            conflict-free   online       online          sync
+
+Anonymous moderation        Yes⁵            No           No              No
+  Mechanism                 zk-promises     N/A          Admin-based     N/A
+                            callbacks
+</code></pre>
+<p><strong>Notes:</strong></p>
+<ol>
+<li>Matrix Megolm has limited forward secrecy. Session keys are shared
+with new members, weakening FS guarantees within a session.</li>
+<li>Matrix post-compromise security requires manual session
+re-establishment. Automatic healing is weaker than MLS.</li>
+<li>Signal uses pairwise encryption for groups (sender keys), which is
+O(n) per message in terms of key distribution.</li>
+<li>Briar supports only 1:1 contacts and small forums, not general
+group encryption.</li>
+<li>Requires Phase 3 (zk-promises integration). Prior to Phase 3,
+members are pseudonymous (per-space keypair), not fully anonymous.</li>
+<li>Briar is 1:1 only; group anonymity is not applicable.</li>
+<li>Briar uses per-contact identities (different identity per contact),
+providing partial unlinkability.</li>
+<li>Signal protects sender identity via sealed sender, but the Signal
+server still sees recipient, timing, and message sizes.</li>
+<li>Matrix homeservers see full metadata: who sends to whom, when,
+room membership, and message sizes.</li>
+<li>Briar uses Tor for all connections and does not rely on servers,
+providing strong metadata protection.</li>
+<li>Signal requires Signal servers for message delivery and user
+registration (phone number).</li>
+<li>Matrix is federated (users choose a server) but servers are
+trusted for availability and see metadata.</li>
+<li>Signal and Matrix queue messages until the recipient is online;
+they do not support offline <em>editing</em> of shared state.</li>
+<li>Briar supports offline operation and syncs when peers reconnect,
+but does not have CRDT-based conflict resolution.</li>
+</ol>
+<hr>
+<h2 id="5-audit-roadmap"><a class="header" href="#5-audit-roadmap">5. Audit Roadmap</a></h2>
+<p>Security audits are planned in phases that align with the development
+roadmap. Each audit phase targets the most critical code paths for
+the corresponding protocol phase.</p>
+<h3 id="audit-phase-1-core-data-path"><a class="header" href="#audit-phase-1-core-data-path">Audit Phase 1: Core data path</a></h3>
+<p><strong>Scope:</strong> The path from CRDT operation to encrypted, stored DAG node
+and back.</p>
+<p><strong>Components:</strong></p>
+<ul>
+<li><code>merkle-crdt</code> crate: DAG construction, CID computation, sync
+protocol, topological sort, anti-entropy algorithm.</li>
+<li>MLS integration: OpenMLS configuration, epoch key derivation,
+encryption/decryption of DAG node payloads.</li>
+<li>MLS + Merkle-CRDT reconciliation: concurrent Commit resolution
+(CID-based tiebreaker), epoch transition during offline editing,
+key caching.</li>
+<li>Local storage encryption: key derivation from root secret, database
+encryption at rest.</li>
+</ul>
+<p><strong>Priority:</strong> This is the highest-priority audit. Every byte of user
+data flows through this path. A bug here could break confidentiality
+or integrity for all users.</p>
+<p><strong>Timing:</strong> Before the first production release (end of Phase 1
+development).</p>
+<h3 id="audit-phase-2-nostr-adapter-and-transport"><a class="header" href="#audit-phase-2-nostr-adapter-and-transport">Audit Phase 2: Nostr adapter and transport</a></h3>
+<p><strong>Scope:</strong> The interface between Kunekt and external infrastructure.</p>
+<p><strong>Components:</strong></p>
+<ul>
+<li>Nostr relay adapter: event construction, tag computation
+(HMAC-based opaque tags), subscription filters, event retrieval.</li>
+<li>Nostr signing key derivation: MLS epoch secret to Nostr keypair.</li>
+<li>Tor integration (arti): connection management, circuit reuse
+policy, error handling.</li>
+<li>Relay discovery and selection logic.</li>
+<li>Multi-relay replication and consistency.</li>
+</ul>
+<p><strong>Priority:</strong> High. The Nostr adapter is the primary attack surface
+for relay-based adversaries. Incorrect tag computation, signing key
+handling, or subscription patterns could leak metadata.</p>
+<p><strong>Timing:</strong> Before Phase 2 production release.</p>
+<h3 id="audit-phase-3-zk-circuits-and-anonymous-credentials"><a class="header" href="#audit-phase-3-zk-circuits-and-anonymous-credentials">Audit Phase 3: ZK circuits and anonymous credentials</a></h3>
+<p><strong>Scope:</strong> The zero-knowledge proof layer.</p>
+<p><strong>Components:</strong></p>
+<ul>
+<li>zk-promises integration: <code>ShowAuthorized</code> circuit, callback
+processing circuit, bulletin board interaction.</li>
+<li>Membership Merkle tree: construction, update (as CRDT operation),
+ZK membership proof circuit.</li>
+<li>Anonymous session tokens: issuance, verification, expiry, linkability
+properties.</li>
+<li>Cross-space credential proofs: BBS+ selective disclosure integration,
+anonymity set estimation.</li>
+<li>Groth16 trusted setup: ceremony design, toxic waste handling.</li>
+</ul>
+<p><strong>Priority:</strong> High. ZK circuits are notoriously difficult to get right.
+A bug in the <code>ShowAuthorized</code> circuit could allow unauthorized actions
+(soundness failure) or leak member identity (zero-knowledge failure).
+Both are catastrophic.</p>
+<p><strong>Timing:</strong> Before Phase 3 production release.</p>
+<h3 id="ongoing-dependency-audits"><a class="header" href="#ongoing-dependency-audits">Ongoing: Dependency audits</a></h3>
+<p>Kunekt integrates several large external dependencies that must be
+monitored continuously:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Dependency</th><th>What to monitor</th></tr>
+</thead>
+<tbody>
+<tr><td>OpenMLS</td><td>CVEs, protocol compliance, ratchet tree correctness</td></tr>
+<tr><td>Arkworks</td><td>Proof system soundness, field arithmetic bugs</td></tr>
+<tr><td>arti (Tor)</td><td>Circuit security, DNS leaks, timing side channels</td></tr>
+<tr><td>Automerge</td><td>CRDT convergence correctness, serialization bugs</td></tr>
+<tr><td>RustCrypto crates</td><td>Constant-time implementation, side channels</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Process:</strong> Subscribe to security advisories for each dependency.
+Pin versions in <code>Cargo.lock</code>. Evaluate each update for security
+implications before upgrading. Run <code>cargo audit</code> in CI.</p>
+<h3 id="bug-bounty-program"><a class="header" href="#bug-bounty-program">Bug bounty program</a></h3>
+<p>After the first production release, establish a bug bounty program
+covering:</p>
+<ul>
+<li>Confidentiality breaks (decrypting content without group membership)</li>
+<li>Integrity breaks (forging a valid CID for tampered data)</li>
+<li>Anonymity breaks (identifying an anonymous poster from protocol
+data alone — not from content analysis)</li>
+<li>Soundness breaks (forging a ZK proof that verifies)</li>
+<li>Key recovery (deriving epoch keys without being a group member)</li>
+</ul>
+<p>Bounty amounts should reflect severity. A confidentiality or soundness
+break is critical. A metadata leak is important but less severe. The
+program should explicitly exclude side channels that require physical
+access to the device (covered by the “compromised device” exclusion in
+the threat model).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="roadmap.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="performance.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="roadmap.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="performance.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

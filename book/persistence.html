@@ -1,0 +1,705 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Storage Layer: Persistence &amp; Retrieval - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="persistence"><a class="header" href="#persistence">Persistence</a></h1>
+<p>Kunekt peers need a way to persist encrypted DAG nodes so that data
+survives restarts, device loss, and periods when all peers are offline.
+Because every piece of stored data is encrypted and content-addressed,
+the storage layer can be remarkably simple: backends are untrusted
+blob stores that never see plaintext. This chapter covers how
+content addressing works, what backends are available, how they
+compose, and the hard economic questions that come with storing data
+in a decentralized system.</p>
+<h2 id="content-addressing"><a class="header" href="#content-addressing">Content addressing</a></h2>
+<p>Every DAG node is identified by its content hash (CID). The CID is
+computed deterministically from the node’s serialized bytes — same
+input always yields the same CID, regardless of who computes it or
+where.</p>
+<p>This gives us three properties that the entire storage layer depends on:</p>
+<ul>
+<li><strong>Deduplication</strong> — if two peers independently produce the same DAG
+node (e.g. identical edits merged to the same state), the CID is
+identical. Only one copy needs to be stored.</li>
+<li><strong>Integrity verification</strong> — any peer that fetches a blob can
+recompute the CID from its contents and confirm the data has not
+been tampered with. A relay that corrupts or substitutes data is
+detected immediately.</li>
+<li><strong>Location independence</strong> — a CID says <em>what</em> the data is, not
+<em>where</em> it lives. The same CID can be fetched from a local database,
+a Nostr relay, an IPFS node, or a blockchain DA layer. The consumer
+does not need to know the source — only that the hash matches.</li>
+</ul>
+<h3 id="hash-function-commitment"><a class="header" href="#hash-function-commitment">Hash function commitment</a></h3>
+<p>Kunekt’s CID scheme commits to a specific hash function (encoded in
+the CID’s multicodec prefix, following the CID specification). Changing
+the hash function — for instance moving from BLAKE3 to a
+post-quantum hash — constitutes a migration. All existing CIDs become
+references to the old scheme and must be re-hashed under the new one.
+This is a coordinated, space-wide operation. The practical implication
+is that the hash function choice is a long-lived commitment and should
+be made conservatively.</p>
+<h2 id="storage-tiers"><a class="header" href="#storage-tiers">Storage tiers</a></h2>
+<p>A peer may use multiple storage backends simultaneously. Each tier
+offers different tradeoffs in latency, durability, cost, and trust
+assumptions.</p>
+<h3 id="local-storage"><a class="header" href="#local-storage">Local storage</a></h3>
+<p>The peer’s own database — SQLite for resource-constrained devices,
+sled for embedded use cases, or a plain filesystem for maximum
+portability. This is the primary working copy: always available,
+lowest latency, and the only tier that is fully trusted.</p>
+<p>Local data is encrypted at rest. The encryption key is derived from
+the peer’s root secret (see <a href="encryption.html">encryption</a> for key
+derivation details). Even if the device’s disk is imaged, an attacker
+without the root secret sees only ciphertext.</p>
+<p>The local schema is minimal:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Column</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cid</code></td><td>Content identifier (primary key)</td></tr>
+<tr><td><code>blob</code></td><td>Encrypted DAG node bytes</td></tr>
+<tr><td><code>document_id</code></td><td>Which document this node belongs to</td></tr>
+<tr><td><code>epoch</code></td><td>MLS epoch during which this node was created</td></tr>
+<tr><td><code>stored_at</code></td><td>Timestamp of local insertion</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>document_id</code> and <code>epoch</code> columns are metadata that support
+garbage collection and epoch-based key rotation. They are not part
+of the CID computation — they are local bookkeeping.</p>
+<h3 id="relay-storage"><a class="header" href="#relay-storage">Relay storage</a></h3>
+<p>Nostr relays serve as dumb blob stores. Kunekt pushes encrypted DAG
+nodes as Nostr events, tagged with their CID. Peers pull nodes by
+querying for events matching a CID tag. See <a href="nostr.html">nostr</a> for
+the event format and relay interaction protocol.</p>
+<p>Relays are untrusted. They see encrypted blobs and CID tags — nothing
+more. A relay operator cannot read, modify, or selectively censor
+content without detection (modification is caught by CID verification;
+censorship is mitigated by using multiple relays).</p>
+<p>For redundancy, spaces can be configured to push to multiple relays.
+If one relay goes offline or purges data, the others still hold copies.
+Relay storage is the default remote tier: it is cheap, widely
+available (the Nostr relay ecosystem already exists), and requires
+no blockchain fees.</p>
+<h3 id="distributed-storage"><a class="header" href="#distributed-storage">Distributed storage</a></h3>
+<p>A DHT (distributed hash table) or IPFS network where content-addressed
+data is spread across many participating nodes. Content addressing
+maps naturally to these systems — the CID <em>is</em> the lookup key.</p>
+<p>Distributed storage provides better redundancy than a single relay
+at the cost of higher and less predictable latency. It is most useful
+for data that needs to survive the loss of all relays — a fallback
+tier rather than a primary one.</p>
+<h3 id="blockchain-da-layer"><a class="header" href="#blockchain-da-layer">Blockchain DA layer</a></h3>
+<p>A data availability (DA) layer on a blockchain provides the strongest
+durability guarantee. Data is replicated across validators and is
+available as long as the chain operates. This tier offers:</p>
+<ul>
+<li><strong>Censorship resistance</strong> — validators cannot selectively suppress
+blobs without consensus-level misbehavior.</li>
+<li><strong>Guaranteed availability</strong> — economic incentives (staking, slashing)
+ensure validators serve data or face penalties.</li>
+<li><strong>Auditability</strong> — the fact that data <em>was</em> published at a given
+block height is publicly verifiable.</li>
+</ul>
+<p>The DA layer only stores encrypted blobs — validators cannot read the
+content. This tier is expensive relative to relays and is appropriate
+for high-value or high-risk spaces: legal records, financial
+coordination, whistleblower communication.</p>
+<h3 id="tiered-policy"><a class="header" href="#tiered-policy">Tiered policy</a></h3>
+<p>Each space configures a <strong>storage policy</strong> that specifies which tiers
+to use and the desired replication factor within each tier. Examples:</p>
+<ul>
+<li><strong>Casual chat</strong>: local + 2 relays. Cheap, good enough availability.</li>
+<li><strong>Team workspace</strong>: local + 3 relays + DHT. Higher redundancy,
+tolerates relay churn.</li>
+<li><strong>High-security archive</strong>: local + relay + DA layer. Maximum
+durability, censorship resistance. Higher cost.</li>
+</ul>
+<p>The policy is set by the space administrator and can be updated over
+time. When a new tier is added, existing nodes are backfilled
+asynchronously. When a tier is removed, its data is left in place
+(there is no way to force a remote backend to delete) but is no
+longer actively replicated.</p>
+<h2 id="storage-backend-trait"><a class="header" href="#storage-backend-trait">Storage backend trait</a></h2>
+<p>All storage backends implement a single trait:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>trait Store&lt;H: Hasher, P: Payload&gt; {
+    type Error;
+    fn get(&amp;self, cid: &amp;Cid&lt;H&gt;) -&gt; Result&lt;Option&lt;DagNode&lt;H, P&gt;&gt;, Self::Error&gt;;
+    fn put(&amp;mut self, cid: Cid&lt;H&gt;, node: DagNode&lt;H, P&gt;) -&gt; Result&lt;(), Self::Error&gt;;
+    fn contains(&amp;self, cid: &amp;Cid&lt;H&gt;) -&gt; Result&lt;bool, Self::Error&gt;;
+}
+<span class="boring">}</span></code></pre>
+<p>Three methods. That’s it. The interface is deliberately minimal — any
+system that can store and retrieve bytes by key can implement it. This
+is what makes the tiered architecture possible: the sync engine does
+not know or care whether it is talking to a SQLite database, a Nostr
+relay, or a blockchain node.</p>
+<h3 id="why-this-is-sufficient"><a class="header" href="#why-this-is-sufficient">Why this is sufficient</a></h3>
+<p>Content addressing eliminates the need for complex query interfaces.
+There are no range queries, no secondary indexes, no joins. A peer
+knows which CIDs it needs (from the DAG structure and sync state)
+and asks for them by name. <code>contains</code> is an optimization — it lets
+a peer skip fetching data it already has.</p>
+<p>Updates are never in-place. A DAG node, once written, is immutable.
+There is no <code>update</code> or <code>delete</code> in the trait. This makes
+replication trivial: <code>put</code> is idempotent and commutative across
+backends.</p>
+<h3 id="implementations"><a class="header" href="#implementations">Implementations</a></h3>
+<ul>
+<li><strong><code>MemStore</code></strong> — in-memory hash map. Used for tests and ephemeral
+sessions.</li>
+<li><strong><code>SqliteStore</code></strong> — SQLite database on disk. The default local
+backend for desktop and server peers.</li>
+<li><strong><code>SledStore</code></strong> — embedded sled database. Suitable for
+resource-constrained environments.</li>
+<li><strong><code>NostrRelayStore</code></strong> — wraps a Nostr relay connection. <code>put</code>
+publishes a Nostr event; <code>get</code> queries by CID tag.</li>
+<li><strong><code>DhtStore</code></strong> — wraps a DHT client. <code>put</code> announces the value;
+<code>get</code> performs a DHT lookup.</li>
+<li><strong><code>DaStore</code></strong> — wraps a blockchain DA layer client. <code>put</code> submits
+a blob transaction; <code>get</code> queries by blob commitment.</li>
+</ul>
+<h3 id="multi-backend-adapter"><a class="header" href="#multi-backend-adapter">Multi-backend adapter</a></h3>
+<p>A <code>MultiStore</code> adapter composes multiple backends into one. Writes
+fan out to all configured backends. Reads try backends in priority
+order (typically: local first, then relay, then DHT, then DA layer)
+and return the first successful result.</p>
+<pre><code>MultiStore [
+  SqliteStore (local, priority 0),
+  NostrRelayStore (relay-a.example, priority 1),
+  NostrRelayStore (relay-b.example, priority 1),
+  DaStore (priority 2),
+]
+</code></pre>
+<p>This is the primary interface the sync engine uses. It does not need
+to know how many backends exist or which one responded — it gets a
+<code>DagNode</code> or an error.</p>
+<h2 id="garbage-collection-and-pruning"><a class="header" href="#garbage-collection-and-pruning">Garbage collection and pruning</a></h2>
+<h3 id="the-growth-problem"><a class="header" href="#the-growth-problem">The growth problem</a></h3>
+<p>Every edit to a document creates at least one new DAG node. In an
+active space with frequent edits — a team chat room, a collaborative
+document — DAG nodes accumulate fast. A space with 50 active members
+producing 100 messages per day generates roughly 3,000 nodes per
+month, each carrying an encrypted payload plus structural overhead.
+Over a year, that is 36,000 nodes. Heavy collaboration spaces will
+generate far more.</p>
+<p>Without pruning, storage grows without bound. This is a problem for
+local storage (disk budget) and for relay storage (operator goodwill
+or payment).</p>
+<h3 id="local-garbage-collection"><a class="header" href="#local-garbage-collection">Local garbage collection</a></h3>
+<p>The sync protocol supports <strong>snapshot compaction</strong> (see
+<a href="sync.html">sync</a>): periodically, a peer computes a snapshot that
+represents the full materialized state at a point in time. Once a
+snapshot exists and is confirmed stored on remote backends, all DAG
+nodes that the snapshot supersedes can be deleted locally.</p>
+<p>The rule: keep at least the most recent snapshot plus all nodes
+created after it. Everything older is prunable.</p>
+<p>Peers should be conservative about pruning. A node that has been
+pruned locally must be re-fetched from a remote backend if needed
+again. Aggressive pruning saves disk space but increases network
+traffic.</p>
+<h3 id="remote-garbage-collection"><a class="header" href="#remote-garbage-collection">Remote garbage collection</a></h3>
+<p>Kunekt cannot force remote backends to delete data. A Nostr relay
+may keep events indefinitely; a DA layer certainly will. But this
+is acceptable because <strong>all remote data is encrypted</strong>. Without the
+decryption keys, stored blobs are indistinguishable from random bytes.</p>
+<p>After an MLS epoch rotation, the keys for the old epoch are ratcheted
+forward and (ideally) deleted. Data encrypted under old-epoch keys
+is effectively dead to anyone who did not hold the keys at the time.
+Even if a relay stores old blobs forever, they are cryptographically
+inaccessible to future attackers.</p>
+<p>This is not true garbage collection — the bytes still exist on disk
+somewhere — but it achieves the security property that matters:
+old data cannot be read.</p>
+<h3 id="ttl-based-expiry"><a class="header" href="#ttl-based-expiry">TTL-based expiry</a></h3>
+<p>Some Nostr relays enforce a TTL (time-to-live) on events. If Kunekt
+relies on such a relay, it must periodically re-publish important
+data — snapshots, recent DAG nodes, pending sync heads — before the
+TTL expires. The <code>MultiStore</code> adapter can handle this automatically
+by tracking publication timestamps and re-publishing when a
+configurable TTL threshold approaches.</p>
+<p>This is a tradeoff: TTL relays are cheaper to operate (they bound
+storage) but require active maintenance from peers. A peer that goes
+offline for longer than the TTL risks losing remote copies. The
+mitigation is to use at least one non-TTL backend (a second relay,
+a DA layer) alongside TTL relays.</p>
+<h3 id="quota-management"><a class="header" href="#quota-management">Quota management</a></h3>
+<p>Local storage can be configured with a per-space budget (e.g. 500 MB
+per space). When the budget is exceeded, the oldest prunable nodes are
+evicted first — nodes that are older than the most recent snapshot and
+that are confirmed replicated to at least one remote backend.</p>
+<p>If no nodes are prunable (everything is newer than the last snapshot),
+the peer triggers a snapshot compaction to create a pruning
+opportunity. If the space is still over budget after compaction, the
+peer alerts the user — the budget may need to be increased or the
+space’s edit rate is simply too high for the configured storage.</p>
+<h2 id="data-availability-and-redundancy"><a class="header" href="#data-availability-and-redundancy">Data availability and redundancy</a></h2>
+<h3 id="erasure-coding"><a class="header" href="#erasure-coding">Erasure coding</a></h3>
+<p>For spaces that require strong durability without fully trusting any
+single backend, Kunekt can split encrypted blobs into fragments using
+Reed-Solomon erasure coding. A blob is encoded into <em>n</em> fragments
+such that any <em>k</em> of them are sufficient to reconstruct the original
+(where <em>k &lt; n</em>). The fragments are distributed across different
+backends.</p>
+<p>This means no single backend holds enough data to be a single point
+of failure, and no single backend holds enough data to be useful to
+an attacker (even if the encryption were somehow broken, each
+fragment is incomplete). Erasure coding is an optional feature — it
+adds complexity and is only warranted for high-value spaces.</p>
+<h3 id="replication-factor"><a class="header" href="#replication-factor">Replication factor</a></h3>
+<p>The replication factor is configurable per space and defaults to 3
+(i.e. each node is stored on at least 3 backends). The <code>MultiStore</code>
+adapter tracks which backends have acknowledged a <code>put</code> and considers
+a write durable only when the replication target is met. If a write
+fails to meet the target (e.g. one relay is temporarily down), it is
+retried in the background.</p>
+<h3 id="availability-monitoring"><a class="header" href="#availability-monitoring">Availability monitoring</a></h3>
+<p>Peers periodically probe their configured backends to verify that
+data is still available. The simplest probe is a <code>contains</code> check
+on a random sample of CIDs. If a backend consistently fails probes,
+the peer marks it as degraded and increases replication to the
+remaining backends.</p>
+<p>In later phases (see <a href="roadmap.html">roadmap</a>), Kunekt may support
+cryptographic proof-of-storage via zero-knowledge challenges: a peer
+challenges a backend to prove it holds a specific blob without
+transferring the entire blob. This is a Phase 4 feature — the
+protocol design is not yet finalized.</p>
+<h3 id="repair"><a class="header" href="#repair">Repair</a></h3>
+<p>If a backend goes offline permanently (a relay shuts down, a DHT node
+leaves), the replication factor drops below the target. The peer
+detects this through availability monitoring and triggers a <strong>repair</strong>
+operation: missing data is read from a surviving backend and written
+to a replacement backend, restoring the replication factor.</p>
+<p>Repair is cooperative — any peer in the space that holds the data can
+perform it. This distributes the bandwidth cost across the group
+rather than placing it on a single peer.</p>
+<h2 id="sync-and-storage-interaction"><a class="header" href="#sync-and-storage-interaction">Sync and storage interaction</a></h2>
+<h3 id="fetch-path"><a class="header" href="#fetch-path">Fetch path</a></h3>
+<p>When a peer needs a DAG node it does not have locally, it walks the
+backend priority list:</p>
+<ol>
+<li><strong>Local store</strong> — check the local database. If found, return
+immediately.</li>
+<li><strong>Relay store</strong> — query configured Nostr relays by CID tag. If
+found, verify the CID, store locally, and return.</li>
+<li><strong>DHT store</strong> — perform a DHT lookup. Higher latency, but reaches
+a wider network.</li>
+<li><strong>DA layer store</strong> — query the blockchain. Slowest and potentially
+costly (RPC fees), but data is guaranteed to be there if it was
+ever published.</li>
+</ol>
+<p>The peer stops at the first tier that returns the data. Every fetched
+blob is verified by recomputing the CID before use — a corrupted or
+substituted blob is rejected regardless of source.</p>
+<h3 id="store-path"><a class="header" href="#store-path">Store path</a></h3>
+<p>When a peer creates a new DAG node (a new message, a document edit):</p>
+<ol>
+<li>The node is encrypted under the current MLS epoch key.</li>
+<li>The CID is computed from the encrypted blob.</li>
+<li>The node is stored locally.</li>
+<li>The node is pushed to all configured remote backends according to
+the space’s storage policy.</li>
+<li>The replication factor is tracked. If any backend fails, the push
+is retried asynchronously.</li>
+</ol>
+<h3 id="caching"><a class="header" href="#caching">Caching</a></h3>
+<p>Frequently accessed remote nodes are cached locally. The cache is
+bounded by the space’s local storage quota and uses LRU eviction.
+Cached nodes are not counted toward the replication factor — they are
+ephemeral local copies that may be evicted at any time.</p>
+<p>Caching is particularly important for spaces where a peer has pruned
+old nodes locally but still needs to access them occasionally (e.g.
+scrolling back through chat history).</p>
+<h2 id="storage-privacy"><a class="header" href="#storage-privacy">Storage privacy</a></h2>
+<p>Even though all stored data is encrypted, the <em>pattern</em> of storage
+operations can leak information. This section outlines the threats
+and mitigations. See <a href="privacy-layers.html">privacy-layers</a> for a
+comprehensive analysis.</p>
+<h3 id="read-privacy"><a class="header" href="#read-privacy">Read privacy</a></h3>
+<p>Which CIDs a peer requests from a relay reveals what content it is
+interested in. A relay operator — or a network observer — can build
+an interest profile by logging queries.</p>
+<p>Mitigations:</p>
+<ul>
+<li><strong>Private information retrieval (PIR)</strong>: cryptographic protocols
+that let a peer query a relay without revealing which CID it wants.
+Computationally expensive; practical only for small query volumes.</li>
+<li><strong>Bulk download</strong>: fetch all events for a space rather than
+individual CIDs. Hides which specific nodes are of interest but
+increases bandwidth.</li>
+<li><strong>Multi-relay split</strong>: distribute queries across multiple relays so
+that no single relay sees the full query pattern.</li>
+</ul>
+<h3 id="write-privacy"><a class="header" href="#write-privacy">Write privacy</a></h3>
+<p>When a peer stores data reveals when it is active. A relay operator
+can infer online hours, timezone, and activity patterns.</p>
+<p>Mitigations:</p>
+<ul>
+<li><strong>Batched writes</strong>: accumulate nodes locally and push to relays in
+periodic batches rather than immediately after each edit. Adds
+latency but hides fine-grained timing.</li>
+<li><strong>Cover traffic</strong>: inject dummy (encrypted, indistinguishable) writes
+at random intervals to mask real activity. Wastes bandwidth and
+relay storage but disrupts timing analysis.</li>
+</ul>
+<h3 id="access-pattern-hiding"><a class="header" href="#access-pattern-hiding">Access pattern hiding</a></h3>
+<p>If a peer’s device may be physically compromised (seized, stolen with
+root secret intact), the local storage access pattern itself is a
+threat. An adversary with disk access could analyze which blocks were
+recently accessed.</p>
+<p>The strongest defense is <strong>Oblivious RAM (ORAM)</strong>, which hides access
+patterns by shuffling data on every read/write. ORAM is expensive — it
+multiplies I/O cost by a logarithmic factor. It is a defense against
+a specific, powerful adversary (someone with ongoing disk access and
+the decryption key) and is not enabled by default.</p>
+<h2 id="economics"><a class="header" href="#economics">Economics</a></h2>
+<p>Storage costs real resources — disk space, bandwidth, electricity —
+and someone has to pay for them. This is one of the biggest open
+questions for real-world deployment of any decentralized storage
+system, and Kunekt is no exception.</p>
+<h3 id="who-pays"><a class="header" href="#who-pays">Who pays?</a></h3>
+<p>Each storage tier has different cost bearers:</p>
+<ul>
+<li><strong>Local storage</strong>: the peer pays, via their own device’s disk. This
+is free in the economic sense (the user already owns the device) but
+limited in capacity.</li>
+<li><strong>Relay storage</strong>: the relay operator pays for disk and bandwidth.
+Today’s Nostr relay ecosystem runs largely on goodwill and donations.
+This works for low-volume usage but does not scale to heavy
+commercial workloads.</li>
+<li><strong>DHT storage</strong>: DHT participants collectively bear the cost. Like
+relay operators, they are currently volunteers. The sustainability
+question is the same.</li>
+<li><strong>DA layer storage</strong>: the blockchain’s fee market determines the
+cost. This is the only tier with a clear, built-in economic model —
+users pay transaction fees and validators are compensated through
+block rewards and fees. It is also the most expensive tier by a
+wide margin.</li>
+</ul>
+<h3 id="incentive-models"><a class="header" href="#incentive-models">Incentive models</a></h3>
+<p>Kunekt aims to be <strong>incentive-model agnostic</strong>. The protocol does not
+mandate a specific payment mechanism but provides hooks for different
+models:</p>
+<ul>
+<li><strong>Free tier (community relays)</strong>: relay operators donate resources,
+as in the current Nostr ecosystem. Sustainable for small-scale,
+community-driven spaces. No guarantees — the relay may disappear
+without notice.</li>
+<li><strong>Paid storage</strong>: space members pay relay operators for guaranteed
+storage and bandwidth. Payment could be via cryptocurrency
+micropayments (Lightning, stablecoin transfers) or traditional
+billing. The relay commits to a service level (retention period,
+availability uptime) in exchange for payment.</li>
+<li><strong>Cooperative model</strong>: space members contribute storage to each
+other. Each member runs a small relay (or a relay-like daemon) and
+stores other members’ data. This distributes cost and eliminates
+the need for external relay operators. It works well for small,
+trusted groups but requires that some members are online at any
+given time.</li>
+<li><strong>DA layer fees</strong>: determined by the blockchain’s fee market. No
+Kunekt-specific design needed — the peer simply pays the gas cost
+for blob submission.</li>
+</ul>
+<h3 id="cost-estimation"><a class="header" href="#cost-estimation">Cost estimation</a></h3>
+<p>Rough order-of-magnitude numbers for a moderately active space (50
+members, 100 messages/day, average message payload 1 KB after
+encryption):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tier</th><th>Monthly cost estimate</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Local</td><td>~0 (uses device disk)</td><td>~100 MB/year</td></tr>
+<tr><td>3 Nostr relays</td><td>~0 (free relays) to ~$1-5/mo</td><td>Paid relays charge per-event</td></tr>
+<tr><td>DHT</td><td>~0 (volunteer network)</td><td>No SLA</td></tr>
+<tr><td>DA layer</td><td>~$10-100+/mo</td><td>Highly variable by chain</td></tr>
+</tbody>
+</table>
+</div>
+<p>These numbers will shift as the ecosystem matures. The point is that
+relay-based storage is cheap enough for most use cases, and DA layer
+storage is reserved for situations where the durability guarantee
+justifies the cost.</p>
+<h3 id="open-questions"><a class="header" href="#open-questions">Open questions</a></h3>
+<ul>
+<li><strong>How does a relay prove it is actually storing data?</strong> Without
+proof-of-storage, a paid relay could accept payment and silently
+discard blobs. ZK proof-of-storage (Phase 4 on the
+<a href="roadmap.html">roadmap</a>) addresses this, but the mechanism is not
+yet designed.</li>
+<li><strong>How are relay payments coordinated among space members?</strong> Does one
+member pay, or is the cost split? Kunekt’s group key management
+(MLS) could potentially be extended to coordinate payment splits,
+but this is unexplored.</li>
+<li><strong>What happens when a free relay disappears?</strong> The redundancy
+strategy (multiple relays, replication factor) mitigates this, but
+users need clear UX signals about their data’s durability status.</li>
+<li><strong>Can storage incentives be built into the protocol itself?</strong> A
+token-based incentive layer is a common answer in the decentralized
+storage space (Filecoin, Arweave), but adding a token introduces
+regulatory complexity and misaligned incentives. Kunekt’s current
+position is to avoid a protocol-native token and instead support
+pluggable payment mechanisms.</li>
+</ul>
+<p>The honest answer is that sustainable decentralized storage economics
+are an unsolved problem industry-wide. Kunekt’s design minimizes the
+surface area of this problem — encrypted, content-addressed blobs are
+the simplest possible unit of storage, compatible with any backend
+and any payment model — but it does not solve the economic question
+itself. That is left to the deployment context and the communities
+that run the infrastructure.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="encryption.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="transport.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="encryption.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="transport.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

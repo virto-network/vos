@@ -1,0 +1,13 @@
+[package]
+name = "merkle-crdt"
+description = "Generic no_std implementation of Merkle-CRDTs: Merkle-DAGs meet CRDTs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dev-dependencies]
+sha2 = "0.10"

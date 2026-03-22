@@ -1,0 +1,892 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Encryption Layer: Group Key Management - The Kunekt Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A protocol for building a private-by-default internet">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-17ab8d9d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-28d86354.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Kunekt Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/nickvdp/kunekt" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="encryption-group-ratchet-keys"><a class="header" href="#encryption-group-ratchet-keys">Encryption: Group Ratchet Keys</a></h1>
+<p>All document content in Kunekt is end-to-end encrypted at the group level.
+Only space members can decrypt. Storage backends, relay nodes, and network
+observers see only opaque blobs.</p>
+<p>This chapter covers <em>why</em> group encryption, <em>how</em> MLS works, and — most
+critically — how a protocol designed for ordered delivery (MLS) is
+reconciled with a protocol that has no ordering at all (Merkle-CRDTs).</p>
+<hr>
+<h2 id="1-why-group-encryption"><a class="header" href="#1-why-group-encryption">1. Why Group Encryption</a></h2>
+<h3 id="the-problem"><a class="header" href="#the-problem">The problem</a></h3>
+<p>A Kunekt space is a set of peers collaborating on shared documents. The
+content must be readable only by current members. Anyone else — relay
+operators, network observers, other Kunekt users — must see nothing
+but opaque ciphertext.</p>
+<h3 id="why-not-pairwise-encryption"><a class="header" href="#why-not-pairwise-encryption">Why not pairwise encryption</a></h3>
+<p>The naive approach: each member encrypts each message to every other
+member individually (like PGP or NIP-44 DMs). For a group of <em>n</em>
+members, every operation produces <em>n - 1</em> ciphertexts. This is O(n)
+per message in bandwidth, O(n^2) in aggregate state, and utterly
+impractical for groups of even modest size. A 50-member space producing
+100 edits/minute would generate 4,900 ciphertext copies per minute.</p>
+<p>Worse, pairwise encryption has no notion of group membership change.
+When a member is removed, every remaining member must stop encrypting
+to that member — but there is no protocol-enforced mechanism to ensure
+this happens. Key rotation requires N new key exchanges.</p>
+<h3 id="why-a-group-ratchet"><a class="header" href="#why-a-group-ratchet">Why a group ratchet</a></h3>
+<p>A group ratchet protocol gives every member the same symmetric key,
+derived from a shared secret that ratchets forward on each membership
+change. This provides:</p>
+<ul>
+<li><strong>O(1) ciphertext per message</strong> — one encrypted payload, any member
+can decrypt.</li>
+<li><strong>Forward secrecy</strong> — a compromised key cannot decrypt past messages.
+Old epoch secrets are deleted after ratcheting.</li>
+<li><strong>Post-compromise security</strong> — after a key compromise, a single
+membership change (or periodic rotation) generates a fresh epoch
+secret that the attacker cannot derive, healing the group.</li>
+<li><strong>Efficient membership changes</strong> — adding or removing a member costs
+O(log n) rather than O(n), thanks to the tree structure.</li>
+</ul>
+<p>Kunekt uses <strong>MLS (Messaging Layer Security, RFC 9420)</strong> for group
+key management. Each space is an MLS group.</p>
+<hr>
+<h2 id="2-mls-primer"><a class="header" href="#2-mls-primer">2. MLS Primer</a></h2>
+<p>MLS is an IETF standard (RFC 9420) for group key agreement. This
+section gives enough background for readers unfamiliar with the
+protocol. For full details, see the RFC.</p>
+<h3 id="ratchet-tree"><a class="header" href="#ratchet-tree">Ratchet tree</a></h3>
+<p>MLS organizes group members as leaves of a binary tree. Each leaf holds
+a member’s public key. Interior nodes hold key pairs derived from their
+children. The root of the tree is the shared group secret.</p>
+<pre><code>              [root]
+             /      \
+          [A,B]    [C,D]
+          /   \    /   \
+        (A)  (B) (C)  (D)    ← leaf nodes = members
+</code></pre>
+<p>When a leaf updates its key, only the nodes along the path from that
+leaf to the root are recomputed — O(log n) operations.</p>
+<h3 id="epochs"><a class="header" href="#epochs">Epochs</a></h3>
+<p>Every membership change or key update produces a new <strong>epoch</strong>. An
+epoch is a snapshot of the group state: the ratchet tree, the member
+list, and a set of derived keys. Epochs are numbered sequentially:
+0, 1, 2, …</p>
+<p>An MLS group begins at epoch 0 (creation). Each Commit that is
+applied advances the epoch by one.</p>
+<h3 id="key-schedule"><a class="header" href="#key-schedule">Key schedule</a></h3>
+<p>Each epoch has an <code>epoch_secret</code> from which all keys for that epoch
+are derived via a key derivation function (KDF):</p>
+<pre><code>epoch_secret
+  ├── encryption_secret   → per-message symmetric keys
+  ├── exporter_secret     → application-specific derived keys
+  ├── authentication_secret
+  ├── external_secret     → for external joins
+  └── init_secret         → seeds the next epoch
+</code></pre>
+<p>Kunekt uses the <code>encryption_secret</code> to encrypt DAG node payloads and
+the <code>exporter_secret</code> to derive application-specific keys (e.g., the
+Nostr relay signing key).</p>
+<h3 id="proposals-and-commits"><a class="header" href="#proposals-and-commits">Proposals and Commits</a></h3>
+<p>MLS changes are made in two steps:</p>
+<ol>
+<li><strong>Proposal</strong> — a member proposes a change (Add, Remove, Update,
+ReInit, etc.). A Proposal does not change the group state by itself.</li>
+<li><strong>Commit</strong> — a member bundles one or more Proposals and applies
+them, producing a new epoch. The Commit contains the new ratchet
+tree information needed for all members to derive the new
+epoch secret.</li>
+</ol>
+<p>Only a Commit advances the epoch. Multiple Proposals can be bundled
+into a single Commit.</p>
+<h3 id="welcome-messages"><a class="header" href="#welcome-messages">Welcome messages</a></h3>
+<p>When a new member is added, the committer produces a <strong>Welcome</strong>
+message alongside the Commit. The Welcome contains everything the
+new member needs to initialize their view of the ratchet tree and
+derive the current epoch secret. It is encrypted to the new member’s
+key package (their long-term or pre-published public key).</p>
+<p>The flow:</p>
+<pre><code>1. New member publishes a KeyPackage (public key + capabilities)
+2. Existing member creates a Proposal(Add) referencing that KeyPackage
+3. Same or different member creates a Commit bundling the Add
+4. Commit → broadcast to existing members
+5. Welcome → sent to new member
+6. Everyone is now in epoch N+1
+</code></pre>
+<hr>
+<h2 id="3-mls--merkle-crdt-reconciliation"><a class="header" href="#3-mls--merkle-crdt-reconciliation">3. MLS + Merkle-CRDT Reconciliation</a></h2>
+<p>This is the hardest integration problem in the Kunekt protocol.</p>
+<p>MLS was designed for a world with a <strong>Delivery Service</strong> — a server
+that sequences Commits so all members see them in the same order.
+Merkle-CRDTs have no server, no ordering, no coordination. Two peers
+can independently create operations and sync later in any order.</p>
+<p>This section describes how these two models are reconciled.</p>
+<h3 id="the-ordering-problem"><a class="header" href="#the-ordering-problem">The ordering problem</a></h3>
+<p>MLS Commits <strong>must</strong> be applied in a total order. If member A and
+member B both issue a Commit at epoch 5, the group cannot apply both —
+each Commit produces a different epoch 6 with a different ratchet tree.
+Applying A’s Commit then B’s (or vice versa) produces different group
+states.</p>
+<p>CRDTs, by design, do not require ordering. Two concurrent operations
+merge deterministically regardless of the order they are received.</p>
+<p>A naive approach — “just treat MLS Commits as CRDT operations” —
+does not work. MLS Commits are not commutative.</p>
+<h3 id="solution-mls-operations-as-a-causal-log-in-the-root-document"><a class="header" href="#solution-mls-operations-as-a-causal-log-in-the-root-document">Solution: MLS operations as a causal log in the root document</a></h3>
+<p>MLS operations (Proposals, Commits, Welcomes) are stored as entries
+in a <strong>special ordered log</strong> within the space’s root document. This
+log is itself a CRDT (an append-only Merkle-DAG), but its <em>interpretation</em>
+imposes an order.</p>
+<p>The key insight: the Merkle-DAG already provides <strong>causal ordering</strong>.
+If node X is an ancestor of node Y, then X happened before Y. If
+neither is an ancestor of the other, they are concurrent.</p>
+<pre><code>MLS log in the root document DAG:
+
+     [epoch 0: init]
+           │
+     [epoch 1: Add(Bob)]     ← Commit by Alice
+           │
+     [epoch 2: Add(Carol)]   ← Commit by Bob
+          / \
+  [epoch 3a]  [epoch 3b]     ← concurrent Commits: FORK
+         \  /
+     [epoch 3: resolved]     ← deterministic winner
+           │
+     [epoch 4: ...]
+</code></pre>
+<h3 id="commit-conflict-resolution"><a class="header" href="#commit-conflict-resolution">Commit conflict resolution</a></h3>
+<p>When two members simultaneously issue MLS Commits (e.g., Alice adds
+Dave while Bob removes Eve), the Merkle-DAG records both as
+concurrent nodes — a fork. Both are valid at the DAG level, but only
+one can be applied to the MLS state.</p>
+<p><strong>Resolution rule:</strong> When a peer encounters concurrent Commits, it
+applies a deterministic tiebreaker:</p>
+<ol>
+<li>Compare the CIDs (content hashes) of the two Commit nodes.</li>
+<li>The Commit with the <strong>lexicographically lower CID</strong> wins.</li>
+<li>The losing Commit’s Proposals are <strong>re-proposed</strong> in the next
+epoch as new Proposals, to be included in a future Commit.</li>
+</ol>
+<p>Because CIDs are deterministic hashes, every peer that encounters the
+same fork reaches the same resolution — no coordination needed.</p>
+<pre><code>Example:
+
+  Epoch 5
+    ├── Commit A (CID: bafy...3a) — Add(Dave)
+    └── Commit B (CID: bafy...7f) — Remove(Eve)
+
+  bafy...3a &lt; bafy...7f  →  Commit A wins  →  epoch 6 includes Dave
+
+  Commit B's Remove(Eve) is re-proposed as a Proposal in epoch 6.
+  The next Commit (epoch 6 → 7) can include it.
+</code></pre>
+<p>This means a losing Commit’s effect is <strong>delayed, not lost</strong>. The
+membership change will happen, just one epoch later.</p>
+<p><strong>Edge cases:</strong></p>
+<ul>
+<li><strong>Three-way or n-way forks:</strong> Same rule applies recursively. Sort
+all concurrent Commits by CID, apply the lowest, re-propose the
+rest.</li>
+<li><strong>Conflicting Commits</strong> (e.g., one adds X, another removes X):
+Both are re-proposed. The next committer sees both Proposals and
+resolves the conflict at the application level (e.g., removal takes
+precedence, or the space’s policy decides).</li>
+<li><strong>Self-referential conflicts</strong> (a Commit that removes the member
+who issued a concurrent Commit): The losing Commit is simply
+discarded — the member who issued it is no longer in the group and
+cannot re-propose.</li>
+</ul>
+<h3 id="epoch-key-derivation-for-dag-nodes"><a class="header" href="#epoch-key-derivation-for-dag-nodes">Epoch key derivation for DAG nodes</a></h3>
+<p>Each DAG node payload is encrypted with the symmetric key derived from
+the MLS epoch that was current when the node was created. To enable
+decryption, the epoch number is stored <strong>in plaintext</strong> alongside the
+encrypted payload:</p>
+<pre><code>DAG node (as stored/transmitted):
+
+┌──────────────────────────────────────────┐
+│  CID: bafy...                            │  ← plaintext (hash of this node)
+│  children: [bafy..., bafy...]            │  ← plaintext (DAG structure)
+│  epoch: 7                                │  ← plaintext (which key to use)
+│  encrypted_payload: 0x8a3f...            │  ← ciphertext (CRDT operation)
+│  nonce: 0xb7c2...                        │  ← per-node random nonce
+└──────────────────────────────────────────┘
+</code></pre>
+<p>A recipient decrypts by:</p>
+<ol>
+<li>Reading the <code>epoch</code> field.</li>
+<li>Looking up the symmetric key for that epoch from their local MLS
+state (or key cache — see section 6).</li>
+<li>Decrypting <code>encrypted_payload</code> with that key and the <code>nonce</code>.</li>
+</ol>
+<p><strong>Why expose the epoch number?</strong> It reveals only <em>when</em> (in terms of
+group membership generation) a node was created, not <em>what</em> it contains.
+The alternative — trying every epoch key until one works — is
+impractical for long-lived spaces with many epochs.</p>
+<h3 id="epoch-transitions-during-offline-editing"><a class="header" href="#epoch-transitions-during-offline-editing">Epoch transitions during offline editing</a></h3>
+<p>A core scenario: Alice goes offline and makes 50 edits. While she is
+offline, Bob adds Carol to the space, advancing the epoch from 7 to 8.
+Alice’s 50 DAG nodes are encrypted with epoch 7 keys.</p>
+<p>On reconnect:</p>
+<ol>
+<li>Alice syncs the root document DAG, discovers the new Commit
+(epoch 7 → 8).</li>
+<li>Alice processes the Commit, derives the new epoch 8 keys.</li>
+<li>Alice’s 50 locally-created nodes remain encrypted with epoch 7.
+She does <strong>not</strong> re-encrypt them — they are already in the DAG
+with epoch 7 CIDs.</li>
+<li>Other members can still decrypt Alice’s nodes because they retain
+epoch 7 keys in their local key cache.</li>
+<li>Alice’s new edits going forward use epoch 8 keys.</li>
+</ol>
+<p>This means a space will always have some DAG nodes encrypted under
+older epochs. This is expected and correct. Members retain old epoch
+keys for decryption (see section 6: Encryption at Rest).</p>
+<p><strong>Security implication:</strong> Carol (added at epoch 8) does NOT have
+epoch 7 keys. She cannot decrypt Alice’s 50 offline edits directly.
+She <em>can</em> see the CRDT state that results from applying all operations
+(including Alice’s), because the CRDT state is reconstructed by peers
+who have the keys and shared via the CRDT’s normal merge semantics.
+See section 7 (Forward Secrecy Semantics in CRDTs) for a detailed
+discussion.</p>
+<hr>
+<h2 id="4-what-gets-encrypted"><a class="header" href="#4-what-gets-encrypted">4. What Gets Encrypted</a></h2>
+<h3 id="dag-node-payloads-encrypted"><a class="header" href="#dag-node-payloads-encrypted">DAG node payloads: encrypted</a></h3>
+<p>Every CRDT operation payload — text insertions, metadata changes,
+chat messages, votes — is encrypted before leaving the local peer.
+The ciphertext is the only form that ever touches the network or
+storage backends.</p>
+<h3 id="cids-and-dag-structure-plaintext"><a class="header" href="#cids-and-dag-structure-plaintext">CIDs and DAG structure: plaintext</a></h3>
+<p>The node’s CID (content hash) and its list of children CIDs remain
+in plaintext. This is a deliberate design choice:</p>
+<ul>
+<li><strong>Relay-assisted traversal:</strong> Untrusted relays can serve DAG nodes
+by CID without being able to read their contents. A peer requests
+“give me node bafy…abc” and the relay can look it up — even though
+the relay cannot decrypt the payload.</li>
+<li><strong>Efficient sync:</strong> The Merkle-CRDT sync protocol compares root CIDs
+and walks the DAG structure to find missing nodes. This must work
+without decryption, because the relay/transport layer does not have
+keys.</li>
+<li><strong>CIDs reveal nothing about content:</strong> A CID is a hash of the
+<em>encrypted</em> payload plus structural metadata. It does not leak
+information about the plaintext. Two identical plaintext operations
+produce different CIDs (because of the random nonce in the
+encryption).</li>
+</ul>
+<p><strong>What CIDs do leak:</strong> An observer who sees the DAG structure learns
+the <em>shape</em> of activity — how many operations, causal relationships
+between them, branching and merging patterns. This is metadata, and
+it is addressed by the uniform envelope and timing defenses described
+in the Nostr integration chapter.</p>
+<h3 id="mls-metadata-partially-visible"><a class="header" href="#mls-metadata-partially-visible">MLS metadata: partially visible</a></h3>
+<p>Some MLS-related metadata is necessarily visible:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Visibility</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>Epoch number on DAG nodes</td><td>Plaintext</td><td>Recipients need it to select the decryption key</td></tr>
+<tr><td>MLS group ID</td><td>Plaintext (same as space ID)</td><td>Identifies the group for key lookup</td></tr>
+<tr><td>MLS Commit/Welcome messages</td><td>Encrypted payloads in root doc</td><td>Their <em>existence</em> is visible (they are DAG nodes), their content is encrypted</td></tr>
+<tr><td>Ratchet tree structure</td><td>Inside MLS messages (encrypted)</td><td>Not visible to non-members</td></tr>
+<tr><td>Member count (from tree)</td><td>Inferable from Commit sizes</td><td>Partial leak — mitigated by padding</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Tradeoff:</strong> Exposing the epoch number is a small metadata leak
+(observers learn when membership changes occurred) in exchange for
+efficient decryption. Without it, decryption would require trial
+decryption with every epoch key — O(epochs) per node.</p>
+<h3 id="uniform-envelope-format"><a class="header" href="#uniform-envelope-format">Uniform envelope format</a></h3>
+<p>All encrypted payloads are padded to fixed-size buckets before
+transmission:</p>
+<pre><code>Bucket sizes: 256 B, 1 KB, 4 KB, 16 KB, 64 KB
+
+Padding:
+  plaintext (variable) → encrypt → pad to next bucket boundary
+</code></pre>
+<p>An observer cannot distinguish a 3-byte chat message from a 900-byte
+document edit — both appear as 1 KB blobs. Combined with cover traffic
+(dummy nodes that are also valid-looking 1 KB blobs), this defeats
+size-based traffic analysis.</p>
+<hr>
+<h2 id="5-key-lifecycle"><a class="header" href="#5-key-lifecycle">5. Key Lifecycle</a></h2>
+<h3 id="space-creation-epoch-0"><a class="header" href="#space-creation-epoch-0">Space creation: epoch 0</a></h3>
+<p>The space creator initializes a new MLS group and becomes the sole
+member. This is epoch 0. The creator’s device generates:</p>
+<ul>
+<li>An MLS credential (identity key for this space)</li>
+<li>A KeyPackage (used if others need to add this member to sub-groups)</li>
+<li>The epoch 0 secret, from which all epoch 0 keys are derived</li>
+</ul>
+<pre><code>Creator's device:
+  mls_group = MlsGroup::new(ciphersuite, credential)
+  epoch_0_secret = mls_group.epoch_secret()
+  encryption_key = KDF(epoch_0_secret, "encryption")
+  nostr_sk = KDF(epoch_0_secret, "nostr-relay-signing")
+</code></pre>
+<h3 id="member-join-welcome--commit--epoch-n1"><a class="header" href="#member-join-welcome--commit--epoch-n1">Member join: Welcome + Commit → epoch N+1</a></h3>
+<p>Adding a new member:</p>
+<ol>
+<li>The new member publishes a <strong>KeyPackage</strong> (out-of-band or via a
+Nostr event).</li>
+<li>An existing member creates a Proposal(Add) referencing the
+KeyPackage.</li>
+<li>The same or another member creates a Commit including the Add
+proposal.</li>
+<li>The Commit is recorded as a DAG node in the root document.</li>
+<li>A Welcome message is also recorded (encrypted to the new member).</li>
+<li>All existing members process the Commit and derive epoch N+1 keys.</li>
+<li>The new member processes the Welcome and derives epoch N+1 keys.</li>
+</ol>
+<p><strong>Forward secrecy:</strong> The new member receives epoch N+1 keys but NOT
+any prior epoch keys. They cannot decrypt DAG nodes from epochs
+0 through N. They can see the <em>current CRDT state</em> (the result of
+all operations), but not the individual historical operations. See
+section 7.</p>
+<h3 id="member-removal-commit--epoch-n1"><a class="header" href="#member-removal-commit--epoch-n1">Member removal: Commit → epoch N+1</a></h3>
+<p>Removing a member:</p>
+<ol>
+<li>An authorized member creates a Proposal(Remove) for the target.</li>
+<li>A Commit including the Remove is recorded in the root document.</li>
+<li>Remaining members process the Commit and derive epoch N+1 keys.</li>
+<li>The removed member does not receive the Commit’s UpdatePath —
+they cannot derive epoch N+1 keys.</li>
+</ol>
+<p><strong>Post-compromise security:</strong> Even if the removed member retained
+epoch N keys, all future content is encrypted under epoch N+1 (and
+beyond), which they cannot derive. The ratchet tree path from their
+former leaf to the root has been re-keyed.</p>
+<h3 id="periodic-rotation"><a class="header" href="#periodic-rotation">Periodic rotation</a></h3>
+<p>MLS supports key updates without membership changes. Any member can
+issue an Update proposal, which re-keys their leaf and the path to
+the root. This provides:</p>
+<ul>
+<li><strong>Healing after undetected compromise:</strong> If a member’s device was
+compromised and later recovered, an Update re-establishes security.</li>
+<li><strong>Limiting window of exposure:</strong> Even without known compromise,
+periodic rotation limits how much content a single key can decrypt.</li>
+</ul>
+<p>Rotation frequency is configurable per space. Recommended defaults:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Space sensitivity</th><th>Rotation interval</th></tr>
+</thead>
+<tbody>
+<tr><td>Standard</td><td>Every 24 hours or every 100 operations, whichever comes first</td></tr>
+<tr><td>High security</td><td>Every 1 hour or every 20 operations</td></tr>
+<tr><td>Low activity</td><td>On membership changes only</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="key-derivation-for-nostr-relay-signing"><a class="header" href="#key-derivation-for-nostr-relay-signing">Key derivation for Nostr relay signing</a></h3>
+<p>The Nostr signing key for a space is derived deterministically from
+the MLS epoch secret:</p>
+<pre><code>nostr_sk = KDF(mls_epoch_secret, "nostr-relay-signing")
+nostr_pk = secp256k1_pubkey(nostr_sk)
+</code></pre>
+<p>Every member independently derives the same key. Any member can sign
+Nostr events on behalf of the space. The key rotates automatically
+with each epoch change, so removed members lose the ability to sign.</p>
+<p>See <a href="./nostr.html">Nostr Integration</a> for a full discussion of signing
+key options and their tradeoffs.</p>
+<hr>
+<h2 id="6-encryption-at-rest"><a class="header" href="#6-encryption-at-rest">6. Encryption at Rest</a></h2>
+<h3 id="local-storage"><a class="header" href="#local-storage">Local storage</a></h3>
+<p>A peer’s local database contains:</p>
+<ul>
+<li>DAG nodes for all subscribed documents (encrypted payloads)</li>
+<li>MLS group state (ratchet tree, epoch secrets)</li>
+<li>Cached epoch keys for past epochs</li>
+</ul>
+<p>All local storage is encrypted with a key derived from the device’s
+<strong>root secret</strong> — a high-entropy secret stored in the platform’s
+secure enclave (Keychain on macOS/iOS, Keystore on Android, Secret
+Service on Linux) or derived from a user passphrase via Argon2.</p>
+<pre><code>root_secret (in secure enclave)
+  └── local_storage_key = KDF(root_secret, "local-db-encryption")
+        └── encrypts SQLite / sled database at rest
+</code></pre>
+<h3 id="stored-ciphertext--transmitted-ciphertext"><a class="header" href="#stored-ciphertext--transmitted-ciphertext">Stored ciphertext = transmitted ciphertext</a></h3>
+<p>DAG nodes are stored on disk in the same encrypted form as they are
+transmitted over the network. There is no decryption-then-re-encryption
+step for storage. Benefits:</p>
+<ul>
+<li><strong>Simplicity:</strong> One code path for encryption, one ciphertext format.</li>
+<li><strong>Verifiability:</strong> The CID of a stored node matches the CID of the
+same node on other peers and on relays, because the ciphertext is
+identical.</li>
+<li><strong>Defense in depth:</strong> If the local storage encryption is bypassed
+(e.g., the device is stolen but the secure enclave is intact), the
+attacker still sees only MLS-encrypted payloads, which require the
+MLS epoch keys to decrypt.</li>
+</ul>
+<h3 id="epoch-key-caching"><a class="header" href="#epoch-key-caching">Epoch key caching</a></h3>
+<p>Members must retain keys from past epochs to decrypt old DAG nodes.
+A member who joins at epoch 5 and the space is now at epoch 12 has
+keys for epochs 5 through 12. They may need any of these to decrypt
+nodes created in those epochs.</p>
+<p>Key cache policy:</p>
+<ul>
+<li><strong>Keep all epoch keys since join.</strong> Epoch keys are small (32 bytes
+each). Even a space with 10,000 epoch changes accumulates only
+~320 KB of key material.</li>
+<li><strong>Epoch keys are never transmitted.</strong> They exist only in local
+storage, encrypted under the local storage key.</li>
+<li><strong>On device loss:</strong> The member must be re-added to the space (a new
+KeyPackage, a new Welcome). They receive the current epoch key only.
+Old epoch keys are lost — old DAG nodes on the new device cannot be
+individually decrypted. The CRDT state (the result of all operations)
+is still available because other peers can share the materialized
+state.</li>
+</ul>
+<hr>
+<h2 id="7-forward-secrecy-semantics-in-crdts"><a class="header" href="#7-forward-secrecy-semantics-in-crdts">7. Forward Secrecy Semantics in CRDTs</a></h2>
+<p>CRDTs and forward secrecy interact in a way that deserves careful
+explanation, because the naive interpretation (“new members can’t see
+old content”) is both true and misleading.</p>
+<h3 id="the-tension"><a class="header" href="#the-tension">The tension</a></h3>
+<p>CRDTs accumulate state. A CRDT’s current value is the result of
+applying ALL operations in its history, including operations from
+before a new member joined. The Automerge document you see now
+reflects every keystroke ever made.</p>
+<p>Forward secrecy means: a new member can derive the current epoch key
+but NOT prior epoch keys.</p>
+<p>These two properties seem contradictory: the CRDT state is the <em>sum</em>
+of all history, but the new member cannot decrypt the historical
+operations.</p>
+<h3 id="the-resolution-state-vs-history"><a class="header" href="#the-resolution-state-vs-history">The resolution: state vs. history</a></h3>
+<p>Kunekt distinguishes between the <strong>document state</strong> (the current
+value of the CRDT) and the <strong>operation history</strong> (the individual
+DAG nodes that built that state).</p>
+<ul>
+<li><strong>Document state</strong> = the current merged CRDT value. This is what
+users see — the current text, the current chat log, the current
+configuration. The state is reconstructed by applying operations
+and can be shared as a snapshot.</li>
+<li><strong>Operation history</strong> = the individual DAG nodes with their
+encrypted CRDT operations. This is the edit log — who changed
+what and when (to the extent that CRDT operations carry that
+information).</li>
+</ul>
+<p>A new member joining at epoch N+1:</p>
+<ol>
+<li><strong>Can</strong> see the current document state — other peers share the
+CRDT state through normal sync. The state itself is not encrypted
+per-epoch; it is the result of applying decrypted operations.</li>
+<li><strong>Cannot</strong> individually decrypt DAG nodes from epochs 0 through N.
+They cannot inspect the fine-grained edit history — which character
+was inserted when, which operation was concurrent with which other.</li>
+<li><strong>Can</strong> decrypt all DAG nodes from epoch N+1 onward.</li>
+</ol>
+<h3 id="this-is-a-design-choice"><a class="header" href="#this-is-a-design-choice">This is a design choice</a></h3>
+<p>This behavior is deliberate:</p>
+<ul>
+<li><strong>The document is the state, not the log.</strong> Users care about the
+current document. The edit history is an implementation detail of
+CRDTs, not a user-facing feature.</li>
+<li><strong>Protecting history protects metadata.</strong> Even if the document
+content is eventually shared via the CRDT state, the fine-grained
+<em>pattern</em> of edits (timing, frequency, which parts were edited,
+concurrent editing behavior) is sensitive metadata that forward
+secrecy protects.</li>
+<li><strong>Least privilege.</strong> A new member should see what they need to
+participate going forward. Granting access to the full edit
+history exceeds that requirement.</li>
+</ul>
+<h3 id="opt-in-history-sharing"><a class="header" href="#opt-in-history-sharing">Opt-in history sharing</a></h3>
+<p>Some spaces may <em>want</em> new members to see full history — for example,
+a knowledge base where the edit log is itself valuable. This is
+supported as an explicit opt-in:</p>
+<ol>
+<li>An existing member (or a quorum, per space policy) decides to
+share history.</li>
+<li>Historical DAG nodes are re-encrypted under the current epoch key.</li>
+<li>The re-encrypted nodes are published as new DAG entries,
+referencing the originals.</li>
+<li>The new member can now decrypt the historical operations.</li>
+</ol>
+<p>This is <strong>not the default</strong>. It requires an explicit space-level
+policy setting and an active re-encryption step by an existing member
+who holds the old epoch keys.</p>
+<hr>
+<h2 id="8-openmls-integration-details"><a class="header" href="#8-openmls-integration-details">8. OpenMLS Integration Details</a></h2>
+<h3 id="crate"><a class="header" href="#crate">Crate</a></h3>
+<p>Kunekt uses the <a href="https://github.com/openmls/openmls"><code>openmls</code></a> crate,
+a Rust implementation of RFC 9420. OpenMLS is modular — it defines
+traits for pluggable backends (crypto, key store, delivery).</p>
+<h3 id="configuration"><a class="header" href="#configuration">Configuration</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Choice</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>Ciphersuite</td><td><code>MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519</code></td><td>X25519 for key agreement, AES-128-GCM for encryption, Ed25519 for signatures. Well-supported, efficient, no RSA baggage.</td></tr>
+<tr><td>Credential type</td><td><code>BasicCredential</code> (Phase 1-2), custom ZK credential (Phase 3+)</td><td>Basic credentials carry an opaque identity. ZK credentials will allow proving membership without revealing which member.</td></tr>
+<tr><td>Protocol version</td><td>MLS 1.0</td><td>Only version specified by RFC 9420.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="custom-mls-backends"><a class="header" href="#custom-mls-backends">Custom MLS backends</a></h3>
+<p>OpenMLS requires three backend components. Kunekt provides custom
+implementations for each, backed by the Merkle-CRDT layer:</p>
+<p><strong>KeyStore</strong> — persists key material (KeyPackages, ratchet tree
+state, epoch secrets).</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>/// KeyStore backed by local encrypted storage
+impl OpenMlsKeyStore for KunektKeyStore {
+    type Error = KeyStoreError;
+
+    fn store&lt;V: MlsEntity&gt;(&amp;self, k: &amp;[u8], v: &amp;V) -&gt; Result&lt;(), Self::Error&gt; {
+        // Serialize, encrypt with local_storage_key, write to local DB
+    }
+
+    fn read&lt;V: MlsEntity&gt;(&amp;self, k: &amp;[u8]) -&gt; Option&lt;V&gt; {
+        // Read from local DB, decrypt, deserialize
+    }
+
+    fn delete&lt;V: MlsEntity&gt;(&amp;self, k: &amp;[u8]) -&gt; Result&lt;(), Self::Error&gt; {
+        // Remove from local DB (e.g., after epoch key is superseded)
+    }
+}
+<span class="boring">}</span></code></pre>
+<p><strong>DeliveryService</strong> — in standard MLS, this is a server that receives
+Commits and distributes them to all members. In Kunekt, there is no
+server. The Merkle-CRDT sync layer <em>is</em> the delivery service.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>/// "Delivery" via Merkle-CRDT root document
+///
+/// MLS Commits and Welcomes are serialized as DAG node payloads
+/// in the space's root document. When a peer syncs the root
+/// document's DAG, it discovers new MLS messages and processes them.
+impl MlsDelivery for CrdtDeliveryService {
+    fn send_commit(&amp;self, commit: MlsCommit) -&gt; Result&lt;(), DeliveryError&gt; {
+        // Serialize Commit as a root document CRDT operation
+        // Record as a new DAG node in the root document's MerkleCrdt
+        // Sync propagates it to other peers
+    }
+
+    fn send_welcome(&amp;self, welcome: MlsWelcome, recipient: &amp;KeyPackageRef)
+        -&gt; Result&lt;(), DeliveryError&gt;
+    {
+        // Serialize Welcome, store in root document DAG
+        // The Welcome is encrypted to the recipient's KeyPackage,
+        // so it is safe to store in the shared DAG
+    }
+
+    fn recv(&amp;self) -&gt; Vec&lt;MlsMessage&gt; {
+        // Walk the root document DAG for new MLS-typed nodes
+        // since last processed epoch
+        // Apply conflict resolution (section 3) for concurrent Commits
+    }
+}
+<span class="boring">}</span></code></pre>
+<p><strong>CryptoProvider</strong> — the cryptographic backend. Kunekt uses
+OpenMLS’s <code>openmls_rust_crypto</code> provider (based on the RustCrypto
+crates) for a pure-Rust, <code>no_std</code>-compatible implementation.</p>
+<h3 id="processing-flow"><a class="header" href="#processing-flow">Processing flow</a></h3>
+<p>The full lifecycle of a DAG node from creation to decryption:</p>
+<pre><code>SENDER:
+  1. Application produces a CRDT operation (e.g., Automerge change)
+  2. Serialize the operation
+  3. Look up current MLS epoch and derive encryption key
+  4. Encrypt: ciphertext = AES-GCM(encryption_key, nonce, plaintext)
+  5. Build DAG node: { children, epoch, ciphertext, nonce }
+  6. Compute CID = Hash(node)
+  7. Record in local MerkleCrdt (plaintext state updated locally)
+  8. Transmit encrypted node to relays / peers
+
+RECIPIENT:
+  1. Receive DAG node (via sync)
+  2. Verify CID matches content (self-verifying)
+  3. Read epoch number from node
+  4. Look up epoch key from local MLS state / key cache
+  5. Decrypt: plaintext = AES-GCM-Open(key, nonce, ciphertext)
+  6. Deserialize CRDT operation
+  7. Apply to local CRDT state
+</code></pre>
+<h3 id="error-handling"><a class="header" href="#error-handling">Error handling</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Scenario</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Unknown epoch (node from future epoch)</td><td>Buffer the node. Process pending MLS Commits first to advance local epoch. Retry decryption.</td></tr>
+<tr><td>Missing epoch key (node from before join)</td><td>Cannot decrypt. Discard the individual operation. CRDT state is still obtained via state sync with peers who have the key.</td></tr>
+<tr><td>Corrupted ciphertext</td><td>CID verification fails (hash mismatch). Node is rejected.</td></tr>
+<tr><td>MLS Commit from removed member</td><td>Commit is invalid per MLS rules. Ignored.</td></tr>
+<tr><td>Concurrent Commits (fork)</td><td>Deterministic conflict resolution (section 3). Losing Commit’s proposals re-queued.</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
+<p>The encryption layer sits between the sync layer (Merkle-CRDTs) and
+the storage/transport layer. It ensures that:</p>
+<ol>
+<li>All content is encrypted with group keys — only space members
+can read it.</li>
+<li>Keys rotate on every membership change — forward secrecy and
+post-compromise security are maintained.</li>
+<li>MLS’s ordering requirements are satisfied by the Merkle-DAG’s
+causal ordering plus deterministic conflict resolution — no
+central server needed.</li>
+<li>Metadata exposure is minimized — epoch numbers are visible,
+but payload content, DAG node sizes (after padding), and member
+identities are protected.</li>
+<li>Old content remains decryptable by members who were present
+during those epochs, while new members see the CRDT state
+without accessing the operation-level history.</li>
+</ol>
+<p>For how encrypted DAG nodes are stored on Nostr relays, see
+<a href="./nostr.html">Nostr Integration</a>. For the anonymity layer that
+protects metadata beyond encryption, see
+<a href="./privacy-layers.html">Privacy Layers</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="sync.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="persistence.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="sync.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="persistence.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

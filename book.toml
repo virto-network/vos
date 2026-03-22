@@ -1,0 +1,12 @@
+[book]
+title = "The Kunekt Book"
+description = "A protocol for building a private-by-default internet"
+authors = ["Virto"]
+language = "en"
+src = "docs"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/nickvdp/kunekt"
+additional-css = []
