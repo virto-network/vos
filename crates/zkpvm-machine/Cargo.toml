@@ -1,0 +1,21 @@
+[package]
+name = "zkpvm-machine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+stwo = { workspace = true }
+stwo-constraint-framework = { workspace = true }
+serde = { workspace = true }
+num-traits = { workspace = true }
+impl-trait-for-tuples = { workspace = true }
+rayon = { workspace = true }
+
+zkpvm-core = { workspace = true }
+zkpvm-trace = { workspace = true }
+zkpvm-air-column = { workspace = true }
+javm = { workspace = true }
+
+[lints.clippy]
+module-inception = { level = "allow", priority = 0 }
