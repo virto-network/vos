@@ -39,8 +39,9 @@ impl TracingPvm {
         let category = opcode.category();
         let decoded_args = args::decode_args(&self.pvm.code, pc_before as usize, skip_len as usize, category);
 
-        // Decode register indices from args
+        // Decode register indices and immediate from args
         let (reg_a, reg_b, reg_d) = decode_reg_indices(opcode, &decoded_args);
+        let imm = decode_immediate(&decoded_args);
 
         let result = self.pvm.step();
 
@@ -70,6 +71,7 @@ impl TracingPvm {
             reg_a,
             reg_b,
             reg_d,
+            imm,
             mem_read: None,
             mem_write: None,
             gas_after,
@@ -107,6 +109,21 @@ fn compute_skip(bitmask: &[u8], i: usize) -> u32 {
         }
     }
     24
+}
+
+/// Extract immediate value from decoded args (0 if none).
+fn decode_immediate(decoded_args: &args::Args) -> u64 {
+    match decoded_args {
+        args::Args::Imm { imm } => *imm,
+        args::Args::RegImm { imm, .. } => *imm,
+        args::Args::RegExtImm { imm, .. } => *imm,
+        args::Args::RegTwoImm { imm_x, .. } => *imm_x,
+        args::Args::RegImmOffset { imm, .. } => *imm,
+        args::Args::TwoImm { imm_x, .. } => *imm_x,
+        args::Args::TwoRegImm { imm, .. } => *imm,
+        args::Args::TwoRegTwoImm { imm_x, .. } => *imm_x,
+        _ => 0,
+    }
 }
 
 /// Decode register indices from decoded instruction arguments.
