@@ -21,7 +21,7 @@ use zkpvm_trace::{
 
 use crate::{
     framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, Range256LookupElements},
+    lookups::{AllLookupElements, LogupTraceBuilder, MemoryAccessLookupElements, Range256LookupElements},
     side_note::SideNote,
 };
 
@@ -111,12 +111,58 @@ pub enum Column {
     #[size = 1]
     CmpLtFlag,
     // ── Shift auxiliary ──
-    /// Shift amount (val_d mod 64 or mod 32), 1 column
     #[size = 1]
     ShiftAmount,
-    /// Shift sub-op: 0=ShloL, 1=ShloR, 2=SharR, 3=RotL, 4=RotR
     #[size = 1]
     ShiftOp,
+    // ── Control flow ──
+    /// Conditional branch (BranchEq/Ne/Lt/Ge + imm variants)
+    #[size = 1]
+    IsBranch,
+    /// Unconditional jump (Jump, JumpInd, Fallthrough, Unlikely, LoadImmJump)
+    #[size = 1]
+    IsJump,
+    /// Branch was taken (1) or fell through (0)
+    #[size = 1]
+    BranchTaken,
+    /// Branch/jump target address (4 limbs, u32)
+    #[size = 4]
+    BranchTarget,
+    // ── DivRem auxiliary ──
+    /// 1 if this is a div/rem op
+    #[size = 1]
+    IsDivRem,
+    /// 0 = DivU, 1 = DivS, 2 = RemU, 3 = RemS
+    #[size = 1]
+    DivRemOp,
+    /// Quotient (8 limbs). For div ops: quotient = result. For rem ops: prover-provided.
+    #[size = 8]
+    DivQuotient,
+    /// Remainder (8 limbs). For rem ops: remainder = result. For div ops: prover-provided.
+    #[size = 8]
+    DivRemainder,
+    /// Carry chain for quotient * divisor + remainder = dividend (16 limbs)
+    #[size = 16]
+    DivMulCarry,
+    /// 1 if divisor is zero (special-case handling)
+    #[size = 1]
+    DivByZero,
+    // ── Memory access ──
+    /// 1 if this is a load instruction
+    #[size = 1]
+    IsLoad,
+    /// 1 if this is a store instruction
+    #[size = 1]
+    IsStore,
+    /// Memory address (4 limbs, u32) — only valid when IsLoad or IsStore
+    #[size = 4]
+    MemAddr,
+    /// Memory value (8 limbs) — the byte value per-byte for the lookup
+    #[size = 8]
+    MemValue,
+    /// Number of bytes accessed (1, 2, 4, or 8)
+    #[size = 1]
+    MemSize,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -141,6 +187,12 @@ struct OpcodeFlags {
     is_neg_add: bool,
     compare_op: u8,
     shift_op: u8,
+    is_branch: bool,
+    is_jump: bool,
+    is_div_rem: bool,
+    div_rem_op: u8,
+    is_load: bool,
+    is_store: bool,
 }
 
 fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -154,6 +206,8 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::NegAddImm32 => { f.is_sub = true; f.is_neg_add = true; f.is_32bit = true; }
         Opcode::Mul64 | Opcode::MulImm64 => { f.is_mul = true; }
         Opcode::Mul32 | Opcode::MulImm32 => { f.is_mul = true; f.is_32bit = true; }
+        // MulUpper (prover-trusted — result = high 64 bits of 128-bit product)
+        Opcode::MulUpperUU | Opcode::MulUpperSS | Opcode::MulUpperSU => {}
         Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.bitwise_op = 0; }
         Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.bitwise_op = 1; }
         Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.bitwise_op = 2; }
@@ -184,7 +238,53 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::MaxU => { f.is_compare = true; f.compare_op = 7; }
         // Move
         Opcode::MoveReg | Opcode::LoadImm | Opcode::LoadImm64 => { f.is_move = true; }
-        _ => {}
+        // BitManip (TwoReg unary ops — prover-trusted, classified to avoid false constraints)
+        Opcode::CountSetBits64 | Opcode::CountSetBits32
+        | Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
+        | Opcode::TrailingZeroBits64 | Opcode::TrailingZeroBits32
+        | Opcode::SignExtend8 | Opcode::SignExtend16
+        | Opcode::ZeroExtend16 | Opcode::ReverseBytes
+        | Opcode::Sbrk
+            => {}
+        // Branches (conditional)
+        Opcode::BranchEq | Opcode::BranchNe | Opcode::BranchLtU | Opcode::BranchLtS
+        | Opcode::BranchGeU | Opcode::BranchGeS
+        | Opcode::BranchEqImm | Opcode::BranchNeImm
+        | Opcode::BranchLtUImm | Opcode::BranchLeUImm | Opcode::BranchGeUImm | Opcode::BranchGtUImm
+        | Opcode::BranchLtSImm | Opcode::BranchLeSImm | Opcode::BranchGeSImm | Opcode::BranchGtSImm
+            => { f.is_branch = true; }
+        // DivRem
+        Opcode::DivU64 => { f.is_div_rem = true; f.div_rem_op = 0; }
+        Opcode::DivU32 => { f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
+        Opcode::DivS64 => { f.is_div_rem = true; f.div_rem_op = 1; }
+        Opcode::DivS32 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_32bit = true; }
+        Opcode::RemU64 => { f.is_div_rem = true; f.div_rem_op = 2; }
+        Opcode::RemU32 => { f.is_div_rem = true; f.div_rem_op = 2; f.is_32bit = true; }
+        Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; }
+        Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; }
+        // Loads
+        Opcode::LoadU8 | Opcode::LoadI8 | Opcode::LoadU16 | Opcode::LoadI16
+        | Opcode::LoadU32 | Opcode::LoadI32 | Opcode::LoadU64
+        | Opcode::LoadIndU8 | Opcode::LoadIndI8 | Opcode::LoadIndU16 | Opcode::LoadIndI16
+        | Opcode::LoadIndU32 | Opcode::LoadIndI32 | Opcode::LoadIndU64
+            => { f.is_load = true; }
+        // Stores
+        Opcode::StoreU8 | Opcode::StoreU16 | Opcode::StoreU32 | Opcode::StoreU64
+        | Opcode::StoreIndU8 | Opcode::StoreIndU16 | Opcode::StoreIndU32 | Opcode::StoreIndU64
+        | Opcode::StoreImmU8 | Opcode::StoreImmU16 | Opcode::StoreImmU32 | Opcode::StoreImmU64
+        | Opcode::StoreImmIndU8 | Opcode::StoreImmIndU16 | Opcode::StoreImmIndU32 | Opcode::StoreImmIndU64
+            => { f.is_store = true; }
+        // Jumps (unconditional, non-sequential target)
+        Opcode::Jump | Opcode::LoadImmJump
+            => { f.is_jump = true; }
+        // Fallthrough/Unlikely: sequential terminators, no special control flow constraint
+        Opcode::Fallthrough | Opcode::Unlikely => {}
+        // JumpInd/LoadImmJumpInd: dynamic jumps (prover-trusted target for now)
+        Opcode::JumpInd | Opcode::LoadImmJumpInd => {}
+        // Ecalli: host call (execution exits, no ALU constraint)
+        Opcode::Ecalli => {}
+        // Trap: causes panic exit
+        Opcode::Trap => {}
     }
     f
 }
@@ -221,7 +321,7 @@ impl BuiltInComponent for CpuChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = Range256LookupElements;
+    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements);
 
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         FinalizedTrace::empty()
@@ -356,15 +456,7 @@ impl BuiltInComponent for CpuChip {
                     cmp_carry[i] = (sum >> 8) as u8;
                     c = cmp_carry[i] as u16;
                 }
-                // If final carry = 0, then val_b < val_d (unsigned)
-                cmp_lt_flag = if cmp_carry[WORD_SIZE - 1] == 0 { 1 } else { 0 };
-                // Actually: carry=1 means no borrow (a >= b), carry=0 means borrow (a < b)
-                // But the final carry from the MSB determines this. Let me reconsider:
-                // a - b via a + ~b + 1: if a >= b, final carry out = 1; if a < b, carry out = 0
-                // So cmp_lt_flag = 1 - final_carry
-                // The "final carry" is the carry out of the last byte.
-                // With 8 limbs, the carry out of limb 7 tells us.
-                // But cmp_carry[7] is the carry OUT of limb 7 (into limb 8, which doesn't exist).
+                // a - b via a + ~b + 1: carry_out=1 means a>=b, carry_out=0 means a<b
                 cmp_lt_flag = 1 - cmp_carry[WORD_SIZE - 1];
             }
             trace.fill_columns_bytes(row, &cmp_carry, Column::CmpCarry);
@@ -395,6 +487,77 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, flags.is_32bit, Column::Is32Bit);
             trace.fill_columns(row, flags.bitwise_op, Column::BitwiseOp);
             trace.fill_columns(row, flags.is_neg_add, Column::IsNegAdd);
+            trace.fill_columns(row, flags.is_branch, Column::IsBranch);
+            trace.fill_columns(row, flags.is_jump, Column::IsJump);
+            trace.fill_columns(row, step.branch_taken, Column::BranchTaken);
+            trace.fill_columns_bytes(row, &step.branch_target.to_le_bytes(), Column::BranchTarget);
+            trace.fill_columns(row, flags.is_div_rem, Column::IsDivRem);
+            trace.fill_columns(row, flags.div_rem_op, Column::DivRemOp);
+
+            // ── DivRem auxiliary ──
+            let mut div_quotient = [0u8; WORD_SIZE];
+            let mut div_remainder = [0u8; WORD_SIZE];
+            let mut div_mul_carry = [0u8; 16];
+            let mut div_by_zero: u8 = 0;
+            if flags.is_div_rem {
+                let dividend = val_b;
+                let divisor = val_d;
+                if divisor == 0 {
+                    div_by_zero = 1;
+                    // For div-by-zero: result is special (u64::MAX for div, dividend for rem)
+                    // quotient/remainder don't matter, constraint is bypassed
+                } else {
+                    let (q, r) = if flags.div_rem_op <= 1 {
+                        // Unsigned div (op 0) or signed div (op 1, prover-trusted for sign)
+                        (dividend / divisor, dividend % divisor)
+                    } else {
+                        // Unsigned rem (op 2) or signed rem (op 3)
+                        (dividend / divisor, dividend % divisor)
+                    };
+                    div_quotient = q.to_le_bytes();
+                    div_remainder = r.to_le_bytes();
+
+                    // Carry chain for q * divisor + remainder = dividend (schoolbook)
+                    let divisor_bytes = divisor.to_le_bytes();
+                    let input_limbs = if flags.is_32bit { 4 } else { WORD_SIZE };
+                    let out_limbs = input_limbs * 2;
+                    let mut accum = [0u32; 16];
+                    for i in 0..input_limbs {
+                        for j in 0..input_limbs {
+                            accum[i + j] += div_quotient[i] as u32 * divisor_bytes[j] as u32;
+                        }
+                    }
+                    // Add remainder to low limbs
+                    for i in 0..input_limbs {
+                        accum[i] += div_remainder[i] as u32;
+                    }
+                    for k in 0..out_limbs.min(16).saturating_sub(1) {
+                        div_mul_carry[k] = (accum[k] >> 8) as u8;
+                        accum[k + 1] += accum[k] >> 8;
+                    }
+                    if out_limbs > 0 && out_limbs <= 16 {
+                        div_mul_carry[out_limbs - 1] = (accum[out_limbs - 1] >> 8) as u8;
+                    }
+                }
+            }
+            trace.fill_columns_bytes(row, &div_quotient, Column::DivQuotient);
+            trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
+            trace.fill_columns_bytes(row, &div_mul_carry, Column::DivMulCarry);
+            trace.fill_columns(row, div_by_zero, Column::DivByZero);
+
+            // ── Memory access columns ──
+            trace.fill_columns(row, flags.is_load, Column::IsLoad);
+            trace.fill_columns(row, flags.is_store, Column::IsStore);
+            if let Some(ref r) = step.mem_read {
+                trace.fill_columns_bytes(row, &r.address.to_le_bytes(), Column::MemAddr);
+                trace.fill_columns(row, r.value, Column::MemValue);
+                trace.fill_columns(row, r.size, Column::MemSize);
+            } else if let Some(ref w) = step.mem_write {
+                trace.fill_columns_bytes(row, &w.address.to_le_bytes(), Column::MemAddr);
+                trace.fill_columns(row, w.value, Column::MemValue);
+                trace.fill_columns(row, w.size, Column::MemSize);
+            }
+            // else: no memory access, columns stay 0 (default)
 
             for &b in &result_bytes {
                 range_bytes.push(b);
@@ -430,6 +593,7 @@ impl BuiltInComponent for CpuChip {
         let is_pad = zkpvm_trace::original_base_column!(component_trace, Column::IsPadding);
         let range256: &Range256LookupElements = lookup_elements.as_ref();
 
+        // Range256 lookups for result bytes
         let result = zkpvm_trace::original_base_column!(component_trace, Column::Result);
         for col in &result {
             logup.add_to_relation_with(
@@ -443,6 +607,32 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // Memory access lookups (producer side, positive)
+        let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
+        let is_load = zkpvm_trace::original_base_column!(component_trace, Column::IsLoad);
+        let is_store = zkpvm_trace::original_base_column!(component_trace, Column::IsStore);
+        let mem_addr = zkpvm_trace::original_base_column!(component_trace, Column::MemAddr);
+        let mem_value = zkpvm_trace::original_base_column!(component_trace, Column::MemValue);
+        let timestamp = zkpvm_trace::original_base_column!(component_trace, Column::Timestamp);
+        let mem_size = zkpvm_trace::original_base_column!(component_trace, Column::MemSize);
+
+        // Build tuple: (addr[4], value[8], timestamp[8], is_write[1], size[1])
+        let mut mem_tuple: Vec<_> = mem_addr.to_vec();
+        mem_tuple.extend_from_slice(&mem_value);
+        mem_tuple.extend_from_slice(&timestamp);
+        mem_tuple.push(is_store[0].clone()); // is_write = is_store
+        mem_tuple.push(mem_size[0].clone());
+
+        // Multiplicity = is_load + is_store (positive, producer side)
+        logup.add_to_relation_with(
+            mem_lookup,
+            [is_load[0].clone(), is_store[0].clone()],
+            |[load, store]| {
+                (load + store).into()
+            },
+            &mem_tuple,
+        );
+
         logup.finalize()
     }
 
@@ -452,8 +642,9 @@ impl BuiltInComponent for CpuChip {
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &Range256LookupElements,
+        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements),
     ) {
+        let (range256_lookup, mem_lookup) = lookup_elements;
         let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -828,6 +1019,87 @@ impl BuiltInComponent for CpuChip {
         let _ = is_shift;
 
         // ════════════════════════════════════════════════════════════════════
+        // DIVREM: quotient * divisor + remainder = dividend
+        // dividend = val_b, divisor = val_d
+        // For div (op 0,1): result = quotient. For rem (op 2,3): result = remainder.
+        // When divisor == 0 (div_by_zero=1): constraint bypassed (special result).
+        // ════════════════════════════════════════════════════════════════════
+        let is_div_rem = zkpvm_trace::trace_eval!(trace_eval, Column::IsDivRem);
+        let div_rem_op = zkpvm_trace::trace_eval!(trace_eval, Column::DivRemOp);
+        let div_quotient = zkpvm_trace::trace_eval!(trace_eval, Column::DivQuotient);
+        let div_remainder = zkpvm_trace::trace_eval!(trace_eval, Column::DivRemainder);
+        let div_mul_carry = zkpvm_trace::trace_eval!(trace_eval, Column::DivMulCarry);
+        let div_by_zero = zkpvm_trace::trace_eval!(trace_eval, Column::DivByZero);
+
+        // Gate: only constrain when is_div_rem=1 and div_by_zero=0
+        let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
+
+        // Schoolbook: quotient * divisor + remainder = dividend
+        // For 64-bit: 16 positions (q[0..8] * d[0..8] produces 16 output bytes)
+        // Output bytes: dividend[k] for k<8, should be 0 for k>=8 (no overflow)
+        for k in 0..16usize {
+            let mut partial_sum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let j = k.wrapping_sub(i);
+                if j < WORD_SIZE {
+                    partial_sum = partial_sum + div_quotient[i].clone() * val_d[j].clone();
+                }
+            }
+            // Add remainder to the low limbs
+            if k < WORD_SIZE {
+                partial_sum = partial_sum + div_remainder[k].clone();
+            }
+            let carry_in = if k == 0 { E::F::zero() } else { div_mul_carry[k - 1].clone() };
+            // Expected output: dividend byte (val_b[k]) for k<8, 0 for k>=8
+            let expected = if k < WORD_SIZE { val_b[k].clone() } else { E::F::zero() };
+            let c = expected + div_mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            eval.add_constraint(div_active.clone() * is_64bit.clone() * c);
+        }
+
+        // 32-bit divrem: same but only 8 positions
+        for k in 0..8usize {
+            let mut partial_sum = E::F::zero();
+            for i in 0..4usize {
+                let j = k.wrapping_sub(i);
+                if j < 4 {
+                    partial_sum = partial_sum + div_quotient[i].clone() * val_d[j].clone();
+                }
+            }
+            if k < 4 {
+                partial_sum = partial_sum + div_remainder[k].clone();
+            }
+            let carry_in = if k == 0 { E::F::zero() } else { div_mul_carry[k - 1].clone() };
+            let expected = if k < 4 { val_b[k].clone() } else { E::F::zero() };
+            let c = expected + div_mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            eval.add_constraint(div_active.clone() * is_32bit[0].clone() * c);
+        }
+
+        // For div ops (op 0,1): result = quotient
+        // div_rem_op ∈ {0,1} for div. Gate: op*(op-1) = 0 when op=0 or op=1.
+        // Use: (op-2)*(op-3) is nonzero for op=0,1 and zero for op=2,3.
+        let drop2 = div_rem_op[0].clone() - E::F::from(BaseField::from(2u32));
+        let drop3 = div_rem_op[0].clone() - E::F::from(BaseField::from(3u32));
+        let gate_div = drop2.clone() * drop3.clone(); // nonzero when op=0 or op=1
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                div_active.clone() * gate_div.clone() * (result[i].clone() - div_quotient[i].clone())
+            );
+        }
+
+        // For rem ops (op 2,3): result = remainder
+        let gate_rem = div_rem_op[0].clone() * (div_rem_op[0].clone() - E::F::one());  // nonzero when op=2 or op=3
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                div_active.clone() * gate_rem.clone() * (result[i].clone() - div_remainder[i].clone())
+            );
+        }
+
+        // 32-bit: upper result limbs = 0
+        for i in 4..WORD_SIZE {
+            eval.add_constraint(is_div_rem[0].clone() * is_32bit[0].clone() * result[i].clone());
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // MOVE: result = val_d
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
@@ -835,15 +1107,87 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // CONTROL FLOW: constrain next_pc based on branch/jump
+        // ════════════════════════════════════════════════════════════════════
+        let is_branch = zkpvm_trace::trace_eval!(trace_eval, Column::IsBranch);
+        let is_jump = zkpvm_trace::trace_eval!(trace_eval, Column::IsJump);
+        let branch_taken = zkpvm_trace::trace_eval!(trace_eval, Column::BranchTaken);
+        let branch_target = zkpvm_trace::trace_eval!(trace_eval, Column::BranchTarget);
+        let next_pc = zkpvm_trace::trace_eval!(trace_eval, Column::NextPc);
+        let _pc = zkpvm_trace::trace_eval!(trace_eval, Column::Pc);
+        let _skip_len = zkpvm_trace::trace_eval!(trace_eval, Column::SkipLen);
+
+        // Sequential next PC = pc + 1 + skip_len (as a 4-byte value)
+        // For simplicity, constrain the low byte: seq_next_pc[0] = pc[0] + 1 + skip_len
+        // Full multi-byte addition would need a carry chain on 4 bytes.
+        // For now: constrain that next_pc equals either branch_target (taken) or sequential (not taken).
+
+        // For unconditional jumps: next_pc = branch_target
+        for i in 0..4 {
+            eval.add_constraint(
+                is_jump[0].clone() * (next_pc[i].clone() - branch_target[i].clone())
+            );
+        }
+
+        // For conditional branches:
+        //   branch_taken=1 → next_pc = branch_target
+        //   branch_taken=0 → next_pc = pc + 1 + skip_len (sequential)
+        // Constraint: is_branch * branch_taken * (next_pc - branch_target) = 0
+        for i in 0..4 {
+            eval.add_constraint(
+                is_branch[0].clone() * branch_taken[0].clone()
+                * (next_pc[i].clone() - branch_target[i].clone())
+            );
+        }
+
+        // branch_taken must be boolean
+        eval.add_constraint(
+            is_branch[0].clone() * branch_taken[0].clone() * (E::F::one() - branch_taken[0].clone())
+        );
+
+        // For non-branch, non-jump ALU ops: next_pc = pc + 1 + skip_len
+        // This is implicitly enforced by the trace (javm computes it), and would require
+        // a full multi-byte addition constraint on PC to prove in the circuit.
+        // For now, the trace is trusted for sequential PC advancement.
+        // Full soundness requires constraining: (1-is_branch-is_jump) * (next_pc - seq_pc) = 0
+
+        // NOTE: Timestamp monotonicity and sequential PC advancement require
+        // finalize_bit_reversed() for mask_next_row to work correctly with circle
+        // domain evaluation. This is deferred to a future refactor.
+
+        // ════════════════════════════════════════════════════════════════════
         // Range256 checks for result byte limbs
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
             eval.add_to_relation(RelationEntry::new(
-                lookup_elements,
+                range256_lookup,
                 is_real.clone().into(),
                 &[result[i].clone()],
             ));
         }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Memory access lookup (producer side)
+        // ════════════════════════════════════════════════════════════════════
+        let is_load_col = zkpvm_trace::trace_eval!(trace_eval, Column::IsLoad);
+        let is_store_col = zkpvm_trace::trace_eval!(trace_eval, Column::IsStore);
+        let mem_addr = zkpvm_trace::trace_eval!(trace_eval, Column::MemAddr);
+        let mem_value = zkpvm_trace::trace_eval!(trace_eval, Column::MemValue);
+        let timestamp = zkpvm_trace::trace_eval!(trace_eval, Column::Timestamp);
+        let mem_size = zkpvm_trace::trace_eval!(trace_eval, Column::MemSize);
+
+        let mut mem_tuple: Vec<E::F> = mem_addr.to_vec();
+        mem_tuple.extend_from_slice(&mem_value);
+        mem_tuple.extend_from_slice(&timestamp);
+        mem_tuple.push(is_store_col[0].clone()); // is_write = is_store
+        mem_tuple.push(mem_size[0].clone());
+
+        let mem_mult = is_load_col[0].clone() + is_store_col[0].clone();
+        eval.add_to_relation(RelationEntry::new(
+            mem_lookup,
+            mem_mult.into(),
+            &mem_tuple,
+        ));
 
         eval.finalize_logup_in_pairs();
     }

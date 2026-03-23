@@ -11,8 +11,8 @@ pub use self::{
     logup_trace_builder::LogupTraceBuilder,
     range_check::Range256LookupElements,
     relations::{
-        ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements,
+        MemoryAccessLookupElements, ProgramExecutionLookupElements,
+        ProgramMemoryLookupElements, RegisterMemoryLookupElements,
     },
 };
 
@@ -22,6 +22,7 @@ macros::register_relation! {
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
         Range256LookupElements,
+        MemoryAccessLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

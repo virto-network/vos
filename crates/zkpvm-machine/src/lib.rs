@@ -9,6 +9,7 @@ mod verify;
 const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::CpuChip,
     &chips::RangeMultiplicity256,
+    &chips::MemoryChip,
 ];
 
 pub use prove::{prove, Proof};

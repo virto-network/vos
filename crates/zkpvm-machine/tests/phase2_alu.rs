@@ -19,9 +19,7 @@ fn run_three_reg(opcode: Opcode, ra: u8, rb: u8, rd: u8, regs: [u64; PVM_REGISTE
     tracing.into_trace()
 }
 
-/// Helper: build a PVM with a two-register + immediate instruction followed by Trap.
-/// Bytecode: [opcode, ra | (rb<<4), imm_bytes..., Trap]
-/// The immediate is sign-extended from `imm_len` bytes.
+#[allow(dead_code)]
 fn run_two_reg_imm(opcode: Opcode, ra: u8, rb: u8, imm: i64, regs: [u64; PVM_REGISTER_COUNT]) -> Vec<zkpvm_core::step::PvmStep> {
     // Encode: opcode, reg_byte, imm (up to 4 bytes LE), trap
     let imm_bytes = (imm as u64).to_le_bytes();
@@ -136,7 +134,7 @@ fn prove_move_reg() {
 fn prove_load_imm() {
     // LoadImm (opcode 51): φ'[ra] = sign_extended(imm)
     // OneRegOneImm encoding: [51, ra_byte, imm_bytes...]
-    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    let regs = [0u64; PVM_REGISTER_COUNT];
     let imm: u32 = 12345;
     let imm_bytes = imm.to_le_bytes();
     let mut code = vec![Opcode::LoadImm as u8, 2]; // ra=2
@@ -315,4 +313,83 @@ fn prove_set_lt_u_equal() {
 #[test]
 fn prove_set_lt_u_large() {
     test_three_reg_op(Opcode::SetLtU, u64::MAX - 1, u64::MAX, 1);
+}
+
+// ── DivRem tests ──
+
+#[test]
+fn prove_div_u64() {
+    test_three_reg_op(Opcode::DivU64, 100, 7, 100 / 7); // 14
+}
+
+#[test]
+fn prove_div_u64_exact() {
+    test_three_reg_op(Opcode::DivU64, 42, 6, 7);
+}
+
+#[test]
+fn prove_div_u64_by_zero() {
+    test_three_reg_op(Opcode::DivU64, 42, 0, u64::MAX);
+}
+
+#[test]
+fn prove_rem_u64() {
+    test_three_reg_op(Opcode::RemU64, 100, 7, 100 % 7); // 2
+}
+
+#[test]
+fn prove_rem_u64_by_zero() {
+    test_three_reg_op(Opcode::RemU64, 42, 0, 42); // rem by zero = dividend
+}
+
+#[test]
+fn prove_div_u32() {
+    test_three_reg_op(Opcode::DivU32, 1000, 30, 1000 / 30); // 33
+}
+
+#[test]
+fn prove_rem_u32() {
+    test_three_reg_op(Opcode::RemU32, 1000, 30, 1000 % 30); // 10
+}
+
+#[test]
+fn prove_div_u64_large() {
+    test_three_reg_op(Opcode::DivU64, u64::MAX, 2, u64::MAX / 2);
+}
+
+// ── BitManip tests ──
+
+#[test]
+fn prove_reverse_bytes() {
+    // ReverseBytes is TwoReg: φ'[rd] = bswap(φ[ra])
+    // Encoding: [opcode, rd | (ra<<4)]
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0x0102030405060708;
+    let code = vec![Opcode::ReverseBytes as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
+    let bitmask = vec![1, 0, 1];
+    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 0x0807060504030201);
+    let mut side_note = zkpvm_machine::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_sign_extend_8() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0x80; // -128 as i8
+    let code = vec![Opcode::SignExtend8 as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
+    let bitmask = vec![1, 0, 1];
+    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 0xFFFFFFFFFFFFFF80); // sign-extended
+    let mut side_note = zkpvm_machine::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
 }

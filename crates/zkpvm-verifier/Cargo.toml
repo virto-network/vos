@@ -1,0 +1,8 @@
+[package]
+name = "zkpvm-verifier"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+zkpvm-machine = { workspace = true }

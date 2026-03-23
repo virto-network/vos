@@ -21,9 +21,15 @@ stwo_constraint_framework::relation!(
 );
 
 // (pc, opcode, skip_len)
-// PC is 4 bytes, opcode is 1, skip_len is 1.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize = PC_SIZE + 2;
 stwo_constraint_framework::relation!(
     ProgramMemoryLookupElements,
     REL_PROG_MEMORY_LOOKUP_SIZE
+);
+
+// (addr[4], value[8], timestamp[8], is_write[1], size[1])
+const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + WORD_SIZE + TS_SIZE + 2;
+stwo_constraint_framework::relation!(
+    MemoryAccessLookupElements,
+    REL_MEMORY_ACCESS_LOOKUP_SIZE
 );

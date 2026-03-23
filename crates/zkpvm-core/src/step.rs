@@ -29,6 +29,10 @@ pub struct PvmStep {
     pub reg_d: usize,
     /// Decoded immediate value (sign-extended, for imm-category ops).
     pub imm: u64,
+    /// Branch/jump target address (decoded from offset). 0 for non-branch ops.
+    pub branch_target: u32,
+    /// Whether a branch was taken.
+    pub branch_taken: bool,
     /// Memory read: (address, value, size_bytes). None if no memory read.
     pub mem_read: Option<MemAccess>,
     /// Memory write: (address, value, size_bytes). None if no memory write.
