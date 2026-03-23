@@ -33,3 +33,10 @@ stwo_constraint_framework::relation!(
     MemoryAccessLookupElements,
     REL_MEMORY_ACCESS_LOOKUP_SIZE
 );
+
+// (a, b, a_and_b) — per-byte bitwise AND lookup
+const REL_BITWISE_AND_LOOKUP_SIZE: usize = 3;
+stwo_constraint_framework::relation!(
+    BitwiseAndLookupElements,
+    REL_BITWISE_AND_LOOKUP_SIZE
+);

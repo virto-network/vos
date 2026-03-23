@@ -112,7 +112,7 @@ impl BuiltInComponent for MemoryChip {
             for row in 0..trace.num_rows() {
                 trace.fill_columns(row, true, Column::IsPadding);
             }
-            return trace.finalize();
+            return trace.finalize_bit_reversed();
         }
 
         // Sort by (address, timestamp)
@@ -146,7 +146,7 @@ impl BuiltInComponent for MemoryChip {
             trace.fill_columns(row, true, Column::IsPadding);
         }
 
-        trace.finalize()
+        trace.finalize_bit_reversed()
     }
 
     fn generate_interaction_trace(

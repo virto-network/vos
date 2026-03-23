@@ -393,3 +393,163 @@ fn prove_sign_extend_8() {
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
+
+// ── CmovIz/CmovNz tests ──
+
+#[test]
+fn prove_cmov_iz_taken() {
+    // CmovIz(ra=0, rb=1, rd=2): if φ[1]==0, φ'[2] = φ[0]
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 42;  // value to move
+    regs[1] = 0;   // condition (zero → move)
+    regs[2] = 99;  // old value
+    let steps = run_three_reg(Opcode::CmovIz, 0, 1, 2, regs);
+    assert_eq!(steps[0].regs_after[2], 42);
+    let code = vec![Opcode::CmovIz as u8, 0x10, 2, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_cmov_iz_not_taken() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 42;
+    regs[1] = 1;   // not zero → don't move
+    regs[2] = 99;  // should stay 99
+    let steps = run_three_reg(Opcode::CmovIz, 0, 1, 2, regs);
+    assert_eq!(steps[0].regs_after[2], 99);
+    let code = vec![Opcode::CmovIz as u8, 0x10, 2, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_cmov_nz_taken() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 42;
+    regs[1] = 5;   // not zero → move
+    let steps = run_three_reg(Opcode::CmovNz, 0, 1, 2, regs);
+    assert_eq!(steps[0].regs_after[2], 42);
+    let code = vec![Opcode::CmovNz as u8, 0x10, 2, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+// ── MinU/MaxU tests ──
+
+#[test]
+fn prove_min_u() {
+    test_three_reg_op(Opcode::MinU, 10, 20, 10);
+}
+
+#[test]
+fn prove_min_u_equal() {
+    test_three_reg_op(Opcode::MinU, 7, 7, 7);
+}
+
+#[test]
+fn prove_max_u() {
+    test_three_reg_op(Opcode::MaxU, 10, 20, 20);
+}
+
+#[test]
+fn prove_max_u_large() {
+    test_three_reg_op(Opcode::MaxU, u64::MAX, 0, u64::MAX);
+}
+
+// ── MulUpper tests ──
+
+#[test]
+fn prove_mul_upper_uu() {
+    // MulUpperUU: result = high64(φ[ra] * φ[rb])
+    // 0x1_0000_0000 * 0x1_0000_0000 = 0x1_0000_0000_0000_0000
+    // high64 = 0x1
+    test_three_reg_op(Opcode::MulUpperUU, 0x1_0000_0000, 0x1_0000_0000, 1);
+}
+
+#[test]
+fn prove_mul_upper_uu_small() {
+    // Small values: high64 = 0
+    test_three_reg_op(Opcode::MulUpperUU, 7, 6, 0);
+}
+
+#[test]
+// ── Shift tests ──
+
+#[test]
+fn prove_shlo_l64() {
+    // ShloL64: φ[rd] = φ[ra] << (φ[rb] % 64)
+    // 1 << 10 = 1024
+    test_three_reg_op(Opcode::ShloL64, 1, 10, 1 << 10);
+}
+
+#[test]
+fn prove_shlo_l64_large() {
+    test_three_reg_op(Opcode::ShloL64, 0xFF, 8, 0xFF00);
+}
+
+#[test]
+fn prove_shlo_l64_overflow() {
+    // Shift that loses bits: 1 << 63 = 0x8000_0000_0000_0000
+    test_three_reg_op(Opcode::ShloL64, 1, 63, 1u64 << 63);
+}
+
+#[test]
+fn prove_shlo_l32() {
+    test_three_reg_op(Opcode::ShloL32, 1, 10, 1 << 10);
+}
+
+#[test]
+fn prove_shlo_r64() {
+    test_three_reg_op(Opcode::ShloR64, 1024, 4, 1024 >> 4); // 64
+}
+
+#[test]
+fn prove_shlo_r64_large() {
+    test_three_reg_op(Opcode::ShloR64, 0xDEAD_BEEF_CAFE_BABE, 16, 0xDEAD_BEEF_CAFE_BABE >> 16);
+}
+
+#[test]
+fn prove_shlo_r32() {
+    test_three_reg_op(Opcode::ShloR32, 0xFF00, 8, 0xFF);
+}
+
+// ── Signed compare tests ──
+
+#[test]
+fn prove_set_lt_s_negative() {
+    // -1 < 0 (signed) → 1
+    test_three_reg_op(Opcode::SetLtS, u64::MAX, 0, 1); // u64::MAX = -1 as i64
+}
+
+#[test]
+fn prove_set_lt_s_positive() {
+    // 5 < 10 (signed) → 1
+    test_three_reg_op(Opcode::SetLtS, 5, 10, 1);
+}
+
+#[test]
+fn prove_set_lt_s_false() {
+    // 10 < 5 (signed) → 0
+    test_three_reg_op(Opcode::SetLtS, 10, 5, 0);
+}
+
+#[test]
+fn prove_set_lt_s_neg_vs_pos() {
+    // -100 < 100 (signed) → 1
+    let neg100 = (-100i64) as u64;
+    test_three_reg_op(Opcode::SetLtS, neg100, 100, 1);
+}
+
+#[test]
+fn prove_set_lt_s_pos_vs_neg() {
+    // 100 < -100 (signed) → 0
+    let neg100 = (-100i64) as u64;
+    test_three_reg_op(Opcode::SetLtS, 100, neg100, 0);
+}
+
+fn prove_mul_upper_uu_large() {
+    // Large but not max: schoolbook carries stay within u8
+    test_three_reg_op(Opcode::MulUpperUU, 0x0102030405060708, 0x0807060504030201,
+        ((0x0102030405060708u128 * 0x0807060504030201u128) >> 64) as u64);
+}

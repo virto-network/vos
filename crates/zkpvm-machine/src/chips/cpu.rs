@@ -21,7 +21,11 @@ use zkpvm_trace::{
 
 use crate::{
     framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, MemoryAccessLookupElements, Range256LookupElements},
+    lookups::{
+        AllLookupElements, BitwiseAndLookupElements, LogupTraceBuilder,
+        MemoryAccessLookupElements, ProgramExecutionLookupElements,
+        Range256LookupElements,
+    },
     side_note::SideNote,
 };
 
@@ -96,6 +100,9 @@ pub enum Column {
     /// Mul partial-product carry chain (16 limbs for schoolbook carries)
     #[size = 16]
     MulCarry,
+    /// 1 if this is MulUpper (result = high bits, mul_high = low bits)
+    #[size = 1]
+    IsMulUpper,
     // ── Bitwise auxiliary: per-byte AND result ──
     /// and_result[i] = val_b[i] AND val_d[i] (8 bytes)
     #[size = 8]
@@ -110,6 +117,18 @@ pub enum Column {
     /// The "less-than" flag derived from cmp_carry (1 if val_b < val_d unsigned)
     #[size = 1]
     CmpLtFlag,
+    /// 1 if val_d == 0 (all limbs zero). Used for CmovIz/CmovNz.
+    #[size = 1]
+    ValDIsZero,
+    /// Sign bit of val_b (bit 63 for 64-bit, bit 31 for 32-bit). Used for signed compare.
+    #[size = 1]
+    SignBitB,
+    /// Sign bit of val_d.
+    #[size = 1]
+    SignBitD,
+    /// Signed less-than flag: 1 if val_b < val_d (signed).
+    #[size = 1]
+    CmpLtSFlag,
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
@@ -163,6 +182,10 @@ pub enum Column {
     /// Number of bytes accessed (1, 2, 4, or 8)
     #[size = 1]
     MemSize,
+    // ── Program execution sequencing ──
+    /// timestamp + 1 (8 limbs), used for the program execution lookup
+    #[size = 8]
+    NextTimestamp,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -193,6 +216,7 @@ struct OpcodeFlags {
     div_rem_op: u8,
     is_load: bool,
     is_store: bool,
+    is_mul_upper: bool,
 }
 
 fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -206,19 +230,20 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::NegAddImm32 => { f.is_sub = true; f.is_neg_add = true; f.is_32bit = true; }
         Opcode::Mul64 | Opcode::MulImm64 => { f.is_mul = true; }
         Opcode::Mul32 | Opcode::MulImm32 => { f.is_mul = true; f.is_32bit = true; }
-        // MulUpper (prover-trusted — result = high 64 bits of 128-bit product)
-        Opcode::MulUpperUU | Opcode::MulUpperSS | Opcode::MulUpperSU => {}
+        // MulUpper: result = high 64 bits of 128-bit product
+        Opcode::MulUpperUU | Opcode::MulUpperSS | Opcode::MulUpperSU => { f.is_mul = true; f.is_mul_upper = true; }
         Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.bitwise_op = 0; }
         Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.bitwise_op = 1; }
         Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.bitwise_op = 2; }
         Opcode::AndInv => { f.is_bitwise = true; f.bitwise_op = 3; }
         Opcode::OrInv  => { f.is_bitwise = true; f.bitwise_op = 4; }
         Opcode::Xnor   => { f.is_bitwise = true; f.bitwise_op = 5; }
-        // Shifts
-        Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => { f.is_shift = true; f.shift_op = 0; }
-        Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => { f.is_shift = true; f.shift_op = 0; f.is_32bit = true; }
-        Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => { f.is_shift = true; f.shift_op = 1; }
-        Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => { f.is_shift = true; f.shift_op = 1; f.is_32bit = true; }
+        // Left shifts: constrained via mul (val_d = 2^shift_amount)
+        Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; }
+        Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; f.is_32bit = true; }
+        // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
+        Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; }
+        Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => { f.is_shift = true; f.shift_op = 2; }
         Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => { f.is_shift = true; f.shift_op = 2; f.is_32bit = true; }
         Opcode::RotL64 => { f.is_shift = true; f.shift_op = 3; }
@@ -317,11 +342,11 @@ fn dest_reg(step: &zkpvm_core::step::PvmStep) -> usize {
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 3;
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 4; // degree-10 constraints (compare gate * conditional result)
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements);
+    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements);
 
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         FinalizedTrace::empty()
@@ -335,6 +360,7 @@ impl BuiltInComponent for CpuChip {
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
         let mut range_bytes: Vec<u8> = Vec::new();
+        let mut bitwise_and_bytes: Vec<(u8, u8)> = Vec::new();
 
         for (row, step) in side_note.steps.iter().enumerate() {
             trace.fill_columns(row, step.timestamp, Column::Timestamp);
@@ -364,6 +390,14 @@ impl BuiltInComponent for CpuChip {
             };
 
             let flags = classify_opcode(step.opcode);
+
+            // For left/right shifts: replace val_d with 2^shift_amount
+            // Left shift reuses mul constraint, right shift reuses divrem constraint
+            if flags.is_shift && (flags.shift_op == 0 || flags.shift_op == 1) {
+                let modulus = if flags.is_32bit { 32u64 } else { 64 };
+                let shift = val_d % modulus;
+                val_d = 1u64 << shift;
+            }
 
             // Truncate for 32-bit ALU ops
             if flags.is_32bit && (flags.is_add || flags.is_sub || flags.is_mul) {
@@ -413,6 +447,10 @@ impl BuiltInComponent for CpuChip {
                     let high32 = (full >> 32) as u32;
                     let high_bytes = high32.to_le_bytes();
                     mul_high[..4].copy_from_slice(&high_bytes);
+                } else if flags.is_mul_upper {
+                    // MulUpper: result holds high bits, mul_high holds LOW bits
+                    let low = full as u64;
+                    mul_high = low.to_le_bytes();
                 } else {
                     let high = (full >> 64) as u64;
                     mul_high = high.to_le_bytes();
@@ -441,6 +479,7 @@ impl BuiltInComponent for CpuChip {
             if flags.is_bitwise {
                 for i in 0..WORD_SIZE {
                     and_result[i] = val_b_bytes[i] & val_d_bytes[i];
+                    bitwise_and_bytes.push((val_b_bytes[i], val_d_bytes[i]));
                 }
             }
             trace.fill_columns_bytes(row, &and_result, Column::AndResult);
@@ -461,6 +500,19 @@ impl BuiltInComponent for CpuChip {
             }
             trace.fill_columns_bytes(row, &cmp_carry, Column::CmpCarry);
             trace.fill_columns(row, cmp_lt_flag, Column::CmpLtFlag);
+            let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
+            trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);
+            let sign_bit_b: u8 = if flags.is_32bit { ((val_b >> 31) & 1) as u8 } else { ((val_b >> 63) & 1) as u8 };
+            let sign_bit_d: u8 = if flags.is_32bit { ((val_d >> 31) & 1) as u8 } else { ((val_d >> 63) & 1) as u8 };
+            trace.fill_columns(row, sign_bit_b, Column::SignBitB);
+            trace.fill_columns(row, sign_bit_d, Column::SignBitD);
+            // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
+            let cmp_lt_s_flag: u8 = if sign_bit_b != sign_bit_d {
+                sign_bit_b // b is negative (sign=1) → b < d
+            } else {
+                cmp_lt_flag // same sign → unsigned comparison
+            };
+            trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
             trace.fill_columns(row, flags.compare_op, Column::CompareOp);
 
             // ── Shift auxiliary ──
@@ -480,6 +532,7 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, flags.is_add, Column::IsAdd);
             trace.fill_columns(row, flags.is_sub, Column::IsSub);
             trace.fill_columns(row, flags.is_mul, Column::IsMul);
+            trace.fill_columns(row, flags.is_mul_upper, Column::IsMulUpper);
             trace.fill_columns(row, flags.is_bitwise, Column::IsBitwise);
             trace.fill_columns(row, flags.is_shift, Column::IsShift);
             trace.fill_columns(row, flags.is_compare, Column::IsCompare);
@@ -559,6 +612,9 @@ impl BuiltInComponent for CpuChip {
             }
             // else: no memory access, columns stay 0 (default)
 
+            // NextTimestamp = timestamp + 1
+            trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
+
             for &b in &result_bytes {
                 range_bytes.push(b);
             }
@@ -567,14 +623,19 @@ impl BuiltInComponent for CpuChip {
         for &b in &range_bytes {
             side_note.add_range256(b);
         }
+        for &(a, b) in &bitwise_and_bytes {
+            side_note.add_bitwise_and(a, b);
+        }
 
         let last_ts = side_note.steps.last().map(|s| s.timestamp).unwrap_or(0);
         for row in num_steps..num_rows {
+            let ts = last_ts + (row - num_steps + 1) as u64;
             trace.fill_columns(row, true, Column::IsPadding);
-            trace.fill_columns(row, last_ts + (row - num_steps + 1) as u64, Column::Timestamp);
+            trace.fill_columns(row, ts, Column::Timestamp);
+            trace.fill_columns(row, ts + 1, Column::NextTimestamp);
         }
 
-        trace.finalize()
+        trace.finalize_bit_reversed()
     }
 
     // ── Interaction trace ──────────────────────────────────────────────────
@@ -633,6 +694,53 @@ impl BuiltInComponent for CpuChip {
             &mem_tuple,
         );
 
+        // Program execution lookup: consume (ts, pc), produce (ts+1, next_pc)
+        let prog_exec: &ProgramExecutionLookupElements = lookup_elements.as_ref();
+        let pc = zkpvm_trace::original_base_column!(component_trace, Column::Pc);
+        let next_pc_col = zkpvm_trace::original_base_column!(component_trace, Column::NextPc);
+        let next_ts = zkpvm_trace::original_base_column!(component_trace, Column::NextTimestamp);
+        {
+            let mut consume_tuple: Vec<_> = timestamp.to_vec();
+            consume_tuple.extend_from_slice(&pc);
+            logup.add_to_relation_with(
+                prog_exec,
+                [is_pad[0].clone()],
+                |[pad]| {
+                    use stwo::prover::backend::simd::m31::PackedBaseField;
+                    (-(PackedBaseField::one() - pad)).into()
+                },
+                &consume_tuple,
+            );
+        }
+        {
+            let mut produce_tuple: Vec<_> = next_ts.to_vec();
+            produce_tuple.extend_from_slice(&next_pc_col);
+            logup.add_to_relation_with(
+                prog_exec,
+                [is_pad[0].clone()],
+                |[pad]| {
+                    use stwo::prover::backend::simd::m31::PackedBaseField;
+                    (PackedBaseField::one() - pad).into()
+                },
+                &produce_tuple,
+            );
+        }
+
+        // Bitwise AND lookup: (val_b[i], val_d[i], and_result[i]) for each byte
+        let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
+        let is_bitwise = zkpvm_trace::original_base_column!(component_trace, Column::IsBitwise);
+        let and_result_cols = zkpvm_trace::original_base_column!(component_trace, Column::AndResult);
+        let val_b_cols = zkpvm_trace::original_base_column!(component_trace, Column::ValB);
+        let val_d_cols = zkpvm_trace::original_base_column!(component_trace, Column::ValD);
+        for i in 0..WORD_SIZE {
+            logup.add_to_relation_with(
+                bitwise_and,
+                [is_bitwise[0].clone()],
+                |[bw]| bw.into(),
+                &[val_b_cols[i].clone(), val_d_cols[i].clone(), and_result_cols[i].clone()],
+            );
+        }
+
         logup.finalize()
     }
 
@@ -642,9 +750,9 @@ impl BuiltInComponent for CpuChip {
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements),
+        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements),
     ) {
-        let (range256_lookup, mem_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup) = lookup_elements;
         let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -717,6 +825,8 @@ impl BuiltInComponent for CpuChip {
         // 64-bit: val_b[0..8] * val_d[0..8] = result[0..8] + mul_high[0..8] * 2^64 (16 positions)
         // 32-bit: val_b[0..4] * val_d[0..4] = result[0..4] + mul_high[0..4] * 2^32 (8 positions)
         // ════════════════════════════════════════════════════════════════════
+        let is_mul_upper = zkpvm_trace::trace_eval!(trace_eval, Column::IsMulUpper);
+        let is_mul_low = E::F::one() - is_mul_upper[0].clone();
         // 64-bit mul constraint (positions 0..15)
         for k in 0..16usize {
             let mut partial_sum = E::F::zero();
@@ -727,9 +837,14 @@ impl BuiltInComponent for CpuChip {
                 }
             }
             let carry_in = if k == 0 { E::F::zero() } else { mul_carry[k - 1].clone() };
-            let out_byte = if k < 8 { result[k].clone() } else { mul_high[k - 8].clone() };
-            let c = out_byte + mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * c);
+            // Normal mul: output = result ++ mul_high
+            let out_normal = if k < 8 { result[k].clone() } else { mul_high[k - 8].clone() };
+            // MulUpper: output = mul_high ++ result (swapped)
+            let out_upper = if k < 8 { mul_high[k].clone() } else { result[k - 8].clone() };
+            let c_normal = out_normal + mul_carry[k].clone() * f256.clone() - partial_sum.clone() - carry_in.clone();
+            let c_upper = out_upper + mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone() * c_normal);
+            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_upper[0].clone() * c_upper);
         }
         // 32-bit mul constraint (positions 0..7, using low 4 limbs of inputs)
         for k in 0..8usize {
@@ -995,14 +1110,93 @@ impl BuiltInComponent for CpuChip {
             let cop7 = cop.clone() - E::F::from(BaseField::from(7u32));
             let gate_setltu = cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
 
-            // result[0] = cmp_lt_flag when compare_op = 0
+            let val_d_is_zero = zkpvm_trace::trace_eval!(trace_eval, Column::ValDIsZero);
+
+            // Constrain val_d_is_zero: if flag=1, all val_d limbs must be 0
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_compare[0].clone() * val_d_is_zero[0].clone() * val_d[i].clone()
+                );
+            }
+
+            // SetLtU (compare_op=0): result = cmp_lt_flag (zero-extended)
+            // result[0] = cmp_lt_flag, result[1..7] = 0
             eval.add_constraint(
                 is_compare[0].clone() * gate_setltu.clone() * (result[0].clone() - cmp_lt_flag[0].clone())
             );
-            // result[1..7] = 0 when compare_op = 0
             for i in 1..WORD_SIZE {
                 eval.add_constraint(
                     is_compare[0].clone() * gate_setltu.clone() * result[i].clone()
+                );
+            }
+
+            // SetLtS (compare_op=1): result = cmp_lt_s_flag (zero-extended)
+            let gate_setlts = cop.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            {
+                let cmp_lt_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
+                let sign_b = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitB);
+                let sign_d = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitD);
+
+                // Constrain cmp_lt_s_flag:
+                // signs_differ = sign_b XOR sign_d (= sign_b + sign_d - 2*sign_b*sign_d)
+                // cmp_lt_s_flag = signs_differ * sign_b + (1 - signs_differ) * cmp_lt_flag
+                let signs_differ = sign_b[0].clone() + sign_d[0].clone()
+                    - E::F::from(BaseField::from(2u32)) * sign_b[0].clone() * sign_d[0].clone();
+                let expected_s = signs_differ.clone() * sign_b[0].clone()
+                    + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_setlts.clone()
+                    * (cmp_lt_s_flag[0].clone() - expected_s)
+                );
+
+                // result[0] = cmp_lt_s_flag, result[1..7] = 0
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_setlts.clone()
+                    * (result[0].clone() - cmp_lt_s_flag[0].clone())
+                );
+                for i in 1..WORD_SIZE {
+                    eval.add_constraint(
+                        is_compare[0].clone() * gate_setlts.clone() * result[i].clone()
+                    );
+                }
+            }
+
+            // CmovIz (compare_op=2): if val_d==0, result=val_b
+            let gate_cmoviz = cop.clone() * cop1.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_cmoviz.clone()
+                    * val_d_is_zero[0].clone() * (result[i].clone() - val_b[i].clone())
+                );
+            }
+
+            // CmovNz (compare_op=3): if val_d!=0, result=val_b (i.e. if val_d_is_zero==0)
+            let gate_cmovnz = cop.clone() * cop1.clone() * cop2.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_cmovnz.clone()
+                    * (E::F::one() - val_d_is_zero[0].clone()) * (result[i].clone() - val_b[i].clone())
+                );
+            }
+
+            // MinU (compare_op=5): result = (val_b < val_d) ? val_b : val_d
+            // = cmp_lt_flag * val_b + (1 - cmp_lt_flag) * val_d
+            let gate_minu = cop.clone() * cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop6.clone() * cop7.clone();
+            for i in 0..WORD_SIZE {
+                let expected = cmp_lt_flag[0].clone() * val_b[i].clone()
+                    + (E::F::one() - cmp_lt_flag[0].clone()) * val_d[i].clone();
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_minu.clone() * (result[i].clone() - expected)
+                );
+            }
+
+            // MaxU (compare_op=7): result = (val_b < val_d) ? val_d : val_b
+            let gate_maxu = cop.clone() * cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone();
+            for i in 0..WORD_SIZE {
+                let expected = cmp_lt_flag[0].clone() * val_d[i].clone()
+                    + (E::F::one() - cmp_lt_flag[0].clone()) * val_b[i].clone();
+                eval.add_constraint(
+                    is_compare[0].clone() * gate_maxu.clone() * (result[i].clone() - expected)
                 );
             }
         }
@@ -1151,10 +1345,6 @@ impl BuiltInComponent for CpuChip {
         // For now, the trace is trusted for sequential PC advancement.
         // Full soundness requires constraining: (1-is_branch-is_jump) * (next_pc - seq_pc) = 0
 
-        // NOTE: Timestamp monotonicity and sequential PC advancement require
-        // finalize_bit_reversed() for mask_next_row to work correctly with circle
-        // domain evaluation. This is deferred to a future refactor.
-
         // ════════════════════════════════════════════════════════════════════
         // Range256 checks for result byte limbs
         // ════════════════════════════════════════════════════════════════════
@@ -1188,6 +1378,47 @@ impl BuiltInComponent for CpuChip {
             mem_mult.into(),
             &mem_tuple,
         ));
+
+        // ════════════════════════════════════════════════════════════════════
+        // Program execution lookup: step sequencing
+        // ════════════════════════════════════════════════════════════════════
+        {
+            let pc_col = zkpvm_trace::trace_eval!(trace_eval, Column::Pc);
+            let next_pc_col = zkpvm_trace::trace_eval!(trace_eval, Column::NextPc);
+            let timestamp = zkpvm_trace::trace_eval!(trace_eval, Column::Timestamp);
+            let next_ts = zkpvm_trace::trace_eval!(trace_eval, Column::NextTimestamp);
+
+            // Consume (timestamp, pc)
+            let mut consume_tuple: Vec<E::F> = timestamp.to_vec();
+            consume_tuple.extend_from_slice(&pc_col);
+            eval.add_to_relation(RelationEntry::new(
+                prog_exec_lookup,
+                (-is_real.clone()).into(),
+                &consume_tuple,
+            ));
+
+            // Produce (next_timestamp, next_pc)
+            let mut produce_tuple: Vec<E::F> = next_ts.to_vec();
+            produce_tuple.extend_from_slice(&next_pc_col);
+            eval.add_to_relation(RelationEntry::new(
+                prog_exec_lookup,
+                is_real.clone().into(),
+                &produce_tuple,
+            ));
+        }
+
+        // Bitwise AND lookup: (val_b[i], val_d[i], and_result[i]) per byte
+        {
+            let and_result = zkpvm_trace::trace_eval!(trace_eval, Column::AndResult);
+            let is_bitwise_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsBitwise);
+            for i in 0..WORD_SIZE {
+                eval.add_to_relation(RelationEntry::new(
+                    bitwise_and_lookup,
+                    is_bitwise_flag[0].clone().into(),
+                    &[val_b[i].clone(), val_d[i].clone(), and_result[i].clone()],
+                ));
+            }
+        }
 
         eval.finalize_logup_in_pairs();
     }

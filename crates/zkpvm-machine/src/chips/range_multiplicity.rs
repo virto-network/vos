@@ -66,7 +66,7 @@ impl BuiltInComponent for RangeMultiplicity256 {
             trace.fill_columns(row, value, PreprocessedColumn::Value);
         }
 
-        trace.finalize()
+        trace.finalize_bit_reversed()
     }
 
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
@@ -86,7 +86,7 @@ impl BuiltInComponent for RangeMultiplicity256 {
             trace.fill_columns(row, BaseField::from(mult), Column::Multiplicity);
         }
 
-        trace.finalize()
+        trace.finalize_bit_reversed()
     }
 
     fn generate_interaction_trace(

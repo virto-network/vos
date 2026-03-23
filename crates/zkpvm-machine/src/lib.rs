@@ -10,6 +10,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::CpuChip,
     &chips::RangeMultiplicity256,
     &chips::MemoryChip,
+    &chips::ProgramBoundaryChip,
+    &chips::BitwiseLookupChip,
 ];
 
 pub use prove::{prove, Proof};
