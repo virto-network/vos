@@ -1,0 +1,14 @@
+[package]
+name = "pvm-actors-macros"
+description = "Derive macros for pvm-actors: #[derive(Actor)] and #[messages]"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
