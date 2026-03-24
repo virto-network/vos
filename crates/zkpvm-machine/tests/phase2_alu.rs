@@ -1,6 +1,6 @@
 use javm::instruction::Opcode;
-use javm::vm::Pvm;
-use javm::Memory;
+use javm::interpreter::Interpreter;
+// Memory is now flat_mem in Interpreter
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm_core::tracing::TracingPvm;
@@ -12,10 +12,10 @@ use zkpvm_machine::{prove, verify};
 fn run_three_reg(opcode: Opcode, ra: u8, rb: u8, rd: u8, regs: [u64; PVM_REGISTER_COUNT]) -> Vec<zkpvm_core::step::PvmStep> {
     let code = vec![opcode as u8, ra | (rb << 4), rd, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
-    let pvm = Pvm::new(code, bitmask, vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code, bitmask, vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     tracing.into_trace()
 }
 
@@ -31,10 +31,10 @@ fn run_two_reg_imm(opcode: Opcode, ra: u8, rb: u8, imm: i64, regs: [u64; PVM_REG
     let mut bitmask = vec![1u8];
     bitmask.extend(vec![0u8; 1 + imm_len]); // reg_byte + imm
     bitmask.push(1);
-    let pvm = Pvm::new(code, bitmask, vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code, bitmask, vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     tracing.into_trace()
 }
 
@@ -121,10 +121,10 @@ fn prove_move_reg() {
     regs[0] = 42;
     let code = vec![Opcode::MoveReg as u8, 0x02, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[2], 42);
     prove_and_verify(steps, &code, &bitmask);
@@ -142,10 +142,10 @@ fn prove_load_imm() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
     // LoadImm with 4-byte positive immediate should give us sign-extended value
     // imm = 12345 (positive, fits in 4 bytes) => sign_extend(12345, 4) = 12345
@@ -181,10 +181,10 @@ fn prove_multi_op_program() {
         1,        // Trap
     ];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
 
     assert_eq!(steps.len(), 5); // Add64 + Sub64 + And + MoveReg + Trap
@@ -208,7 +208,7 @@ fn prove_add_imm64() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1u8, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -226,7 +226,7 @@ fn prove_neg_add_imm64() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1u8, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -367,10 +367,10 @@ fn prove_reverse_bytes() {
     regs[0] = 0x0102030405060708;
     let code = vec![Opcode::ReverseBytes as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
     let bitmask = vec![1, 0, 1];
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0x0807060504030201);
     let mut side_note = zkpvm_machine::SideNote::new(steps, code, bitmask);
@@ -384,7 +384,7 @@ fn prove_sign_extend_8() {
     regs[0] = 0x80; // -128 as i8
     let code = vec![Opcode::SignExtend8 as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
     let bitmask = vec![1, 0, 1];
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, Memory::new(), 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();

@@ -28,6 +28,7 @@ pub struct Proof {
     pub stark_proof: StarkProof<Blake2sMerkleHasher>,
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
+    pub num_components: usize,
 }
 
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
@@ -118,9 +119,11 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
         commitment_scheme,
     )?;
 
+    let num_components = BASE_COMPONENTS.len();
     Ok(Proof {
         stark_proof: proof,
         claimed_sums,
+        num_components,
         log_sizes,
     })
 }

@@ -1,19 +1,20 @@
 use javm::args;
 use javm::instruction::Opcode;
-use javm::vm::{ExitReason, Pvm};
+use javm::interpreter::Interpreter;
+use javm::ExitReason;
 use javm::PVM_REGISTER_COUNT;
 
 use crate::step::{MemAccess, PvmStep};
 
 /// A tracing wrapper around javm's Pvm that records a full execution trace.
 pub struct TracingPvm {
-    pub pvm: Pvm,
+    pub pvm: Interpreter,
     pub steps: Vec<PvmStep>,
     timestamp: u64,
 }
 
 impl TracingPvm {
-    pub fn new(pvm: Pvm) -> Self {
+    pub fn new(pvm: Interpreter) -> Self {
         Self {
             pvm,
             steps: Vec::new(),
@@ -67,7 +68,7 @@ impl TracingPvm {
 
         // Reconstruct memory accesses from opcode + args + register state
         let (mem_read, mem_write) = decode_mem_access(
-            opcode, &decoded_args, &regs_before, &regs_after, &self.pvm.memory,
+            opcode, &decoded_args, &regs_before, &regs_after,
         );
 
         self.steps.push(PvmStep {
@@ -155,7 +156,6 @@ fn decode_mem_access(
     decoded_args: &args::Args,
     regs_before: &[u64; PVM_REGISTER_COUNT],
     regs_after: &[u64; PVM_REGISTER_COUNT],
-    memory: &javm::Memory,
 ) -> (Option<MemAccess>, Option<MemAccess>) {
     match opcode {
         // Direct loads (A.5.6): addr = imm, result in ra
@@ -334,7 +334,6 @@ fn decode_mem_access(
         }
         _ => {}
     }
-    let _ = memory; // reserved for future use (reading prev values)
     (None, None)
 }
 

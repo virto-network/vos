@@ -1,7 +1,6 @@
 use javm::instruction::Opcode;
-use javm::vm::Pvm;
-use javm::memory::PageAccess;
-use javm::Memory;
+use javm::interpreter::Interpreter;
+// Memory is now flat_mem in Interpreter
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm_core::tracing::TracingPvm;
@@ -27,8 +26,7 @@ fn prove_store_only() {
     regs[0] = 42;
     regs[1] = 0x1000;
 
-    let mut memory = Memory::new();
-    memory.map_page(0x1000 / 4096, PageAccess::ReadWrite);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,
@@ -36,10 +34,10 @@ fn prove_store_only() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2);
     assert!(steps[0].mem_write.is_some());
@@ -56,8 +54,7 @@ fn prove_store_and_load_u8() {
     regs[0] = 42;    // value to store
     regs[1] = 0x1000; // base address
 
-    let mut memory = Memory::new();
-    memory.map_page(0x1000 / 4096, PageAccess::ReadWrite);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     // StoreIndU8 (opcode 120): TwoRegOneImm [opcode, ra|(rb<<4), imm...]
     //   ra=0 (value source), rb=1 (base addr), imm=0 (offset)
@@ -70,10 +67,10 @@ fn prove_store_and_load_u8() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 3); // Store, Load, Trap
@@ -103,8 +100,7 @@ fn prove_store_and_load_u64() {
     regs[0] = 0xDEAD_BEEF_CAFE_BABE;
     regs[1] = 0x2000;
 
-    let mut memory = Memory::new();
-    memory.map_page(0x2000 / 4096, PageAccess::ReadWrite);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::StoreIndU64 as u8, 0x10, 0, 0, 0, 0,
@@ -113,10 +109,10 @@ fn prove_store_and_load_u64() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
 
     let steps = tracing.into_trace();
     assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
@@ -132,8 +128,7 @@ fn prove_multiple_stores_same_addr() {
     regs[1] = 0x1000;  // address
     regs[3] = 20;      // second value
 
-    let mut memory = Memory::new();
-    memory.map_page(0x1000 / 4096, PageAccess::ReadWrite);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     // Store 10, store 20, load (should get 20)
     let code = vec![
@@ -144,7 +139,7 @@ fn prove_multiple_stores_same_addr() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     eprintln!("exit: {exit:?}");
@@ -153,7 +148,7 @@ fn prove_multiple_stores_same_addr() {
     for (i, s) in steps.iter().enumerate() {
         eprintln!("  step {i}: pc={} opcode={:?} regs[0..4]={:?}", s.pc, s.opcode, &s.regs_after[..4]);
     }
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
     assert_eq!(steps.len(), 4);
     assert_eq!(steps[2].regs_after[2], 20); // should read the second write
 
@@ -171,8 +166,7 @@ fn prove_store_load_with_alu() {
     regs[1] = 50;
     regs[4] = 0x1000; // address register
 
-    let mut memory = Memory::new();
-    memory.map_page(0x1000 / 4096, PageAccess::ReadWrite);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::Add64 as u8, 0x10, 2,                   // φ[2] = φ[0]+φ[1] = 150
@@ -182,10 +176,10 @@ fn prove_store_load_with_alu() {
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Pvm::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic);
+    assert_eq!(exit, javm::ExitReason::Trap);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 4);

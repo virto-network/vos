@@ -1,6 +1,6 @@
 use javm::instruction::Opcode;
-use javm::vm::Pvm;
-use javm::Memory;
+use javm::interpreter::Interpreter;
+// Memory is now flat_mem in Interpreter
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm_core::tracing::TracingPvm;
@@ -21,18 +21,19 @@ fn prove_verify_add64() {
     registers[0] = 100;
     registers[1] = 200;
 
-    let pvm = Pvm::new(
+    let pvm = Interpreter::new(
         code.clone(),
         bitmask.clone(),
         vec![],
         registers,
-        Memory::new(),
+        vec![0u8; 4 * 1024 * 1024],
         1000u64,
+        25,
     );
 
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, javm::vm::ExitReason::Panic); // Trap = Panic
+    assert_eq!(exit, javm::ExitReason::Trap); // Trap = Panic
 
     let steps = tracing.into_trace();
     eprintln!("Steps: {}", steps.len());

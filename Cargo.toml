@@ -31,7 +31,7 @@ zkpvm-core = { path = "crates/zkpvm-core" }
 zkpvm-trace = { path = "crates/zkpvm-trace" }
 zkpvm-machine = { path = "crates/zkpvm-machine" }
 zkpvm-verifier = { path = "crates/zkpvm-verifier" }
-javm = { path = "/home/daniel/src/gh/grey/crates/javm" }
+javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
 # Stwo (pinned to same rev as Nexus zkVM)
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "0790eba", features = [

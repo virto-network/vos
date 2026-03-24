@@ -1,6 +1,7 @@
 mod chips;
 mod framework;
 mod lookups;
+pub mod framework_access;
 pub mod side_note;
 
 mod prove;

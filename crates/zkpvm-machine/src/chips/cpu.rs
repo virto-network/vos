@@ -307,7 +307,7 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // JumpInd/LoadImmJumpInd: dynamic jumps (prover-trusted target for now)
         Opcode::JumpInd | Opcode::LoadImmJumpInd => {}
         // Ecalli: host call (execution exits, no ALU constraint)
-        Opcode::Ecalli => {}
+        Opcode::Ecalli | Opcode::Ecall => {}
         // Trap: causes panic exit
         Opcode::Trap => {}
     }

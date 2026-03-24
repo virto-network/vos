@@ -26,6 +26,7 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
         stark_proof: proof,
         claimed_sums,
         log_sizes: claimed_log_sizes,
+        ..
     } = proof;
 
     if claimed_sums.len() != components.len() {

@@ -31,8 +31,8 @@ vos-macros = { path = "../vos-macros", optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 
 # std-only: PVM runtime and vosx binary dependencies
-javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }
-grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler", optional = true }
+javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168", optional = true }
+grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 blake2b_simd = { version = "1", optional = true }

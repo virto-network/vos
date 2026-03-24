@@ -17,5 +17,8 @@ zkpvm-trace = { workspace = true }
 zkpvm-air-column = { workspace = true }
 javm = { workspace = true }
 
+[dev-dependencies]
+grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }
