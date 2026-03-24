@@ -79,6 +79,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pvm-abi"
+version = "0.1.0"
+
+[[package]]
 name = "pvm-actors"
 version = "0.1.0"
 dependencies = [
@@ -92,6 +96,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "pvm-executor"
+version = "0.1.0"
+dependencies = [
+ "pvm-abi",
+ "pvm-actors",
 ]
 
 [[package]]
