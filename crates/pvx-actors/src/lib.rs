@@ -26,6 +26,7 @@ mod actor;
 mod context;
 mod executor;
 mod mailbox;
+pub mod metadata;
 mod run;
 
 pub use actor::{Actor, Message};

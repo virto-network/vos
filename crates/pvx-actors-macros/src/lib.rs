@@ -90,6 +90,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let enum_name = format_ident!("{}Msg", actor_name);
     let archived_enum_name = format_ident!("Archived{}Msg", actor_name);
+    let actor_name_str = actor_name.to_string();
 
     let mut msg_structs = Vec::new();
     let mut msg_impls = Vec::new();
@@ -97,6 +98,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut deliver_arms = Vec::new();
     let mut dispatch_arms = Vec::new();
     let mut is_query_arms = Vec::new();
+    let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
 
     for item in &input.items {
@@ -220,6 +222,30 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         is_query_arms.push(quote! {
             #enum_name::#struct_name(_) => #query_val
         });
+
+        // Metadata for this message
+        let msg_name_str = method_name.to_string();
+        let field_metas: Vec<_> = field_names
+            .iter()
+            .zip(field_types.iter())
+            .map(|(name, ty)| {
+                let name_str = name.to_string();
+                let ty_str = quote!(#ty).to_string();
+                quote! {
+                    pvx_actors::metadata::FieldMeta {
+                        name: #name_str,
+                        ty: #ty_str,
+                    }
+                }
+            })
+            .collect();
+        meta_messages.push(quote! {
+            pvx_actors::metadata::MessageMeta {
+                name: #msg_name_str,
+                is_query: #query_val,
+                fields: &[ #( #field_metas ),* ],
+            }
+        });
     }
 
     // Generate the aggregated enum
@@ -264,6 +290,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     #( #is_query_arms ),*
                 }
             }
+
+            /// Static metadata describing this actor's message interface.
+            pub const META: pvx_actors::metadata::ActorMeta = pvx_actors::metadata::ActorMeta {
+                actor_name: #actor_name_str,
+                messages: &[ #( #meta_messages ),* ],
+            };
         }
     };
 

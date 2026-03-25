@@ -198,10 +198,41 @@ impl Default for PvmDriver {
 }
 
 /// The message type for PVM actors: raw encoded bytes.
-/// Uses the pvx-abi message format (Header + payload).
+///
+/// Format: `Header(sender, payload_len) ++ rkyv_payload`.
+/// The rkyv payload contains the serialized message enum variant
+/// (discriminant + fields). The Header carries the sender and length.
 #[derive(Debug)]
 pub struct RawMsg {
     pub data: Vec<u8>,
+}
+
+impl RawMsg {
+    /// Build a RawMsg from a sender and rkyv-serialized payload bytes.
+    pub fn new(sender: ActorId, payload: &[u8]) -> Self {
+        let header = pvx_abi::msg::Header {
+            sender,
+            payload_len: payload.len() as u32,
+        };
+        let mut data = Vec::with_capacity(pvx_abi::msg::Header::SIZE + payload.len());
+        data.extend_from_slice(&header.to_bytes());
+        data.extend_from_slice(payload);
+        Self { data }
+    }
+
+    /// Parse the header from the raw data.
+    pub fn header(&self) -> Option<pvx_abi::msg::Header> {
+        pvx_abi::msg::Header::from_bytes(&self.data)
+    }
+
+    /// Get the rkyv payload bytes (after the header).
+    pub fn payload(&self) -> &[u8] {
+        if self.data.len() > pvx_abi::msg::Header::SIZE {
+            &self.data[pvx_abi::msg::Header::SIZE..]
+        } else {
+            &[]
+        }
+    }
 }
 
 impl Driver<RawMsg> for PvmDriver {
