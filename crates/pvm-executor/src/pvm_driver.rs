@@ -10,6 +10,7 @@ use javm::program::initialize_program;
 use javm::{ExitReason, Gas, Pvm};
 use pvm_abi::actor::{ActorId, Status};
 use pvm_abi::syscall::Syscall;
+use std::io::Write;
 
 /// Maximum number of PVM instances the driver can hold.
 const MAX_INSTANCES: usize = 64;
@@ -128,6 +129,49 @@ impl PvmDriver {
                             continue;
                         }
                     };
+
+                    // Intercept FdWrite on stdout/stderr to print to host
+                    if syscall == Syscall::FdWrite {
+                        let fd = args.a0;
+                        let buf_ptr = args.a1 as u32;
+                        let buf_len = args.a2 as usize;
+                        if fd == 1 || fd == 2 {
+                            let mut buf = vec![0u8; buf_len];
+                            for (i, byte) in buf.iter_mut().enumerate() {
+                                *byte = actor.pvm.read_u8(buf_ptr + i as u32).unwrap_or(0);
+                            }
+                            if fd == 1 {
+                                let _ = std::io::stdout().write_all(&buf);
+                                let _ = std::io::stdout().flush();
+                            } else {
+                                let _ = std::io::stderr().write_all(&buf);
+                            }
+                            actor.pvm.registers[7] = buf_len as u64;
+                            continue;
+                        }
+                    }
+
+                    // Intercept Yield — suspend this actor so others can run
+                    if syscall == Syscall::Yield {
+                        actor.pvm.registers[7] = 0;
+                        actor.suspended = true;
+                        return Status::Pending;
+                    }
+
+                    // Intercept Log syscall to print to host stderr
+                    if syscall == Syscall::Log {
+                        let msg_ptr = args.a1 as u32;
+                        let msg_len = args.a2 as usize;
+                        let mut buf = vec![0u8; msg_len];
+                        for (i, byte) in buf.iter_mut().enumerate() {
+                            *byte = actor.pvm.read_u8(msg_ptr + i as u32).unwrap_or(0);
+                        }
+                        if let Ok(s) = std::str::from_utf8(&buf) {
+                            eprintln!("[actor {}] {s}", id.0);
+                        }
+                        actor.pvm.registers[7] = 0;
+                        continue;
+                    }
 
                     match self.syscalls.dispatch(id, syscall, &args) {
                         SyscallResult::Value(v) => {

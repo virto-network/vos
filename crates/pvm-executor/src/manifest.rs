@@ -47,10 +47,17 @@ fn default_gas() -> u64 {
 pub struct ActorDef {
     /// Human-readable name for this actor.
     pub name: String,
-    /// Path to the RISC-V ELF binary (resolved relative to the manifest).
+    /// Path to the binary (resolved relative to the manifest).
     pub path: Option<PathBuf>,
     /// Future: registry source (e.g. "kunekt-registry:counter@1.0").
     pub source: Option<String>,
+    /// Binary format: "elf" (default) or "pvm" (pre-built blob).
+    #[serde(default = "default_format")]
+    pub format: String,
+}
+
+fn default_format() -> String {
+    "elf".to_string()
 }
 
 impl Manifest {

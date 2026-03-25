@@ -3,6 +3,9 @@ resolver = "3"
 members = [
     "crates/*",
 ]
+exclude = [
+    "examples/actors",
+]
 
 [workspace.package]
 version = "0.1.0"

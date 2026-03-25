@@ -1,0 +1,25 @@
+[package]
+name = "example-actors"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pvm-scape = { path = "../../crates/pvm-scape" }
+pvm-actors = { path = "../../crates/pvm-actors", features = ["pvm-actors-macros"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+[[bin]]
+name = "greeter"
+path = "src/bin/greeter.rs"
+
+[[bin]]
+name = "counter"
+path = "src/bin/counter.rs"
+
+[[bin]]
+name = "fizzbuzz"
+path = "src/bin/fizzbuzz.rs"

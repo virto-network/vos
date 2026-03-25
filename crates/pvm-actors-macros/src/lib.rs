@@ -210,6 +210,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         deliver_arms.push(quote! {
             #enum_name::#struct_name(msg) => {
                 let _ = <#actor_name as pvm_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                pvm_actors::Yield::once().await;
             }
         });
     }

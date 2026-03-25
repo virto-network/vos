@@ -22,11 +22,13 @@ mod actor;
 mod context;
 mod executor;
 mod mailbox;
+mod run;
 
 pub use actor::{Actor, Message};
 pub use context::{ActorId, Context};
 pub use executor::{Executor, Progress};
 pub use mailbox::Mailbox;
+pub use run::{Yield, block_on};
 
 #[cfg(feature = "pvm-actors-macros")]
 pub use pvm_actors_macros::{Actor, messages};

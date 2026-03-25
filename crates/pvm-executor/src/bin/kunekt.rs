@@ -4,12 +4,6 @@
 //!     kunekt [path/to/Kunekt.toml]
 //!
 //! If no path is given, looks for `Kunekt.toml` in the current directory.
-//!
-//! The binary:
-//! 1. Reads the manifest to discover actor ELF paths
-//! 2. Transpiles each RISC-V ELF to a PVM blob using grey-transpiler
-//! 3. Loads all actors into the PVM executor
-//! 4. Runs the cooperative scheduler until all actors complete
 
 use pvm_executor::manifest::Manifest;
 use pvm_executor::pvm_driver::{PvmDriver, RawMsg};
@@ -46,9 +40,8 @@ fn main() {
     let mut driver = PvmDriver::new();
     let mut blob_indices = Vec::new();
 
-    // Transpile and register each actor
     for actor_def in &manifest.actors {
-        let elf_path = match &actor_def.path {
+        let file_path = match &actor_def.path {
             Some(p) => manifest_dir.join(p),
             None => {
                 eprintln!(
@@ -59,21 +52,28 @@ fn main() {
             }
         };
 
-        eprintln!("  transpiling '{}' from {}", actor_def.name, elf_path.display());
-
-        let elf_data = match std::fs::read(&elf_path) {
+        let file_data = match std::fs::read(&file_path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("error: reading {}: {e}", elf_path.display());
+                eprintln!("error: reading {}: {e}", file_path.display());
                 process::exit(1);
             }
         };
 
-        let pvm_blob = match grey_transpiler::link_elf(&elf_data) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("error: transpiling '{}': {e:?}", actor_def.name);
-                process::exit(1);
+        let pvm_blob = match actor_def.format.as_str() {
+            "pvm" => {
+                eprintln!("  loading '{}' from {}", actor_def.name, file_path.display());
+                file_data
+            }
+            "elf" | _ => {
+                eprintln!("  transpiling '{}' from {}", actor_def.name, file_path.display());
+                match grey_transpiler::link_elf(&file_data) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: transpiling '{}': {e:?}", actor_def.name);
+                        process::exit(1);
+                    }
+                }
             }
         };
 
@@ -81,7 +81,6 @@ fn main() {
         blob_indices.push((actor_def.name.clone(), blob_idx));
     }
 
-    // Create the scheduler and spawn actors
     let mut sched: Scheduler<RawMsg, PvmDriver, 64, 16> = Scheduler::new(driver);
 
     for (name, blob_idx) in &blob_indices {
@@ -99,13 +98,10 @@ fn main() {
 
     eprintln!("kunekt: running...\n");
 
-    // Run the cooperative scheduler
     loop {
         match sched.tick() {
             TickResult::Progress => {}
             TickResult::Idle => {
-                // All actors idle — in a real system we'd wait for
-                // external events. For now, just exit.
                 eprintln!("\nkunekt: all actors idle, exiting");
                 break;
             }
