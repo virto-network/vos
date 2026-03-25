@@ -3,4 +3,5 @@ target = "riscv64em-javm.json"
 rustflags = ["-Zunstable-options"]
 
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

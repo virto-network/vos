@@ -30,6 +30,9 @@
 
 #![no_std]
 
+#[cfg(feature = "alloc")]
+mod bump_alloc;
+
 pub mod io;
 pub mod mem;
 pub mod syscall;

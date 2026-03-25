@@ -5,6 +5,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use example_actors::{print, println};
 use pvx_actors::{Actor, block_on, messages};
 
@@ -14,11 +17,19 @@ struct Greeter;
 #[messages]
 impl Greeter {
     #[msg]
-    async fn greet(&self, name: &'static [u8], _ctx: &mut Context<Self>) {
+    async fn greet(&self, name: Vec<u8>, _ctx: &mut Context<Self>) {
         print(b"Hello, ");
-        print(name);
+        print(&name);
         println(b"!");
     }
+}
+
+fn to_vec(s: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(s.len());
+    for &b in s {
+        v.push(b);
+    }
+    v
 }
 
 #[unsafe(no_mangle)]
@@ -29,9 +40,7 @@ pub extern "C" fn _start() {
     ));
 
     block_on(async {
-        GreeterMsg::Greet(Greet { name: b"Kunekt" })
-            .deliver(&mut greeter, &mut ctx).await;
-        GreeterMsg::Greet(Greet { name: b"World" })
+        GreeterMsg::Greet(Greet { name: to_vec(b"Kunekt") })
             .deliver(&mut greeter, &mut ctx).await;
     });
 }

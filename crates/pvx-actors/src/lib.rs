@@ -18,6 +18,10 @@
 // Single-threaded PVM execution — no Send bounds needed on async trait futures.
 #![allow(async_fn_in_trait)]
 
+extern crate alloc;
+
+pub use rkyv;
+
 mod actor;
 mod context;
 mod executor;

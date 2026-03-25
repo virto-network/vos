@@ -68,47 +68,16 @@ pub fn derive_actor(input: TokenStream) -> TokenStream {
 /// Attribute macro for impl blocks that generates message types and handlers.
 ///
 /// Each method marked with `#[msg]` becomes:
-/// 1. A public struct with the method's parameters as fields
+/// 1. A public struct with the method's parameters as fields (with rkyv derives)
 /// 2. A `Message<ThatStruct>` impl that delegates to the method body
 ///
-/// An aggregated enum `{Actor}Msg` is generated containing all message variants.
+/// An aggregated enum `{Actor}Msg` is generated containing all message variants
+/// with rkyv derives and helper methods:
+/// - `to_bytes(&self) -> AlignedVec` — serialize via rkyv
+/// - `dispatch(bytes: &[u8], actor, ctx)` — zero-copy deserialize + deliver
+/// - `is_query(&self) -> bool` — true for `&self` methods, false for `&mut self`
+///
 /// A `Mailbox`-compatible `deliver` method is generated for the enum.
-///
-/// # Example
-///
-/// ```ignore
-/// #[messages]
-/// impl Counter {
-///     #[msg]
-///     async fn increment(&mut self, amount: i32) -> i32 {
-///         self.count += amount;
-///         self.count
-///     }
-///
-///     #[msg]
-///     async fn reset(&mut self) {
-///         self.count = 0;
-///     }
-/// }
-/// ```
-///
-/// Generates:
-/// ```ignore
-/// pub struct Increment { pub amount: i32 }
-/// pub struct Reset;
-///
-/// pub enum CounterMsg {
-///     Increment(Increment),
-///     Reset(Reset),
-/// }
-///
-/// impl Message<Increment> for Counter { ... }
-/// impl Message<Reset> for Counter { ... }
-///
-/// impl CounterMsg {
-///     pub async fn deliver(self, actor: &mut Counter, ctx: &mut Context<Counter>) { ... }
-/// }
-/// ```
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -120,11 +89,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         _ => panic!("#[messages] requires a simple type path"),
     };
     let enum_name = format_ident!("{}Msg", actor_name);
+    let archived_enum_name = format_ident!("Archived{}Msg", actor_name);
 
     let mut msg_structs = Vec::new();
     let mut msg_impls = Vec::new();
     let mut enum_variants = Vec::new();
     let mut deliver_arms = Vec::new();
+    let mut dispatch_arms = Vec::new();
+    let mut is_query_arms = Vec::new();
     let mut passthrough_items = Vec::new();
 
     for item in &input.items {
@@ -146,7 +118,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             to_pascal_case(&method_name.to_string())
         );
 
-        // Collect parameters (skip &mut self)
+        // Detect &self vs &mut self
+        let is_query = match method.sig.inputs.first() {
+            Some(FnArg::Receiver(r)) => r.mutability.is_none(),
+            _ => false,
+        };
+
+        // Collect parameters (skip self)
         let mut field_names = Vec::new();
         let mut field_types = Vec::new();
         for arg in method.sig.inputs.iter().skip(1) {
@@ -168,11 +146,25 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ReturnType::Type(_, ty) => quote! { #ty },
         };
 
-        // Generate the message struct
+        // Generate the message struct with rkyv derives
         let msg_struct = if field_names.is_empty() {
-            quote! { pub struct #struct_name; }
+            quote! {
+                #[derive(
+                    pvx_actors::rkyv::Archive,
+                    pvx_actors::rkyv::Serialize,
+                    pvx_actors::rkyv::Deserialize,
+                )]
+                #[rkyv(crate = pvx_actors::rkyv)]
+                pub struct #struct_name;
+            }
         } else {
             quote! {
+                #[derive(
+                    pvx_actors::rkyv::Archive,
+                    pvx_actors::rkyv::Serialize,
+                    pvx_actors::rkyv::Deserialize,
+                )]
+                #[rkyv(crate = pvx_actors::rkyv)]
                 pub struct #struct_name {
                     #( pub #field_names: #field_types ),*
                 }
@@ -213,10 +205,31 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 pvx_actors::Yield::once().await;
             }
         });
+
+        // Dispatch arm (deserialize from archived)
+        dispatch_arms.push(quote! {
+            #archived_enum_name::#struct_name(archived) => {
+                let msg: #struct_name = pvx_actors::rkyv::deserialize::<#struct_name, pvx_actors::rkyv::rancor::Error>(archived).unwrap();
+                let _ = <#actor_name as pvx_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                pvx_actors::Yield::once().await;
+            }
+        });
+
+        // is_query arm
+        let query_val = is_query;
+        is_query_arms.push(quote! {
+            #enum_name::#struct_name(_) => #query_val
+        });
     }
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
+        #[derive(
+            pvx_actors::rkyv::Archive,
+            pvx_actors::rkyv::Serialize,
+            pvx_actors::rkyv::Deserialize,
+        )]
+        #[rkyv(crate = pvx_actors::rkyv)]
         pub enum #enum_name {
             #( #enum_variants ),*
         }
@@ -226,6 +239,29 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut pvx_actors::Context<#actor_name>) {
                 match self {
                     #( #deliver_arms )*
+                }
+            }
+
+            /// Serialize this message to bytes.
+            pub fn to_bytes(&self) -> pvx_actors::rkyv::util::AlignedVec {
+                pvx_actors::rkyv::to_bytes::<pvx_actors::rkyv::rancor::Error>(self).unwrap()
+            }
+
+            /// Deserialize from bytes and dispatch to the actor's handler.
+            ///
+            /// # Safety
+            /// The caller must ensure `bytes` were produced by `to_bytes` on a valid `#enum_name`.
+            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut pvx_actors::Context<#actor_name>) {
+                let archived = unsafe { pvx_actors::rkyv::access_unchecked::<#archived_enum_name>(bytes) };
+                match archived {
+                    #( #dispatch_arms )*
+                }
+            }
+
+            /// Returns `true` if this message is a query (`&self` handler).
+            pub fn is_query(&self) -> bool {
+                match self {
+                    #( #is_query_arms ),*
                 }
             }
         }

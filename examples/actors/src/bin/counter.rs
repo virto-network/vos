@@ -6,6 +6,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use example_actors::{print, println, print_digit};
 use pvx_actors::{Actor, block_on, messages};
 

@@ -11,5 +11,6 @@ pvx-actors-macros = ["dep:pvx-actors-macros"]
 
 [dependencies]
 pvx-actors-macros = { path = "../pvx-actors-macros", optional = true }
+rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

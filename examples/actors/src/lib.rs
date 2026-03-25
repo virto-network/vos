@@ -2,6 +2,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 #[panic_handler]
