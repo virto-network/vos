@@ -18,6 +18,14 @@ const MAX_INSTANCES: usize = 64;
 /// Default gas budget per actor per tick.
 const DEFAULT_GAS: Gas = 1_000_000;
 
+/// A pending message send from one actor to another.
+#[derive(Debug)]
+pub struct PendingSend {
+    pub from: ActorId,
+    pub to: ActorId,
+    pub msg: RawMsg,
+}
+
 /// A child actor backed by a javm PVM instance.
 struct PvmActor {
     pvm: Pvm,
@@ -33,6 +41,8 @@ pub struct PvmDriver {
     actors: [Option<PvmActor>; MAX_INSTANCES],
     blobs: Vec<Vec<u8>>,
     pub syscalls: SyscallHandler,
+    /// Messages sent by actors during execution, to be routed by the scheduler.
+    pub pending_sends: Vec<PendingSend>,
 }
 
 impl PvmDriver {
@@ -42,6 +52,7 @@ impl PvmDriver {
             actors: [NONE; MAX_INSTANCES],
             blobs: Vec::new(),
             syscalls: SyscallHandler::new(),
+            pending_sends: Vec::new(),
         }
     }
 
@@ -177,11 +188,34 @@ impl PvmDriver {
                         SyscallResult::Value(v) => {
                             actor.pvm.registers[7] = v as u64; // return in a0
                         }
-                        SyscallResult::Send { .. } | SyscallResult::Recv { .. } => {
-                            // Send/Recv need registry access — handled at
-                            // scheduler level. For now return EAGAIN.
-                            actor.pvm.registers[7] =
-                                pvx_abi::syscall::errno::EAGAIN as u64;
+                        SyscallResult::Send {
+                            target,
+                            msg_ptr,
+                            msg_len,
+                        } => {
+                            // Read payload from guest memory
+                            let len = msg_len as usize;
+                            let mut payload = vec![0u8; len];
+                            for (i, byte) in payload.iter_mut().enumerate() {
+                                *byte = actor
+                                    .pvm
+                                    .read_u8(msg_ptr as u32 + i as u32)
+                                    .unwrap_or(0);
+                            }
+                            self.pending_sends.push(PendingSend {
+                                from: id,
+                                to: target,
+                                msg: RawMsg::new(id, &payload),
+                            });
+                            actor.pvm.registers[7] = 0; // success
+                        }
+                        SyscallResult::Recv { buf_ptr, buf_len } => {
+                            // Recv is handled by writing the message data
+                            // before calling run_actor (via handle()).
+                            // If the actor calls recv() during execution,
+                            // there's no message yet — return 0 (no message).
+                            let _ = (buf_ptr, buf_len);
+                            actor.pvm.registers[7] = 0;
                         }
                     }
                     // Continue execution after handling the host-call
@@ -273,6 +307,12 @@ impl Driver<RawMsg> for PvmDriver {
     fn drop_actor(&mut self, id: ActorId) {
         let idx = (id.0 - 1) as usize;
         self.actors[idx] = None;
+    }
+
+    fn drain_sends(&mut self, mut route: impl FnMut(ActorId, RawMsg)) {
+        for send in self.pending_sends.drain(..) {
+            route(send.to, send.msg);
+        }
     }
 }
 

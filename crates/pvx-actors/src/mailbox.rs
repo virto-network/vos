@@ -55,6 +55,14 @@ impl<T, const N: usize> Mailbox<T, N> {
         self.len == 0
     }
 
+    /// Peek at the next message without removing it.
+    pub fn peek(&self) -> Option<&T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.buf[self.head].as_ref()
+    }
+
     /// Whether the mailbox is full.
     pub fn is_full(&self) -> bool {
         self.len == N

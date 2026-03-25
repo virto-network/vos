@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+pvx-abi = { path = "../../crates/pvx-abi" }
 pvx-scape = { path = "../../crates/pvx-scape" }
 pvx-actors = { path = "../../crates/pvx-actors", features = ["pvx-actors-macros"] }
 

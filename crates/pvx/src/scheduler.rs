@@ -52,6 +52,11 @@ pub trait Driver<Msg> {
 
     /// Clean up a stopped actor.
     fn drop_actor(&mut self, id: ActorId);
+
+    /// Drain messages that actors sent during the last execution step.
+    /// Called with a routing callback for each pending send.
+    /// Default: no pending sends.
+    fn drain_sends(&mut self, _route: impl FnMut(ActorId, Msg)) {}
 }
 
 impl<Msg, D: Driver<Msg>, const N: usize, const MC: usize> Scheduler<Msg, D, N, MC> {
@@ -102,6 +107,15 @@ impl<Msg, D: Driver<Msg>, const N: usize, const MC: usize> Scheduler<Msg, D, N, 
             }
 
             status
+        });
+
+        // Route any messages sent by actors during this tick
+        // (driver and registry are separate fields, so split borrows work)
+        let driver = &mut self.driver;
+        let registry = &mut self.registry;
+        driver.drain_sends(|target, msg| {
+            let _ = registry.send(target, msg);
+            progress = true;
         });
 
         if progress {

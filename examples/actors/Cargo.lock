@@ -6,6 +6,7 @@ version = 4
 name = "example-actors"
 version = "0.1.0"
 dependencies = [
+ "pvx-abi",
  "pvx-actors",
  "pvx-scape",
 ]

@@ -235,3 +235,56 @@ fn scheduler_actor_with_self_id() {
     assert_eq!(sched.tick(), TickResult::Progress);
     assert_eq!(sched.tick(), TickResult::Done);
 }
+
+/// Program that sends a 4-byte message to actor ID 2 via Send syscall, then halts.
+fn program_send_to(target: u32) -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+    // Write payload "PING" at address 0
+    asm.load_imm(Reg::T0, 0x50); // 'P'
+    asm.store_u8(Reg::T0, 0);
+    asm.load_imm(Reg::T0, 0x49); // 'I'
+    asm.store_u8(Reg::T0, 1);
+    asm.load_imm(Reg::T0, 0x4E); // 'N'
+    asm.store_u8(Reg::T0, 2);
+    asm.load_imm(Reg::T0, 0x47); // 'G'
+    asm.store_u8(Reg::T0, 3);
+    // Send: a0=target, a1=buf_ptr, a2=buf_len
+    asm.load_imm(Reg::A0, target as i32);
+    asm.load_imm(Reg::A1, 0); // buf at 0
+    asm.load_imm(Reg::A2, 4); // 4 bytes
+    asm.ecalli(Syscall::Send as u32);
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+#[test]
+fn scheduler_send_routes_to_mailbox() {
+    let sender_blob = program_send_to(2);
+    let receiver_blob = program_yield_then_halt();
+    let mut driver = PvmDriver::new();
+    let sender_idx = driver.register_blob(sender_blob);
+    let receiver_idx = driver.register_blob(receiver_blob);
+
+    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
+
+    let sender_id = sched.spawn().unwrap(); // ActorId(1)
+    sched.driver_mut().spawn_blob(sender_id, sender_idx);
+    let receiver_id = sched.spawn().unwrap(); // ActorId(2)
+    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
+
+    // First tick: sender runs Send syscall → queues PendingSend → halts.
+    // Receiver runs yield → suspends.
+    // drain_sends routes the message to receiver's mailbox.
+    assert_eq!(sched.tick(), TickResult::Progress);
+
+    // Verify the message arrived in the receiver's mailbox
+    let entry = sched.registry.get(receiver_id).unwrap();
+    assert!(!entry.mailbox.is_empty(), "receiver should have a pending message");
+
+    // The message payload should be "PING" wrapped in a Header
+    let msg = entry.mailbox.peek().unwrap();
+    let header = msg.header().unwrap();
+    assert_eq!(header.sender, sender_id);
+    assert_eq!(msg.payload(), b"PING");
+}
