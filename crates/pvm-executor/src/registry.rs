@@ -35,6 +35,14 @@ pub struct ActorRegistry<Msg, const N: usize, const MAILBOX_CAP: usize> {
     count: u32,
 }
 
+impl<Msg, const N: usize, const MAILBOX_CAP: usize> Default
+    for ActorRegistry<Msg, N, MAILBOX_CAP>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Msg, const N: usize, const MAILBOX_CAP: usize> ActorRegistry<Msg, N, MAILBOX_CAP> {
     const NONE: Option<ActorEntry<Msg, MAILBOX_CAP>> = None;
 

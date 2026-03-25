@@ -40,6 +40,12 @@ pub(crate) struct Slot<S> {
     pub(crate) alive: bool,
 }
 
+impl<S, const N: usize> Default for Executor<S, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<S, const N: usize> Executor<S, N> {
     const NONE: Option<Slot<S>> = None;
 

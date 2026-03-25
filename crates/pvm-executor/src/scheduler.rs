@@ -84,16 +84,17 @@ impl<Msg, D: Driver<Msg>, const N: usize, const MC: usize> Scheduler<Msg, D, N, 
         }
 
         let mut progress = false;
+        let driver = &mut self.driver;
 
         self.registry.tick(|id, state, msg| {
             let status = match (state, msg) {
-                (ActorState::Suspended, _) => self.driver.poll(id),
-                (ActorState::Running, Some(msg)) => self.driver.handle(id, msg),
+                (ActorState::Suspended, _) => driver.poll(id),
+                (ActorState::Running, Some(msg)) => driver.handle(id, msg),
                 _ => Status::Ready,
             };
 
             if status == Status::Done || status == Status::Error {
-                self.driver.drop_actor(id);
+                driver.drop_actor(id);
             }
 
             if status != Status::Ready || msg.is_some() {

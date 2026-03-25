@@ -4,10 +4,16 @@
 //! The format is a simple fixed header + payload — no allocator needed
 //! to decode.
 //!
+//! **Byte order**: All multi-byte fields use **little-endian** encoding.
+//! This matches the PVM target (RISC-V little-endian) and avoids byte
+//! swapping on the most common host architectures (x86, ARM in LE mode).
+//! If a big-endian host is ever needed, the encoding functions handle
+//! the conversion — callers always work with native types.
+//!
 //! ```text
 //! ┌──────────┬──────────┬──────────┬─────────────────┐
 //! │ sender   │ msg_type │ payload  │ payload bytes... │
-//! │ (4 bytes)│ (4 bytes)│ len (4b) │ (variable)      │
+//! │ (4 LE)   │ (4 LE)   │ len(4 LE)│ (variable)      │
 //! └──────────┴──────────┴──────────┴─────────────────┘
 //! ```
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use pvm_abi::actor::{ActorId, Status};
 use pvm_executor::scheduler::{Driver, Scheduler, TickResult};
 

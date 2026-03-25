@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use pvm_actors::{Actor, ActorId, Context, Executor, Mailbox, Progress};
 
 // -- Actor definition --

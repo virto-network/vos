@@ -36,7 +36,7 @@ impl<A: Actor> Context<A> {
     }
 
     /// Check if a stop has been requested.
-    pub(crate) fn stop_requested(&self) -> bool {
+    pub fn stop_requested(&self) -> bool {
         self.stop_requested
     }
 }

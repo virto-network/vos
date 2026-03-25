@@ -39,3 +39,5 @@ pub mod registry;
 pub mod scheduler;
 pub mod syscall_handler;
 pub mod vfs;
+
+pub use syscall_handler::MemoryAccess;

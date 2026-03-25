@@ -1,5 +1,4 @@
 use crate::Context;
-use crate::reply::Reply;
 
 /// The core actor trait. An actor is an independent unit of computation
 /// that processes messages sequentially with exclusive access to its state.
@@ -52,7 +51,7 @@ pub trait Actor: Sized {
 /// ```
 pub trait Message<M>: Actor {
     /// The response type sent back to the caller.
-    type Reply: Reply;
+    type Reply;
 
     /// Process the message with exclusive mutable access to actor state.
     /// Async — `.await` yields to the host for cooperative scheduling.

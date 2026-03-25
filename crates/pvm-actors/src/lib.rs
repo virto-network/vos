@@ -20,17 +20,13 @@
 
 mod actor;
 mod context;
-mod envelope;
 mod executor;
 mod mailbox;
-mod reply;
 
 pub use actor::{Actor, Message};
 pub use context::{ActorId, Context};
-pub use envelope::Envelope;
 pub use executor::{Executor, Progress};
 pub use mailbox::Mailbox;
-pub use reply::{Reply, ReplySender};
 
 #[cfg(feature = "pvm-actors-macros")]
 pub use pvm_actors_macros::{Actor, messages};

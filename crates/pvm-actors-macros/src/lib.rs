@@ -150,14 +150,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let mut field_names = Vec::new();
         let mut field_types = Vec::new();
         for arg in method.sig.inputs.iter().skip(1) {
-            // skip also if it's a Context parameter
+            // skip Context parameters (&Context<..> or &mut Context<..>)
             if let FnArg::Typed(pat_type) = arg {
-                if let syn::Type::Reference(r) = pat_type.ty.as_ref() {
-                    if let syn::Type::Path(p) = r.elem.as_ref() {
-                        if p.path.segments.last().is_some_and(|s| s.ident == "Context") {
-                            continue;
-                        }
-                    }
+                if is_context_type(pat_type.ty.as_ref()) {
+                    continue;
                 }
                 if let Pat::Ident(pat) = pat_type.pat.as_ref() {
                     field_names.push(pat.ident.clone());
@@ -253,6 +249,21 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Check if a type is a reference to `Context` (either `&Context<..>` or `&mut Context<..>`).
+fn is_context_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Reference(r) = ty {
+        return match r.elem.as_ref() {
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "Context"),
+            _ => false,
+        };
+    }
+    false
 }
 
 fn to_pascal_case(s: &str) -> String {
