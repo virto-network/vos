@@ -1,9 +1,0 @@
-[package]
-name = "pvm-scape"
-description = "libc-compatible shim for PVM child actors — routes std I/O through the executor's syscall ABI"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-pvm-abi = { path = "../pvm-abi" }

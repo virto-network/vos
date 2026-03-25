@@ -7,7 +7,7 @@
 #![no_main]
 
 use example_actors::println;
-use pvm_actors::{Actor, block_on, messages};
+use pvx_actors::{Actor, block_on, messages};
 
 static OUTPUTS: [&[u8]; 15] = [
     b"1", b"2", b"fizz", b"4", b"buzz",
@@ -34,8 +34,8 @@ impl FizzBuzz {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     let mut fb = FizzBuzz { position: 0 };
-    let mut ctx = pvm_actors::Context::new(pvm_actors::ActorId(
-        pvm_scape::io::self_id() as u16,
+    let mut ctx = pvx_actors::Context::new(pvx_actors::ActorId(
+        pvx_scape::io::self_id() as u16,
     ));
 
     block_on(async {

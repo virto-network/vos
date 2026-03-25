@@ -12,7 +12,7 @@ fn panic(_info: &PanicInfo) -> ! {
 /// Write a byte slice to stdout.
 #[inline(never)]
 pub fn print(s: &[u8]) {
-    pvm_scape::io::pvm_write(1, s.as_ptr(), s.len());
+    pvx_scape::io::pvm_write(1, s.as_ptr(), s.len());
 }
 
 /// Write a byte slice to stdout followed by a newline.
@@ -26,5 +26,5 @@ pub fn println(s: &[u8]) {
 #[inline(never)]
 pub fn print_digit(n: u8) {
     let c = b'0' + n;
-    pvm_scape::io::pvm_write(1, &c as *const u8, 1);
+    pvx_scape::io::pvm_write(1, &c as *const u8, 1);
 }

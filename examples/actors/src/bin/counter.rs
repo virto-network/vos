@@ -7,7 +7,7 @@
 #![no_main]
 
 use example_actors::{print, println, print_digit};
-use pvm_actors::{Actor, block_on, messages};
+use pvx_actors::{Actor, block_on, messages};
 
 #[derive(Actor)]
 struct Counter {
@@ -33,8 +33,8 @@ impl Counter {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     let mut counter = Counter { count: 0 };
-    let mut ctx = pvm_actors::Context::new(pvm_actors::ActorId(
-        pvm_scape::io::self_id() as u16,
+    let mut ctx = pvx_actors::Context::new(pvx_actors::ActorId(
+        pvx_scape::io::self_id() as u16,
     ));
 
     block_on(async {

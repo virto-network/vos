@@ -1,0 +1,25 @@
+[package]
+name = "pvx"
+description = "Cooperative executor for PVM actor programs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde"]
+
+[dependencies]
+pvx-abi = { path = "../pvx-abi" }
+pvx-actors = { path = "../pvx-actors" }
+
+# std-only: PVM runtime and manifest parsing
+javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }
+grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler", optional = true }
+toml = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[[bin]]
+name = "kunekt"
+path = "src/bin/kunekt.rs"
+required-features = ["std"]

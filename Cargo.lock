@@ -152,18 +152,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "pvm-abi"
-version = "0.1.0"
-
-[[package]]
-name = "pvm-actors"
+name = "pvx"
 version = "0.1.0"
 dependencies = [
- "pvm-actors-macros",
+ "grey-transpiler",
+ "javm",
+ "pvx-abi",
+ "pvx-actors",
+ "serde",
+ "toml",
 ]
 
 [[package]]
-name = "pvm-actors-macros"
+name = "pvx-abi"
+version = "0.1.0"
+
+[[package]]
+name = "pvx-actors"
+version = "0.1.0"
+dependencies = [
+ "pvx-actors-macros",
+]
+
+[[package]]
+name = "pvx-actors-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
@@ -172,22 +184,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pvm-executor"
+name = "pvx-scape"
 version = "0.1.0"
 dependencies = [
- "grey-transpiler",
- "javm",
- "pvm-abi",
- "pvm-actors",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "pvm-scape"
-version = "0.1.0"
-dependencies = [
- "pvm-abi",
+ "pvx-abi",
 ]
 
 [[package]]

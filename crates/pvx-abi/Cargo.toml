@@ -1,0 +1,9 @@
+[package]
+name = "pvx-abi"
+description = "Shared ABI types between PVM executor and child actor programs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []

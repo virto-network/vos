@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pvm-scape = { path = "../../crates/pvm-scape" }
-pvm-actors = { path = "../../crates/pvm-actors", features = ["pvm-actors-macros"] }
+pvx-scape = { path = "../../crates/pvx-scape" }
+pvx-actors = { path = "../../crates/pvx-actors", features = ["pvx-actors-macros"] }
 
 [profile.release]
 opt-level = "s"
