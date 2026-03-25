@@ -123,6 +123,27 @@ pub enum LogLevel {
     Trace = 5,
 }
 
+impl Syscall {
+    /// Convert a raw host-call ID to a syscall variant.
+    pub fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(Self::Send),
+            2 => Some(Self::Recv),
+            10 => Some(Self::FdOpen),
+            11 => Some(Self::FdRead),
+            12 => Some(Self::FdWrite),
+            13 => Some(Self::FdClose),
+            14 => Some(Self::FdPoll),
+            15 => Some(Self::FdSeek),
+            30 => Some(Self::Log),
+            31 => Some(Self::Yield),
+            32 => Some(Self::SelfId),
+            33 => Some(Self::Now),
+            _ => None,
+        }
+    }
+}
+
 /// Standard errno-style error codes returned by fd syscalls.
 pub mod errno {
     pub const ENOENT: i32 = -2;

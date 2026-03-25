@@ -1,0 +1,241 @@
+//! PVM driver — runs child actors inside javm (Grey's PVM implementation).
+//!
+//! Each child actor is a PVM program instance. The driver translates
+//! `Driver` trait calls into PVM execution: loading blobs, running
+//! until a host-call or halt, and reading/writing guest memory.
+
+use crate::scheduler::Driver;
+use crate::syscall_handler::{MemoryAccess, SyscallArgs, SyscallHandler, SyscallResult};
+use javm::program::initialize_program;
+use javm::{ExitReason, Gas, Pvm};
+use pvm_abi::actor::{ActorId, Status};
+use pvm_abi::syscall::Syscall;
+
+/// Maximum number of PVM instances the driver can hold.
+const MAX_INSTANCES: usize = 64;
+
+/// Default gas budget per actor per tick.
+const DEFAULT_GAS: Gas = 1_000_000;
+
+/// A child actor backed by a javm PVM instance.
+struct PvmActor {
+    pvm: Pvm,
+    /// Whether the actor is suspended mid-execution (hit a Yield host-call).
+    suspended: bool,
+}
+
+/// PVM driver managing child actor PVM instances.
+///
+/// Uses grey-transpiler to load RISC-V ELFs and javm to execute
+/// the resulting PVM programs.
+pub struct PvmDriver {
+    actors: [Option<PvmActor>; MAX_INSTANCES],
+    blobs: Vec<Vec<u8>>,
+    pub syscalls: SyscallHandler,
+}
+
+impl PvmDriver {
+    pub fn new() -> Self {
+        const NONE: Option<PvmActor> = None;
+        Self {
+            actors: [NONE; MAX_INSTANCES],
+            blobs: Vec::new(),
+            syscalls: SyscallHandler::new(),
+        }
+    }
+
+    /// Register a PVM blob. Returns a blob index for use with `spawn_blob`.
+    pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
+        let idx = self.blobs.len();
+        self.blobs.push(blob);
+        idx
+    }
+
+    /// Spawn an actor from a registered blob.
+    /// Returns `Pending` so the scheduler puts it in Suspended state,
+    /// meaning it will be polled on the next tick to start execution.
+    pub fn spawn_blob(&mut self, id: ActorId, blob_idx: usize) -> Status {
+        let blob = match self.blobs.get(blob_idx) {
+            Some(b) => b,
+            None => return Status::Error,
+        };
+
+        let pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+            Some(p) => p,
+            None => return Status::Error,
+        };
+
+        let idx = (id.0 - 1) as usize;
+        if idx >= MAX_INSTANCES {
+            return Status::Error;
+        }
+
+        // Set up default fds for this actor
+        self.syscalls.vfs.init_actor(id);
+
+        self.actors[idx] = Some(PvmActor {
+            pvm,
+            suspended: false,
+        });
+        // Return Pending → Scheduler sets state to Suspended → tick will poll
+        Status::Pending
+    }
+
+    /// Run a PVM instance until it halts, yields, or runs out of gas.
+    /// Handles host-calls (syscalls) inline.
+    fn run_actor(&mut self, id: ActorId) -> Status {
+        let idx = (id.0 - 1) as usize;
+        let actor = match &mut self.actors[idx] {
+            Some(a) => a,
+            None => return Status::Error,
+        };
+
+        // Refuel gas for this tick
+        actor.pvm.gas = DEFAULT_GAS;
+
+        loop {
+            let (exit, _gas) = actor.pvm.run();
+            match exit {
+                ExitReason::Halt => {
+                    return Status::Done;
+                }
+                ExitReason::Panic => {
+                    return Status::Error;
+                }
+                ExitReason::OutOfGas => {
+                    // Ran out of gas this tick — suspend and resume next tick
+                    actor.suspended = true;
+                    return Status::Pending;
+                }
+                ExitReason::PageFault(_addr) => {
+                    return Status::Error;
+                }
+                ExitReason::HostCall(call_id) => {
+                    // Map host-call ID to syscall
+                    let args = SyscallArgs {
+                        a0: actor.pvm.registers[7] as i64,  // a0 = φ₇
+                        a1: actor.pvm.registers[8] as i64,  // a1 = φ₈
+                        a2: actor.pvm.registers[9] as i64,  // a2 = φ₉
+                        a3: actor.pvm.registers[10] as i64, // a3 = φ₁₀
+                    };
+
+                    let syscall = match Syscall::from_id(call_id) {
+                        Some(s) => s,
+                        None => {
+                            // Unknown syscall — return ENOSYS
+                            actor.pvm.registers[7] =
+                                pvm_abi::syscall::errno::ENOSYS as u64;
+                            continue;
+                        }
+                    };
+
+                    match self.syscalls.dispatch(id, syscall, &args) {
+                        SyscallResult::Value(v) => {
+                            actor.pvm.registers[7] = v as u64; // return in a0
+                        }
+                        SyscallResult::Send { .. } | SyscallResult::Recv { .. } => {
+                            // Send/Recv need registry access — handled at
+                            // scheduler level. For now return EAGAIN.
+                            actor.pvm.registers[7] =
+                                pvm_abi::syscall::errno::EAGAIN as u64;
+                        }
+                    }
+                    // Continue execution after handling the host-call
+                }
+            }
+        }
+    }
+}
+
+impl Default for PvmDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The message type for PVM actors: raw encoded bytes.
+/// Uses the pvm-abi message format (Header + payload).
+#[derive(Debug)]
+pub struct RawMsg {
+    pub data: Vec<u8>,
+}
+
+impl Driver<RawMsg> for PvmDriver {
+    fn init(&mut self, _id: ActorId) -> Status {
+        // Return Pending → actor enters Suspended state.
+        // The actual PVM program is loaded via spawn_blob() after spawn(),
+        // and will start executing when the scheduler polls it.
+        Status::Pending
+    }
+
+    fn handle(&mut self, id: ActorId, msg: &RawMsg) -> Status {
+        let idx = (id.0 - 1) as usize;
+        let actor = match &mut self.actors[idx] {
+            Some(a) => a,
+            None => return Status::Error,
+        };
+
+        // Write the message into guest memory at a known location.
+        // Convention: message buffer starts at a fixed address that
+        // the child reads via recv(). For now, write to the argument
+        // region and set registers to point to it.
+        let msg_addr = 0x1000u32; // after stack
+        for (i, &byte) in msg.data.iter().enumerate() {
+            actor.pvm.write_u8(msg_addr + i as u32, byte);
+        }
+
+        // Set a0 = msg_ptr, a1 = msg_len for the handle entry point
+        actor.pvm.registers[7] = msg_addr as u64;
+        actor.pvm.registers[8] = msg.data.len() as u64;
+
+        self.run_actor(id)
+    }
+
+    fn poll(&mut self, id: ActorId) -> Status {
+        self.run_actor(id)
+    }
+
+    fn drop_actor(&mut self, id: ActorId) {
+        let idx = (id.0 - 1) as usize;
+        self.actors[idx] = None;
+    }
+}
+
+impl MemoryAccess for PvmDriver {
+    fn read_guest(&self, actor: ActorId, ptr: i64, dst: &mut [u8]) -> usize {
+        let idx = (actor.0 - 1) as usize;
+        let pvm = match &self.actors[idx] {
+            Some(a) => &a.pvm,
+            None => return 0,
+        };
+        let mut count = 0;
+        for (i, byte) in dst.iter_mut().enumerate() {
+            match pvm.read_u8(ptr as u32 + i as u32) {
+                Some(b) => {
+                    *byte = b;
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        count
+    }
+
+    fn write_guest(&mut self, actor: ActorId, ptr: i64, src: &[u8]) -> usize {
+        let idx = (actor.0 - 1) as usize;
+        let pvm = match &mut self.actors[idx] {
+            Some(a) => &mut a.pvm,
+            None => return 0,
+        };
+        let mut count = 0;
+        for (i, &byte) in src.iter().enumerate() {
+            if pvm.write_u8(ptr as u32 + i as u32, byte) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+}
+

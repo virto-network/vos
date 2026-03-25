@@ -40,4 +40,9 @@ pub mod scheduler;
 pub mod syscall_handler;
 pub mod vfs;
 
+#[cfg(feature = "std")]
+pub mod manifest;
+#[cfg(feature = "std")]
+pub mod pvm_driver;
+
 pub use syscall_handler::MemoryAccess;
