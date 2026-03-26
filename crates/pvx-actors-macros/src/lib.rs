@@ -1,7 +1,7 @@
 //! Proc macros for `pvx-actors`.
 //!
 //! - `#[derive(Actor)]` — implements the `Actor` trait with default lifecycle hooks
-//! - `#[messages]` — on an `impl` block, generates a message enum and `Message` impls
+//! - `#[messages]` — on an `impl` block, generates message types, dispatch, and `_start`
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -65,19 +65,30 @@ pub fn derive_actor(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Attribute macro for impl blocks that generates message types and handlers.
+/// Attribute macro for impl blocks that generates message types, handlers,
+/// and the actor entry point (`_start`).
+///
+/// ## Constructor
+///
+/// A `fn new(...) -> Self` method (without `#[msg]`) defines the constructor.
+/// The executor sends constructor arguments as the first message when spawning.
+///
+/// ## Message handlers
 ///
 /// Each method marked with `#[msg]` becomes:
 /// 1. A public struct with the method's parameters as fields (with rkyv derives)
 /// 2. A `Message<ThatStruct>` impl that delegates to the method body
 ///
-/// An aggregated enum `{Actor}Msg` is generated containing all message variants
-/// with rkyv derives and helper methods:
-/// - `to_bytes(&self) -> AlignedVec` — serialize via rkyv
-/// - `dispatch(bytes: &[u8], actor, ctx)` — zero-copy deserialize + deliver
-/// - `is_query(&self) -> bool` — true for `&self` methods, false for `&mut self`
+/// An aggregated enum `{Actor}Msg` is generated with:
+/// - `deliver(actor, ctx)` — dispatch to handler
+/// - `to_bytes()` — serialize via rkyv
+/// - `dispatch(bytes, actor, ctx)` — zero-copy deserialize + deliver
+/// - `dispatch_sync(bytes, actor, ctx)` — sync wrapper using `block_on`
 ///
-/// A `Mailbox`-compatible `deliver` method is generated for the enum.
+/// ## Generated `_start`
+///
+/// The macro generates the PVM entry point that runs the standard lifecycle:
+/// yield → recv constructor → build actor → checkpoint → message loop.
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -101,6 +112,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
 
+    // Constructor info
+    let mut ctor_method = None;
+
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
             passthrough_items.push(item.clone());
@@ -109,6 +123,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Check for #[msg] attribute
         let is_msg = method.attrs.iter().any(|a| a.path().is_ident("msg"));
+
+        // Detect constructor: fn new(...) -> Self (without #[msg])
+        if !is_msg && method.sig.ident == "new" {
+            ctor_method = Some(method.clone());
+            passthrough_items.push(item.clone());
+            continue;
+        }
+
         if !is_msg {
             passthrough_items.push(item.clone());
             continue;
@@ -200,20 +222,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Enum variant
         enum_variants.push(quote! { #struct_name(#struct_name) });
 
-        // Deliver arm
+        // Deliver arm (no Yield — outer loop handles scheduling)
         deliver_arms.push(quote! {
             #enum_name::#struct_name(msg) => {
                 let _ = <#actor_name as pvx_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
-                pvx_actors::Yield::once().await;
             }
         });
 
-        // Dispatch arm (deserialize from archived)
+        // Dispatch arm (deserialize from archived, no Yield)
         dispatch_arms.push(quote! {
             #archived_enum_name::#struct_name(archived) => {
                 let msg: #struct_name = pvx_actors::rkyv::deserialize::<#struct_name, pvx_actors::rkyv::rancor::Error>(archived).unwrap();
                 let _ = <#actor_name as pvx_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
-                pvx_actors::Yield::once().await;
             }
         });
 
@@ -247,6 +267,96 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
     }
+
+    // --- Constructor: generate Init struct and _start ---
+
+    let (init_struct, init_deserialize, ctor_call) = if let Some(ctor) = &ctor_method {
+        // Collect constructor params (skip Context if present)
+        let mut ctor_field_names = Vec::new();
+        let mut ctor_field_types = Vec::new();
+        for arg in &ctor.sig.inputs {
+            if let FnArg::Typed(pat_type) = arg {
+                if is_context_type(pat_type.ty.as_ref()) {
+                    continue;
+                }
+                if let Pat::Ident(pat) = pat_type.pat.as_ref() {
+                    ctor_field_names.push(pat.ident.clone());
+                    ctor_field_types.push(pat_type.ty.as_ref().clone());
+                }
+            }
+        }
+
+        let init_struct_name = format_ident!("{}Init", actor_name);
+        let archived_init_name = format_ident!("Archived{}Init", actor_name);
+
+        let init_struct_def = if ctor_field_names.is_empty() {
+            quote! {
+                #[derive(
+                    pvx_actors::rkyv::Archive,
+                    pvx_actors::rkyv::Serialize,
+                    pvx_actors::rkyv::Deserialize,
+                )]
+                #[rkyv(crate = pvx_actors::rkyv)]
+                pub struct #init_struct_name;
+            }
+        } else {
+            quote! {
+                #[derive(
+                    pvx_actors::rkyv::Archive,
+                    pvx_actors::rkyv::Serialize,
+                    pvx_actors::rkyv::Deserialize,
+                )]
+                #[rkyv(crate = pvx_actors::rkyv)]
+                pub struct #init_struct_name {
+                    #( pub #ctor_field_names: #ctor_field_types ),*
+                }
+            }
+        };
+
+        let deser = if ctor_field_names.is_empty() {
+            quote! {
+                let _ = __payload;
+            }
+        } else {
+            quote! {
+                let __archived = unsafe {
+                    pvx_actors::rkyv::access_unchecked::<#archived_init_name>(__payload)
+                };
+                let #init_struct_name { #( #ctor_field_names ),* } =
+                    pvx_actors::rkyv::deserialize::<#init_struct_name, pvx_actors::rkyv::rancor::Error>(__archived).unwrap();
+            }
+        };
+
+        let call = quote! {
+            #actor_name::new(#( #ctor_field_names ),*)
+        };
+
+        (init_struct_def, deser, call)
+    } else {
+        // No constructor — require Default
+        let init_struct_def = quote! {};
+        let deser = quote! { let _ = __payload; };
+        let call = quote! { <#actor_name as Default>::default() };
+        (init_struct_def, deser, call)
+    };
+
+    // Generate _start
+    let start_fn = quote! {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() {
+            pvx_actors::main_loop::<#actor_name>(
+                |__payload| {
+                    #init_deserialize
+                    #ctor_call
+                },
+                |__payload, __actor, __ctx| {
+                    pvx_actors::block_on(async {
+                        unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await; }
+                    });
+                },
+            );
+        }
+    };
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
@@ -299,7 +409,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Re-emit the impl block with non-message methods preserved
+    // Re-emit the impl block with non-message methods preserved (including new)
     let passthrough_impl = if !passthrough_items.is_empty() {
         quote! {
             impl #actor_ty {
@@ -311,10 +421,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
+        #init_struct
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
         #passthrough_impl
+        #start_fn
     };
 
     expanded.into()

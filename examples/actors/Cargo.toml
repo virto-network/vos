@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 pvx-abi = { path = "../../crates/pvx-abi" }
 pvx-scape = { path = "../../crates/pvx-scape" }
-pvx-actors = { path = "../../crates/pvx-actors", features = ["pvx-actors-macros"] }
+pvx-actors = { path = "../../crates/pvx-actors", features = ["pvx-actors-macros", "guest"] }
 
 [profile.release]
 opt-level = "s"

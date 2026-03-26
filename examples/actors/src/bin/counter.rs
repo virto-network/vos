@@ -1,7 +1,8 @@
 //! Counter actor — handles Increment and Print messages.
 //!
-//! Demonstrates stateful actors with multiple message types running in PVM.
-//! Cooperative yielding happens automatically after each message delivery.
+//! Demonstrates stateful actors with constructor args and multiple message types.
+//! The executor sends an init message with the starting count, then delivers
+//! Increment/PrintCount messages. Yielding, recv, and checkpointing are automatic.
 
 #![no_std]
 #![no_main]
@@ -9,7 +10,7 @@
 extern crate alloc;
 
 use example_actors::{print, println, print_digit};
-use pvx_actors::{Actor, block_on, messages};
+use pvx_actors::{Actor, messages};
 
 #[derive(Actor)]
 struct Counter {
@@ -18,6 +19,10 @@ struct Counter {
 
 #[messages]
 impl Counter {
+    fn new(initial: u8) -> Self {
+        Counter { count: initial }
+    }
+
     #[msg]
     async fn increment(&mut self, _ctx: &mut Context<Self>) -> u8 {
         self.count += 1;
@@ -30,23 +35,4 @@ impl Counter {
         print_digit(self.count);
         println(b"");
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() {
-    let mut counter = Counter { count: 0 };
-    let mut ctx = pvx_actors::Context::new(pvx_actors::ActorId(
-        pvx_scape::io::self_id() as u16,
-    ));
-
-    block_on(async {
-        let mut i: u8 = 0;
-        while i < 5 {
-            CounterMsg::Increment(Increment)
-                .deliver(&mut counter, &mut ctx).await;
-            CounterMsg::PrintCount(PrintCount)
-                .deliver(&mut counter, &mut ctx).await;
-            i += 1;
-        }
-    });
 }

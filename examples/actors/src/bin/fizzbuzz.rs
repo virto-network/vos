@@ -1,7 +1,6 @@
 //! FizzBuzz actor — handles Tick messages, printing fizzbuzz output.
 //!
 //! Demonstrates an actor with internal state and conditional logic.
-//! Cooperative yielding happens automatically after each message delivery.
 
 #![no_std]
 #![no_main]
@@ -9,7 +8,7 @@
 extern crate alloc;
 
 use example_actors::println;
-use pvx_actors::{Actor, block_on, messages};
+use pvx_actors::{Actor, messages};
 
 static OUTPUTS: [&[u8]; 15] = [
     b"1", b"2", b"fizz", b"4", b"buzz",
@@ -24,6 +23,10 @@ struct FizzBuzz {
 
 #[messages]
 impl FizzBuzz {
+    fn new() -> Self {
+        FizzBuzz { position: 0 }
+    }
+
     #[msg]
     async fn tick(&mut self, _ctx: &mut Context<Self>) {
         if (self.position as usize) < OUTPUTS.len() {
@@ -31,21 +34,4 @@ impl FizzBuzz {
             self.position += 1;
         }
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() {
-    let mut fb = FizzBuzz { position: 0 };
-    let mut ctx = pvx_actors::Context::new(pvx_actors::ActorId(
-        pvx_scape::io::self_id() as u16,
-    ));
-
-    block_on(async {
-        let mut i: u8 = 0;
-        while i < 15 {
-            FizzBuzzMsg::Tick(Tick)
-                .deliver(&mut fb, &mut ctx).await;
-            i += 1;
-        }
-    });
 }

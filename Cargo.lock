@@ -211,7 +211,9 @@ version = "0.1.0"
 name = "pvx-actors"
 version = "0.1.0"
 dependencies = [
+ "pvx-abi",
  "pvx-actors-macros",
+ "pvx-scape",
  "rkyv",
 ]
 

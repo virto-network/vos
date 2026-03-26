@@ -34,6 +34,8 @@ pub use context::{ActorId, Context};
 pub use executor::{Executor, Progress};
 pub use mailbox::Mailbox;
 pub use run::{Yield, block_on};
+#[cfg(feature = "guest")]
+pub use run::main_loop;
 
 #[cfg(feature = "pvx-actors-macros")]
 pub use pvx_actors_macros::{Actor, messages};

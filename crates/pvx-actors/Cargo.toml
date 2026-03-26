@@ -8,9 +8,12 @@ license.workspace = true
 [features]
 default = []
 pvx-actors-macros = ["dep:pvx-actors-macros"]
+guest = ["dep:pvx-abi", "dep:pvx-scape"]
 
 [dependencies]
 pvx-actors-macros = { path = "../pvx-actors-macros", optional = true }
+pvx-abi = { path = "../pvx-abi", optional = true }
+pvx-scape = { path = "../pvx-scape", optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
