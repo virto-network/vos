@@ -39,3 +39,19 @@ pub use run::main_loop;
 
 #[cfg(feature = "pvx-actors-macros")]
 pub use pvx_actors_macros::{Actor, messages};
+
+// --- Guest I/O macros and panic handler ---
+// These are gated behind the `guest` feature so they don't affect host-side usage.
+
+#[cfg(feature = "guest")]
+mod guest_io;
+
+#[cfg(feature = "guest")]
+mod guest_panic;
+
+/// Re-export for use by generated println!/print! macros.
+#[cfg(feature = "guest")]
+#[doc(hidden)]
+pub mod __io {
+    pub use pvx_scape::io::pvm_write;
+}

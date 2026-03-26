@@ -1,0 +1,7 @@
+build:
+    cd greeter && cargo build --release
+    cd counter && cargo build --release
+    cd fizzbuzz && cargo build --release
+
+run: build
+    cargo run --manifest-path ../crates/pvx/Cargo.toml --bin kunekt -- Kunekt.toml

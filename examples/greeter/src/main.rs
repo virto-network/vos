@@ -2,13 +2,6 @@
 //!
 //! Demonstrates a stateless actor with `#[derive(Actor)]` and `#[messages]`.
 
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
-use alloc::vec::Vec;
-use example_actors::{print, println};
 use pvx_actors::{Actor, messages};
 
 #[derive(Actor)]
@@ -22,8 +15,7 @@ impl Greeter {
 
     #[msg]
     async fn greet(&self, name: Vec<u8>, _ctx: &mut Context<Self>) {
-        print(b"Hello, ");
-        print(&name);
-        println(b"!");
+        let name = String::from_utf8_lossy(&name);
+        println!("Hello, {name}!");
     }
 }

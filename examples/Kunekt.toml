@@ -1,0 +1,14 @@
+[manifest]
+name = "examples"
+
+[[actors]]
+name = "greeter"
+path = "greeter/target/riscv64em-javm/release/greeter.elf"
+
+[[actors]]
+name = "counter"
+path = "counter/target/riscv64em-javm/release/counter.elf"
+
+[[actors]]
+name = "fizzbuzz"
+path = "fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf"

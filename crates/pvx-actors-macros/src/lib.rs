@@ -87,8 +87,9 @@ pub fn derive_actor(input: TokenStream) -> TokenStream {
 ///
 /// ## Generated `_start`
 ///
-/// The macro generates the PVM entry point that runs the standard lifecycle:
-/// yield → recv constructor → build actor → checkpoint → message loop.
+/// The macro generates the PVM entry point along with `extern crate alloc`
+/// and I/O macro imports, so actor source files need no boilerplate.
+/// Lifecycle: yield → recv constructor → build actor → checkpoint → message loop.
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -340,8 +341,16 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         (init_struct_def, deser, call)
     };
 
-    // Generate _start
+    // Generate _start entry point + alloc import + I/O macro imports
     let start_fn = quote! {
+        extern crate alloc;
+
+        // Bring common types and I/O macros into scope for a std-like experience.
+        #[allow(unused_imports)]
+        use pvx_actors::{print, println, eprint, eprintln};
+        #[allow(unused_imports)]
+        use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             pvx_actors::main_loop::<#actor_name>(
