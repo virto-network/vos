@@ -86,6 +86,10 @@ pub enum Syscall {
     /// Get monotonic time in microseconds.
     /// Args: () -> u64
     Now = 33,
+
+    /// Request a state checkpoint (snapshot persisted by executor).
+    /// Args: () -> i32 (0 on success, negative on error)
+    Checkpoint = 34,
 }
 
 /// Poll event for `FdPoll` syscall.
@@ -139,6 +143,7 @@ impl Syscall {
             31 => Some(Self::Yield),
             32 => Some(Self::SelfId),
             33 => Some(Self::Now),
+            34 => Some(Self::Checkpoint),
             _ => None,
         }
     }

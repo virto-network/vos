@@ -44,5 +44,7 @@ pub mod vfs;
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod pvm_driver;
+#[cfg(feature = "std")]
+pub mod snapshot;
 
 pub use syscall_handler::MemoryAccess;

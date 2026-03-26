@@ -5,6 +5,7 @@
 //! until a host-call or halt, and reading/writing guest memory.
 
 use crate::scheduler::Driver;
+use crate::snapshot::{ActorStore, InstanceId, MemActorStore, PvmSnapshot};
 use crate::syscall_handler::{MemoryAccess, SyscallArgs, SyscallHandler, SyscallResult};
 use javm::program::initialize_program;
 use javm::{ExitReason, Gas, Pvm};
@@ -38,23 +39,36 @@ struct PvmActor {
 /// PVM driver managing child actor PVM instances.
 ///
 /// Uses grey-transpiler to load RISC-V ELFs and javm to execute
-/// the resulting PVM programs.
-pub struct PvmDriver {
+/// the resulting PVM programs. Generic over the actor store for persistence.
+pub struct PvmDriver<S: ActorStore = MemActorStore> {
     actors: [Option<PvmActor>; MAX_INSTANCES],
     blobs: Vec<Vec<u8>>,
     pub syscalls: SyscallHandler,
     /// Messages sent by actors during execution, to be routed by the scheduler.
     pub pending_sends: Vec<PendingSend>,
+    /// Persistence store for actor snapshots.
+    pub store: S,
+    /// Maps actor slot → InstanceId for persistence.
+    instance_ids: [Option<InstanceId>; MAX_INSTANCES],
 }
 
-impl PvmDriver {
+impl PvmDriver<MemActorStore> {
     pub fn new() -> Self {
-        const NONE: Option<PvmActor> = None;
+        Self::with_store(MemActorStore::new())
+    }
+}
+
+impl<S: ActorStore> PvmDriver<S> {
+    pub fn with_store(store: S) -> Self {
+        const NONE_ACTOR: Option<PvmActor> = None;
+        const NONE_IID: Option<InstanceId> = None;
         Self {
-            actors: [NONE; MAX_INSTANCES],
+            actors: [NONE_ACTOR; MAX_INSTANCES],
             blobs: Vec::new(),
             syscalls: SyscallHandler::new(),
             pending_sends: Vec::new(),
+            store,
+            instance_ids: [NONE_IID; MAX_INSTANCES],
         }
     }
 
@@ -65,17 +79,17 @@ impl PvmDriver {
         idx
     }
 
-    /// Spawn an actor from a registered blob.
-    /// Returns `Pending` so the scheduler puts it in Suspended state,
-    /// meaning it will be polled on the next tick to start execution.
-    pub fn spawn_blob(&mut self, id: ActorId, blob_idx: usize) -> Status {
+    /// Spawn an actor from a registered blob, optionally with an InstanceId
+    /// for persistence. If the store contains a snapshot for the given
+    /// InstanceId, the actor is restored from it instead of starting fresh.
+    pub fn spawn_blob(
+        &mut self,
+        id: ActorId,
+        blob_idx: usize,
+        instance_id: Option<InstanceId>,
+    ) -> Status {
         let blob = match self.blobs.get(blob_idx) {
             Some(b) => b,
-            None => return Status::Error,
-        };
-
-        let pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
-            Some(p) => p,
             None => return Status::Error,
         };
 
@@ -84,32 +98,71 @@ impl PvmDriver {
             return Status::Error;
         }
 
+        // Try restoring from store if we have an InstanceId
+        let (pvm, suspended, pending_msg) = if let Some(iid) = instance_id {
+            if let Ok(Some(snapshot)) = self.store.load(iid) {
+                let sus = snapshot.suspended;
+                let pm = snapshot.pending_msg.clone();
+                match snapshot.restore(blob) {
+                    Some(pvm) => (pvm, sus, pm.map(|d| RawMsg { data: d })),
+                    None => return Status::Error,
+                }
+            } else {
+                match initialize_program(blob, &[], DEFAULT_GAS) {
+                    Some(p) => (p, false, None),
+                    None => return Status::Error,
+                }
+            }
+        } else {
+            match initialize_program(blob, &[], DEFAULT_GAS) {
+                Some(p) => (p, false, None),
+                None => return Status::Error,
+            }
+        };
+
         // Set up default fds for this actor
         self.syscalls.vfs.init_actor(id);
 
         self.actors[idx] = Some(PvmActor {
             pvm,
-            suspended: false,
-            pending_msg: None,
+            suspended,
+            pending_msg,
         });
+        self.instance_ids[idx] = instance_id;
         // Return Pending → Scheduler sets state to Suspended → tick will poll
         Status::Pending
+    }
+
+    /// Persist a snapshot for the actor at the given slot, if it has an InstanceId.
+    fn save_snapshot(&mut self, idx: usize) {
+        if let (Some(iid), Some(actor)) = (self.instance_ids[idx], &self.actors[idx]) {
+            let snapshot = PvmSnapshot::capture(
+                &actor.pvm,
+                actor.suspended,
+                actor.pending_msg.as_ref().map(|m| m.data.as_slice()),
+            );
+            let _ = self.store.save(iid, &snapshot);
+        }
     }
 
     /// Run a PVM instance until it halts, yields, or runs out of gas.
     /// Handles host-calls (syscalls) inline.
     fn run_actor(&mut self, id: ActorId) -> Status {
         let idx = (id.0 - 1) as usize;
-        let actor = match &mut self.actors[idx] {
-            Some(a) => a,
-            None => return Status::Error,
-        };
+        if self.actors[idx].is_none() {
+            return Status::Error;
+        }
 
         // Refuel gas for this tick
-        actor.pvm.gas = DEFAULT_GAS;
+        self.actors[idx].as_mut().unwrap().pvm.gas = DEFAULT_GAS;
+
+        // Use a macro to access the actor without holding a long-lived borrow on self
+        macro_rules! actor {
+            () => { self.actors[idx].as_mut().unwrap() };
+        }
 
         loop {
-            let (exit, _gas) = actor.pvm.run();
+            let (exit, _gas) = actor!().pvm.run();
             match exit {
                 ExitReason::Halt => {
                     return Status::Done;
@@ -118,27 +171,24 @@ impl PvmDriver {
                     return Status::Error;
                 }
                 ExitReason::OutOfGas => {
-                    // Ran out of gas this tick — suspend and resume next tick
-                    actor.suspended = true;
+                    actor!().suspended = true;
                     return Status::Pending;
                 }
                 ExitReason::PageFault(_addr) => {
                     return Status::Error;
                 }
                 ExitReason::HostCall(call_id) => {
-                    // Map host-call ID to syscall
                     let args = SyscallArgs {
-                        a0: actor.pvm.registers[7] as i64,  // a0 = φ₇
-                        a1: actor.pvm.registers[8] as i64,  // a1 = φ₈
-                        a2: actor.pvm.registers[9] as i64,  // a2 = φ₉
-                        a3: actor.pvm.registers[10] as i64, // a3 = φ₁₀
+                        a0: actor!().pvm.registers[7] as i64,
+                        a1: actor!().pvm.registers[8] as i64,
+                        a2: actor!().pvm.registers[9] as i64,
+                        a3: actor!().pvm.registers[10] as i64,
                     };
 
                     let syscall = match Syscall::from_id(call_id) {
                         Some(s) => s,
                         None => {
-                            // Unknown syscall — return ENOSYS
-                            actor.pvm.registers[7] =
+                            actor!().pvm.registers[7] =
                                 pvx_abi::syscall::errno::ENOSYS as u64;
                             continue;
                         }
@@ -152,7 +202,7 @@ impl PvmDriver {
                         if fd == 1 || fd == 2 {
                             let mut buf = vec![0u8; buf_len];
                             for (i, byte) in buf.iter_mut().enumerate() {
-                                *byte = actor.pvm.read_u8(buf_ptr + i as u32).unwrap_or(0);
+                                *byte = actor!().pvm.read_u8(buf_ptr + i as u32).unwrap_or(0);
                             }
                             if fd == 1 {
                                 let _ = std::io::stdout().write_all(&buf);
@@ -160,16 +210,24 @@ impl PvmDriver {
                             } else {
                                 let _ = std::io::stderr().write_all(&buf);
                             }
-                            actor.pvm.registers[7] = buf_len as u64;
+                            actor!().pvm.registers[7] = buf_len as u64;
                             continue;
                         }
                     }
 
-                    // Intercept Yield — suspend this actor so others can run
+                    // Intercept Yield — suspend and persist snapshot
                     if syscall == Syscall::Yield {
-                        actor.pvm.registers[7] = 0;
-                        actor.suspended = true;
+                        actor!().pvm.registers[7] = 0;
+                        actor!().suspended = true;
+                        self.save_snapshot(idx);
                         return Status::Pending;
+                    }
+
+                    // Intercept Checkpoint — persist snapshot and continue
+                    if syscall == Syscall::Checkpoint {
+                        actor!().pvm.registers[7] = 0;
+                        self.save_snapshot(idx);
+                        continue;
                     }
 
                     // Intercept Log syscall to print to host stderr
@@ -178,29 +236,28 @@ impl PvmDriver {
                         let msg_len = args.a2 as usize;
                         let mut buf = vec![0u8; msg_len];
                         for (i, byte) in buf.iter_mut().enumerate() {
-                            *byte = actor.pvm.read_u8(msg_ptr + i as u32).unwrap_or(0);
+                            *byte = actor!().pvm.read_u8(msg_ptr + i as u32).unwrap_or(0);
                         }
                         if let Ok(s) = std::str::from_utf8(&buf) {
                             eprintln!("[actor {}] {s}", id.0);
                         }
-                        actor.pvm.registers[7] = 0;
+                        actor!().pvm.registers[7] = 0;
                         continue;
                     }
 
                     match self.syscalls.dispatch(id, syscall, &args) {
                         SyscallResult::Value(v) => {
-                            actor.pvm.registers[7] = v as u64; // return in a0
+                            actor!().pvm.registers[7] = v as u64;
                         }
                         SyscallResult::Send {
                             target,
                             msg_ptr,
                             msg_len,
                         } => {
-                            // Read payload from guest memory
                             let len = msg_len as usize;
                             let mut payload = vec![0u8; len];
                             for (i, byte) in payload.iter_mut().enumerate() {
-                                *byte = actor
+                                *byte = actor!()
                                     .pvm
                                     .read_u8(msg_ptr as u32 + i as u32)
                                     .unwrap_or(0);
@@ -210,30 +267,28 @@ impl PvmDriver {
                                 to: target,
                                 msg: RawMsg::new(id, &payload),
                             });
-                            actor.pvm.registers[7] = 0; // success
+                            actor!().pvm.registers[7] = 0;
                         }
                         SyscallResult::Recv { buf_ptr, buf_len } => {
-                            if let Some(msg) = actor.pending_msg.take() {
+                            if let Some(msg) = actor!().pending_msg.take() {
                                 let data = &msg.data;
                                 let copy_len = data.len().min(buf_len as usize);
                                 for (i, &byte) in data[..copy_len].iter().enumerate() {
-                                    actor.pvm.write_u8(buf_ptr as u32 + i as u32, byte);
+                                    actor!().pvm.write_u8(buf_ptr as u32 + i as u32, byte);
                                 }
-                                actor.pvm.registers[7] = copy_len as u64;
+                                actor!().pvm.registers[7] = copy_len as u64;
                             } else {
-                                // No message pending
-                                actor.pvm.registers[7] = 0;
+                                actor!().pvm.registers[7] = 0;
                             }
                         }
                     }
-                    // Continue execution after handling the host-call
                 }
             }
         }
     }
 }
 
-impl Default for PvmDriver {
+impl Default for PvmDriver<MemActorStore> {
     fn default() -> Self {
         Self::new()
     }
@@ -277,7 +332,7 @@ impl RawMsg {
     }
 }
 
-impl Driver<RawMsg> for PvmDriver {
+impl<S: ActorStore> Driver<RawMsg> for PvmDriver<S> {
     fn init(&mut self, _id: ActorId) -> Status {
         // Return Pending → actor enters Suspended state.
         // The actual PVM program is loaded via spawn_blob() after spawn(),
@@ -316,7 +371,7 @@ impl Driver<RawMsg> for PvmDriver {
     }
 }
 
-impl MemoryAccess for PvmDriver {
+impl<S: ActorStore> MemoryAccess for PvmDriver<S> {
     fn read_guest(&self, actor: ActorId, ptr: i64, dst: &mut [u8]) -> usize {
         let idx = (actor.0 - 1) as usize;
         let pvm = match &self.actors[idx] {

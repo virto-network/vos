@@ -171,7 +171,7 @@ fn driver_spawn_and_halt() {
     let blob_idx = driver.register_blob(blob);
 
     let id = ActorId(1);
-    assert_eq!(driver.spawn_blob(id, blob_idx), pvx_abi::actor::Status::Pending);
+    assert_eq!(driver.spawn_blob(id, blob_idx, None), pvx_abi::actor::Status::Pending);
     // Polling runs the program to completion
     assert_eq!(driver.poll(id), pvx_abi::actor::Status::Done);
 }
@@ -183,7 +183,7 @@ fn driver_self_id_syscall() {
     let blob_idx = driver.register_blob(blob);
 
     let id = ActorId(5);
-    driver.spawn_blob(id, blob_idx);
+    driver.spawn_blob(id, blob_idx, None);
     assert_eq!(driver.poll(id), pvx_abi::actor::Status::Done);
 }
 
@@ -194,7 +194,7 @@ fn driver_write_stdout_syscall() {
     let blob_idx = driver.register_blob(blob);
 
     let id = ActorId(1);
-    driver.spawn_blob(id, blob_idx);
+    driver.spawn_blob(id, blob_idx, None);
     assert_eq!(driver.poll(id), pvx_abi::actor::Status::Done);
 }
 
@@ -209,9 +209,9 @@ fn scheduler_two_actors_halt() {
     let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
 
     let a = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(a, blob_idx);
+    sched.driver_mut().spawn_blob(a, blob_idx, None);
     let b = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(b, blob_idx);
+    sched.driver_mut().spawn_blob(b, blob_idx, None);
 
     // spawn_blob returns Pending → actors start in Suspended state.
     // First tick: polls both suspended actors, they run and halt → Done.
@@ -229,7 +229,7 @@ fn scheduler_actor_with_self_id() {
     let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
 
     let id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(id, blob_idx);
+    sched.driver_mut().spawn_blob(id, blob_idx, None);
 
     // First tick polls the suspended actor → runs SelfId syscall → halts
     assert_eq!(sched.tick(), TickResult::Progress);
@@ -269,9 +269,9 @@ fn scheduler_send_routes_to_mailbox() {
     let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
 
     let sender_id = sched.spawn().unwrap(); // ActorId(1)
-    sched.driver_mut().spawn_blob(sender_id, sender_idx);
+    sched.driver_mut().spawn_blob(sender_id, sender_idx, None);
     let receiver_id = sched.spawn().unwrap(); // ActorId(2)
-    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
+    sched.driver_mut().spawn_blob(receiver_id, receiver_idx, None);
 
     // First tick: sender runs Send syscall → queues PendingSend → halts.
     // Receiver runs yield → suspends.
@@ -322,9 +322,9 @@ fn scheduler_send_recv_round_trip() {
     let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
 
     let sender_id = sched.spawn().unwrap(); // ActorId(1)
-    sched.driver_mut().spawn_blob(sender_id, sender_idx);
+    sched.driver_mut().spawn_blob(sender_id, sender_idx, None);
     let receiver_id = sched.spawn().unwrap(); // ActorId(2)
-    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
+    sched.driver_mut().spawn_blob(receiver_id, receiver_idx, None);
 
     // Tick 1: sender sends "PING" → halts. receiver yields → suspended.
     // drain_sends routes message to receiver's mailbox.
@@ -351,4 +351,112 @@ fn scheduler_send_recv_round_trip() {
     assert_eq!(header.payload_len, 4);
     let payload = &msg_buf[Header::SIZE..Header::SIZE + 4];
     assert_eq!(payload, b"PING");
+}
+
+// -- Snapshot / persistence tests --
+
+use pvx::snapshot::{ActorStore, InstanceId};
+
+#[test]
+fn snapshot_capture_restore_via_store() {
+    // Spawn a counting actor with an InstanceId, run partway (2 yields of 3),
+    // extract the snapshot from the store, create a new driver, load the
+    // snapshot into the new driver's store, spawn with same InstanceId → resumes.
+    let blob = program_counting_yields(3);
+    let mut driver = PvmDriver::new();
+    let blob_idx = driver.register_blob(blob.clone());
+    let iid = InstanceId { blob_idx: 0, instance: 0 };
+
+    let id = ActorId(1);
+    driver.spawn_blob(id, blob_idx, Some(iid));
+
+    // Run 2 ticks (yield 1, yield 2) — snapshots saved to store on each yield
+    assert_eq!(driver.poll(id), pvx_abi::actor::Status::Pending);
+    assert_eq!(driver.poll(id), pvx_abi::actor::Status::Pending);
+
+    // Verify the counter is at 2 via MemoryAccess
+    use pvx::MemoryAccess;
+    let mut buf = [0u8; 1];
+    driver.read_guest(id, 0, &mut buf);
+    assert_eq!(buf[0], 2);
+
+    // Extract the snapshot from the store
+    let snapshot = driver.store.load(iid).unwrap().unwrap();
+
+    // Create a brand new driver and load the snapshot into its store
+    let mut driver2 = PvmDriver::new();
+    let blob_idx2 = driver2.register_blob(blob);
+    driver2.store.save(iid, &snapshot).unwrap();
+
+    // Spawn with same InstanceId — auto-restores from store
+    let id2 = ActorId(1);
+    driver2.spawn_blob(id2, blob_idx2, Some(iid));
+
+    // Should resume from after yield 2: yield 3, then halt
+    assert_eq!(driver2.poll(id2), pvx_abi::actor::Status::Pending); // yield 3
+    assert_eq!(driver2.poll(id2), pvx_abi::actor::Status::Done);    // halt
+}
+
+#[test]
+fn store_persist_and_resume() {
+    // Spawn an actor with an InstanceId, run to yield, drop it.
+    // Spawn again with the same InstanceId — auto-restores from store.
+    let blob = program_counting_yields(3);
+    let mut driver = PvmDriver::new();
+    let blob_idx = driver.register_blob(blob);
+    let iid = InstanceId { blob_idx: 0, instance: 0 };
+
+    let id = ActorId(1);
+    driver.spawn_blob(id, blob_idx, Some(iid));
+
+    // Yield 1 — snapshot saved to store
+    assert_eq!(driver.poll(id), pvx_abi::actor::Status::Pending);
+
+    // Verify store has a snapshot
+    assert!(driver.store.load(iid).unwrap().is_some());
+
+    // Yield 2 — snapshot updated
+    assert_eq!(driver.poll(id), pvx_abi::actor::Status::Pending);
+
+    // Drop the actor
+    driver.drop_actor(id);
+
+    // Re-spawn with same InstanceId — should auto-restore from store
+    let id2 = ActorId(2);
+    driver.spawn_blob(id2, blob_idx, Some(iid));
+
+    // Should resume from after yield 2, do yield 3 then halt
+    assert_eq!(driver.poll(id2), pvx_abi::actor::Status::Pending); // yield 3
+    assert_eq!(driver.poll(id2), pvx_abi::actor::Status::Done);    // halt
+}
+
+/// Program that calls Checkpoint, then halts.
+fn program_checkpoint_then_halt() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+    // Store a marker at addr 0
+    asm.load_imm(Reg::T0, 0x42);
+    asm.store_u8(Reg::T0, 0);
+    asm.ecalli(Syscall::Checkpoint as u32);
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+#[test]
+fn checkpoint_syscall() {
+    let blob = program_checkpoint_then_halt();
+    let mut driver = PvmDriver::new();
+    let blob_idx = driver.register_blob(blob);
+    let iid = InstanceId { blob_idx: 0, instance: 0 };
+
+    let id = ActorId(1);
+    driver.spawn_blob(id, blob_idx, Some(iid));
+
+    // Run to completion (Checkpoint + Halt)
+    assert_eq!(driver.poll(id), pvx_abi::actor::Status::Done);
+
+    // Verify the store captured the snapshot at checkpoint time
+    let snapshot = driver.store.load(iid).unwrap().expect("snapshot should exist");
+    // The snapshot memory should contain our marker
+    assert_eq!(snapshot.flat_mem[0], 0x42);
 }

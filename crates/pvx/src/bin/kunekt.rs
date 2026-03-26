@@ -86,7 +86,7 @@ fn main() {
     for (name, blob_idx) in &blob_indices {
         match sched.spawn() {
             Some(id) => {
-                let status = sched.driver_mut().spawn_blob(id, *blob_idx);
+                let status = sched.driver_mut().spawn_blob(id, *blob_idx, None);
                 eprintln!("  spawned '{name}' as actor {id:?} — {status:?}");
             }
             None => {

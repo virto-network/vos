@@ -94,6 +94,9 @@ impl SyscallHandler {
                 buf_ptr: args.a0,
                 buf_len: args.a1,
             },
+
+            // Checkpoint is handled directly in the PVM driver (needs PVM access)
+            Syscall::Checkpoint => SyscallResult::Value(0),
         }
     }
 

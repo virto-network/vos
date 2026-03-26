@@ -59,3 +59,10 @@ pub fn send(target: u32, msg: &[u8]) -> i32 {
 pub fn recv(buf: &mut [u8]) -> i32 {
     syscall2(Syscall::Recv, buf.as_mut_ptr() as i64, buf.len() as i64) as i32
 }
+
+/// Request a state checkpoint — the executor persists the actor's PVM snapshot.
+/// Returns 0 on success.
+#[inline]
+pub fn checkpoint() -> i32 {
+    syscall1(Syscall::Checkpoint, 0) as i32
+}
