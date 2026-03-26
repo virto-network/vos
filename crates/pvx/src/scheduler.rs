@@ -93,8 +93,8 @@ impl<Msg, D: Driver<Msg>, const N: usize, const MC: usize> Scheduler<Msg, D, N, 
 
         self.registry.tick(|id, state, msg| {
             let status = match (state, msg) {
-                (ActorState::Suspended, _) => driver.poll(id),
-                (ActorState::Running, Some(msg)) => driver.handle(id, msg),
+                (_, Some(msg)) => driver.handle(id, msg),
+                (ActorState::Suspended, None) => driver.poll(id),
                 _ => Status::Ready,
             };
 

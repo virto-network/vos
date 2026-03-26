@@ -114,8 +114,9 @@ impl<Msg, const N: usize, const MAILBOX_CAP: usize> ActorRegistry<Msg, N, MAILBO
             match entry.state {
                 ActorState::Stopped | ActorState::Created => continue,
                 ActorState::Suspended => {
-                    // Resume suspended actor (no new message)
-                    let status = f(entry.id, entry.state, None);
+                    // If there's a pending message, deliver it (resume + message)
+                    let msg = entry.mailbox.pop();
+                    let status = f(entry.id, entry.state, msg.as_ref());
                     entry.state = match status {
                         Status::Ready => ActorState::Running,
                         Status::Pending => ActorState::Suspended,

@@ -31,6 +31,8 @@ struct PvmActor {
     pvm: Pvm,
     /// Whether the actor is suspended mid-execution (hit a Yield host-call).
     suspended: bool,
+    /// Message waiting to be delivered via the next Recv syscall.
+    pending_msg: Option<RawMsg>,
 }
 
 /// PVM driver managing child actor PVM instances.
@@ -88,6 +90,7 @@ impl PvmDriver {
         self.actors[idx] = Some(PvmActor {
             pvm,
             suspended: false,
+            pending_msg: None,
         });
         // Return Pending → Scheduler sets state to Suspended → tick will poll
         Status::Pending
@@ -210,12 +213,17 @@ impl PvmDriver {
                             actor.pvm.registers[7] = 0; // success
                         }
                         SyscallResult::Recv { buf_ptr, buf_len } => {
-                            // Recv is handled by writing the message data
-                            // before calling run_actor (via handle()).
-                            // If the actor calls recv() during execution,
-                            // there's no message yet — return 0 (no message).
-                            let _ = (buf_ptr, buf_len);
-                            actor.pvm.registers[7] = 0;
+                            if let Some(msg) = actor.pending_msg.take() {
+                                let data = &msg.data;
+                                let copy_len = data.len().min(buf_len as usize);
+                                for (i, &byte) in data[..copy_len].iter().enumerate() {
+                                    actor.pvm.write_u8(buf_ptr as u32 + i as u32, byte);
+                                }
+                                actor.pvm.registers[7] = copy_len as u64;
+                            } else {
+                                // No message pending
+                                actor.pvm.registers[7] = 0;
+                            }
                         }
                     }
                     // Continue execution after handling the host-call
@@ -284,18 +292,10 @@ impl Driver<RawMsg> for PvmDriver {
             None => return Status::Error,
         };
 
-        // Write the message into guest memory at a known location.
-        // Convention: message buffer starts at a fixed address that
-        // the child reads via recv(). For now, write to the argument
-        // region and set registers to point to it.
-        let msg_addr = 0x1000u32; // after stack
-        for (i, &byte) in msg.data.iter().enumerate() {
-            actor.pvm.write_u8(msg_addr + i as u32, byte);
-        }
-
-        // Set a0 = msg_ptr, a1 = msg_len for the handle entry point
-        actor.pvm.registers[7] = msg_addr as u64;
-        actor.pvm.registers[8] = msg.data.len() as u64;
+        // Store the message — the actor retrieves it via the Recv syscall.
+        actor.pending_msg = Some(RawMsg {
+            data: msg.data.clone(),
+        });
 
         self.run_actor(id)
     }

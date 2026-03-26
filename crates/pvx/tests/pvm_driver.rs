@@ -288,3 +288,67 @@ fn scheduler_send_routes_to_mailbox() {
     assert_eq!(header.sender, sender_id);
     assert_eq!(msg.payload(), b"PING");
 }
+
+/// Program that calls Recv into a buffer at addr 0, stores the return
+/// value (bytes received) at addr 256, then yields (so memory can be inspected).
+fn program_recv_and_store() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+    // First yield — let the executor deliver a message to us
+    asm.ecalli(Syscall::Yield as u32);
+    // Recv: a0=buf_ptr, a1=buf_len
+    asm.load_imm(Reg::A0, 0);   // buf at addr 0
+    asm.load_imm(Reg::A1, 128); // buf_len
+    asm.ecalli(Syscall::Recv as u32);
+    // a0 now has bytes received — store at addr 256
+    asm.store_u64(Reg::A0, 256);
+    // Yield again so the test can inspect memory before the actor is dropped
+    asm.ecalli(Syscall::Yield as u32);
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+#[test]
+fn scheduler_send_recv_round_trip() {
+    use pvx::MemoryAccess;
+    use pvx_abi::msg::Header;
+
+    let sender_blob = program_send_to(2);
+    let receiver_blob = program_recv_and_store();
+    let mut driver = PvmDriver::new();
+    let sender_idx = driver.register_blob(sender_blob);
+    let receiver_idx = driver.register_blob(receiver_blob);
+
+    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
+
+    let sender_id = sched.spawn().unwrap(); // ActorId(1)
+    sched.driver_mut().spawn_blob(sender_id, sender_idx);
+    let receiver_id = sched.spawn().unwrap(); // ActorId(2)
+    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
+
+    // Tick 1: sender sends "PING" → halts. receiver yields → suspended.
+    // drain_sends routes message to receiver's mailbox.
+    assert_eq!(sched.tick(), TickResult::Progress);
+
+    // Tick 2: receiver has a pending message → handle() stores it as pending_msg,
+    // then run_actor resumes. Receiver calls Recv → gets the data → stores len → yields.
+    assert_eq!(sched.tick(), TickResult::Progress);
+
+    // Read the bytes-received count from addr 256
+    let mut count_buf = [0u8; 8];
+    sched.driver().read_guest(receiver_id, 256, &mut count_buf);
+    let bytes_received = u64::from_le_bytes(count_buf);
+    let expected_len = Header::SIZE + 4; // header(8) + "PING"(4)
+    assert_eq!(bytes_received as usize, expected_len);
+
+    // Read the actual message data from addr 0
+    let mut msg_buf = [0u8; 64];
+    sched.driver().read_guest(receiver_id, 0, &mut msg_buf[..expected_len]);
+
+    // Parse: Header + payload
+    let header = Header::from_bytes(&msg_buf).unwrap();
+    assert_eq!(header.sender, sender_id);
+    assert_eq!(header.payload_len, 4);
+    let payload = &msg_buf[Header::SIZE..Header::SIZE + 4];
+    assert_eq!(payload, b"PING");
+}
