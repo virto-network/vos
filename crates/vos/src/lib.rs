@@ -37,10 +37,10 @@ pub mod actors;
 
 // Re-export core actor types at crate root for `use vos::*`
 pub use actors::{Actor, Message, Context, Executor, Progress, Mailbox, Yield, block_on, metadata};
+#[cfg(feature = "macros")]
+pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "guest")]
 pub use actors::main_loop;
-#[cfg(feature = "macros")]
-pub use vos_macros::{actor, messages};
 
 // --- Runtime infrastructure ---
 
