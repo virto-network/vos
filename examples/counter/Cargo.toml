@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pvx-actors = { path = "../../crates/pvx-actors", features = ["pvx-actors-macros", "guest"] }
+vos-actors = { path = "../../crates/vos-actors", features = ["vos-actors-macros", "guest"] }
 
 [profile.release]
 opt-level = "s"

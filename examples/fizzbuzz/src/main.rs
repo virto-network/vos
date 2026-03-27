@@ -2,7 +2,7 @@
 //!
 //! Demonstrates an actor with internal state and conditional logic.
 
-use pvx_actors::{Actor, messages};
+use vos_actors::{Actor, messages};
 
 static OUTPUTS: [&str; 15] = [
     "1", "2", "fizz", "4", "buzz",

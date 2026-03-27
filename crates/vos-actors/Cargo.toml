@@ -1,0 +1,18 @@
+[package]
+name = "vos-actors"
+description = "Minimal no_std actor framework for VOS — JAR-aligned actor lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+vos-actors-macros = ["dep:vos-actors-macros"]
+guest = ["dep:vos-abi", "vos-abi/guest"]
+
+[dependencies]
+vos-actors-macros = { path = "../vos-actors-macros", optional = true }
+vos-abi = { path = "../vos-abi", optional = true }
+rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]

@@ -2,7 +2,7 @@
 //!
 //! Demonstrates stateful actors with constructor args and multiple message types.
 
-use pvx_actors::{Actor, messages};
+use vos_actors::{Actor, messages};
 
 #[derive(Actor)]
 struct Counter {

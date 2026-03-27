@@ -2,7 +2,7 @@
 //!
 //! Demonstrates a stateless actor with `#[derive(Actor)]` and `#[messages]`.
 
-use pvx_actors::{Actor, messages};
+use vos_actors::{Actor, messages};
 
 #[derive(Actor)]
 struct Greeter;

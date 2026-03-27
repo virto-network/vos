@@ -1,0 +1,26 @@
+[package]
+name = "vos"
+description = "VOS runtime — JAR-aligned PVM executor for VOS actors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd"]
+
+[dependencies]
+vos-abi = { path = "../vos-abi" }
+vos-actors = { path = "../vos-actors" }
+
+# std-only: PVM runtime, manifest parsing, and blake2b hashing
+javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }
+grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler", optional = true }
+toml = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+blake2b_simd = { version = "1", optional = true }
+
+[[bin]]
+name = "vosx"
+path = "src/bin/vosx.rs"
+required-features = ["std"]
