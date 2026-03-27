@@ -3,7 +3,7 @@ name = "examples"
 
 [[actors]]
 name = "vos-agent"
-path = "vos-agent/target/riscv64em-javm/release/vos-agent.elf"
+path = "../crates/vos-agent/target/riscv64em-javm/release/vos-agent.elf"
 
 [[actors]]
 name = "greeter"
