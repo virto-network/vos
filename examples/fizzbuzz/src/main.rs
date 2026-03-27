@@ -11,6 +11,12 @@ static OUTPUTS: [&str; 15] = [
 ];
 
 #[derive(Actor)]
+#[derive(
+    vos_actors::rkyv::Archive,
+    vos_actors::rkyv::Serialize,
+    vos_actors::rkyv::Deserialize,
+)]
+#[rkyv(crate = vos_actors::rkyv)]
 struct FizzBuzz {
     position: u8,
 }

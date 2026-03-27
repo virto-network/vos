@@ -3,10 +3,33 @@
 version = 4
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "blake2b_simd"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "constant_time_eq",
+]
 
 [[package]]
 name = "block-buffer"
@@ -22,6 +45,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "cpufeatures"
@@ -189,48 +218,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "pvx"
-version = "0.1.0"
-dependencies = [
- "grey-transpiler",
- "javm",
- "pvx-abi",
- "pvx-actors",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "pvx-abi"
-version = "0.1.0"
-
-[[package]]
-name = "pvx-actors"
-version = "0.1.0"
-dependencies = [
- "pvx-abi",
- "pvx-actors-macros",
- "pvx-scape",
- "rkyv",
-]
-
-[[package]]
-name = "pvx-actors-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "pvx-scape"
-version = "0.1.0"
-dependencies = [
- "pvx-abi",
 ]
 
 [[package]]
@@ -468,6 +455,41 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vos"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "grey-transpiler",
+ "javm",
+ "serde",
+ "toml",
+ "vos-abi",
+ "vos-actors",
+]
+
+[[package]]
+name = "vos-abi"
+version = "0.1.0"
+
+[[package]]
+name = "vos-actors"
+version = "0.1.0"
+dependencies = [
+ "rkyv",
+ "vos-abi",
+ "vos-actors-macros",
+]
+
+[[package]]
+name = "vos-actors-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "winnow"

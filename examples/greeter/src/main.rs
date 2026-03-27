@@ -5,6 +5,12 @@
 use vos_actors::{Actor, messages};
 
 #[derive(Actor)]
+#[derive(
+    vos_actors::rkyv::Archive,
+    vos_actors::rkyv::Serialize,
+    vos_actors::rkyv::Deserialize,
+)]
+#[rkyv(crate = vos_actors::rkyv)]
 struct Greeter;
 
 #[messages]

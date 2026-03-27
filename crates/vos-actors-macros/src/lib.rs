@@ -341,7 +341,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         (init_struct_def, deser, call)
     };
 
-    // Generate _start entry point
+    let archived_actor_name = format_ident!("Archived{}", actor_name);
+
+    // Generate _start entry point with save/load closures for state persistence
     let start_fn = quote! {
         extern crate alloc;
 
@@ -361,6 +363,16 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     vos_actors::block_on(async {
                         unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await; }
                     });
+                },
+                |__actor| {
+                    let bytes = vos_actors::rkyv::to_bytes::<vos_actors::rkyv::rancor::Error>(__actor).unwrap();
+                    bytes.to_vec()
+                },
+                |__bytes| {
+                    let archived = unsafe {
+                        vos_actors::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
+                    };
+                    vos_actors::rkyv::deserialize::<#actor_name, vos_actors::rkyv::rancor::Error>(archived).unwrap()
                 },
             );
         }
