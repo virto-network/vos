@@ -1,37 +1,37 @@
-//! Supervisor actor — manages service registry and blob storage.
+//! Supervisor / VOS Agent — manages service registry and blob storage.
 //!
-//! The supervisor is a regular VOS actor that would be compiled to RISC-V
-//! and transpiled to PVM, running as PVM-in-PVM. For now, vosx uses the
-//! VosRuntime directly, but this source defines the supervisor's message
-//! interface for when it becomes a cross-compiled actor.
+//! The agent is a regular VOS actor compiled to RISC-V and transpiled to PVM,
+//! running as PVM-in-PVM inside vosx. See `examples/vos-agent/` for the
+//! implementation.
 //!
 //! ## Messages
 //!
-//! - `RegisterBlob(blob)` → stores blob, returns code hash
-//! - `SpawnService(code_hash)` → creates new service from blob
+//! - `RegisterBlob(blob)` → stores blob in registry, returns code hash
+//! - `SpawnService(code_hash)` → creates new service from registered blob
 //! - `Route(target, payload)` → forwards payload to target service
+//! - `Status` → reports agent status
 //!
-//! ## Future: cross-compiled supervisor
+//! ## Integration with vosx
+//!
+//! When cross-compilation is set up, vosx loads the pre-built agent blob as
+//! service 0. The agent manages child services: blob registration, spawning,
+//! and message routing.
 //!
 //! ```ignore
-//! use vos_actors::{Actor, messages};
+//! use vos::{Actor, messages};
 //!
 //! #[derive(Actor)]
-//! #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-//! pub struct Supervisor {
-//!     services: BTreeMap<ServiceId, ServiceState>,
-//!     blob_registry: BTreeMap<[u8; 32], Vec<u8>>,
+//! struct Agent {
+//!     blob_count: u32,
+//!     service_count: u32,
 //! }
 //!
 //! #[messages]
-//! impl Supervisor {
+//! impl Agent {
 //!     fn new() -> Self { ... }
-//!     #[msg] async fn register_blob(&mut self, blob: Vec<u8>, ctx: &mut Context<Self>) -> [u8; 32] { ... }
-//!     #[msg] async fn spawn_service(&mut self, code_hash: [u8; 32], ctx: &mut Context<Self>) -> u32 { ... }
+//!     #[msg] async fn register_blob(&mut self, blob: Vec<u8>, ctx: &mut Context<Self>) { ... }
+//!     #[msg] async fn spawn_service(&mut self, code_hash: Vec<u8>, ctx: &mut Context<Self>) { ... }
 //!     #[msg] async fn route(&mut self, target: u32, payload: Vec<u8>, ctx: &mut Context<Self>) { ... }
+//!     #[msg] async fn status(&self, _ctx: &mut Context<Self>) { ... }
 //! }
 //! ```
-//!
-//! When cross-compilation is set up, this will be built as a RISC-V binary,
-//! transpiled to PVM, and embedded in vosx. The VosRuntime will load it as
-//! service 0 (the supervisor service).

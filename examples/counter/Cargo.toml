@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-vos-actors = { path = "../../crates/vos-actors", features = ["vos-actors-macros", "guest"] }
+vos = { path = "../../crates/vos", default-features = false, features = ["macros", "guest"] }
 
 [profile.release]
 opt-level = "s"

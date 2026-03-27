@@ -1,4 +1,4 @@
-use crate::Actor;
+use super::Actor;
 use alloc::vec::Vec;
 
 /// Execution context passed to message handlers.
@@ -14,9 +14,7 @@ pub struct Context<A: Actor> {
     _phantom: core::marker::PhantomData<A>,
 }
 
-/// Service identifier within the VOS runtime.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ServiceId(pub u32);
+pub use vos_abi::service::ServiceId;
 
 /// A queued transfer to another service.
 struct PendingSend {

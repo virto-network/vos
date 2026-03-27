@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use vos_actors::{Actor, Context, Executor, Mailbox, Progress};
-use vos_actors::context::ServiceId;
+use vos::{Actor, Context, Executor, Mailbox, Progress};
+use vos::actors::context::ServiceId;
 
 // -- Actor definition --
 
@@ -22,7 +22,7 @@ struct GetCount;
 
 struct Reset;
 
-impl vos_actors::Message<Increment> for Counter {
+impl vos::Message<Increment> for Counter {
     type Reply = i32;
     async fn handle(&mut self, msg: Increment, _ctx: &mut Context<Self>) -> Result<i32, ()> {
         self.count += msg.amount;
@@ -30,14 +30,14 @@ impl vos_actors::Message<Increment> for Counter {
     }
 }
 
-impl vos_actors::Message<GetCount> for Counter {
+impl vos::Message<GetCount> for Counter {
     type Reply = i32;
     async fn handle(&mut self, _msg: GetCount, _ctx: &mut Context<Self>) -> Result<i32, ()> {
         Ok(self.count)
     }
 }
 
-impl vos_actors::Message<Reset> for Counter {
+impl vos::Message<Reset> for Counter {
     type Reply = ();
     async fn handle(&mut self, _msg: Reset, _ctx: &mut Context<Self>) -> Result<(), ()> {
         self.count = 0;
@@ -57,13 +57,13 @@ impl CounterMsg {
     async fn deliver(self, actor: &mut Counter, ctx: &mut Context<Counter>) {
         match self {
             CounterMsg::Increment(msg) => {
-                let _ = <Counter as vos_actors::Message<Increment>>::handle(actor, msg, ctx).await;
+                let _ = <Counter as vos::Message<Increment>>::handle(actor, msg, ctx).await;
             }
             CounterMsg::GetCount(msg) => {
-                let _ = <Counter as vos_actors::Message<GetCount>>::handle(actor, msg, ctx).await;
+                let _ = <Counter as vos::Message<GetCount>>::handle(actor, msg, ctx).await;
             }
             CounterMsg::Reset(msg) => {
-                let _ = <Counter as vos_actors::Message<Reset>>::handle(actor, msg, ctx).await;
+                let _ = <Counter as vos::Message<Reset>>::handle(actor, msg, ctx).await;
             }
         }
     }

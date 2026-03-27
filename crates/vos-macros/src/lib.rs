@@ -1,4 +1,4 @@
-//! Proc macros for `vos-actors`.
+//! Proc macros for `vos`.
 //!
 //! - `#[derive(Actor)]` — implements the `Actor` trait with default lifecycle hooks,
 //!   and adds rkyv derives for state persistence
@@ -60,7 +60,7 @@ pub fn derive_actor(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let expanded = quote! {
-        impl #impl_generics vos_actors::Actor for #name #ty_generics #where_clause {
+        impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
         }
     };
@@ -175,21 +175,21 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let msg_struct = if field_names.is_empty() {
             quote! {
                 #[derive(
-                    vos_actors::rkyv::Archive,
-                    vos_actors::rkyv::Serialize,
-                    vos_actors::rkyv::Deserialize,
+                    vos::rkyv::Archive,
+                    vos::rkyv::Serialize,
+                    vos::rkyv::Deserialize,
                 )]
-                #[rkyv(crate = vos_actors::rkyv)]
+                #[rkyv(crate = vos::rkyv)]
                 pub struct #struct_name;
             }
         } else {
             quote! {
                 #[derive(
-                    vos_actors::rkyv::Archive,
-                    vos_actors::rkyv::Serialize,
-                    vos_actors::rkyv::Deserialize,
+                    vos::rkyv::Archive,
+                    vos::rkyv::Serialize,
+                    vos::rkyv::Deserialize,
                 )]
-                #[rkyv(crate = vos_actors::rkyv)]
+                #[rkyv(crate = vos::rkyv)]
                 pub struct #struct_name {
                     #( pub #field_names: #field_types ),*
                 }
@@ -206,12 +206,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let msg_impl = quote! {
-            impl vos_actors::Message<#struct_name> for #actor_name {
+            impl vos::Message<#struct_name> for #actor_name {
                 type Reply = #reply_ty;
                 async fn handle(
                     &mut self,
                     msg: #struct_name,
-                    ctx: &mut vos_actors::Context<Self>,
+                    ctx: &mut vos::Context<Self>,
                 ) -> Result<Self::Reply, Self::Error> {
                     #field_binds
                     Ok(#body)
@@ -226,15 +226,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Deliver arm
         deliver_arms.push(quote! {
             #enum_name::#struct_name(msg) => {
-                let _ = <#actor_name as vos_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                let _ = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
             }
         });
 
         // Dispatch arm (deserialize from archived)
         dispatch_arms.push(quote! {
             #archived_enum_name::#struct_name(archived) => {
-                let msg: #struct_name = vos_actors::rkyv::deserialize::<#struct_name, vos_actors::rkyv::rancor::Error>(archived).unwrap();
-                let _ = <#actor_name as vos_actors::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                let msg: #struct_name = vos::rkyv::deserialize::<#struct_name, vos::rkyv::rancor::Error>(archived).unwrap();
+                let _ = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
             }
         });
 
@@ -253,7 +253,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let name_str = name.to_string();
                 let ty_str = quote!(#ty).to_string();
                 quote! {
-                    vos_actors::metadata::FieldMeta {
+                    vos::metadata::FieldMeta {
                         name: #name_str,
                         ty: #ty_str,
                     }
@@ -261,7 +261,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             })
             .collect();
         meta_messages.push(quote! {
-            vos_actors::metadata::MessageMeta {
+            vos::metadata::MessageMeta {
                 name: #msg_name_str,
                 is_query: #query_val,
                 fields: &[ #( #field_metas ),* ],
@@ -293,21 +293,21 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let init_struct_def = if ctor_field_names.is_empty() {
             quote! {
                 #[derive(
-                    vos_actors::rkyv::Archive,
-                    vos_actors::rkyv::Serialize,
-                    vos_actors::rkyv::Deserialize,
+                    vos::rkyv::Archive,
+                    vos::rkyv::Serialize,
+                    vos::rkyv::Deserialize,
                 )]
-                #[rkyv(crate = vos_actors::rkyv)]
+                #[rkyv(crate = vos::rkyv)]
                 pub struct #init_struct_name;
             }
         } else {
             quote! {
                 #[derive(
-                    vos_actors::rkyv::Archive,
-                    vos_actors::rkyv::Serialize,
-                    vos_actors::rkyv::Deserialize,
+                    vos::rkyv::Archive,
+                    vos::rkyv::Serialize,
+                    vos::rkyv::Deserialize,
                 )]
-                #[rkyv(crate = vos_actors::rkyv)]
+                #[rkyv(crate = vos::rkyv)]
                 pub struct #init_struct_name {
                     #( pub #ctor_field_names: #ctor_field_types ),*
                 }
@@ -321,10 +321,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {
                 let __archived = unsafe {
-                    vos_actors::rkyv::access_unchecked::<#archived_init_name>(__payload)
+                    vos::rkyv::access_unchecked::<#archived_init_name>(__payload)
                 };
                 let #init_struct_name { #( #ctor_field_names ),* } =
-                    vos_actors::rkyv::deserialize::<#init_struct_name, vos_actors::rkyv::rancor::Error>(__archived).unwrap();
+                    vos::rkyv::deserialize::<#init_struct_name, vos::rkyv::rancor::Error>(__archived).unwrap();
             }
         };
 
@@ -348,31 +348,31 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         extern crate alloc;
 
         #[allow(unused_imports)]
-        use vos_actors::{print, println, eprint, eprintln};
+        use vos::{print, println, eprint, eprintln};
         #[allow(unused_imports)]
         use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
-            vos_actors::main_loop::<#actor_name>(
+            vos::main_loop::<#actor_name>(
                 |__payload| {
                     #init_deserialize
                     #ctor_call
                 },
                 |__payload, __actor, __ctx| {
-                    vos_actors::block_on(async {
+                    vos::block_on(async {
                         unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await; }
                     });
                 },
                 |__actor| {
-                    let bytes = vos_actors::rkyv::to_bytes::<vos_actors::rkyv::rancor::Error>(__actor).unwrap();
+                    let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(__actor).unwrap();
                     bytes.to_vec()
                 },
                 |__bytes| {
                     let archived = unsafe {
-                        vos_actors::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
+                        vos::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
                     };
-                    vos_actors::rkyv::deserialize::<#actor_name, vos_actors::rkyv::rancor::Error>(archived).unwrap()
+                    vos::rkyv::deserialize::<#actor_name, vos::rkyv::rancor::Error>(archived).unwrap()
                 },
             );
         }
@@ -381,28 +381,28 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate the aggregated enum
     let aggregated_enum = quote! {
         #[derive(
-            vos_actors::rkyv::Archive,
-            vos_actors::rkyv::Serialize,
-            vos_actors::rkyv::Deserialize,
+            vos::rkyv::Archive,
+            vos::rkyv::Serialize,
+            vos::rkyv::Deserialize,
         )]
-        #[rkyv(crate = vos_actors::rkyv)]
+        #[rkyv(crate = vos::rkyv)]
         pub enum #enum_name {
             #( #enum_variants ),*
         }
 
         impl #enum_name {
-            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos_actors::Context<#actor_name>) {
+            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) {
                 match self {
                     #( #deliver_arms )*
                 }
             }
 
-            pub fn to_bytes(&self) -> vos_actors::rkyv::util::AlignedVec {
-                vos_actors::rkyv::to_bytes::<vos_actors::rkyv::rancor::Error>(self).unwrap()
+            pub fn to_bytes(&self) -> vos::rkyv::util::AlignedVec {
+                vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(self).unwrap()
             }
 
-            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut vos_actors::Context<#actor_name>) {
-                let archived = unsafe { vos_actors::rkyv::access_unchecked::<#archived_enum_name>(bytes) };
+            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) {
+                let archived = unsafe { vos::rkyv::access_unchecked::<#archived_enum_name>(bytes) };
                 match archived {
                     #( #dispatch_arms )*
                 }
@@ -414,7 +414,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            pub const META: vos_actors::metadata::ActorMeta = vos_actors::metadata::ActorMeta {
+            pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
             };

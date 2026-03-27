@@ -2,7 +2,7 @@
 //!
 //! Demonstrates an actor with internal state and conditional logic.
 
-use vos_actors::{Actor, messages};
+use vos::{Actor, messages};
 
 static OUTPUTS: [&str; 15] = [
     "1", "2", "fizz", "4", "buzz",
@@ -12,11 +12,11 @@ static OUTPUTS: [&str; 15] = [
 
 #[derive(Actor)]
 #[derive(
-    vos_actors::rkyv::Archive,
-    vos_actors::rkyv::Serialize,
-    vos_actors::rkyv::Deserialize,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
 )]
-#[rkyv(crate = vos_actors::rkyv)]
+#[rkyv(crate = vos::rkyv)]
 struct FizzBuzz {
     position: u8,
 }

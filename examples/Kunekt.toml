@@ -2,6 +2,10 @@
 name = "examples"
 
 [[actors]]
+name = "vos-agent"
+path = "vos-agent/target/riscv64em-javm/release/vos-agent.elf"
+
+[[actors]]
 name = "greeter"
 path = "greeter/target/riscv64em-javm/release/greeter.elf"
 

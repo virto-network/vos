@@ -463,10 +463,11 @@ dependencies = [
  "blake2b_simd",
  "grey-transpiler",
  "javm",
+ "rkyv",
  "serde",
  "toml",
  "vos-abi",
- "vos-actors",
+ "vos-macros",
 ]
 
 [[package]]
@@ -474,16 +475,7 @@ name = "vos-abi"
 version = "0.1.0"
 
 [[package]]
-name = "vos-actors"
-version = "0.1.0"
-dependencies = [
- "rkyv",
- "vos-abi",
- "vos-actors-macros",
-]
-
-[[package]]
-name = "vos-actors-macros"
+name = "vos-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",

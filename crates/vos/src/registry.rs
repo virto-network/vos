@@ -1,7 +1,7 @@
 //! Service registry — manages the lifecycle of VOS services.
 
 use vos_abi::service::ServiceId;
-use vos_actors::Mailbox;
+use crate::actors::Mailbox;
 
 /// State of a registered service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

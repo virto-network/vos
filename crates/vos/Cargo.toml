@@ -8,10 +8,13 @@ license.workspace = true
 [features]
 default = ["std"]
 std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd"]
+macros = ["dep:vos-macros"]
+guest = ["vos-abi/guest"]
 
 [dependencies]
 vos-abi = { path = "../vos-abi" }
-vos-actors = { path = "../vos-actors" }
+vos-macros = { path = "../vos-macros", optional = true }
+rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 
 # std-only: PVM runtime, manifest parsing, and blake2b hashing
 javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }

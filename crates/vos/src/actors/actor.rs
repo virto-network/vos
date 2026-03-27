@@ -1,4 +1,4 @@
-use crate::Context;
+use super::Context;
 
 /// The core actor trait. An actor is an independent unit of computation
 /// that processes messages sequentially with exclusive access to its state.

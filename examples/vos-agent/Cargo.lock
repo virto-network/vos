@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "greeter"
-version = "0.1.0"
-dependencies = [
- "vos",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -158,6 +151,13 @@ dependencies = [
 [[package]]
 name = "vos-abi"
 version = "0.1.0"
+
+[[package]]
+name = "vos-agent"
+version = "0.1.0"
+dependencies = [
+ "vos",
+]
 
 [[package]]
 name = "vos-macros"

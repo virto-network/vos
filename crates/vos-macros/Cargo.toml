@@ -1,6 +1,6 @@
 [package]
-name = "vos-actors-macros"
-description = "Derive macros for vos-actors: #[derive(Actor)] and #[messages]"
+name = "vos-macros"
+description = "Derive macros for vos actors: #[derive(Actor)] and #[messages]"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

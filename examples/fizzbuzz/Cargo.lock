@@ -6,7 +6,7 @@ version = 4
 name = "fizzbuzz"
 version = "0.1.0"
 dependencies = [
- "pvx-actors",
+ "vos",
 ]
 
 [[package]]
@@ -62,36 +62,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "pvx-abi"
-version = "0.1.0"
-
-[[package]]
-name = "pvx-actors"
-version = "0.1.0"
-dependencies = [
- "pvx-abi",
- "pvx-actors-macros",
- "pvx-scape",
- "rkyv",
-]
-
-[[package]]
-name = "pvx-actors-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "pvx-scape"
-version = "0.1.0"
-dependencies = [
- "pvx-abi",
 ]
 
 [[package]]
@@ -175,3 +145,25 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "vos"
+version = "0.1.0"
+dependencies = [
+ "rkyv",
+ "vos-abi",
+ "vos-macros",
+]
+
+[[package]]
+name = "vos-abi"
+version = "0.1.0"
+
+[[package]]
+name = "vos-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]

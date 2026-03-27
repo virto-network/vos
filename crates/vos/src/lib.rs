@@ -27,6 +27,23 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(async_fn_in_trait)]
 
+extern crate alloc;
+
+pub use rkyv;
+
+// --- Actor framework (always available, no_std compatible) ---
+
+pub mod actors;
+
+// Re-export core actor types at crate root for `use vos::*`
+pub use actors::{Actor, Message, Context, Executor, Progress, Mailbox, Yield, block_on, metadata};
+#[cfg(feature = "guest")]
+pub use actors::main_loop;
+#[cfg(feature = "macros")]
+pub use vos_macros::{Actor, messages};
+
+// --- Runtime infrastructure ---
+
 pub mod registry;
 pub mod scheduler;
 pub mod hostcall_handler;
@@ -40,3 +57,10 @@ pub mod runtime;
 pub mod supervisor;
 
 pub use hostcall_handler::MemoryAccess;
+
+/// Re-export for use by generated print!/println! macros.
+#[cfg(feature = "guest")]
+#[doc(hidden)]
+pub mod __io {
+    pub use vos_abi::guest::hostcalls::debug_write;
+}
