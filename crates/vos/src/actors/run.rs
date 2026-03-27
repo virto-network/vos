@@ -92,7 +92,7 @@ const STATE_KEY: &[u8] = b"__vos_actor_state";
 #[cfg(feature = "guest")]
 pub fn main_loop<A: super::Actor>(
     init: impl FnOnce(&[u8]) -> A,
-    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>),
+    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>) -> bool,
     save: impl Fn(&A) -> alloc::vec::Vec<u8>,
     load: impl Fn(&[u8]) -> A,
 ) {
@@ -127,8 +127,9 @@ pub fn main_loop<A: super::Actor>(
             break; // No more items
         }
         let payload = &buf[..n as usize];
-        dispatch(payload, &mut actor, &mut ctx);
+        let stop = dispatch(payload, &mut actor, &mut ctx);
         ctx.flush_effects();
+        if stop { break; }
     }
 
     // Step 3: Persist state and halt

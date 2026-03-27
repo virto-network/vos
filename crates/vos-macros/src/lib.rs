@@ -261,7 +261,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Deliver arm
         deliver_arms.push(quote! {
             #enum_name::#struct_name(msg) => {
-                let _ = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
+                    Ok(_) => false,
+                    Err(e) => vos::Actor::on_error(actor, &e),
+                }
             }
         });
 
@@ -269,7 +272,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         dispatch_arms.push(quote! {
             #archived_enum_name::#struct_name(archived) => {
                 let msg: #struct_name = vos::rkyv::deserialize::<#struct_name, vos::rkyv::rancor::Error>(archived).unwrap();
-                let _ = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
+                    Ok(_) => false,
+                    Err(e) => vos::Actor::on_error(actor, &e),
+                }
             }
         });
 
@@ -394,10 +400,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     #init_deserialize
                     #ctor_call
                 },
-                |__payload, __actor, __ctx| {
+                |__payload, __actor, __ctx| -> bool {
                     vos::block_on(async {
-                        unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await; }
-                    });
+                        unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await }
+                    })
                 },
                 |__actor| {
                     let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(__actor).unwrap();
@@ -426,7 +432,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl #enum_name {
-            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) {
+            /// Dispatch this message to the actor. Returns `true` if the actor
+            /// should stop processing further messages (i.e. `on_error` returned `true`).
+            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) -> bool {
                 match self {
                     #( #deliver_arms )*
                 }
@@ -436,7 +444,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(self).unwrap()
             }
 
-            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) {
+            /// Deserialize and dispatch a message from bytes. Returns `true` if the
+            /// actor should stop processing further messages.
+            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) -> bool {
                 let archived = unsafe { vos::rkyv::access_unchecked::<#archived_enum_name>(bytes) };
                 match archived {
                     #( #dispatch_arms )*
