@@ -1,16 +1,10 @@
 //! Greeter actor — responds to Greet messages with a personalized greeting.
 //!
-//! Demonstrates a stateless actor with `#[derive(Actor)]` and `#[messages]`.
+//! Demonstrates a stateless actor with `#[actor]` and `#[messages]`.
 
-use vos::{Actor, messages};
+use vos::{actor, messages};
 
-#[derive(Actor)]
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-)]
-#[rkyv(crate = vos::rkyv)]
+#[actor]
 struct Greeter;
 
 #[messages]

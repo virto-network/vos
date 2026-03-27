@@ -2,15 +2,9 @@
 //!
 //! Demonstrates stateful actors with constructor args and multiple message types.
 
-use vos::{Actor, messages};
+use vos::{actor, messages};
 
-#[derive(Actor)]
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-)]
-#[rkyv(crate = vos::rkyv)]
+#[actor]
 struct Counter {
     count: u8,
 }

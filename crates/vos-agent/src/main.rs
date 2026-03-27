@@ -10,7 +10,7 @@
 //! - `SpawnService(code_hash)` → creates new service from registered blob
 //! - `Route(target, payload)` → forwards payload to target service
 
-use vos::{Actor, messages};
+use vos::{actor, messages};
 
 /// Simple hash for blob identification.
 /// Returns first 32 bytes of a basic xor-rotate hash.
@@ -22,13 +22,7 @@ fn hash_blob(data: &[u8]) -> [u8; 32] {
     h
 }
 
-#[derive(Actor)]
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-)]
-#[rkyv(crate = vos::rkyv)]
+#[actor]
 struct Agent {
     /// Number of registered blobs.
     blob_count: u32,

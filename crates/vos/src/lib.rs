@@ -40,7 +40,7 @@ pub use actors::{Actor, Message, Context, Executor, Progress, Mailbox, Yield, bl
 #[cfg(feature = "guest")]
 pub use actors::main_loop;
 #[cfg(feature = "macros")]
-pub use vos_macros::{Actor, messages};
+pub use vos_macros::{actor, messages};
 
 // --- Runtime infrastructure ---
 

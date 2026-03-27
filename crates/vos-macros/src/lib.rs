@@ -6,60 +6,95 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, DeriveInput, FnArg, ImplItem, ItemImpl, Pat, ReturnType};
+use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType};
 
-/// Derive the `Actor` trait with defaults and rkyv serialization.
+/// Attribute macro that makes a struct a VOS actor.
+///
+/// Adds rkyv `Archive`/`Serialize`/`Deserialize` derives for state persistence
+/// and implements the `Actor` trait with default lifecycle hooks.
 ///
 /// ```ignore
-/// #[derive(Actor)]
+/// #[actor]
 /// struct Counter { count: i32 }
 /// ```
-///
-/// Generates:
-/// ```ignore
-/// impl Actor for Counter {
-///     type Error = ();
-/// }
-/// ```
-///
-/// Also adds rkyv Archive/Serialize/Deserialize derives for state persistence.
 ///
 /// Optionally specify the error type:
 /// ```ignore
-/// #[derive(Actor)]
 /// #[actor(error = MyError)]
 /// struct Counter { count: i32 }
 /// ```
-#[proc_macro_derive(Actor, attributes(actor))]
-pub fn derive_actor(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+#[proc_macro_attribute]
+pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemStruct);
     let name = &input.ident;
 
-    // Look for #[actor(error = Type)]
-    let error_ty = input
-        .attrs
-        .iter()
-        .find(|a| a.path().is_ident("actor"))
-        .and_then(|a| {
-            let mut ty = None;
-            a.parse_nested_meta(|meta| {
-                if meta.path.is_ident("error") {
-                    let value = meta.value()?;
-                    ty = Some(value.parse::<syn::Type>()?);
-                }
-                Ok(())
-            })
-            .ok();
-            ty
-        });
-
-    let error_ty = error_ty
-        .map(|t| quote! { #t })
-        .unwrap_or_else(|| quote! { () });
+    // Parse optional error type from #[actor(error = Type)]
+    let error_ty = if attr.is_empty() {
+        quote! { () }
+    } else {
+        let meta = syn::parse_macro_input!(attr as syn::Meta);
+        match meta {
+            syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
+                let val = &nv.value;
+                quote! { #val }
+            }
+            syn::Meta::List(list) => {
+                let mut ty = None;
+                let _ = list.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("error") {
+                        let value = meta.value()?;
+                        ty = Some(value.parse::<syn::Type>()?);
+                    }
+                    Ok(())
+                });
+                ty.map(|t| quote! { #t }).unwrap_or_else(|| quote! { () })
+            }
+            _ => quote! { () },
+        }
+    };
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let vis = &input.vis;
+    let attrs = &input.attrs;
+    let fields = &input.fields;
+
+    // Re-emit struct with rkyv derives injected
+    let struct_def = match fields {
+        syn::Fields::Named(f) => quote! {
+            #( #attrs )*
+            #[derive(
+                vos::rkyv::Archive,
+                vos::rkyv::Serialize,
+                vos::rkyv::Deserialize,
+            )]
+            #[rkyv(crate = vos::rkyv)]
+            #vis struct #name #impl_generics #where_clause #f
+        },
+        syn::Fields::Unit => quote! {
+            #( #attrs )*
+            #[derive(
+                vos::rkyv::Archive,
+                vos::rkyv::Serialize,
+                vos::rkyv::Deserialize,
+            )]
+            #[rkyv(crate = vos::rkyv)]
+            #vis struct #name #impl_generics #where_clause;
+        },
+        syn::Fields::Unnamed(f) => quote! {
+            #( #attrs )*
+            #[derive(
+                vos::rkyv::Archive,
+                vos::rkyv::Serialize,
+                vos::rkyv::Deserialize,
+            )]
+            #[rkyv(crate = vos::rkyv)]
+            #vis struct #name #impl_generics #f #where_clause;
+        },
+    };
 
     let expanded = quote! {
+        #struct_def
+
         impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
         }
