@@ -4,11 +4,11 @@
 //!     vosx [path/to/Kunekt.toml]
 //!
 //! vosx is functionally a single-node JAR chain: same hostcall semantics,
-//! same service lifecycle. For development and testing.
+//! same service lifecycle. Actor code is identical for offline (vosx) and
+//! online (JAR chain).
 
 use vos::manifest::Manifest;
-use vos::pvm_driver::{PvmDriver, RawMsg};
-use vos::scheduler::{Scheduler, TickResult};
+use vos::runtime::VosRuntime;
 use std::path::PathBuf;
 use std::process;
 
@@ -38,8 +38,8 @@ fn main() {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
 
-    let mut driver = PvmDriver::new();
-    let mut blob_indices = Vec::new();
+    let mut runtime = VosRuntime::new();
+    let mut service_ids = Vec::new();
 
     for svc_def in &manifest.actors {
         let file_path = match &svc_def.path {
@@ -78,38 +78,20 @@ fn main() {
             }
         };
 
-        let blob_idx = driver.register_blob(pvm_blob);
-        blob_indices.push((svc_def.name.clone(), blob_idx));
+        let blob_idx = runtime.register_blob(pvm_blob);
+        let id = runtime.register_service(blob_idx);
+        eprintln!("  registered '{}' as service {id:?}", svc_def.name);
+        service_ids.push((svc_def.name.clone(), id));
     }
 
-    let mut sched: Scheduler<RawMsg, PvmDriver, 64, 16> = Scheduler::new(driver);
-
-    for (name, blob_idx) in &blob_indices {
-        match sched.spawn() {
-            Some(id) => {
-                let status = sched.driver_mut().spawn_blob(id, *blob_idx);
-                eprintln!("  spawned '{name}' as service {id:?} — {status:?}");
-            }
-            None => {
-                eprintln!("error: too many services");
-                process::exit(1);
-            }
-        }
+    // Send an empty init item to each service to trigger construction
+    for (_name, id) in &service_ids {
+        runtime.send_to(*id, Vec::new());
     }
 
     eprintln!("vosx: running...\n");
 
-    loop {
-        match sched.tick() {
-            TickResult::Progress => {}
-            TickResult::Idle => {
-                eprintln!("\nvosx: all services idle, exiting");
-                break;
-            }
-            TickResult::Done => {
-                eprintln!("\nvosx: all services done");
-                break;
-            }
-        }
-    }
+    runtime.run();
+
+    eprintln!("\nvosx: done");
 }
