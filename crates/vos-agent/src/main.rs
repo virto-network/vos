@@ -22,11 +22,14 @@ fn hash_blob(data: &[u8]) -> [u8; 32] {
     h
 }
 
-#[actor]
+#[derive(Debug)]
+enum AgentError {
+    InvalidCodeHash { expected: usize, got: usize },
+}
+
+#[actor(error = AgentError)]
 struct Agent {
-    /// Number of registered blobs.
     blob_count: u32,
-    /// Number of spawned services.
     service_count: u32,
 }
 
@@ -40,31 +43,30 @@ impl Agent {
         }
     }
 
-    /// Register a code blob. Stores it as a preimage and returns the hash.
     #[msg]
     async fn register_blob(&mut self, blob: Vec<u8>, ctx: &mut Context<Self>) {
         let hash = hash_blob(&blob);
-        // Store blob keyed by hash so it can be retrieved for spawning
         ctx.store(&hash, &blob);
         self.blob_count += 1;
         println!("agent: registered blob #{} ({} bytes)", self.blob_count, blob.len());
     }
 
-    /// Spawn a new service from a previously registered code hash.
     #[msg]
-    async fn spawn_service(&mut self, code_hash: Vec<u8>, ctx: &mut Context<Self>) {
-        if code_hash.len() == 32 {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&code_hash);
-            ctx.spawn(hash);
-            self.service_count += 1;
-            println!("agent: spawned service #{}", self.service_count);
-        } else {
-            println!("agent: invalid code hash length");
+    async fn spawn_service(&mut self, code_hash: Vec<u8>, ctx: &mut Context<Self>) -> Result<()> {
+        if code_hash.len() != 32 {
+            return Err(AgentError::InvalidCodeHash {
+                expected: 32,
+                got: code_hash.len(),
+            });
         }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&code_hash);
+        ctx.spawn(hash);
+        self.service_count += 1;
+        println!("agent: spawned service #{}", self.service_count);
+        Ok(())
     }
 
-    /// Route a payload to a target service.
     #[msg]
     async fn route(&mut self, target: u32, payload: Vec<u8>, ctx: &mut Context<Self>) {
         println!("agent: routing {} bytes to service {}", payload.len(), target);
@@ -74,7 +76,6 @@ impl Agent {
         );
     }
 
-    /// Report agent status.
     #[msg]
     async fn status(&self, _ctx: &mut Context<Self>) {
         println!(

@@ -4,13 +4,13 @@
 #![allow(dead_code)]
 
 use grey_transpiler::assembler::{Assembler, Reg};
-use javm::program::initialize_program;
 use javm::ExitReason;
+use javm::program::initialize_program;
+use vos::pvm_driver::{PvmDriver, RawMsg};
+use vos::registry::Status;
+use vos::scheduler::{Driver, Scheduler, TickResult};
 use vos_abi::hostcall;
 use vos_abi::service::ServiceId;
-use vos::pvm_driver::{PvmDriver, RawMsg};
-use vos::scheduler::{Driver, Scheduler, TickResult};
-use vos::registry::Status;
 
 // -- Program builders --
 
@@ -254,7 +254,10 @@ fn scheduler_transfer_routes_to_mailbox() {
 
     // Verify the message arrived in the receiver's mailbox
     let entry = sched.registry.get(receiver_id).unwrap();
-    assert!(!entry.mailbox.is_empty(), "receiver should have a pending message");
+    assert!(
+        !entry.mailbox.is_empty(),
+        "receiver should have a pending message"
+    );
 
     let msg = entry.mailbox.peek().unwrap();
     assert_eq!(&msg.data, b"PING");
@@ -267,7 +270,7 @@ fn program_fetch_and_store() -> Vec<u8> {
     // First yield — let the runtime deliver a message
     asm.ecalli(hostcall::YIELD);
     // FETCH: a0=buf_ptr, a1=buf_len
-    asm.load_imm(Reg::A0, 0);   // buf at addr 0
+    asm.load_imm(Reg::A0, 0); // buf at addr 0
     asm.load_imm(Reg::A1, 128); // buf_len
     asm.ecalli(hostcall::FETCH);
     // a0 now has bytes received — store at addr 256

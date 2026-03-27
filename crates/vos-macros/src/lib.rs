@@ -1,7 +1,6 @@
 //! Proc macros for `vos`.
 //!
-//! - `#[derive(Actor)]` — implements the `Actor` trait with default lifecycle hooks,
-//!   and adds rkyv derives for state persistence
+//! - `#[actor]` — makes a struct a VOS actor with rkyv derives and Actor trait impl
 //! - `#[messages]` — on an `impl` block, generates message types, dispatch, and `_start`
 
 use proc_macro::TokenStream;
@@ -106,20 +105,20 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Attribute macro for impl blocks that generates message types, handlers,
 /// and the actor entry point (`_start`).
 ///
+/// ## Result type alias
+///
+/// The macro emits `type Result<T> = core::result::Result<T, <Actor as vos::Actor>::Error>`
+/// so handlers can use `Result<T>` with `?` and the actor's error type is used automatically.
+///
 /// ## Constructor
 ///
 /// A `fn new(...) -> Self` method (without `#[msg]`) defines the constructor.
 ///
 /// ## Message handlers
 ///
-/// Each method marked with `#[msg]` becomes:
-/// 1. A public struct with the method's parameters as fields (with rkyv derives)
-/// 2. A `Message<ThatStruct>` impl that delegates to the method body
-///
-/// An aggregated enum `{Actor}Msg` is generated with:
-/// - `deliver(actor, ctx)` — dispatch to handler
-/// - `to_bytes()` — serialize via rkyv
-/// - `dispatch(bytes, actor, ctx)` — zero-copy deserialize + deliver
+/// Each method marked with `#[msg]` becomes a message type. Handlers can return:
+/// - `T` — infallible, wrapped in `Ok(T)` automatically
+/// - `Result<T>` — fallible, errors propagated to `on_error`
 ///
 /// ## Generated `_start`
 ///
@@ -200,10 +199,16 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // Determine reply type
-        let reply_ty = match &method.sig.output {
-            ReturnType::Default => quote! { () },
-            ReturnType::Type(_, ty) => quote! { #ty },
+        // Determine reply type and whether handler returns Result
+        let (reply_ty, returns_result) = match &method.sig.output {
+            ReturnType::Default => (quote! { () }, false),
+            ReturnType::Type(_, ty) => {
+                if let Some(inner) = result_ok_type(ty) {
+                    (quote! { #inner }, true)
+                } else {
+                    (quote! { #ty }, false)
+                }
+            }
         };
 
         // Generate the message struct with rkyv derives
@@ -240,6 +245,19 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { let #struct_name { #( #field_names ),* } = msg; }
         };
 
+        // If handler returns Result<T>, pass through directly; otherwise wrap in Ok()
+        let handler_body = if returns_result {
+            quote! {
+                #field_binds
+                #body
+            }
+        } else {
+            quote! {
+                #field_binds
+                Ok(#body)
+            }
+        };
+
         let msg_impl = quote! {
             impl vos::Message<#struct_name> for #actor_name {
                 type Reply = #reply_ty;
@@ -247,9 +265,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     &mut self,
                     msg: #struct_name,
                     ctx: &mut vos::Context<Self>,
-                ) -> Result<Self::Reply, Self::Error> {
-                    #field_binds
-                    Ok(#body)
+                ) -> core::result::Result<Self::Reply, Self::Error> {
+                    #handler_body
                 }
             }
         };
@@ -388,6 +405,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let start_fn = quote! {
         extern crate alloc;
 
+        /// Result type alias using this actor's error type.
+        #[allow(dead_code)]
+        type Result<T> = core::result::Result<T, <#actor_name as vos::Actor>::Error>;
+
         #[allow(unused_imports)]
         use vos::{print, println, eprint, eprintln};
         #[allow(unused_imports)]
@@ -502,6 +523,22 @@ fn is_context_type(ty: &syn::Type) -> bool {
         };
     }
     false
+}
+
+/// If `ty` is `Result<T>` or `Result<T, E>`, return the `T`.
+fn result_ok_type(ty: &syn::Type) -> Option<syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
 }
 
 fn to_pascal_case(s: &str) -> String {
