@@ -42,9 +42,12 @@ pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, m
 #[cfg(feature = "guest")]
 pub use actors::main_loop;
 
-// --- Runtime infrastructure ---
+// --- Shared data structures (no_std compatible) ---
 
 pub mod registry;
+
+// --- Runtime infrastructure (host-only) ---
+
 pub mod scheduler;
 pub mod hostcall_handler;
 
@@ -54,7 +57,6 @@ pub mod manifest;
 pub mod pvm_driver;
 #[cfg(feature = "std")]
 pub mod runtime;
-pub mod supervisor;
 
 pub use hostcall_handler::MemoryAccess;
 
