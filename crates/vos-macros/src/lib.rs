@@ -329,7 +329,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // --- Constructor: generate Init struct and _start ---
 
-    let (init_struct, init_deserialize, ctor_call) = if let Some(ctor) = &ctor_method {
+    let (init_struct, init_deserialize, ctor_call, needs_init_payload) = if let Some(ctor) = &ctor_method {
         // Collect constructor params (skip Context if present)
         let mut ctor_field_names = Vec::new();
         let mut ctor_field_types = Vec::new();
@@ -345,6 +345,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        let has_params = !ctor_field_names.is_empty();
         let init_struct_name = format_ident!("{}Init", actor_name);
         let archived_init_name = format_ident!("Archived{}Init", actor_name);
 
@@ -377,9 +378,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let _ = __payload;
             }
         } else {
+            // Constructor needs args — unwrap the payload from Option
             quote! {
+                let __bytes = __payload.expect("constructor requires init payload");
                 let __archived = unsafe {
-                    vos::rkyv::access_unchecked::<#archived_init_name>(__payload)
+                    vos::rkyv::access_unchecked::<#archived_init_name>(__bytes)
                 };
                 let #init_struct_name { #( #ctor_field_names ),* } =
                     vos::rkyv::deserialize::<#init_struct_name, vos::rkyv::rancor::Error>(__archived).unwrap();
@@ -390,13 +393,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #actor_name::new(#( #ctor_field_names ),*)
         };
 
-        (init_struct_def, deser, call)
+        (init_struct_def, deser, call, has_params)
     } else {
         // No constructor — require Default
         let init_struct_def = quote! {};
         let deser = quote! { let _ = __payload; };
         let call = quote! { <#actor_name as Default>::default() };
-        (init_struct_def, deser, call)
+        (init_struct_def, deser, call, false)
     };
 
     let archived_actor_name = format_ident!("Archived{}", actor_name);
@@ -417,6 +420,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             vos::main_loop::<#actor_name>(
+                #needs_init_payload,
                 |__payload| {
                     #init_deserialize
                     #ctor_call

@@ -137,7 +137,7 @@ impl VosRuntime {
                 match exit {
                     ExitReason::Halt => break,
                     ExitReason::Panic => {
-                        eprintln!("vosx: service {svc_id} panicked");
+                        eprintln!("vosx: service {svc_id} panicked at pc={:#x}", pvm.pc);
                         break;
                     }
                     ExitReason::OutOfGas => {

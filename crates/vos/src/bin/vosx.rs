@@ -68,7 +68,7 @@ fn main() {
             }
             "elf" | _ => {
                 eprintln!("  transpiling '{}' from {}", svc_def.name, file_path.display());
-                match grey_transpiler::link_elf(&file_data) {
+                match grey_transpiler::link_elf_actor(&file_data) {
                     Ok(b) => b,
                     Err(e) => {
                         eprintln!("error: transpiling '{}': {e:?}", svc_def.name);
