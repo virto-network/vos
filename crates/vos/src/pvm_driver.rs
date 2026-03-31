@@ -4,7 +4,6 @@
 //! `Driver` trait calls into PVM execution: loading blobs, running
 //! until a host-call or halt, and reading/writing guest memory.
 
-use crate::scheduler::Driver;
 use crate::hostcall_handler::{HostcallHandler, HostcallArgs, MemoryAccess};
 use javm::program::initialize_program;
 use javm::{ExitReason, Gas, Pvm};
@@ -287,12 +286,9 @@ impl RawMsg {
     }
 }
 
-impl Driver<RawMsg> for PvmDriver {
-    fn init(&mut self, _id: ServiceId) -> Status {
-        Status::Pending
-    }
-
-    fn handle(&mut self, id: ServiceId, msg: &RawMsg) -> Status {
+impl PvmDriver {
+    /// Deliver a message to a service and run it.
+    pub fn handle(&mut self, id: ServiceId, msg: &RawMsg) -> Status {
         let idx = (id.0 - 1) as usize;
         let svc = match &mut self.services[idx] {
             Some(a) => a,
@@ -306,16 +302,19 @@ impl Driver<RawMsg> for PvmDriver {
         self.run_service(id)
     }
 
-    fn poll(&mut self, id: ServiceId) -> Status {
+    /// Resume a suspended service.
+    pub fn poll(&mut self, id: ServiceId) -> Status {
         self.run_service(id)
     }
 
-    fn drop_service(&mut self, id: ServiceId) {
+    /// Drop a service instance.
+    pub fn drop_service(&mut self, id: ServiceId) {
         let idx = (id.0 - 1) as usize;
         self.services[idx] = None;
     }
 
-    fn drain_sends(&mut self, mut route: impl FnMut(ServiceId, RawMsg)) {
+    /// Drain pending cross-service sends.
+    pub fn drain_sends(&mut self, mut route: impl FnMut(ServiceId, RawMsg)) {
         for send in self.pending_sends.drain(..) {
             route(send.to, send.msg);
         }

@@ -8,7 +8,6 @@ use javm::ExitReason;
 use javm::program::initialize_program;
 use vos::pvm_driver::{PvmDriver, RawMsg};
 use vos::registry::Status;
-use vos::scheduler::{Driver, Scheduler, TickResult};
 use vos_abi::hostcall;
 use vos_abi::service::ServiceId;
 
@@ -43,15 +42,6 @@ fn program_debug_write() -> Vec<u8> {
     asm.load_imm(Reg::A0, 0); // buf at 0
     asm.load_imm(Reg::A1, 2); // 2 bytes
     asm.ecalli(hostcall::DEBUG_WRITE);
-    asm.jump_ind(Reg::RA, 0);
-    asm.build()
-}
-
-/// Program that yields once, then halts.
-fn program_yield_then_halt() -> Vec<u8> {
-    let mut asm = Assembler::new();
-    asm.set_stack_size(4096);
-    asm.ecalli(hostcall::YIELD);
     asm.jump_ind(Reg::RA, 0);
     asm.build()
 }
@@ -176,39 +166,7 @@ fn driver_debug_write_hostcall() {
     assert_eq!(driver.poll(id), Status::Done);
 }
 
-// -- Scheduler tests --
-
-#[test]
-fn scheduler_two_services_halt() {
-    let blob = program_halt();
-    let mut driver = PvmDriver::new();
-    let blob_idx = driver.register_blob(blob);
-
-    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
-
-    let a = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(a, blob_idx);
-    let b = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(b, blob_idx);
-
-    assert_eq!(sched.tick(), TickResult::Progress);
-    assert_eq!(sched.tick(), TickResult::Done);
-}
-
-#[test]
-fn scheduler_service_with_info() {
-    let blob = program_info();
-    let mut driver = PvmDriver::new();
-    let blob_idx = driver.register_blob(blob);
-
-    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
-
-    let id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(id, blob_idx);
-
-    assert_eq!(sched.tick(), TickResult::Progress);
-    assert_eq!(sched.tick(), TickResult::Done);
-}
+// -- Transfer + routing tests (using PvmDriver directly) --
 
 /// Program that sends a TRANSFER to target service with memo data, then halts.
 fn program_transfer_to(target: u32) -> Vec<u8> {
@@ -235,84 +193,62 @@ fn program_transfer_to(target: u32) -> Vec<u8> {
 }
 
 #[test]
-fn scheduler_transfer_routes_to_mailbox() {
-    let sender_blob = program_transfer_to(2);
-    let receiver_blob = program_yield_then_halt();
+fn driver_transfer_queues_send() {
+    let blob = program_transfer_to(2);
     let mut driver = PvmDriver::new();
-    let sender_idx = driver.register_blob(sender_blob);
-    let receiver_idx = driver.register_blob(receiver_blob);
+    let blob_idx = driver.register_blob(blob);
 
-    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
+    let id = ServiceId(1);
+    driver.spawn_blob(id, blob_idx);
+    let status = driver.poll(id);
+    assert_eq!(status, Status::Done);
 
-    let sender_id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(sender_id, sender_idx);
-    let receiver_id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
-
-    // First tick: sender sends TRANSFER → halts. Receiver yields → suspended.
-    assert_eq!(sched.tick(), TickResult::Progress);
-
-    // Verify the message arrived in the receiver's mailbox
-    let entry = sched.registry.get(receiver_id).unwrap();
-    assert!(
-        !entry.mailbox.is_empty(),
-        "receiver should have a pending message"
-    );
-
-    let msg = entry.mailbox.peek().unwrap();
-    assert_eq!(&msg.data, b"PING");
-}
-
-/// Program that calls FETCH into a buffer at addr 0, stores return value at addr 256, then yields.
-fn program_fetch_and_store() -> Vec<u8> {
-    let mut asm = Assembler::new();
-    asm.set_stack_size(4096);
-    // First yield — let the runtime deliver a message
-    asm.ecalli(hostcall::YIELD);
-    // FETCH: a0=buf_ptr, a1=buf_len
-    asm.load_imm(Reg::A0, 0); // buf at addr 0
-    asm.load_imm(Reg::A1, 128); // buf_len
-    asm.ecalli(hostcall::FETCH);
-    // a0 now has bytes received — store at addr 256
-    asm.store_u64(Reg::A0, 256);
-    // Yield again so the test can inspect memory
-    asm.ecalli(hostcall::YIELD);
-    asm.jump_ind(Reg::RA, 0);
-    asm.build()
+    // The transfer should be queued
+    assert_eq!(driver.pending_sends.len(), 1);
+    assert_eq!(driver.pending_sends[0].to, ServiceId(2));
+    assert_eq!(&driver.pending_sends[0].msg.data, b"PING");
 }
 
 #[test]
-fn scheduler_transfer_fetch_round_trip() {
+fn driver_transfer_deliver_via_handle() {
     use vos::MemoryAccess;
 
-    let sender_blob = program_transfer_to(2);
-    let receiver_blob = program_fetch_and_store();
+    // Receiver: yields, then fetches, stores len at 256, yields again
+    let receiver_blob = {
+        let mut asm = Assembler::new();
+        asm.set_stack_size(4096);
+        asm.ecalli(hostcall::YIELD);
+        asm.load_imm(Reg::A0, 0);
+        asm.load_imm(Reg::A1, 128);
+        asm.ecalli(hostcall::FETCH);
+        asm.store_u64(Reg::A0, 256);
+        asm.ecalli(hostcall::YIELD);
+        asm.jump_ind(Reg::RA, 0);
+        asm.build()
+    };
+
     let mut driver = PvmDriver::new();
-    let sender_idx = driver.register_blob(sender_blob);
-    let receiver_idx = driver.register_blob(receiver_blob);
+    let blob_idx = driver.register_blob(receiver_blob);
 
-    let mut sched: Scheduler<RawMsg, PvmDriver, 4, 16> = Scheduler::new(driver);
+    let id = ServiceId(2);
+    driver.spawn_blob(id, blob_idx);
 
-    let sender_id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(sender_id, sender_idx);
-    let receiver_id = sched.spawn().unwrap();
-    sched.driver_mut().spawn_blob(receiver_id, receiver_idx);
+    // First poll: runs until YIELD → suspended
+    assert_eq!(driver.poll(id), Status::Pending);
 
-    // Tick 1: sender transfers → halts. Receiver yields → suspended.
-    assert_eq!(sched.tick(), TickResult::Progress);
-
-    // Tick 2: receiver has pending message → handle() stores as pending_msg,
-    // then run: FETCH → gets data → stores len → yields.
-    assert_eq!(sched.tick(), TickResult::Progress);
+    // Deliver "PING" message
+    let msg = RawMsg::new(b"PING".to_vec());
+    let status = driver.handle(id, &msg);
+    assert_eq!(status, Status::Pending); // yields again after storing
 
     // Read the bytes-received count from addr 256
     let mut count_buf = [0u8; 8];
-    sched.driver().read_guest(receiver_id, 256, &mut count_buf);
+    driver.read_guest(id, 256, &mut count_buf);
     let bytes_received = u64::from_le_bytes(count_buf);
-    assert_eq!(bytes_received as usize, 4); // "PING"
+    assert_eq!(bytes_received as usize, 4);
 
-    // Read the actual data from addr 0
+    // Read the data from addr 0
     let mut msg_buf = [0u8; 4];
-    sched.driver().read_guest(receiver_id, 0, &mut msg_buf);
+    driver.read_guest(id, 0, &mut msg_buf);
     assert_eq!(&msg_buf, b"PING");
 }

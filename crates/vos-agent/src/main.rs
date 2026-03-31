@@ -1,31 +1,33 @@
 //! VOS Agent — supervisor actor that schedules child services.
 //!
 //! The agent is a regular VOS actor compiled to RISC-V, running as PVM-in-PVM
-//! inside vosx. It owns the service registry and scheduler: blob registration,
-//! service spawning, message routing, and cooperative tick-based execution.
+//! inside vosx. It owns the service table and drives child services via the
+//! YIELD-loop convergence pattern:
+//!
+//! 1. Process incoming messages (register_blob, spawn, route)
+//! 2. Queue transfers to child services
+//! 3. YIELD → host runs children, generates receipts
+//! 4. FETCH receipts → update service states
+//! 5. Route cross-service messages if any → loop back to YIELD
+//! 6. Persist state and halt when converged
 //!
 //! ## Messages
 //!
 //! - `RegisterBlob(blob)` → stores blob, returns code hash
 //! - `SpawnService(code_hash)` → creates new child service
-//! - `Route(target, payload)` → queues message for target, ticks scheduler
+//! - `Route(target, payload)` → queues message for target
 //! - `Tick` → advance all child services one step
 //! - `Status` → report agent state
 
 use vos::actors::context::ServiceId;
-use vos::registry::{ServiceRegistry, ServiceState};
+use vos::registry::{ServiceTable, ServiceState};
 use vos::{agent, messages};
 
 /// Max child services the agent can manage.
 const MAX_SERVICES: usize = 32;
-/// Mailbox capacity per child service.
-const MAILBOX_CAP: usize = 16;
 
-/// A pending message for a child service.
-#[derive(Default)]
-struct RawMsg {
-    data: Vec<u8>,
-}
+/// Receipt size: 4 bytes service_id + 1 byte status.
+const RECEIPT_SIZE: usize = 5;
 
 /// Simple hash for blob identification.
 fn hash_blob(data: &[u8]) -> [u8; 32] {
@@ -46,9 +48,8 @@ enum AgentError {
 #[agent(error = AgentError)]
 struct Agent {
     blob_count: u32,
-    /// Transient per-invocation state — not persisted, rebuilt each invocation.
-    #[rkyv(with = vos::rkyv::with::Skip)]
-    services: ServiceRegistry<RawMsg, MAX_SERVICES, MAILBOX_CAP>,
+    /// Persistent service metadata — survives across invocations.
+    services: ServiceTable<MAX_SERVICES>,
 }
 
 #[messages]
@@ -57,7 +58,7 @@ impl Agent {
         println!("agent: initialized");
         Agent {
             blob_count: 0,
-            services: ServiceRegistry::new(),
+            services: ServiceTable::new(),
         }
     }
 
@@ -75,8 +76,6 @@ impl Agent {
     }
 
     /// Spawn a new child service from a previously registered code hash.
-    /// Registers it in the local service registry and tells the host to
-    /// create the PVM instance.
     #[msg]
     async fn spawn_service(&mut self, code_hash: Vec<u8>, ctx: &mut Context<Self>) -> Result<()> {
         if code_hash.len() != 32 {
@@ -85,10 +84,11 @@ impl Agent {
                 got: code_hash.len(),
             });
         }
-        let id = self.services.register().ok_or(AgentError::RegistryFull)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&code_hash);
+        let id = self.services.register(hash).ok_or(AgentError::RegistryFull)?;
         ctx.spawn(hash);
+        self.services.update_state(id, ServiceState::Running);
         println!(
             "agent: spawned service {} (id={})",
             self.services.alive_count(),
@@ -97,7 +97,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Route a message to a child service's local mailbox, then tick.
+    /// Route a message to a child service. Queues a transfer and triggers
+    /// the YIELD-loop to flush it, run the child, and process receipts.
     #[msg]
     async fn route(
         &mut self,
@@ -106,19 +107,22 @@ impl Agent {
         ctx: &mut Context<Self>,
     ) -> Result<()> {
         let id = ServiceId(target);
-        let msg = RawMsg { data: payload };
-        self.services
-            .send(id, msg)
-            .map_err(|_| AgentError::ServiceNotFound(target))?;
+        if self.services.get(id).is_none() {
+            return Err(AgentError::ServiceNotFound(target));
+        }
+        ctx.send(id, &payload);
         println!("agent: queued message for service {}", target);
-        self.tick_services(ctx);
+        // Flush effects so the YIELD-loop can process the transfer
+        ctx.flush_effects();
+        self.process_receipts();
         Ok(())
     }
 
-    /// Advance all child services that have pending work.
+    /// Advance: flush any pending transfers and process receipts.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
-        self.tick_services(ctx);
+        ctx.flush_effects();
+        self.process_receipts();
     }
 
     /// Report agent status.
@@ -133,22 +137,45 @@ impl Agent {
 }
 
 impl Agent {
-    /// Tick all services: drain mailboxes and send pending messages
-    /// to the host for PVM execution.
-    fn tick_services(&mut self, ctx: &mut vos::Context<Agent>) {
-        use vos::registry::Status;
-        self.services.tick(|id, state, msg| match (state, msg) {
-            (_, Some(raw)) => {
-                ctx.send(id, &raw.data);
-                println!(
-                    "agent: delivering {} bytes to service {}",
-                    raw.data.len(),
-                    id.0
+    /// YIELD-loop: yield to host, fetch receipts, update service states.
+    /// Repeats until no more receipts (convergence).
+    fn process_receipts(&mut self) {
+        #[cfg(feature = "guest")]
+        {
+            use vos_abi::guest::ecall;
+            use vos_abi::hostcall;
+
+            let mut buf = [0u8; 4096];
+
+            loop {
+                // YIELD: tell host to process our queued transfers
+                ecall::ecall0(hostcall::YIELD);
+
+                // FETCH: get receipts from host
+                let n = ecall::ecall2(
+                    hostcall::FETCH,
+                    buf.as_mut_ptr() as u64,
+                    buf.len() as u64,
                 );
-                Status::Pending
+                if n == 0 || n as usize > buf.len() {
+                    break; // No receipts → converged
+                }
+
+                let receipt_data = &buf[..n as usize];
+                // Parse 5-byte receipt chunks: [service_id: u32 LE, status: u8]
+                for chunk in receipt_data.chunks_exact(RECEIPT_SIZE) {
+                    let svc_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let status = chunk[4];
+                    let state = match status {
+                        0 => ServiceState::Running,   // Halt → completed successfully
+                        1 => ServiceState::Stopped,    // Panic
+                        2 => ServiceState::Suspended,  // Out of gas
+                        _ => ServiceState::Stopped,    // Page fault / other error
+                    };
+                    self.services.update_state(ServiceId(svc_id), state);
+                    println!("agent: receipt svc={} status={}", svc_id, status);
+                }
             }
-            (ServiceState::Suspended, None) => Status::Pending,
-            _ => Status::Ready,
-        });
+        }
     }
 }

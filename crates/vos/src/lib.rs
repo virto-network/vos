@@ -48,7 +48,6 @@ pub mod registry;
 
 // --- Runtime infrastructure (host-only) ---
 
-pub mod scheduler;
 pub mod hostcall_handler;
 
 #[cfg(feature = "std")]
