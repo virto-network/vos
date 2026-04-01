@@ -52,9 +52,9 @@ impl Animation {
         println!("animation: frame {} rendered, sleeping {} tick(s)", self.frame, duration);
 
         if duration > 0 {
-            ctx.sleep(duration);
+            ctx.sleep(duration).await;
         } else {
-            ctx.yield_now();
+            ctx.yield_now().await;
         }
     }
 

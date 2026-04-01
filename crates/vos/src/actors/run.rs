@@ -13,16 +13,20 @@ fn noop_raw_waker() -> RawWaker {
     RawWaker::new(core::ptr::null(), &VTABLE)
 }
 
-/// Drive a future to completion, yielding to the PVM host on each `Pending`.
-pub fn block_on<F: Future>(mut fut: F) -> F::Output {
+/// Result of a single poll: either the future completed or it yielded.
+pub enum RunResult<T> {
+    Complete(T),
+    Yielded,
+}
+
+/// Poll a future exactly once. Returns `Complete(val)` if ready, `Yielded` if pending.
+pub fn try_poll<F: Future>(mut fut: F) -> RunResult<F::Output> {
     let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(val) => return val,
-            Poll::Pending => yield_to_host(),
-        }
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(val) => RunResult::Complete(val),
+        Poll::Pending => RunResult::Yielded,
     }
 }
 
@@ -49,24 +53,6 @@ impl Future for Yield {
             Poll::Pending
         }
     }
-}
-
-/// Yield to the PVM host via the Yield hostcall.
-#[cfg(target_arch = "riscv64")]
-fn yield_to_host() {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("t0") vos_abi::hostcall::accumulate::YIELD as u64,
-            lateout("a0") _,
-            options(nostack),
-        );
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn yield_to_host() {
-    // No-op on non-PVM targets (tests, host-side usage)
 }
 
 /// Halt the PVM by jumping to the halt sentinel address (2^32 - 2^16 = 0xFFFF0000).
@@ -126,7 +112,7 @@ const SLEEP_UNTIL_KEY: &[u8] = b"__vos_sleep_until";
 pub fn main_loop<A: super::Actor>(
     needs_init_payload: bool,
     init: impl FnOnce(Option<&[u8]>) -> A,
-    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>) -> bool,
+    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>) -> RunResult<bool>,
     save: impl Fn(&A) -> alloc::vec::Vec<u8>,
     load: impl Fn(&[u8]) -> A,
 ) {
@@ -187,16 +173,13 @@ pub fn main_loop<A: super::Actor>(
         let mut payload_buf = [0u8; BUF_SIZE];
         payload_buf[..payload_len].copy_from_slice(&buf[..payload_len]);
 
-        let stop = dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx);
-        ctx.flush_effects();
-        if stop { break; }
+        match dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx) {
+            RunResult::Yielded => { ctx.flush_effects(); break; }
+            RunResult::Complete(stop) => { ctx.flush_effects(); if stop { break; } }
+        }
 
         // Resolve pending asks: call invoke(), cache result, replay handler
         while let Some(pending) = ctx.take_pending_ask() {
-            // Look up the target's code hash from the service table.
-            // For now, use the target service ID as a simple hash lookup key.
-            // The invoke hostcall takes a code_hash — we construct one from
-            // the target's storage blob hash.
             let mut invoke_buf = [0u8; BUF_SIZE];
             let result_len = hostcalls::invoke(
                 &target_code_hash(pending.target.0),
@@ -212,14 +195,10 @@ pub fn main_loop<A: super::Actor>(
             ctx.push_call_result_and_reset(result);
 
             // Replay: re-dispatch the same message with cached results
-            let stop = dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx);
-            ctx.flush_effects();
-            if stop { break; }
-        }
-
-        // If cooperative scheduling was requested, break out of item processing
-        if ctx.self_scheduled() {
-            break;
+            match dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx) {
+                RunResult::Yielded => { ctx.flush_effects(); break; }
+                RunResult::Complete(stop) => { ctx.flush_effects(); if stop { break; } }
+            }
         }
     }
 

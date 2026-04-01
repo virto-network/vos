@@ -46,7 +46,7 @@ impl Hasher {
             self.current_hash[0], self.current_hash[1],
             self.current_hash[2], self.current_hash[3],
         );
-        ctx.yield_now();
+        ctx.yield_now().await;
     }
 
     /// Query the latest hash and iteration count.

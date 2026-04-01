@@ -118,14 +118,18 @@ impl<A: Actor> Context<A> {
     // --- Cooperative scheduling ---
 
     /// Checkpoint state and yield to other actors. Resumes next tick.
-    pub fn yield_now(&mut self) {
+    /// Returns a future that yields once — use `.await` to suspend.
+    pub fn yield_now(&mut self) -> super::run::Yield {
         self.self_schedule = true;
+        super::run::Yield::once()
     }
 
     /// Checkpoint state and sleep for N ticks.
-    pub fn sleep(&mut self, ticks: u32) {
+    /// Returns a future that yields once — use `.await` to suspend.
+    pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
         self.sleep_ticks = ticks;
+        super::run::Yield::once()
     }
 
     // --- Storage ---

@@ -427,8 +427,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     #init_deserialize
                     #ctor_call
                 },
-                |__payload, __actor, __ctx| -> bool {
-                    vos::block_on(async {
+                |__payload, __actor, __ctx| -> vos::RunResult<bool> {
+                    vos::try_poll(async {
                         unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await }
                     })
                 },
