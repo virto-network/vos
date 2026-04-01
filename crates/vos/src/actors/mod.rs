@@ -13,16 +13,12 @@
 //! - `ctx.sleep(n)` — checkpoint state, sleep N ticks, halt
 
 mod actor;
-mod executor;
-mod mailbox;
 pub mod metadata;
 mod run;
 
 pub use actor::{Actor, Message};
 pub mod context;
 pub use context::{Context, PendingAsk};
-pub use executor::{Executor, Progress};
-pub use mailbox::Mailbox;
 pub use run::{Yield, block_on};
 #[cfg(feature = "guest")]
 pub use run::main_loop;
