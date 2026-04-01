@@ -8,7 +8,7 @@ use javm::ExitReason;
 use javm::program::initialize_program;
 use vos::pvm_driver::{PvmDriver, RawMsg};
 use vos::registry::Status;
-use vos_abi::hostcall;
+use vos_abi::hostcall::{self, accumulate};
 use vos_abi::service::ServiceId;
 
 // -- Program builders --
@@ -25,7 +25,7 @@ fn program_halt() -> Vec<u8> {
 fn program_info() -> Vec<u8> {
     let mut asm = Assembler::new();
     asm.set_stack_size(4096);
-    asm.ecalli(hostcall::INFO);
+    asm.ecalli(accumulate::INFO);
     asm.store_u64(Reg::A0, 0);
     asm.jump_ind(Reg::RA, 0);
     asm.build()
@@ -56,7 +56,7 @@ fn program_counting_yields(n: i32) -> Vec<u8> {
 
     let loop_start = asm.current_offset();
     asm.store_u64(Reg::S0, 0);
-    asm.ecalli(hostcall::YIELD);
+    asm.ecalli(accumulate::YIELD);
     asm.add_imm_64(Reg::S0, Reg::S0, 1);
     asm.sub_64(Reg::T0, Reg::S0, Reg::S1);
     let branch_pc = asm.current_offset();
@@ -83,7 +83,7 @@ fn raw_pvm_info() {
     let mut pvm = initialize_program(&blob, &[], 100_000).expect("init");
 
     let (exit, _) = pvm.run();
-    assert_eq!(exit, ExitReason::HostCall(hostcall::INFO));
+    assert_eq!(exit, ExitReason::HostCall(accumulate::INFO));
 
     pvm.registers[7] = 42;
     let (exit, _) = pvm.run();
@@ -122,7 +122,7 @@ fn raw_pvm_counting_yields() {
 
     for expected in 1..=3u8 {
         let (exit, _) = pvm.run();
-        assert_eq!(exit, ExitReason::HostCall(hostcall::YIELD));
+        assert_eq!(exit, ExitReason::HostCall(accumulate::YIELD));
         let val = pvm.read_u8(0).unwrap();
         assert_eq!(val, expected, "iteration {expected}");
     }
@@ -187,7 +187,7 @@ fn program_transfer_to(target: u32) -> Vec<u8> {
     asm.load_imm(Reg::A2, 0); // gas_limit
     asm.load_imm(Reg::A3, 0); // memo at addr 0
     asm.load_imm(Reg::A4, 4); // 4 bytes
-    asm.ecalli(hostcall::TRANSFER);
+    asm.ecalli(accumulate::TRANSFER);
     asm.jump_ind(Reg::RA, 0);
     asm.build()
 }
@@ -217,12 +217,12 @@ fn driver_transfer_deliver_via_handle() {
     let receiver_blob = {
         let mut asm = Assembler::new();
         asm.set_stack_size(4096);
-        asm.ecalli(hostcall::YIELD);
+        asm.ecalli(accumulate::YIELD);
         asm.load_imm(Reg::A0, 0);
         asm.load_imm(Reg::A1, 128);
         asm.ecalli(hostcall::FETCH);
         asm.store_u64(Reg::A0, 256);
-        asm.ecalli(hostcall::YIELD);
+        asm.ecalli(accumulate::YIELD);
         asm.jump_ind(Reg::RA, 0);
         asm.build()
     };

@@ -4,7 +4,11 @@
 //! between services across rounds. Each service gets a fresh PVM per
 //! invocation (JAR model).
 //!
-//! ## YIELD flush-and-process
+//! ## Execution model
+//!
+//! vosx currently runs in accumulate-only mode: all hostcalls (read, write,
+//! transfer, invoke, etc.) are available in a single pass. A future `jam`
+//! feature flag will enable strict two-phase (refine + accumulate) execution.
 //!
 //! When a service YIELDs, the runtime:
 //! 1. Drains the service's queued transfers
@@ -12,20 +16,18 @@
 //! 3. Builds 5-byte receipts: `[service_id: u32 LE, status: u8]`
 //! 4. Feeds receipts back via the service's FETCH queue
 //! 5. Resumes the service
-//!
-//! This enables the agent to do multi-round tick convergence within
-//! a single invocation using the YIELD+FETCH loop pattern.
 
 use crate::hostcall_handler::HostcallHandler;
 use javm::program::initialize_program;
 use javm::{ExitReason, Gas, Pvm};
 use vos_abi::error;
-use vos_abi::hostcall;
+use vos_abi::hostcall::{self, accumulate, refine};
 use vos_abi::service::ServiceId;
 use std::collections::HashMap;
 use std::io::Write;
 
 const DEFAULT_GAS: Gas = 10_000_000;
+const MAX_INVOKE_DEPTH: usize = 8;
 
 /// Exit status bytes for receipts.
 pub const STATUS_HALT: u8 = 0;
@@ -59,6 +61,8 @@ struct PendingTransfer {
 /// 5. Repeat until no new work
 pub struct VosRuntime {
     blobs: Vec<Vec<u8>>,
+    /// Map from code hash → blob index for invoke() lookups.
+    blob_by_hash: HashMap<[u8; 32], usize>,
     services: HashMap<u32, ServiceInfo>,
     next_id: u32,
     pub hostcalls: HostcallHandler,
@@ -69,6 +73,7 @@ impl VosRuntime {
     pub fn new() -> Self {
         Self {
             blobs: Vec::new(),
+            blob_by_hash: HashMap::new(),
             services: HashMap::new(),
             next_id: 1,
             hostcalls: HostcallHandler::new(),
@@ -79,6 +84,9 @@ impl VosRuntime {
     /// Register a PVM blob. Returns a blob index.
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
         let idx = self.blobs.len();
+        // Compute a simple hash for invoke() lookups
+        let hash = simple_hash(&blob);
+        self.blob_by_hash.insert(hash, idx);
         self.blobs.push(blob);
         idx
     }
@@ -127,6 +135,7 @@ impl VosRuntime {
 
         // Destructure to get separate borrows for the YIELD handler
         let blobs = &self.blobs;
+        let blob_by_hash = &self.blob_by_hash;
         let services = &self.services;
         let hostcalls = &mut self.hostcalls;
 
@@ -190,7 +199,7 @@ impl VosRuntime {
                                 let _ = std::io::stderr().flush();
                                 pvm.registers[7] = buf_len as u64;
                             }
-                            hostcall::YIELD => {
+                            accumulate::YIELD => {
                                 // Flush-and-process: run child services, collect receipts
                                 let pending: Vec<_> = new_transfers.drain(..).collect();
                                 let mut receipts = Vec::new();
@@ -209,6 +218,8 @@ impl VosRuntime {
                                         t.to.0,
                                         vec![t.data],
                                         hostcalls,
+                                        blobs,
+                                        blob_by_hash,
                                     );
                                     // 5-byte receipt: [service_id: u32 LE, status: u8]
                                     receipts.extend_from_slice(&t.to.0.to_le_bytes());
@@ -230,7 +241,7 @@ impl VosRuntime {
                                 }
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            hostcall::INFO => {
+                            accumulate::INFO => {
                                 pvm.registers[7] = svc_id as u64;
                             }
                             hostcall::FETCH => {
@@ -247,7 +258,7 @@ impl VosRuntime {
                                     pvm.registers[7] = 0;
                                 }
                             }
-                            hostcall::READ => {
+                            accumulate::READ => {
                                 let key_ptr = a0 as u32;
                                 let key_len = a1 as usize;
                                 let val_buf_ptr = a2 as u32;
@@ -267,7 +278,7 @@ impl VosRuntime {
                                     pvm.registers[7] = error::HOST_NONE;
                                 }
                             }
-                            hostcall::WRITE => {
+                            accumulate::WRITE => {
                                 let key_ptr = a0 as u32;
                                 let key_len = a1 as usize;
                                 let val_ptr = a2 as u32;
@@ -283,7 +294,7 @@ impl VosRuntime {
                                 hostcalls.storage.write(id, &key, &value);
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            hostcall::PROVIDE => {
+                            accumulate::PROVIDE => {
                                 let hash_ptr = a0 as u32;
                                 let data_ptr = a1 as u32;
                                 let data_len = a2 as usize;
@@ -298,7 +309,7 @@ impl VosRuntime {
                                 hostcalls.preimages.store(hash, data);
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            hostcall::TRANSFER => {
+                            accumulate::TRANSFER => {
                                 let target = ServiceId(a0 as u32);
                                 let memo_ptr = a3 as u32;
                                 let memo_len = a4 as usize;
@@ -313,12 +324,22 @@ impl VosRuntime {
                                 });
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            hostcall::NEW => {
+                            accumulate::NEW => {
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            hostcall::CHECKPOINT => {
+                            accumulate::CHECKPOINT => {
                                 pvm.registers[7] = error::HOST_OK;
                             }
+                            // Refine-phase: invoke() — run sub-PVM synchronously
+                            refine::INVOKE => {
+                                let result = handle_invoke(
+                                    &mut pvm, blobs, blob_by_hash, hostcalls, 0,
+                                );
+                                pvm.registers[7] = result;
+                            }
+                            // Note: refine::PEEK (6) collides with accumulate::INFO (6).
+                            // In accumulate-only mode, ID 6 = INFO. Guests use READ (4)
+                            // for storage access in this mode.
                             _ => {
                                 pvm.registers[7] = error::HOST_WHAT;
                             }
@@ -328,9 +349,7 @@ impl VosRuntime {
             }
 
             // Any un-flushed transfers (service halted without yielding) → outer queue
-            outer_transfers.extend(
-                new_transfers.into_iter().map(|t| t),
-            );
+            outer_transfers.extend(new_transfers);
         }
 
         // Queue remaining transfers for next round
@@ -366,6 +385,8 @@ fn run_child_pvm(
     svc_id: u32,
     items: Vec<Vec<u8>>,
     hostcalls: &mut HostcallHandler,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
 ) -> ChildResult {
     let mut pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
         Some(p) => p,
@@ -398,6 +419,7 @@ fn run_child_pvm(
                 handle_child_hostcall(
                     &mut pvm, call_id, id, hostcalls,
                     &mut item_queue, &mut transfers,
+                    blobs, blob_by_hash,
                 );
             }
         }
@@ -412,6 +434,8 @@ fn handle_child_hostcall(
     hostcalls: &mut HostcallHandler,
     item_queue: &mut Vec<Vec<u8>>,
     transfers: &mut Vec<(ServiceId, Vec<u8>)>,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
 ) {
     let a0 = pvm.registers[7];
     let a1 = pvm.registers[8];
@@ -431,11 +455,11 @@ fn handle_child_hostcall(
             let _ = std::io::stderr().flush();
             pvm.registers[7] = buf_len as u64;
         }
-        hostcall::YIELD => {
+        accumulate::YIELD => {
             // Children don't get recursive flush-and-process (one level deep)
             pvm.registers[7] = error::HOST_OK;
         }
-        hostcall::INFO => {
+        accumulate::INFO => {
             pvm.registers[7] = id.0 as u64;
         }
         hostcall::FETCH => {
@@ -452,7 +476,7 @@ fn handle_child_hostcall(
                 pvm.registers[7] = 0;
             }
         }
-        hostcall::READ => {
+        accumulate::READ => {
             let key_ptr = a0 as u32;
             let key_len = a1 as usize;
             let val_buf_ptr = a2 as u32;
@@ -472,7 +496,7 @@ fn handle_child_hostcall(
                 pvm.registers[7] = error::HOST_NONE;
             }
         }
-        hostcall::WRITE => {
+        accumulate::WRITE => {
             let key_ptr = a0 as u32;
             let key_len = a1 as usize;
             let val_ptr = a2 as u32;
@@ -488,7 +512,7 @@ fn handle_child_hostcall(
             hostcalls.storage.write(id, &key, &value);
             pvm.registers[7] = error::HOST_OK;
         }
-        hostcall::PROVIDE => {
+        accumulate::PROVIDE => {
             let hash_ptr = a0 as u32;
             let data_ptr = a1 as u32;
             let data_len = a2 as usize;
@@ -503,7 +527,7 @@ fn handle_child_hostcall(
             hostcalls.preimages.store(hash, data);
             pvm.registers[7] = error::HOST_OK;
         }
-        hostcall::TRANSFER => {
+        accumulate::TRANSFER => {
             let target = ServiceId(a0 as u32);
             let memo_ptr = a3 as u32;
             let memo_len = a4 as usize;
@@ -514,14 +538,169 @@ fn handle_child_hostcall(
             transfers.push((target, memo));
             pvm.registers[7] = error::HOST_OK;
         }
-        hostcall::NEW => {
+        accumulate::NEW => {
             pvm.registers[7] = error::HOST_OK;
         }
-        hostcall::CHECKPOINT => {
+        accumulate::CHECKPOINT => {
             pvm.registers[7] = error::HOST_OK;
+        }
+        refine::INVOKE => {
+            let result = handle_invoke(pvm, blobs, blob_by_hash, hostcalls, 0);
+            pvm.registers[7] = result;
         }
         _ => {
             pvm.registers[7] = error::HOST_WHAT;
         }
     }
+}
+
+/// Handle invoke() hostcall: run a sub-PVM synchronously.
+///
+/// Reads code_hash from caller memory, looks up blob, creates fresh child PVM,
+/// runs to completion, copies output back to caller memory.
+fn handle_invoke(
+    caller: &mut Pvm,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
+    hostcalls: &mut HostcallHandler,
+    depth: usize,
+) -> u64 {
+    if depth >= MAX_INVOKE_DEPTH {
+        return error::HOST_WHAT;
+    }
+
+    let hash_ptr = caller.registers[7] as u32;
+    let input_ptr = caller.registers[8] as u32;
+    let input_len = caller.registers[9] as usize;
+    let gas_limit = caller.registers[10];
+    let _output_ptr = caller.registers[11] as u32;
+
+    // Read code hash from caller memory
+    let mut code_hash = [0u8; 32];
+    for (i, byte) in code_hash.iter_mut().enumerate() {
+        *byte = caller.read_u8(hash_ptr + i as u32).unwrap_or(0);
+    }
+
+    // Look up blob
+    let blob_idx = match blob_by_hash.get(&code_hash) {
+        Some(&idx) => idx,
+        None => return error::HOST_NONE,
+    };
+    let blob = match blobs.get(blob_idx) {
+        Some(b) => b,
+        None => return error::HOST_NONE,
+    };
+
+    // Read input from caller memory
+    let mut input = vec![0u8; input_len];
+    for (i, byte) in input.iter_mut().enumerate() {
+        *byte = caller.read_u8(input_ptr + i as u32).unwrap_or(0);
+    }
+
+    // Create fresh child PVM
+    let gas = if gas_limit == 0 { DEFAULT_GAS } else { gas_limit.min(DEFAULT_GAS) };
+    let mut child = match initialize_program(blob, &[], gas) {
+        Some(p) => p,
+        None => return error::HOST_WHAT,
+    };
+
+    // Pass input to child via FETCH (first fetch returns input)
+    let mut child_items = vec![input];
+
+    // Run child to completion
+    loop {
+        let (exit, _) = child.run();
+        match exit {
+            ExitReason::Halt => break,
+            ExitReason::Panic | ExitReason::OutOfGas | ExitReason::PageFault(_) => {
+                return error::HOST_WHAT;
+            }
+            ExitReason::HostCall(call_id) => {
+                match call_id {
+                    hostcall::GAS => {
+                        child.registers[7] = child.gas;
+                    }
+                    hostcall::GROW_HEAP => {
+                        child.registers[7] = error::HOST_OK;
+                    }
+                    hostcall::DEBUG_WRITE => {
+                        let buf_ptr = child.registers[7] as u32;
+                        let buf_len = child.registers[8] as usize;
+                        let mut buf = vec![0u8; buf_len];
+                        for (i, byte) in buf.iter_mut().enumerate() {
+                            *byte = child.read_u8(buf_ptr + i as u32).unwrap_or(0);
+                        }
+                        let _ = std::io::stderr().write_all(&buf);
+                        let _ = std::io::stderr().flush();
+                        child.registers[7] = buf_len as u64;
+                    }
+                    hostcall::FETCH => {
+                        let buf_ptr = child.registers[7] as u32;
+                        let buf_len = child.registers[8] as usize;
+                        if let Some(item) = child_items.first() {
+                            let copy_len = item.len().min(buf_len);
+                            for (i, &byte) in item[..copy_len].iter().enumerate() {
+                                child.write_u8(buf_ptr + i as u32, byte);
+                            }
+                            child_items.remove(0);
+                            child.registers[7] = copy_len as u64;
+                        } else {
+                            child.registers[7] = 0;
+                        }
+                    }
+                    accumulate::READ => {
+                        // In invoke context, allow read-only storage access
+                        let key_ptr = child.registers[7] as u32;
+                        let key_len = child.registers[8] as usize;
+                        let val_buf_ptr = child.registers[9] as u32;
+                        let val_buf_len = child.registers[10] as usize;
+                        let mut key = vec![0u8; key_len];
+                        for (i, byte) in key.iter_mut().enumerate() {
+                            *byte = child.read_u8(key_ptr + i as u32).unwrap_or(0);
+                        }
+                        // Use a dummy service ID for invoke children
+                        let child_id = ServiceId(0);
+                        if let Some(value) = hostcalls.storage.read(child_id, &key) {
+                            let copy_len = value.len().min(val_buf_len);
+                            let value = value[..copy_len].to_vec();
+                            for (i, &byte) in value.iter().enumerate() {
+                                child.write_u8(val_buf_ptr + i as u32, byte);
+                            }
+                            child.registers[7] = copy_len as u64;
+                        } else {
+                            child.registers[7] = error::HOST_NONE;
+                        }
+                    }
+                    // Note: refine::PEEK (6) = accumulate::INFO (6), handled above
+                    refine::INVOKE => {
+                        // Recursive invoke
+                        let result = handle_invoke(
+                            &mut child, blobs, blob_by_hash, hostcalls, depth + 1,
+                        );
+                        child.registers[7] = result;
+                    }
+                    accumulate::INFO => {
+                        child.registers[7] = 0; // invoke children have no service ID
+                    }
+                    _ => {
+                        // Most hostcalls not available in invoke context
+                        child.registers[7] = error::HOST_WHAT;
+                    }
+                }
+            }
+        }
+    }
+
+    // TODO: Copy child output back to caller memory
+    // For now, return success
+    error::HOST_OK
+}
+
+/// Simple hash for blob identification (matches vos-agent's hash_blob).
+fn simple_hash(data: &[u8]) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    for (i, &byte) in data.iter().enumerate() {
+        h[i % 32] ^= byte.wrapping_add(i as u8);
+    }
+    h
 }

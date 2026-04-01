@@ -3,7 +3,8 @@
 //! JAR-aligned ABI for VOS actors. Zero dependencies, `no_std`.
 //!
 //! Defines:
-//! - **Hostcall IDs**: constants matching the JAR hostcall spec (0–27 + DEBUG_WRITE=128)
+//! - **Hostcall IDs**: phase-split modules (`hostcall::refine`, `hostcall::accumulate`)
+//!   with deprecated flat aliases for transition
 //! - **Error codes**: JAR result codes (HOST_OK, HOST_NONE, etc.)
 //! - **ServiceId**: service identity type
 //! - **TransferMemo**: 128-byte transfer metadata

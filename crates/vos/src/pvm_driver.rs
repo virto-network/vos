@@ -7,7 +7,7 @@
 use crate::hostcall_handler::{HostcallHandler, HostcallArgs, MemoryAccess};
 use javm::program::initialize_program;
 use javm::{ExitReason, Gas, Pvm};
-use vos_abi::hostcall;
+use vos_abi::hostcall::{self, accumulate};
 use vos_abi::error;
 use vos_abi::service::ServiceId;
 use crate::registry::Status;
@@ -137,7 +137,7 @@ impl PvmDriver {
                     }
 
                     // Intercept YIELD — suspend
-                    if call_id == hostcall::YIELD {
+                    if call_id == accumulate::YIELD {
                         svc!().pvm.registers[7] = error::HOST_OK;
                         svc!().suspended = true;
                         return Status::Pending;
@@ -161,7 +161,7 @@ impl PvmDriver {
                     }
 
                     // Intercept READ — per-service KV storage read
-                    if call_id == hostcall::READ {
+                    if call_id == accumulate::READ {
                         let key_ptr = args.a0 as u32;
                         let key_len = args.a1 as usize;
                         let val_buf_ptr = args.a2 as u32;
@@ -186,7 +186,7 @@ impl PvmDriver {
                     }
 
                     // Intercept WRITE — per-service KV storage write
-                    if call_id == hostcall::WRITE {
+                    if call_id == accumulate::WRITE {
                         let key_ptr = args.a0 as u32;
                         let key_len = args.a1 as usize;
                         let val_ptr = args.a2 as u32;
@@ -207,7 +207,7 @@ impl PvmDriver {
                     }
 
                     // Intercept PROVIDE — store preimage
-                    if call_id == hostcall::PROVIDE {
+                    if call_id == accumulate::PROVIDE {
                         let hash_ptr = args.a0 as u32;
                         let data_ptr = args.a1 as u32;
                         let data_len = args.a2 as usize;
@@ -227,7 +227,7 @@ impl PvmDriver {
                     }
 
                     // Intercept TRANSFER — queue send to target
-                    if call_id == hostcall::TRANSFER {
+                    if call_id == accumulate::TRANSFER {
                         let target = ServiceId(args.a0 as u32);
                         let _amount = args.a1;
                         let _gas_limit = args.a2;
@@ -249,13 +249,13 @@ impl PvmDriver {
                     }
 
                     // Intercept INFO — return service ID
-                    if call_id == hostcall::INFO {
+                    if call_id == accumulate::INFO {
                         svc!().pvm.registers[7] = id.0 as u64;
                         continue;
                     }
 
                     // Intercept CHECKPOINT — no-op (no snapshots)
-                    if call_id == hostcall::CHECKPOINT {
+                    if call_id == accumulate::CHECKPOINT {
                         svc!().pvm.registers[7] = error::HOST_OK;
                         continue;
                     }

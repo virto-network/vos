@@ -19,9 +19,9 @@ fn example_elf(name: &str) -> Vec<u8> {
     }
 }
 
-/// Transpile an ELF to a PVM blob using the actor linker.
+/// Transpile an ELF to a PVM blob.
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
-    grey_transpiler::link_elf_actor(elf_data).expect("transpile failed")
+    grey_transpiler::link_elf(elf_data).expect("transpile failed")
 }
 
 #[test]

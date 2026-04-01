@@ -1,7 +1,7 @@
 //! Integration tests for VosRuntime — the fresh-PVM-per-invocation model.
 
 use grey_transpiler::assembler::{Assembler, Reg};
-use vos_abi::hostcall;
+use vos_abi::hostcall::{self, accumulate};
 use vos::runtime::VosRuntime;
 
 /// Program that writes "Hi" via DEBUG_WRITE then halts.
@@ -37,7 +37,7 @@ fn program_write_storage() -> Vec<u8> {
     asm.load_imm(Reg::A1, 1);  // key_len = 1
     asm.load_imm(Reg::A2, 16); // val at 16
     asm.load_imm(Reg::A3, 1);  // val_len = 1
-    asm.ecalli(hostcall::WRITE);
+    asm.ecalli(accumulate::WRITE);
 
     asm.jump_ind(Reg::RA, 0);
     asm.build()
@@ -57,7 +57,7 @@ fn program_read_storage() -> Vec<u8> {
     asm.load_imm(Reg::A1, 1);  // key_len = 1
     asm.load_imm(Reg::A2, 32); // val_buf at 32
     asm.load_imm(Reg::A3, 16); // val_buf_len = 16
-    asm.ecalli(hostcall::READ);
+    asm.ecalli(accumulate::READ);
 
     // Store return value (bytes read) at addr 48
     asm.store_u64(Reg::A0, 48);
@@ -81,7 +81,7 @@ fn program_transfer_to(target: u32) -> Vec<u8> {
     asm.load_imm(Reg::A2, 0);
     asm.load_imm(Reg::A3, 0); // memo at 0
     asm.load_imm(Reg::A4, 2); // 2 bytes
-    asm.ecalli(hostcall::TRANSFER);
+    asm.ecalli(accumulate::TRANSFER);
     asm.jump_ind(Reg::RA, 0);
     asm.build()
 }
@@ -112,7 +112,7 @@ fn program_fetch_and_store_len() -> Vec<u8> {
     asm.load_imm(Reg::A1, 3);   // key_len
     asm.load_imm(Reg::A2, 200); // val_ptr
     asm.load_imm(Reg::A3, 1);   // val_len
-    asm.ecalli(hostcall::WRITE);
+    asm.ecalli(accumulate::WRITE);
 
     asm.jump_ind(Reg::RA, 0);
     asm.build()

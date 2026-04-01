@@ -16,3 +16,7 @@ path = "counter/target/riscv64em-javm/release/counter.elf"
 [[actors]]
 name = "fizzbuzz"
 path = "fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf"
+
+[[actors]]
+name = "hasher"
+path = "hasher/target/riscv64em-javm/release/hasher.elf"

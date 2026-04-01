@@ -404,7 +404,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let archived_actor_name = format_ident!("Archived{}", actor_name);
 
-    // Generate _start entry point with save/load closures for state persistence
+    // Generate _start (refine) and _accumulate entry points.
+    // In accumulate-only mode (current), _start runs the full lifecycle.
+    // _accumulate is provided for link_elf_service compatibility.
     let start_fn = quote! {
         extern crate alloc;
 
@@ -441,6 +443,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     vos::rkyv::deserialize::<#actor_name, vos::rkyv::rancor::Error>(archived).unwrap()
                 },
             );
+        }
+
+        /// Accumulate entry point (PC=5 in JAM service blobs).
+        /// In accumulate-only mode, this is identical to _start.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn accumulate() {
+            _start();
         }
     };
 

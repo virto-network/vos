@@ -57,7 +57,7 @@ fn yield_to_host() {
     unsafe {
         core::arch::asm!(
             "ecall",
-            in("t0") vos_abi::hostcall::YIELD as u64,
+            in("t0") vos_abi::hostcall::accumulate::YIELD as u64,
             lateout("a0") _,
             options(nostack),
         );
@@ -99,14 +99,24 @@ const BUF_SIZE: usize = 4096;
 #[cfg(feature = "guest")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
 
+/// Storage key for cooperative call results cache.
+#[cfg(feature = "guest")]
+const CALL_RESULTS_KEY: &[u8] = b"__vos_call_results";
+
+/// Storage key for sleep-until tick count.
+#[cfg(feature = "guest")]
+const SLEEP_UNTIL_KEY: &[u8] = b"__vos_sleep_until";
+
 /// Standard actor lifecycle — JAR-aligned fresh-PVM model.
 ///
 /// Each invocation:
 /// 1. Try loading existing state from storage via `read(STATE_KEY)`
 /// 2. If no state, construct fresh actor (from init payload if needed)
-/// 3. Process all pending items (transfers delivered via `fetch()`)
-/// 4. Flush effects after each handler
-/// 5. Persist state via `write(STATE_KEY)` and halt
+/// 3. Load cooperative state (call_results) from storage
+/// 4. Process all pending items (transfers delivered via `fetch()`)
+/// 5. Flush effects after each handler
+/// 6. If yield_now/sleep was called, self-schedule via transfer
+/// 7. Persist state + cooperative metadata via `write()` and halt
 ///
 /// The `init` closure receives `Option<&[u8]>`: `None` for parameterless
 /// constructors (called immediately), `Some(bytes)` when init data is
@@ -122,12 +132,31 @@ pub fn main_loop<A: super::Actor>(
 ) {
     use vos_abi::guest::hostcalls;
     use vos_abi::guest::ecall;
-    use vos_abi::hostcall;
+    use vos_abi::hostcall::accumulate;
 
     let self_id = hostcalls::info() as u32;
-    let mut ctx = super::Context::new(super::context::ServiceId(self_id));
 
+    // Load cooperative state (call_results) from storage
     let mut buf = [0u8; BUF_SIZE];
+    let call_results = {
+        let n = hostcalls::read(CALL_RESULTS_KEY, &mut buf);
+        if n > 0 && n < BUF_SIZE as u64 {
+            // Deserialize Vec<Vec<u8>> from rkyv
+            let bytes = &buf[..n as usize];
+            let archived = unsafe {
+                rkyv::access_unchecked::<rkyv::Archived<alloc::vec::Vec<alloc::vec::Vec<u8>>>>(bytes)
+            };
+            rkyv::deserialize::<alloc::vec::Vec<alloc::vec::Vec<u8>>, rkyv::rancor::Error>(archived)
+                .unwrap_or_default()
+        } else {
+            alloc::vec::Vec::new()
+        }
+    };
+
+    let mut ctx = super::Context::with_call_results(
+        super::context::ServiceId(self_id),
+        call_results,
+    );
 
     // Step 1: Try loading existing state from storage
     let state_read = hostcalls::read(STATE_KEY, &mut buf);
@@ -136,8 +165,8 @@ pub fn main_loop<A: super::Actor>(
     } else if needs_init_payload {
         // Constructor needs arguments — wait for init payload via FETCH
         loop {
-            ecall::ecall0(hostcall::YIELD);
-            let n = ecall::ecall2(hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
+            ecall::ecall0(accumulate::YIELD);
+            let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
             if n > 0 && n < BUF_SIZE as u64 {
                 break init(Some(&buf[..n as usize]));
             }
@@ -149,7 +178,7 @@ pub fn main_loop<A: super::Actor>(
 
     // Step 2: Process all pending items
     loop {
-        let n = ecall::ecall2(hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n == 0 || n >= BUF_SIZE as u64 {
             break; // No more items
         }
@@ -157,11 +186,45 @@ pub fn main_loop<A: super::Actor>(
         let stop = dispatch(payload, &mut actor, &mut ctx);
         ctx.flush_effects();
         if stop { break; }
+
+        // If cooperative scheduling was requested, break out of item processing
+        if ctx.self_scheduled() {
+            break;
+        }
     }
 
-    // Step 3: Persist state and halt
+    // Step 3: Persist state
     let state_bytes = save(&actor);
     hostcalls::write(STATE_KEY, &state_bytes);
+
+    // Step 4: Persist cooperative state if needed
+    if ctx.self_scheduled() || ctx.take_pending_ask().is_some() {
+        // Save call results for replay on next invocation
+        let call_results = ctx.call_results();
+        if !call_results.is_empty() {
+            let call_results_vec: alloc::vec::Vec<alloc::vec::Vec<u8>> = call_results.to_vec();
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&call_results_vec).unwrap();
+            hostcalls::write(CALL_RESULTS_KEY, &bytes);
+        }
+
+        // Self-schedule: transfer to ourselves to ensure we get invoked again
+        if ctx.self_scheduled() {
+            let sleep_ticks = ctx.sleep_ticks();
+            if sleep_ticks > 0 {
+                // Persist sleep-until counter
+                let bytes = sleep_ticks.to_le_bytes();
+                hostcalls::write(SLEEP_UNTIL_KEY, &bytes);
+            }
+            // Queue a transfer to self (empty payload = continue marker)
+            hostcalls::transfer(
+                super::context::ServiceId(self_id),
+                0, 0, &[],
+            );
+        }
+    } else {
+        // Clear cooperative state if we finished normally
+        hostcalls::write(CALL_RESULTS_KEY, &[]);
+    }
 
     // Explicit PVM halt: jump to the halt sentinel address (2^32 - 2^16).
     // Cannot rely on ra being preserved through the call chain.

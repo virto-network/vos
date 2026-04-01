@@ -4,7 +4,7 @@
 //! and a preimage store instead of file descriptors.
 
 use vos_abi::error;
-use vos_abi::hostcall;
+use vos_abi::hostcall::{self, accumulate};
 use vos_abi::service::ServiceId;
 
 /// Result of dispatching a hostcall.
@@ -78,16 +78,16 @@ impl HostcallHandler {
         match call_id {
             hostcall::GAS => HostcallResult::Value(args.a0), // placeholder: return remaining gas
             hostcall::GROW_HEAP => HostcallResult::Value(error::HOST_OK),
-            hostcall::INFO => HostcallResult::Value(caller.0 as u64),
-            hostcall::CHECKPOINT => HostcallResult::Value(error::HOST_OK),
-            hostcall::YIELD => HostcallResult::Value(error::HOST_OK),
+            accumulate::INFO => HostcallResult::Value(caller.0 as u64),
+            accumulate::CHECKPOINT => HostcallResult::Value(error::HOST_OK),
+            accumulate::YIELD => HostcallResult::Value(error::HOST_OK),
 
-            hostcall::READ => {
+            accumulate::READ => {
                 // args: a0=key_ptr, a1=key_len, a2=val_buf_ptr, a3=val_buf_len
                 // Actual read requires memory access — handled at driver level
                 HostcallResult::Value(error::HOST_NONE)
             }
-            hostcall::WRITE => {
+            accumulate::WRITE => {
                 // args: a0=key_ptr, a1=key_len, a2=val_ptr, a3=val_len
                 // Actual write requires memory access — handled at driver level
                 HostcallResult::Value(error::HOST_OK)
@@ -96,11 +96,11 @@ impl HostcallHandler {
                 // args: a0=hash_ptr/buf_ptr, a1=buf_ptr/buf_len (depends on mode)
                 HostcallResult::Value(error::HOST_NONE)
             }
-            hostcall::PROVIDE => {
+            accumulate::PROVIDE => {
                 // args: a0=hash_ptr, a1=data_ptr, a2=data_len
                 HostcallResult::Value(error::HOST_OK)
             }
-            hostcall::TRANSFER => {
+            accumulate::TRANSFER => {
                 HostcallResult::Transfer {
                     target: ServiceId(args.a0 as u32),
                     amount: args.a1,
@@ -109,7 +109,7 @@ impl HostcallHandler {
                     memo_len: args.a4,
                 }
             }
-            hostcall::NEW => {
+            accumulate::NEW => {
                 // args: a0=code_hash_ptr
                 HostcallResult::Value(error::HOST_OK)
             }

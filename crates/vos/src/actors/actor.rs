@@ -20,6 +20,7 @@ pub trait Actor: Sized {
     /// stop processing remaining messages in this batch, `false` to continue.
     ///
     /// Default: prints the error and stops.
+    #[allow(unused_variables)]
     fn on_error(&mut self, error: &Self::Error) -> bool {
         // Use Debug format since we can't assume Display
         #[cfg(feature = "guest")]
