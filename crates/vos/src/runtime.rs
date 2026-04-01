@@ -312,9 +312,16 @@ impl VosRuntime {
                             }
                             // Refine-phase: invoke() — run sub-PVM synchronously
                             refine::INVOKE => {
+                                let mut invoke_transfers = Vec::new();
                                 let result = handle_invoke(
                                     &mut pvm, blobs, blob_by_hash, services, hostcalls, 0,
+                                    &mut invoke_transfers,
                                 );
+                                for (to, data) in invoke_transfers {
+                                    new_transfers.push(PendingTransfer {
+                                        from: id, to, data,
+                                    });
+                                }
                                 pvm.registers[7] = result;
                             }
                             // Note: refine::PEEK (6) collides with accumulate::INFO (6).
@@ -351,10 +358,11 @@ impl Default for VosRuntime {
     }
 }
 
-/// Handle invoke() hostcall: run a sub-PVM synchronously.
+/// Handle invoke() hostcall: run a sub-PVM synchronously with full accumulate access.
 ///
-/// Reads code_hash from caller memory, looks up blob, creates fresh child PVM,
-/// runs to completion, copies output back to caller memory.
+/// The child gets its own storage namespace (keyed by target service ID),
+/// can emit transfers (collected in `transfers_out`), and communicates
+/// exit status via the YIELD hostcall (captured as invoke output).
 fn handle_invoke(
     caller: &mut Pvm,
     blobs: &[Vec<u8>],
@@ -362,6 +370,7 @@ fn handle_invoke(
     services: &HashMap<u32, ServiceInfo>,
     hostcalls: &mut HostcallHandler,
     depth: usize,
+    transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
 ) -> u64 {
     if depth >= MAX_INVOKE_DEPTH {
         return error::HOST_WHAT;
@@ -379,13 +388,18 @@ fn handle_invoke(
         *byte = caller.read_u8(hash_ptr + i as u32).unwrap_or(0);
     }
 
+    // Determine target service ID from code hash (service-ID convention)
+    let target_svc_id = if code_hash[4..].iter().all(|&b| b == 0) {
+        ServiceId(u32::from_le_bytes([code_hash[0], code_hash[1], code_hash[2], code_hash[3]]))
+    } else {
+        ServiceId(0) // hash-based lookup — no service identity
+    };
+
     // Look up blob — first try by hash, then by service-ID convention
-    // (first 4 bytes = service ID LE, rest zeroed)
     let blob_idx = if let Some(&idx) = blob_by_hash.get(&code_hash) {
         idx
-    } else if code_hash[4..].iter().all(|&b| b == 0) {
-        let target_id = u32::from_le_bytes([code_hash[0], code_hash[1], code_hash[2], code_hash[3]]);
-        match services.get(&target_id) {
+    } else if target_svc_id.0 != 0 {
+        match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
             None => return error::HOST_NONE,
         }
@@ -403,9 +417,14 @@ fn handle_invoke(
         *byte = caller.read_u8(input_ptr + i as u32).unwrap_or(0);
     }
 
-    // Create fresh child PVM
+    // Create fresh child PVM — use service entry point (PC=5) if available
     let gas = if gas_limit == 0 { DEFAULT_GAS } else { gas_limit.min(DEFAULT_GAS) };
-    let mut child = match initialize_program(blob, &[], gas) {
+    let is_service = services.get(&target_svc_id.0).is_some_and(|i| i.is_service_blob);
+    let mut child = match if is_service {
+        initialize_program_at(blob, &[], gas, 5)
+    } else {
+        initialize_program(blob, &[], gas)
+    } {
         Some(p) => p,
         None => return error::HOST_WHAT,
     };
@@ -413,12 +432,16 @@ fn handle_invoke(
     // Pass input to child via FETCH (first fetch returns input)
     let mut child_items = vec![input];
 
-    // Run child to completion
+    // Run child to completion or YIELD
     loop {
         let (exit, _) = child.run();
         match exit {
             ExitReason::Halt => break,
-            ExitReason::Panic | ExitReason::OutOfGas | ExitReason::PageFault(_) => {
+            ExitReason::Panic => {
+                eprintln!("vosx: invoke child {} panicked at pc={:#x}", target_svc_id.0, child.pc);
+                return error::HOST_WHAT;
+            }
+            ExitReason::OutOfGas | ExitReason::PageFault(_) => {
                 return error::HOST_WHAT;
             }
             ExitReason::HostCall(call_id) => {
@@ -455,7 +478,6 @@ fn handle_invoke(
                         }
                     }
                     accumulate::READ => {
-                        // In invoke context, allow read-only storage access
                         let key_ptr = child.registers[7] as u32;
                         let key_len = child.registers[8] as usize;
                         let val_buf_ptr = child.registers[9] as u32;
@@ -464,9 +486,7 @@ fn handle_invoke(
                         for (i, byte) in key.iter_mut().enumerate() {
                             *byte = child.read_u8(key_ptr + i as u32).unwrap_or(0);
                         }
-                        // Use a dummy service ID for invoke children
-                        let child_id = ServiceId(0);
-                        if let Some(value) = hostcalls.storage.read(child_id, &key) {
+                        if let Some(value) = hostcalls.storage.read(target_svc_id, &key) {
                             let copy_len = value.len().min(val_buf_len);
                             let value = value[..copy_len].to_vec();
                             for (i, &byte) in value.iter().enumerate() {
@@ -477,19 +497,80 @@ fn handle_invoke(
                             child.registers[7] = error::HOST_NONE;
                         }
                     }
-                    // Note: refine::PEEK (6) = accumulate::INFO (6), handled above
-                    refine::INVOKE => {
-                        // Recursive invoke
-                        let result = handle_invoke(
-                            &mut child, blobs, blob_by_hash, services, hostcalls, depth + 1,
-                        );
-                        child.registers[7] = result;
+                    accumulate::WRITE => {
+                        let key_ptr = child.registers[7] as u32;
+                        let key_len = child.registers[8] as usize;
+                        let val_ptr = child.registers[9] as u32;
+                        let val_len = child.registers[10] as usize;
+                        let mut key = vec![0u8; key_len];
+                        for (i, byte) in key.iter_mut().enumerate() {
+                            *byte = child.read_u8(key_ptr + i as u32).unwrap_or(0);
+                        }
+                        let mut value = vec![0u8; val_len];
+                        for (i, byte) in value.iter_mut().enumerate() {
+                            *byte = child.read_u8(val_ptr + i as u32).unwrap_or(0);
+                        }
+                        hostcalls.storage.write(target_svc_id, &key, &value);
+                        child.registers[7] = error::HOST_OK;
                     }
                     accumulate::INFO => {
-                        child.registers[7] = 0; // invoke children have no service ID
+                        child.registers[7] = target_svc_id.0 as u64;
+                    }
+                    accumulate::TRANSFER => {
+                        let target = ServiceId(child.registers[7] as u32);
+                        let memo_ptr = child.registers[10] as u32;
+                        let memo_len = child.registers[11] as usize;
+                        let mut memo = vec![0u8; memo_len];
+                        for (i, byte) in memo.iter_mut().enumerate() {
+                            *byte = child.read_u8(memo_ptr + i as u32).unwrap_or(0);
+                        }
+                        transfers_out.push((target, memo));
+                        child.registers[7] = error::HOST_OK;
+                    }
+                    accumulate::PROVIDE => {
+                        let hash_ptr = child.registers[7] as u32;
+                        let data_ptr = child.registers[8] as u32;
+                        let data_len = child.registers[9] as usize;
+                        let mut hash = [0u8; 32];
+                        for (i, byte) in hash.iter_mut().enumerate() {
+                            *byte = child.read_u8(hash_ptr + i as u32).unwrap_or(0);
+                        }
+                        let mut data = vec![0u8; data_len];
+                        for (i, byte) in data.iter_mut().enumerate() {
+                            *byte = child.read_u8(data_ptr + i as u32).unwrap_or(0);
+                        }
+                        hostcalls.preimages.store(hash, data);
+                        child.registers[7] = error::HOST_OK;
+                    }
+                    accumulate::NEW => {
+                        child.registers[7] = error::HOST_OK;
+                    }
+                    accumulate::CHECKPOINT => {
+                        child.registers[7] = error::HOST_OK;
+                    }
+                    accumulate::YIELD => {
+                        // Child yielded — capture output data and return early.
+                        // This is how main_loop communicates exit status to the agent.
+                        let data_ptr = child.registers[7] as u32;
+                        let data_len = child.registers[8] as usize;
+                        let copy_len = data_len.min(4096);
+                        for i in 0..copy_len {
+                            let byte = child.read_u8(data_ptr + i as u32).unwrap_or(0);
+                            caller.write_u8(output_ptr + i as u32, byte);
+                        }
+                        return copy_len as u64;
+                    }
+                    refine::INVOKE => {
+                        // Recursive invoke
+                        let mut nested_transfers = Vec::new();
+                        let result = handle_invoke(
+                            &mut child, blobs, blob_by_hash, services, hostcalls,
+                            depth + 1, &mut nested_transfers,
+                        );
+                        transfers_out.extend(nested_transfers);
+                        child.registers[7] = result;
                     }
                     _ => {
-                        // Most hostcalls not available in invoke context
                         child.registers[7] = error::HOST_WHAT;
                     }
                 }
@@ -497,11 +578,10 @@ fn handle_invoke(
         }
     }
 
-    // Copy child output back to caller memory.
-    // Convention: after halt, child a0 = output_ptr, a1 = output_len in child memory.
+    // Child halted without calling YIELD — copy register-based output.
     let child_out_ptr = child.registers[7] as u32;
     let child_out_len = child.registers[8] as usize;
-    let copy_len = child_out_len.min(4096); // cap output size
+    let copy_len = child_out_len.min(4096);
     for i in 0..copy_len {
         let byte = child.read_u8(child_out_ptr + i as u32).unwrap_or(0);
         caller.write_u8(output_ptr + i as u32, byte);

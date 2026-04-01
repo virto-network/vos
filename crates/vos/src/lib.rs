@@ -37,10 +37,17 @@ pub mod actors;
 
 // Re-export core actor types at crate root for `use vos::*`
 pub use actors::{Actor, Message, Context, PendingAsk, Yield, RunResult, try_poll, metadata};
+pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED};
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "guest")]
 pub use actors::main_loop;
+
+/// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
+#[cfg(feature = "guest")]
+pub mod hostcalls {
+    pub use vos_abi::guest::hostcalls::*;
+}
 
 // --- Shared data structures (no_std compatible) ---
 

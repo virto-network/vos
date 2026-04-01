@@ -19,7 +19,7 @@ mod run;
 pub use actor::{Actor, Message};
 pub mod context;
 pub use context::{Context, PendingAsk};
-pub use run::{Yield, RunResult, try_poll};
+pub use run::{Yield, RunResult, try_poll, service_code_hash, STATUS_DONE, STATUS_YIELDED};
 #[cfg(feature = "guest")]
 pub use run::main_loop;
 

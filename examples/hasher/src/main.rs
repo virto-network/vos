@@ -1,7 +1,9 @@
 //! Hasher actor — endless compute loop demonstrating yield_now().
 //!
-//! Each invocation: hash once, print progress, yield_now() to self-schedule,
-//! then halt. The next invocation resumes from persisted state.
+//! Each invocation: hash once, print progress, yield to let the agent
+//! re-invoke us. The loop body runs once per invocation — `try_poll`
+//! returns `Yielded` on the first `.await`, and the agent re-sends
+//! the same `Run` message to drive the next iteration.
 
 use vos::{actor, messages};
 
@@ -36,17 +38,20 @@ impl Hasher {
         }
     }
 
-    /// Run one hash iteration, persist state, and self-schedule.
+    /// Run the hash loop. Each invocation executes one iteration:
+    /// hash → print → yield. The agent re-invokes to drive the next one.
     #[msg]
     async fn run(&mut self, ctx: &mut Context<Self>) {
-        self.current_hash = simple_hash(&self.current_hash);
-        self.iterations += 1;
-        println!("hasher: iteration {} — hash[0..4]={:02x}{:02x}{:02x}{:02x}",
-            self.iterations,
-            self.current_hash[0], self.current_hash[1],
-            self.current_hash[2], self.current_hash[3],
-        );
-        ctx.yield_now().await;
+        loop {
+            self.current_hash = simple_hash(&self.current_hash);
+            self.iterations += 1;
+            println!("hasher: iteration {} — hash[0..4]={:02x}{:02x}{:02x}{:02x}",
+                self.iterations,
+                self.current_hash[0], self.current_hash[1],
+                self.current_hash[2], self.current_hash[3],
+            );
+            ctx.yield_now().await;
+        }
     }
 
     /// Query the latest hash and iteration count.
