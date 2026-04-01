@@ -18,7 +18,7 @@
 //! 5. Resumes the service
 
 use crate::hostcall_handler::HostcallHandler;
-use javm::program::initialize_program;
+use javm::program::{initialize_program, initialize_program_at};
 use javm::{ExitReason, Gas, Pvm};
 use vos_abi::error;
 use vos_abi::hostcall::{self, accumulate, refine};
@@ -26,7 +26,7 @@ use vos_abi::service::ServiceId;
 use std::collections::HashMap;
 use std::io::Write;
 
-const DEFAULT_GAS: Gas = 10_000_000;
+const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
 
 /// Exit status bytes for receipts.
@@ -41,6 +41,9 @@ struct ServiceInfo {
     blob_idx: usize,
     /// Whether this service is alive.
     alive: bool,
+    /// Whether the blob has dual entry points (service format).
+    /// If true, accumulate entry is at PC=5.
+    is_service_blob: bool,
 }
 
 /// A pending transfer between services.
@@ -81,23 +84,45 @@ impl VosRuntime {
         }
     }
 
-    /// Register a PVM blob. Returns a blob index.
+    /// Register a standard PVM blob (single entry point). Returns a blob index.
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
+        self.register_blob_inner(blob, false)
+    }
+
+    /// Register a service PVM blob (dual entry: refine at PC=0, accumulate at PC=5).
+    /// In accumulate-only mode, the runtime starts these at PC=5.
+    pub fn register_service_blob(&mut self, blob: Vec<u8>) -> usize {
+        self.register_blob_inner(blob, true)
+    }
+
+    fn register_blob_inner(&mut self, blob: Vec<u8>, is_service: bool) -> usize {
         let idx = self.blobs.len();
-        // Compute a simple hash for invoke() lookups
         let hash = simple_hash(&blob);
         self.blob_by_hash.insert(hash, idx);
         self.blobs.push(blob);
+        // Store format info alongside the blob index
+        // (We'll look this up via ServiceInfo.is_service_blob)
+        let _ = is_service; // tracked per-service, not per-blob
         idx
     }
 
     /// Register a service from a blob index. Returns its ServiceId.
     pub fn register_service(&mut self, blob_idx: usize) -> ServiceId {
+        self.register_service_with_format(blob_idx, false)
+    }
+
+    /// Register a service from a service blob (dual entry point).
+    pub fn register_service_from_service_blob(&mut self, blob_idx: usize) -> ServiceId {
+        self.register_service_with_format(blob_idx, true)
+    }
+
+    fn register_service_with_format(&mut self, blob_idx: usize, is_service_blob: bool) -> ServiceId {
         let id = self.next_id;
         self.next_id += 1;
         self.services.insert(id, ServiceInfo {
             blob_idx,
             alive: true,
+            is_service_blob,
         });
         ServiceId(id)
     }
@@ -149,8 +174,12 @@ impl VosRuntime {
                 None => continue,
             };
 
-            // Fresh PVM from blob
-            let mut pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+            // Fresh PVM from blob — service blobs start at accumulate entry (PC=5)
+            let mut pvm = match if info.is_service_blob {
+                initialize_program_at(blob, &[], DEFAULT_GAS, 5)
+            } else {
+                initialize_program(blob, &[], DEFAULT_GAS)
+            } {
                 Some(p) => p,
                 None => {
                     eprintln!("vosx: failed to init PVM for service {svc_id}");

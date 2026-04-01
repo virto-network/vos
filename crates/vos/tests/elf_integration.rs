@@ -19,10 +19,15 @@ fn example_elf(name: &str) -> Vec<u8> {
     }
 }
 
-/// Transpile an ELF to a PVM blob (accumulate-only mode).
-/// Use link_elf_service for strict JAM two-phase mode (not yet supported by runtime).
+/// Transpile an ELF to a JAM service PVM blob (dual entry: refine + accumulate).
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
-    grey_transpiler::link_elf(elf_data).expect("transpile failed")
+    grey_transpiler::link_elf_service(elf_data).expect("transpile failed")
+}
+
+/// Register a service blob and create a service (dual-entry, accumulate at PC=5).
+fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos_abi::service::ServiceId {
+    let blob_idx = rt.register_service_blob(blob);
+    rt.register_service_from_service_blob(blob_idx)
 }
 
 #[test]
@@ -31,8 +36,7 @@ fn greeter_lifecycle() {
     let blob = transpile_actor(&elf);
 
     let mut rt = VosRuntime::new();
-    let blob_idx = rt.register_blob(blob);
-    let id = rt.register_service(blob_idx);
+    let id = register_svc(&mut rt, blob);
 
     // Send empty init trigger — greeter has a parameterless constructor
     rt.send_to(id, Vec::new());
@@ -52,8 +56,7 @@ fn greeter_survives_second_invocation() {
     let blob = transpile_actor(&elf);
 
     let mut rt = VosRuntime::new();
-    let blob_idx = rt.register_blob(blob);
-    let id = rt.register_service(blob_idx);
+    let id = register_svc(&mut rt, blob);
 
     // First invocation — init
     rt.send_to(id, Vec::new());
@@ -103,9 +106,9 @@ fn runtime_multiple_services_mixed() {
     let blob = transpile_actor(&elf);
 
     let mut rt = VosRuntime::new();
-    let blob_idx = rt.register_blob(blob);
-    let id1 = rt.register_service(blob_idx);
-    let id2 = rt.register_service(blob_idx);
+    let blob_idx = rt.register_service_blob(blob);
+    let id1 = rt.register_service_from_service_blob(blob_idx);
+    let id2 = rt.register_service_from_service_blob(blob_idx);
 
     rt.send_to(id1, Vec::new());
     rt.send_to(id2, Vec::new());
@@ -125,8 +128,7 @@ fn counter_needs_init_payload() {
     let blob = transpile_actor(&elf);
 
     let mut rt = VosRuntime::new();
-    let blob_idx = rt.register_blob(blob);
-    let id = rt.register_service(blob_idx);
+    let id = register_svc(&mut rt, blob);
 
     // Send empty — counter will spin waiting for init payload
     rt.send_to(id, Vec::new());

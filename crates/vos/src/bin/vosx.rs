@@ -61,17 +61,17 @@ fn main() {
             }
         };
 
-        let pvm_blob = match svc_def.format.as_str() {
+        let (pvm_blob, is_service) = match svc_def.format.as_str() {
             "pvm" => {
                 eprintln!("  loading '{}' from {}", svc_def.name, file_path.display());
-                file_data
+                (file_data, false)
             }
             "elf" | _ => {
                 eprintln!("  transpiling '{}' from {}", svc_def.name, file_path.display());
-                // Use link_elf (accumulate-only mode). link_elf_service
-                // produces dual-entry blobs for strict JAM two-phase mode.
-                match grey_transpiler::link_elf(&file_data) {
-                    Ok(b) => b,
+                // Use link_elf_service for dual-entry (refine at PC=0, accumulate at PC=5).
+                // Runtime starts at PC=5 (accumulate) in vosx mode.
+                match grey_transpiler::link_elf_service(&file_data) {
+                    Ok(b) => (b, true),
                     Err(e) => {
                         eprintln!("error: transpiling '{}': {e:?}", svc_def.name);
                         process::exit(1);
@@ -80,8 +80,16 @@ fn main() {
             }
         };
 
-        let blob_idx = runtime.register_blob(pvm_blob);
-        let id = runtime.register_service(blob_idx);
+        let blob_idx = if is_service {
+            runtime.register_service_blob(pvm_blob)
+        } else {
+            runtime.register_blob(pvm_blob)
+        };
+        let id = if is_service {
+            runtime.register_service_from_service_blob(blob_idx)
+        } else {
+            runtime.register_service(blob_idx)
+        };
         eprintln!("  registered '{}' as service {id:?}", svc_def.name);
         service_ids.push((svc_def.name.clone(), id));
     }
