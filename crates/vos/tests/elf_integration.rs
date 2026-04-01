@@ -19,7 +19,8 @@ fn example_elf(name: &str) -> Vec<u8> {
     }
 }
 
-/// Transpile an ELF to a PVM blob.
+/// Transpile an ELF to a PVM blob (accumulate-only mode).
+/// Use link_elf_service for strict JAM two-phase mode (not yet supported by runtime).
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
     grey_transpiler::link_elf(elf_data).expect("transpile failed")
 }

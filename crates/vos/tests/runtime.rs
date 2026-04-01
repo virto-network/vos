@@ -118,6 +118,66 @@ fn program_fetch_and_store_len() -> Vec<u8> {
     asm.build()
 }
 
+/// Program that immediately halts (simplest possible service).
+fn program_halt() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+/// Program that calls INFO, stores result to storage key "id", then halts.
+fn program_info_to_storage() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+
+    // INFO → a0 = service ID
+    asm.ecalli(accumulate::INFO);
+    // Store ID at addr 200
+    asm.store_u8(Reg::A0, 200);
+
+    // Write storage key "id" at addr 210
+    asm.load_imm(Reg::T0, 0x69); // 'i'
+    asm.store_u8(Reg::T0, 210);
+    asm.load_imm(Reg::T0, 0x64); // 'd'
+    asm.store_u8(Reg::T0, 211);
+
+    // WRITE: key="id" at 210 (2 bytes), val=service_id at 200 (1 byte)
+    asm.load_imm(Reg::A0, 210); // key_ptr
+    asm.load_imm(Reg::A1, 2);   // key_len
+    asm.load_imm(Reg::A2, 200); // val_ptr
+    asm.load_imm(Reg::A3, 1);   // val_len
+    asm.ecalli(accumulate::WRITE);
+
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+#[test]
+fn runtime_halt_only() {
+    let blob = program_halt();
+    let mut rt = VosRuntime::new();
+    let blob_idx = rt.register_blob(blob);
+    let id = rt.register_service(blob_idx);
+    rt.send_to(id, Vec::new());
+    rt.run();
+    // Service should halt cleanly without persisting anything
+}
+
+#[test]
+fn runtime_info_returns_service_id() {
+    let blob = program_info_to_storage();
+    let mut rt = VosRuntime::new();
+    let blob_idx = rt.register_blob(blob);
+    let id = rt.register_service(blob_idx);
+    rt.send_to(id, Vec::new());
+    rt.run();
+
+    // Verify INFO returned the correct service ID
+    let val = rt.hostcalls.storage.read(id, b"id");
+    assert_eq!(val, Some(&[id.0 as u8][..]));
+}
+
 #[test]
 fn runtime_single_service_debug_write() {
     let blob = program_debug_write();

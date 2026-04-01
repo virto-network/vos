@@ -53,11 +53,7 @@ pub mod hostcall_handler;
 #[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
-pub mod pvm_driver;
-#[cfg(feature = "std")]
 pub mod runtime;
-
-pub use hostcall_handler::MemoryAccess;
 
 /// Re-export for use by generated print!/println! macros.
 #[cfg(feature = "guest")]

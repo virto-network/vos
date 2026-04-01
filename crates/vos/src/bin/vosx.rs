@@ -68,6 +68,8 @@ fn main() {
             }
             "elf" | _ => {
                 eprintln!("  transpiling '{}' from {}", svc_def.name, file_path.display());
+                // Use link_elf (accumulate-only mode). link_elf_service
+                // produces dual-entry blobs for strict JAM two-phase mode.
                 match grey_transpiler::link_elf(&file_data) {
                     Ok(b) => b,
                     Err(e) => {
