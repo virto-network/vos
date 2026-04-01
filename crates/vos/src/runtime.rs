@@ -220,6 +220,7 @@ impl VosRuntime {
                                         hostcalls,
                                         blobs,
                                         blob_by_hash,
+                                        services,
                                     );
                                     // 5-byte receipt: [service_id: u32 LE, status: u8]
                                     receipts.extend_from_slice(&t.to.0.to_le_bytes());
@@ -333,7 +334,7 @@ impl VosRuntime {
                             // Refine-phase: invoke() — run sub-PVM synchronously
                             refine::INVOKE => {
                                 let result = handle_invoke(
-                                    &mut pvm, blobs, blob_by_hash, hostcalls, 0,
+                                    &mut pvm, blobs, blob_by_hash, services, hostcalls, 0,
                                 );
                                 pvm.registers[7] = result;
                             }
@@ -387,6 +388,7 @@ fn run_child_pvm(
     hostcalls: &mut HostcallHandler,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
 ) -> ChildResult {
     let mut pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
         Some(p) => p,
@@ -419,7 +421,7 @@ fn run_child_pvm(
                 handle_child_hostcall(
                     &mut pvm, call_id, id, hostcalls,
                     &mut item_queue, &mut transfers,
-                    blobs, blob_by_hash,
+                    blobs, blob_by_hash, services,
                 );
             }
         }
@@ -436,6 +438,7 @@ fn handle_child_hostcall(
     transfers: &mut Vec<(ServiceId, Vec<u8>)>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
 ) {
     let a0 = pvm.registers[7];
     let a1 = pvm.registers[8];
@@ -545,7 +548,7 @@ fn handle_child_hostcall(
             pvm.registers[7] = error::HOST_OK;
         }
         refine::INVOKE => {
-            let result = handle_invoke(pvm, blobs, blob_by_hash, hostcalls, 0);
+            let result = handle_invoke(pvm, blobs, blob_by_hash, services, hostcalls, 0);
             pvm.registers[7] = result;
         }
         _ => {
@@ -562,6 +565,7 @@ fn handle_invoke(
     caller: &mut Pvm,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
     hostcalls: &mut HostcallHandler,
     depth: usize,
 ) -> u64 {
@@ -573,7 +577,7 @@ fn handle_invoke(
     let input_ptr = caller.registers[8] as u32;
     let input_len = caller.registers[9] as usize;
     let gas_limit = caller.registers[10];
-    let _output_ptr = caller.registers[11] as u32;
+    let output_ptr = caller.registers[11] as u32;
 
     // Read code hash from caller memory
     let mut code_hash = [0u8; 32];
@@ -581,10 +585,18 @@ fn handle_invoke(
         *byte = caller.read_u8(hash_ptr + i as u32).unwrap_or(0);
     }
 
-    // Look up blob
-    let blob_idx = match blob_by_hash.get(&code_hash) {
-        Some(&idx) => idx,
-        None => return error::HOST_NONE,
+    // Look up blob — first try by hash, then by service-ID convention
+    // (first 4 bytes = service ID LE, rest zeroed)
+    let blob_idx = if let Some(&idx) = blob_by_hash.get(&code_hash) {
+        idx
+    } else if code_hash[4..].iter().all(|&b| b == 0) {
+        let target_id = u32::from_le_bytes([code_hash[0], code_hash[1], code_hash[2], code_hash[3]]);
+        match services.get(&target_id) {
+            Some(info) => info.blob_idx,
+            None => return error::HOST_NONE,
+        }
+    } else {
+        return error::HOST_NONE;
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
@@ -675,7 +687,7 @@ fn handle_invoke(
                     refine::INVOKE => {
                         // Recursive invoke
                         let result = handle_invoke(
-                            &mut child, blobs, blob_by_hash, hostcalls, depth + 1,
+                            &mut child, blobs, blob_by_hash, services, hostcalls, depth + 1,
                         );
                         child.registers[7] = result;
                     }
@@ -691,9 +703,16 @@ fn handle_invoke(
         }
     }
 
-    // TODO: Copy child output back to caller memory
-    // For now, return success
-    error::HOST_OK
+    // Copy child output back to caller memory.
+    // Convention: after halt, child a0 = output_ptr, a1 = output_len in child memory.
+    let child_out_ptr = child.registers[7] as u32;
+    let child_out_len = child.registers[8] as usize;
+    let copy_len = child_out_len.min(4096); // cap output size
+    for i in 0..copy_len {
+        let byte = child.read_u8(child_out_ptr + i as u32).unwrap_or(0);
+        caller.write_u8(output_ptr + i as u32, byte);
+    }
+    copy_len as u64
 }
 
 /// Simple hash for blob identification (matches vos-agent's hash_blob).

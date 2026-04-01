@@ -175,6 +175,18 @@ impl<A: Actor> Context<A> {
         &self.call_results
     }
 
+    /// Push a new call result (from a resolved ask) and reset for replay.
+    ///
+    /// After resolving an ask via invoke(), the framework pushes the result
+    /// and resets the call_index so the handler can be replayed from the start.
+    pub fn push_call_result_and_reset(&mut self, result: Vec<u8>) {
+        self.call_results.push(result);
+        self.call_index = 0;
+        self.pending_ask = None;
+        self.self_schedule = false;
+        self.sleep_ticks = 0;
+    }
+
     /// Flush all queued effects via hostcalls.
     ///
     /// On non-RISC-V targets this is a no-op (effects are only meaningful

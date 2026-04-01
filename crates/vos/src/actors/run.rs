@@ -182,10 +182,40 @@ pub fn main_loop<A: super::Actor>(
         if n == 0 || n >= BUF_SIZE as u64 {
             break; // No more items
         }
-        let payload = &buf[..n as usize];
-        let stop = dispatch(payload, &mut actor, &mut ctx);
+        // Copy payload so we can replay if ask() suspends
+        let payload_len = n as usize;
+        let mut payload_buf = [0u8; BUF_SIZE];
+        payload_buf[..payload_len].copy_from_slice(&buf[..payload_len]);
+
+        let stop = dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx);
         ctx.flush_effects();
         if stop { break; }
+
+        // Resolve pending asks: call invoke(), cache result, replay handler
+        while let Some(pending) = ctx.take_pending_ask() {
+            // Look up the target's code hash from the service table.
+            // For now, use the target service ID as a simple hash lookup key.
+            // The invoke hostcall takes a code_hash — we construct one from
+            // the target's storage blob hash.
+            let mut invoke_buf = [0u8; BUF_SIZE];
+            let result_len = hostcalls::invoke(
+                &target_code_hash(pending.target.0),
+                &pending.payload,
+                0, // 0 = use default gas
+                &mut invoke_buf,
+            );
+            let result = if result_len > 0 && result_len < BUF_SIZE as u64 {
+                invoke_buf[..result_len as usize].to_vec()
+            } else {
+                alloc::vec::Vec::new()
+            };
+            ctx.push_call_result_and_reset(result);
+
+            // Replay: re-dispatch the same message with cached results
+            let stop = dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx);
+            ctx.flush_effects();
+            if stop { break; }
+        }
 
         // If cooperative scheduling was requested, break out of item processing
         if ctx.self_scheduled() {
@@ -229,4 +259,16 @@ pub fn main_loop<A: super::Actor>(
     // Explicit PVM halt: jump to the halt sentinel address (2^32 - 2^16).
     // Cannot rely on ra being preserved through the call chain.
     halt();
+}
+
+/// Derive a code hash from a service ID for invoke() lookup.
+///
+/// Convention: the first 4 bytes are the service ID in LE, rest zeroed.
+/// The vosx runtime recognizes this pattern and looks up the service's blob
+/// by ID instead of by hash.
+#[cfg(feature = "guest")]
+fn target_code_hash(service_id: u32) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    hash[..4].copy_from_slice(&service_id.to_le_bytes());
+    hash
 }

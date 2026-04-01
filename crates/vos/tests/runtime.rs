@@ -1,7 +1,8 @@
 //! Integration tests for VosRuntime — the fresh-PVM-per-invocation model.
 
 use grey_transpiler::assembler::{Assembler, Reg};
-use vos_abi::hostcall::{self, accumulate};
+use vos_abi::hostcall::{self, accumulate, refine};
+use vos_abi::service::ServiceId;
 use vos::runtime::VosRuntime;
 
 /// Program that writes "Hi" via DEBUG_WRITE then halts.
@@ -245,4 +246,99 @@ fn runtime_fresh_pvm_per_invocation() {
     rt.run();
     // Still 42 — the program writes 42 unconditionally
     assert_eq!(rt.hostcalls.storage.read(id, b"x"), Some(&[42u8][..]));
+}
+
+/// "Doubler" service: FETCHes one byte, doubles it, leaves result in a0/a1 for invoke output.
+fn program_doubler() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+
+    // FETCH input into addr 0
+    asm.load_imm(Reg::A0, 0);   // buf_ptr
+    asm.load_imm(Reg::A1, 128); // buf_len
+    asm.ecalli(hostcall::FETCH);
+
+    // Load byte at addr 0, double it, store at addr 200
+    asm.load_u8(Reg::T0, 0);
+    asm.add_64(Reg::T0, Reg::T0, Reg::T0); // double
+    asm.store_u8(Reg::T0, 200);
+
+    // Set output: a0 = output_ptr (200), a1 = output_len (1)
+    asm.load_imm(Reg::A0, 200);
+    asm.load_imm(Reg::A1, 1);
+
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+/// Caller service: writes a code_hash (service-ID convention) + input byte into memory,
+/// calls INVOKE, reads the output, stores it to storage key "r".
+fn program_invoke_doubler(target_id: u32) -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_size(4096);
+
+    // Write code_hash at addr 0: first 4 bytes = target_id LE, rest = 0
+    // (stack is zeroed, so we only need to write the first 4 bytes)
+    let id_bytes = target_id.to_le_bytes();
+    asm.load_imm(Reg::T0, id_bytes[0] as i32);
+    asm.store_u8(Reg::T0, 0);
+    if id_bytes[1] != 0 {
+        asm.load_imm(Reg::T0, id_bytes[1] as i32);
+        asm.store_u8(Reg::T0, 1);
+    }
+    // bytes 2,3 are 0 for small IDs, and bytes 4-31 are already 0
+
+    // Write input byte (21) at addr 64
+    asm.load_imm(Reg::T0, 21);
+    asm.store_u8(Reg::T0, 64);
+
+    // INVOKE: a0=hash_ptr(0), a1=input_ptr(64), a2=input_len(1), a3=gas(0=default), a4=output_ptr(128)
+    asm.load_imm(Reg::A0, 0);   // hash_ptr
+    asm.load_imm(Reg::A1, 64);  // input_ptr
+    asm.load_imm(Reg::A2, 1);   // input_len
+    asm.load_imm(Reg::A3, 0);   // gas (0 = default)
+    asm.load_imm(Reg::A4, 128); // output_ptr
+    asm.ecalli(refine::INVOKE);
+
+    // a0 now contains output_len (should be 1)
+    // Read the output byte from addr 128, store to storage key "r" at addr 180
+
+    // Write key "r" at addr 180
+    asm.load_imm(Reg::T0, 0x72); // 'r'
+    asm.store_u8(Reg::T0, 180);
+
+    // WRITE: key="r" at 180 (1 byte), val=invoke output at 128 (1 byte)
+    asm.load_imm(Reg::A0, 180); // key_ptr
+    asm.load_imm(Reg::A1, 1);   // key_len
+    asm.load_imm(Reg::A2, 128); // val_ptr
+    asm.load_imm(Reg::A3, 1);   // val_len
+    asm.ecalli(accumulate::WRITE);
+
+    asm.jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+#[test]
+fn runtime_invoke_by_service_id() {
+    // Register a "doubler" service, then a "caller" that invokes it
+    let doubler_blob = program_doubler();
+    let caller_blob = program_invoke_doubler(1); // target = ServiceId(1)
+
+    let mut rt = VosRuntime::new();
+    let doubler_idx = rt.register_blob(doubler_blob);
+    let caller_idx = rt.register_blob(caller_blob);
+
+    let doubler_id = rt.register_service(doubler_idx); // ServiceId(1)
+    let caller_id = rt.register_service(caller_idx);   // ServiceId(2)
+
+    assert_eq!(doubler_id, ServiceId(1));
+
+    // Trigger caller
+    rt.send_to(caller_id, Vec::new());
+    rt.run();
+
+    // Caller invoked doubler with input=21, doubler returns 42
+    // Caller stored result in storage key "r"
+    let val = rt.hostcalls.storage.read(caller_id, b"r");
+    assert_eq!(val, Some(&[42u8][..]), "invoke should return doubled value");
 }
