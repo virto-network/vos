@@ -45,39 +45,3 @@ pub mod accumulate {
     pub const YIELD: u32 = 26;
     pub const PROVIDE: u32 = 27;
 }
-
-// --- Deprecated flat aliases (accumulate IDs at old positions) ---
-// These keep existing code compiling during the transition.
-
-#[deprecated = "use accumulate::READ"]
-pub const READ: u32 = accumulate::READ;
-#[deprecated = "use accumulate::WRITE"]
-pub const WRITE: u32 = accumulate::WRITE;
-#[deprecated = "use accumulate::INFO"]
-pub const INFO: u32 = accumulate::INFO;
-#[deprecated = "use accumulate::BLESS"]
-pub const BLESS: u32 = accumulate::BLESS;
-#[deprecated = "use accumulate::ASSIGN"]
-pub const ASSIGN: u32 = accumulate::ASSIGN;
-#[deprecated = "use accumulate::DESIGNATE"]
-pub const DESIGNATE: u32 = accumulate::DESIGNATE;
-#[deprecated = "use accumulate::CHECKPOINT"]
-pub const CHECKPOINT: u32 = accumulate::CHECKPOINT;
-#[deprecated = "use accumulate::NEW"]
-pub const NEW: u32 = accumulate::NEW;
-#[deprecated = "use accumulate::UPGRADE"]
-pub const UPGRADE: u32 = accumulate::UPGRADE;
-#[deprecated = "use accumulate::TRANSFER"]
-pub const TRANSFER: u32 = accumulate::TRANSFER;
-#[deprecated = "use accumulate::EJECT"]
-pub const EJECT: u32 = accumulate::EJECT;
-#[deprecated = "use accumulate::QUERY"]
-pub const QUERY: u32 = accumulate::QUERY;
-#[deprecated = "use accumulate::SOLICIT"]
-pub const SOLICIT: u32 = accumulate::SOLICIT;
-#[deprecated = "use accumulate::FORGET"]
-pub const FORGET: u32 = accumulate::FORGET;
-#[deprecated = "use accumulate::YIELD"]
-pub const YIELD: u32 = accumulate::YIELD;
-#[deprecated = "use accumulate::PROVIDE"]
-pub const PROVIDE: u32 = accumulate::PROVIDE;

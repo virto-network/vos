@@ -122,8 +122,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// ## Generated `_start`
 ///
-/// The macro generates the PVM entry point. Lifecycle:
-/// read state from storage → dispatch all pending items → write state back → halt.
+/// The macro generates the PVM entry point. The `service` cargo feature
+/// determines whether `main_loop` (service with accumulate) or `refine_loop`
+/// (stateless guest) is used — no macro argument needed.
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -404,10 +405,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let archived_actor_name = format_ident!("Archived{}", actor_name);
 
-    // Generate _start (refine) and _accumulate entry points.
-    // In accumulate-only mode (current), _start runs the full lifecycle.
-    // _accumulate is provided for link_elf_service compatibility.
-    let start_fn = quote! {
+    let common_preamble = quote! {
         extern crate alloc;
 
         /// Result type alias using this actor's error type.
@@ -418,39 +416,80 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         use vos::{print, println, eprint, eprintln};
         #[allow(unused_imports)]
         use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+    };
+
+    let save_fn = quote! {
+        |__actor| {
+            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(__actor).unwrap();
+            bytes.to_vec()
+        }
+    };
+
+    let load_fn = quote! {
+        |__bytes| {
+            let archived = unsafe {
+                vos::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
+            };
+            vos::rkyv::deserialize::<#actor_name, vos::rkyv::rancor::Error>(archived).unwrap()
+        }
+    };
+
+    let dispatch_fn = quote! {
+        |__payload, __actor, __ctx| -> vos::RunResult<bool> {
+            vos::try_poll(async {
+                unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await }
+            })
+        }
+    };
+
+    let init_fn = quote! {
+        |__payload| {
+            #init_deserialize
+            #ctor_call
+        }
+    };
+
+    let start_fn = quote! {
+        #common_preamble
 
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
-            vos::main_loop::<#actor_name>(
+            vos::entry_loop::<#actor_name>(
                 #needs_init_payload,
-                |__payload| {
-                    #init_deserialize
-                    #ctor_call
-                },
-                |__payload, __actor, __ctx| -> vos::RunResult<bool> {
-                    vos::try_poll(async {
-                        unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await }
-                    })
-                },
-                |__actor| {
-                    let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(__actor).unwrap();
-                    bytes.to_vec()
-                },
-                |__bytes| {
-                    let archived = unsafe {
-                        vos::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
-                    };
-                    vos::rkyv::deserialize::<#actor_name, vos::rkyv::rancor::Error>(archived).unwrap()
-                },
+                #init_fn,
+                #dispatch_fn,
+                #save_fn,
+                #load_fn,
             );
         }
 
         /// Accumulate entry point (PC=5 in JAM service blobs).
-        /// In accumulate-only mode, this is identical to _start.
+        /// Only reachable in service blobs linked with `link_elf_service`.
         #[unsafe(no_mangle)]
         pub extern "C" fn accumulate() {
             _start();
         }
+
+        // Force the linker to keep `accumulate` even under LTO.
+        #[used]
+        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
+
+        // Embed actor metadata in the .vos_meta ELF section.
+        // vosx reads this to discover messages without running the binary.
+        const _VOS_META_ENCODED: ([u8; 4096], usize) =
+            vos::metadata::encode::<4096>(&#enum_name::META);
+
+        #[unsafe(link_section = ".vos_meta")]
+        #[used]
+        static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
+            // Copy only the used bytes from the encoded buffer.
+            // This is a const context so we use a loop.
+            let (src, len) = _VOS_META_ENCODED;
+            let mut out = [0u8; _VOS_META_ENCODED.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
     };
 
     // Generate the aggregated enum

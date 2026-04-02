@@ -40,31 +40,31 @@ pub use actors::{Actor, Message, Context, PendingAsk, Yield, RunResult, try_poll
 pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED};
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
-#[cfg(feature = "guest")]
+#[cfg(feature = "service")]
 pub use actors::main_loop;
+#[cfg(feature = "pvm")]
+pub use actors::refine_loop;
+
+// Unified entry — macro always calls this, feature flag picks the right loop.
+#[cfg(feature = "service")]
+pub use actors::main_loop as entry_loop;
+#[cfg(all(feature = "pvm", not(feature = "service")))]
+pub use actors::refine_loop as entry_loop;
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
-#[cfg(feature = "guest")]
+#[cfg(feature = "pvm")]
 pub mod hostcalls {
-    pub use vos_abi::guest::hostcalls::*;
+    pub use vos_abi::pvm::hostcalls::*;
 }
-
-// --- Shared data structures (no_std compatible) ---
-
-pub mod registry;
 
 // --- Runtime infrastructure (host-only) ---
 
-pub mod hostcall_handler;
-
-#[cfg(feature = "std")]
-pub mod manifest;
 #[cfg(feature = "std")]
 pub mod runtime;
 
 /// Re-export for use by generated print!/println! macros.
-#[cfg(feature = "guest")]
+#[cfg(feature = "pvm")]
 #[doc(hidden)]
 pub mod __io {
-    pub use vos_abi::guest::hostcalls::debug_write;
+    pub use vos_abi::pvm::hostcalls::debug_write;
 }

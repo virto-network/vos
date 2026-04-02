@@ -6,15 +6,12 @@
 //!
 //! ## Execution model
 //!
-//! vosx currently runs in accumulate-only mode: all hostcalls (read, write,
-//! transfer, invoke, etc.) are available in a single pass. A future `jam`
-//! feature flag will enable strict two-phase (refine + accumulate) execution.
-//!
-//! When a service YIELDs, the runtime returns HOST_OK. Self-driving actors
-//! re-invoke themselves via self-transfer. The round loop delivers transfers
-//! round by round.
+//! Top-level services (agents) run at PC=5 (accumulate entry) with full
+//! hostcall access. Guest actors invoked via `invoke()` run at PC=0 (refine
+//! entry) with only refine-phase hostcalls. When a service YIELDs, the
+//! runtime returns HOST_OK. Self-driving actors re-invoke themselves via
+//! self-transfer. The round loop delivers transfers round by round.
 
-use crate::hostcall_handler::HostcallHandler;
 use javm::program::{initialize_program, initialize_program_at};
 use javm::{ExitReason, Gas, Pvm};
 use vos_abi::error;
@@ -26,23 +23,99 @@ use std::io::Write;
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
 
-/// Entry in the service registry.
-struct ServiceInfo {
-    /// Index into `blobs`.
-    blob_idx: usize,
-    /// Whether this service is alive.
-    alive: bool,
-    /// Whether the blob has dual entry points (service format).
-    /// If true, accumulate entry is at PC=5.
-    is_service_blob: bool,
+// --- PVM memory helpers ---
+
+fn pvm_read(pvm: &Pvm, ptr: u32, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = pvm.read_u8(ptr + i as u32).unwrap_or(0);
+    }
+    buf
 }
 
-/// A pending transfer between services.
-struct PendingTransfer {
-    #[allow(dead_code)]
-    from: ServiceId,
-    to: ServiceId,
-    data: Vec<u8>,
+fn pvm_read_hash(pvm: &Pvm, ptr: u32) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    for (i, byte) in h.iter_mut().enumerate() {
+        *byte = pvm.read_u8(ptr + i as u32).unwrap_or(0);
+    }
+    h
+}
+
+fn pvm_write(pvm: &mut Pvm, ptr: u32, data: &[u8]) {
+    for (i, &byte) in data.iter().enumerate() {
+        pvm.write_u8(ptr + i as u32, byte);
+    }
+}
+
+// --- Shared hostcall dispatch (refine-phase: available to all PVMs) ---
+
+/// Handle hostcalls common to both refine and accumulate phases.
+/// Returns `true` if handled.
+fn handle_base_hostcall(
+    pvm: &mut Pvm,
+    call_id: u32,
+    items: &mut Vec<Vec<u8>>,
+) -> bool {
+    let a0 = pvm.registers[7];
+    let a1 = pvm.registers[8];
+
+    match call_id {
+        hostcall::GAS => {
+            pvm.registers[7] = pvm.gas;
+        }
+        hostcall::GROW_HEAP => {
+            pvm.registers[7] = error::HOST_OK;
+        }
+        hostcall::DEBUG_WRITE => {
+            let buf = pvm_read(pvm, a0 as u32, a1 as usize);
+            let _ = std::io::stderr().write_all(&buf);
+            let _ = std::io::stderr().flush();
+            pvm.registers[7] = buf.len() as u64;
+        }
+        hostcall::FETCH => {
+            let buf_ptr = a0 as u32;
+            let buf_len = a1 as usize;
+            if let Some(item) = items.first() {
+                let copy_len = item.len().min(buf_len);
+                pvm_write(pvm, buf_ptr, &item[..copy_len]);
+                items.remove(0);
+                pvm.registers[7] = copy_len as u64;
+            } else {
+                pvm.registers[7] = 0;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+// --- Per-service storage ---
+
+/// Per-service key-value storage.
+pub struct ServiceStorage {
+    data: HashMap<(u32, Vec<u8>), Vec<u8>>,
+}
+
+impl ServiceStorage {
+    fn new() -> Self {
+        Self { data: HashMap::new() }
+    }
+
+    pub fn read(&self, service: ServiceId, key: &[u8]) -> Option<&[u8]> {
+        self.data.get(&(service.0, key.to_vec())).map(|v| v.as_slice())
+    }
+
+    pub fn write(&mut self, service: ServiceId, key: &[u8], value: &[u8]) {
+        self.data.insert((service.0, key.to_vec()), value.to_vec());
+    }
+}
+
+// --- Service registry ---
+
+struct ServiceInfo {
+    blob_idx: usize,
+    alive: bool,
+    is_service_blob: bool,
 }
 
 /// VOS runtime — drives services in rounds mimicking JAR accumulation.
@@ -54,12 +127,12 @@ struct PendingTransfer {
 /// 4. Repeat until no new work
 pub struct VosRuntime {
     blobs: Vec<Vec<u8>>,
-    /// Map from code hash → blob index for invoke() lookups.
     blob_by_hash: HashMap<[u8; 32], usize>,
     services: HashMap<u32, ServiceInfo>,
     next_id: u32,
-    pub hostcalls: HostcallHandler,
-    pending_transfers: Vec<PendingTransfer>,
+    pub storage: ServiceStorage,
+    preimages: HashMap<[u8; 32], Vec<u8>>,
+    pending_transfers: Vec<(ServiceId, Vec<u8>)>,
 }
 
 impl VosRuntime {
@@ -69,61 +142,45 @@ impl VosRuntime {
             blob_by_hash: HashMap::new(),
             services: HashMap::new(),
             next_id: 1,
-            hostcalls: HostcallHandler::new(),
+            storage: ServiceStorage::new(),
+            preimages: HashMap::new(),
             pending_transfers: Vec::new(),
         }
     }
 
-    /// Register a standard PVM blob (single entry point). Returns a blob index.
+    /// Register a PVM blob. Returns a blob index.
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
-        self.register_blob_inner(blob, false)
-    }
-
-    /// Register a service PVM blob (dual entry: refine at PC=0, accumulate at PC=5).
-    /// In accumulate-only mode, the runtime starts these at PC=5.
-    pub fn register_service_blob(&mut self, blob: Vec<u8>) -> usize {
-        self.register_blob_inner(blob, true)
-    }
-
-    fn register_blob_inner(&mut self, blob: Vec<u8>, is_service: bool) -> usize {
         let idx = self.blobs.len();
-        let hash = simple_hash(&blob);
-        self.blob_by_hash.insert(hash, idx);
+        self.blob_by_hash.insert(simple_hash(&blob), idx);
         self.blobs.push(blob);
-        // Store format info alongside the blob index
-        // (We'll look this up via ServiceInfo.is_service_blob)
-        let _ = is_service; // tracked per-service, not per-blob
         idx
     }
 
-    /// Register a service from a blob index. Returns its ServiceId.
+    /// Register a service PVM blob (dual entry: refine at PC=0, accumulate at PC=5).
+    pub fn register_service_blob(&mut self, blob: Vec<u8>) -> usize {
+        self.register_blob(blob)
+    }
+
+    /// Register a service from a blob index (single-entry blob). Returns its ServiceId.
     pub fn register_service(&mut self, blob_idx: usize) -> ServiceId {
-        self.register_service_with_format(blob_idx, false)
+        self.add_service(blob_idx, false)
     }
 
-    /// Register a service from a service blob (dual entry point).
+    /// Register a service from a dual-entry blob. Returns its ServiceId.
     pub fn register_service_from_service_blob(&mut self, blob_idx: usize) -> ServiceId {
-        self.register_service_with_format(blob_idx, true)
+        self.add_service(blob_idx, true)
     }
 
-    fn register_service_with_format(&mut self, blob_idx: usize, is_service_blob: bool) -> ServiceId {
+    fn add_service(&mut self, blob_idx: usize, is_service_blob: bool) -> ServiceId {
         let id = self.next_id;
         self.next_id += 1;
-        self.services.insert(id, ServiceInfo {
-            blob_idx,
-            alive: true,
-            is_service_blob,
-        });
+        self.services.insert(id, ServiceInfo { blob_idx, alive: true, is_service_blob });
         ServiceId(id)
     }
 
     /// Queue a transfer to a service.
     pub fn send_to(&mut self, target: ServiceId, data: Vec<u8>) {
-        self.pending_transfers.push(PendingTransfer {
-            from: ServiceId(0), // from host
-            to: target,
-            data,
-        });
+        self.pending_transfers.push((target, data));
     }
 
     /// Check if there is any pending work.
@@ -138,21 +195,19 @@ impl VosRuntime {
             return false;
         }
 
-        // Group pending transfers by target service
-        let transfers: Vec<PendingTransfer> = self.pending_transfers.drain(..).collect();
         let mut by_service: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
-        for t in transfers {
-            by_service.entry(t.to.0).or_default().push(t.data);
+        for (to, data) in self.pending_transfers.drain(..) {
+            by_service.entry(to.0).or_default().push(data);
         }
 
-        let mut outer_transfers = Vec::new();
+        let mut new_transfers = Vec::new();
         let mut did_work = false;
 
-        // Destructure to get separate borrows for the YIELD handler
         let blobs = &self.blobs;
         let blob_by_hash = &self.blob_by_hash;
         let services = &self.services;
-        let hostcalls = &mut self.hostcalls;
+        let storage = &mut self.storage;
+        let preimages = &mut self.preimages;
 
         for (svc_id, items) in by_service {
             let info = match services.get(&svc_id) {
@@ -164,7 +219,6 @@ impl VosRuntime {
                 None => continue,
             };
 
-            // Fresh PVM from blob — service blobs start at accumulate entry (PC=5)
             let mut pvm = match if info.is_service_blob {
                 initialize_program_at(blob, &[], DEFAULT_GAS, 5)
             } else {
@@ -178,13 +232,12 @@ impl VosRuntime {
             };
 
             let id = ServiceId(svc_id);
-            let mut item_queue: Vec<Vec<u8>> = items;
-            let mut new_transfers: Vec<PendingTransfer> = Vec::new();
+            let mut item_queue = items;
+            let mut svc_transfers: Vec<(ServiceId, Vec<u8>)> = Vec::new();
             did_work = true;
 
-            // Run the PVM
             loop {
-                let (exit, _gas) = pvm.run();
+                let (exit, _) = pvm.run();
                 match exit {
                     ExitReason::Halt => break,
                     ExitReason::Panic => {
@@ -200,6 +253,10 @@ impl VosRuntime {
                         break;
                     }
                     ExitReason::HostCall(call_id) => {
+                        if handle_base_hostcall(&mut pvm, call_id, &mut item_queue) {
+                            continue;
+                        }
+
                         let a0 = pvm.registers[7];
                         let a1 = pvm.registers[8];
                         let a2 = pvm.registers[9];
@@ -207,126 +264,51 @@ impl VosRuntime {
                         let a4 = pvm.registers[11];
 
                         match call_id {
-                            hostcall::DEBUG_WRITE => {
-                                let buf_ptr = a0 as u32;
-                                let buf_len = a1 as usize;
-                                let mut buf = vec![0u8; buf_len];
-                                for (i, byte) in buf.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(buf_ptr + i as u32).unwrap_or(0);
-                                }
-                                let _ = std::io::stderr().write_all(&buf);
-                                let _ = std::io::stderr().flush();
-                                pvm.registers[7] = buf_len as u64;
-                            }
                             accumulate::YIELD => {
                                 pvm.registers[7] = error::HOST_OK;
                             }
                             accumulate::INFO => {
                                 pvm.registers[7] = svc_id as u64;
                             }
-                            hostcall::FETCH => {
-                                let buf_ptr = a0 as u32;
-                                let buf_len = a1 as usize;
-                                if let Some(item) = item_queue.first() {
-                                    let copy_len = item.len().min(buf_len);
-                                    for (i, &byte) in item[..copy_len].iter().enumerate() {
-                                        pvm.write_u8(buf_ptr + i as u32, byte);
-                                    }
-                                    item_queue.remove(0);
-                                    pvm.registers[7] = copy_len as u64;
-                                } else {
-                                    pvm.registers[7] = 0;
-                                }
-                            }
                             accumulate::READ => {
-                                let key_ptr = a0 as u32;
-                                let key_len = a1 as usize;
-                                let val_buf_ptr = a2 as u32;
-                                let val_buf_len = a3 as usize;
-                                let mut key = vec![0u8; key_len];
-                                for (i, byte) in key.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(key_ptr + i as u32).unwrap_or(0);
-                                }
-                                if let Some(value) = hostcalls.storage.read(id, &key) {
-                                    let copy_len = value.len().min(val_buf_len);
+                                let key = pvm_read(&pvm, a0 as u32, a1 as usize);
+                                if let Some(value) = storage.read(id, &key) {
+                                    let copy_len = value.len().min(a3 as usize);
                                     let value = value[..copy_len].to_vec();
-                                    for (i, &byte) in value.iter().enumerate() {
-                                        pvm.write_u8(val_buf_ptr + i as u32, byte);
-                                    }
+                                    pvm_write(&mut pvm, a2 as u32, &value);
                                     pvm.registers[7] = copy_len as u64;
                                 } else {
                                     pvm.registers[7] = error::HOST_NONE;
                                 }
                             }
                             accumulate::WRITE => {
-                                let key_ptr = a0 as u32;
-                                let key_len = a1 as usize;
-                                let val_ptr = a2 as u32;
-                                let val_len = a3 as usize;
-                                let mut key = vec![0u8; key_len];
-                                for (i, byte) in key.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(key_ptr + i as u32).unwrap_or(0);
-                                }
-                                let mut value = vec![0u8; val_len];
-                                for (i, byte) in value.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(val_ptr + i as u32).unwrap_or(0);
-                                }
-                                hostcalls.storage.write(id, &key, &value);
+                                let key = pvm_read(&pvm, a0 as u32, a1 as usize);
+                                let value = pvm_read(&pvm, a2 as u32, a3 as usize);
+                                storage.write(id, &key, &value);
                                 pvm.registers[7] = error::HOST_OK;
                             }
                             accumulate::PROVIDE => {
-                                let hash_ptr = a0 as u32;
-                                let data_ptr = a1 as u32;
-                                let data_len = a2 as usize;
-                                let mut hash = [0u8; 32];
-                                for (i, byte) in hash.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(hash_ptr + i as u32).unwrap_or(0);
-                                }
-                                let mut data = vec![0u8; data_len];
-                                for (i, byte) in data.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(data_ptr + i as u32).unwrap_or(0);
-                                }
-                                hostcalls.preimages.store(hash, data);
+                                let hash = pvm_read_hash(&pvm, a0 as u32);
+                                let data = pvm_read(&pvm, a1 as u32, a2 as usize);
+                                preimages.insert(hash, data);
                                 pvm.registers[7] = error::HOST_OK;
                             }
                             accumulate::TRANSFER => {
                                 let target = ServiceId(a0 as u32);
-                                let memo_ptr = a3 as u32;
-                                let memo_len = a4 as usize;
-                                let mut memo = vec![0u8; memo_len];
-                                for (i, byte) in memo.iter_mut().enumerate() {
-                                    *byte = pvm.read_u8(memo_ptr + i as u32).unwrap_or(0);
-                                }
-                                new_transfers.push(PendingTransfer {
-                                    from: id,
-                                    to: target,
-                                    data: memo,
-                                });
+                                let memo = pvm_read(&pvm, a3 as u32, a4 as usize);
+                                svc_transfers.push((target, memo));
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            accumulate::NEW => {
+                            accumulate::NEW | accumulate::CHECKPOINT => {
                                 pvm.registers[7] = error::HOST_OK;
                             }
-                            accumulate::CHECKPOINT => {
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            // Refine-phase: invoke() — run sub-PVM synchronously
                             refine::INVOKE => {
-                                let mut invoke_transfers = Vec::new();
                                 let result = handle_invoke(
-                                    &mut pvm, blobs, blob_by_hash, services, hostcalls, 0,
-                                    &mut invoke_transfers,
+                                    &mut pvm, blobs, blob_by_hash, services, storage, preimages,
+                                    0, &mut svc_transfers,
                                 );
-                                for (to, data) in invoke_transfers {
-                                    new_transfers.push(PendingTransfer {
-                                        from: id, to, data,
-                                    });
-                                }
                                 pvm.registers[7] = result;
                             }
-                            // Note: refine::PEEK (6) collides with accumulate::INFO (6).
-                            // In accumulate-only mode, ID 6 = INFO. Guests use READ (4)
-                            // for storage access in this mode.
                             _ => {
                                 pvm.registers[7] = error::HOST_WHAT;
                             }
@@ -335,12 +317,10 @@ impl VosRuntime {
                 }
             }
 
-            // Any un-flushed transfers (service halted without yielding) → outer queue
-            outer_transfers.extend(new_transfers);
+            new_transfers.extend(svc_transfers);
         }
 
-        // Queue remaining transfers for next round
-        self.pending_transfers.extend(outer_transfers);
+        self.pending_transfers.extend(new_transfers);
         did_work
     }
 
@@ -358,17 +338,14 @@ impl Default for VosRuntime {
     }
 }
 
-/// Handle invoke() hostcall: run a sub-PVM synchronously with full accumulate access.
-///
-/// The child gets its own storage namespace (keyed by target service ID),
-/// can emit transfers (collected in `transfers_out`), and communicates
-/// exit status via the YIELD hostcall (captured as invoke output).
+/// Handle invoke() hostcall: run a child PVM at PC=0 (refine phase).
 fn handle_invoke(
     caller: &mut Pvm,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
-    hostcalls: &mut HostcallHandler,
+    storage: &mut ServiceStorage,
+    preimages: &mut HashMap<[u8; 32], Vec<u8>>,
     depth: usize,
     transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
 ) -> u64 {
@@ -382,20 +359,15 @@ fn handle_invoke(
     let gas_limit = caller.registers[10];
     let output_ptr = caller.registers[11] as u32;
 
-    // Read code hash from caller memory
-    let mut code_hash = [0u8; 32];
-    for (i, byte) in code_hash.iter_mut().enumerate() {
-        *byte = caller.read_u8(hash_ptr + i as u32).unwrap_or(0);
-    }
+    let code_hash = pvm_read_hash(caller, hash_ptr);
 
-    // Determine target service ID from code hash (service-ID convention)
+    // Resolve blob: service-ID convention (first 4 bytes = ID, rest zero) or hash lookup
     let target_svc_id = if code_hash[4..].iter().all(|&b| b == 0) {
         ServiceId(u32::from_le_bytes([code_hash[0], code_hash[1], code_hash[2], code_hash[3]]))
     } else {
-        ServiceId(0) // hash-based lookup — no service identity
+        ServiceId(0)
     };
 
-    // Look up blob — first try by hash, then by service-ID convention
     let blob_idx = if let Some(&idx) = blob_by_hash.get(&code_hash) {
         idx
     } else if target_svc_id.0 != 0 {
@@ -411,163 +383,38 @@ fn handle_invoke(
         None => return error::HOST_NONE,
     };
 
-    // Read input from caller memory
-    let mut input = vec![0u8; input_len];
-    for (i, byte) in input.iter_mut().enumerate() {
-        *byte = caller.read_u8(input_ptr + i as u32).unwrap_or(0);
-    }
+    let input = pvm_read(caller, input_ptr, input_len);
 
-    // Create fresh child PVM — use service entry point (PC=5) if available
     let gas = if gas_limit == 0 { DEFAULT_GAS } else { gas_limit.min(DEFAULT_GAS) };
-    let is_service = services.get(&target_svc_id.0).is_some_and(|i| i.is_service_blob);
-    let mut child = match if is_service {
-        initialize_program_at(blob, &[], gas, 5)
-    } else {
-        initialize_program(blob, &[], gas)
-    } {
+    let mut child = match initialize_program(blob, &[], gas) {
         Some(p) => p,
         None => return error::HOST_WHAT,
     };
 
-    // Pass input to child via FETCH (first fetch returns input)
     let mut child_items = vec![input];
 
-    // Run child to completion or YIELD
     loop {
         let (exit, _) = child.run();
         match exit {
             ExitReason::Halt => break,
             ExitReason::Panic => {
-                eprintln!("vosx: invoke child {} panicked at pc={:#x}", target_svc_id.0, child.pc);
+                eprintln!("vosx: child {} panicked at pc={:#x}", target_svc_id.0, child.pc);
                 return error::HOST_WHAT;
             }
-            ExitReason::OutOfGas | ExitReason::PageFault(_) => {
-                return error::HOST_WHAT;
-            }
+            ExitReason::OutOfGas => return error::HOST_WHAT,
+            ExitReason::PageFault(_) => return error::HOST_WHAT,
             ExitReason::HostCall(call_id) => {
+                if handle_base_hostcall(&mut child, call_id, &mut child_items) {
+                    continue;
+                }
                 match call_id {
-                    hostcall::GAS => {
-                        child.registers[7] = child.gas;
-                    }
-                    hostcall::GROW_HEAP => {
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    hostcall::DEBUG_WRITE => {
-                        let buf_ptr = child.registers[7] as u32;
-                        let buf_len = child.registers[8] as usize;
-                        let mut buf = vec![0u8; buf_len];
-                        for (i, byte) in buf.iter_mut().enumerate() {
-                            *byte = child.read_u8(buf_ptr + i as u32).unwrap_or(0);
-                        }
-                        let _ = std::io::stderr().write_all(&buf);
-                        let _ = std::io::stderr().flush();
-                        child.registers[7] = buf_len as u64;
-                    }
-                    hostcall::FETCH => {
-                        let buf_ptr = child.registers[7] as u32;
-                        let buf_len = child.registers[8] as usize;
-                        if let Some(item) = child_items.first() {
-                            let copy_len = item.len().min(buf_len);
-                            for (i, &byte) in item[..copy_len].iter().enumerate() {
-                                child.write_u8(buf_ptr + i as u32, byte);
-                            }
-                            child_items.remove(0);
-                            child.registers[7] = copy_len as u64;
-                        } else {
-                            child.registers[7] = 0;
-                        }
-                    }
-                    accumulate::READ => {
-                        let key_ptr = child.registers[7] as u32;
-                        let key_len = child.registers[8] as usize;
-                        let val_buf_ptr = child.registers[9] as u32;
-                        let val_buf_len = child.registers[10] as usize;
-                        let mut key = vec![0u8; key_len];
-                        for (i, byte) in key.iter_mut().enumerate() {
-                            *byte = child.read_u8(key_ptr + i as u32).unwrap_or(0);
-                        }
-                        if let Some(value) = hostcalls.storage.read(target_svc_id, &key) {
-                            let copy_len = value.len().min(val_buf_len);
-                            let value = value[..copy_len].to_vec();
-                            for (i, &byte) in value.iter().enumerate() {
-                                child.write_u8(val_buf_ptr + i as u32, byte);
-                            }
-                            child.registers[7] = copy_len as u64;
-                        } else {
-                            child.registers[7] = error::HOST_NONE;
-                        }
-                    }
-                    accumulate::WRITE => {
-                        let key_ptr = child.registers[7] as u32;
-                        let key_len = child.registers[8] as usize;
-                        let val_ptr = child.registers[9] as u32;
-                        let val_len = child.registers[10] as usize;
-                        let mut key = vec![0u8; key_len];
-                        for (i, byte) in key.iter_mut().enumerate() {
-                            *byte = child.read_u8(key_ptr + i as u32).unwrap_or(0);
-                        }
-                        let mut value = vec![0u8; val_len];
-                        for (i, byte) in value.iter_mut().enumerate() {
-                            *byte = child.read_u8(val_ptr + i as u32).unwrap_or(0);
-                        }
-                        hostcalls.storage.write(target_svc_id, &key, &value);
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    accumulate::INFO => {
-                        child.registers[7] = target_svc_id.0 as u64;
-                    }
-                    accumulate::TRANSFER => {
-                        let target = ServiceId(child.registers[7] as u32);
-                        let memo_ptr = child.registers[10] as u32;
-                        let memo_len = child.registers[11] as usize;
-                        let mut memo = vec![0u8; memo_len];
-                        for (i, byte) in memo.iter_mut().enumerate() {
-                            *byte = child.read_u8(memo_ptr + i as u32).unwrap_or(0);
-                        }
-                        transfers_out.push((target, memo));
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    accumulate::PROVIDE => {
-                        let hash_ptr = child.registers[7] as u32;
-                        let data_ptr = child.registers[8] as u32;
-                        let data_len = child.registers[9] as usize;
-                        let mut hash = [0u8; 32];
-                        for (i, byte) in hash.iter_mut().enumerate() {
-                            *byte = child.read_u8(hash_ptr + i as u32).unwrap_or(0);
-                        }
-                        let mut data = vec![0u8; data_len];
-                        for (i, byte) in data.iter_mut().enumerate() {
-                            *byte = child.read_u8(data_ptr + i as u32).unwrap_or(0);
-                        }
-                        hostcalls.preimages.store(hash, data);
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    accumulate::NEW => {
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    accumulate::CHECKPOINT => {
-                        child.registers[7] = error::HOST_OK;
-                    }
-                    accumulate::YIELD => {
-                        // Child yielded — capture output data and return early.
-                        // This is how main_loop communicates exit status to the agent.
-                        let data_ptr = child.registers[7] as u32;
-                        let data_len = child.registers[8] as usize;
-                        let copy_len = data_len.min(4096);
-                        for i in 0..copy_len {
-                            let byte = child.read_u8(data_ptr + i as u32).unwrap_or(0);
-                            caller.write_u8(output_ptr + i as u32, byte);
-                        }
-                        return copy_len as u64;
-                    }
                     refine::INVOKE => {
-                        // Recursive invoke
-                        let mut nested_transfers = Vec::new();
+                        let mut nested = Vec::new();
                         let result = handle_invoke(
-                            &mut child, blobs, blob_by_hash, services, hostcalls,
-                            depth + 1, &mut nested_transfers,
+                            &mut child, blobs, blob_by_hash, services, storage, preimages,
+                            depth + 1, &mut nested,
                         );
-                        transfers_out.extend(nested_transfers);
+                        transfers_out.extend(nested);
                         child.registers[7] = result;
                     }
                     _ => {
@@ -578,18 +425,14 @@ fn handle_invoke(
         }
     }
 
-    // Child halted without calling YIELD — copy register-based output.
-    let child_out_ptr = child.registers[7] as u32;
-    let child_out_len = child.registers[8] as usize;
-    let copy_len = child_out_len.min(4096);
-    for i in 0..copy_len {
-        let byte = child.read_u8(child_out_ptr + i as u32).unwrap_or(0);
-        caller.write_u8(output_ptr + i as u32, byte);
-    }
-    copy_len as u64
+    // Copy register-based output back to caller
+    let out_ptr = child.registers[7] as u32;
+    let out_len = (child.registers[8] as usize).min(4096);
+    let output = pvm_read(&child, out_ptr, out_len);
+    pvm_write(caller, output_ptr, &output);
+    out_len as u64
 }
 
-/// Simple hash for blob identification (matches vos-agent's hash_blob).
 fn simple_hash(data: &[u8]) -> [u8; 32] {
     let mut h = [0u8; 32];
     for (i, &byte) in data.iter().enumerate() {

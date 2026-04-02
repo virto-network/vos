@@ -23,12 +23,12 @@ pub trait Actor: Sized {
     #[allow(unused_variables)]
     fn on_error(&mut self, error: &Self::Error) -> bool {
         // Use Debug format since we can't assume Display
-        #[cfg(feature = "guest")]
+        #[cfg(feature = "pvm")]
         {
             struct ErrorWriter;
             impl core::fmt::Write for ErrorWriter {
                 fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    vos_abi::guest::hostcalls::debug_write(s.as_bytes());
+                    vos_abi::pvm::hostcalls::debug_write(s.as_bytes());
                     Ok(())
                 }
             }

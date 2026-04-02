@@ -1,4 +1,4 @@
-//! Guest-side support for VOS actors compiled to RISC-V / PVM.
+//! PVM guest-side support for VOS actors compiled to RISC-V.
 //!
 //! Provides:
 //! - Raw ecall interface

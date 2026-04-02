@@ -20,13 +20,22 @@ pub use actor::{Actor, Message};
 pub mod context;
 pub use context::{Context, PendingAsk};
 pub use run::{Yield, RunResult, try_poll, service_code_hash, STATUS_DONE, STATUS_YIELDED};
-#[cfg(feature = "guest")]
+#[cfg(feature = "service")]
 pub use run::main_loop;
+#[cfg(feature = "pvm")]
+pub use run::refine_loop;
+
+/// Unified entry point — resolves to `main_loop` (service) or `refine_loop` (guest).
+/// The macro always generates calls to this so the same code works with either feature.
+#[cfg(feature = "service")]
+pub use run::main_loop as entry_loop;
+#[cfg(all(feature = "pvm", not(feature = "service")))]
+pub use run::refine_loop as entry_loop;
 
 // --- Guest I/O macros and panic handler ---
 
-#[cfg(feature = "guest")]
+#[cfg(feature = "pvm")]
 mod guest_io;
 
-#[cfg(feature = "guest")]
+#[cfg(feature = "pvm")]
 mod guest_panic;

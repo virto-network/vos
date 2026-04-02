@@ -27,13 +27,18 @@ pub struct Context<A: Actor> {
     self_schedule: bool,
     sleep_ticks: u32,
 
+    // Durable functions replay state
+    yield_replay_index: u32,
+    replay_until: u32,
+    continue_as_new: bool,
+
     _phantom: core::marker::PhantomData<A>,
 }
 
 pub use vos_abi::service::ServiceId;
 
 /// A queued transfer to another service (fire-and-forget).
-#[allow(dead_code)] // Fields read in cfg(guest) path
+#[allow(dead_code)] // Fields read in cfg(pvm) path
 struct PendingTell {
     target: ServiceId,
     payload: Vec<u8>,
@@ -58,6 +63,9 @@ impl<A: Actor> Context<A> {
             pending_ask: None,
             self_schedule: false,
             sleep_ticks: 0,
+            yield_replay_index: 0,
+            replay_until: 0,
+            continue_as_new: false,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -82,16 +90,11 @@ impl<A: Actor> Context<A> {
     ///
     /// This is the renamed version of the old `send()`.
     pub fn tell(&mut self, target: ServiceId, payload: &[u8]) {
+        if self.replaying() { return; }
         self.pending_tells.push(PendingTell {
             target,
             payload: payload.to_vec(),
         });
-    }
-
-    /// Deprecated alias for `tell()`.
-    #[deprecated = "use tell() instead"]
-    pub fn send(&mut self, target: ServiceId, payload: &[u8]) {
-        self.tell(target, payload);
     }
 
     // --- Synchronous query ---
@@ -118,29 +121,78 @@ impl<A: Actor> Context<A> {
     // --- Cooperative scheduling ---
 
     /// Checkpoint state and yield to other actors. Resumes next tick.
-    /// Returns a future that yields once — use `.await` to suspend.
+    /// Returns a future — during replay, completed yields return instantly.
     pub fn yield_now(&mut self) -> super::run::Yield {
         self.self_schedule = true;
-        super::run::Yield::once()
+        let idx = self.yield_replay_index;
+        self.yield_replay_index += 1;
+        if idx < self.replay_until {
+            super::run::Yield::skip()
+        } else {
+            super::run::Yield::once()
+        }
     }
 
     /// Checkpoint state and sleep for N ticks.
-    /// Returns a future that yields once — use `.await` to suspend.
+    /// Returns a future — during replay, completed yields return instantly.
     pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
         self.sleep_ticks = ticks;
-        super::run::Yield::once()
+        let idx = self.yield_replay_index;
+        self.yield_replay_index += 1;
+        if idx < self.replay_until {
+            super::run::Yield::skip()
+        } else {
+            super::run::Yield::once()
+        }
+    }
+
+    /// Reset actor state and restart the handler from scratch.
+    /// Use this to bound replay cost in long-running loops.
+    pub fn continue_as_new(&mut self) {
+        self.continue_as_new = true;
+    }
+
+    /// Whether continue_as_new was requested.
+    pub fn should_continue_as_new(&self) -> bool {
+        self.continue_as_new
+    }
+
+    /// Whether we're in replay phase (fast-forwarding past completed yields).
+    /// True when there are still yield points to skip. Once yield_replay_index
+    /// reaches replay_until, we're in the live phase.
+    pub fn replaying(&self) -> bool {
+        self.yield_replay_index < self.replay_until
+    }
+
+    /// Set the yield index to replay up to.
+    pub fn set_replay_until(&mut self, n: u32) {
+        self.replay_until = n;
+    }
+
+    /// Get the current yield replay index (how many yields we've passed).
+    pub fn yield_index(&self) -> u32 {
+        self.yield_replay_index
+    }
+
+    /// Reset yield replay state for re-dispatch (e.g. after ask resolution).
+    pub fn reset_yield_state(&mut self) {
+        self.yield_replay_index = 0;
+        self.self_schedule = false;
+        self.sleep_ticks = 0;
     }
 
     // --- Storage ---
 
     /// Queue a key-value write to per-service storage.
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
+        if self.replaying() { return; }
         self.pending_writes.push((key.to_vec(), value.to_vec()));
     }
 
     /// Queue a new service spawn from a code hash.
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
+        if self.replaying() { return; }
         self.pending_spawns.push(code_hash);
     }
 
@@ -189,40 +241,34 @@ impl<A: Actor> Context<A> {
         self.pending_ask = None;
         self.self_schedule = false;
         self.sleep_ticks = 0;
+        self.yield_replay_index = 0;
     }
 
-    /// Flush all queued effects via hostcalls.
+    /// Flush all queued effects via accumulate-phase hostcalls.
     ///
-    /// On non-RISC-V targets this is a no-op (effects are only meaningful
-    /// when running inside the PVM).
+    /// Requires the `service` feature — only service actors (not refine-only
+    /// guest actors) can flush effects to the host.
     pub fn flush_effects(&mut self) {
-        #[cfg(feature = "guest")]
+        #[cfg(feature = "service")]
         {
-            use vos_abi::guest::hostcalls;
+            use vos_abi::pvm::hostcalls;
 
-            // Flush storage writes
             for (key, value) in self.pending_writes.drain(..) {
                 hostcalls::write(&key, &value);
             }
 
-            // Flush tells: provide preimage + transfer
             for tell in self.pending_tells.drain(..) {
-                // The host computes the hash — we pass a zero hash and let
-                // the provide hostcall return the real hash. For now, we
-                // send the payload directly as the memo (vosx handles it).
-                let hash = [0u8; 32]; // placeholder — host computes
+                let hash = [0u8; 32];
                 hostcalls::provide(&hash, &tell.payload);
-                // Transfer with memo = raw payload for now
                 hostcalls::transfer(tell.target, 0, 0, &tell.payload);
             }
 
-            // Flush spawns
             for code_hash in self.pending_spawns.drain(..) {
                 hostcalls::new_service(&code_hash);
             }
         }
 
-        #[cfg(not(feature = "guest"))]
+        #[cfg(not(feature = "service"))]
         {
             self.pending_writes.clear();
             self.pending_tells.clear();
