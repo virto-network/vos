@@ -27,13 +27,9 @@ struct Hasher {
 
 #[messages]
 impl Hasher {
-    fn new(seed: Vec<u8>) -> Self {
-        let mut hash = [0u8; 32];
-        for (i, &b) in seed.iter().enumerate() {
-            hash[i % 32] ^= b;
-        }
+    fn new() -> Self {
         Hasher {
-            current_hash: hash,
+            current_hash: [42u8; 32],
             iterations: 0,
         }
     }
@@ -45,24 +41,10 @@ impl Hasher {
         loop {
             self.current_hash = simple_hash(&self.current_hash);
             self.iterations += 1;
-            println!("hasher: iteration {} — hash[0..4]={:02x}{:02x}{:02x}{:02x}",
-                self.iterations,
-                self.current_hash[0], self.current_hash[1],
-                self.current_hash[2], self.current_hash[3],
-            );
+            if !ctx.replaying() {
+                println!("hasher: iteration {}", self.iterations);
+            }
             ctx.yield_now().await;
         }
-    }
-
-    /// Query the latest hash and iteration count.
-    #[msg]
-    async fn latest(&self, _ctx: &mut Context<Self>) -> (u64, u8, u8, u8, u8) {
-        (
-            self.iterations,
-            self.current_hash[0],
-            self.current_hash[1],
-            self.current_hash[2],
-            self.current_hash[3],
-        )
     }
 }

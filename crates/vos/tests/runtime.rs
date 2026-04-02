@@ -175,7 +175,7 @@ fn runtime_info_returns_service_id() {
     rt.run();
 
     // Verify INFO returned the correct service ID
-    let val = rt.hostcalls.storage.read(id, b"id");
+    let val = rt.storage.read(id, b"id");
     assert_eq!(val, Some(&[id.0 as u8][..]));
 }
 
@@ -201,7 +201,7 @@ fn runtime_storage_persists_across_invocations() {
     rt.run();
 
     // Verify storage has the value
-    let val = rt.hostcalls.storage.read(id, b"x");
+    let val = rt.storage.read(id, b"x");
     assert_eq!(val, Some(&[42u8][..]));
 }
 
@@ -224,7 +224,7 @@ fn runtime_transfer_routes_between_services() {
     rt.run();
 
     // Verify receiver stored the length of "HI" (2 bytes) in storage key "len"
-    let val = rt.hostcalls.storage.read(receiver_id, b"len");
+    let val = rt.storage.read(receiver_id, b"len");
     assert_eq!(val, Some(&[2u8][..]));
 }
 
@@ -239,13 +239,13 @@ fn runtime_fresh_pvm_per_invocation() {
     // First invocation
     rt.send_to(id, Vec::new());
     rt.run();
-    assert_eq!(rt.hostcalls.storage.read(id, b"x"), Some(&[42u8][..]));
+    assert_eq!(rt.storage.read(id, b"x"), Some(&[42u8][..]));
 
     // Second invocation — fresh PVM, but storage persists
     rt.send_to(id, Vec::new());
     rt.run();
     // Still 42 — the program writes 42 unconditionally
-    assert_eq!(rt.hostcalls.storage.read(id, b"x"), Some(&[42u8][..]));
+    assert_eq!(rt.storage.read(id, b"x"), Some(&[42u8][..]));
 }
 
 /// "Doubler" service: FETCHes one byte, doubles it, leaves result in a0/a1 for invoke output.
@@ -339,6 +339,6 @@ fn runtime_invoke_by_service_id() {
 
     // Caller invoked doubler with input=21, doubler returns 42
     // Caller stored result in storage key "r"
-    let val = rt.hostcalls.storage.read(caller_id, b"r");
+    let val = rt.storage.read(caller_id, b"r");
     assert_eq!(val, Some(&[42u8][..]), "invoke should return doubled value");
 }

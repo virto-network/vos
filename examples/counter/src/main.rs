@@ -1,28 +1,30 @@
-//! Counter actor — handles Increment and PrintCount messages.
+//! Counter actor — increments and prints a count each iteration.
 //!
-//! Demonstrates stateful actors with constructor args and multiple message types.
+//! Demonstrates a stateful refine-only actor with a yield loop.
+//! Each invocation runs one iteration: increment, print, yield.
+//! The agent re-invokes to drive subsequent iterations.
 
 use vos::{actor, messages};
 
 #[actor]
 struct Counter {
-    count: u8,
+    count: u32,
 }
 
 #[messages]
 impl Counter {
-    fn new(initial: u8) -> Self {
-        Counter { count: initial }
+    fn new() -> Self {
+        Counter { count: 0 }
     }
 
     #[msg]
-    async fn increment(&mut self, _ctx: &mut Context<Self>) -> u8 {
-        self.count += 1;
-        self.count
-    }
-
-    #[msg]
-    async fn print_count(&self, _ctx: &mut Context<Self>) {
-        println!("count = {}", self.count);
+    async fn run(&mut self, ctx: &mut Context<Self>) {
+        loop {
+            self.count += 1;
+            if !ctx.replaying() {
+                println!("count = {}", self.count);
+            }
+            ctx.yield_now().await;
+        }
     }
 }

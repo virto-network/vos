@@ -1,21 +1,23 @@
-//! Greeter actor — responds to Greet messages with a personalized greeting.
+//! Greeter actor — one-shot actor that prints a greeting and exits.
 //!
-//! Demonstrates a stateless actor with `#[actor]` and `#[messages]`.
+//! Demonstrates the simplest refine-only actor: a single `run()` handler
+//! that executes once and completes.
 
 use vos::{actor, messages};
 
 #[actor]
-struct Greeter;
+struct Greeter {
+    n: u32,
+}
 
 #[messages]
 impl Greeter {
     fn new() -> Self {
-        Greeter
+        Greeter { n: 42 }
     }
 
     #[msg]
-    async fn greet(&self, name: Vec<u8>, _ctx: &mut Context<Self>) {
-        let name = String::from_utf8_lossy(&name);
-        println!("Hello, {name}!");
+    async fn run(&self, _ctx: &mut Context<Self>) {
+        println!("Hello n={}", self.n);
     }
 }

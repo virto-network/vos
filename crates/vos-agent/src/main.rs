@@ -1,177 +1,146 @@
-//! VOS Agent — scheduler that drives child services via invoke().
+//! VOS Agent — generic orchestrator that drives guest actors via invoke().
 //!
-//! The agent owns the service table and scheduling loop. When a message
-//! is routed to a child, the agent invokes it synchronously, running it
-//! to its next `.await` point. Yielded services are re-invoked on the
-//! next tick. This is the only place scheduling policy lives — fork
-//! this crate to customize prioritization, time-slicing, etc.
+//! Runs as a full JAM service (refine+accumulate). Discovers registered actors
+//! from storage on init, and accepts runtime `install` messages to register
+//! new actors dynamically.
 //!
-//! ## Messages
+//! ## Bootstrap
 //!
-//! - `RegisterBlob(blob)` → stores blob, returns code hash
-//! - `SpawnService(code_hash)` → creates new child service
-//! - `Route(target, payload)` → invoke child, drive to next yield
-//! - `Tick` → continue processing yielded services
-//! - `Status` → report agent state
+//! vosx writes actor IDs to the agent's storage key `__actors` before running:
+//! `[id_1:u32 LE][id_2:u32 LE]...`
+//!
+//! The agent reads this on construction and self-schedules `start`.
+//!
+//! ## Runtime registration
+//!
+//! Other services can send `install(actor_id: u32)` messages to register
+//! actors at runtime. Installed actors are immediately invoked.
+//!
+//! ## Invoke protocol (per child)
+//!
+//! Input:  `[yield_index:u32][state_len:u32][state][message]`
+//! Output: `[status:u8][yield_index:u32][state_len:u32][state]`
 
 use vos::actors::context::ServiceId;
-use vos::registry::{ServiceTable, ServiceState};
-use vos::{agent, messages, service_code_hash, STATUS_YIELDED};
+use vos::{actor, messages, service_code_hash, STATUS_YIELDED};
 
-/// Max child services the agent can manage.
-const MAX_SERVICES: usize = 32;
+const HEADER_SIZE: usize = 8;
+const MAX_ROUNDS: u32 = 64;
+const ACTORS_KEY: &[u8] = b"__actors";
 
-/// Max invoke iterations per tick (time-slice budget).
-const MAX_ROUNDS_PER_TICK: usize = 16;
-
-/// Simple hash for blob identification.
-fn hash_blob(data: &[u8]) -> [u8; 32] {
-    let mut h = [0u8; 32];
-    for (i, &byte) in data.iter().enumerate() {
-        h[i % 32] ^= byte.wrapping_add(i as u8);
-    }
-    h
-}
-
-#[derive(Debug)]
-enum AgentError {
-    InvalidCodeHash { expected: usize, got: usize },
-    RegistryFull,
-    ServiceNotFound(u32),
-}
-
-#[agent(error = AgentError)]
+#[actor]
 struct Agent {
-    blob_count: u32,
-    /// Persistent service metadata — survives across invocations.
-    services: ServiceTable<MAX_SERVICES>,
-    /// Queue of (service_id, last_message) for yielded services awaiting re-invocation.
-    run_queue: Vec<(u32, Vec<u8>)>,
+    round: u32,
+    /// (service_id, message, actor_state, yield_index)
+    run_queue: Vec<(u32, Vec<u8>, Vec<u8>, u32)>,
+    children: Vec<u32>,
 }
 
 #[messages]
 impl Agent {
     fn new() -> Self {
-        println!("agent: initialized");
+        // Read registered actor IDs from storage (written by vosx at bootstrap)
+        let mut buf = [0u8; 512];
+        let n = vos::hostcalls::read(ACTORS_KEY, &mut buf) as usize;
+        let mut children = Vec::new();
+        if n <= 512 {
+            let mut off = 0;
+            while off + 4 <= n {
+                children.push(u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
+                off += 4;
+            }
+        }
+
+        println!("agent: init");
+
+        // Self-schedule Start
+        let self_id = vos::hostcalls::info() as u32;
+        let bytes = AgentMsg::Start(Start).to_bytes();
+        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &bytes);
+
         Agent {
-            blob_count: 0,
-            services: ServiceTable::new(),
+            round: 0,
             run_queue: Vec::new(),
+            children,
         }
     }
 
-    /// Register a code blob. Stores it as a preimage keyed by hash.
+    /// Register a new actor at runtime and invoke it immediately.
     #[msg]
-    async fn register_blob(&mut self, blob: Vec<u8>, ctx: &mut Context<Self>) {
-        let hash = hash_blob(&blob);
-        ctx.store(&hash, &blob);
-        self.blob_count += 1;
-        println!(
-            "agent: registered blob #{} ({} bytes)",
-            self.blob_count,
-            blob.len()
-        );
-    }
+    async fn install(&mut self, actor_id: u32, ctx: &mut Context<Self>) {
+        self.children.push(actor_id);
+        println!("agent: installed actor {}", actor_id);
 
-    /// Spawn a new child service from a previously registered code hash.
-    #[msg]
-    async fn spawn_service(&mut self, code_hash: Vec<u8>, ctx: &mut Context<Self>) -> Result<()> {
-        if code_hash.len() != 32 {
-            return Err(AgentError::InvalidCodeHash {
-                expected: 32,
-                got: code_hash.len(),
-            });
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&code_hash);
-        let id = self.services.register(hash).ok_or(AgentError::RegistryFull)?;
-        ctx.spawn(hash);
-        self.services.update_state(id, ServiceState::Running);
-        println!(
-            "agent: spawned service {} (id={})",
-            self.services.alive_count(),
-            id.0
-        );
-        Ok(())
-    }
-
-    /// Route a message to a child service. The agent invokes the child
-    /// synchronously, driving it to its next yield point. If the child
-    /// yields, it's queued for re-invocation on the next tick.
-    #[msg]
-    async fn route(
-        &mut self,
-        target: u32,
-        payload: Vec<u8>,
-        ctx: &mut Context<Self>,
-    ) -> Result<()> {
-        let svc_id = ServiceId(target);
-        if self.services.get(svc_id).is_none() {
-            return Err(AgentError::ServiceNotFound(target));
-        }
-
-        let status = Self::invoke_child(target, &payload);
+        let run_msg: Vec<u8> = vec![0];
+        let (status, state, yi) = Self::invoke_child(actor_id, &run_msg, &[], 0);
         if status == STATUS_YIELDED {
-            self.run_queue.push((target, payload));
-            self.services.update_state(svc_id, ServiceState::Suspended);
+            self.run_queue.push((actor_id, run_msg, state, yi));
+            self.maybe_schedule_tick(ctx);
         }
-
-        self.maybe_schedule_tick(ctx);
-        println!("agent: routed message to service {}", target);
-        Ok(())
     }
 
-    /// Process the run queue: re-invoke yielded services with their
-    /// last message. Time-sliced to MAX_ROUNDS_PER_TICK iterations.
+    /// Invoke all registered actors with an initial Run message.
+    #[msg]
+    async fn start(&mut self, ctx: &mut Context<Self>) {
+        let run_msg: Vec<u8> = vec![0]; // variant 0 = Run
+        for &child_id in &self.children.clone() {
+            let (status, state, yi) = Self::invoke_child(child_id, &run_msg, &[], 0);
+            if status == STATUS_YIELDED {
+                self.run_queue.push((child_id, run_msg.clone(), state, yi));
+            }
+        }
+        self.maybe_schedule_tick(ctx);
+    }
+
+    /// Re-invoke yielded children.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
+        self.round += 1;
+
         let queue: Vec<_> = self.run_queue.drain(..).collect();
-        let mut rounds = 0;
-
-        for (svc_id, msg) in queue {
-            let status = Self::invoke_child(svc_id, &msg);
+        for (svc_id, msg, prev_state, prev_yi) in queue {
+            let (status, state, yi) = Self::invoke_child(svc_id, &msg, &prev_state, prev_yi);
             if status == STATUS_YIELDED {
-                self.run_queue.push((svc_id, msg));
-            } else {
-                self.services.update_state(ServiceId(svc_id), ServiceState::Running);
-            }
-
-            rounds += 1;
-            if rounds >= MAX_ROUNDS_PER_TICK {
-                break;
+                self.run_queue.push((svc_id, msg, state, yi));
             }
         }
 
         self.maybe_schedule_tick(ctx);
     }
 
-    /// Report agent status.
-    #[msg]
-    async fn report_status(&self, _ctx: &mut Context<Self>) {
-        println!(
-            "agent: {} blob(s), {} service(s) alive, {} in run queue",
-            self.blob_count,
-            self.services.alive_count(),
-            self.run_queue.len(),
-        );
-    }
+    /// Invoke a guest actor with the refine protocol.
+    fn invoke_child(svc_id: u32, message: &[u8], state: &[u8], yield_index: u32) -> (u8, Vec<u8>, u32) {
+        let total = HEADER_SIZE + state.len() + message.len();
+        let mut input = vec![0u8; total];
+        input[0..4].copy_from_slice(&yield_index.to_le_bytes());
+        input[4..8].copy_from_slice(&(state.len() as u32).to_le_bytes());
+        input[8..8 + state.len()].copy_from_slice(state);
+        input[8 + state.len()..].copy_from_slice(message);
 
-    // --- Internal helpers (not messages) ---
-
-    /// Invoke a child service synchronously. Returns the exit status byte.
-    fn invoke_child(svc_id: u32, payload: &[u8]) -> u8 {
         let hash = service_code_hash(svc_id);
-        let mut output = [0u8; 64];
-        let n = vos::hostcalls::invoke(&hash, payload, 0, &mut output);
-        if n > 0 { output[0] } else { 0 }
+        let mut output = [0u8; 4096];
+        let n = vos::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
+
+        if n < 9 {
+            return (0, Vec::new(), 0);
+        }
+
+        let status = output[0];
+        let new_yi = u32::from_le_bytes([output[1], output[2], output[3], output[4]]);
+        let state_len = u32::from_le_bytes([output[5], output[6], output[7], output[8]]) as usize;
+        let new_state = if state_len > 0 && 9 + state_len <= n {
+            output[9..9 + state_len].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        (status, new_state, new_yi)
     }
 
-    /// If the run queue has pending work, send ourselves a Tick message
-    /// so the runtime re-invokes us next round.
-    fn maybe_schedule_tick(&self, ctx: &mut Context<Self>) {
-        if !self.run_queue.is_empty() {
-            let tick_msg = AgentMsg::Tick(Tick);
-            ctx.tell(ctx.id(), &tick_msg.to_bytes());
+    fn maybe_schedule_tick(&self, ctx: &mut vos::Context<Self>) {
+        if !self.run_queue.is_empty() && self.round < MAX_ROUNDS {
+            let bytes = AgentMsg::Tick(Tick).to_bytes();
+            ctx.tell(ctx.id(), &bytes);
         }
     }
 }

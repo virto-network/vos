@@ -4,6 +4,7 @@ build:
     cd counter && cargo build --release
     cd fizzbuzz && cargo build --release
     cd hasher && cargo build --release
+    cd animation && cargo build --release
 
 run: build
     cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- Kunekt.toml

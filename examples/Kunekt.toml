@@ -1,7 +1,7 @@
 [manifest]
 name = "examples"
 
-[[actors]]
+[service]
 name = "vos-agent"
 path = "../crates/vos-agent/target/riscv64em-javm/release/vos-agent.elf"
 
@@ -20,3 +20,7 @@ path = "fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf"
 [[actors]]
 name = "hasher"
 path = "hasher/target/riscv64em-javm/release/hasher.elf"
+
+[[actors]]
+name = "animation"
+path = "animation/target/riscv64em-javm/release/animation.elf"
