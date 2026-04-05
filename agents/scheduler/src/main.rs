@@ -1,4 +1,4 @@
-//! VOS Agent — generic orchestrator that drives guest actors via invoke().
+//! Scheduler agent — orchestrator that drives guest actors via invoke().
 //!
 //! Runs as a full JAM service (refine+accumulate). Discovers registered actors
 //! from init args (written to storage by the host), and accepts runtime
@@ -7,9 +7,6 @@
 //! On start, sends a dynamic `run` message to each child. Actors without
 //! a `run` handler silently skip it. Actors that yield get re-invoked in
 //! subsequent tick rounds.
-//!
-//! NOTE: This crate is kept for backwards compatibility with existing test
-//! binaries. New development should use `agents/scheduler/` instead.
 
 use vos::actors::context::ServiceId;
 use vos::lifecycle::InvokeResult;

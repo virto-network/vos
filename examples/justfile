@@ -1,5 +1,5 @@
 build:
-    cd ../crates/vos-agent && cargo build --release
+    cd ../agents/scheduler && cargo build --release
     cd greeter && cargo build --release
     cd counter && cargo build --release
     cd fizzbuzz && cargo build --release

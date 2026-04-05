@@ -2,8 +2,8 @@
 name = "examples"
 
 [service]
-name = "vos-agent"
-path = "../crates/vos-agent/target/riscv64em-javm/release/vos-agent.elf"
+name = "scheduler"
+path = "../agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
 
 [[actors]]
 name = "greeter"

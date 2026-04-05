@@ -5,6 +5,7 @@ members = [
 ]
 exclude = [
     "crates/vos-agent",
+    "agents/*",
     "examples/*",
 ]
 
