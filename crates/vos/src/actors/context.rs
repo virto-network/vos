@@ -7,8 +7,8 @@ use alloc::vec::Vec;
 /// execution. Effects are flushed after each handler via hostcalls.
 ///
 /// Also provides cooperative async primitives:
-/// - `tell()` — fire-and-forget message (queues a transfer)
-/// - `ask()` — synchronous query (suspends until result available)
+/// - `tell()` — fire-and-forget dynamic message
+/// - `ask()` — query another actor, suspends until reply (returns `Value`)
 /// - `yield_now()` — checkpoint state and yield to other actors
 /// - `sleep(n)` — checkpoint state and sleep for N ticks
 pub struct Context<A: Actor> {
@@ -20,17 +20,18 @@ pub struct Context<A: Actor> {
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pending_spawns: Vec<[u8; 32]>,
 
-    // Cooperative execution state
+    // Ask resolution state
     call_index: usize,
     call_results: Vec<Vec<u8>>,
     pending_ask: Option<PendingAsk>,
+    re_dispatching: bool,
+
+    // Reply data (rkyv-encoded Value, included in refine output)
+    reply: Option<Vec<u8>>,
+
+    // Cooperative scheduling
     self_schedule: bool,
     sleep_ticks: u32,
-
-    // Durable functions replay state
-    yield_replay_index: u32,
-    replay_until: u32,
-    continue_as_new: bool,
 
     _phantom: core::marker::PhantomData<A>,
 }
@@ -61,11 +62,10 @@ impl<A: Actor> Context<A> {
             call_index: 0,
             call_results: Vec::new(),
             pending_ask: None,
+            re_dispatching: false,
+            reply: None,
             self_schedule: false,
             sleep_ticks: 0,
-            yield_replay_index: 0,
-            replay_until: 0,
-            continue_as_new: false,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -94,8 +94,9 @@ impl<A: Actor> Context<A> {
     // --- Fire-and-forget messaging ---
 
     /// Send raw bytes to another service (fire-and-forget).
-    pub fn tell(&mut self, target: ServiceId, payload: &[u8]) {
-        if self.replaying() { return; }
+    /// Prefer `tell()` for cross-actor dynamic messaging.
+    pub fn tell_raw(&mut self, target: ServiceId, payload: &[u8]) {
+        if self.re_dispatching { return; }
         self.pending_tells.push(PendingTell {
             target,
             payload: payload.to_vec(),
@@ -104,45 +105,71 @@ impl<A: Actor> Context<A> {
 
     /// Send a typed message to another service (auto-encodes).
     pub fn send<M: super::codec::Encode>(&mut self, target: ServiceId, msg: &M) {
-        self.tell(target, &msg.encode());
+        self.tell_raw(target, &msg.encode());
     }
 
     /// Send a typed message to self (auto-encodes, self-targets).
     pub fn send_self<M: super::codec::Encode>(&mut self, msg: &M) {
         let id = self.id;
-        self.tell(id, &msg.encode());
+        self.tell_raw(id, &msg.encode());
     }
 
-    // --- Synchronous query ---
-
-    /// Synchronous query to another actor. Suspends until result available.
+    /// Send a dynamic message to another actor (fire-and-forget).
     ///
-    /// On first call (no cached result), sets `pending_ask` and returns `None`.
-    /// On replay (cached result available), returns `Some(result)`.
-    pub fn ask(&mut self, target: ServiceId, payload: &[u8]) -> Option<Vec<u8>> {
+    /// The message is encoded with a tag byte so the receiver's `dispatch_one`
+    /// decodes it as a `Msg` and converts via `FromDynamic`.
+    pub fn tell(&mut self, target: ServiceId, msg: &super::value::Msg) {
+        let encoded = super::codec::Encode::encode(msg);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(super::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        self.tell_raw(target, &payload);
+    }
+
+    // --- Query (ask) ---
+
+    /// Query another actor with a dynamic message. Suspends until reply.
+    ///
+    /// Returns an `Ask` future — `.await` it to get the reply as a `Value`.
+    /// The message is encoded with a tag byte for dynamic dispatch.
+    pub fn ask(&mut self, target: ServiceId, msg: &super::value::Msg) -> super::run::Ask {
+        let encoded = super::codec::Encode::encode(msg);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(super::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        self.ask_raw(target, &payload)
+    }
+
+    /// Raw query — takes pre-encoded payload bytes.
+    /// Used internally by the framework. Prefer `ask()` for cross-actor queries.
+    pub fn ask_raw(&mut self, target: ServiceId, payload: &[u8]) -> super::run::Ask {
         if self.call_index < self.call_results.len() {
             let result = self.call_results[self.call_index].clone();
             self.call_index += 1;
-            Some(result)
+            // Last cached result consumed — we're live again
+            if self.call_index >= self.call_results.len() {
+                self.re_dispatching = false;
+                #[cfg(feature = "pvm")]
+                super::run::set_suppressing_io(false);
+            }
+            super::run::Ask::ready(result)
         } else {
             self.pending_ask = Some(PendingAsk {
                 target,
                 payload: payload.to_vec(),
             });
             self.call_index += 1;
-            None
+            super::run::Ask::pending()
         }
     }
 
     // --- Cooperative scheduling ---
 
     /// Checkpoint state and yield to other actors. Resumes next tick.
-    /// Returns a future — during replay, completed yields return instantly.
+    /// Each invocation runs one iteration; state is saved automatically.
     pub fn yield_now(&mut self) -> super::run::Yield {
         self.self_schedule = true;
-        let idx = self.yield_replay_index;
-        self.yield_replay_index += 1;
-        if idx < self.replay_until {
+        if self.re_dispatching {
             super::run::Yield::skip()
         } else {
             super::run::Yield::once()
@@ -150,65 +177,28 @@ impl<A: Actor> Context<A> {
     }
 
     /// Checkpoint state and sleep for N ticks.
-    /// Returns a future — during replay, completed yields return instantly.
+    /// Each invocation runs one iteration; state is saved automatically.
     pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
         self.sleep_ticks = ticks;
-        let idx = self.yield_replay_index;
-        self.yield_replay_index += 1;
-        if idx < self.replay_until {
+        if self.re_dispatching {
             super::run::Yield::skip()
         } else {
             super::run::Yield::once()
         }
     }
 
-    /// Reset actor state and restart the handler from scratch.
-    /// Use this to bound replay cost in long-running loops.
-    pub fn continue_as_new(&mut self) {
-        self.continue_as_new = true;
-    }
-
-    /// Whether continue_as_new was requested.
-    pub fn should_continue_as_new(&self) -> bool {
-        self.continue_as_new
-    }
-
-    /// Whether we're in replay phase (fast-forwarding past completed yields).
-    /// True when there are still yield points to skip. Once yield_replay_index
-    /// reaches replay_until, we're in the live phase.
-    pub fn replaying(&self) -> bool {
-        self.yield_replay_index < self.replay_until
-    }
-
-    /// Set the yield index to replay up to.
-    pub fn set_replay_until(&mut self, n: u32) {
-        self.replay_until = n;
-    }
-
-    /// Get the current yield replay index (how many yields we've passed).
-    pub fn yield_index(&self) -> u32 {
-        self.yield_replay_index
-    }
-
-    /// Reset yield replay state for re-dispatch (e.g. after ask resolution).
-    pub fn reset_yield_state(&mut self) {
-        self.yield_replay_index = 0;
-        self.self_schedule = false;
-        self.sleep_ticks = 0;
-    }
-
     // --- Storage ---
 
     /// Queue a key-value write to per-service storage.
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
-        if self.replaying() { return; }
+        if self.re_dispatching { return; }
         self.pending_writes.push((key.to_vec(), value.to_vec()));
     }
 
     /// Queue a new service spawn from a code hash.
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
-        if self.replaying() { return; }
+        if self.re_dispatching { return; }
         self.pending_spawns.push(code_hash);
     }
 
@@ -216,6 +206,27 @@ impl<A: Actor> Context<A> {
     pub fn stop(&mut self) {
         self.stop_requested = true;
     }
+
+    // --- Reply (framework-internal) ---
+
+    /// Set the reply value for the current invocation.
+    /// Called by macro-generated code after the handler returns.
+    /// The value is rkyv-encoded and included in the refine output.
+    #[doc(hidden)]
+    pub fn __set_reply(&mut self, value: super::value::Value) {
+        if self.re_dispatching { return; }
+        // Don't store Unit replies — they carry no information
+        if matches!(value, super::value::Value::Unit) { return; }
+        self.reply = Some(super::codec::Encode::encode(&value));
+    }
+
+    /// Take the reply as raw bytes (rkyv-encoded Value).
+    /// Used by `run_refine` to pack the output.
+    pub fn take_reply_bytes(&mut self) -> Vec<u8> {
+        self.reply.take().unwrap_or_default()
+    }
+
+    // --- Introspection ---
 
     /// Check if a stop has been requested.
     pub fn stop_requested(&self) -> bool {
@@ -255,9 +266,11 @@ impl<A: Actor> Context<A> {
         self.call_results.push(result);
         self.call_index = 0;
         self.pending_ask = None;
+        self.re_dispatching = true;
         self.self_schedule = false;
         self.sleep_ticks = 0;
-        self.yield_replay_index = 0;
+        #[cfg(feature = "pvm")]
+        super::run::set_suppressing_io(true);
     }
 
     /// Flush all queued effects via accumulate-phase hostcalls.

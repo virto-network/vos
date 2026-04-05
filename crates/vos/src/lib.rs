@@ -36,11 +36,12 @@ pub use rkyv;
 pub mod actors;
 
 // Re-export core actor types at crate root for `use vos::*`
-pub use actors::{Actor, Message, Context, PendingAsk, Yield, RunResult, try_poll, metadata};
+pub use actors::{Actor, Message, Context, Yield, Ask, RunResult, try_poll, metadata};
 pub use actors::{Encode, Decode};
 pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED};
 pub use actors::init;
 pub use actors::lifecycle;
+pub use actors::value;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "service")]

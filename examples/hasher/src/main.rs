@@ -41,9 +41,7 @@ impl Hasher {
         loop {
             self.current_hash = simple_hash(&self.current_hash);
             self.iterations += 1;
-            if !ctx.replaying() {
-                println!("hasher: iteration {}", self.iterations);
-            }
+            println!("hasher: iteration {}", self.iterations);
             ctx.yield_now().await;
         }
     }

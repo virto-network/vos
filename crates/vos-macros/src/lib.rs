@@ -162,6 +162,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut enum_variants = Vec::new();
     let mut deliver_arms = Vec::new();
     let mut is_query_arms = Vec::new();
+    let mut from_msg_arms = Vec::new();
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
@@ -222,12 +223,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // Determine reply type and whether handler returns Result
-        let (reply_ty, returns_result) = match &method.sig.output {
+        // Determine output type and whether handler returns Result
+        let (output_ty, returns_result) = match &method.sig.output {
             ReturnType::Default => (quote! { () }, false),
             ReturnType::Type(_, ty) => {
-                if let Some(inner) = result_ok_type(ty) {
-                    (quote! { #inner }, true)
+                if result_ok_type(ty).is_some() {
+                    (quote! { #ty }, true)
                 } else {
                     (quote! { #ty }, false)
                 }
@@ -268,27 +269,20 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { let #struct_name { #( #field_names ),* } = msg; }
         };
 
-        let handler_body = if returns_result {
-            quote! {
-                #field_binds
-                #body
-            }
-        } else {
-            quote! {
-                #field_binds
-                Ok(#body)
-            }
+        let handler_body = quote! {
+            #field_binds
+            #body
         };
 
         let msg_impl = quote! {
             impl vos::Message<#struct_name> for #actor_name {
-                type Reply = #reply_ty;
+                type Output = #output_ty;
                 #[allow(unreachable_code)]
                 async fn handle(
                     &mut self,
                     msg: #struct_name,
                     ctx: &mut vos::Context<Self>,
-                ) -> core::result::Result<Self::Reply, Self::Error> {
+                ) -> Self::Output {
                     #handler_body
                 }
             }
@@ -298,15 +292,29 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Enum variant
         enum_variants.push(quote! { #struct_name(#struct_name) });
 
-        // Deliver arm
-        deliver_arms.push(quote! {
-            #enum_name::#struct_name(msg) => {
-                match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
-                    Ok(_) => false,
-                    Err(e) => vos::Actor::on_error(actor, &e),
+        // Deliver arm — different code for infallible vs fallible handlers
+        let deliver_arm = if returns_result {
+            quote! {
+                #enum_name::#struct_name(msg) => {
+                    match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
+                        Ok(reply) => {
+                            ctx.__set_reply(reply.into());
+                            false
+                        }
+                        Err(e) => vos::Actor::on_error(actor, &e),
+                    }
                 }
             }
-        });
+        } else {
+            quote! {
+                #enum_name::#struct_name(msg) => {
+                    let reply = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
+                    ctx.__set_reply(reply.into());
+                    false
+                }
+            }
+        };
+        deliver_arms.push(deliver_arm);
 
         // is_query arm
         let query_val = is_query;
@@ -336,6 +344,26 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 is_query: #query_val,
                 fields: &[ #( #field_metas ),* ],
             }
+        });
+
+        // Dynamic from_msg arm
+        let from_msg_body = if field_names.is_empty() {
+            quote! { Some(#enum_name::#struct_name(#struct_name)) }
+        } else {
+            let extractions: Vec<_> = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
+                let name_str = name.to_string();
+                let accessor = type_to_accessor(ty);
+                quote! {
+                    let #name: #ty = msg.args.#accessor(#name_str)?;
+                }
+            }).collect();
+            quote! {
+                #( #extractions )*
+                Some(#enum_name::#struct_name(#struct_name { #( #field_names ),* }))
+            }
+        };
+        from_msg_arms.push(quote! {
+            #msg_name_str => { #from_msg_body }
         });
     }
 
@@ -382,6 +410,23 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
+            /// Convert a dynamic message to this typed enum.
+            /// Returns `None` if the message name or argument types don't match.
+            pub fn from_msg(msg: &vos::value::Msg) -> Option<Self> {
+                match msg.name.as_str() {
+                    #( #from_msg_arms )*
+                    _ => None,
+                }
+            }
+        }
+
+        impl vos::value::FromDynamic for #enum_name {
+            fn from_dynamic(msg: &vos::value::Msg) -> Option<Self> {
+                Self::from_msg(msg)
+            }
+        }
+
+        impl #enum_name {
             pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
@@ -409,7 +454,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
         quote! {
             fn __vos_create() -> Self {
-                let args: vos::init::InitArgs = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
+                let args: vos::value::Args = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
                     .expect("actor init args not found in storage");
                 #( #extractions )*
                 Self::new(#( #names ),*)

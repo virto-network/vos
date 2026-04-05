@@ -22,5 +22,17 @@ name = "hasher"
 path = "hasher/target/riscv64em-javm/release/hasher.elf"
 
 [[actors]]
+name = "display"
+path = "display/target/riscv64em-javm/release/display.elf"
+
+[[actors]]
 name = "animation"
 path = "animation/target/riscv64em-javm/release/animation.elf"
+
+[[actors]]
+name = "math"
+path = "math/target/riscv64em-javm/release/math.elf"
+
+[[actors]]
+name = "pipeline"
+path = "pipeline/target/riscv64em-javm/release/pipeline.elf"

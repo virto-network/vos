@@ -45,8 +45,8 @@ impl Yield {
     pub fn once() -> Self {
         Self { yielded: false }
     }
-    /// Returns Ready immediately — used during replay to fast-forward past
-    /// yield points that already executed in a previous invocation.
+    /// Returns Ready immediately — used during ask-replay to skip past
+    /// yield points while the framework re-executes the handler.
     pub fn skip() -> Self {
         Self { yielded: true }
     }
@@ -65,6 +65,63 @@ impl Future for Yield {
         }
     }
 }
+
+/// A future returned by `ctx.ask()`.
+///
+/// On first invocation: returns `Pending` (triggers ask resolution in `dispatch_one`).
+/// On replay: returns `Ready(Value)` — the reply deserialized from cached bytes.
+pub struct Ask {
+    /// Raw reply bytes (rkyv-encoded Value). Deserialized lazily in poll().
+    result: Option<alloc::vec::Vec<u8>>,
+}
+
+impl Ask {
+    pub fn ready(result: alloc::vec::Vec<u8>) -> Self {
+        Self { result: Some(result) }
+    }
+    pub fn pending() -> Self {
+        Self { result: None }
+    }
+}
+
+impl Future for Ask {
+    type Output = super::value::Value;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<super::value::Value> {
+        let this = self.get_mut();
+        if let Some(bytes) = this.result.take() {
+            let value = if bytes.is_empty() {
+                super::value::Value::Unit
+            } else {
+                <super::value::Value as super::codec::Decode>::decode(&bytes)
+            };
+            Poll::Ready(value)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+// ── I/O suppression (ask-replay) ─────────────────────────────────────
+
+/// Global flag: suppress I/O (println! etc) during ask-replay re-dispatch.
+/// Safe because PVM is single-threaded.
+#[cfg(feature = "pvm")]
+static mut SUPPRESSING_IO: bool = false;
+
+/// Set the I/O suppression flag (framework-internal).
+#[cfg(feature = "pvm")]
+pub fn set_suppressing_io(v: bool) {
+    unsafe { SUPPRESSING_IO = v; }
+}
+
+/// Check if I/O is currently suppressed (ask-replay in progress).
+#[cfg(feature = "pvm")]
+pub fn is_suppressing_io() -> bool {
+    unsafe { SUPPRESSING_IO }
+}
+
+// ── Halt ──────────────────────────────────────────────────────────────
 
 /// Halt the PVM (no output). Used by accumulate (service mode).
 #[cfg(all(feature = "service", target_arch = "riscv64"))]
@@ -111,14 +168,14 @@ pub const STATUS_DONE: u8 = 0x00;
 /// Exit status: actor handler yielded (wants re-invocation).
 pub const STATUS_YIELDED: u8 = 0x01;
 
-// ── Accumulate phase (service actors) ───────────────────────────────
+// ── Accumulate phase (service actors) ─────────────────────────────────
 
 /// Service actor lifecycle — JAR accumulate phase (PC=5).
 ///
 /// Composed from lifecycle building blocks:
-/// 1. `load_or_create` — state + yield index from storage
+/// 1. `load_or_create` — state from storage
 /// 2. `fetch_raw` + `dispatch_one` — message loop
-/// 3. `save_state` — persist state + yield index
+/// 3. `save_state` — persist current state
 /// 4. `emit_status` — output exit status, halt
 #[cfg(feature = "service")]
 pub fn run_accumulate<A: super::Actor>() {
@@ -130,12 +187,9 @@ pub fn run_accumulate<A: super::Actor>() {
 
     // Read persisted state from storage
     let mut buf = [0u8; BUF_SIZE];
-    let (state_len, yield_index) = lifecycle::read_persisted_state(&mut buf);
+    let state_len = lifecycle::read_persisted_state(&mut buf);
     let state = if state_len > 0 { Some(&buf[..state_len]) } else { None };
     let mut actor = lifecycle::load_or_create::<A>(state);
-
-    ctx.set_replay_until(yield_index);
-    let initial_state = super::codec::Encode::encode(&actor);
 
     // Dispatch messages
     loop {
@@ -147,40 +201,32 @@ pub fn run_accumulate<A: super::Actor>() {
         }
     }
 
-    lifecycle::save_state::<A>(&actor, &ctx, &initial_state);
+    lifecycle::save_state::<A>(&actor, &ctx);
     lifecycle::emit_status::<A>(&ctx);
     halt();
 }
 
-// ── Refine phase (all actors) ───────────────────────────────────────
+// ── Refine phase (all actors) ─────────────────────────────────────────
 
 /// Refine-only actor lifecycle — JAR refine phase (PC=0).
 ///
-/// Uses the same fetch → load → dispatch → save pattern as accumulate.
 /// The runtime splits invoke input into separate FETCH items:
-///   FETCH 1: `[yield_index:u32 LE][state_bytes]`
+///   FETCH 1: `[state_bytes]` (empty on first invocation)
 ///   FETCH 2+: message bytes
 ///
-/// Output: `[status:u8][yield_index:u32 LE][state_len:u32 LE][state_bytes]`
+/// Output: `[status:u8][state_len:u32 LE][state_bytes]`
 #[cfg(feature = "pvm")]
 pub fn run_refine<A: super::Actor>() {
     use super::lifecycle::{self, DispatchResult, BUF_SIZE};
     use super::context::ServiceId;
 
-    // FETCH 1: state + yield index
+    // FETCH 1: state
     let mut buf = [0u8; BUF_SIZE];
     let n = lifecycle::fetch_raw(&mut buf);
-    if n < 4 {
-        halt_with_output(&[STATUS_DONE]);
-    }
-
-    let yield_index = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let state = if n > 4 { Some(&buf[4..n]) } else { None };
+    let state = if n > 0 { Some(&buf[..n]) } else { None };
     let mut actor = lifecycle::load_or_create::<A>(state);
 
     let mut ctx = super::Context::new(ServiceId(0));
-    ctx.set_replay_until(yield_index);
-    let initial_state = super::codec::Encode::encode(&actor);
 
     // FETCH 2+: messages (same loop as accumulate)
     loop {
@@ -192,22 +238,21 @@ pub fn run_refine<A: super::Actor>() {
         }
     }
 
-    // save_state returns (state_bytes, yield_index) — no storage write on refine
-    let (state, yi) = lifecycle::save_state::<A>(&actor, &ctx, &initial_state);
+    let state = lifecycle::save_state::<A>(&actor, &ctx);
     let status = lifecycle::exit_status::<A>(&ctx);
+    let reply_bytes = ctx.take_reply_bytes();
 
-    // Pack output: [status:u8][yield_index:u32][state_len:u32][state...]
+    // Pack output: [status:u8][state_len:u32][state...][reply...]
     let sl = (state.len() as u32).to_le_bytes();
-    let yi_bytes = yi.to_le_bytes();
-    let mut out = alloc::vec![0u8; 1 + 4 + 4 + state.len()];
+    let mut out = alloc::vec![0u8; 1 + 4 + state.len() + reply_bytes.len()];
     out[0] = status[0];
-    out[1..5].copy_from_slice(&yi_bytes);
-    out[5..9].copy_from_slice(&sl);
-    out[9..].copy_from_slice(&state);
+    out[1..5].copy_from_slice(&sl);
+    out[5..5 + state.len()].copy_from_slice(&state);
+    out[5 + state.len()..].copy_from_slice(&reply_bytes);
     halt_with_output(&out);
 }
 
-// ── Utilities ───────────────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────────────
 
 /// Build a code hash from a service ID (public, for agent use).
 pub fn service_code_hash(service_id: u32) -> [u8; 32] {

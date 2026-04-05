@@ -38,7 +38,7 @@ pub trait Actor: Sized + Encode + Decode {
     type Error: core::fmt::Debug;
 
     /// The message enum dispatched to this actor.
-    type Message: Decode;
+    type Message: Decode + super::value::FromDynamic;
 
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
@@ -68,14 +68,19 @@ pub trait Actor: Sized + Encode + Decode {
 }
 
 /// Defines how an actor handles a specific message type.
+///
+/// `Output` is the raw return type of the handler:
+/// - Infallible handlers: `Output = T` (e.g. `u64`)
+/// - Fallible handlers: `Output = Result<T, E>`
+///
+/// The macro generates deliver arms that handle each case appropriately.
 pub trait Message<M>: Actor {
-    /// The response type sent back to the caller.
-    type Reply;
+    type Output;
 
     /// Process the message with exclusive mutable access to actor state.
     async fn handle(
         &mut self,
         msg: M,
         ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error>;
+    ) -> Self::Output;
 }

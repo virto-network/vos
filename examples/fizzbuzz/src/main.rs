@@ -20,16 +20,14 @@ impl FizzBuzz {
     async fn run(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.n += 1;
-            if !ctx.replaying() {
-                if self.n % 15 == 0 {
-                    println!("fizzbuzz");
-                } else if self.n % 3 == 0 {
-                    println!("fizz");
-                } else if self.n % 5 == 0 {
-                    println!("buzz");
-                } else {
-                    println!("{}", self.n);
-                }
+            if self.n % 15 == 0 {
+                println!("fizzbuzz: fizzbuzz");
+            } else if self.n % 3 == 0 {
+                println!("fizzbuzz: fizz");
+            } else if self.n % 5 == 0 {
+                println!("fizzbuzz: buzz");
+            } else {
+                println!("fizzbuzz: {}", self.n);
             }
             ctx.yield_now().await;
         }

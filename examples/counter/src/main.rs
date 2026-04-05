@@ -21,9 +21,7 @@ impl Counter {
     async fn run(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.count += 1;
-            if !ctx.replaying() {
-                println!("count = {}", self.count);
-            }
+            println!("counter: count = {}", self.count);
             ctx.yield_now().await;
         }
     }

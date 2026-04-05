@@ -18,6 +18,6 @@ impl Greeter {
 
     #[msg]
     async fn run(&self, _ctx: &mut Context<Self>) {
-        println!("Hello n={}", self.n);
+        println!("greeter: Hello n={}", self.n);
     }
 }
