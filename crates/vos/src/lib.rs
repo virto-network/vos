@@ -37,19 +37,17 @@ pub mod actors;
 
 // Re-export core actor types at crate root for `use vos::*`
 pub use actors::{Actor, Message, Context, PendingAsk, Yield, RunResult, try_poll, metadata};
+pub use actors::{Encode, Decode};
 pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED};
+pub use actors::lifecycle;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "service")]
-pub use actors::main_loop;
+pub use actors::run_accumulate;
 #[cfg(feature = "pvm")]
-pub use actors::refine_loop;
-
-// Unified entry — macro always calls this, feature flag picks the right loop.
-#[cfg(feature = "service")]
-pub use actors::main_loop as entry_loop;
-#[cfg(all(feature = "pvm", not(feature = "service")))]
-pub use actors::refine_loop as entry_loop;
+pub use actors::run_refine;
+#[cfg(feature = "pvm")]
+pub use actors::run_entry;
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]

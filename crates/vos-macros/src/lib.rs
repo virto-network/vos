@@ -1,16 +1,19 @@
 //! Proc macros for `vos`.
 //!
-//! - `#[actor]` — makes a struct a VOS actor with rkyv derives and Actor trait impl
-//! - `#[messages]` — on an `impl` block, generates message types, dispatch, and `_start`
+//! - `#[actor]` — rkyv derives + `impl Actor for X` using conventions
+//! - `#[messages]` — message types, dispatch enum, entry points
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType};
 
-/// Attribute macro that makes a struct a VOS actor.
+/// Makes a struct a VOS actor.
 ///
-/// Adds rkyv `Archive`/`Serialize`/`Deserialize` derives for state persistence
-/// and implements the `Actor` trait with default lifecycle hooks.
+/// 1. Adds rkyv `Archive`/`Serialize`/`Deserialize` derives
+/// 2. Generates `impl Actor for X` with:
+///    - `create` → calls `Self::new()`
+///    - `dispatch` → forwards to `{Name}Msg::dispatch` (from `#[messages]`)
+///    - `encode`/`decode` → rkyv via [`vos::rkyv_encode`]/[`vos::rkyv_decode`]
 ///
 /// ```ignore
 /// #[actor]
@@ -22,10 +25,16 @@ use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnT
 /// #[actor(error = MyError)]
 /// struct Counter { count: i32 }
 /// ```
+///
+/// ## Without this macro
+///
+/// If you need custom construction (e.g. init payload), skip `#[actor]` and
+/// implement `Actor` manually. You still use `#[messages]` for the dispatch enum.
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
     let name = &input.ident;
+    let msg_enum = format_ident!("{}Msg", name);
 
     // Parse optional error type from #[actor(error = Type)]
     let error_ty = if attr.is_empty() {
@@ -96,23 +105,32 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
+            type Message = #msg_enum;
+
+            fn create() -> Self {
+                Self::new()
+            }
+
+            fn dispatch(
+                &mut self,
+                msg: Self::Message,
+                ctx: &mut vos::Context<Self>,
+            ) -> vos::RunResult<bool> {
+                vos::try_poll(async {
+                    msg.deliver(self, ctx).await
+                })
+            }
         }
     };
 
     expanded.into()
 }
 
-/// Attribute macro for impl blocks that generates message types, handlers,
-/// and the actor entry point (`_start`).
-///
-/// ## Result type alias
-///
-/// The macro emits `type Result<T> = core::result::Result<T, <Actor as vos::Actor>::Error>`
-/// so handlers can use `Result<T>` with `?` and the actor's error type is used automatically.
+/// Generates message types, dispatch enum, and PVM entry points from an impl block.
 ///
 /// ## Constructor
 ///
-/// A `fn new(...) -> Self` method (without `#[msg]`) defines the constructor.
+/// A `fn new(...) -> Self` method (without `#[msg]`) is preserved as an inherent method.
 ///
 /// ## Message handlers
 ///
@@ -120,11 +138,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `T` — infallible, wrapped in `Ok(T)` automatically
 /// - `Result<T>` — fallible, errors propagated to `on_error`
 ///
-/// ## Generated `_start`
+/// ## Generated items
 ///
-/// The macro generates the PVM entry point. The `service` cargo feature
-/// determines whether `main_loop` (service with accumulate) or `refine_loop`
-/// (stateless guest) is used — no macro argument needed.
+/// - `{Name}Msg` enum with rkyv derives
+/// - `Message<T>` trait impls for each handler
+/// - `_start` / `accumulate` PVM entry points
+/// - `.vos_meta` section with actor metadata
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -136,20 +155,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         _ => panic!("#[messages] requires a simple type path"),
     };
     let enum_name = format_ident!("{}Msg", actor_name);
-    let archived_enum_name = format_ident!("Archived{}Msg", actor_name);
     let actor_name_str = actor_name.to_string();
 
     let mut msg_structs = Vec::new();
     let mut msg_impls = Vec::new();
     let mut enum_variants = Vec::new();
     let mut deliver_arms = Vec::new();
-    let mut dispatch_arms = Vec::new();
     let mut is_query_arms = Vec::new();
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
-
-    // Constructor info
-    let mut ctor_method = None;
 
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
@@ -157,15 +171,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
 
-        // Check for #[msg] attribute
         let is_msg = method.attrs.iter().any(|a| a.path().is_ident("msg"));
-
-        // Detect constructor: fn new(...) -> Self (without #[msg])
-        if !is_msg && method.sig.ident == "new" {
-            ctor_method = Some(method.clone());
-            passthrough_items.push(item.clone());
-            continue;
-        }
 
         if !is_msg {
             passthrough_items.push(item.clone());
@@ -184,11 +190,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             _ => false,
         };
 
-        // Collect parameters (skip self)
+        // Collect parameters (skip self, skip Context)
         let mut field_names = Vec::new();
         let mut field_types = Vec::new();
         for arg in method.sig.inputs.iter().skip(1) {
-            // skip Context parameters (&Context<..> or &mut Context<..>)
             if let FnArg::Typed(pat_type) = arg {
                 if is_context_type(pat_type.ty.as_ref()) {
                     continue;
@@ -246,7 +251,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { let #struct_name { #( #field_names ),* } = msg; }
         };
 
-        // If handler returns Result<T>, pass through directly; otherwise wrap in Ok()
         let handler_body = if returns_result {
             quote! {
                 #field_binds
@@ -262,6 +266,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let msg_impl = quote! {
             impl vos::Message<#struct_name> for #actor_name {
                 type Reply = #reply_ty;
+                #[allow(unreachable_code)]
                 async fn handle(
                     &mut self,
                     msg: #struct_name,
@@ -286,24 +291,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
 
-        // Dispatch arm (deserialize from archived)
-        dispatch_arms.push(quote! {
-            #archived_enum_name::#struct_name(archived) => {
-                let msg: #struct_name = vos::rkyv::deserialize::<#struct_name, vos::rkyv::rancor::Error>(archived).unwrap();
-                match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
-                    Ok(_) => false,
-                    Err(e) => vos::Actor::on_error(actor, &e),
-                }
-            }
-        });
-
         // is_query arm
         let query_val = is_query;
         is_query_arms.push(quote! {
             #enum_name::#struct_name(_) => #query_val
         });
 
-        // Metadata for this message
+        // Metadata
         let msg_name_str = method_name.to_string();
         let field_metas: Vec<_> = field_names
             .iter()
@@ -327,170 +321,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
     }
-
-    // --- Constructor: generate Init struct and _start ---
-
-    let (init_struct, init_deserialize, ctor_call, needs_init_payload) = if let Some(ctor) = &ctor_method {
-        // Collect constructor params (skip Context if present)
-        let mut ctor_field_names = Vec::new();
-        let mut ctor_field_types = Vec::new();
-        for arg in &ctor.sig.inputs {
-            if let FnArg::Typed(pat_type) = arg {
-                if is_context_type(pat_type.ty.as_ref()) {
-                    continue;
-                }
-                if let Pat::Ident(pat) = pat_type.pat.as_ref() {
-                    ctor_field_names.push(pat.ident.clone());
-                    ctor_field_types.push(pat_type.ty.as_ref().clone());
-                }
-            }
-        }
-
-        let has_params = !ctor_field_names.is_empty();
-        let init_struct_name = format_ident!("{}Init", actor_name);
-        let archived_init_name = format_ident!("Archived{}Init", actor_name);
-
-        let init_struct_def = if ctor_field_names.is_empty() {
-            quote! {
-                #[derive(
-                    vos::rkyv::Archive,
-                    vos::rkyv::Serialize,
-                    vos::rkyv::Deserialize,
-                )]
-                #[rkyv(crate = vos::rkyv)]
-                pub struct #init_struct_name;
-            }
-        } else {
-            quote! {
-                #[derive(
-                    vos::rkyv::Archive,
-                    vos::rkyv::Serialize,
-                    vos::rkyv::Deserialize,
-                )]
-                #[rkyv(crate = vos::rkyv)]
-                pub struct #init_struct_name {
-                    #( pub #ctor_field_names: #ctor_field_types ),*
-                }
-            }
-        };
-
-        let deser = if ctor_field_names.is_empty() {
-            quote! {
-                let _ = __payload;
-            }
-        } else {
-            // Constructor needs args — unwrap the payload from Option
-            quote! {
-                let __bytes = __payload.expect("constructor requires init payload");
-                let __archived = unsafe {
-                    vos::rkyv::access_unchecked::<#archived_init_name>(__bytes)
-                };
-                let #init_struct_name { #( #ctor_field_names ),* } =
-                    vos::rkyv::deserialize::<#init_struct_name, vos::rkyv::rancor::Error>(__archived).unwrap();
-            }
-        };
-
-        let call = quote! {
-            #actor_name::new(#( #ctor_field_names ),*)
-        };
-
-        (init_struct_def, deser, call, has_params)
-    } else {
-        // No constructor — require Default
-        let init_struct_def = quote! {};
-        let deser = quote! { let _ = __payload; };
-        let call = quote! { <#actor_name as Default>::default() };
-        (init_struct_def, deser, call, false)
-    };
-
-    let archived_actor_name = format_ident!("Archived{}", actor_name);
-
-    let common_preamble = quote! {
-        extern crate alloc;
-
-        /// Result type alias using this actor's error type.
-        #[allow(dead_code)]
-        type Result<T> = core::result::Result<T, <#actor_name as vos::Actor>::Error>;
-
-        #[allow(unused_imports)]
-        use vos::{print, println, eprint, eprintln};
-        #[allow(unused_imports)]
-        use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
-    };
-
-    let save_fn = quote! {
-        |__actor| {
-            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(__actor).unwrap();
-            bytes.to_vec()
-        }
-    };
-
-    let load_fn = quote! {
-        |__bytes| {
-            let archived = unsafe {
-                vos::rkyv::access_unchecked::<#archived_actor_name>(__bytes)
-            };
-            vos::rkyv::deserialize::<#actor_name, vos::rkyv::rancor::Error>(archived).unwrap()
-        }
-    };
-
-    let dispatch_fn = quote! {
-        |__payload, __actor, __ctx| -> vos::RunResult<bool> {
-            vos::try_poll(async {
-                unsafe { #enum_name::dispatch(__payload, __actor, __ctx).await }
-            })
-        }
-    };
-
-    let init_fn = quote! {
-        |__payload| {
-            #init_deserialize
-            #ctor_call
-        }
-    };
-
-    let start_fn = quote! {
-        #common_preamble
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn _start() {
-            vos::entry_loop::<#actor_name>(
-                #needs_init_payload,
-                #init_fn,
-                #dispatch_fn,
-                #save_fn,
-                #load_fn,
-            );
-        }
-
-        /// Accumulate entry point (PC=5 in JAM service blobs).
-        /// Only reachable in service blobs linked with `link_elf_service`.
-        #[unsafe(no_mangle)]
-        pub extern "C" fn accumulate() {
-            _start();
-        }
-
-        // Force the linker to keep `accumulate` even under LTO.
-        #[used]
-        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
-
-        // Embed actor metadata in the .vos_meta ELF section.
-        // vosx reads this to discover messages without running the binary.
-        const _VOS_META_ENCODED: ([u8; 4096], usize) =
-            vos::metadata::encode::<4096>(&#enum_name::META);
-
-        #[unsafe(link_section = ".vos_meta")]
-        #[used]
-        static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
-            // Copy only the used bytes from the encoded buffer.
-            // This is a const context so we use a loop.
-            let (src, len) = _VOS_META_ENCODED;
-            let mut out = [0u8; _VOS_META_ENCODED.1];
-            let mut i = 0;
-            while i < len { out[i] = src[i]; i += 1; }
-            out
-        };
-    };
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
@@ -517,15 +347,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(self).unwrap()
             }
 
-            /// Deserialize and dispatch a message from bytes. Returns `true` if the
-            /// actor should stop processing further messages.
-            pub async unsafe fn dispatch(bytes: &[u8], actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) -> bool {
-                let archived = unsafe { vos::rkyv::access_unchecked::<#archived_enum_name>(bytes) };
-                match archived {
-                    #( #dispatch_arms )*
-                }
-            }
-
             pub fn is_query(&self) -> bool {
                 match self {
                     #( #is_query_arms ),*
@@ -550,13 +371,52 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Entry points and preamble
+    let entry_points = quote! {
+        extern crate alloc;
+
+        /// Result type alias using this actor's error type.
+        #[allow(dead_code)]
+        type Result<T> = core::result::Result<T, <#actor_name as vos::Actor>::Error>;
+
+        #[allow(unused_imports)]
+        use vos::{print, println, eprint, eprintln};
+        #[allow(unused_imports)]
+        use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() {
+            vos::run_entry::<#actor_name>();
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn accumulate() {
+            _start();
+        }
+
+        #[used]
+        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
+
+        const _VOS_META_ENCODED: ([u8; 4096], usize) =
+            vos::metadata::encode::<4096>(&#enum_name::META);
+
+        #[unsafe(link_section = ".vos_meta")]
+        #[used]
+        static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
+            let (src, len) = _VOS_META_ENCODED;
+            let mut out = [0u8; _VOS_META_ENCODED.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
+    };
+
     let expanded = quote! {
-        #init_struct
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
         #passthrough_impl
-        #start_fn
+        #entry_points
     };
 
     expanded.into()

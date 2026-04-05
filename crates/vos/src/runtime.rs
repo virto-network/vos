@@ -391,7 +391,25 @@ fn handle_invoke(
         None => return error::HOST_WHAT,
     };
 
-    let mut child_items = vec![input];
+    // Split invoke input [yi:4][state_len:4][state][msg] into separate FETCH items:
+    //   FETCH 1: [yi:4][state_bytes]   (state + yield index)
+    //   FETCH 2: [msg_bytes]           (message)
+    // This lets invoked actors use the same fetch_raw → load_or_create → dispatch
+    // pattern as service actors.
+    let mut child_items = if input.len() >= 8 {
+        let state_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+        let state_end = (8 + state_len).min(input.len());
+        let mut state_item = Vec::with_capacity(4 + state_len);
+        state_item.extend_from_slice(&input[..4]); // yi
+        state_item.extend_from_slice(&input[8..state_end]); // state bytes (skip state_len header)
+        let mut items = vec![state_item];
+        if state_end < input.len() {
+            items.push(input[state_end..].to_vec());
+        }
+        items
+    } else {
+        vec![input]
+    };
 
     loop {
         let (exit, _) = child.run();

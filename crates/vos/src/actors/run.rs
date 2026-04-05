@@ -1,4 +1,9 @@
 //! Cooperative single-threaded executor for VOS actor programs.
+//!
+//! Two-phase JAM lifecycle:
+//! - **Refine (PC=0)**: Dispatch message, handle yields/asks, produce output.
+//! - **Accumulate (PC=5)**: Service-only. Load state from storage, dispatch
+//!   messages, persist state. Uses lifecycle building blocks.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -61,7 +66,7 @@ impl Future for Yield {
     }
 }
 
-/// Halt the PVM (no output). Used by main_loop (service mode).
+/// Halt the PVM (no output). Used by accumulate (service mode).
 #[cfg(all(feature = "service", target_arch = "riscv64"))]
 fn halt() -> ! {
     unsafe {
@@ -76,7 +81,6 @@ fn halt() -> ! {
 }
 
 /// Halt with output data in registers a0 (ptr) and a1 (len).
-/// The invoke() host handler reads these to copy output to the caller.
 #[cfg(target_arch = "riscv64")]
 fn halt_with_output(data: &[u8]) -> ! {
     unsafe {
@@ -102,253 +106,108 @@ fn halt_with_output(_data: &[u8]) -> ! {
     panic!("halt_with_output is only supported on RISC-V targets");
 }
 
-/// Buffer size for hostcall data exchange.
-#[cfg(feature = "pvm")]
-const BUF_SIZE: usize = 4096;
-
-/// Storage key for persisted actor state (service mode only).
-#[cfg(feature = "service")]
-const STATE_KEY: &[u8] = b"__vos_actor_state";
-
-/// Storage key for the yield replay index (service mode only).
-#[cfg(feature = "service")]
-const YIELD_INDEX_KEY: &[u8] = b"__vos_yield_index";
-
 /// Exit status: actor processed all messages normally.
 pub const STATUS_DONE: u8 = 0x00;
 /// Exit status: actor handler yielded (wants re-invocation).
 pub const STATUS_YIELDED: u8 = 0x01;
 
-/// Service actor lifecycle — JAR-aligned fresh-PVM model (accumulate phase).
+// ── Accumulate phase (service actors) ───────────────────────────────
+
+/// Service actor lifecycle — JAR accumulate phase (PC=5).
 ///
-/// Each invocation:
-/// 1. Try loading existing state from storage via `read(STATE_KEY)`
-/// 2. If no state, construct fresh actor (from init payload if needed)
-/// 3. Process all pending items (transfers delivered via `fetch()`)
-/// 4. Flush effects after each handler
-/// 5. Persist state via `write()`, output exit status via YIELD, halt
-///
-/// Requires the `service` feature — uses accumulate-phase hostcalls
-/// (READ, WRITE, YIELD, INFO) that are not available to refine-only actors.
+/// Composed from lifecycle building blocks:
+/// 1. `load_or_create` — state + yield index from storage
+/// 2. `fetch_raw` + `dispatch_one` — message loop
+/// 3. `save_state` — persist state + yield index
+/// 4. `emit_status` — output exit status, halt
 #[cfg(feature = "service")]
-pub fn main_loop<A: super::Actor>(
-    needs_init_payload: bool,
-    init: impl FnOnce(Option<&[u8]>) -> A,
-    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>) -> RunResult<bool>,
-    save: impl Fn(&A) -> alloc::vec::Vec<u8>,
-    load: impl Fn(&[u8]) -> A,
-) {
-    use vos_abi::pvm::hostcalls;
-    use vos_abi::pvm::ecall;
-    use vos_abi::hostcall::accumulate;
+pub fn run_accumulate<A: super::Actor>() {
+    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
+    use super::context::ServiceId;
 
-    let self_id = hostcalls::info() as u32;
+    let id = lifecycle::service_id();
+    let mut ctx = super::Context::new(ServiceId(id));
 
-    let mut ctx = super::Context::new(
-        super::context::ServiceId(self_id),
-    );
-
-    // Step 1: Try loading existing state from storage
+    // Read persisted state from storage
     let mut buf = [0u8; BUF_SIZE];
-    let state_read = hostcalls::read(STATE_KEY, &mut buf);
-    let mut actor = if state_read > 0 && state_read < BUF_SIZE as u64 {
-        load(&buf[..state_read as usize])
-    } else if needs_init_payload {
-        // Constructor needs arguments — fetch init payload.
-        // FETCH before YIELD so invoke() callers get immediate service.
-        loop {
-            let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
-            if n > 0 && n < BUF_SIZE as u64 {
-                break init(Some(&buf[..n as usize]));
-            }
-            ecall::ecall0(accumulate::YIELD);
-        }
-    } else {
-        // Parameterless constructor — construct immediately
-        init(None)
-    };
+    let (state_len, yield_index) = lifecycle::read_persisted_state(&mut buf);
+    let state = if state_len > 0 { Some(&buf[..state_len]) } else { None };
+    let mut actor = lifecycle::load_or_create::<A>(state);
 
-    // Step 2: Load yield replay index from storage
-    let mut yield_buf = [0u8; 4];
-    let yi_read = hostcalls::read(YIELD_INDEX_KEY, &mut yield_buf);
-    let yield_index = if yi_read == 4 {
-        u32::from_le_bytes(yield_buf)
-    } else {
-        0
-    };
     ctx.set_replay_until(yield_index);
+    let initial_state = super::codec::Encode::encode(&actor);
 
-    // Step 3: Save initial state for durable replay.
-    // On yield, we persist this snapshot (not the mutated state) so the
-    // next invocation replays the handler from the same starting point.
-    let initial_state = save(&actor);
-
-    // Step 4: Process all pending items
+    // Dispatch messages
     loop {
-        let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
-        if n == 0 || n >= BUF_SIZE as u64 {
-            break; // No more items
-        }
-        // Copy payload so we can replay if ask() suspends
-        let payload_len = n as usize;
-        let mut payload_buf = [0u8; BUF_SIZE];
-        payload_buf[..payload_len].copy_from_slice(&buf[..payload_len]);
-
-        match dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx) {
-            RunResult::Yielded => { ctx.flush_effects(); break; }
-            RunResult::Complete(stop) => { ctx.flush_effects(); if stop { break; } }
-        }
-
-        // Resolve pending asks: call invoke(), cache result, replay handler
-        while let Some(pending) = ctx.take_pending_ask() {
-            let mut invoke_buf = [0u8; BUF_SIZE];
-            let result_len = hostcalls::invoke(
-                &target_code_hash(pending.target.0),
-                &pending.payload,
-                0, // 0 = use default gas
-                &mut invoke_buf,
-            );
-            let result = if result_len > 0 && result_len < BUF_SIZE as u64 {
-                invoke_buf[..result_len as usize].to_vec()
-            } else {
-                alloc::vec::Vec::new()
-            };
-            ctx.push_call_result_and_reset(result);
-
-            // Replay: re-dispatch the same message with cached results
-            match dispatch(&payload_buf[..payload_len], &mut actor, &mut ctx) {
-                RunResult::Yielded => { ctx.flush_effects(); break; }
-                RunResult::Complete(stop) => { ctx.flush_effects(); if stop { break; } }
-            }
+        let n = lifecycle::fetch_raw(&mut buf);
+        if n == 0 { break; }
+        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
+        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
+            break;
         }
     }
 
-    // Step 5: Persist state + yield index
-    if ctx.self_scheduled() && !ctx.should_continue_as_new() {
-        // Yielded: save initial state (for replay) and increment yield index.
-        // The next invocation will replay from this state, fast-forwarding
-        // through completed yields until it hits the new one.
-        hostcalls::write(STATE_KEY, &initial_state);
-        let new_yi = ctx.yield_index().to_le_bytes();
-        hostcalls::write(YIELD_INDEX_KEY, &new_yi);
-    } else {
-        // Complete or continue_as_new: save final mutated state, reset yield index.
-        let state_bytes = save(&actor);
-        hostcalls::write(STATE_KEY, &state_bytes);
-        hostcalls::write(YIELD_INDEX_KEY, &0u32.to_le_bytes());
-    }
-
-    // Step 6: Output exit status via YIELD, then halt.
-    let status = if ctx.self_scheduled() {
-        let ticks = ctx.sleep_ticks();
-        if ticks > 0 {
-            let mut s = alloc::vec![STATUS_YIELDED];
-            s.extend_from_slice(&ticks.to_le_bytes());
-            s
-        } else {
-            alloc::vec![STATUS_YIELDED]
-        }
-    } else {
-        alloc::vec![STATUS_DONE]
-    };
-    hostcalls::yield_output(&status);
+    lifecycle::save_state::<A>(&actor, &ctx, &initial_state);
+    lifecycle::emit_status::<A>(&ctx);
     halt();
 }
 
-/// Refine-only actor lifecycle — stateless guest program invoked by the agent.
+// ── Refine phase (all actors) ───────────────────────────────────────
+
+/// Refine-only actor lifecycle — JAR refine phase (PC=0).
 ///
-/// Guest actors receive their state and message as invoke input, run the
-/// handler, and return mutated state as invoke output. No storage access —
-/// the agent manages state on their behalf.
+/// Uses the same fetch → load → dispatch → save pattern as accumulate.
+/// The runtime splits invoke input into separate FETCH items:
+///   FETCH 1: `[yield_index:u32 LE][state_bytes]`
+///   FETCH 2+: message bytes
 ///
-/// Input protocol:  `[yield_index:u32 LE][state_len:u32 LE][state_bytes][message_bytes]`
-/// Output protocol: `[status:u8][yield_index:u32 LE][state_len:u32 LE][state_bytes]`
+/// Output: `[status:u8][yield_index:u32 LE][state_len:u32 LE][state_bytes]`
 #[cfg(feature = "pvm")]
-pub fn refine_loop<A: super::Actor>(
-    _needs_init_payload: bool,
-    init: impl FnOnce(Option<&[u8]>) -> A,
-    dispatch: impl Fn(&[u8], &mut A, &mut super::Context<A>) -> RunResult<bool>,
-    save: impl Fn(&A) -> alloc::vec::Vec<u8>,
-    load: impl Fn(&[u8]) -> A,
-) {
-    use vos_abi::pvm::ecall;
+pub fn run_refine<A: super::Actor>() {
+    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
+    use super::context::ServiceId;
 
+    // FETCH 1: state + yield index
     let mut buf = [0u8; BUF_SIZE];
-
-    // Step 1: FETCH input
-    let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
-    if n == 0 || n >= BUF_SIZE as u64 {
+    let n = lifecycle::fetch_raw(&mut buf);
+    if n < 4 {
         halt_with_output(&[STATUS_DONE]);
     }
-    let input = &buf[..n as usize];
 
-    // Step 2: Unpack [yield_index:u32][state_len:u32][state...][message...]
-    if input.len() < 8 {
-        halt_with_output(&[STATUS_DONE]);
-    }
-    let yield_index = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
-    let state_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
-    if input.len() < 8 + state_len {
-        halt_with_output(&[STATUS_DONE]);
-    }
-    let state_bytes = &input[8..8 + state_len];
-    let message = &input[8 + state_len..];
+    let yield_index = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let state = if n > 4 { Some(&buf[4..n]) } else { None };
+    let mut actor = lifecycle::load_or_create::<A>(state);
 
-    // Step 3: Load or construct actor
-    let mut ctx = super::Context::new(super::context::ServiceId(0));
-    let mut actor = if state_len > 0 {
-        load(state_bytes)
-    } else {
-        init(None)
-    };
-
-    // Step 4: Set durable replay state
+    let mut ctx = super::Context::new(ServiceId(0));
     ctx.set_replay_until(yield_index);
-    let initial_state = save(&actor);
+    let initial_state = super::codec::Encode::encode(&actor);
 
-    // Step 5: Dispatch message
-    let yielded = match dispatch(message, &mut actor, &mut ctx) {
-        RunResult::Yielded => true,
-        RunResult::Complete(_) => false,
-    };
-
-    // Step 6: Pack output and halt
-    if yielded && !ctx.should_continue_as_new() {
-        // Yielded: return initial state (for replay) + new yield index
-        let yi = ctx.yield_index().to_le_bytes();
-        let sl = (initial_state.len() as u32).to_le_bytes();
-        let total = 1 + 4 + 4 + initial_state.len();
-        let mut out = alloc::vec![0u8; total];
-        out[0] = STATUS_YIELDED;
-        out[1..5].copy_from_slice(&yi);
-        out[5..9].copy_from_slice(&sl);
-        out[9..].copy_from_slice(&initial_state);
-        halt_with_output(&out);
-    } else {
-        // Complete or continue_as_new: return final mutated state
-        let final_state = save(&actor);
-        let sl = (final_state.len() as u32).to_le_bytes();
-        let total = 1 + 4 + 4 + final_state.len();
-        let mut out = alloc::vec![0u8; total];
-        out[0] = STATUS_DONE;
-        out[1..5].copy_from_slice(&[0; 4]);
-        out[5..9].copy_from_slice(&sl);
-        out[9..].copy_from_slice(&final_state);
-        halt_with_output(&out);
+    // FETCH 2+: messages (same loop as accumulate)
+    loop {
+        let n = lifecycle::fetch_raw(&mut buf);
+        if n == 0 { break; }
+        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
+        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
+            break;
+        }
     }
+
+    // save_state returns (state_bytes, yield_index) — no storage write on refine
+    let (state, yi) = lifecycle::save_state::<A>(&actor, &ctx, &initial_state);
+    let status = lifecycle::exit_status::<A>(&ctx);
+
+    // Pack output: [status:u8][yield_index:u32][state_len:u32][state...]
+    let sl = (state.len() as u32).to_le_bytes();
+    let yi_bytes = yi.to_le_bytes();
+    let mut out = alloc::vec![0u8; 1 + 4 + 4 + state.len()];
+    out[0] = status[0];
+    out[1..5].copy_from_slice(&yi_bytes);
+    out[5..9].copy_from_slice(&sl);
+    out[9..].copy_from_slice(&state);
+    halt_with_output(&out);
 }
 
-/// Derive a code hash from a service ID for invoke() lookup.
-///
-/// Convention: the first 4 bytes are the service ID in LE, rest zeroed.
-/// The vosx runtime recognizes this pattern and looks up the service's blob
-/// by ID instead of by hash.
-#[cfg(feature = "service")]
-fn target_code_hash(service_id: u32) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    hash[..4].copy_from_slice(&service_id.to_le_bytes());
-    hash
-}
+// ── Utilities ───────────────────────────────────────────────────────
 
 /// Build a code hash from a service ID (public, for agent use).
 pub fn service_code_hash(service_id: u32) -> [u8; 32] {

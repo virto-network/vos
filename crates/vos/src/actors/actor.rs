@@ -1,28 +1,57 @@
 use super::Context;
+use super::codec::{Encode, Decode};
+use super::run::RunResult;
 
-/// The core actor trait. An actor is an independent unit of computation
-/// that processes messages sequentially with exclusive access to its state.
-pub trait Actor: Sized {
-    /// Error type for message handlers. Must implement `Debug` so the
-    /// runtime can report failures.
+/// The core actor trait. Defines the full lifecycle of a VOS actor:
+/// construction, message dispatch, and error handling.
+///
+/// Serialization is handled by the `Encode + Decode` supertraits, which
+/// are blanket-implemented for any type with rkyv derives. The `#[actor]`
+/// macro adds these derives automatically.
+///
+/// ## With macros
+///
+/// `#[actor]` generates rkyv derives + `impl Actor` with:
+/// - `type Message` = the `{Name}Msg` enum (from `#[messages]`)
+/// - `create` → calls `Self::new()`
+/// - `dispatch` → forwards to `msg.deliver(self, ctx)`
+///
+/// ## Without macros
+///
+/// Add rkyv derives manually and implement `Actor`:
+///
+/// ```ignore
+/// #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+/// struct MyActor { count: i32 }
+///
+/// impl Actor for MyActor {
+///     type Error = ();
+///     type Message = MyActorMsg;
+///     fn create() -> Self { MyActor { count: 0 } }
+///     fn dispatch(&mut self, msg: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool> {
+///         vos::try_poll(async { msg.deliver(self, ctx).await })
+///     }
+/// }
+/// ```
+pub trait Actor: Sized + Encode + Decode {
+    /// Error type for message handlers.
     type Error: core::fmt::Debug;
 
-    /// Called once when the actor is spawned, before it starts processing
-    /// messages. Use for initialization that needs the actor's context.
-    async fn on_start(&mut self, _ctx: &mut Context<Self>) -> Result<(), Self::Error> {
-        Ok(())
-    }
+    /// The message enum dispatched to this actor.
+    type Message: Decode;
 
-    /// Called when the actor is about to stop. Use for cleanup.
-    async fn on_stop(&mut self) {}
+    /// Create a fresh actor instance with default state.
+    /// Any initialization data should arrive as a regular message.
+    fn create() -> Self;
+
+    /// Dispatch a typed message to the appropriate handler.
+    /// Returns `Complete(true)` to stop, `Complete(false)` to continue, `Yielded` to suspend.
+    fn dispatch(&mut self, msg: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool>;
 
     /// Called when a message handler returns an error. Return `true` to
     /// stop processing remaining messages in this batch, `false` to continue.
-    ///
-    /// Default: prints the error and stops.
     #[allow(unused_variables)]
     fn on_error(&mut self, error: &Self::Error) -> bool {
-        // Use Debug format since we can't assume Display
         #[cfg(feature = "pvm")]
         {
             struct ErrorWriter;
