@@ -81,7 +81,7 @@ impl Animation {
             // Send pixels to display, get delta ticks back
             let delta = ctx.ask(display, &Msg::new("render")
                 .with("pixels", pixels))
-                .await
+                .await.unwrap_or(vos::value::Value::U64(1))
                 .as_u64().unwrap_or(1);
 
             self.elapsed += delta;

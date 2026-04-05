@@ -44,7 +44,7 @@ impl Pipeline {
             let sum = ctx.ask(math, &Msg::new("add")
                 .with("a", base)
                 .with("b", offset))
-                .await
+                .await.unwrap()
                 .as_u64().unwrap();
             println!("pipeline: {} + {} = {}", base, offset, sum);
 
@@ -54,7 +54,7 @@ impl Pipeline {
             let product = ctx.ask(math, &Msg::new("multiply")
                 .with("a", sum)
                 .with("b", factor))
-                .await
+                .await.unwrap()
                 .as_u64().unwrap();
             println!("pipeline: {} * {} = {}", sum, factor, product);
 
