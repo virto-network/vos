@@ -61,16 +61,16 @@ fn greeter_metadata_from_elf() {
 
 #[test]
 fn agent_service_lifecycle() {
-    // The vos-agent is a service (main_loop at PC=5). Verify it inits and halts.
+    // The scheduler agent is a service (accumulate at PC=5). Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../../crates/vos-agent/target/riscv64em-javm/release/vos-agent.elf",
+        "{}/../../agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
         Err(_) => {
-            eprintln!("SKIP: vos-agent not built");
+            eprintln!("SKIP: scheduler agent not built");
             return;
         }
     };
@@ -99,16 +99,16 @@ fn agent_service_lifecycle() {
 
 #[test]
 fn cooperative_loop_with_greeter() {
-    // Full cooperative test: agent invokes greeter.
+    // Full cooperative test: scheduler agent invokes greeter.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../../crates/vos-agent/target/riscv64em-javm/release/vos-agent.elf",
+        "{}/../../agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
         Err(_) => {
-            eprintln!("SKIP: vos-agent not built");
+            eprintln!("SKIP: scheduler agent not built");
             return;
         }
     };
