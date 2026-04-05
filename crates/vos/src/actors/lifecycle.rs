@@ -18,6 +18,10 @@ use alloc::vec::Vec;
 #[cfg(feature = "pvm")]
 pub(crate) const BUF_SIZE: usize = 4096;
 
+/// Well-known storage key for actor constructor arguments.
+/// The host writes rkyv-encoded init args here before first run.
+pub const INIT_KEY: &[u8] = b"__vos_init";
+
 /// Storage key for persisted actor state.
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
@@ -143,6 +147,74 @@ pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
 #[cfg(feature = "service")]
 pub fn emit_status<A: Actor>(ctx: &Context<A>) {
     vos_abi::pvm::hostcalls::yield_output(&exit_status::<A>(ctx));
+}
+
+// ── Storage ───────────────────────────────────────────────────────
+
+/// Read a raw value from per-service storage.
+/// Returns the number of bytes read, or 0 if key not found.
+#[cfg(feature = "service")]
+pub fn read_storage(key: &[u8], buf: &mut [u8]) -> usize {
+    let n = vos_abi::pvm::hostcalls::read(key, buf);
+    if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
+}
+
+/// Read and decode a typed value from per-service storage.
+#[cfg(feature = "service")]
+pub fn load<T: super::codec::Decode>(key: &[u8]) -> Option<T> {
+    let mut buf = [0u8; BUF_SIZE];
+    let n = read_storage(key, &mut buf);
+    if n > 0 { Some(T::decode(&buf[..n])) } else { None }
+}
+
+// ── Invoke ────────────────────────────────────────────────────────
+
+/// Result of invoking a child actor.
+#[cfg(feature = "pvm")]
+pub struct InvokeResult {
+    pub status: u8,
+    pub state: Vec<u8>,
+    pub yield_index: u32,
+}
+
+/// Invoke a child actor via the refine protocol.
+///
+/// Packs the invoke input `[yi:4][state_len:4][state][message]`,
+/// calls the invoke hostcall, and unpacks the output.
+#[cfg(feature = "pvm")]
+pub fn invoke(
+    service_id: u32,
+    message: &[u8],
+    state: &[u8],
+    yield_index: u32,
+) -> InvokeResult {
+    let total = 8 + state.len() + message.len();
+    let mut input = alloc::vec![0u8; total];
+    input[0..4].copy_from_slice(&yield_index.to_le_bytes());
+    input[4..8].copy_from_slice(&(state.len() as u32).to_le_bytes());
+    input[8..8 + state.len()].copy_from_slice(state);
+    input[8 + state.len()..].copy_from_slice(message);
+
+    let hash = super::run::service_code_hash(service_id);
+    let mut output = [0u8; BUF_SIZE];
+    let n = vos_abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
+
+    if n < 9 {
+        return InvokeResult { status: 0, state: Vec::new(), yield_index: 0 };
+    }
+
+    InvokeResult {
+        status: output[0],
+        yield_index: u32::from_le_bytes([output[1], output[2], output[3], output[4]]),
+        state: {
+            let state_len = u32::from_le_bytes([output[5], output[6], output[7], output[8]]) as usize;
+            if state_len > 0 && 9 + state_len <= n {
+                output[9..9 + state_len].to_vec()
+            } else {
+                Vec::new()
+            }
+        },
+    }
 }
 
 // ── Message dispatch ──────────────────────────────────────────────

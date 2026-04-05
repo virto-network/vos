@@ -32,10 +32,11 @@ pub struct MessageMeta {
     pub fields: &'static [FieldMeta],
 }
 
-/// Actor descriptor — actor name and its messages.
+/// Actor descriptor — actor name, messages, and constructor params.
 pub struct ActorMeta {
     pub actor_name: &'static str,
     pub messages: &'static [MessageMeta],
+    pub constructor: &'static [FieldMeta],
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -98,6 +99,30 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         m += 1;
     }
 
+    // constructor fields
+    let [lo, hi] = (meta.constructor.len() as u16).to_le_bytes();
+    buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+
+    let mut c = 0;
+    while c < meta.constructor.len() {
+        let field = &meta.constructor[c];
+        // field name
+        let fn_bytes = field.name.as_bytes();
+        let [lo, hi] = (fn_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        let mut i = 0;
+        while i < fn_bytes.len() { buf[pos + i] = fn_bytes[i]; i += 1; }
+        pos += fn_bytes.len();
+        // field type
+        let ft_bytes = field.ty.as_bytes();
+        let [lo, hi] = (ft_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        let mut i = 0;
+        while i < ft_bytes.len() { buf[pos + i] = ft_bytes[i]; i += 1; }
+        pos += ft_bytes.len();
+        c += 1;
+    }
+
     (buf, pos)
 }
 
@@ -128,6 +153,9 @@ mod tests {
                     ],
                 },
             ],
+            constructor: &[
+                FieldMeta { name: "start", ty: "u32" },
+            ],
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -143,6 +171,9 @@ mod tests {
         assert_eq!(parsed.messages[1].fields.len(), 1);
         assert_eq!(parsed.messages[1].fields[0].name, "verbose");
         assert_eq!(parsed.messages[1].fields[0].ty, "bool");
+        assert_eq!(parsed.constructor.len(), 1);
+        assert_eq!(parsed.constructor[0].name, "start");
+        assert_eq!(parsed.constructor[0].ty, "u32");
     }
 }
 
@@ -172,6 +203,7 @@ mod decode {
     pub struct ParsedMeta {
         pub actor_name: String,
         pub messages: Vec<ParsedMessage>,
+        pub constructor: Vec<ParsedField>,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -196,7 +228,19 @@ mod decode {
             messages.push(ParsedMessage { name, is_query, fields });
         }
 
-        Some(ParsedMeta { actor_name, messages })
+        // Constructor fields (optional — backward compat with old ELFs)
+        let mut constructor = Vec::new();
+        if pos < data.len() {
+            if let Some(ctor_count) = read_u16(data, &mut pos) {
+                for _ in 0..ctor_count as usize {
+                    let fname = read_str(data, &mut pos)?;
+                    let fty = read_str(data, &mut pos)?;
+                    constructor.push(ParsedField { name: fname, ty: fty });
+                }
+            }
+        }
+
+        Some(ParsedMeta { actor_name, messages, constructor })
     }
 
     fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {

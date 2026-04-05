@@ -7,4 +7,4 @@ build:
     cd animation && cargo build --release
 
 run: build
-    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- Kunekt.toml
+    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- Agent.toml

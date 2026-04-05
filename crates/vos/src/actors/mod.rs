@@ -14,6 +14,7 @@
 
 mod actor;
 pub mod codec;
+pub mod init;
 pub mod lifecycle;
 pub mod metadata;
 mod run;

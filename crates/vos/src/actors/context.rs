@@ -83,18 +83,34 @@ impl<A: Actor> Context<A> {
         self.id
     }
 
+    // --- Storage ---
+
+    /// Read and decode a typed value from per-service storage.
+    #[cfg(feature = "service")]
+    pub fn load<T: super::codec::Decode>(&self, key: &[u8]) -> Option<T> {
+        super::lifecycle::load::<T>(key)
+    }
+
     // --- Fire-and-forget messaging ---
 
-    /// Send a message to another service (fire-and-forget). The payload is
-    /// provided as a preimage and a transfer with the hash is queued.
-    ///
-    /// This is the renamed version of the old `send()`.
+    /// Send raw bytes to another service (fire-and-forget).
     pub fn tell(&mut self, target: ServiceId, payload: &[u8]) {
         if self.replaying() { return; }
         self.pending_tells.push(PendingTell {
             target,
             payload: payload.to_vec(),
         });
+    }
+
+    /// Send a typed message to another service (auto-encodes).
+    pub fn send<M: super::codec::Encode>(&mut self, target: ServiceId, msg: &M) {
+        self.tell(target, &msg.encode());
+    }
+
+    /// Send a typed message to self (auto-encodes, self-targets).
+    pub fn send_self<M: super::codec::Encode>(&mut self, msg: &M) {
+        let id = self.id;
+        self.tell(id, &msg.encode());
     }
 
     // --- Synchronous query ---

@@ -10,7 +10,9 @@
 
 use vos::runtime::VosRuntime;
 use vos::metadata;
+use vos::init::{InitArgs, InitValue};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -35,6 +37,8 @@ struct ServiceDef {
     path: Option<PathBuf>,
     #[serde(default = "default_format")]
     format: String,
+    #[serde(default)]
+    init: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +47,8 @@ struct ActorDef {
     path: Option<PathBuf>,
     #[serde(default = "default_format")]
     format: String,
+    #[serde(default)]
+    init: BTreeMap<String, toml::Value>,
 }
 
 fn default_format() -> String { "elf".to_string() }
@@ -97,8 +103,46 @@ fn transpile_elf(data: &[u8], name: &str) -> Vec<u8> {
     }
 }
 
+/// Convert a TOML value to an InitValue using the expected type from metadata.
+fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {
+    let ty = expected_ty.replace(' ', "");
+    match (val, ty.as_str()) {
+        (toml::Value::Integer(n), "u32") => InitValue::U32(*n as u32),
+        (toml::Value::Integer(n), "u64") => InitValue::U64(*n as u64),
+        (toml::Value::Integer(n), "i32") => InitValue::I32(*n as i32),
+        (toml::Value::Boolean(b), "bool") => InitValue::Bool(*b),
+        (toml::Value::String(s), "String") => InitValue::Str(s.clone()),
+        (toml::Value::Array(arr), "Vec<u32>") => {
+            let items: Vec<u32> = arr.iter()
+                .map(|v| v.as_integer().expect("expected integer in array") as u32)
+                .collect();
+            InitValue::ListU32(items)
+        }
+        _ => {
+            eprintln!("error: cannot convert TOML value to {expected_ty}");
+            process::exit(1);
+        }
+    }
+}
+
+fn print_help() {
+    println!("vosx — run VOS actor manifests\n");
+    println!("Usage: vosx [OPTIONS] [MANIFEST]\n");
+    println!("Arguments:");
+    println!("  [MANIFEST]    Path to Kunekt.toml (default: ./Kunekt.toml)\n");
+    println!("Options:");
+    println!("  --list        List actors and their messages without running");
+    println!("  -h, --help    Show this help");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return;
+    }
+
     let list_mode = args.iter().any(|a| a == "--list");
     let manifest_path = args.iter()
         .filter(|a| !a.starts_with('-') && *a != &args[0])
@@ -146,13 +190,25 @@ fn print_actor_meta(name: &str, path: &Path, role: &str) {
     match metadata::from_elf(&data) {
         Some(meta) => {
             println!("  {} ({role}: {})", name, meta.actor_name);
+            if !meta.constructor.is_empty() {
+                let params: Vec<String> = meta.constructor.iter()
+                    .map(|f| {
+                        let ty = f.ty.replace(' ', "");
+                        format!("{}: {ty}", f.name)
+                    })
+                    .collect();
+                println!("    new({})", params.join(", "));
+            }
             for msg in &meta.messages {
                 let kind = if msg.is_query { "query" } else { "cmd" };
                 if msg.fields.is_empty() {
                     println!("    {kind} {}()", msg.name);
                 } else {
                     let params: Vec<String> = msg.fields.iter()
-                        .map(|f| format!("{}: {}", f.name, f.ty))
+                        .map(|f| {
+                            let ty = f.ty.replace(' ', "");
+                            format!("{}: {ty}", f.name)
+                        })
                         .collect();
                     println!("    {kind} {}({})", msg.name, params.join(", "));
                 }
@@ -179,7 +235,7 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
     let agent_data = load_file(&svc_path, &manifest.service.name);
     eprintln!("  loading '{}' from {}", manifest.service.name, svc_path.display());
     let agent_blob = match manifest.service.format.as_str() {
-        "pvm" => agent_data,
+        "pvm" => agent_data.clone(),
         _ => transpile_elf(&agent_data, &manifest.service.name),
     };
     let agent_blob_idx = runtime.register_service_blob(agent_blob);
@@ -194,23 +250,51 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
         let data = load_file(&path, &actor_def.name);
         eprintln!("  loading '{}' from {}", actor_def.name, path.display());
         let blob = match actor_def.format.as_str() {
-            "pvm" => data,
+            "pvm" => data.clone(),
             _ => transpile_elf(&data, &actor_def.name),
         };
         let blob_idx = runtime.register_service_blob(blob);
         let id = runtime.register_service_from_service_blob(blob_idx);
         eprintln!("  registered '{}' as service {id:?}", actor_def.name);
         actor_ids.push(id);
+
+        // Write actor init args from manifest
+        if !actor_def.init.is_empty() {
+            let meta = metadata::from_elf(&data);
+            let mut args = InitArgs::new();
+            for (key, val) in &actor_def.init {
+                let ty = meta.as_ref()
+                    .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
+                    .map(|f| f.ty.as_str())
+                    .unwrap_or("String");
+                args = args.with(key.as_str(), toml_to_init_value(val, ty));
+            }
+            let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+            runtime.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
+        }
     }
 
-    // Step 3: Write actor IDs to the agent's storage for bootstrap discovery.
-    // The agent reads key "__actors" on init: [id_1:u32 LE][id_2:u32 LE]...
+    // Step 3: Build init args for the service.
+    // Convention: auto-inject "children" with registered actor IDs.
     {
-        let mut actors_data = Vec::with_capacity(actor_ids.len() * 4);
-        for &id in &actor_ids {
-            actors_data.extend_from_slice(&id.0.to_le_bytes());
+        let mut args = InitArgs::new();
+
+        // Auto-inject children from [[actors]]
+        let children: Vec<u32> = actor_ids.iter().map(|id| id.0).collect();
+        args = args.with("children", InitValue::ListU32(children));
+
+        // Merge explicit init values from manifest
+        if let Some(meta) = metadata::from_elf(&agent_data) {
+            for field in &meta.constructor {
+                if field.name == "children" { continue; } // already injected
+                if let Some(val) = manifest.service.init.get(&field.name) {
+                    args = args.with(&field.name, toml_to_init_value(val, &field.ty));
+                }
+            }
         }
-        runtime.storage.write(agent_id, b"__actors", &actors_data);
+
+        let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+        runtime.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
     }
 
     // Send an empty transfer to kick-start the agent (triggers first FETCH).

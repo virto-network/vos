@@ -39,6 +39,7 @@ pub mod actors;
 pub use actors::{Actor, Message, Context, PendingAsk, Yield, RunResult, try_poll, metadata};
 pub use actors::{Encode, Decode};
 pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED};
+pub use actors::init;
 pub use actors::lifecycle;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};

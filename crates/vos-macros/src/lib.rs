@@ -108,7 +108,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             type Message = #msg_enum;
 
             fn create() -> Self {
-                Self::new()
+                Self::__vos_create()
             }
 
             fn dispatch(
@@ -164,6 +164,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut is_query_arms = Vec::new();
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
+    let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
 
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
@@ -174,6 +175,22 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let is_msg = method.attrs.iter().any(|a| a.path().is_ident("msg"));
 
         if !is_msg {
+            // Detect constructor and extract its typed parameters
+            if method.sig.ident == "new" {
+                for arg in &method.sig.inputs {
+                    if let FnArg::Typed(pat_type) = arg {
+                        if is_context_type(pat_type.ty.as_ref()) {
+                            continue;
+                        }
+                        if let Pat::Ident(pat) = pat_type.pat.as_ref() {
+                            constructor_params.push((
+                                pat.ident.clone(),
+                                pat_type.ty.as_ref().clone(),
+                            ));
+                        }
+                    }
+                }
+            }
             passthrough_items.push(item.clone());
             continue;
         }
@@ -322,6 +339,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    // Constructor field metadata
+    let ctor_field_metas: Vec<_> = constructor_params.iter().map(|(name, ty)| {
+        let name_str = name.to_string();
+        let ty_str = quote!(#ty).to_string();
+        quote! {
+            vos::metadata::FieldMeta {
+                name: #name_str,
+                ty: #ty_str,
+            }
+        }
+    }).collect();
+
     // Generate the aggregated enum
     let aggregated_enum = quote! {
         #[derive(
@@ -356,19 +385,44 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
+                constructor: &[ #( #ctor_field_metas ),* ],
             };
         }
     };
 
-    // Re-emit the impl block with non-message methods preserved
-    let passthrough_impl = if !passthrough_items.is_empty() {
+    // Generate __vos_create() — reads init args from storage if constructor has params
+    let vos_create = if constructor_params.is_empty() {
         quote! {
-            impl #actor_ty {
-                #( #passthrough_items )*
+            fn __vos_create() -> Self {
+                Self::new()
             }
         }
     } else {
-        quote! {}
+        let extractions: Vec<_> = constructor_params.iter().map(|(name, ty)| {
+            let name_str = name.to_string();
+            let accessor = type_to_accessor(ty);
+            quote! {
+                let #name: #ty = args.#accessor(#name_str)
+                    .expect(concat!("missing init arg '", #name_str, "'"));
+            }
+        }).collect();
+        let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
+        quote! {
+            fn __vos_create() -> Self {
+                let args: vos::init::InitArgs = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
+                    .expect("actor init args not found in storage");
+                #( #extractions )*
+                Self::new(#( #names ),*)
+            }
+        }
+    };
+
+    // Re-emit the impl block with non-message methods + __vos_create
+    let passthrough_impl = quote! {
+        impl #actor_ty {
+            #vos_create
+            #( #passthrough_items )*
+        }
     };
 
     // Entry points and preamble
@@ -450,6 +504,24 @@ fn result_ok_type(ty: &syn::Type) -> Option<syn::Type> {
     match args.args.first()? {
         syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
+    }
+}
+
+/// Map a Rust type to the corresponding `InitArgs` accessor method.
+fn type_to_accessor(ty: &syn::Type) -> proc_macro2::TokenStream {
+    let ty_str = quote!(#ty).to_string().replace(' ', "");
+    match ty_str.as_str() {
+        "u32" => quote! { get_u32 },
+        "u64" => quote! { get_u64 },
+        "i32" => quote! { get_i32 },
+        "bool" => quote! { get_bool },
+        "String" => quote! { get_str },
+        "Vec<u8>" => quote! { get_bytes },
+        "Vec<u32>" => quote! { get_list_u32 },
+        _ => {
+            let msg = format!("unsupported constructor param type for init args: {ty_str}");
+            quote! { compile_error!(#msg) }
+        }
     }
 }
 

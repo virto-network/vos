@@ -79,6 +79,12 @@ fn agent_service_lifecycle() {
     let mut rt = VosRuntime::new();
     let id = register_svc(&mut rt, blob);
 
+    // Write init args (empty children list)
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
+
     // Send empty kick-start transfer
     rt.send_to(id, Vec::new());
     rt.run();
@@ -122,8 +128,11 @@ fn cooperative_loop_with_greeter() {
     let greeter_blob_idx = rt.register_service_blob(greeter_blob);
     let greeter_id = rt.register_service_from_service_blob(greeter_blob_idx);
 
-    // Write actor ID to agent's storage
-    rt.storage.write(agent_id, b"__actors", &greeter_id.0.to_le_bytes());
+    // Write init args (children = [greeter_id])
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![greeter_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     // Kick-start agent
     rt.send_to(agent_id, Vec::new());
