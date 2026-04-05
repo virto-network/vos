@@ -69,15 +69,18 @@ impl Future for Yield {
 /// A future returned by `ctx.ask()`.
 ///
 /// On first invocation: returns `Pending` (triggers ask resolution in `dispatch_one`).
-/// On replay: returns `Ready(Value)` — the reply deserialized from cached bytes.
+/// On replay: returns `Ready(Ok(Value))` or `Ready(Err(InvokeError))`.
 pub struct Ask {
-    /// Raw reply bytes (rkyv-encoded Value). Deserialized lazily in poll().
-    result: Option<alloc::vec::Vec<u8>>,
+    /// Raw reply bytes or error. Deserialized lazily in poll().
+    result: Option<Result<alloc::vec::Vec<u8>, super::value::InvokeError>>,
 }
 
 impl Ask {
     pub fn ready(result: alloc::vec::Vec<u8>) -> Self {
-        Self { result: Some(result) }
+        Self { result: Some(Ok(result)) }
+    }
+    pub fn ready_err(err: super::value::InvokeError) -> Self {
+        Self { result: Some(Err(err)) }
     }
     pub fn pending() -> Self {
         Self { result: None }
@@ -85,17 +88,22 @@ impl Ask {
 }
 
 impl Future for Ask {
-    type Output = super::value::Value;
+    type Output = Result<super::value::Value, super::value::InvokeError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<super::value::Value> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if let Some(bytes) = this.result.take() {
-            let value = if bytes.is_empty() {
-                super::value::Value::Unit
-            } else {
-                <super::value::Value as super::codec::Decode>::decode(&bytes)
-            };
-            Poll::Ready(value)
+        if let Some(result) = this.result.take() {
+            match result {
+                Ok(bytes) => {
+                    let value = if bytes.is_empty() {
+                        super::value::Value::Unit
+                    } else {
+                        <super::value::Value as super::codec::Decode>::decode(&bytes)
+                    };
+                    Poll::Ready(Ok(value))
+                }
+                Err(e) => Poll::Ready(Err(e)),
+            }
         } else {
             Poll::Pending
         }
@@ -167,6 +175,12 @@ fn halt_with_output(_data: &[u8]) -> ! {
 pub const STATUS_DONE: u8 = 0x00;
 /// Exit status: actor handler yielded (wants re-invocation).
 pub const STATUS_YIELDED: u8 = 0x01;
+/// Exit status: child actor panicked during invoke.
+pub const STATUS_PANICKED: u8 = 0x02;
+/// Exit status: target service not found during invoke.
+pub const STATUS_NOT_FOUND: u8 = 0x03;
+/// Exit status: child actor ran out of gas during invoke.
+pub const STATUS_OOG: u8 = 0x04;
 
 // ── Accumulate phase (service actors) ─────────────────────────────────
 

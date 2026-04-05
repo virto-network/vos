@@ -8,6 +8,30 @@
 
 use alloc::{string::String, vec::Vec};
 
+/// Error returned when an `ask()` invocation fails.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InvokeError {
+    /// The target actor panicked.
+    Panicked,
+    /// The target service was not found.
+    NotFound,
+    /// The target ran out of gas.
+    OutOfGas,
+    /// Unknown error status byte from the wire.
+    Unknown(u8),
+}
+
+impl core::fmt::Display for InvokeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            InvokeError::Panicked => write!(f, "invoke: child panicked"),
+            InvokeError::NotFound => write!(f, "invoke: service not found"),
+            InvokeError::OutOfGas => write!(f, "invoke: out of gas"),
+            InvokeError::Unknown(s) => write!(f, "invoke: unknown error (0x{s:02x})"),
+        }
+    }
+}
+
 /// A dynamically-typed value.
 ///
 /// Flat by design — no recursive nesting. Covers the types expressible

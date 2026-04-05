@@ -350,7 +350,9 @@ fn handle_invoke(
     transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
 ) -> u64 {
     if depth >= MAX_INVOKE_DEPTH {
-        return error::HOST_WHAT;
+        let output_ptr = caller.registers[11] as u32;
+        pvm_write(caller, output_ptr, &[crate::actors::run::STATUS_OOG]);
+        return 1;
     }
 
     let hash_ptr = caller.registers[7] as u32;
@@ -368,19 +370,28 @@ fn handle_invoke(
         ServiceId(0)
     };
 
+    use crate::actors::run::{STATUS_NOT_FOUND, STATUS_PANICKED, STATUS_OOG};
+
     let blob_idx = if let Some(&idx) = blob_by_hash.get(&code_hash) {
         idx
     } else if target_svc_id.0 != 0 {
         match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
-            None => return error::HOST_NONE,
+            None => {
+                pvm_write(caller, output_ptr, &[STATUS_NOT_FOUND]);
+                return 1;
+            }
         }
     } else {
-        return error::HOST_NONE;
+        pvm_write(caller, output_ptr, &[STATUS_NOT_FOUND]);
+        return 1;
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
-        None => return error::HOST_NONE,
+        None => {
+            pvm_write(caller, output_ptr, &[STATUS_NOT_FOUND]);
+            return 1;
+        }
     };
 
     let input = pvm_read(caller, input_ptr, input_len);
@@ -388,7 +399,10 @@ fn handle_invoke(
     let gas = if gas_limit == 0 { DEFAULT_GAS } else { gas_limit.min(DEFAULT_GAS) };
     let mut child = match initialize_program(blob, &[], gas) {
         Some(p) => p,
-        None => return error::HOST_WHAT,
+        None => {
+            pvm_write(caller, output_ptr, &[STATUS_PANICKED]);
+            return 1;
+        }
     };
 
     // Split invoke input [state_len:4][state][msg] into separate FETCH items:
@@ -414,10 +428,17 @@ fn handle_invoke(
             ExitReason::Halt => break,
             ExitReason::Panic => {
                 eprintln!("vosx: child {} panicked at pc={:#x}", target_svc_id.0, child.pc);
-                return error::HOST_WHAT;
+                pvm_write(caller, output_ptr, &[STATUS_PANICKED]);
+                return 1;
             }
-            ExitReason::OutOfGas => return error::HOST_WHAT,
-            ExitReason::PageFault(_) => return error::HOST_WHAT,
+            ExitReason::OutOfGas => {
+                pvm_write(caller, output_ptr, &[STATUS_OOG]);
+                return 1;
+            }
+            ExitReason::PageFault(_) => {
+                pvm_write(caller, output_ptr, &[STATUS_PANICKED]);
+                return 1;
+            }
             ExitReason::HostCall(call_id) => {
                 if handle_base_hostcall(&mut child, call_id, &mut child_items) {
                     continue;

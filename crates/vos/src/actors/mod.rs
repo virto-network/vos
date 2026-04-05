@@ -24,7 +24,8 @@ pub use actor::{Actor, Message};
 pub use codec::{Encode, Decode};
 pub mod context;
 pub use context::Context;
-pub use run::{Yield, Ask, RunResult, try_poll, service_code_hash, STATUS_DONE, STATUS_YIELDED};
+pub use run::{Yield, Ask, RunResult, try_poll, service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
+pub use value::InvokeError;
 #[cfg(feature = "service")]
 pub use run::run_accumulate;
 #[cfg(feature = "pvm")]

@@ -22,7 +22,7 @@ pub struct Context<A: Actor> {
 
     // Ask resolution state
     call_index: usize,
-    call_results: Vec<Vec<u8>>,
+    call_results: Vec<Result<Vec<u8>, super::value::InvokeError>>,
     pending_ask: Option<PendingAsk>,
     re_dispatching: bool,
 
@@ -71,7 +71,7 @@ impl<A: Actor> Context<A> {
     }
 
     /// Create a context with cached call results from a previous invocation (replay).
-    pub fn with_call_results(id: ServiceId, call_results: Vec<Vec<u8>>) -> Self {
+    pub fn with_call_results(id: ServiceId, call_results: Vec<Result<Vec<u8>, super::value::InvokeError>>) -> Self {
         Self {
             call_results,
             ..Self::new(id)
@@ -152,7 +152,10 @@ impl<A: Actor> Context<A> {
                 #[cfg(feature = "pvm")]
                 super::run::set_suppressing_io(false);
             }
-            super::run::Ask::ready(result)
+            match result {
+                Ok(bytes) => super::run::Ask::ready(bytes),
+                Err(e) => super::run::Ask::ready_err(e),
+            }
         } else {
             self.pending_ask = Some(PendingAsk {
                 target,
@@ -254,15 +257,21 @@ impl<A: Actor> Context<A> {
     }
 
     /// Get a reference to the cached call results.
-    pub fn call_results(&self) -> &[Vec<u8>] {
+    pub fn call_results(&self) -> &[Result<Vec<u8>, super::value::InvokeError>] {
         &self.call_results
     }
 
-    /// Push a new call result (from a resolved ask) and reset for replay.
-    ///
-    /// After resolving an ask via invoke(), the framework pushes the result
-    /// and resets the call_index so the handler can be replayed from the start.
-    pub fn push_call_result_and_reset(&mut self, result: Vec<u8>) {
+    /// Push a successful call result and reset for replay.
+    pub fn push_call_result_ok(&mut self, result: Vec<u8>) {
+        self.push_call_result_inner(Ok(result));
+    }
+
+    /// Push a failed call result and reset for replay.
+    pub fn push_call_result_err(&mut self, err: super::value::InvokeError) {
+        self.push_call_result_inner(Err(err));
+    }
+
+    fn push_call_result_inner(&mut self, result: Result<Vec<u8>, super::value::InvokeError>) {
         self.call_results.push(result);
         self.call_index = 0;
         self.pending_ask = None;

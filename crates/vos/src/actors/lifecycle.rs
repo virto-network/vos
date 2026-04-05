@@ -157,18 +157,44 @@ pub fn load<T: super::codec::Decode>(key: &[u8]) -> Option<T> {
 
 /// Result of invoking a child actor.
 #[cfg(feature = "pvm")]
-pub struct InvokeResult {
-    pub status: u8,
-    pub state: Vec<u8>,
-    pub reply: Vec<u8>,
+pub enum InvokeResult {
+    /// Actor completed normally.
+    Done { state: Vec<u8>, reply: Vec<u8> },
+    /// Actor yielded (wants re-invocation).
+    Yielded { state: Vec<u8>, reply: Vec<u8> },
+    /// Actor panicked.
+    Panicked,
+    /// Target service not found.
+    NotFound,
+    /// Actor ran out of gas.
+    OutOfGas,
+    /// Unknown error status byte.
+    Error(u8),
 }
 
-/// Invoke a child actor via the refine protocol.
+/// Invoke a child actor with a dynamic message.
+///
+/// Encodes the `Msg` with the wire tag and delegates to `invoke_raw`.
+/// This is the preferred API for agents — no need to handle TAG_DYNAMIC manually.
+#[cfg(feature = "pvm")]
+pub fn invoke(
+    service_id: u32,
+    message: &super::value::Msg,
+    state: &[u8],
+) -> InvokeResult {
+    let encoded = super::codec::Encode::encode(message);
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(super::value::TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    invoke_raw(service_id, &payload, state)
+}
+
+/// Invoke a child actor with pre-encoded message bytes.
 ///
 /// Packs the invoke input `[state_len:4][state][message]`,
 /// calls the invoke hostcall, and unpacks the output.
 #[cfg(feature = "pvm")]
-pub fn invoke(
+pub fn invoke_raw(
     service_id: u32,
     message: &[u8],
     state: &[u8],
@@ -183,24 +209,42 @@ pub fn invoke(
     let mut output = [0u8; BUF_SIZE];
     let n = vos_abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
+    use super::run::{STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
+
+    // Short output = error status byte only (no state/reply envelope)
     if n < 5 {
-        return InvokeResult { status: 0, state: Vec::new(), reply: Vec::new() };
+        if n >= 1 {
+            return match output[0] {
+                STATUS_PANICKED => InvokeResult::Panicked,
+                STATUS_NOT_FOUND => InvokeResult::NotFound,
+                STATUS_OOG => InvokeResult::OutOfGas,
+                STATUS_DONE => InvokeResult::Done { state: Vec::new(), reply: Vec::new() },
+                STATUS_YIELDED => InvokeResult::Yielded { state: Vec::new(), reply: Vec::new() },
+                other => InvokeResult::Error(other),
+            };
+        }
+        return InvokeResult::Done { state: Vec::new(), reply: Vec::new() };
     }
 
     let state_len = u32::from_le_bytes([output[1], output[2], output[3], output[4]]) as usize;
     let state_end = (5 + state_len).min(n);
-    InvokeResult {
-        status: output[0],
-        state: if state_len > 0 && state_end <= n {
-            output[5..state_end].to_vec()
-        } else {
-            Vec::new()
-        },
-        reply: if state_end < n {
-            output[state_end..n].to_vec()
-        } else {
-            Vec::new()
-        },
+    let state = if state_len > 0 && state_end <= n {
+        output[5..state_end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let reply = if state_end < n {
+        output[state_end..n].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    match output[0] {
+        STATUS_YIELDED => InvokeResult::Yielded { state, reply },
+        STATUS_PANICKED => InvokeResult::Panicked,
+        STATUS_NOT_FOUND => InvokeResult::NotFound,
+        STATUS_OOG => InvokeResult::OutOfGas,
+        _ => InvokeResult::Done { state, reply },
     }
 }
 
@@ -244,8 +288,23 @@ pub fn dispatch_one<A: Actor>(
             RunResult::Yielded => {
                 // Check if this yield was caused by an ask() suspension
                 if let Some(pending) = ctx.take_pending_ask() {
-                    let r = invoke(pending.target.0, &pending.payload, &[]);
-                    ctx.push_call_result_and_reset(r.reply);
+                    match invoke_raw(pending.target.0, &pending.payload, &[]) {
+                        InvokeResult::Done { reply, .. } | InvokeResult::Yielded { reply, .. } => {
+                            ctx.push_call_result_ok(reply);
+                        }
+                        InvokeResult::Panicked => {
+                            ctx.push_call_result_err(super::value::InvokeError::Panicked);
+                        }
+                        InvokeResult::NotFound => {
+                            ctx.push_call_result_err(super::value::InvokeError::NotFound);
+                        }
+                        InvokeResult::OutOfGas => {
+                            ctx.push_call_result_err(super::value::InvokeError::OutOfGas);
+                        }
+                        InvokeResult::Error(s) => {
+                            ctx.push_call_result_err(super::value::InvokeError::Unknown(s));
+                        }
+                    }
                     // Restore actor state to pre-dispatch snapshot
                     *actor = A::decode(&snapshot);
                     continue; // replay handler with cached result
