@@ -1,13 +1,16 @@
 build:
-    cd ../agents/scheduler && cargo build --release
-    cd greeter && cargo build --release
-    cd counter && cargo build --release
-    cd fizzbuzz && cargo build --release
-    cd hasher && cargo build --release
-    cd display && cargo build --release
-    cd animation && cargo build --release
-    cd math && cargo build --release
-    cd pipeline && cargo build --release
+    cd agents/scheduler && cargo build --release
+    cd actors/greeter && cargo build --release
+    cd actors/counter && cargo build --release
+    cd actors/fizzbuzz && cargo build --release
+    cd actors/hasher && cargo build --release
+    cd actors/display && cargo build --release
+    cd actors/animation && cargo build --release
+    cd actors/math && cargo build --release
+    cd actors/pipeline && cargo build --release
 
 run: build
     cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- Agent.toml
+
+list: build
+    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- --list Agent.toml

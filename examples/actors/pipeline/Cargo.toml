@@ -1,12 +1,12 @@
 [workspace]
 
 [package]
-name = "fizzbuzz"
+name = "pipeline"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-vos = { path = "../../crates/vos", default-features = false, features = ["macros", "pvm"] }
+vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "pvm"] }
 
 [profile.release]
 opt-level = "s"

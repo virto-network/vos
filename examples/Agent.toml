@@ -3,36 +3,36 @@ name = "examples"
 
 [service]
 name = "scheduler"
-path = "../agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
+path = "agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
 
 [[actors]]
 name = "greeter"
-path = "greeter/target/riscv64em-javm/release/greeter.elf"
+path = "actors/greeter/target/riscv64em-javm/release/greeter.elf"
 
 [[actors]]
 name = "counter"
-path = "counter/target/riscv64em-javm/release/counter.elf"
+path = "actors/counter/target/riscv64em-javm/release/counter.elf"
 
 [[actors]]
 name = "fizzbuzz"
-path = "fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf"
+path = "actors/fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf"
 
 [[actors]]
 name = "hasher"
-path = "hasher/target/riscv64em-javm/release/hasher.elf"
+path = "actors/hasher/target/riscv64em-javm/release/hasher.elf"
 
 [[actors]]
 name = "display"
-path = "display/target/riscv64em-javm/release/display.elf"
+path = "actors/display/target/riscv64em-javm/release/display.elf"
 
 [[actors]]
 name = "animation"
-path = "animation/target/riscv64em-javm/release/animation.elf"
+path = "actors/animation/target/riscv64em-javm/release/animation.elf"
 
 [[actors]]
 name = "math"
-path = "math/target/riscv64em-javm/release/math.elf"
+path = "actors/math/target/riscv64em-javm/release/math.elf"
 
 [[actors]]
 name = "pipeline"
-path = "pipeline/target/riscv64em-javm/release/pipeline.elf"
+path = "actors/pipeline/target/riscv64em-javm/release/pipeline.elf"

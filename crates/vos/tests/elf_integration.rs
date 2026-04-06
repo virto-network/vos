@@ -9,7 +9,7 @@ use vos::runtime::VosRuntime;
 fn example_elf(name: &str) -> Vec<u8> {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../../examples/{name}/target/riscv64em-javm/release/{name}.elf",
+        "{}/../../examples/actors/{name}/target/riscv64em-javm/release/{name}.elf",
         workspace
     );
     match std::fs::read(&path) {
@@ -64,7 +64,7 @@ fn agent_service_lifecycle() {
     // The scheduler agent is a service (accumulate at PC=5). Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../../agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -102,7 +102,7 @@ fn cooperative_loop_with_greeter() {
     // Full cooperative test: scheduler agent invokes greeter.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../../agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {

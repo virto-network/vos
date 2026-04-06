@@ -4,8 +4,8 @@ members = [
     "crates/*",
 ]
 exclude = [
-    "agents/*",
-    "examples/*",
+    "examples/agents/*",
+    "examples/actors/*",
 ]
 
 [workspace.package]
