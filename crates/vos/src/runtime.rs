@@ -3,30 +3,40 @@
 //! Manages PVM instances per service, handles hostcalls, routes transfers
 //! between services across rounds.
 //!
-//! ## Execution model (JAR-aligned)
+//! ## Execution model (JAM-aligned)
 //!
-//! Top-level services (agents) run at PC=0 (refine entry). Refine is the hot
-//! loop: cheap, sandboxed, and where handler logic, child `INVOKE`, and
-//! intra-round message exchange happen. Side-effecting hostcalls — `WRITE`,
-//! `TRANSFER`, `PROVIDE` — are *staged* into a per-service `RefineJournal`
-//! rather than applied immediately. `READ` during refine overlays the
-//! journal so a handler sees its own writes within the round.
+//! Each `tick()` runs each service with pending input through a real
+//! two-stage cycle:
 //!
-//! A `TRANSFER` to the running service is interpreted as "re-enter refine
-//! with this new message in the same round" and queued into
-//! `journal.self_messages`. This turns the scheduler's `send_self(Tick)`
-//! loop into a cheap intra-round re-entry rather than a full tick round-trip.
+//! 1. **Refine** (PC=0). Pure: the guest reads persisted state via the
+//!    read-only `READ` hostcall, dispatches the messages it FETCHes from
+//!    the runtime, may `INVOKE` child actors, and halts with a
+//!    `RefinePayload` blob (state + reply + staged effects) returned via
+//!    `a0`/`a1`. State-mutating hostcalls (`WRITE`, `TRANSFER`,
+//!    `PROVIDE`, `NEW`, `CHECKPOINT`) are **forbidden** at this stage —
+//!    `handle_refine_hostcall` returns `HOST_WHAT` so a misbuilt guest
+//!    fails the same way it would on a JAM core.
 //!
-//! At the end of a refine round (no more self-messages, or iteration cap
-//! hit) the runtime **commits the journal** directly: writes go into
-//! storage, preimages into the preimage map, cross-service transfers into
-//! `pending_transfers` for the next `tick()`. The runtime does NOT currently
-//! re-enter the PVM at PC=5 — accumulate is a runtime-side replay of the
-//! journal, equivalent to a trivial accumulate body. A future change can
-//! reintroduce a real PC=5 entry when services need to compute summaries.
+//! 2. **Accumulate** (PC=5). The only stage that mutates state. The
+//!    runtime hands the refine output back to a fresh PVM instance as a
+//!    single FETCH item; the guest's `run_accumulate_service` decodes
+//!    the `RefinePayload` and replays each effect via the corresponding
+//!    accumulate-phase hostcall. `INVOKE` is **forbidden** here:
+//!    accumulate is commit-only, mirroring on-chain behaviour.
 //!
-//! Guest actors invoked via `INVOKE` still run at PC=0 with only refine-phase
-//! hostcalls; their state is returned in the reply envelope (not storage).
+//! Per-stage gas budgets come from [`GasConfig`] on the runtime.
+//! Cross-service `TRANSFER`s issued during accumulate are appended to
+//! `pending_transfers` for the next `tick()`.
+//!
+//! Guest actors invoked via `INVOKE` from a refining service still run
+//! at PC=0 under the same refine-phase policy; their state is returned
+//! in the reply envelope (not storage), so they never need accumulate.
+//!
+//! Hand-rolled single-entry test fixtures (registered with
+//! `register_service` rather than `register_service_from_service_blob`)
+//! bypass the refine→accumulate split entirely and run through a legacy
+//! one-PVM compat path with the union of both hostcall tables. See
+//! [`run_legacy_stage`].
 
 use javm::program::{initialize_program, initialize_program_at};
 use javm::{ExitReason, Gas, Pvm};
@@ -38,6 +48,44 @@ use std::io::Write;
 
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
+
+/// Per-stage gas budgets for one service tick.
+///
+/// JAM splits gas accounting across stages: refine has its own budget
+/// (validators run it on a small assigned subset of cores), while
+/// accumulate runs once per block and is bounded by `accumulate_gas`,
+/// which on-chain is set per-service in the manifest. We mirror that
+/// here so off-chain runs can later be tightened to match what the
+/// manifest declares.
+#[derive(Debug, Clone, Copy)]
+pub struct GasConfig {
+    /// Maximum gas a single refine invocation may burn.
+    pub refine_gas: Gas,
+    /// Maximum gas a single accumulate invocation may burn. On-chain
+    /// the manifest can override this per-service; we clamp to this
+    /// host maximum so a misconfigured service can't run forever.
+    pub accumulate_gas_max: Gas,
+    /// Default accumulate gas to use when a service has no manifest
+    /// override. Always `<= accumulate_gas_max`.
+    pub accumulate_gas_default: Gas,
+}
+
+impl GasConfig {
+    /// Clamp a requested accumulate gas to `accumulate_gas_max`.
+    pub fn clamp_accumulate(&self, requested: Gas) -> Gas {
+        requested.min(self.accumulate_gas_max)
+    }
+}
+
+impl Default for GasConfig {
+    fn default() -> Self {
+        Self {
+            refine_gas: DEFAULT_GAS,
+            accumulate_gas_max: DEFAULT_GAS,
+            accumulate_gas_default: DEFAULT_GAS,
+        }
+    }
+}
 
 // --- PVM memory helpers ---
 
@@ -355,10 +403,16 @@ pub struct VosRuntime {
     pub storage: ServiceStorage,
     preimages: HashMap<[u8; 32], Vec<u8>>,
     pending_transfers: Vec<(ServiceId, Vec<u8>)>,
+    gas: GasConfig,
 }
 
 impl VosRuntime {
     pub fn new() -> Self {
+        Self::with_gas_config(GasConfig::default())
+    }
+
+    /// Create a runtime with explicit per-stage gas budgets.
+    pub fn with_gas_config(gas: GasConfig) -> Self {
         Self {
             blobs: Vec::new(),
             blob_by_hash: HashMap::new(),
@@ -367,7 +421,13 @@ impl VosRuntime {
             storage: ServiceStorage::new(),
             preimages: HashMap::new(),
             pending_transfers: Vec::new(),
+            gas,
         }
+    }
+
+    /// Get the current gas configuration.
+    pub fn gas_config(&self) -> &GasConfig {
+        &self.gas
     }
 
     /// Register a PVM blob. Returns a blob index.
@@ -443,6 +503,8 @@ impl VosRuntime {
         let services = &self.services;
         let storage = &mut self.storage;
         let preimages = &mut self.preimages;
+        let refine_gas = self.gas.refine_gas;
+        let accumulate_gas = self.gas.clamp_accumulate(self.gas.accumulate_gas_default);
 
         for (svc_id, items) in by_service {
             let info = match services.get(&svc_id) {
@@ -459,7 +521,7 @@ impl VosRuntime {
             if info.is_service_blob {
                 // ── Stage 1: refine (PC=0) ────────────────────────────
                 let mut refine_items = items;
-                let mut refine_pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+                let mut refine_pvm = match initialize_program(blob, &[], refine_gas) {
                     Some(p) => p,
                     None => {
                         eprintln!("vosx: failed to init refine PVM for service {svc_id}");
@@ -484,7 +546,7 @@ impl VosRuntime {
                 // The guest decodes the refine payload as a single FETCH
                 // item and replays each effect via real hostcalls.
                 let mut acc_items: Vec<Vec<u8>> = vec![refine_output];
-                let mut acc_pvm = match initialize_program_at(blob, &[], DEFAULT_GAS, 5) {
+                let mut acc_pvm = match initialize_program_at(blob, &[], accumulate_gas, 5) {
                     Some(p) => p,
                     None => {
                         eprintln!("vosx: failed to init accumulate PVM for service {svc_id}");
@@ -506,7 +568,7 @@ impl VosRuntime {
                 // Run a single PVM at PC=0 with the full accumulate
                 // hostcall table so it can WRITE / TRANSFER directly.
                 let mut single_items = items;
-                let mut pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+                let mut pvm = match initialize_program(blob, &[], refine_gas) {
                     Some(p) => p,
                     None => {
                         eprintln!("vosx: failed to init PVM for service {svc_id}");
@@ -858,4 +920,44 @@ fn simple_hash(data: &[u8]) -> [u8; 32] {
         h[i % 32] ^= byte.wrapping_add(i as u8);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gas_config_default_is_balanced() {
+        let g = GasConfig::default();
+        assert_eq!(g.refine_gas, DEFAULT_GAS);
+        assert_eq!(g.accumulate_gas_default, DEFAULT_GAS);
+        assert_eq!(g.accumulate_gas_max, DEFAULT_GAS);
+        assert!(g.accumulate_gas_default <= g.accumulate_gas_max);
+    }
+
+    #[test]
+    fn gas_config_clamps_accumulate() {
+        let g = GasConfig {
+            refine_gas: 1_000,
+            accumulate_gas_max: 500,
+            accumulate_gas_default: 200,
+        };
+        assert_eq!(g.clamp_accumulate(200), 200);
+        assert_eq!(g.clamp_accumulate(500), 500);
+        assert_eq!(g.clamp_accumulate(10_000), 500);
+    }
+
+    #[test]
+    fn runtime_with_gas_config_uses_overrides() {
+        let g = GasConfig {
+            refine_gas: 12_345,
+            accumulate_gas_max: 6_789,
+            accumulate_gas_default: 4_321,
+        };
+        let rt = VosRuntime::with_gas_config(g);
+        let cfg = rt.gas_config();
+        assert_eq!(cfg.refine_gas, 12_345);
+        assert_eq!(cfg.accumulate_gas_max, 6_789);
+        assert_eq!(cfg.accumulate_gas_default, 4_321);
+    }
 }

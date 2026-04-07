@@ -1,9 +1,29 @@
 //! Cooperative single-threaded executor for VOS actor programs.
 //!
-//! Two-phase JAM lifecycle:
-//! - **Refine (PC=0)**: Dispatch message, handle yields/asks, produce output.
-//! - **Accumulate (PC=5)**: Service-only. Load state from storage, dispatch
-//!   messages, persist state. Uses lifecycle building blocks.
+//! ## JAM lifecycle entry points
+//!
+//! Services built with the actor framework expose two distinct entries
+//! that map onto the JAM refine→accumulate split:
+//!
+//! - [`run_refine_service`] (`_start`, PC=0): the **pure** refine body.
+//!   Reads persisted state via the read-only `READ` hostcall, dispatches
+//!   incoming FETCH messages, may issue child `INVOKE`s, and halts with
+//!   a [`crate::refine_payload::RefinePayload`] blob in `a0`/`a1`.
+//!   Side-effecting hostcalls are *forbidden* at this stage — the
+//!   framework's `Context` honours an internal refine-mode flag and
+//!   buffers `WRITE`/`TRANSFER`/`PROVIDE`/`NEW` into the payload's
+//!   effects list instead of issuing them.
+//!
+//! - [`run_accumulate_service`] (`accumulate`, PC=5): the **commit**
+//!   body. The host hands the refine payload back as a single FETCH
+//!   item; this function decodes it and replays each effect via the
+//!   real accumulate-phase hostcall. `INVOKE` is unavailable here —
+//!   accumulate is structurally a state-mutating commit pass.
+//!
+//! Invoked actors (no `service` feature) use [`run_refine`] instead:
+//! one PVM at PC=0 with state delivered as the first FETCH item and the
+//! resulting state returned in the reply envelope rather than written
+//! to storage.
 
 use core::future::Future;
 use core::pin::Pin;
