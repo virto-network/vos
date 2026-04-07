@@ -12,10 +12,11 @@
 //! to both the guest framework (encoding) and the host runtime (parsing,
 //! when needed for tests or tracing).
 //!
-//! ## Wire layout (version 1)
+//! ## Wire layout (version 2)
 //!
 //! ```text
-//! [version: u8 = 0x01]
+//! [version: u8 = 0x02]
+//! [flags: u8]              // bit 0 = continue_next
 //! [state_len: u32 LE][state_bytes]
 //! [reply_len:  u32 LE][reply_bytes]
 //! [effects_count: u16 LE]
@@ -24,6 +25,10 @@
 //!     [payload_len: u32 LE]
 //!     [payload_bytes]
 //! ```
+//!
+//! `continue_next` is set by the guest framework when a handler called
+//! `ctx.yield_now()` or `ctx.sleep(_)` — the host re-queues the service
+//! for the next tick so the actor can make progress.
 //!
 //! ## Effect tags
 //!
@@ -37,7 +42,10 @@
 
 use alloc::vec::Vec;
 
-pub const REFINE_PAYLOAD_VERSION: u8 = 0x01;
+pub const REFINE_PAYLOAD_VERSION: u8 = 0x02;
+
+/// Flag bit: guest yielded; host should re-queue this service next tick.
+pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
 
 pub const EFFECT_WRITE: u8 = 0x01;
 pub const EFFECT_TRANSFER: u8 = 0x02;
@@ -59,6 +67,8 @@ pub struct RefinePayload {
     pub state: Vec<u8>,
     pub reply: Vec<u8>,
     pub effects: Vec<Effect>,
+    /// Guest requested to be re-scheduled next tick (yield_now / sleep).
+    pub continue_next: bool,
 }
 
 impl RefinePayload {
@@ -70,6 +80,9 @@ impl RefinePayload {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(REFINE_PAYLOAD_VERSION);
+        let mut flags: u8 = 0;
+        if self.continue_next { flags |= FLAG_CONTINUE_NEXT; }
+        out.push(flags);
         push_u32(&mut out, self.state.len() as u32);
         out.extend_from_slice(&self.state);
         push_u32(&mut out, self.reply.len() as u32);
@@ -88,6 +101,8 @@ impl RefinePayload {
         if version != REFINE_PAYLOAD_VERSION {
             return None;
         }
+        let flags = c.read_u8()?;
+        let continue_next = flags & FLAG_CONTINUE_NEXT != 0;
         let state_len = c.read_u32()? as usize;
         let state = c.read_bytes(state_len)?.to_vec();
         let reply_len = c.read_u32()? as usize;
@@ -97,7 +112,7 @@ impl RefinePayload {
         for _ in 0..effects_count {
             effects.push(decode_effect(&mut c)?);
         }
-        Some(RefinePayload { state, reply, effects })
+        Some(RefinePayload { state, reply, effects, continue_next })
     }
 }
 
@@ -234,6 +249,7 @@ mod tests {
             state: vec![1, 2, 3, 4],
             reply: vec![0xAA, 0xBB],
             effects: vec![],
+            continue_next: true,
         };
         let bytes = p.encode();
         let decoded = RefinePayload::decode(&bytes).unwrap();
@@ -251,6 +267,7 @@ mod tests {
                 Effect::Provide { hash: [9; 32], data: vec![0xFF, 0xEE] },
                 Effect::New { code_hash: [7; 32] },
             ],
+            continue_next: false,
         };
         let bytes = p.encode();
         let decoded = RefinePayload::decode(&bytes).unwrap();
@@ -270,6 +287,7 @@ mod tests {
             state: vec![1, 2, 3],
             reply: vec![],
             effects: vec![],
+            continue_next: false,
         }
         .encode();
         // Lop off the last state byte

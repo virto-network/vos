@@ -542,6 +542,14 @@ impl VosRuntime {
                     None => continue, // panic / OOG already logged
                 };
 
+                // Peek at the continue_next flag so we can re-queue the
+                // service after accumulate commits. We decode the
+                // payload here just for that bit; the accumulate guest
+                // re-decodes the same bytes for the effect replay.
+                let continue_next = crate::refine_payload::RefinePayload::decode(&refine_output)
+                    .map(|p| p.continue_next)
+                    .unwrap_or(false);
+
                 // ── Stage 2: accumulate (PC=5) ────────────────────────
                 // The guest decodes the refine payload as a single FETCH
                 // item and replays each effect via real hostcalls.
@@ -562,6 +570,14 @@ impl VosRuntime {
                     preimages,
                     &mut new_transfers,
                 );
+
+                // If the guest yielded mid-round, re-queue an empty
+                // wakeup so it runs again next tick. State has been
+                // committed via STATE_KEY in accumulate, so the next
+                // refine will load it back via READ.
+                if continue_next {
+                    new_transfers.push((ServiceId(svc_id), Vec::new()));
+                }
             } else {
                 // Legacy single-entry blob (hand-rolled test fixtures and
                 // such): no refine/accumulate split, no RefinePayload.

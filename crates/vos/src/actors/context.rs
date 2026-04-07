@@ -287,6 +287,6 @@ impl<A: Actor> Context<A> {
         for code_hash in self.pending_spawns.drain(..) {
             effects.push(Effect::New { code_hash });
         }
-        RefinePayload { state, reply, effects }
+        RefinePayload { state, reply, effects, continue_next: self.self_schedule }
     }
 }
