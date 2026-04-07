@@ -60,6 +60,9 @@ use vos_abi::service::ServiceId;
 use std::collections::HashMap;
 use std::io::Write;
 
+use crate::data_layer::{DataLayer, MemoryDataLayer};
+use crate::pvm_image;
+
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
 /// Hard cap on how many refine→accumulate iterations a single service
@@ -384,13 +387,14 @@ fn handle_accumulate_hostcall(
 // --- Per-service storage ---
 
 /// Per-service key-value storage.
+#[derive(Default)]
 pub struct ServiceStorage {
     data: HashMap<(u32, Vec<u8>), Vec<u8>>,
 }
 
 impl ServiceStorage {
     fn new() -> Self {
-        Self { data: HashMap::new() }
+        Self::default()
     }
 
     pub fn read(&self, service: ServiceId, key: &[u8]) -> Option<&[u8]> {
@@ -416,7 +420,7 @@ struct ServiceInfo {
 /// 2. Run to halt, handling hostcalls inline
 /// 3. Collect outgoing transfers → next round
 /// 4. Repeat until no new work
-pub struct VosRuntime {
+pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
     blob_by_hash: HashMap<[u8; 32], usize>,
     services: HashMap<u32, ServiceInfo>,
@@ -425,37 +429,52 @@ pub struct VosRuntime {
     preimages: HashMap<[u8; 32], Vec<u8>>,
     pending_transfers: Vec<(ServiceId, Vec<u8>)>,
     gas: GasConfig,
-    /// Suspended refine PVMs — the **DA simulation**.
+    /// Pluggable continuation store — the **data layer**.
     ///
     /// VOS follows a CoreVM-style model on top of JAM: each service's
     /// canonical state is its full PVM image (flat_mem + registers +
     /// heap), not a serialized actor under a magic storage key. When a
-    /// service yields with `continue_next`, we capture that image here
-    /// so the next tick can resume from it.
+    /// service yields with `continue_next`, we capture that image via
+    /// [`pvm_image::capture`] and hand it to [`DataLayer::put`]; the
+    /// next tick fetches it with [`DataLayer::get`] and rehydrates via
+    /// [`pvm_image::restore`].
     ///
-    /// Today this map lives in process memory; the long-term plan is to
-    /// serialize each entry into real on-chain DA so every validator can
-    /// rehydrate the same image and replay refine deterministically.
-    /// Until then, a process restart cold-starts every service.
-    ///
-    /// `iters` is the consecutive-resume count, used to enforce
-    /// [`MAX_REFINE_ITERATIONS`] against runaway `continue_next` loops.
-    continuations: HashMap<u32, Continuation>,
+    /// Swap in a disk- or network-backed [`DataLayer`] implementation
+    /// to survive process restarts or to push continuation blobs into
+    /// a real on-chain DA lane.
+    pub data: D,
+    /// Per-service consecutive-resume count, used to enforce
+    /// [`MAX_REFINE_ITERATIONS`] against runaway `continue_next`
+    /// loops. Kept in runtime memory rather than in the data layer:
+    /// resetting after a process restart just gives each resumed
+    /// service a fresh quota, which is the behaviour we want.
+    iters: HashMap<u32, usize>,
 }
 
-/// One suspended PVM image plus runaway-loop accounting.
-struct Continuation {
-    pvm: Pvm,
-    iters: usize,
-}
-
-impl VosRuntime {
+impl VosRuntime<MemoryDataLayer> {
+    /// Create a runtime with the default in-memory data layer.
     pub fn new() -> Self {
         Self::with_gas_config(GasConfig::default())
     }
 
-    /// Create a runtime with explicit per-stage gas budgets.
+    /// Create a runtime with explicit per-stage gas budgets and the
+    /// default in-memory data layer.
     pub fn with_gas_config(gas: GasConfig) -> Self {
+        Self::with_data_layer_and_gas(MemoryDataLayer::new(), gas)
+    }
+}
+
+impl<D: DataLayer> VosRuntime<D> {
+    /// Create a runtime with a custom [`DataLayer`] backend and
+    /// default gas config. Use this to swap in a disk- or
+    /// network-backed continuation store.
+    pub fn with_data_layer(data: D) -> Self {
+        Self::with_data_layer_and_gas(data, GasConfig::default())
+    }
+
+    /// Create a runtime with a custom [`DataLayer`] backend and
+    /// explicit gas config.
+    pub fn with_data_layer_and_gas(data: D, gas: GasConfig) -> Self {
         Self {
             blobs: Vec::new(),
             blob_by_hash: HashMap::new(),
@@ -465,7 +484,8 @@ impl VosRuntime {
             preimages: HashMap::new(),
             pending_transfers: Vec::new(),
             gas,
-            continuations: HashMap::new(),
+            data,
+            iters: HashMap::new(),
         }
     }
 
@@ -505,11 +525,11 @@ impl VosRuntime {
         !self.pending_transfers.is_empty()
     }
 
-    /// Whether a service has a suspended PVM image (DA continuation).
+    /// Whether a service has a suspended PVM image in the data layer.
     /// True between a `continue_next` yield and either the next
     /// completing tick or eviction (panic / max iterations).
     pub fn is_suspended(&self, id: ServiceId) -> bool {
-        self.continuations.contains_key(&id.0)
+        self.data.contains(id)
     }
 
     /// Run one round: process all services with pending items.
@@ -527,7 +547,7 @@ impl VosRuntime {
     ///      forbidden here.
     ///
     /// Returns true if any work was done.
-    pub fn tick(&mut self) -> bool {
+    pub async fn tick(&mut self) -> bool {
         if self.pending_transfers.is_empty() {
             return false;
         }
@@ -545,7 +565,8 @@ impl VosRuntime {
         let services = &self.services;
         let storage = &mut self.storage;
         let preimages = &mut self.preimages;
-        let continuations = &mut self.continuations;
+        let data_layer = &mut self.data;
+        let iters_map = &mut self.iters;
         let refine_gas = self.gas.refine_gas;
         let accumulate_gas = self.gas.clamp_accumulate(self.gas.accumulate_gas_default);
 
@@ -564,7 +585,8 @@ impl VosRuntime {
             // ── Stage 1: refine (PC=0) ────────────────────────────
             let mut refine_items = items;
             // Always build a fresh template — we need its initial register
-            // file (sp at top of stack, etc.) to set up a clean call frame.
+            // file (sp at top of stack, etc.) to set up a clean call frame
+            // and the blob-derived code/bitmask/jump_table.
             let fresh = match initialize_program(blob, &[], refine_gas) {
                 Some(p) => p,
                 None => {
@@ -572,30 +594,52 @@ impl VosRuntime {
                     continue;
                 }
             };
-            // Warm restart: take the suspended PVM image (flat_mem
-            // includes heap + static rw_data preserved from last refine)
-            // and graft a fresh register/pc/gas frame on top so _start
-            // re-enters cleanly. We *clone* the cached entry rather than
-            // remove it, so a refine panic/OOG below can fall back to
-            // the unmutated image on retry.
-            let prior_iters = continuations.get(&svc_id).map(|c| c.iters).unwrap_or(0);
+
+            let prior_iters = iters_map.get(&svc_id).copied().unwrap_or(0);
             if prior_iters >= MAX_REFINE_ITERATIONS {
                 eprintln!(
                     "vosx: service {svc_id} hit MAX_REFINE_ITERATIONS ({}); evicting continuation",
                     MAX_REFINE_ITERATIONS
                 );
-                continuations.remove(&svc_id);
+                data_layer.remove(ServiceId(svc_id)).await;
+                iters_map.remove(&svc_id);
                 continue;
             }
-            let mut refine_pvm = if let Some(cached) = continuations.get(&svc_id) {
-                let mut p = cached.pvm.clone();
-                p.registers = fresh.registers;
-                p.pc = fresh.pc;
-                p.gas = refine_gas;
-                p.need_gas_charge = fresh.need_gas_charge;
-                p
-            } else {
-                fresh
+
+            // Warm restart: fetch the captured image from the data
+            // layer and rehydrate on top of the fresh PVM. We fetch a
+            // *copy* (not remove) so a refine panic/OOG below leaves
+            // the prior image intact for an idempotent retry.
+            let mut refine_pvm = match data_layer.get(ServiceId(svc_id)).await {
+                Some(image) => match pvm_image::restore(fresh, image) {
+                    Some(p) => {
+                        let mut p = p;
+                        // Graft a fresh register/pc/gas frame on top
+                        // of the preserved flat_mem so `_start`
+                        // re-enters cleanly.
+                        let reinit = match initialize_program(blob, &[], refine_gas) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        p.registers = reinit.registers;
+                        p.pc = reinit.pc;
+                        p.gas = refine_gas;
+                        p.need_gas_charge = reinit.need_gas_charge;
+                        p
+                    }
+                    None => {
+                        eprintln!(
+                            "vosx: service {svc_id} continuation image corrupt; cold-starting"
+                        );
+                        data_layer.remove(ServiceId(svc_id)).await;
+                        iters_map.remove(&svc_id);
+                        match initialize_program(blob, &[], refine_gas) {
+                            Some(p) => p,
+                            None => continue,
+                        }
+                    }
+                },
+                None => fresh,
             };
 
             let refine_output = match run_refine_stage(
@@ -608,19 +652,16 @@ impl VosRuntime {
                 storage,
             ) {
                 Some(out) => out,
-                None => continue, // panic / OOG already logged
+                None => continue, // panic / OOG already logged; prior image preserved
             };
 
             // Peek at the continue_next flag so we can re-queue the
-            // service after accumulate commits. The accumulate guest
-            // re-decodes the same bytes for the effect replay.
+            // service after accumulate commits.
             let continue_next = crate::refine_payload::RefinePayload::decode(&refine_output)
                 .map(|p| p.continue_next)
                 .unwrap_or(false);
 
             // ── Stage 2: accumulate (PC=5) ────────────────────────
-            // The guest decodes the refine payload as a single FETCH
-            // item and replays each effect via real hostcalls.
             let mut acc_items: Vec<Vec<u8>> = vec![refine_output];
             let mut acc_pvm = match initialize_program_at(blob, &[], accumulate_gas, 5) {
                 Some(p) => p,
@@ -639,19 +680,18 @@ impl VosRuntime {
                 &mut new_transfers,
             );
 
-            // If the guest yielded mid-round, snapshot the live PVM image
-            // so the next tick can resume from the same heap/state, and
-            // re-queue an empty wakeup. Otherwise drop any prior snapshot
-            // — the service finished its work and should cold-start next.
+            // If the guest yielded mid-round, capture the live PVM
+            // image and hand it to the data layer so the next tick can
+            // resume from it. Otherwise drop any prior image — the
+            // service finished its work and should cold-start next.
             if continue_next {
-                let next_iters = prior_iters + 1;
-                continuations.insert(
-                    svc_id,
-                    Continuation { pvm: refine_pvm.clone(), iters: next_iters },
-                );
+                let image = pvm_image::capture(&refine_pvm);
+                data_layer.put(ServiceId(svc_id), image).await;
+                iters_map.insert(svc_id, prior_iters + 1);
                 new_transfers.push((ServiceId(svc_id), Vec::new()));
             } else {
-                continuations.remove(&svc_id);
+                data_layer.remove(ServiceId(svc_id)).await;
+                iters_map.remove(&svc_id);
             }
         }
 
@@ -660,14 +700,27 @@ impl VosRuntime {
     }
 
     /// Run until no more work.
-    pub fn run(&mut self) {
+    pub async fn run(&mut self) {
         while self.has_work() {
-            self.tick();
+            self.tick().await;
         }
+    }
+
+    /// Blocking wrapper around [`Self::run`] for sync call sites.
+    /// Uses `pollster` under the hood; fine for the in-memory data
+    /// layer and any other backend that doesn't need an external
+    /// executor.
+    pub fn run_blocking(&mut self) {
+        pollster::block_on(self.run());
+    }
+
+    /// Blocking wrapper around [`Self::tick`].
+    pub fn tick_blocking(&mut self) -> bool {
+        pollster::block_on(self.tick())
     }
 }
 
-impl Default for VosRuntime {
+impl Default for VosRuntime<MemoryDataLayer> {
     fn default() -> Self {
         Self::new()
     }

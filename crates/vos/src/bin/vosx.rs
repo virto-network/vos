@@ -313,7 +313,7 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
 
     eprintln!("vosx: running...\n");
 
-    runtime.run();
+    runtime.run_blocking();
 
     eprintln!("\nvosx: done");
 }

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["std"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster"]
 macros = ["dep:vos-macros"]
 pvm = ["vos-abi/pvm"]
 service = ["pvm", "vos-abi/service"]
@@ -23,6 +23,7 @@ grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler", op
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 blake2b_simd = { version = "1", optional = true }
+pollster = { version = "0.3", optional = true }
 
 [[bin]]
 name = "vosx"

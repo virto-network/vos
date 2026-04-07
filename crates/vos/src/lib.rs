@@ -36,6 +36,11 @@ pub use rkyv;
 pub mod actors;
 pub mod refine_payload;
 
+#[cfg(feature = "std")]
+pub mod data_layer;
+#[cfg(feature = "std")]
+pub mod pvm_image;
+
 // Re-export core actor types at crate root for `use vos::*`
 pub use actors::{Actor, Message, Context, Yield, Ask, RunResult, try_poll, metadata};
 pub use actors::{Encode, Decode};

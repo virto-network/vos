@@ -87,7 +87,7 @@ fn agent_service_lifecycle() {
 
     // Send empty kick-start transfer
     rt.send_to(id, Vec::new());
-    rt.run();
+    rt.run_blocking();
 
     // Under the CoreVM-on-JAM model the agent's state is its PVM
     // image, not a serialized actor under STATE_KEY. With an empty
@@ -142,7 +142,7 @@ fn cooperative_loop_with_greeter() {
 
     // Kick-start agent
     rt.send_to(agent_id, Vec::new());
-    rt.run();
+    rt.run_blocking();
 
     // Cooperative loop completes: scheduler eventually drains its
     // run queue, the final tick is non-yielding, and both the
@@ -184,13 +184,147 @@ fn refine_completes_and_clears_continuation() {
     assert!(!rt.is_suspended(id), "no continuation before first tick");
 
     rt.send_to(id, Vec::new());
-    rt.run();
+    rt.run_blocking();
 
     assert!(
         !rt.is_suspended(id),
         "scheduler with no children should run to completion (no DA continuation)"
     );
     assert!(!rt.has_work(), "no leftover pending_transfers expected");
+}
+
+#[test]
+fn data_layer_roundtrip_via_runtime() {
+    // Basic wiring test for the pluggable DataLayer: poke bytes
+    // directly into the backend under a service id and verify the
+    // runtime's `is_suspended` surfaces them. This covers the
+    // DataLayer <-> VosRuntime plumbing without needing a service
+    // actor that actually calls `yield_now` (none of the current
+    // examples do — the scheduler drives progress via `send_self`
+    // transfers, not explicit refine yields).
+    //
+    // TODO: add an end-to-end "suspend in runtime A, resume in
+    // runtime B through a shared DataLayer" test once we have a
+    // service actor whose refine body calls `ctx.yield_now()` or
+    // `ctx.sleep()`. That's the test that exercises
+    // `pvm_image::capture`/`restore` against a real PVM image.
+    use vos::data_layer::{DataLayer, MemoryDataLayer};
+    use vos::pvm_image::HEADER_SIZE;
+
+    let mut da = MemoryDataLayer::new();
+    let id = vos_abi::service::ServiceId(42);
+    assert!(!da.contains(id));
+
+    // Synthesize a minimally valid image — we never actually
+    // rehydrate it, just prove the runtime observes it through
+    // `is_suspended`.
+    let mut image = vec![0u8; HEADER_SIZE];
+    image[0..4].copy_from_slice(b"VPVM");
+    image[4] = vos::pvm_image::VERSION;
+    pollster::block_on(da.put(id, image.clone()));
+    assert!(da.contains(id));
+    assert_eq!(pollster::block_on(da.get(id)).as_deref(), Some(&image[..]));
+
+    let rt = VosRuntime::with_data_layer(da);
+    assert!(
+        rt.is_suspended(id),
+        "runtime should see the continuation that was written directly to the DataLayer"
+    );
+}
+
+#[test]
+#[ignore = "needs a service actor that calls ctx.yield_now() to exercise continuation capture"]
+fn data_layer_survives_runtime_teardown() {
+    // The hero test: run a yielding service in runtime A until it
+    // suspends with a captured PVM image in the data layer, move the
+    // data layer into runtime B, and verify B resumes from where A
+    // left off. Ignored until a yielding service actor exists among
+    // the examples.
+    use vos::data_layer::MemoryDataLayer;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let greeter_elf = example_elf("greeter");
+    let agent_blob = transpile_actor(&agent_data);
+    let greeter_blob = transpile_actor(&greeter_elf);
+
+    // Runtime A — run one tick, then stop before completion so the
+    // scheduler is left with a live continuation in the data layer.
+    let da = MemoryDataLayer::new();
+    let mut rt_a = VosRuntime::with_data_layer(da);
+    let a_agent_blob = rt_a.register_service_blob(agent_blob.clone());
+    let a_agent_id = rt_a.register_service(a_agent_blob);
+    let a_greeter_blob = rt_a.register_service_blob(greeter_blob.clone());
+    let a_greeter_id = rt_a.register_service(a_greeter_blob);
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![a_greeter_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt_a.storage.write(a_agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt_a.send_to(a_agent_id, Vec::new());
+    // Drive runtime A tick-by-tick up to a small cap, looking for
+    // the first tick where the scheduler leaves a captured image
+    // behind. That's when we'll tear the runtime down.
+    let mut suspended = false;
+    for _ in 0..8 {
+        if !rt_a.has_work() { break; }
+        rt_a.tick_blocking();
+        if rt_a.is_suspended(a_agent_id) {
+            suspended = true;
+            break;
+        }
+    }
+    assert!(
+        suspended,
+        "scheduler should suspend at least once while processing init+children"
+    );
+
+    // Detach the data layer from runtime A. Swap in an empty one
+    // first so the `.data` move is well-defined.
+    let da_moved = std::mem::replace(&mut rt_a.data, MemoryDataLayer::new());
+    let storage_moved = std::mem::take(&mut rt_a.storage);
+    drop(rt_a);
+
+    // Build runtime B with the same blobs; service ids match because
+    // the id counter is monotonic from 1 and we register in the same
+    // order.
+    let mut rt_b = VosRuntime::with_data_layer(da_moved);
+    let b_agent_blob = rt_b.register_service_blob(agent_blob);
+    let b_agent_id = rt_b.register_service(b_agent_blob);
+    assert_eq!(b_agent_id, a_agent_id);
+    let b_greeter_blob = rt_b.register_service_blob(greeter_blob);
+    let b_greeter_id = rt_b.register_service(b_greeter_blob);
+    assert_eq!(b_greeter_id, a_greeter_id);
+    rt_b.storage = storage_moved;
+
+    assert!(
+        rt_b.is_suspended(b_agent_id),
+        "new runtime sees the captured image via the shared data layer"
+    );
+
+    // Re-kick the suspended agent so the data layer's image is
+    // rehydrated and the scheduler continues its run queue.
+    rt_b.send_to(b_agent_id, Vec::new());
+
+    // Drive runtime B to completion. If the data layer path is correct,
+    // this should drain the scheduler's queue exactly like a single
+    // in-process run would have.
+    rt_b.run_blocking();
+
+    assert!(!rt_b.has_work());
+    assert!(!rt_b.is_suspended(b_agent_id));
+    assert!(!rt_b.is_suspended(b_greeter_id));
 }
 
 #[test]
