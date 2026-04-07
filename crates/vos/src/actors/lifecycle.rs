@@ -1,7 +1,7 @@
 //! Lifecycle building blocks for VOS actors.
 //!
 //! Composable functions that implement the JAM actor lifecycle.
-//! Used by the default `run_accumulate` and `run_refine` implementations,
+//! Used by the default `run_refine_service` and `run_refine` implementations,
 //! and exported for custom lifecycle composition.
 //!
 //! Persistence methods are feature-gated internally: on services they

@@ -27,16 +27,9 @@ pub use context::Context;
 pub use run::{Yield, Ask, RunResult, try_poll, service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
 pub use value::InvokeError;
 #[cfg(feature = "service")]
-pub use run::{run_accumulate, run_refine_service, run_accumulate_service};
+pub use run::{run_refine_service, run_accumulate_service};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
-
-/// Unified entry point — resolves to `run_accumulate` (service) or `run_refine` (guest).
-/// The macro generates calls to this so downstream crates don't need feature cfgs.
-#[cfg(feature = "service")]
-pub fn run_entry<A: Actor>() { run::run_accumulate::<A>() }
-#[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_entry<A: Actor>() { run::run_refine::<A>() }
 
 /// JAM refine entry (PC=0). On services, runs the pure refine body and
 /// halts with a `RefinePayload`. On invoked actors (no `service` feature),

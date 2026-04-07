@@ -38,8 +38,6 @@
 //! - `0x03` PROVIDE — `[hash: 32 bytes][data_bytes]`
 //! - `0x04` NEW     — `[code_hash: 32 bytes]`
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 pub const REFINE_PAYLOAD_VERSION: u8 = 0x02;

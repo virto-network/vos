@@ -46,12 +46,8 @@ pub use actors::lifecycle;
 pub use actors::value;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
-#[cfg(feature = "service")]
-pub use actors::run_accumulate;
 #[cfg(feature = "pvm")]
 pub use actors::run_refine;
-#[cfg(feature = "pvm")]
-pub use actors::run_entry;
 #[cfg(feature = "pvm")]
 pub use actors::{run_refine_entry, run_accumulate_entry};
 

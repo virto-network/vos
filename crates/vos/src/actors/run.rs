@@ -65,11 +65,6 @@ impl Yield {
     pub fn once() -> Self {
         Self { yielded: false }
     }
-    /// Returns Ready immediately — used during ask-replay to skip past
-    /// yield points while the framework re-executes the handler.
-    pub fn skip() -> Self {
-        Self { yielded: true }
-    }
 }
 
 impl Future for Yield {
@@ -209,54 +204,6 @@ pub const STATUS_PANICKED: u8 = 0x02;
 pub const STATUS_NOT_FOUND: u8 = 0x03;
 /// Exit status: child actor ran out of gas during invoke.
 pub const STATUS_OOG: u8 = 0x04;
-
-// ── Accumulate phase (service actors) ─────────────────────────────────
-
-/// Service actor lifecycle.
-///
-/// Historically this was the JAM accumulate-phase entry (PC=5). In the
-/// current runtime model, top-level services run at PC=0 (refine) and the
-/// host journals side effects, committing them after the refine round
-/// without re-entering the PVM at PC=5. This function is the actual body
-/// the guest executes — it reads state via `READ` (which the runtime
-/// overlays with the refine journal), dispatches messages, and writes
-/// state back via `WRITE` (which the runtime stages into the journal).
-/// The PC=5 entry remains present in the blob for dual-entry layout but
-/// is unreachable from the runtime today.
-///
-/// Composed from lifecycle building blocks:
-/// 1. `load_or_create` — state from storage
-/// 2. `fetch_raw` + `dispatch_one` — message loop
-/// 3. `save_state` — persist current state
-/// 4. `emit_status` — output exit status, halt
-#[cfg(feature = "service")]
-pub fn run_accumulate<A: super::Actor>() {
-    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
-    use super::context::ServiceId;
-
-    let id = lifecycle::service_id();
-    let mut ctx = super::Context::new(ServiceId(id));
-
-    // Read persisted state from storage
-    let mut buf = [0u8; BUF_SIZE];
-    let state_len = lifecycle::read_persisted_state(&mut buf);
-    let state = if state_len > 0 { Some(&buf[..state_len]) } else { None };
-    let mut actor = lifecycle::load_or_create::<A>(state);
-
-    // Dispatch messages
-    loop {
-        let n = lifecycle::fetch_raw(&mut buf);
-        if n == 0 { break; }
-        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
-        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
-            break;
-        }
-    }
-
-    lifecycle::save_state::<A>(&actor, &ctx);
-    lifecycle::emit_status::<A>(&ctx);
-    halt();
-}
 
 // ── Service refine phase (PC=0, JAM-pure) ─────────────────────────────
 
