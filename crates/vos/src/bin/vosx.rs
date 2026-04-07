@@ -297,8 +297,19 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
         runtime.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
     }
 
-    // Send an empty transfer to kick-start the agent (triggers first FETCH).
-    runtime.send_to(agent_id, Vec::new());
+    // Send a dynamic "start" message to kick-start the agent. Encoded
+    // as a tagged Msg so the framework's dispatch_one decodes it via
+    // FromDynamic — the agent's `start` handler then runs.
+    {
+        use vos::value::{Msg, TAG_DYNAMIC};
+        use vos::Encode;
+        let msg = Msg::new("start");
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        runtime.send_to(agent_id, payload);
+    }
 
     eprintln!("vosx: running...\n");
 

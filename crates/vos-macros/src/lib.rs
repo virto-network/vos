@@ -483,14 +483,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(unused_imports)]
         use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
+        // PC=0 entry — JAM refine. Pure: state mutations are buffered in
+        // the context and emitted as a `RefinePayload` via halt_with_output.
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
-            vos::run_entry::<#actor_name>();
+            vos::run_refine_entry::<#actor_name>();
         }
 
+        // PC=5 entry — JAM accumulate. The only stage allowed to mutate
+        // state. Replays the effects encoded in each refine output.
         #[unsafe(no_mangle)]
         pub extern "C" fn accumulate() {
-            _start();
+            vos::run_accumulate_entry::<#actor_name>();
         }
 
         #[used]

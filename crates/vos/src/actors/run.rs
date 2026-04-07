@@ -129,6 +129,36 @@ pub fn is_suppressing_io() -> bool {
     unsafe { SUPPRESSING_IO }
 }
 
+// ── Refine-mode flag (service framework) ──────────────────────────────
+
+/// Global flag: are we currently inside `run_refine_service`?
+///
+/// In refine the JAM-pure hostcall table forbids state-mutating calls
+/// (`WRITE`, `TRANSFER`, `PROVIDE`, `NEW`). The framework's
+/// `Context::flush_effects` checks this flag and, when set, *buffers*
+/// effects in the context's pending vectors instead of issuing hostcalls
+/// — `run_refine_service` then drains them into the refine output payload.
+/// `run_accumulate_service` clears the flag and applies the same effects
+/// via real hostcalls.
+///
+/// Safe because PVM is single-threaded.
+#[cfg(feature = "service")]
+static mut IN_REFINE: bool = false;
+
+#[cfg(feature = "service")]
+pub fn set_refine_mode(v: bool) {
+    unsafe { IN_REFINE = v; }
+}
+
+#[cfg(feature = "service")]
+pub fn is_refine_mode() -> bool {
+    unsafe { IN_REFINE }
+}
+
+/// Stub for non-service builds so framework code can call it unconditionally.
+#[cfg(not(feature = "service"))]
+pub fn is_refine_mode() -> bool { false }
+
 // ── Halt ──────────────────────────────────────────────────────────────
 
 /// Halt the PVM (no output). Used by accumulate (service mode).
@@ -184,7 +214,17 @@ pub const STATUS_OOG: u8 = 0x04;
 
 // ── Accumulate phase (service actors) ─────────────────────────────────
 
-/// Service actor lifecycle — JAR accumulate phase (PC=5).
+/// Service actor lifecycle.
+///
+/// Historically this was the JAM accumulate-phase entry (PC=5). In the
+/// current runtime model, top-level services run at PC=0 (refine) and the
+/// host journals side effects, committing them after the refine round
+/// without re-entering the PVM at PC=5. This function is the actual body
+/// the guest executes — it reads state via `READ` (which the runtime
+/// overlays with the refine journal), dispatches messages, and writes
+/// state back via `WRITE` (which the runtime stages into the journal).
+/// The PC=5 entry remains present in the blob for dual-entry layout but
+/// is unreachable from the runtime today.
 ///
 /// Composed from lifecycle building blocks:
 /// 1. `load_or_create` — state from storage
@@ -217,6 +257,127 @@ pub fn run_accumulate<A: super::Actor>() {
 
     lifecycle::save_state::<A>(&actor, &ctx);
     lifecycle::emit_status::<A>(&ctx);
+    halt();
+}
+
+// ── Service refine phase (PC=0, JAM-pure) ─────────────────────────────
+
+/// JAM-pure refine entry for service actors.
+///
+/// Runs at PC=0. Cannot mutate state — issues only read-only hostcalls.
+/// Side effects produced by handlers are buffered in the `Context` and
+/// then encoded into a `RefinePayload` which is emitted as the refine
+/// output bytes (registers a0/a1).
+///
+/// Lifecycle:
+/// 1. Read persisted state via `READ(STATE_KEY)` (allowed in refine).
+/// 2. `load_or_create::<A>(state)`.
+/// 3. FETCH and dispatch each pending message; handler effects buffer
+///    into `Context::pending_*` because `is_refine_mode() == true`.
+/// 4. Encode the new actor state, the buffered effects, and any reply
+///    bytes into a `RefinePayload`.
+/// 5. `halt_with_output(payload)`.
+#[cfg(feature = "service")]
+pub fn run_refine_service<A: super::Actor>() {
+    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
+    use super::context::ServiceId;
+
+    set_refine_mode(true);
+
+    let id = lifecycle::service_id();
+    let mut ctx = super::Context::new(ServiceId(id));
+
+    // Read persisted state via the read-only READ hostcall.
+    let mut buf = [0u8; BUF_SIZE];
+    let state_len = lifecycle::read_persisted_state(&mut buf);
+    let state = if state_len > 0 { Some(&buf[..state_len]) } else { None };
+    let mut actor = lifecycle::load_or_create::<A>(state);
+
+    // Dispatch messages. flush_effects() inside dispatch_one is a no-op
+    // in refine mode — effects accumulate in the context's pending_* vecs.
+    loop {
+        let n = lifecycle::fetch_raw(&mut buf);
+        if n == 0 { break; }
+        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
+        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
+            break;
+        }
+    }
+
+    // Pack: new state + buffered effects + reply → RefinePayload bytes.
+    // Note: under the new model the framework also writes STATE_KEY as a
+    // WRITE effect (added below) so the accumulate stage persists it.
+    let new_state_bytes = super::codec::Encode::encode(&actor);
+    let reply_bytes = ctx.take_reply_bytes();
+    let mut payload = ctx.drain_into_refine_payload(new_state_bytes.clone(), reply_bytes);
+
+    // Always include a STATE_KEY write so accumulate persists the new
+    // state. We use the same well-known key the lifecycle helpers use.
+    payload.effects.insert(
+        0,
+        crate::refine_payload::Effect::Write {
+            key: lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: new_state_bytes,
+        },
+    );
+
+    let encoded = payload.encode();
+    halt_with_output(&encoded);
+}
+
+// ── Service accumulate phase (PC=5, JAM-pure commit) ──────────────────
+
+/// JAM-pure accumulate entry for service actors.
+///
+/// Runs at PC=5. The only stage allowed to mutate state. Receives one
+/// `RefinePayload` per work item via FETCH and replays each effect via
+/// the corresponding accumulate-phase hostcall. Does **not** run user
+/// handlers — accumulate is purely structural.
+#[cfg(feature = "service")]
+pub fn run_accumulate_service<A: super::Actor>() {
+    use super::lifecycle::{self, BUF_SIZE};
+    use crate::refine_payload::{Effect, RefinePayload};
+    use vos_abi::pvm::hostcalls;
+    use vos_abi::service::ServiceId;
+
+    set_refine_mode(false);
+
+    // FETCH each refine output operand. The runtime hands one
+    // `RefinePayload`-encoded blob per FETCH call.
+    //
+    // NB: this is a slimmed encoding — the full JAM operand layout
+    // (`encode_operand` from grey-state) wraps these bytes with package
+    // headers, an accumulate_gas field, and a `WorkResult` tag. The
+    // host-side runtime constructs that wrapper today; this guest body
+    // currently consumes the inner refine payload directly. A follow-up
+    // commit will switch the FETCH layout to include the full operand
+    // header so the same blob is bit-identical with on-chain accumulate.
+    let mut buf = [0u8; BUF_SIZE];
+    loop {
+        let n = lifecycle::fetch_raw(&mut buf);
+        if n == 0 { break; }
+        let payload = match RefinePayload::decode(&buf[..n]) {
+            Some(p) => p,
+            None => continue, // skip malformed operand
+        };
+        for eff in payload.effects {
+            match eff {
+                Effect::Write { key, value } => {
+                    hostcalls::write(&key, &value);
+                }
+                Effect::Transfer { target, memo } => {
+                    hostcalls::transfer(ServiceId(target), 0, 0, &memo);
+                }
+                Effect::Provide { hash, data } => {
+                    hostcalls::provide(&hash, &data);
+                }
+                Effect::New { code_hash } => {
+                    hostcalls::new_service(&code_hash);
+                }
+            }
+        }
+    }
+
     halt();
 }
 

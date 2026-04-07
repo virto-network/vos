@@ -34,6 +34,7 @@ pub use rkyv;
 // --- Actor framework (always available, no_std compatible) ---
 
 pub mod actors;
+pub mod refine_payload;
 
 // Re-export core actor types at crate root for `use vos::*`
 pub use actors::{Actor, Message, Context, Yield, Ask, RunResult, try_poll, metadata};
@@ -51,6 +52,8 @@ pub use actors::run_accumulate;
 pub use actors::run_refine;
 #[cfg(feature = "pvm")]
 pub use actors::run_entry;
+#[cfg(feature = "pvm")]
+pub use actors::{run_refine_entry, run_accumulate_entry};
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
@@ -59,6 +62,9 @@ pub mod hostcalls {
 }
 
 // --- Runtime infrastructure (host-only) ---
+
+#[cfg(feature = "std")]
+pub mod operand;
 
 #[cfg(feature = "std")]
 pub mod runtime;

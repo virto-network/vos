@@ -1,16 +1,32 @@
 //! VosRuntime — thin native host driving VOS services.
 //!
 //! Manages PVM instances per service, handles hostcalls, routes transfers
-//! between services across rounds. Each service gets a fresh PVM per
-//! invocation (JAR model).
+//! between services across rounds.
 //!
-//! ## Execution model
+//! ## Execution model (JAR-aligned)
 //!
-//! Top-level services (agents) run at PC=5 (accumulate entry) with full
-//! hostcall access. Guest actors invoked via `invoke()` run at PC=0 (refine
-//! entry) with only refine-phase hostcalls. When a service YIELDs, the
-//! runtime returns HOST_OK. Self-driving actors re-invoke themselves via
-//! self-transfer. The round loop delivers transfers round by round.
+//! Top-level services (agents) run at PC=0 (refine entry). Refine is the hot
+//! loop: cheap, sandboxed, and where handler logic, child `INVOKE`, and
+//! intra-round message exchange happen. Side-effecting hostcalls — `WRITE`,
+//! `TRANSFER`, `PROVIDE` — are *staged* into a per-service `RefineJournal`
+//! rather than applied immediately. `READ` during refine overlays the
+//! journal so a handler sees its own writes within the round.
+//!
+//! A `TRANSFER` to the running service is interpreted as "re-enter refine
+//! with this new message in the same round" and queued into
+//! `journal.self_messages`. This turns the scheduler's `send_self(Tick)`
+//! loop into a cheap intra-round re-entry rather than a full tick round-trip.
+//!
+//! At the end of a refine round (no more self-messages, or iteration cap
+//! hit) the runtime **commits the journal** directly: writes go into
+//! storage, preimages into the preimage map, cross-service transfers into
+//! `pending_transfers` for the next `tick()`. The runtime does NOT currently
+//! re-enter the PVM at PC=5 — accumulate is a runtime-side replay of the
+//! journal, equivalent to a trivial accumulate body. A future change can
+//! reintroduce a real PC=5 entry when services need to compute summaries.
+//!
+//! Guest actors invoked via `INVOKE` still run at PC=0 with only refine-phase
+//! hostcalls; their state is returned in the reply envelope (not storage).
 
 use javm::program::{initialize_program, initialize_program_at};
 use javm::{ExitReason, Gas, Pvm};
@@ -89,6 +105,206 @@ fn handle_base_hostcall(
     true
 }
 
+// --- JAM-aligned hostcall dispatch (refine vs. accumulate) ---
+//
+// These two functions are the clean, journal-free dispatch tables that the
+// two-stage `tick()` (introduced in step 3) will use. They deliberately
+// enforce JAM hostcall partitioning:
+//
+//   * Refine is pure: it can READ storage, INVOKE children, FETCH inputs,
+//     INFO its own id, and YIELD (no-op). Any attempt to mutate state
+//     (`WRITE`, `TRANSFER`, `PROVIDE`, `NEW`, `CHECKPOINT`) returns
+//     `HOST_WHAT` so a misbuilt guest fails loudly during refine, exactly
+//     as it would on a JAM core.
+//
+//   * Accumulate is the only stage that mutates state. It allows
+//     `READ`/`WRITE`/`TRANSFER`/`PROVIDE`/`NEW`/`CHECKPOINT`/`YIELD`/`INFO`
+//     and refuses `INVOKE` (accumulate is commit-only on-chain).
+//
+// Both share `handle_base_hostcall` for `GAS`/`GROW_HEAP`/`FETCH`/
+// `DEBUG_WRITE`. The signatures are sized for what each stage actually
+// touches: refine has read-only storage, accumulate has &mut storage.
+
+/// Outcome of one hostcall dispatch attempt.
+enum HostcallOutcome {
+    /// The call was handled (`pvm.registers[7]` is set to the result).
+    Handled,
+    /// Unknown call id — caller should set `HOST_WHAT` and continue.
+    Unknown,
+}
+
+/// Refine-stage hostcall dispatch (PC=0). JAM-pure: read-only storage,
+/// no transfers, no preimage writes, no service spawning. `INVOKE` is
+/// allowed and runs the child at PC=0 with the same refine policy.
+#[allow(clippy::too_many_arguments)]
+fn handle_refine_hostcall(
+    pvm: &mut Pvm,
+    call_id: u32,
+    items: &mut Vec<Vec<u8>>,
+    svc_id: u32,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
+    // Refine is read-only by *policy* (the dispatch arms below never
+    // mutate storage). We accept &mut here to share the existing
+    // `handle_invoke` signature without an unsafe cast; nothing in this
+    // function or its callees writes to storage.
+    storage: &mut ServiceStorage,
+    // INVOKE may, via nested children, produce side effects the framework
+    // wants to surface; we keep an out-vec parameter to mirror the
+    // accumulate signature, but in a JAM-pure refine this stays empty.
+    invoke_side_transfers: &mut Vec<(ServiceId, Vec<u8>)>,
+    // Same: preimages from nested invoke. Empty in pure refine.
+    invoke_side_preimages: &mut HashMap<[u8; 32], Vec<u8>>,
+) -> HostcallOutcome {
+    if handle_base_hostcall(pvm, call_id, items) {
+        return HostcallOutcome::Handled;
+    }
+
+    let a0 = pvm.registers[7];
+    let a1 = pvm.registers[8];
+    let a2 = pvm.registers[9];
+    let a3 = pvm.registers[10];
+
+    let id = ServiceId(svc_id);
+
+    match call_id {
+        // INFO — service id.
+        accumulate::INFO => {
+            pvm.registers[7] = svc_id as u64;
+            HostcallOutcome::Handled
+        }
+        // READ — read-only storage. No journal overlay: refine cannot
+        // have written anything, by construction.
+        accumulate::READ => {
+            let key = pvm_read(pvm, a0 as u32, a1 as usize);
+            if let Some(value) = (*storage).read(id, &key) {
+                let copy_len = value.len().min(a3 as usize);
+                let value = value[..copy_len].to_vec();
+                pvm_write(pvm, a2 as u32, &value);
+                pvm.registers[7] = copy_len as u64;
+            } else {
+                pvm.registers[7] = error::HOST_NONE;
+            }
+            HostcallOutcome::Handled
+        }
+        // YIELD — accepted but no-op in refine. JAM treats yield_output
+        // as a status emission; for refine we let the guest call it
+        // harmlessly so the same lifecycle code can run in either stage.
+        accumulate::YIELD => {
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        // INVOKE — child PVM at PC=0. Children run under the same refine
+        // policy via `handle_invoke`, which already restricts to refine
+        // hostcalls.
+        refine::INVOKE => {
+            let result = handle_invoke(
+                pvm,
+                blobs,
+                blob_by_hash,
+                services,
+                storage,
+                invoke_side_preimages,
+                0,
+                invoke_side_transfers,
+            );
+            pvm.registers[7] = result;
+            HostcallOutcome::Handled
+        }
+        // Disallowed in refine — JAM-pure: any state-mutating call here
+        // is a guest bug and we want it to fail loudly.
+        accumulate::WRITE
+        | accumulate::TRANSFER
+        | accumulate::PROVIDE
+        | accumulate::NEW
+        | accumulate::CHECKPOINT => {
+            pvm.registers[7] = error::HOST_WHAT;
+            HostcallOutcome::Handled
+        }
+        _ => HostcallOutcome::Unknown,
+    }
+}
+
+/// Accumulate-stage hostcall dispatch (PC=5). The only stage that mutates
+/// state. `INVOKE` is forbidden — accumulate is commit-only on-chain.
+#[allow(clippy::too_many_arguments)]
+fn handle_accumulate_hostcall(
+    pvm: &mut Pvm,
+    call_id: u32,
+    items: &mut Vec<Vec<u8>>,
+    svc_id: u32,
+    storage: &mut ServiceStorage,
+    preimages: &mut HashMap<[u8; 32], Vec<u8>>,
+    transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
+) -> HostcallOutcome {
+    if handle_base_hostcall(pvm, call_id, items) {
+        return HostcallOutcome::Handled;
+    }
+
+    let a0 = pvm.registers[7];
+    let a1 = pvm.registers[8];
+    let a2 = pvm.registers[9];
+    let a3 = pvm.registers[10];
+    let a4 = pvm.registers[11];
+
+    let id = ServiceId(svc_id);
+
+    match call_id {
+        accumulate::YIELD => {
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        accumulate::INFO => {
+            pvm.registers[7] = svc_id as u64;
+            HostcallOutcome::Handled
+        }
+        accumulate::READ => {
+            let key = pvm_read(pvm, a0 as u32, a1 as usize);
+            if let Some(value) = storage.read(id, &key) {
+                let copy_len = value.len().min(a3 as usize);
+                let value = value[..copy_len].to_vec();
+                pvm_write(pvm, a2 as u32, &value);
+                pvm.registers[7] = copy_len as u64;
+            } else {
+                pvm.registers[7] = error::HOST_NONE;
+            }
+            HostcallOutcome::Handled
+        }
+        accumulate::WRITE => {
+            let key = pvm_read(pvm, a0 as u32, a1 as usize);
+            let value = pvm_read(pvm, a2 as u32, a3 as usize);
+            storage.write(id, &key, &value);
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        accumulate::PROVIDE => {
+            let hash = pvm_read_hash(pvm, a0 as u32);
+            let data = pvm_read(pvm, a1 as u32, a2 as usize);
+            preimages.insert(hash, data);
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        accumulate::TRANSFER => {
+            let target = ServiceId(a0 as u32);
+            let memo = pvm_read(pvm, a3 as u32, a4 as usize);
+            transfers_out.push((target, memo));
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        accumulate::NEW | accumulate::CHECKPOINT => {
+            pvm.registers[7] = error::HOST_OK;
+            HostcallOutcome::Handled
+        }
+        // Forbidden in accumulate (commit-only): no INVOKE.
+        refine::INVOKE => {
+            pvm.registers[7] = error::HOST_WHAT;
+            HostcallOutcome::Handled
+        }
+        _ => HostcallOutcome::Unknown,
+    }
+}
+
 // --- Per-service storage ---
 
 /// Per-service key-value storage.
@@ -115,6 +331,12 @@ impl ServiceStorage {
 struct ServiceInfo {
     blob_idx: usize,
     alive: bool,
+    /// Whether this service was registered from a dual-entry (refine+
+    /// accumulate) blob built by the actor framework. `true` → run the
+    /// JAM-aligned two-stage refine→accumulate cycle in `tick()`.
+    /// `false` → legacy single-entry mode where one PVM runs at PC=0
+    /// with the full accumulate hostcall table (used by hand-rolled
+    /// PVM test fixtures that pre-date the framework).
     is_service_blob: bool,
 }
 
@@ -189,6 +411,19 @@ impl VosRuntime {
     }
 
     /// Run one round: process all services with pending items.
+    ///
+    /// JAM-aligned two-stage execution per service:
+    ///
+    ///   1. **Refine** (PC=0). Pure: fed the pending messages as FETCH
+    ///      items, allowed to READ storage and INVOKE children, but
+    ///      forbidden from mutating state. Halts with a `RefinePayload`
+    ///      blob (state + reply + staged effects) in `a0`/`a1`.
+    ///   2. **Accumulate** (PC=5). The only stage that mutates state.
+    ///      Receives the refine payload as a single FETCH item; the
+    ///      guest decodes it and replays each effect via real
+    ///      `WRITE`/`TRANSFER`/`PROVIDE`/`NEW` hostcalls. INVOKE is
+    ///      forbidden here.
+    ///
     /// Returns true if any work was done.
     pub fn tick(&mut self) -> bool {
         if self.pending_transfers.is_empty() {
@@ -219,105 +454,78 @@ impl VosRuntime {
                 None => continue,
             };
 
-            let mut pvm = match if info.is_service_blob {
-                initialize_program_at(blob, &[], DEFAULT_GAS, 5)
-            } else {
-                initialize_program(blob, &[], DEFAULT_GAS)
-            } {
-                Some(p) => p,
-                None => {
-                    eprintln!("vosx: failed to init PVM for service {svc_id}");
-                    continue;
-                }
-            };
-
-            let id = ServiceId(svc_id);
-            let mut item_queue = items;
-            let mut svc_transfers: Vec<(ServiceId, Vec<u8>)> = Vec::new();
             did_work = true;
 
-            loop {
-                let (exit, _) = pvm.run();
-                match exit {
-                    ExitReason::Halt => break,
-                    ExitReason::Panic => {
-                        eprintln!("vosx: service {svc_id} panicked at pc={:#x}", pvm.pc);
-                        break;
+            if info.is_service_blob {
+                // ── Stage 1: refine (PC=0) ────────────────────────────
+                let mut refine_items = items;
+                let mut refine_pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("vosx: failed to init refine PVM for service {svc_id}");
+                        continue;
                     }
-                    ExitReason::OutOfGas => {
-                        eprintln!("vosx: service {svc_id} out of gas");
-                        break;
-                    }
-                    ExitReason::PageFault(addr) => {
-                        eprintln!("vosx: service {svc_id} page fault at {addr:#x}");
-                        break;
-                    }
-                    ExitReason::HostCall(call_id) => {
-                        if handle_base_hostcall(&mut pvm, call_id, &mut item_queue) {
-                            continue;
-                        }
+                };
 
-                        let a0 = pvm.registers[7];
-                        let a1 = pvm.registers[8];
-                        let a2 = pvm.registers[9];
-                        let a3 = pvm.registers[10];
-                        let a4 = pvm.registers[11];
+                let refine_output = match run_refine_stage(
+                    &mut refine_pvm,
+                    svc_id,
+                    &mut refine_items,
+                    blobs,
+                    blob_by_hash,
+                    services,
+                    storage,
+                ) {
+                    Some(out) => out,
+                    None => continue, // panic / OOG already logged
+                };
 
-                        match call_id {
-                            accumulate::YIELD => {
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            accumulate::INFO => {
-                                pvm.registers[7] = svc_id as u64;
-                            }
-                            accumulate::READ => {
-                                let key = pvm_read(&pvm, a0 as u32, a1 as usize);
-                                if let Some(value) = storage.read(id, &key) {
-                                    let copy_len = value.len().min(a3 as usize);
-                                    let value = value[..copy_len].to_vec();
-                                    pvm_write(&mut pvm, a2 as u32, &value);
-                                    pvm.registers[7] = copy_len as u64;
-                                } else {
-                                    pvm.registers[7] = error::HOST_NONE;
-                                }
-                            }
-                            accumulate::WRITE => {
-                                let key = pvm_read(&pvm, a0 as u32, a1 as usize);
-                                let value = pvm_read(&pvm, a2 as u32, a3 as usize);
-                                storage.write(id, &key, &value);
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            accumulate::PROVIDE => {
-                                let hash = pvm_read_hash(&pvm, a0 as u32);
-                                let data = pvm_read(&pvm, a1 as u32, a2 as usize);
-                                preimages.insert(hash, data);
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            accumulate::TRANSFER => {
-                                let target = ServiceId(a0 as u32);
-                                let memo = pvm_read(&pvm, a3 as u32, a4 as usize);
-                                svc_transfers.push((target, memo));
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            accumulate::NEW | accumulate::CHECKPOINT => {
-                                pvm.registers[7] = error::HOST_OK;
-                            }
-                            refine::INVOKE => {
-                                let result = handle_invoke(
-                                    &mut pvm, blobs, blob_by_hash, services, storage, preimages,
-                                    0, &mut svc_transfers,
-                                );
-                                pvm.registers[7] = result;
-                            }
-                            _ => {
-                                pvm.registers[7] = error::HOST_WHAT;
-                            }
-                        }
+                // ── Stage 2: accumulate (PC=5) ────────────────────────
+                // The guest decodes the refine payload as a single FETCH
+                // item and replays each effect via real hostcalls.
+                let mut acc_items: Vec<Vec<u8>> = vec![refine_output];
+                let mut acc_pvm = match initialize_program_at(blob, &[], DEFAULT_GAS, 5) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("vosx: failed to init accumulate PVM for service {svc_id}");
+                        continue;
                     }
-                }
+                };
+
+                run_accumulate_stage(
+                    &mut acc_pvm,
+                    svc_id,
+                    &mut acc_items,
+                    storage,
+                    preimages,
+                    &mut new_transfers,
+                );
+            } else {
+                // Legacy single-entry blob (hand-rolled test fixtures and
+                // such): no refine/accumulate split, no RefinePayload.
+                // Run a single PVM at PC=0 with the full accumulate
+                // hostcall table so it can WRITE / TRANSFER directly.
+                let mut single_items = items;
+                let mut pvm = match initialize_program(blob, &[], DEFAULT_GAS) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("vosx: failed to init PVM for service {svc_id}");
+                        continue;
+                    }
+                };
+
+                run_legacy_stage(
+                    &mut pvm,
+                    svc_id,
+                    &mut single_items,
+                    blobs,
+                    blob_by_hash,
+                    services,
+                    storage,
+                    preimages,
+                    &mut new_transfers,
+                );
             }
-
-            new_transfers.extend(svc_transfers);
         }
 
         self.pending_transfers.extend(new_transfers);
@@ -335,6 +543,181 @@ impl VosRuntime {
 impl Default for VosRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drive a service PVM through the refine stage (PC=0). On Halt,
+/// reads the guest's output buffer (RefinePayload bytes) from `a0`/`a1`
+/// and returns it. Returns `None` on panic / OOG / page fault.
+#[allow(clippy::too_many_arguments)]
+fn run_refine_stage(
+    pvm: &mut Pvm,
+    svc_id: u32,
+    items: &mut Vec<Vec<u8>>,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
+    storage: &mut ServiceStorage,
+) -> Option<Vec<u8>> {
+    // Refine is JAM-pure: any nested-invoke transfers are dropped on
+    // the floor (refine cannot stage them — only accumulate may).
+    let mut sink_transfers: Vec<(ServiceId, Vec<u8>)> = Vec::new();
+    let mut sink_preimages: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            ExitReason::Halt => {
+                let ptr = pvm.registers[7] as u32;
+                let len = (pvm.registers[8] as usize).min(1 << 20);
+                return Some(pvm_read(pvm, ptr, len));
+            }
+            ExitReason::Panic => {
+                eprintln!("vosx: service {svc_id} panicked in refine at pc={:#x}", pvm.pc);
+                return None;
+            }
+            ExitReason::OutOfGas => {
+                eprintln!("vosx: service {svc_id} out of gas in refine");
+                return None;
+            }
+            ExitReason::PageFault(addr) => {
+                eprintln!("vosx: service {svc_id} page fault in refine at {addr:#x}");
+                return None;
+            }
+            ExitReason::HostCall(call_id) => {
+                match handle_refine_hostcall(
+                    pvm,
+                    call_id,
+                    items,
+                    svc_id,
+                    blobs,
+                    blob_by_hash,
+                    services,
+                    storage,
+                    &mut sink_transfers,
+                    &mut sink_preimages,
+                ) {
+                    HostcallOutcome::Handled => continue,
+                    HostcallOutcome::Unknown => {
+                        pvm.registers[7] = error::HOST_WHAT;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drive a service PVM through the accumulate stage (PC=5). Effects
+/// the guest issues via WRITE / PROVIDE / TRANSFER are applied to the
+/// host directly via `handle_accumulate_hostcall`. Cross-service
+/// transfers are appended to `transfers_out` for the next tick.
+fn run_accumulate_stage(
+    pvm: &mut Pvm,
+    svc_id: u32,
+    items: &mut Vec<Vec<u8>>,
+    storage: &mut ServiceStorage,
+    preimages: &mut HashMap<[u8; 32], Vec<u8>>,
+    transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
+) {
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            ExitReason::Halt => return,
+            ExitReason::Panic => {
+                eprintln!("vosx: service {svc_id} panicked in accumulate at pc={:#x}", pvm.pc);
+                return;
+            }
+            ExitReason::OutOfGas => {
+                eprintln!("vosx: service {svc_id} out of gas in accumulate");
+                return;
+            }
+            ExitReason::PageFault(addr) => {
+                eprintln!("vosx: service {svc_id} page fault in accumulate at {addr:#x}");
+                return;
+            }
+            ExitReason::HostCall(call_id) => {
+                match handle_accumulate_hostcall(
+                    pvm,
+                    call_id,
+                    items,
+                    svc_id,
+                    storage,
+                    preimages,
+                    transfers_out,
+                ) {
+                    HostcallOutcome::Handled => continue,
+                    HostcallOutcome::Unknown => {
+                        pvm.registers[7] = error::HOST_WHAT;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+/// Drive a legacy single-entry service PVM. Hostcall dispatch is the
+/// union of refine+accumulate (INVOKE *and* WRITE/TRANSFER/PROVIDE),
+/// since hand-rolled fixtures issue these directly without going
+/// through the refine→accumulate split.
+#[allow(clippy::too_many_arguments)]
+fn run_legacy_stage(
+    pvm: &mut Pvm,
+    svc_id: u32,
+    items: &mut Vec<Vec<u8>>,
+    blobs: &[Vec<u8>],
+    blob_by_hash: &HashMap<[u8; 32], usize>,
+    services: &HashMap<u32, ServiceInfo>,
+    storage: &mut ServiceStorage,
+    preimages: &mut HashMap<[u8; 32], Vec<u8>>,
+    transfers_out: &mut Vec<(ServiceId, Vec<u8>)>,
+) {
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            ExitReason::Halt => return,
+            ExitReason::Panic => {
+                eprintln!("vosx: service {svc_id} panicked at pc={:#x}", pvm.pc);
+                return;
+            }
+            ExitReason::OutOfGas => {
+                eprintln!("vosx: service {svc_id} out of gas");
+                return;
+            }
+            ExitReason::PageFault(addr) => {
+                eprintln!("vosx: service {svc_id} page fault at {addr:#x}");
+                return;
+            }
+            ExitReason::HostCall(call_id) => {
+                // INVOKE goes through the refine handler; everything
+                // else (WRITE/TRANSFER/PROVIDE/READ/INFO/YIELD/NEW)
+                // through the accumulate handler.
+                if matches!(call_id, refine::INVOKE) {
+                    let mut sink_pre = HashMap::new();
+                    match handle_refine_hostcall(
+                        pvm, call_id, items, svc_id, blobs, blob_by_hash,
+                        services, storage, transfers_out, &mut sink_pre,
+                    ) {
+                        HostcallOutcome::Handled => {
+                            for (h, d) in sink_pre { preimages.insert(h, d); }
+                            continue;
+                        }
+                        HostcallOutcome::Unknown => {
+                            pvm.registers[7] = error::HOST_WHAT;
+                            continue;
+                        }
+                    }
+                }
+                match handle_accumulate_hostcall(
+                    pvm, call_id, items, svc_id, storage, preimages, transfers_out,
+                ) {
+                    HostcallOutcome::Handled => continue,
+                    HostcallOutcome::Unknown => {
+                        pvm.registers[7] = error::HOST_WHAT;
+                    }
+                }
+            }
+        }
     }
 }
 

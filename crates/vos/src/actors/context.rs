@@ -282,13 +282,28 @@ impl<A: Actor> Context<A> {
         super::run::set_suppressing_io(true);
     }
 
-    /// Flush all queued effects via accumulate-phase hostcalls.
+    /// Flush all queued effects.
     ///
-    /// Requires the `service` feature — only service actors (not refine-only
-    /// guest actors) can flush effects to the host.
+    /// Behaviour depends on the current execution stage:
+    ///
+    /// - **Refine mode** (`run_refine_service`): effects stay queued in the
+    ///   pending vectors so `run_refine_service` can drain them into the
+    ///   refine output payload. JAM forbids state-mutating hostcalls in
+    ///   refine, so we cannot issue them here.
+    /// - **Accumulate mode** (`run_accumulate_service`): effects are issued
+    ///   directly via accumulate-phase hostcalls. This is the only stage
+    ///   that mutates state.
+    /// - **Non-service builds**: effects are dropped (invoked actors don't
+    ///   have a host stage to flush to).
     pub fn flush_effects(&mut self) {
         #[cfg(feature = "service")]
         {
+            // Refine cannot mutate state — leave the pending_* queues
+            // populated so the caller can pack them into the refine output.
+            if super::run::is_refine_mode() {
+                return;
+            }
+
             use vos_abi::pvm::hostcalls;
 
             for (key, value) in self.pending_writes.drain(..) {
@@ -296,8 +311,6 @@ impl<A: Actor> Context<A> {
             }
 
             for tell in self.pending_tells.drain(..) {
-                let hash = [0u8; 32];
-                hostcalls::provide(&hash, &tell.payload);
                 hostcalls::transfer(tell.target, 0, 0, &tell.payload);
             }
 
@@ -312,5 +325,33 @@ impl<A: Actor> Context<A> {
             self.pending_tells.clear();
             self.pending_spawns.clear();
         }
+    }
+
+    // ── Refine output packing (framework-internal) ───────────────────
+
+    /// Drain the pending effect queues into a `RefinePayload` ready to be
+    /// emitted as the refine output. Used by `run_refine_service`.
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn drain_into_refine_payload(
+        &mut self,
+        state: Vec<u8>,
+        reply: Vec<u8>,
+    ) -> crate::refine_payload::RefinePayload {
+        use crate::refine_payload::{Effect, RefinePayload};
+        let mut effects: Vec<Effect> = Vec::new();
+        for (key, value) in self.pending_writes.drain(..) {
+            effects.push(Effect::Write { key, value });
+        }
+        for tell in self.pending_tells.drain(..) {
+            effects.push(Effect::Transfer {
+                target: tell.target.0,
+                memo: tell.payload,
+            });
+        }
+        for code_hash in self.pending_spawns.drain(..) {
+            effects.push(Effect::New { code_hash });
+        }
+        RefinePayload { state, reply, effects }
     }
 }

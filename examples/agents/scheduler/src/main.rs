@@ -55,9 +55,9 @@ impl Agent {
     fn new(children: Vec<u32>) -> Self {
         println!("agent: init");
 
-        // Self-schedule Start
-        let self_id = lifecycle::service_id();
-        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &AgentMsg::Start(Start).to_bytes());
+        // The host kicks us with a dynamic `start` message — no need to
+        // self-schedule from the constructor (refine forbids raw
+        // TRANSFER hostcalls).
 
         Agent {
             round: 0,

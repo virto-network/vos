@@ -143,6 +143,53 @@ fn cooperative_loop_with_greeter() {
 }
 
 #[test]
+fn refine_round_commits_once() {
+    // Smoke test for the refine journal commit path. The scheduler agent
+    // is a full service (built with the `service` feature) — its
+    // `save_state` issues a real `WRITE` hostcall during refine, which
+    // the runtime journals and then commits to storage. We verify that
+    // after a single `run()` the persisted state is present and that
+    // there is no leftover work in the pending-transfers queue.
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let blob = transpile_actor(&agent_data);
+
+    let mut rt = VosRuntime::new();
+    let id = register_svc(&mut rt, blob);
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
+
+    let before = rt.storage.read(id, b"__vos_actor_state").map(|v| v.to_vec());
+    assert!(before.is_none(), "state should be empty before first tick");
+
+    rt.send_to(id, Vec::new());
+    rt.run();
+
+    let after = rt.storage.read(id, b"__vos_actor_state");
+    assert!(
+        after.is_some(),
+        "refine journal WRITE should have been committed to storage after tick"
+    );
+
+    // No further work should be pending: journal had no cross-service
+    // transfers and no self-messages beyond what the single tick consumed.
+    assert!(!rt.has_work(), "no leftover pending_transfers expected");
+}
+
+#[test]
 fn runtime_multiple_services_same_blob() {
     // Register same blob twice — both services are independent.
     let elf = example_elf("greeter");

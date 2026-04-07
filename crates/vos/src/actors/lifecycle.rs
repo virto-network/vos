@@ -26,6 +26,12 @@ pub const INIT_KEY: &[u8] = b"__vos_init";
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
 
+/// Public alias of `STATE_KEY` so the refine/accumulate framework code can
+/// reference it without re-declaring the constant. Always available — even
+/// without the `service` feature — so non-service callers can interpret
+/// refine output payloads.
+pub const STATE_KEY_BYTES: &[u8] = b"__vos_actor_state";
+
 /// Result of dispatching a single message.
 pub enum DispatchResult {
     /// Message processed, continue with next.
