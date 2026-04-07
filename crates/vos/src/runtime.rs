@@ -60,18 +60,9 @@ use vos_abi::service::ServiceId;
 use std::collections::HashMap;
 use std::io::Write;
 
+use crate::actors::lifecycle::CONTINUATION_HEADER_KEY;
 use crate::data_layer::{DataLayer, MemoryDataLayer};
 use crate::pvm_image::{self, ContinuationHeader};
-
-/// Per-service storage key under which the runtime stores the
-/// (small) [`ContinuationHeader`] for a suspended PVM. The body
-/// (flat_mem) lives in the [`DataLayer`] keyed by the header's
-/// commitment hash. Together they reconstitute the full PVM image.
-///
-/// The leading NUL keeps this key out of any space a guest actor
-/// might use; guest keys originate from `Encode`d Rust types whose
-/// rkyv prefixes never start with `\0`.
-const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
 
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
@@ -533,11 +524,16 @@ impl<D: DataLayer> VosRuntime<D> {
     }
 
     /// Whether a service has a suspended PVM continuation. The
-    /// canonical signal is the [`ContinuationHeader`] sitting in
+    /// canonical signal is a *decodable* [`ContinuationHeader`] in
     /// service storage; the body in the data layer is keyed by that
-    /// header's commitment.
+    /// header's commitment. An empty or malformed header bytes
+    /// entry — which the framework writes when refine completes
+    /// without `continue_next` — counts as "not suspended".
     pub fn is_suspended(&self, id: ServiceId) -> bool {
-        self.storage.read(id, CONTINUATION_HEADER_KEY).is_some()
+        self.storage
+            .read(id, CONTINUATION_HEADER_KEY)
+            .and_then(ContinuationHeader::decode)
+            .is_some()
     }
 
     /// Run one round: process all services with pending items.
@@ -683,13 +679,47 @@ impl<D: DataLayer> VosRuntime<D> {
             };
 
             // Peek at the continue_next flag so we can re-queue the
-            // service after accumulate commits.
+            // service and decide whether to capture a continuation.
             let continue_next = crate::refine_payload::RefinePayload::decode(&refine_output)
                 .map(|p| p.continue_next)
                 .unwrap_or(false);
 
+            // Capture the continuation (header, body) now, *before*
+            // accumulate runs. Bodies are too large to round-trip
+            // through the `WRITE` hostcall so the host stores them
+            // directly in the data layer, keyed by commitment. The
+            // small header is handed to accumulate as a second FETCH
+            // item; the guest's `run_accumulate_service` persists it
+            // via a real `WRITE` hostcall so the only code path that
+            // mutates service storage is still an accumulate-phase
+            // hostcall, matching JAM's commit discipline.
+            //
+            // When `!continue_next`, we pass an empty header so the
+            // guest writes an empty value; `is_suspended` treats an
+            // undecodable (including empty) header as "not suspended",
+            // which cleans up any prior continuation marker.
+            let continuation_header_bytes = if continue_next {
+                let (header, body) = pvm_image::capture(&refine_pvm, prior_iters + 1);
+                // GC: drop the prior body if its commitment changed.
+                if let Some(old) = &prior_header {
+                    if old.commitment != header.commitment {
+                        data_layer.remove(&old.commitment).await;
+                    }
+                }
+                data_layer.put(header.commitment, body).await;
+                header.encode()
+            } else {
+                if let Some(old) = &prior_header {
+                    data_layer.remove(&old.commitment).await;
+                }
+                Vec::new()
+            };
+
             // ── Stage 2: accumulate (PC=5) ────────────────────────
-            let mut acc_items: Vec<Vec<u8>> = vec![refine_output];
+            // FETCH layout:
+            //   item 1: refine output (RefinePayload — effects/state/reply)
+            //   item 2: continuation header bytes (possibly empty)
+            let mut acc_items: Vec<Vec<u8>> = vec![refine_output, continuation_header_bytes];
             let mut acc_pvm = match initialize_program_at(blob, &[], accumulate_gas, 5) {
                 Some(p) => p,
                 None => {
@@ -707,29 +737,8 @@ impl<D: DataLayer> VosRuntime<D> {
                 &mut new_transfers,
             );
 
-            // If the guest yielded mid-round, capture the live PVM as
-            // (header, body): header → service storage, body → data
-            // layer keyed by its commitment. GC the old body if the
-            // commitment changed. Otherwise drop any prior
-            // continuation — the service finished its work and should
-            // cold-start next.
             if continue_next {
-                let (header, body) = pvm_image::capture(&refine_pvm, prior_iters + 1);
-                // GC: if the old body's commitment is different, drop it.
-                if let Some(old) = &prior_header {
-                    if old.commitment != header.commitment {
-                        data_layer.remove(&old.commitment).await;
-                    }
-                }
-                data_layer.put(header.commitment, body).await;
-                // Persist header last so readers never see a header
-                // whose body isn't yet in the data layer.
-                let encoded = header.encode();
-                storage.write(ServiceId(svc_id), CONTINUATION_HEADER_KEY, &encoded);
                 new_transfers.push((ServiceId(svc_id), Vec::new()));
-            } else if let Some(old) = &prior_header {
-                data_layer.remove(&old.commitment).await;
-                storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
             }
         }
 

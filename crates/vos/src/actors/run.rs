@@ -314,31 +314,39 @@ pub fn run_accumulate_service<A: super::Actor>() {
     // currently consumes the inner refine payload directly. A follow-up
     // commit will switch the FETCH layout to include the full operand
     // header so the same blob is bit-identical with on-chain accumulate.
+    // FETCH 1: the refine output payload (effects to replay).
     let mut buf = [0u8; BUF_SIZE];
-    loop {
-        let n = lifecycle::fetch_raw(&mut buf);
-        if n == 0 { break; }
-        let payload = match RefinePayload::decode(&buf[..n]) {
-            Some(p) => p,
-            None => continue, // skip malformed operand
-        };
-        for eff in payload.effects {
-            match eff {
-                Effect::Write { key, value } => {
-                    hostcalls::write(&key, &value);
-                }
-                Effect::Transfer { target, memo } => {
-                    hostcalls::transfer(ServiceId(target), 0, 0, &memo);
-                }
-                Effect::Provide { hash, data } => {
-                    hostcalls::provide(&hash, &data);
-                }
-                Effect::New { code_hash } => {
-                    hostcalls::new_service(&code_hash);
+    let n = lifecycle::fetch_raw(&mut buf);
+    if n > 0 {
+        if let Some(payload) = RefinePayload::decode(&buf[..n]) {
+            for eff in payload.effects {
+                match eff {
+                    Effect::Write { key, value } => {
+                        hostcalls::write(&key, &value);
+                    }
+                    Effect::Transfer { target, memo } => {
+                        hostcalls::transfer(ServiceId(target), 0, 0, &memo);
+                    }
+                    Effect::Provide { hash, data } => {
+                        hostcalls::provide(&hash, &data);
+                    }
+                    Effect::New { code_hash } => {
+                        hostcalls::new_service(&code_hash);
+                    }
                 }
             }
         }
     }
+
+    // FETCH 2: continuation header bytes (possibly empty). The host
+    // captured the live PVM image after refine halted and built the
+    // small header here; we persist it via a real WRITE so storage
+    // mutation only ever flows through accumulate-phase hostcalls.
+    // Empty bytes mean "no continuation" — `is_suspended` rejects
+    // undecodable headers, so writing an empty value cleans up any
+    // prior continuation marker idempotently.
+    let n = lifecycle::fetch_raw(&mut buf);
+    hostcalls::write(lifecycle::CONTINUATION_HEADER_KEY, &buf[..n]);
 
     halt();
 }

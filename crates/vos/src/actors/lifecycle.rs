@@ -22,6 +22,17 @@ pub(crate) const BUF_SIZE: usize = 4096;
 /// The host writes rkyv-encoded init args here before first run.
 pub const INIT_KEY: &[u8] = b"__vos_init";
 
+/// Per-service storage key under which the runtime records a
+/// suspended PVM's `ContinuationHeader`. Written by the framework's
+/// `run_accumulate_service` via a real `WRITE` hostcall when refine
+/// set `continue_next = true`; read by the runtime at the start of
+/// the next tick to rehydrate.
+///
+/// The leading NUL keeps this key disjoint from any guest-chosen
+/// key: guest keys originate from `Encode`d Rust types whose rkyv
+/// prefixes never begin with `\0`.
+pub const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
+
 /// Storage key for persisted actor state.
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
