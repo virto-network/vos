@@ -239,7 +239,7 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
         _ => transpile_elf(&agent_data, &manifest.service.name),
     };
     let agent_blob_idx = runtime.register_service_blob(agent_blob);
-    let agent_id = runtime.register_service_from_service_blob(agent_blob_idx);
+    let agent_id = runtime.register_service(agent_blob_idx);
     eprintln!("  registered '{}' as service {agent_id:?}", manifest.service.name);
 
     // Step 2: Register actor blobs (dual-entry: refine at PC=0, accumulate at PC=5)
@@ -254,7 +254,7 @@ fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
             _ => transpile_elf(&data, &actor_def.name),
         };
         let blob_idx = runtime.register_service_blob(blob);
-        let id = runtime.register_service_from_service_blob(blob_idx);
+        let id = runtime.register_service(blob_idx);
         eprintln!("  registered '{}' as service {id:?}", actor_def.name);
         actor_ids.push(id);
 

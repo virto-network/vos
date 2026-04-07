@@ -26,7 +26,7 @@ fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
 /// Register a service blob and create a service (dual-entry, accumulate at PC=5).
 fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos_abi::service::ServiceId {
     let blob_idx = rt.register_service_blob(blob);
-    rt.register_service_from_service_blob(blob_idx)
+    rt.register_service(blob_idx)
 }
 
 #[test]
@@ -122,11 +122,11 @@ fn cooperative_loop_with_greeter() {
 
     // Register agent as service
     let agent_blob_idx = rt.register_service_blob(agent_blob);
-    let agent_id = rt.register_service_from_service_blob(agent_blob_idx);
+    let agent_id = rt.register_service(agent_blob_idx);
 
     // Register greeter as service blob (dual-entry for invoke at PC=0)
     let greeter_blob_idx = rt.register_service_blob(greeter_blob);
-    let greeter_id = rt.register_service_from_service_blob(greeter_blob_idx);
+    let greeter_id = rt.register_service(greeter_blob_idx);
 
     // Write init args (children = [greeter_id])
     let args = vos::init::InitArgs::new()
@@ -197,8 +197,8 @@ fn runtime_multiple_services_same_blob() {
 
     let mut rt = VosRuntime::new();
     let blob_idx = rt.register_service_blob(blob);
-    let id1 = rt.register_service_from_service_blob(blob_idx);
-    let id2 = rt.register_service_from_service_blob(blob_idx);
+    let id1 = rt.register_service(blob_idx);
+    let id2 = rt.register_service(blob_idx);
 
     assert_ne!(id1, id2);
 }
