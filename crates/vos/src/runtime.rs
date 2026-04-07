@@ -61,7 +61,17 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::data_layer::{DataLayer, MemoryDataLayer};
-use crate::pvm_image;
+use crate::pvm_image::{self, ContinuationHeader};
+
+/// Per-service storage key under which the runtime stores the
+/// (small) [`ContinuationHeader`] for a suspended PVM. The body
+/// (flat_mem) lives in the [`DataLayer`] keyed by the header's
+/// commitment hash. Together they reconstitute the full PVM image.
+///
+/// The leading NUL keeps this key out of any space a guest actor
+/// might use; guest keys originate from `Encode`d Rust types whose
+/// rkyv prefixes never start with `\0`.
+const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
 
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
@@ -404,6 +414,10 @@ impl ServiceStorage {
     pub fn write(&mut self, service: ServiceId, key: &[u8], value: &[u8]) {
         self.data.insert((service.0, key.to_vec()), value.to_vec());
     }
+
+    pub fn delete(&mut self, service: ServiceId, key: &[u8]) {
+        self.data.remove(&(service.0, key.to_vec()));
+    }
 }
 
 // --- Service registry ---
@@ -525,11 +539,12 @@ impl<D: DataLayer> VosRuntime<D> {
         !self.pending_transfers.is_empty()
     }
 
-    /// Whether a service has a suspended PVM image in the data layer.
-    /// True between a `continue_next` yield and either the next
-    /// completing tick or eviction (panic / max iterations).
+    /// Whether a service has a suspended PVM continuation. The
+    /// canonical signal is the [`ContinuationHeader`] sitting in
+    /// service storage; the body in the data layer is keyed by that
+    /// header's commitment.
     pub fn is_suspended(&self, id: ServiceId) -> bool {
-        self.data.contains(id)
+        self.storage.read(id, CONTINUATION_HEADER_KEY).is_some()
     }
 
     /// Run one round: process all services with pending items.
@@ -595,43 +610,66 @@ impl<D: DataLayer> VosRuntime<D> {
                 }
             };
 
-            let prior_iters = iters_map.get(&svc_id).copied().unwrap_or(0);
-            if prior_iters >= MAX_REFINE_ITERATIONS {
+            // Read the suspended header (if any) from service storage.
+            // Header lives on-chain in a real deployment; body comes
+            // from the data layer. iters is part of the header.
+            let prior_header: Option<ContinuationHeader> = storage
+                .read(ServiceId(svc_id), CONTINUATION_HEADER_KEY)
+                .and_then(ContinuationHeader::decode);
+            let prior_iters = prior_header.as_ref().map(|h| h.iters).unwrap_or(0);
+            if prior_iters as usize >= MAX_REFINE_ITERATIONS {
                 eprintln!(
                     "vosx: service {svc_id} hit MAX_REFINE_ITERATIONS ({}); evicting continuation",
                     MAX_REFINE_ITERATIONS
                 );
-                data_layer.remove(ServiceId(svc_id)).await;
+                if let Some(h) = &prior_header {
+                    data_layer.remove(&h.commitment).await;
+                }
+                storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
                 iters_map.remove(&svc_id);
                 continue;
             }
 
-            // Warm restart: fetch the captured image from the data
-            // layer and rehydrate on top of the fresh PVM. We fetch a
-            // *copy* (not remove) so a refine panic/OOG below leaves
-            // the prior image intact for an idempotent retry.
-            let mut refine_pvm = match data_layer.get(ServiceId(svc_id)).await {
-                Some(image) => match pvm_image::restore(fresh, image) {
-                    Some(p) => {
-                        let mut p = p;
-                        // Graft a fresh register/pc/gas frame on top
-                        // of the preserved flat_mem so `_start`
-                        // re-enters cleanly.
-                        let reinit = match initialize_program(blob, &[], refine_gas) {
-                            Some(r) => r,
-                            None => continue,
-                        };
-                        p.registers = reinit.registers;
-                        p.pc = reinit.pc;
-                        p.gas = refine_gas;
-                        p.need_gas_charge = reinit.need_gas_charge;
-                        p
-                    }
+            // Warm restart: pull the body from the data layer using
+            // the header's commitment and rehydrate on top of the
+            // fresh PVM. We do **not** delete the prior header here —
+            // on refine panic/OOG below the prior continuation stays
+            // intact and the next tick can retry idempotently.
+            let mut refine_pvm = match &prior_header {
+                Some(h) => match data_layer.get(&h.commitment).await {
+                    Some(body) => match pvm_image::restore(fresh, h, body) {
+                        Some(mut p) => {
+                            // Graft a fresh register/pc/gas frame on
+                            // top of the preserved flat_mem so
+                            // `_start` re-enters cleanly.
+                            let reinit = match initialize_program(blob, &[], refine_gas) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            p.registers = reinit.registers;
+                            p.pc = reinit.pc;
+                            p.gas = refine_gas;
+                            p.need_gas_charge = reinit.need_gas_charge;
+                            p
+                        }
+                        None => {
+                            eprintln!(
+                                "vosx: service {svc_id} continuation body failed verification; cold-starting"
+                            );
+                            data_layer.remove(&h.commitment).await;
+                            storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
+                            iters_map.remove(&svc_id);
+                            match initialize_program(blob, &[], refine_gas) {
+                                Some(p) => p,
+                                None => continue,
+                            }
+                        }
+                    },
                     None => {
                         eprintln!(
-                            "vosx: service {svc_id} continuation image corrupt; cold-starting"
+                            "vosx: service {svc_id} continuation body missing from data layer; cold-starting"
                         );
-                        data_layer.remove(ServiceId(svc_id)).await;
+                        storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
                         iters_map.remove(&svc_id);
                         match initialize_program(blob, &[], refine_gas) {
                             Some(p) => p,
@@ -680,17 +718,36 @@ impl<D: DataLayer> VosRuntime<D> {
                 &mut new_transfers,
             );
 
-            // If the guest yielded mid-round, capture the live PVM
-            // image and hand it to the data layer so the next tick can
-            // resume from it. Otherwise drop any prior image — the
-            // service finished its work and should cold-start next.
+            // If the guest yielded mid-round, capture the live PVM as
+            // (header, body): header → service storage, body → data
+            // layer keyed by its commitment. GC the old body if the
+            // commitment changed. Otherwise drop any prior
+            // continuation — the service finished its work and should
+            // cold-start next.
             if continue_next {
-                let image = pvm_image::capture(&refine_pvm);
-                data_layer.put(ServiceId(svc_id), image).await;
-                iters_map.insert(svc_id, prior_iters + 1);
+                let (mut header, body) = pvm_image::capture(&refine_pvm, prior_iters + 1);
+                // GC: if the old body's commitment is different, drop it.
+                if let Some(old) = &prior_header {
+                    if old.commitment != header.commitment {
+                        data_layer.remove(&old.commitment).await;
+                    }
+                }
+                data_layer.put(header.commitment, body).await;
+                // Persist header last so readers never see a header
+                // whose body isn't yet in the data layer.
+                let encoded = header.encode();
+                // (mut binding kept so future fields like a monotonic
+                // sequence number can be bumped pre-encode without
+                // another clone.)
+                let _ = &mut header;
+                storage.write(ServiceId(svc_id), CONTINUATION_HEADER_KEY, &encoded);
+                iters_map.insert(svc_id, (prior_iters + 1) as usize);
                 new_transfers.push((ServiceId(svc_id), Vec::new()));
             } else {
-                data_layer.remove(ServiceId(svc_id)).await;
+                if let Some(old) = &prior_header {
+                    data_layer.remove(&old.commitment).await;
+                }
+                storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
                 iters_map.remove(&svc_id);
             }
         }

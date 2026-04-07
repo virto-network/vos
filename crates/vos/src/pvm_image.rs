@@ -1,192 +1,234 @@
-//! Serialize/deserialize a live `Pvm` as a DA blob.
+//! Serialize/deserialize a live `Pvm` continuation as a CoreVM-style
+//! split: a small **header** (PC + 13 registers + heap state +
+//! iters + a 32-byte commitment to flat_mem) plus a separate **body**
+//! (the flat_mem bytes themselves, content-addressed by that
+//! commitment).
 //!
-//! A VOS service's canonical state is its full PVM image — heap, stack,
-//! static rw_data, registers, pc. This module encodes that image as a
-//! flat byte vector that a [`DataLayer`](crate::data_layer::DataLayer)
-//! can persist and later hand back to [`restore`] to rehydrate the
-//! service where it left off.
+//! This mirrors how CoreVM-on-JAM persists continuations: the cheap,
+//! small metadata lives in the service's on-chain storage, while the
+//! bulky memory image lives in the data-availability layer keyed by
+//! its hash. JAM accumulate writes the header via `set_storage`; the
+//! refine reader on the next round fetches the body from DA by
+//! commitment and reassembles the live PVM.
 //!
-//! ## Wire format (version 1)
+//! ## Header wire format (version 2)
 //!
 //! ```text
 //! offset  size  field
 //! 0       4     magic = b"VPVM"
-//! 4       1     version = 1
+//! 4       1     version = 2
 //! 5       3     reserved
 //! 8       4     pc: u32 LE
 //! 12      4     heap_base: u32 LE
 //! 16      4     heap_top: u32 LE
 //! 20      1     need_gas_charge: u8
 //! 21      3     reserved
-//! 24      104   registers: 13 × u64 LE
-//! 128     4     flat_mem_len: u32 LE
-//! 132     N     flat_mem (tail — restore moves this out of the Vec)
+//! 24      4     iters: u32 LE
+//! 28      4     flat_mem_len: u32 LE
+//! 32      32    commitment: blake2b-256(flat_mem)
+//! 64      104   registers: 13 × u64 LE
+//! 168     -     end (HEADER_SIZE)
 //! ```
 //!
 //! Gas, code, bitmask, jump_table, and block_gas_costs are **not**
 //! serialized: they're either per-invocation (gas) or derived from the
 //! immutable blob (the rest). Rehydration re-runs `initialize_program`
-//! to rebuild those fields, then grafts the saved dynamic state on top.
+//! on the host side and grafts the persisted dynamic state on top.
 
 use alloc::vec::Vec;
 
 /// Byte layout magic: b"VPVM".
 const MAGIC: [u8; 4] = *b"VPVM";
-/// Current format version.
-pub const VERSION: u8 = 1;
-/// Size of the fixed-width header before the flat_mem tail.
-pub const HEADER_SIZE: usize = 132;
+/// Current header format version.
+pub const VERSION: u8 = 2;
+/// Size of the encoded continuation header.
+pub const HEADER_SIZE: usize = 168;
 
 #[cfg(feature = "std")]
 use javm::Pvm;
 
-/// Capture a live `Pvm` as a DA blob.
+/// Small persistable header for a suspended PVM continuation.
 ///
-/// Allocates a single `Vec<u8>` of size `HEADER_SIZE + flat_mem.len()`.
-#[cfg(feature = "std")]
-pub fn capture(pvm: &Pvm) -> Vec<u8> {
-    let flat_len = pvm.flat_mem.len();
-    let mut out = Vec::with_capacity(HEADER_SIZE + flat_len);
-    out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&[0u8; 3]);
-    out.extend_from_slice(&pvm.pc.to_le_bytes());
-    out.extend_from_slice(&pvm.heap_base.to_le_bytes());
-    out.extend_from_slice(&pvm.heap_top.to_le_bytes());
-    out.push(pvm.need_gas_charge as u8);
-    out.extend_from_slice(&[0u8; 3]);
-    for r in pvm.registers.iter() {
-        out.extend_from_slice(&r.to_le_bytes());
+/// This is what gets written to a service's on-chain storage. The
+/// `commitment` field is a blake2b-256 hash of the flat_mem body and
+/// is the lookup key into the [`DataLayer`](crate::data_layer::DataLayer).
+#[derive(Debug, Clone)]
+pub struct ContinuationHeader {
+    pub pc: u32,
+    pub heap_base: u32,
+    pub heap_top: u32,
+    pub need_gas_charge: bool,
+    pub iters: u32,
+    pub flat_mem_len: u32,
+    pub commitment: [u8; 32],
+    pub registers: [u64; 13],
+}
+
+impl ContinuationHeader {
+    /// Encode this header to a fixed-size byte vector.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_SIZE);
+        out.extend_from_slice(&MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(&self.pc.to_le_bytes());
+        out.extend_from_slice(&self.heap_base.to_le_bytes());
+        out.extend_from_slice(&self.heap_top.to_le_bytes());
+        out.push(self.need_gas_charge as u8);
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(&self.iters.to_le_bytes());
+        out.extend_from_slice(&self.flat_mem_len.to_le_bytes());
+        out.extend_from_slice(&self.commitment);
+        for r in self.registers.iter() {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        debug_assert_eq!(out.len(), HEADER_SIZE);
+        out
     }
-    out.extend_from_slice(&(flat_len as u32).to_le_bytes());
-    debug_assert_eq!(out.len(), HEADER_SIZE);
-    out.extend_from_slice(&pvm.flat_mem);
+
+    /// Decode a header from bytes. Returns `None` on malformed input.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < HEADER_SIZE {
+            return None;
+        }
+        if bytes[0..4] != MAGIC || bytes[4] != VERSION {
+            return None;
+        }
+        let pc = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let heap_base = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        let heap_top = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+        let need_gas_charge = bytes[20] != 0;
+        let iters = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+        let flat_mem_len = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
+        let mut commitment = [0u8; 32];
+        commitment.copy_from_slice(&bytes[32..64]);
+        let mut registers = [0u64; 13];
+        for (i, r) in registers.iter_mut().enumerate() {
+            let off = 64 + i * 8;
+            *r = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
+        }
+        Some(Self {
+            pc,
+            heap_base,
+            heap_top,
+            need_gas_charge,
+            iters,
+            flat_mem_len,
+            commitment,
+            registers,
+        })
+    }
+}
+
+/// Compute the data-layer commitment (blake2b-256) for a flat_mem body.
+#[cfg(feature = "std")]
+pub fn commit(flat_mem: &[u8]) -> [u8; 32] {
+    let h = blake2b_simd::Params::new().hash_length(32).hash(flat_mem);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_bytes());
     out
 }
 
-/// Rehydrate a `Pvm` from a captured image, on top of a freshly
+/// Capture a live PVM as `(header, body)`. The body is the raw
+/// flat_mem bytes; the header carries the commitment that addresses
+/// it in the data layer.
+#[cfg(feature = "std")]
+pub fn capture(pvm: &Pvm, iters: u32) -> (ContinuationHeader, Vec<u8>) {
+    let body = pvm.flat_mem.clone();
+    let commitment = commit(&body);
+    let header = ContinuationHeader {
+        pc: pvm.pc,
+        heap_base: pvm.heap_base,
+        heap_top: pvm.heap_top,
+        need_gas_charge: pvm.need_gas_charge,
+        iters,
+        flat_mem_len: body.len() as u32,
+        commitment,
+        registers: pvm.registers,
+    };
+    (header, body)
+}
+
+/// Rehydrate a `Pvm` from a header + body, on top of a freshly
 /// initialized program. The `fresh` PVM supplies `code`, `bitmask`,
 /// `jump_table`, `block_gas_costs`, and the initial `gas` budget; this
-/// function overwrites its dynamic fields with the saved image.
+/// function overwrites its dynamic fields with the persisted state.
 ///
-/// Takes the captured bytes **by value** so we can split the tail and
-/// move `flat_mem` into `fresh` without a second allocation.
-///
-/// Returns `None` if the image is malformed or the flat_mem length
-/// doesn't match what the blob expects.
+/// Returns `None` if the body length doesn't match the header, the
+/// commitment doesn't verify, or flat_mem layout disagrees with the
+/// fresh template.
 #[cfg(feature = "std")]
-pub fn restore(mut fresh: Pvm, mut image: Vec<u8>) -> Option<Pvm> {
-    if image.len() < HEADER_SIZE {
+pub fn restore(mut fresh: Pvm, header: &ContinuationHeader, body: Vec<u8>) -> Option<Pvm> {
+    if body.len() != header.flat_mem_len as usize {
         return None;
     }
-    if image[0..4] != MAGIC {
+    if body.len() != fresh.flat_mem.len() {
         return None;
     }
-    if image[4] != VERSION {
+    if commit(&body) != header.commitment {
         return None;
     }
-    let pc = u32::from_le_bytes(image[8..12].try_into().ok()?);
-    let heap_base = u32::from_le_bytes(image[12..16].try_into().ok()?);
-    let heap_top = u32::from_le_bytes(image[16..20].try_into().ok()?);
-    let need_gas_charge = image[20] != 0;
-
-    let mut registers = [0u64; 13];
-    for (i, r) in registers.iter_mut().enumerate() {
-        let off = 24 + i * 8;
-        *r = u64::from_le_bytes(image[off..off + 8].try_into().ok()?);
-    }
-
-    let flat_len = u32::from_le_bytes(image[128..132].try_into().ok()?) as usize;
-    if image.len() != HEADER_SIZE + flat_len {
-        return None;
-    }
-    // Sanity check: the rehydrated flat_mem must be the same length as
-    // the fresh one. Blob-derived memory layout is immutable.
-    if flat_len != fresh.flat_mem.len() {
-        return None;
-    }
-
-    // Zero-copy tail extraction: split off the header, leaving `image`
-    // holding only `flat_mem` bytes, then move it into `fresh`.
-    let flat_mem = image.split_off(HEADER_SIZE);
-    fresh.flat_mem = flat_mem;
-    fresh.pc = pc;
-    fresh.heap_base = heap_base;
-    fresh.heap_top = heap_top;
-    fresh.need_gas_charge = need_gas_charge;
-    fresh.registers = registers;
-
+    fresh.flat_mem = body;
+    fresh.pc = header.pc;
+    fresh.heap_base = header.heap_base;
+    fresh.heap_top = header.heap_top;
+    fresh.need_gas_charge = header.need_gas_charge;
+    fresh.registers = header.registers;
     Some(fresh)
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use javm::program::initialize_program;
-
-    // Minimal valid PVM blob: one halt instruction.
-    // This is brittle; a simpler approach is to round-trip against
-    // whatever `initialize_program` gives us for an empty/near-empty
-    // blob. For now, just test the header encoding/decoding by hand.
 
     #[test]
-    fn header_size_is_132() {
-        assert_eq!(HEADER_SIZE, 132);
+    fn header_size_is_168() {
+        assert_eq!(HEADER_SIZE, 168);
     }
 
     #[test]
-    fn roundtrip_header_fields() {
-        // Fabricate a capture-shaped vector by hand, then decode it.
-        let flat = vec![0xAB; 16];
-        let mut img = Vec::with_capacity(HEADER_SIZE + flat.len());
-        img.extend_from_slice(&MAGIC);
-        img.push(VERSION);
-        img.extend_from_slice(&[0; 3]);
-        img.extend_from_slice(&0x1234u32.to_le_bytes()); // pc
-        img.extend_from_slice(&0x1000u32.to_le_bytes()); // heap_base
-        img.extend_from_slice(&0x2000u32.to_le_bytes()); // heap_top
-        img.push(1);
-        img.extend_from_slice(&[0; 3]);
-        for i in 0..13u64 {
-            img.extend_from_slice(&(i * 100).to_le_bytes());
-        }
-        img.extend_from_slice(&(flat.len() as u32).to_le_bytes());
-        img.extend_from_slice(&flat);
-
-        assert_eq!(img.len(), HEADER_SIZE + flat.len());
-        assert_eq!(&img[0..4], &MAGIC);
-        assert_eq!(img[4], VERSION);
-
-        // Manual decode (mirrors restore, without needing a real Pvm).
-        let pc = u32::from_le_bytes(img[8..12].try_into().unwrap());
-        assert_eq!(pc, 0x1234);
-        let flat_len =
-            u32::from_le_bytes(img[128..132].try_into().unwrap()) as usize;
-        assert_eq!(flat_len, 16);
-        assert_eq!(&img[HEADER_SIZE..], &flat[..]);
+    fn header_roundtrip() {
+        let h = ContinuationHeader {
+            pc: 0x1234,
+            heap_base: 0x1000,
+            heap_top: 0x2000,
+            need_gas_charge: true,
+            iters: 7,
+            flat_mem_len: 16,
+            commitment: [0xAB; 32],
+            registers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        };
+        let bytes = h.encode();
+        assert_eq!(bytes.len(), HEADER_SIZE);
+        let d = ContinuationHeader::decode(&bytes).unwrap();
+        assert_eq!(d.pc, 0x1234);
+        assert_eq!(d.heap_base, 0x1000);
+        assert_eq!(d.heap_top, 0x2000);
+        assert!(d.need_gas_charge);
+        assert_eq!(d.iters, 7);
+        assert_eq!(d.flat_mem_len, 16);
+        assert_eq!(d.commitment, [0xAB; 32]);
+        assert_eq!(d.registers[12], 12);
     }
 
     #[test]
     fn rejects_bad_magic() {
-        // We can't call restore without a real Pvm, so just check the
-        // header parsing precondition directly.
-        let mut img = vec![0u8; HEADER_SIZE];
-        img[0..4].copy_from_slice(b"XXXX");
-        assert_ne!(&img[0..4], &MAGIC);
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..4].copy_from_slice(b"XXXX");
+        assert!(ContinuationHeader::decode(&bytes).is_none());
     }
 
     #[test]
-    fn roundtrip_real_pvm() {
-        // Build a trivial PVM blob: one halt instruction at PC=0.
-        // djump to 0xFFFF0000 halts.
-        //   lui t1, 0x10         -> t1 = 0x10000
-        //   addi t1, t1, -1      -> t1 = 0xFFFF
-        //   slli t1, t1, 16      -> t1 = 0xFFFF0000
-        //   jalr x0, t1, 0       -> djump halt
-        let _ = initialize_program;
-        // Full program creation is done by the transpiler elsewhere;
-        // this test is just a compile-check that `restore` typechecks
-        // against `Pvm`. Actual end-to-end coverage lives in the
-        // integration tests that exercise the DataLayer via tick().
+    fn rejects_bad_version() {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&MAGIC);
+        bytes[4] = 0xFF;
+        assert!(ContinuationHeader::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn commit_is_deterministic() {
+        assert_eq!(commit(b"hello"), commit(b"hello"));
+        assert_ne!(commit(b"hello"), commit(b"world"));
     }
 }

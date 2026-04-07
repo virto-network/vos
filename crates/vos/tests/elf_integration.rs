@@ -209,26 +209,39 @@ fn data_layer_roundtrip_via_runtime() {
     // `ctx.sleep()`. That's the test that exercises
     // `pvm_image::capture`/`restore` against a real PVM image.
     use vos::data_layer::{DataLayer, MemoryDataLayer};
-    use vos::pvm_image::HEADER_SIZE;
+    use vos::pvm_image::{commit, ContinuationHeader};
+
+    // Build a body + matching header, put the body in the data
+    // layer, write the header into service storage, and verify the
+    // runtime sees the service as suspended.
+    let body = vec![0xAAu8; 64];
+    let commitment = commit(&body);
 
     let mut da = MemoryDataLayer::new();
+    assert!(!da.contains(&commitment));
+    pollster::block_on(da.put(commitment, body.clone()));
+    assert!(da.contains(&commitment));
+    assert_eq!(pollster::block_on(da.get(&commitment)).as_deref(), Some(&body[..]));
+
+    let header = ContinuationHeader {
+        pc: 0,
+        heap_base: 0,
+        heap_top: 0,
+        need_gas_charge: false,
+        iters: 1,
+        flat_mem_len: body.len() as u32,
+        commitment,
+        registers: [0; 13],
+    };
+    let encoded = header.encode();
+
+    let mut rt = VosRuntime::with_data_layer(da);
     let id = vos_abi::service::ServiceId(42);
-    assert!(!da.contains(id));
-
-    // Synthesize a minimally valid image — we never actually
-    // rehydrate it, just prove the runtime observes it through
-    // `is_suspended`.
-    let mut image = vec![0u8; HEADER_SIZE];
-    image[0..4].copy_from_slice(b"VPVM");
-    image[4] = vos::pvm_image::VERSION;
-    pollster::block_on(da.put(id, image.clone()));
-    assert!(da.contains(id));
-    assert_eq!(pollster::block_on(da.get(id)).as_deref(), Some(&image[..]));
-
-    let rt = VosRuntime::with_data_layer(da);
+    assert!(!rt.is_suspended(id));
+    rt.storage.write(id, b"\0__vos_cont", &encoded);
     assert!(
         rt.is_suspended(id),
-        "runtime should see the continuation that was written directly to the DataLayer"
+        "runtime should see the continuation header in service storage"
     );
 }
 
