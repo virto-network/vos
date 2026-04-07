@@ -7,11 +7,15 @@
 //! phase (refine vs accumulate). The `refine` and `accumulate` sub-modules
 //! define the phase-specific IDs.
 
-/// Shared hostcalls (same ID and semantics in both phases)
-pub const GAS: u32 = 0;
-pub const GROW_HEAP: u32 = 1;
+/// Shared hostcalls (same ID and semantics in both phases).
+///
+/// Slot 0 is reserved by the kernel for IPC/REPLY; slots >127 panic the VM.
+/// These IDs live inside the 1..=28 protocol-cap range. `GAS` and `FETCH`
+/// match the JAM canonical slot numbering used by `grey-state`.
+pub const GAS: u32 = 1;
 pub const FETCH: u32 = 2;
-pub const DEBUG_WRITE: u32 = 128;
+pub const GROW_HEAP: u32 = 11;
+pub const DEBUG_WRITE: u32 = 12;
 
 /// Refine-phase hostcalls (PC=0 entry point, stateless computation).
 pub mod refine {
