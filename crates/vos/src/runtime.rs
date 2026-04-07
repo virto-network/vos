@@ -457,12 +457,6 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// to survive process restarts or to push continuation blobs into
     /// a real on-chain DA lane.
     pub data: D,
-    /// Per-service consecutive-resume count, used to enforce
-    /// [`MAX_REFINE_ITERATIONS`] against runaway `continue_next`
-    /// loops. Kept in runtime memory rather than in the data layer:
-    /// resetting after a process restart just gives each resumed
-    /// service a fresh quota, which is the behaviour we want.
-    iters: HashMap<u32, usize>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -499,7 +493,6 @@ impl<D: DataLayer> VosRuntime<D> {
             pending_transfers: Vec::new(),
             gas,
             data,
-            iters: HashMap::new(),
         }
     }
 
@@ -581,7 +574,6 @@ impl<D: DataLayer> VosRuntime<D> {
         let storage = &mut self.storage;
         let preimages = &mut self.preimages;
         let data_layer = &mut self.data;
-        let iters_map = &mut self.iters;
         let refine_gas = self.gas.refine_gas;
         let accumulate_gas = self.gas.clamp_accumulate(self.gas.accumulate_gas_default);
 
@@ -626,7 +618,6 @@ impl<D: DataLayer> VosRuntime<D> {
                     data_layer.remove(&h.commitment).await;
                 }
                 storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
-                iters_map.remove(&svc_id);
                 continue;
             }
 
@@ -658,7 +649,6 @@ impl<D: DataLayer> VosRuntime<D> {
                             );
                             data_layer.remove(&h.commitment).await;
                             storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
-                            iters_map.remove(&svc_id);
                             match initialize_program(blob, &[], refine_gas) {
                                 Some(p) => p,
                                 None => continue,
@@ -670,7 +660,6 @@ impl<D: DataLayer> VosRuntime<D> {
                             "vosx: service {svc_id} continuation body missing from data layer; cold-starting"
                         );
                         storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
-                        iters_map.remove(&svc_id);
                         match initialize_program(blob, &[], refine_gas) {
                             Some(p) => p,
                             None => continue,
@@ -725,7 +714,7 @@ impl<D: DataLayer> VosRuntime<D> {
             // continuation — the service finished its work and should
             // cold-start next.
             if continue_next {
-                let (mut header, body) = pvm_image::capture(&refine_pvm, prior_iters + 1);
+                let (header, body) = pvm_image::capture(&refine_pvm, prior_iters + 1);
                 // GC: if the old body's commitment is different, drop it.
                 if let Some(old) = &prior_header {
                     if old.commitment != header.commitment {
@@ -736,19 +725,11 @@ impl<D: DataLayer> VosRuntime<D> {
                 // Persist header last so readers never see a header
                 // whose body isn't yet in the data layer.
                 let encoded = header.encode();
-                // (mut binding kept so future fields like a monotonic
-                // sequence number can be bumped pre-encode without
-                // another clone.)
-                let _ = &mut header;
                 storage.write(ServiceId(svc_id), CONTINUATION_HEADER_KEY, &encoded);
-                iters_map.insert(svc_id, (prior_iters + 1) as usize);
                 new_transfers.push((ServiceId(svc_id), Vec::new()));
-            } else {
-                if let Some(old) = &prior_header {
-                    data_layer.remove(&old.commitment).await;
-                }
+            } else if let Some(old) = &prior_header {
+                data_layer.remove(&old.commitment).await;
                 storage.delete(ServiceId(svc_id), CONTINUATION_HEADER_KEY);
-                iters_map.remove(&svc_id);
             }
         }
 
