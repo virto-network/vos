@@ -3,6 +3,21 @@
 //! Manages PVM instances per service, handles hostcalls, routes transfers
 //! between services across rounds.
 //!
+//! ## State model (CoreVM-on-JAM)
+//!
+//! VOS treats each service like CoreVM treats a guest: the canonical
+//! state of a service **is** its PVM image (flat_mem + registers +
+//! heap), not a serialized actor under a magic storage key. When refine
+//! halts mid-work via `ctx.yield_now()` / `ctx.sleep()`, the runtime
+//! captures that whole image into `continuations` and resumes from it
+//! on the next tick. This is the "continuity" property that lets
+//! actors run loops naturally across many ticks.
+//!
+//! Today the continuation map is in-process RAM (a "DA simulation").
+//! The same shape will later serialize each image to real on-chain DA
+//! so any validator can rehydrate and replay the exact same refine.
+//! Until that lands, a process restart cold-starts every service.
+//!
 //! ## Execution model (JAM-aligned)
 //!
 //! Each `tick()` runs each service with pending input through a real
@@ -47,6 +62,11 @@ use std::io::Write;
 
 const DEFAULT_GAS: Gas = 100_000_000;
 const MAX_INVOKE_DEPTH: usize = 8;
+/// Hard cap on how many refine→accumulate iterations a single service
+/// may run inside one `tick()` before the runtime stops re-queuing it.
+/// Protects the runtime from a misbuilt or malicious guest that sets
+/// `continue_next = true` forever without making progress.
+const MAX_REFINE_ITERATIONS: usize = 64;
 
 /// Per-stage gas budgets for one service tick.
 ///
@@ -183,6 +203,12 @@ enum HostcallOutcome {
 /// Refine-stage hostcall dispatch (PC=0). JAM-pure: read-only storage,
 /// no transfers, no preimage writes, no service spawning. `INVOKE` is
 /// allowed and runs the child at PC=0 with the same refine policy.
+///
+/// This is the **single** definition of what hostcalls a refining PVM
+/// may issue. Both the top-level service refine loop
+/// (`run_refine_stage`) and the nested-child invoke loop
+/// (`handle_invoke`) route through this function so the policy can
+/// only ever be wrong in one place.
 #[allow(clippy::too_many_arguments)]
 fn handle_refine_hostcall(
     pvm: &mut Pvm,
@@ -203,6 +229,9 @@ fn handle_refine_hostcall(
     invoke_side_transfers: &mut Vec<(ServiceId, Vec<u8>)>,
     // Same: preimages from nested invoke. Empty in pure refine.
     invoke_side_preimages: &mut HashMap<[u8; 32], Vec<u8>>,
+    // Recursive INVOKE depth — incremented each time we enter a child
+    // PVM. `handle_invoke` checks this against `MAX_INVOKE_DEPTH`.
+    depth: usize,
 ) -> HostcallOutcome {
     if handle_base_hostcall(pvm, call_id, items) {
         return HostcallOutcome::Handled;
@@ -253,7 +282,7 @@ fn handle_refine_hostcall(
                 services,
                 storage,
                 invoke_side_preimages,
-                0,
+                depth + 1,
                 invoke_side_transfers,
             );
             pvm.registers[7] = result;
@@ -396,6 +425,28 @@ pub struct VosRuntime {
     preimages: HashMap<[u8; 32], Vec<u8>>,
     pending_transfers: Vec<(ServiceId, Vec<u8>)>,
     gas: GasConfig,
+    /// Suspended refine PVMs — the **DA simulation**.
+    ///
+    /// VOS follows a CoreVM-style model on top of JAM: each service's
+    /// canonical state is its full PVM image (flat_mem + registers +
+    /// heap), not a serialized actor under a magic storage key. When a
+    /// service yields with `continue_next`, we capture that image here
+    /// so the next tick can resume from it.
+    ///
+    /// Today this map lives in process memory; the long-term plan is to
+    /// serialize each entry into real on-chain DA so every validator can
+    /// rehydrate the same image and replay refine deterministically.
+    /// Until then, a process restart cold-starts every service.
+    ///
+    /// `iters` is the consecutive-resume count, used to enforce
+    /// [`MAX_REFINE_ITERATIONS`] against runaway `continue_next` loops.
+    continuations: HashMap<u32, Continuation>,
+}
+
+/// One suspended PVM image plus runaway-loop accounting.
+struct Continuation {
+    pvm: Pvm,
+    iters: usize,
 }
 
 impl VosRuntime {
@@ -414,6 +465,7 @@ impl VosRuntime {
             preimages: HashMap::new(),
             pending_transfers: Vec::new(),
             gas,
+            continuations: HashMap::new(),
         }
     }
 
@@ -453,6 +505,13 @@ impl VosRuntime {
         !self.pending_transfers.is_empty()
     }
 
+    /// Whether a service has a suspended PVM image (DA continuation).
+    /// True between a `continue_next` yield and either the next
+    /// completing tick or eviction (panic / max iterations).
+    pub fn is_suspended(&self, id: ServiceId) -> bool {
+        self.continuations.contains_key(&id.0)
+    }
+
     /// Run one round: process all services with pending items.
     ///
     /// JAM-aligned two-stage execution per service:
@@ -486,6 +545,7 @@ impl VosRuntime {
         let services = &self.services;
         let storage = &mut self.storage;
         let preimages = &mut self.preimages;
+        let continuations = &mut self.continuations;
         let refine_gas = self.gas.refine_gas;
         let accumulate_gas = self.gas.clamp_accumulate(self.gas.accumulate_gas_default);
 
@@ -503,12 +563,39 @@ impl VosRuntime {
 
             // ── Stage 1: refine (PC=0) ────────────────────────────
             let mut refine_items = items;
-            let mut refine_pvm = match initialize_program(blob, &[], refine_gas) {
+            // Always build a fresh template — we need its initial register
+            // file (sp at top of stack, etc.) to set up a clean call frame.
+            let fresh = match initialize_program(blob, &[], refine_gas) {
                 Some(p) => p,
                 None => {
                     eprintln!("vosx: failed to init refine PVM for service {svc_id}");
                     continue;
                 }
+            };
+            // Warm restart: take the suspended PVM image (flat_mem
+            // includes heap + static rw_data preserved from last refine)
+            // and graft a fresh register/pc/gas frame on top so _start
+            // re-enters cleanly. We *clone* the cached entry rather than
+            // remove it, so a refine panic/OOG below can fall back to
+            // the unmutated image on retry.
+            let prior_iters = continuations.get(&svc_id).map(|c| c.iters).unwrap_or(0);
+            if prior_iters >= MAX_REFINE_ITERATIONS {
+                eprintln!(
+                    "vosx: service {svc_id} hit MAX_REFINE_ITERATIONS ({}); evicting continuation",
+                    MAX_REFINE_ITERATIONS
+                );
+                continuations.remove(&svc_id);
+                continue;
+            }
+            let mut refine_pvm = if let Some(cached) = continuations.get(&svc_id) {
+                let mut p = cached.pvm.clone();
+                p.registers = fresh.registers;
+                p.pc = fresh.pc;
+                p.gas = refine_gas;
+                p.need_gas_charge = fresh.need_gas_charge;
+                p
+            } else {
+                fresh
             };
 
             let refine_output = match run_refine_stage(
@@ -552,11 +639,19 @@ impl VosRuntime {
                 &mut new_transfers,
             );
 
-            // If the guest yielded mid-round, re-queue an empty wakeup
-            // so it runs again next tick. State was committed via
-            // STATE_KEY in accumulate; the next refine reloads via READ.
+            // If the guest yielded mid-round, snapshot the live PVM image
+            // so the next tick can resume from the same heap/state, and
+            // re-queue an empty wakeup. Otherwise drop any prior snapshot
+            // — the service finished its work and should cold-start next.
             if continue_next {
+                let next_iters = prior_iters + 1;
+                continuations.insert(
+                    svc_id,
+                    Continuation { pvm: refine_pvm.clone(), iters: next_iters },
+                );
                 new_transfers.push((ServiceId(svc_id), Vec::new()));
+            } else {
+                continuations.remove(&svc_id);
             }
         }
 
@@ -628,6 +723,7 @@ fn run_refine_stage(
                     storage,
                     &mut sink_transfers,
                     &mut sink_preimages,
+                    0,
                 ) {
                     HostcallOutcome::Handled => continue,
                     HostcallOutcome::Unknown => {
@@ -790,22 +886,31 @@ fn handle_invoke(
                 return 1;
             }
             ExitReason::HostCall(call_id) => {
-                if handle_base_hostcall(&mut child, call_id, &mut child_items) {
-                    continue;
-                }
-                match call_id {
-                    refine::INVOKE => {
-                        let mut nested = Vec::new();
-                        let result = handle_invoke(
-                            &mut child, blobs, blob_by_hash, services, storage, preimages,
-                            depth + 1, &mut nested,
-                        );
-                        transfers_out.extend(nested);
-                        child.registers[7] = result;
-                    }
-                    _ => {
-                        child.registers[7] = error::HOST_WHAT;
-                    }
+                // Route through the unified refine policy. The child
+                // PVM is itself refining (PC=0), so it gets exactly the
+                // same allowlist as a top-level refine — the sole place
+                // we declare what hostcalls a refining guest may issue.
+                let mut nested_transfers: Vec<(ServiceId, Vec<u8>)> = Vec::new();
+                let outcome = handle_refine_hostcall(
+                    &mut child,
+                    call_id,
+                    &mut child_items,
+                    target_svc_id.0,
+                    blobs,
+                    blob_by_hash,
+                    services,
+                    storage,
+                    &mut nested_transfers,
+                    preimages,
+                    depth,
+                );
+                // Refine is JAM-pure: a child cannot legitimately stage
+                // transfers up the chain. We surface them anyway for the
+                // accumulate stage to deal with, matching what a future
+                // bridged on-chain run would do.
+                transfers_out.extend(nested_transfers);
+                if matches!(outcome, HostcallOutcome::Unknown) {
+                    child.registers[7] = error::HOST_WHAT;
                 }
             }
         }

@@ -89,11 +89,17 @@ fn agent_service_lifecycle() {
     rt.send_to(id, Vec::new());
     rt.run();
 
-    // Agent persists state via main_loop's accumulate path
-    let state = rt.storage.read(id, b"__vos_actor_state");
+    // Under the CoreVM-on-JAM model the agent's state is its PVM
+    // image, not a serialized actor under STATE_KEY. With an empty
+    // children list the scheduler completes its init pass and the
+    // continuation is evicted on the final non-yielding tick.
     assert!(
-        state.is_some(),
-        "agent should persist actor state after init"
+        !rt.has_work(),
+        "scheduler should drain pending_transfers after init"
+    );
+    assert!(
+        !rt.is_suspended(id),
+        "scheduler with empty children list should run to completion"
     );
 }
 
@@ -138,18 +144,21 @@ fn cooperative_loop_with_greeter() {
     rt.send_to(agent_id, Vec::new());
     rt.run();
 
-    // Agent should have state persisted
-    assert!(rt.storage.read(agent_id, b"__vos_actor_state").is_some());
+    // Cooperative loop completes: scheduler eventually drains its
+    // run queue, the final tick is non-yielding, and both the
+    // continuation cache and the pending-transfers queue are empty.
+    assert!(!rt.has_work());
+    assert!(!rt.is_suspended(agent_id));
+    assert!(!rt.is_suspended(greeter_id));
 }
 
 #[test]
-fn refine_round_commits_once() {
-    // Smoke test for the refine journal commit path. The scheduler agent
-    // is a full service (built with the `service` feature) — its
-    // `save_state` issues a real `WRITE` hostcall during refine, which
-    // the runtime journals and then commits to storage. We verify that
-    // after a single `run()` the persisted state is present and that
-    // there is no leftover work in the pending-transfers queue.
+fn refine_completes_and_clears_continuation() {
+    // Smoke test for the CoreVM-on-JAM model: a service that completes
+    // its work in one tick should leave behind no continuation image
+    // and no pending transfers. (When a service yields mid-work, the
+    // continuation is preserved instead — covered by the cooperative
+    // loop test.)
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
         "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
@@ -172,20 +181,15 @@ fn refine_round_commits_once() {
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
 
-    let before = rt.storage.read(id, b"__vos_actor_state").map(|v| v.to_vec());
-    assert!(before.is_none(), "state should be empty before first tick");
+    assert!(!rt.is_suspended(id), "no continuation before first tick");
 
     rt.send_to(id, Vec::new());
     rt.run();
 
-    let after = rt.storage.read(id, b"__vos_actor_state");
     assert!(
-        after.is_some(),
-        "refine journal WRITE should have been committed to storage after tick"
+        !rt.is_suspended(id),
+        "scheduler with no children should run to completion (no DA continuation)"
     );
-
-    // No further work should be pending: journal had no cross-service
-    // transfers and no self-messages beyond what the single tick consumed.
     assert!(!rt.has_work(), "no leftover pending_transfers expected");
 }
 

@@ -226,45 +226,62 @@ pub const STATUS_OOG: u8 = 0x04;
 pub fn run_refine_service<A: super::Actor>() {
     use super::lifecycle::{self, DispatchResult, BUF_SIZE};
     use super::context::ServiceId;
+    use alloc::boxed::Box;
+    use core::ptr::addr_of_mut;
 
     set_refine_mode(true);
 
     let id = lifecycle::service_id();
     let mut ctx = super::Context::new(ServiceId(id));
 
-    // Read persisted state via the read-only READ hostcall.
+    // Warm-restart actor holder. Lives in static rw_data, which sits
+    // inside the PVM's flat_mem; the host preserves flat_mem across
+    // suspended ticks (the DA continuation), so on a warm restart this
+    // pointer still references a valid heap-allocated `A` from the
+    // previous refine call and we skip cold init entirely.
+    //
+    // Per-service uniqueness: each service has its own PVM instance
+    // with its own flat_mem, so each one gets its own copy of this
+    // static — even when two services share the same blob. Type-erased
+    // as `usize` because `A` differs per service; safe because PVM is
+    // single-threaded and the holder is only ever consulted by
+    // `run_refine_service::<A>` for the same `A` within one PVM image.
+    //
+    // No `STATE_KEY` involvement: under the CoreVM-on-JAM model the
+    // PVM image *is* the canonical state. Cold start = no DA image
+    // available, so we build a fresh actor (reading optional init args
+    // from `INIT_KEY` via `A::create`). Warm start = the actor is
+    // already alive in our heap; reuse it verbatim.
+    static mut ACTOR_HOLDER: usize = 0;
+    let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
+    let actor_ref: &mut A = unsafe {
+        if *holder_ptr == 0 {
+            let boxed = Box::new(lifecycle::load_or_create::<A>(None));
+            *holder_ptr = Box::into_raw(boxed) as usize;
+        }
+        &mut *(*holder_ptr as *mut A)
+    };
     let mut buf = [0u8; BUF_SIZE];
-    let state_len = lifecycle::read_persisted_state(&mut buf);
-    let state = if state_len > 0 { Some(&buf[..state_len]) } else { None };
-    let mut actor = lifecycle::load_or_create::<A>(state);
 
     // Dispatch messages. flush_effects() inside dispatch_one is a no-op
     // in refine mode — effects accumulate in the context's pending_* vecs.
     loop {
         let n = lifecycle::fetch_raw(&mut buf);
         if n == 0 { break; }
-        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
+        let result = lifecycle::dispatch_one::<A>(&buf[..n], actor_ref, &mut ctx);
         if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
             break;
         }
     }
 
-    // Pack: new state + buffered effects + reply → RefinePayload bytes.
-    // Note: under the new model the framework also writes STATE_KEY as a
-    // WRITE effect (added below) so the accumulate stage persists it.
-    let new_state_bytes = super::codec::Encode::encode(&actor);
+    // Pack: state-bytes-from-actor + buffered effects + reply →
+    // RefinePayload. The state field is currently informational only;
+    // the canonical state is the PVM image preserved across ticks.
+    // A future commit will replace this field with a real serialized
+    // PVM image so accumulate can persist it to on-chain DA.
+    let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
     let reply_bytes = ctx.take_reply_bytes();
-    let mut payload = ctx.drain_into_refine_payload(new_state_bytes.clone(), reply_bytes);
-
-    // Always include a STATE_KEY write so accumulate persists the new
-    // state. We use the same well-known key the lifecycle helpers use.
-    payload.effects.insert(
-        0,
-        crate::refine_payload::Effect::Write {
-            key: lifecycle::STATE_KEY_BYTES.to_vec(),
-            value: new_state_bytes,
-        },
-    );
+    let payload = ctx.drain_into_refine_payload(new_state_bytes, reply_bytes);
 
     let encoded = payload.encode();
     halt_with_output(&encoded);
