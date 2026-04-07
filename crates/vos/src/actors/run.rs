@@ -86,24 +86,20 @@ impl Future for Yield {
     }
 }
 
-/// A future returned by `ctx.ask()`.
-///
-/// On first invocation: returns `Pending` (triggers ask resolution in `dispatch_one`).
-/// On replay: returns `Ready(Ok(Value))` or `Ready(Err(InvokeError))`.
+/// A future returned by `ctx.ask()`. Always `Ready` from the first
+/// poll: the synchronous `INVOKE` hostcall has already populated the
+/// reply bytes by the time the guest returns from `ask_raw`. The
+/// `Future` impl exists purely so handlers can `.await` for ergonomics.
 pub struct Ask {
-    /// Raw reply bytes or error. Deserialized lazily in poll().
-    result: Option<Result<alloc::vec::Vec<u8>, super::value::InvokeError>>,
+    result: Result<alloc::vec::Vec<u8>, super::value::InvokeError>,
 }
 
 impl Ask {
     pub fn ready(result: alloc::vec::Vec<u8>) -> Self {
-        Self { result: Some(Ok(result)) }
+        Self { result: Ok(result) }
     }
     pub fn ready_err(err: super::value::InvokeError) -> Self {
-        Self { result: Some(Err(err)) }
-    }
-    pub fn pending() -> Self {
-        Self { result: None }
+        Self { result: Err(err) }
     }
 }
 
@@ -111,42 +107,24 @@ impl Future for Ask {
     type Output = Result<super::value::Value, super::value::InvokeError>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Move out by replacing with a sentinel error.
         let this = self.get_mut();
-        if let Some(result) = this.result.take() {
-            match result {
-                Ok(bytes) => {
-                    let value = if bytes.is_empty() {
-                        super::value::Value::Unit
-                    } else {
-                        <super::value::Value as super::codec::Decode>::decode(&bytes)
-                    };
-                    Poll::Ready(Ok(value))
-                }
-                Err(e) => Poll::Ready(Err(e)),
+        let result = core::mem::replace(
+            &mut this.result,
+            Err(super::value::InvokeError::Panicked),
+        );
+        match result {
+            Ok(bytes) => {
+                let value = if bytes.is_empty() {
+                    super::value::Value::Unit
+                } else {
+                    <super::value::Value as super::codec::Decode>::decode(&bytes)
+                };
+                Poll::Ready(Ok(value))
             }
-        } else {
-            Poll::Pending
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
-}
-
-// ── I/O suppression (ask-replay) ─────────────────────────────────────
-
-/// Global flag: suppress I/O (println! etc) during ask-replay re-dispatch.
-/// Safe because PVM is single-threaded.
-#[cfg(feature = "pvm")]
-static mut SUPPRESSING_IO: bool = false;
-
-/// Set the I/O suppression flag (framework-internal).
-#[cfg(feature = "pvm")]
-pub fn set_suppressing_io(v: bool) {
-    unsafe { SUPPRESSING_IO = v; }
-}
-
-/// Check if I/O is currently suppressed (ask-replay in progress).
-#[cfg(feature = "pvm")]
-pub fn is_suppressing_io() -> bool {
-    unsafe { SUPPRESSING_IO }
 }
 
 // ── Refine-mode flag (service framework) ──────────────────────────────

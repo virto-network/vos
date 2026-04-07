@@ -1,25 +1,19 @@
 //! I/O macros for guest actors — print!/println!/eprint!/eprintln!
-//! backed by DEBUG_WRITE hostcall.
-//!
-//! Output is automatically suppressed during ask-replay re-dispatch
-//! so that handlers don't produce duplicate output.
+//! backed by the DEBUG_WRITE hostcall.
 
 /// Print to debug output via DEBUG_WRITE hostcall.
-/// Suppressed during ask-replay.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
-        if !$crate::actors::run::is_suppressing_io() {
-            use core::fmt::Write;
-            struct __VosDbg;
-            impl core::fmt::Write for __VosDbg {
-                fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    $crate::__io::debug_write(s.as_bytes());
-                    Ok(())
-                }
+        use core::fmt::Write;
+        struct __VosDbg;
+        impl core::fmt::Write for __VosDbg {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                $crate::__io::debug_write(s.as_bytes());
+                Ok(())
             }
-            let _ = core::write!(__VosDbg, $($arg)*);
         }
+        let _ = core::write!(__VosDbg, $($arg)*);
     }};
 }
 
@@ -37,17 +31,15 @@ macro_rules! println {
 #[macro_export]
 macro_rules! eprint {
     ($($arg:tt)*) => {{
-        if !$crate::actors::run::is_suppressing_io() {
-            use core::fmt::Write;
-            struct __VosDbgErr;
-            impl core::fmt::Write for __VosDbgErr {
-                fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    $crate::__io::debug_write(s.as_bytes());
-                    Ok(())
-                }
+        use core::fmt::Write;
+        struct __VosDbgErr;
+        impl core::fmt::Write for __VosDbgErr {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                $crate::__io::debug_write(s.as_bytes());
+                Ok(())
             }
-            let _ = core::write!(__VosDbgErr, $($arg)*);
         }
+        let _ = core::write!(__VosDbgErr, $($arg)*);
     }};
 }
 

@@ -20,12 +20,6 @@ pub struct Context<A: Actor> {
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pending_spawns: Vec<[u8; 32]>,
 
-    // Ask resolution state
-    call_index: usize,
-    call_results: Vec<Result<Vec<u8>, super::value::InvokeError>>,
-    pending_ask: Option<PendingAsk>,
-    re_dispatching: bool,
-
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
 
@@ -45,12 +39,6 @@ struct PendingTell {
     payload: Vec<u8>,
 }
 
-/// A pending synchronous query awaiting execution.
-pub struct PendingAsk {
-    pub target: ServiceId,
-    pub payload: Vec<u8>,
-}
-
 impl<A: Actor> Context<A> {
     pub fn new(id: ServiceId) -> Self {
         Self {
@@ -59,22 +47,10 @@ impl<A: Actor> Context<A> {
             pending_tells: Vec::new(),
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
-            call_index: 0,
-            call_results: Vec::new(),
-            pending_ask: None,
-            re_dispatching: false,
             reply: None,
             self_schedule: false,
             sleep_ticks: 0,
             _phantom: core::marker::PhantomData,
-        }
-    }
-
-    /// Create a context with cached call results from a previous invocation (replay).
-    pub fn with_call_results(id: ServiceId, call_results: Vec<Result<Vec<u8>, super::value::InvokeError>>) -> Self {
-        Self {
-            call_results,
-            ..Self::new(id)
         }
     }
 
@@ -96,7 +72,6 @@ impl<A: Actor> Context<A> {
     /// Send raw bytes to another service (fire-and-forget).
     /// Prefer `tell()` for cross-actor dynamic messaging.
     pub fn tell_raw(&mut self, target: ServiceId, payload: &[u8]) {
-        if self.re_dispatching { return; }
         self.pending_tells.push(PendingTell {
             target,
             payload: payload.to_vec(),
@@ -141,28 +116,35 @@ impl<A: Actor> Context<A> {
     }
 
     /// Raw query — takes pre-encoded payload bytes.
-    /// Used internally by the framework. Prefer `ask()` for cross-actor queries.
+    ///
+    /// On guest builds (`pvm`) this issues an `INVOKE` hostcall
+    /// synchronously: the host runs the child to completion and writes
+    /// the reply into our buffer before returning. The returned `Ask`
+    /// is `Ready` from the first poll. No replay, no snapshots, no
+    /// pending state — the parent PVM is suspended at the ecall by the
+    /// host loop and resumes here with the reply already in hand.
+    ///
+    /// On non-guest builds (host tests, etc.) this returns
+    /// `InvokeError::NotFound` since there is no PVM to dispatch into.
     pub fn ask_raw(&mut self, target: ServiceId, payload: &[u8]) -> super::run::Ask {
-        if self.call_index < self.call_results.len() {
-            let result = self.call_results[self.call_index].clone();
-            self.call_index += 1;
-            // Last cached result consumed — we're live again
-            if self.call_index >= self.call_results.len() {
-                self.re_dispatching = false;
-                #[cfg(feature = "pvm")]
-                super::run::set_suppressing_io(false);
+        #[cfg(feature = "pvm")]
+        {
+            use super::lifecycle::{invoke_raw, InvokeResult};
+            use super::value::InvokeError;
+            match invoke_raw(target.0, payload, &[]) {
+                InvokeResult::Done { reply, .. } | InvokeResult::Yielded { reply, .. } => {
+                    super::run::Ask::ready(reply)
+                }
+                InvokeResult::Panicked => super::run::Ask::ready_err(InvokeError::Panicked),
+                InvokeResult::NotFound => super::run::Ask::ready_err(InvokeError::NotFound),
+                InvokeResult::OutOfGas => super::run::Ask::ready_err(InvokeError::OutOfGas),
+                InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
-            match result {
-                Ok(bytes) => super::run::Ask::ready(bytes),
-                Err(e) => super::run::Ask::ready_err(e),
-            }
-        } else {
-            self.pending_ask = Some(PendingAsk {
-                target,
-                payload: payload.to_vec(),
-            });
-            self.call_index += 1;
-            super::run::Ask::pending()
+        }
+        #[cfg(not(feature = "pvm"))]
+        {
+            let _ = (target, payload);
+            super::run::Ask::ready_err(super::value::InvokeError::NotFound)
         }
     }
 
@@ -172,11 +154,7 @@ impl<A: Actor> Context<A> {
     /// Each invocation runs one iteration; state is saved automatically.
     pub fn yield_now(&mut self) -> super::run::Yield {
         self.self_schedule = true;
-        if self.re_dispatching {
-            super::run::Yield::skip()
-        } else {
-            super::run::Yield::once()
-        }
+        super::run::Yield::once()
     }
 
     /// Checkpoint state and sleep for N ticks.
@@ -184,24 +162,18 @@ impl<A: Actor> Context<A> {
     pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
         self.sleep_ticks = ticks;
-        if self.re_dispatching {
-            super::run::Yield::skip()
-        } else {
-            super::run::Yield::once()
-        }
+        super::run::Yield::once()
     }
 
     // --- Storage ---
 
     /// Queue a key-value write to per-service storage.
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
-        if self.re_dispatching { return; }
         self.pending_writes.push((key.to_vec(), value.to_vec()));
     }
 
     /// Queue a new service spawn from a code hash.
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
-        if self.re_dispatching { return; }
         self.pending_spawns.push(code_hash);
     }
 
@@ -217,7 +189,6 @@ impl<A: Actor> Context<A> {
     /// The value is rkyv-encoded and included in the refine output.
     #[doc(hidden)]
     pub fn __set_reply(&mut self, value: super::value::Value) {
-        if self.re_dispatching { return; }
         // Don't store Unit replies — they carry no information
         if matches!(value, super::value::Value::Unit) { return; }
         self.reply = Some(super::codec::Encode::encode(&value));
@@ -244,42 +215,6 @@ impl<A: Actor> Context<A> {
     /// Get the number of ticks to sleep (0 = yield_now).
     pub fn sleep_ticks(&self) -> u32 {
         self.sleep_ticks
-    }
-
-    /// Take the pending ask request, if any.
-    pub fn take_pending_ask(&mut self) -> Option<PendingAsk> {
-        self.pending_ask.take()
-    }
-
-    /// Get the current call index (how far we've replayed).
-    pub fn call_index(&self) -> usize {
-        self.call_index
-    }
-
-    /// Get a reference to the cached call results.
-    pub fn call_results(&self) -> &[Result<Vec<u8>, super::value::InvokeError>] {
-        &self.call_results
-    }
-
-    /// Push a successful call result and reset for replay.
-    pub fn push_call_result_ok(&mut self, result: Vec<u8>) {
-        self.push_call_result_inner(Ok(result));
-    }
-
-    /// Push a failed call result and reset for replay.
-    pub fn push_call_result_err(&mut self, err: super::value::InvokeError) {
-        self.push_call_result_inner(Err(err));
-    }
-
-    fn push_call_result_inner(&mut self, result: Result<Vec<u8>, super::value::InvokeError>) {
-        self.call_results.push(result);
-        self.call_index = 0;
-        self.pending_ask = None;
-        self.re_dispatching = true;
-        self.self_schedule = false;
-        self.sleep_ticks = 0;
-        #[cfg(feature = "pvm")]
-        super::run::set_suppressing_io(true);
     }
 
     /// Flush all queued effects.

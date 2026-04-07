@@ -256,10 +256,13 @@ pub fn invoke_raw(
 
 // ── Message dispatch ──────────────────────────────────────────────
 
-/// Dispatch a single message to the actor, with ask resolution.
+/// Dispatch a single message to the actor.
 ///
-/// Decodes raw bytes to `A::Message`, calls `actor.dispatch()`.
-/// If the handler calls `ask()`, resolves it via `invoke()` and replays.
+/// Decodes raw bytes to `A::Message` and calls `actor.dispatch()` once.
+/// `ctx.ask()` resolves synchronously inside the handler via the
+/// `INVOKE` hostcall, so there is no ask-replay loop and no actor
+/// snapshot — a `Yielded` result here always means a real
+/// `yield_now` / `sleep` checkpoint, not an in-flight query.
 #[cfg(feature = "pvm")]
 pub fn dispatch_one<A: Actor>(
     raw: &[u8],
@@ -268,61 +271,24 @@ pub fn dispatch_one<A: Actor>(
 ) -> DispatchResult {
     // Decode message: if first byte is TAG_DYNAMIC, decode as dynamic Msg → FromDynamic;
     // otherwise decode as typed A::Message directly.
-    let decode_msg = |raw: &[u8]| -> Option<A::Message> {
-        if !raw.is_empty() && raw[0] == TAG_DYNAMIC {
-            let dynamic: super::value::Msg = Decode::decode(&raw[1..]);
-            A::Message::from_dynamic(&dynamic)
-        } else {
-            Some(A::Message::decode(raw))
-        }
-    };
-
-    // Snapshot actor state before dispatch. If ask-replay is needed,
-    // we restore the snapshot so mutations don't accumulate across replays.
-    let snapshot = actor.encode();
-
-    // Dispatch + ask resolution loop.
-    // When the handler awaits `ask()`, it yields Pending with a pending_ask set.
-    // We resolve the ask, push the result, restore state, and replay. This
-    // repeats until the handler either completes or yields for a real reason.
-    loop {
-        let msg = match decode_msg(raw) {
+    let msg = if !raw.is_empty() && raw[0] == TAG_DYNAMIC {
+        let dynamic: super::value::Msg = Decode::decode(&raw[1..]);
+        match A::Message::from_dynamic(&dynamic) {
             Some(m) => m,
             None => return DispatchResult::Skipped,
-        };
-        match actor.dispatch(msg, ctx) {
-            RunResult::Yielded => {
-                // Check if this yield was caused by an ask() suspension
-                if let Some(pending) = ctx.take_pending_ask() {
-                    match invoke_raw(pending.target.0, &pending.payload, &[]) {
-                        InvokeResult::Done { reply, .. } | InvokeResult::Yielded { reply, .. } => {
-                            ctx.push_call_result_ok(reply);
-                        }
-                        InvokeResult::Panicked => {
-                            ctx.push_call_result_err(super::value::InvokeError::Panicked);
-                        }
-                        InvokeResult::NotFound => {
-                            ctx.push_call_result_err(super::value::InvokeError::NotFound);
-                        }
-                        InvokeResult::OutOfGas => {
-                            ctx.push_call_result_err(super::value::InvokeError::OutOfGas);
-                        }
-                        InvokeResult::Error(s) => {
-                            ctx.push_call_result_err(super::value::InvokeError::Unknown(s));
-                        }
-                    }
-                    // Restore actor state to pre-dispatch snapshot
-                    *actor = A::decode(&snapshot);
-                    continue; // replay handler with cached result
-                }
-                // Real yield (yield_now / sleep)
-                ctx.flush_effects();
-                return DispatchResult::Yielded;
-            }
-            RunResult::Complete(stop) => {
-                ctx.flush_effects();
-                return if stop { DispatchResult::Stopped } else { DispatchResult::Continue };
-            }
+        }
+    } else {
+        A::Message::decode(raw)
+    };
+
+    match actor.dispatch(msg, ctx) {
+        RunResult::Yielded => {
+            ctx.flush_effects();
+            DispatchResult::Yielded
+        }
+        RunResult::Complete(stop) => {
+            ctx.flush_effects();
+            if stop { DispatchResult::Stopped } else { DispatchResult::Continue }
         }
     }
 }
