@@ -93,8 +93,8 @@ fn load_file(path: &Path, _name: &str) -> Vec<u8> {
 }
 
 fn transpile_elf(data: &[u8], name: &str) -> Vec<u8> {
-    eprintln!("  transpiling '{name}' via link_elf_service");
-    match grey_transpiler::link_elf_service(data) {
+    eprintln!("  transpiling '{name}' via link_elf");
+    match grey_transpiler::link_elf(data) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: transpiling '{name}': {e:?}");

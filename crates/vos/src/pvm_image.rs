@@ -44,8 +44,11 @@ pub const VERSION: u8 = 2;
 /// Size of the encoded continuation header.
 pub const HEADER_SIZE: usize = 168;
 
-#[cfg(feature = "std")]
-use javm::Pvm;
+// NOTE: `capture`/`restore` against a live `javm::Pvm` were removed when
+// VOS migrated to the new `InvocationKernel` API, which does not (yet)
+// expose a snapshot/restore surface. Only the `ContinuationHeader` type
+// survives, so callers that persist headers stay source-compatible
+// while the runtime cold-starts every tick.
 
 /// Small persistable header for a suspended PVM continuation.
 ///
@@ -127,54 +130,6 @@ pub fn commit(flat_mem: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(h.as_bytes());
     out
-}
-
-/// Capture a live PVM as `(header, body)`. The body is the raw
-/// flat_mem bytes; the header carries the commitment that addresses
-/// it in the data layer.
-#[cfg(feature = "std")]
-pub fn capture(pvm: &Pvm, iters: u32) -> (ContinuationHeader, Vec<u8>) {
-    let body = pvm.flat_mem.clone();
-    let commitment = commit(&body);
-    let header = ContinuationHeader {
-        pc: pvm.pc,
-        heap_base: pvm.heap_base,
-        heap_top: pvm.heap_top,
-        need_gas_charge: pvm.need_gas_charge,
-        iters,
-        flat_mem_len: body.len() as u32,
-        commitment,
-        registers: pvm.registers,
-    };
-    (header, body)
-}
-
-/// Rehydrate a `Pvm` from a header + body, on top of a freshly
-/// initialized program. The `fresh` PVM supplies `code`, `bitmask`,
-/// `jump_table`, `block_gas_costs`, and the initial `gas` budget; this
-/// function overwrites its dynamic fields with the persisted state.
-///
-/// Returns `None` if the body length doesn't match the header, the
-/// commitment doesn't verify, or flat_mem layout disagrees with the
-/// fresh template.
-#[cfg(feature = "std")]
-pub fn restore(mut fresh: Pvm, header: &ContinuationHeader, body: Vec<u8>) -> Option<Pvm> {
-    if body.len() != header.flat_mem_len as usize {
-        return None;
-    }
-    if body.len() != fresh.flat_mem.len() {
-        return None;
-    }
-    if commit(&body) != header.commitment {
-        return None;
-    }
-    fresh.flat_mem = body;
-    fresh.pc = header.pc;
-    fresh.heap_base = header.heap_base;
-    fresh.heap_top = header.heap_top;
-    fresh.need_gas_charge = header.need_gas_charge;
-    fresh.registers = header.registers;
-    Some(fresh)
 }
 
 #[cfg(all(test, feature = "std"))]
