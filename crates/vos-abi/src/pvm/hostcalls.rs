@@ -1,12 +1,13 @@
 //! Typed hostcall wrappers for PVM actors.
 //!
-//! Shared and refine-phase hostcalls are always available.
-//! Accumulate-phase hostcalls require the `service` feature.
+//! Hostcall IDs are spec-canonical JAR/JAM protocol cap slots. Phase
+//! discipline (which calls are legal in refine vs accumulate) is enforced
+//! by the host runtime, not the ID namespace.
 
-use crate::hostcall::{self, refine};
+use crate::hostcall;
 use super::ecall::*;
 
-// --- Shared hostcalls (both phases) ---
+// --- Shared across phases ---
 
 /// Get remaining gas.
 #[inline]
@@ -26,13 +27,13 @@ pub fn debug_write(data: &[u8]) -> u64 {
     ecall2(hostcall::DEBUG_WRITE, data.as_ptr() as u64, data.len() as u64)
 }
 
-// --- Refine-phase hostcalls ---
+// --- Refine-legal ---
 
-/// Read-only storage access (refine phase).
+/// Read-only storage access. Legal in both refine and accumulate.
 #[inline]
 pub fn peek(key: &[u8], value_buf: &mut [u8]) -> u64 {
     ecall4(
-        refine::PEEK,
+        hostcall::STORAGE_R,
         key.as_ptr() as u64,
         key.len() as u64,
         value_buf.as_mut_ptr() as u64,
@@ -50,7 +51,7 @@ pub fn invoke(
     output: &mut [u8],
 ) -> u64 {
     ecall5(
-        refine::INVOKE,
+        hostcall::INVOKE,
         code_hash.as_ptr() as u64,
         input.as_ptr() as u64,
         input.len() as u64,
@@ -76,29 +77,21 @@ pub fn fetch(hash: &[u8; 32], buf: &mut [u8]) -> u64 {
     )
 }
 
-// --- Accumulate-phase hostcalls (service feature only) ---
+// --- Accumulate-only (service feature) ---
 
-/// Read a value from per-service storage by key.
+/// Read a value from per-service storage by key. Alias for [`peek`].
 #[cfg(feature = "service")]
 #[inline]
 pub fn read(key: &[u8], value_buf: &mut [u8]) -> u64 {
-    use crate::hostcall::accumulate;
-    ecall4(
-        accumulate::READ,
-        key.as_ptr() as u64,
-        key.len() as u64,
-        value_buf.as_mut_ptr() as u64,
-        value_buf.len() as u64,
-    )
+    peek(key, value_buf)
 }
 
 /// Write a key-value pair to per-service storage.
 #[cfg(feature = "service")]
 #[inline]
 pub fn write(key: &[u8], value: &[u8]) -> u64 {
-    use crate::hostcall::accumulate;
     ecall4(
-        accumulate::WRITE,
+        hostcall::STORAGE_W,
         key.as_ptr() as u64,
         key.len() as u64,
         value.as_ptr() as u64,
@@ -110,9 +103,8 @@ pub fn write(key: &[u8], value: &[u8]) -> u64 {
 #[cfg(feature = "service")]
 #[inline]
 pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
-    use crate::hostcall::accumulate;
     ecall3(
-        accumulate::PROVIDE,
+        hostcall::PREIMAGE_PROVIDE,
         hash.as_ptr() as u64,
         data.as_ptr() as u64,
         data.len() as u64,
@@ -123,9 +115,8 @@ pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
 #[cfg(feature = "service")]
 #[inline]
 pub fn transfer(target: crate::service::ServiceId, amount: u64, gas_limit: u64, memo: &[u8]) -> u64 {
-    use crate::hostcall::accumulate;
     ecall5(
-        accumulate::TRANSFER,
+        hostcall::TRANSFER,
         target.0 as u64,
         amount,
         gas_limit,
@@ -138,32 +129,28 @@ pub fn transfer(target: crate::service::ServiceId, amount: u64, gas_limit: u64, 
 #[cfg(feature = "service")]
 #[inline]
 pub fn new_service(code_hash: &[u8; 32]) -> u64 {
-    use crate::hostcall::accumulate;
-    ecall1(accumulate::NEW, code_hash.as_ptr() as u64)
+    ecall1(hostcall::SERVICE_NEW, code_hash.as_ptr() as u64)
 }
 
 /// Create a gas checkpoint for intra-invocation rollback.
 #[cfg(feature = "service")]
 #[inline]
 pub fn checkpoint() -> u64 {
-    use crate::hostcall::accumulate;
-    ecall0(accumulate::CHECKPOINT)
+    ecall0(hostcall::CHECKPOINT)
 }
 
 /// Yield output data and signal completion status.
 #[cfg(feature = "service")]
 #[inline]
 pub fn yield_output(data: &[u8]) -> u64 {
-    use crate::hostcall::accumulate;
-    ecall2(accumulate::YIELD, data.as_ptr() as u64, data.len() as u64)
+    ecall2(hostcall::OUTPUT, data.as_ptr() as u64, data.len() as u64)
 }
 
 /// Get the current service's ID.
 #[cfg(feature = "service")]
 #[inline]
 pub fn info() -> u64 {
-    use crate::hostcall::accumulate;
-    ecall0(accumulate::INFO)
+    ecall0(hostcall::INFO)
 }
 
 /// Get the current service's own ID as ServiceId.

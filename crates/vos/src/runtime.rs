@@ -55,7 +55,7 @@
 use javm::program::{initialize_program, initialize_program_at};
 use javm::{ExitReason, Gas, Pvm};
 use vos_abi::error;
-use vos_abi::hostcall::{self, accumulate, refine};
+use vos_abi::hostcall;
 use vos_abi::service::ServiceId;
 use std::collections::HashMap;
 use std::io::Write;
@@ -250,13 +250,13 @@ fn handle_refine_hostcall(
 
     match call_id {
         // INFO — service id.
-        accumulate::INFO => {
+        hostcall::INFO => {
             pvm.registers[7] = svc_id as u64;
             HostcallOutcome::Handled
         }
         // READ — read-only storage. No journal overlay: refine cannot
         // have written anything, by construction.
-        accumulate::READ => {
+        hostcall::STORAGE_R => {
             let key = pvm_read(pvm, a0 as u32, a1 as usize);
             if let Some(value) = (*storage).read(id, &key) {
                 let copy_len = value.len().min(a3 as usize);
@@ -271,14 +271,14 @@ fn handle_refine_hostcall(
         // YIELD — accepted but no-op in refine. JAM treats yield_output
         // as a status emission; for refine we let the guest call it
         // harmlessly so the same lifecycle code can run in either stage.
-        accumulate::YIELD => {
+        hostcall::OUTPUT => {
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
         // INVOKE — child PVM at PC=0. Children run under the same refine
         // policy via `handle_invoke`, which already restricts to refine
         // hostcalls.
-        refine::INVOKE => {
+        hostcall::INVOKE => {
             let result = handle_invoke(
                 pvm,
                 blobs,
@@ -294,11 +294,11 @@ fn handle_refine_hostcall(
         }
         // Disallowed in refine — JAM-pure: any state-mutating call here
         // is a guest bug and we want it to fail loudly.
-        accumulate::WRITE
-        | accumulate::TRANSFER
-        | accumulate::PROVIDE
-        | accumulate::NEW
-        | accumulate::CHECKPOINT => {
+        hostcall::STORAGE_W
+        | hostcall::TRANSFER
+        | hostcall::PREIMAGE_PROVIDE
+        | hostcall::SERVICE_NEW
+        | hostcall::CHECKPOINT => {
             pvm.registers[7] = error::HOST_WHAT;
             HostcallOutcome::Handled
         }
@@ -331,15 +331,15 @@ fn handle_accumulate_hostcall(
     let id = ServiceId(svc_id);
 
     match call_id {
-        accumulate::YIELD => {
+        hostcall::OUTPUT => {
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
-        accumulate::INFO => {
+        hostcall::INFO => {
             pvm.registers[7] = svc_id as u64;
             HostcallOutcome::Handled
         }
-        accumulate::READ => {
+        hostcall::STORAGE_R => {
             let key = pvm_read(pvm, a0 as u32, a1 as usize);
             if let Some(value) = storage.read(id, &key) {
                 let copy_len = value.len().min(a3 as usize);
@@ -351,33 +351,33 @@ fn handle_accumulate_hostcall(
             }
             HostcallOutcome::Handled
         }
-        accumulate::WRITE => {
+        hostcall::STORAGE_W => {
             let key = pvm_read(pvm, a0 as u32, a1 as usize);
             let value = pvm_read(pvm, a2 as u32, a3 as usize);
             storage.write(id, &key, &value);
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
-        accumulate::PROVIDE => {
+        hostcall::PREIMAGE_PROVIDE => {
             let hash = pvm_read_hash(pvm, a0 as u32);
             let data = pvm_read(pvm, a1 as u32, a2 as usize);
             preimages.insert(hash, data);
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
-        accumulate::TRANSFER => {
+        hostcall::TRANSFER => {
             let target = ServiceId(a0 as u32);
             let memo = pvm_read(pvm, a3 as u32, a4 as usize);
             transfers_out.push((target, memo));
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
-        accumulate::NEW | accumulate::CHECKPOINT => {
+        hostcall::SERVICE_NEW | hostcall::CHECKPOINT => {
             pvm.registers[7] = error::HOST_OK;
             HostcallOutcome::Handled
         }
         // Forbidden in accumulate (commit-only): no INVOKE.
-        refine::INVOKE => {
+        hostcall::INVOKE => {
             pvm.registers[7] = error::HOST_WHAT;
             HostcallOutcome::Handled
         }
