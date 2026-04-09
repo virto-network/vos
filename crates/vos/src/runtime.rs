@@ -206,6 +206,9 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     pub storage: ServiceStorage,
     preimages: HashMap<[u8; 32], Vec<u8>>,
     pending_transfers: Vec<(ServiceId, Vec<u8>)>,
+    /// Count of services that panicked in refine this runtime's lifetime.
+    /// Exposed so tests can detect silent guest crashes.
+    pub panics: u32,
     gas: GasConfig,
     /// Pluggable data layer. Currently unused by the tick loop (we cold-
     /// start every tick), but retained so swap-in backends still compile.
@@ -236,6 +239,7 @@ impl<D: DataLayer> VosRuntime<D> {
             storage: ServiceStorage::new(),
             preimages: HashMap::new(),
             pending_transfers: Vec::new(),
+            panics: 0,
             gas,
             data,
         }
@@ -299,6 +303,7 @@ impl<D: DataLayer> VosRuntime<D> {
         let storage = &mut self.storage;
         let preimages = &mut self.preimages;
         let refine_gas = self.gas.refine_gas;
+        let panics = &mut self.panics;
 
         for (svc_id, mut items) in by_service {
             let info = match services.get(&svc_id) {
@@ -323,6 +328,11 @@ impl<D: DataLayer> VosRuntime<D> {
                 };
                 // φ[7] = 0 → refine phase.
                 kernel.set_active_reg(7, 0);
+                // Transition VM 0 from Ready → Running so kernel.run() executes.
+                let _ = kernel
+                    .vm_arena
+                    .vm_mut(0)
+                    .transition(javm::vm_pool::VmState::Running);
 
                 // Stage FETCH items (raw transfers become one item each).
                 let mut round_items = std::mem::take(&mut items);
@@ -350,6 +360,9 @@ impl<D: DataLayer> VosRuntime<D> {
                             break;
                         }
                     }
+                } else {
+                    *panics += 1;
+                    break;
                 }
 
                 // Re-enter on self-messages, else stop.
@@ -415,15 +428,43 @@ fn run_refine_kernel(
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
 ) -> Option<Vec<u8>> {
+    eprintln!("  [svc {svc_id}] run_refine_kernel entering, items={} first_len={}",
+        items.len(),
+        items.first().map(|v| v.len()).unwrap_or(0),
+    );
     loop {
-        match kernel.run() {
+        let result = kernel.run();
+        eprintln!("  [svc {svc_id}] kernel.run() -> {:?}", match &result {
+            KernelResult::Halt(v) => format!("Halt({v})"),
+            KernelResult::Panic => "Panic".into(),
+            KernelResult::OutOfGas => "OutOfGas".into(),
+            KernelResult::PageFault(a) => format!("PageFault({a:#x})"),
+            KernelResult::ProtocolCall { slot } => format!("ProtocolCall({slot})"),
+        });
+        match result {
             KernelResult::Halt(_exit) => {
                 let ptr = kernel.active_reg(7) as u32;
                 let len = (kernel.active_reg(8) as usize).min(1 << 20);
                 return Some(kread(kernel, ptr, len));
             }
             KernelResult::Panic => {
-                eprintln!("vosx: service {svc_id} panicked in refine");
+                let vm = kernel.vm_arena.vm(kernel.active_vm);
+                let pc = vm.pc;
+                let gas = vm.gas();
+                // Dump a window of PVM code bytes around the failing PC.
+                if let Some(parsed) = javm::program::parse_blob(blobs[0].as_slice()) {
+                    if let Some(code_cap) = parsed.caps.iter().find(|c| matches!(c.cap_type, javm::program::CapEntryType::Code)) {
+                        let cap_data = &parsed.data_section[code_cap.data_offset as usize..(code_cap.data_offset + code_cap.data_len) as usize];
+                        if let Some(code_blob) = javm::program::parse_code_blob(cap_data) {
+                            let start = pc.saturating_sub(8) as usize;
+                            let end = ((pc + 16) as usize).min(code_blob.code.len());
+                            eprintln!("vosx: code[{start}..{end}] = {:02x?}", &code_blob.code[start..end]);
+                        }
+                    }
+                }
+                let regs: Vec<String> = (0..13).map(|i| format!("φ{i}={:#x}", kernel.active_reg(i))).collect();
+                eprintln!("vosx: regs: {}", regs.join(" "));
+                eprintln!("vosx: service {svc_id} panicked in refine at PC={pc} gas={gas}");
                 return None;
             }
             KernelResult::OutOfGas => {
@@ -435,6 +476,15 @@ fn run_refine_kernel(
                 return None;
             }
             KernelResult::ProtocolCall { slot } => {
+                eprintln!(
+                    "  [svc {svc_id}] top ecalli slot={slot} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} phi12={:#x}",
+                    kernel.active_reg(7),
+                    kernel.active_reg(8),
+                    kernel.active_reg(9),
+                    kernel.active_reg(10),
+                    kernel.active_reg(11),
+                    kernel.active_reg(12),
+                );
                 handle_refine_hostcall(
                     kernel,
                     slot as u32,
@@ -629,6 +679,10 @@ fn handle_invoke(
         }
     };
     child.set_active_reg(7, 0); // refine
+    let _ = child
+        .vm_arena
+        .vm_mut(0)
+        .transition(javm::vm_pool::VmState::Running);
 
     // Children expect `[state_len:u32 LE][state][msg]` split into
     // separate FETCH items (FETCH#1=state, FETCH#2=msg) so they can

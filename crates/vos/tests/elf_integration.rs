@@ -101,6 +101,7 @@ fn agent_service_lifecycle() {
         !rt.is_suspended(id),
         "scheduler with empty children list should run to completion"
     );
+    assert_eq!(rt.panics, 0, "scheduler (empty children) panicked");
 }
 
 #[test]
@@ -150,6 +151,7 @@ fn cooperative_loop_with_greeter() {
     assert!(!rt.has_work());
     assert!(!rt.is_suspended(agent_id));
     assert!(!rt.is_suspended(greeter_id));
+    assert_eq!(rt.panics, 0, "no service should have panicked in refine");
 }
 
 #[test]
@@ -339,6 +341,25 @@ fn data_layer_survives_runtime_teardown() {
     assert!(!rt_b.has_work());
     assert!(!rt_b.is_suspended(b_agent_id));
     assert!(!rt_b.is_suspended(b_greeter_id));
+}
+
+#[test]
+fn greeter_as_top_level_service() {
+    // Skip the scheduler; register greeter directly as a service and send it a run message.
+    let elf = example_elf("greeter");
+    let blob = transpile_actor(&elf);
+    let mut rt = VosRuntime::new();
+    let id = register_svc(&mut rt, blob);
+
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let encoded = Msg::new("run").encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    rt.send_to(id, payload);
+    rt.run_blocking();
+    assert_eq!(rt.panics, 0, "greeter panicked running directly as top-level service");
 }
 
 #[test]

@@ -159,10 +159,8 @@ pub fn is_refine_mode() -> bool { false }
 fn halt() -> ! {
     unsafe {
         core::arch::asm!(
-            "lui t1, 0x10",       // t1 = 0x10000
-            "addi t1, t1, -1",    // t1 = 0xFFFF
-            "slli t1, t1, 16",    // t1 = 0xFFFF0000
-            "jalr x0, t1, 0",    // djump → halt
+            "ecall",
+            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
             options(noreturn),
         );
     }
@@ -173,12 +171,10 @@ fn halt() -> ! {
 fn halt_with_output(data: &[u8]) -> ! {
     unsafe {
         core::arch::asm!(
-            "lui t1, 0x10",
-            "addi t1, t1, -1",
-            "slli t1, t1, 16",
-            "jalr x0, t1, 0",
+            "ecall",
             in("a0") data.as_ptr() as u64,
             in("a1") data.len() as u64,
+            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
             options(noreturn),
         );
     }
