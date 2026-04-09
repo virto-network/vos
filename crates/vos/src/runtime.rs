@@ -428,43 +428,16 @@ fn run_refine_kernel(
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
 ) -> Option<Vec<u8>> {
-    eprintln!("  [svc {svc_id}] run_refine_kernel entering, items={} first_len={}",
-        items.len(),
-        items.first().map(|v| v.len()).unwrap_or(0),
-    );
     loop {
-        let result = kernel.run();
-        eprintln!("  [svc {svc_id}] kernel.run() -> {:?}", match &result {
-            KernelResult::Halt(v) => format!("Halt({v})"),
-            KernelResult::Panic => "Panic".into(),
-            KernelResult::OutOfGas => "OutOfGas".into(),
-            KernelResult::PageFault(a) => format!("PageFault({a:#x})"),
-            KernelResult::ProtocolCall { slot } => format!("ProtocolCall({slot})"),
-        });
-        match result {
+        match kernel.run() {
             KernelResult::Halt(_exit) => {
                 let ptr = kernel.active_reg(7) as u32;
                 let len = (kernel.active_reg(8) as usize).min(1 << 20);
                 return Some(kread(kernel, ptr, len));
             }
             KernelResult::Panic => {
-                let vm = kernel.vm_arena.vm(kernel.active_vm);
-                let pc = vm.pc;
-                let gas = vm.gas();
-                // Dump a window of PVM code bytes around the failing PC.
-                if let Some(parsed) = javm::program::parse_blob(blobs[0].as_slice()) {
-                    if let Some(code_cap) = parsed.caps.iter().find(|c| matches!(c.cap_type, javm::program::CapEntryType::Code)) {
-                        let cap_data = &parsed.data_section[code_cap.data_offset as usize..(code_cap.data_offset + code_cap.data_len) as usize];
-                        if let Some(code_blob) = javm::program::parse_code_blob(cap_data) {
-                            let start = pc.saturating_sub(8) as usize;
-                            let end = ((pc + 16) as usize).min(code_blob.code.len());
-                            eprintln!("vosx: code[{start}..{end}] = {:02x?}", &code_blob.code[start..end]);
-                        }
-                    }
-                }
-                let regs: Vec<String> = (0..13).map(|i| format!("φ{i}={:#x}", kernel.active_reg(i))).collect();
-                eprintln!("vosx: regs: {}", regs.join(" "));
-                eprintln!("vosx: service {svc_id} panicked in refine at PC={pc} gas={gas}");
+                let pc = kernel.vm_arena.vm(kernel.active_vm).pc;
+                eprintln!("vosx: service {svc_id} panicked in refine at PC={pc}");
                 return None;
             }
             KernelResult::OutOfGas => {
@@ -476,15 +449,6 @@ fn run_refine_kernel(
                 return None;
             }
             KernelResult::ProtocolCall { slot } => {
-                eprintln!(
-                    "  [svc {svc_id}] top ecalli slot={slot} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} phi12={:#x}",
-                    kernel.active_reg(7),
-                    kernel.active_reg(8),
-                    kernel.active_reg(9),
-                    kernel.active_reg(10),
-                    kernel.active_reg(11),
-                    kernel.active_reg(12),
-                );
                 handle_refine_hostcall(
                     kernel,
                     slot as u32,
