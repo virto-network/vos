@@ -669,6 +669,8 @@ fn handle_invoke(
         match child.run() {
             KernelResult::Halt(_) => break,
             KernelResult::Panic => {
+                let pc = child.vm_arena.vm(child.active_vm).pc;
+                eprintln!("vosx: child invoke panicked at PC={pc} (target svc {target_svc_id:?})");
                 kwrite(caller, output_ptr, &[STATUS_PANICKED]);
                 return 1;
             }
@@ -676,7 +678,7 @@ fn handle_invoke(
                 kwrite(caller, output_ptr, &[STATUS_OOG]);
                 return 1;
             }
-            KernelResult::PageFault(_) => {
+            KernelResult::PageFault(_addr) => {
                 kwrite(caller, output_ptr, &[STATUS_PANICKED]);
                 return 1;
             }

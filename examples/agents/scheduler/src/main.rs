@@ -8,10 +8,9 @@
 //! a `run` handler silently skip it. Actors that yield get re-invoked in
 //! subsequent tick rounds.
 
-use vos::actors::context::ServiceId;
 use vos::lifecycle::InvokeResult;
 use vos::value::Msg;
-use vos::{actor, messages, lifecycle, Encode};
+use vos::{actor, messages, lifecycle};
 
 const MAX_ROUNDS: u32 = 64;
 
