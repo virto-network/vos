@@ -33,10 +33,14 @@
 //! Nested `INVOKE` children also run at PC=0 under the same refine
 //! policy; their effects merge into the parent's journal.
 //!
-//! Continuations (suspended PVM images across ticks) are temporarily
-//! disabled during the kernel-API migration — every tick cold-starts a
-//! fresh `InvocationKernel`. Re-adding continuations requires a
-//! snapshot/restore API on the kernel and will be a follow-up.
+//! ## Continuations (warm restart)
+//!
+//! When a service's refine phase sets `continue_next = true`, the
+//! runtime captures `flat_mem` into the [`DataLayer`], writes a
+//! [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) to
+//! the journal, and on the next tick restores the kernel with that
+//! memory via `InvocationKernel::new_warm`. The service always
+//! re-enters at PC=0 but the heap, statics, and actor instance survive.
 //!
 //! ## Memory model
 //!
@@ -210,9 +214,11 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// Exposed so tests can detect silent guest crashes.
     pub panics: u32,
     gas: GasConfig,
-    /// Pluggable data layer. Currently unused by the tick loop (we cold-
-    /// start every tick), but retained so swap-in backends still compile.
+    /// Pluggable data layer for continuation blob storage.
     pub data: D,
+    /// JIT compile cache — avoids re-compiling the same PVM blob on
+    /// every child invocation.
+    code_cache: javm::CodeCache,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -242,6 +248,7 @@ impl<D: DataLayer> VosRuntime<D> {
             panics: 0,
             gas,
             data,
+            code_cache: javm::CodeCache::new(),
         }
     }
 
@@ -276,9 +283,19 @@ impl<D: DataLayer> VosRuntime<D> {
         !self.pending_transfers.is_empty()
     }
 
-    /// Continuations are disabled during the kernel-API migration.
-    pub fn is_suspended(&self, _id: ServiceId) -> bool {
-        false
+    /// Check whether a service has a live continuation in the data layer.
+    pub fn is_suspended(&self, id: ServiceId) -> bool {
+        let Some(header_bytes) = self.storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)
+        else {
+            return false;
+        };
+        if header_bytes.is_empty() {
+            return false;
+        }
+        let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) else {
+            return false;
+        };
+        self.data.contains(&header.commitment)
     }
 
     /// Run one round: for each service with pending input, run refine
@@ -318,12 +335,31 @@ impl<D: DataLayer> VosRuntime<D> {
             did_work = true;
             let mut journal = RefineJournal::default();
 
+            // Load any existing continuation for the first iteration.
+            // Subsequent iterations use the previous iteration's captured
+            // flat_mem so `ACTOR_HOLDER` and heap state survive across
+            // self-message re-entries within the same tick.
+            let mut warm_mem: Option<(Vec<u8>, u32, u32)> =
+                load_continuation(storage, &self.data, svc_id);
+
             for iteration in 0..MAX_REFINE_ITERATIONS {
-                let mut kernel = match InvocationKernel::new(blob, &[], refine_gas) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("vosx: service {svc_id} kernel init failed: {e}");
-                        break;
+                let mut kernel = if let Some((ref flat_mem, heap_base, heap_top)) = warm_mem {
+                    match InvocationKernel::new_warm(
+                        blob, &[], refine_gas, flat_mem, heap_base, heap_top,
+                    ) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("vosx: service {svc_id} warm kernel init failed: {e}");
+                            break;
+                        }
+                    }
+                } else {
+                    match InvocationKernel::new_cached(blob, &[], refine_gas, &mut self.code_cache) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("vosx: service {svc_id} kernel init failed: {e}");
+                            break;
+                        }
                     }
                 };
                 // φ[7] = 0 → refine phase.
@@ -335,7 +371,10 @@ impl<D: DataLayer> VosRuntime<D> {
                     .transition(javm::vm_pool::VmState::Running);
 
                 // Stage FETCH items (raw transfers become one item each).
+                // Filter out empty wake-up transfers (used to re-tick
+                // suspended services with continuations).
                 let mut round_items = std::mem::take(&mut items);
+                round_items.retain(|item| !item.is_empty());
 
                 let halted = run_refine_kernel(
                     &mut kernel,
@@ -346,6 +385,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     blobs,
                     blob_by_hash,
                     services,
+                    &mut self.code_cache,
                 );
 
                 // Absorb the guest's RefinePayload output (if any) into
@@ -353,12 +393,57 @@ impl<D: DataLayer> VosRuntime<D> {
                 // effect-buffering path where `set_refine_mode(true)`
                 // packs writes/transfers into the refine output.
                 if let Some(payload_bytes) = halted {
-                    if let Some(payload) = RefinePayload::decode(&payload_bytes) {
+                    // Determine whether the guest wants to continue next tick.
+                    // Two output formats: RefinePayload (service actors) or
+                    // old-style [status:u8][state_len:u32][state...][reply...]
+                    // (invoked actors). Both can signal yield/continue.
+                    let continue_next = if let Some(payload) = RefinePayload::decode(&payload_bytes)
+                    {
                         journal.absorb_payload(&payload, svc_id);
-                        if !payload.continue_next && journal.self_messages.is_empty() {
-                            // Guest signalled it's done; exit the refine loop.
-                            break;
-                        }
+                        payload.continue_next
+                    } else {
+                        // Old-style format: status byte 0x01 = yielded.
+                        !payload_bytes.is_empty()
+                            && payload_bytes[0] == crate::actors::run::STATUS_YIELDED
+                    };
+
+                    if continue_next {
+                        // Capture flat_mem into the data layer and write
+                        // a continuation header to the journal.
+                        let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
+                        let commitment = crate::pvm_image::commit(&flat_mem);
+                        pollster::block_on(self.data.put(commitment, flat_mem.clone()));
+                        let header = crate::pvm_image::ContinuationHeader {
+                            pc: 0,
+                            heap_base,
+                            heap_top,
+                            need_gas_charge: false,
+                            iters: 0,
+                            flat_mem_len: flat_mem.len() as u32,
+                            commitment,
+                            registers: [0; 13],
+                        };
+                        journal.writes.push((
+                            crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+                            header.encode(),
+                        ));
+                        // Enqueue a wake-up transfer so the service is
+                        // re-ticked next round (continuation resumes it
+                        // with warm memory).
+                        new_transfers.push((ServiceId(svc_id), Vec::new()));
+                        break;
+                    }
+
+                    if journal.self_messages.is_empty() {
+                        // Guest signalled it's done; clear any prior
+                        // continuation and exit the refine loop.
+                        clear_continuation(
+                            &mut journal,
+                            storage,
+                            &mut self.data,
+                            svc_id,
+                        );
+                        break;
                     }
                 } else {
                     *panics += 1;
@@ -369,14 +454,39 @@ impl<D: DataLayer> VosRuntime<D> {
                 if journal.self_messages.is_empty() {
                     break;
                 }
+                // Capture flat_mem for the next iteration's warm restart
+                // so ACTOR_HOLDER and heap state survive across self-message
+                // re-entries within the same tick.
+                let captured = kernel.extract_flat_mem();
                 items = std::mem::take(&mut journal.self_messages);
                 if iteration + 1 == MAX_REFINE_ITERATIONS {
-                    eprintln!(
-                        "vosx: service {svc_id} hit MAX_REFINE_ITERATIONS; dropping {} pending self-messages",
-                        items.len()
-                    );
+                    // Spill remaining self-messages as pending transfers
+                    // for the next tick. Capture a continuation so the
+                    // service warm-restarts with its current heap/actor.
+                    let (flat_mem, heap_base, heap_top) = captured;
+                    let commitment = crate::pvm_image::commit(&flat_mem);
+                    pollster::block_on(self.data.put(commitment, flat_mem.clone()));
+                    let header = crate::pvm_image::ContinuationHeader {
+                        pc: 0,
+                        heap_base,
+                        heap_top,
+                        need_gas_charge: false,
+                        iters: 0,
+                        flat_mem_len: flat_mem.len() as u32,
+                        commitment,
+                        registers: [0; 13],
+                    };
+                    journal.writes.push((
+                        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+                        header.encode(),
+                    ));
+                    // Re-queue leftover self-messages for next tick.
+                    for msg in items.drain(..) {
+                        new_transfers.push((ServiceId(svc_id), msg));
+                    }
                     break;
                 }
+                warm_mem = Some(captured);
             }
 
             // Commit the journal (accumulate as a direct replay).
@@ -427,6 +537,7 @@ fn run_refine_kernel(
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
+    code_cache: &mut javm::CodeCache,
 ) -> Option<Vec<u8>> {
     loop {
         match kernel.run() {
@@ -459,6 +570,7 @@ fn run_refine_kernel(
                     blobs,
                     blob_by_hash,
                     services,
+                    code_cache,
                     0,
                 );
             }
@@ -480,6 +592,7 @@ fn handle_refine_hostcall(
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
+    code_cache: &mut javm::CodeCache,
     depth: usize,
 ) {
     let a0 = kernel.active_reg(7);
@@ -555,6 +668,7 @@ fn handle_refine_hostcall(
                 blob_by_hash,
                 services,
                 storage,
+                code_cache,
                 journal,
                 depth + 1,
             );
@@ -576,6 +690,7 @@ fn handle_invoke(
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
     storage: &ServiceStorage,
+    code_cache: &mut javm::CodeCache,
     journal: &mut RefineJournal,
     depth: usize,
 ) -> u64 {
@@ -635,7 +750,7 @@ fn handle_invoke(
         gas_limit.min(DEFAULT_GAS)
     };
 
-    let mut child = match InvocationKernel::new(blob, &[], gas) {
+    let mut child = match InvocationKernel::new_cached(blob, &[], gas, code_cache) {
         Ok(k) => k,
         Err(_) => {
             kwrite(caller, output_ptr, &[STATUS_PANICKED]);
@@ -693,6 +808,7 @@ fn handle_invoke(
                     blobs,
                     blob_by_hash,
                     services,
+                    code_cache,
                     depth,
                 );
             }
@@ -705,6 +821,48 @@ fn handle_invoke(
     let output = kread(&child, out_ptr, out_len);
     kwrite(caller, output_ptr, &output);
     out_len as u64
+}
+
+/// Load a continuation for a service: read header from storage (checking
+/// journal first for read-your-own-writes), fetch the body from the data
+/// layer, and return `Some((flat_mem, heap_base, heap_top))`.
+fn load_continuation<D: crate::data_layer::DataLayer>(
+    storage: &ServiceStorage,
+    data: &D,
+    svc_id: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let id = ServiceId(svc_id);
+    let header_bytes = storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)?;
+    if header_bytes.is_empty() {
+        return None;
+    }
+    let header = crate::pvm_image::ContinuationHeader::decode(header_bytes)?;
+    let body = pollster::block_on(data.get(&header.commitment))?;
+    Some((body, header.heap_base, header.heap_top))
+}
+
+/// Clear any prior continuation for a service by writing an empty header
+/// key and removing the body from the data layer.
+fn clear_continuation<D: crate::data_layer::DataLayer>(
+    journal: &mut RefineJournal,
+    storage: &ServiceStorage,
+    data: &mut D,
+    svc_id: u32,
+) {
+    let id = ServiceId(svc_id);
+    // Check if there's a prior continuation to clean up.
+    if let Some(header_bytes) = storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY) {
+        if !header_bytes.is_empty() {
+            if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
+                pollster::block_on(data.remove(&header.commitment));
+            }
+        }
+    }
+    // Write empty value to clear the header key.
+    journal.writes.push((
+        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+        vec![],
+    ));
 }
 
 fn simple_hash(data: &[u8]) -> [u8; 32] {

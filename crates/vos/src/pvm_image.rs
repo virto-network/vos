@@ -44,12 +44,6 @@ pub const VERSION: u8 = 2;
 /// Size of the encoded continuation header.
 pub const HEADER_SIZE: usize = 168;
 
-// NOTE: `capture`/`restore` against a live `javm::Pvm` were removed when
-// VOS migrated to the new `InvocationKernel` API, which does not (yet)
-// expose a snapshot/restore surface. Only the `ContinuationHeader` type
-// survives, so callers that persist headers stay source-compatible
-// while the runtime cold-starts every tick.
-
 /// Small persistable header for a suspended PVM continuation.
 ///
 /// This is what gets written to a service's on-chain storage. The
