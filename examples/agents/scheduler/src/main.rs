@@ -12,7 +12,10 @@ use vos::lifecycle::InvokeResult;
 use vos::value::Msg;
 use vos::{actor, messages, lifecycle};
 
-const MAX_ROUNDS: u32 = 64;
+/// No artificial cap — the runtime's per-tick iteration limit + gas
+/// budget provide the safety ceiling. Across ticks, continuations
+/// let the scheduler run indefinitely.
+const MAX_ROUNDS: u32 = u32::MAX;
 
 /// Invoke a child and handle the result. Returns Some(state) if yielded.
 fn invoke_child(svc_id: u32, msg: &Msg, state: &[u8]) -> Option<Vec<u8>> {
