@@ -271,16 +271,31 @@ pub fn run_refine_service<A: super::Actor>() {
     }
 
     // Pack: state-bytes-from-actor + buffered effects + reply →
-    // RefinePayload. The state field is currently informational only;
-    // the canonical state is the PVM image preserved across ticks.
-    // A future commit will replace this field with a real serialized
-    // PVM image so accumulate can persist it to on-chain DA.
-    let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
-    let reply_bytes = ctx.take_reply_bytes();
-    let payload = ctx.drain_into_refine_payload(new_state_bytes, reply_bytes);
-
-    let encoded = payload.encode();
-    halt_with_output(&encoded);
+    // RefinePayload. Drop temporaries eagerly before halt_with_output
+    // (which is `-> !` and never runs destructors).
+    //
+    // The output buffer is a static Vec reused across warm restarts to
+    // avoid leaking a fresh allocation on every halt (the `-> !` ecall
+    // never runs destructors).
+    static mut OUTPUT_BUF: usize = 0;
+    let out_ptr = addr_of_mut!(OUTPUT_BUF);
+    let out_buf: &mut alloc::vec::Vec<u8> = unsafe {
+        if *out_ptr == 0 {
+            *out_ptr = Box::into_raw(Box::new(alloc::vec::Vec::<u8>::new())) as usize;
+        }
+        &mut *(*out_ptr as *mut alloc::vec::Vec<u8>)
+    };
+    {
+        let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
+        let reply_bytes = ctx.take_reply_bytes();
+        let payload = ctx.drain_into_refine_payload(new_state_bytes, reply_bytes);
+        drop(ctx);
+        let encoded = payload.encode();
+        out_buf.clear();
+        out_buf.extend_from_slice(&encoded);
+        // encoded, new_state_bytes, reply_bytes, payload dropped here
+    }
+    halt_with_output(out_buf);
 }
 
 // ── Service accumulate phase (PC=5, JAM-pure commit) ──────────────────
@@ -379,17 +394,25 @@ pub fn run_refine<A: super::Actor>() {
         }
     }
 
-    let state = lifecycle::save_state::<A>(&actor, &ctx);
     let status = lifecycle::exit_status::<A>(&ctx);
-    let reply_bytes = ctx.take_reply_bytes();
 
     // Pack output: [status:u8][state_len:u32][state...][reply...]
-    let sl = (state.len() as u32).to_le_bytes();
-    let mut out = alloc::vec![0u8; 1 + 4 + state.len() + reply_bytes.len()];
-    out[0] = status[0];
-    out[1..5].copy_from_slice(&sl);
-    out[5..5 + state.len()].copy_from_slice(&state);
-    out[5 + state.len()..].copy_from_slice(&reply_bytes);
+    // Drop temporaries and ctx eagerly — halt_with_output is `-> !`
+    // so destructors never run; without explicit drops the Vecs leak
+    // on every warm-restart iteration.
+    let out = {
+        let state = lifecycle::save_state::<A>(&actor, &ctx);
+        let reply_bytes = ctx.take_reply_bytes();
+        drop(ctx);
+        let sl = (state.len() as u32).to_le_bytes();
+        let mut out = alloc::vec![0u8; 1 + 4 + state.len() + reply_bytes.len()];
+        out[0] = status[0];
+        out[1..5].copy_from_slice(&sl);
+        out[5..5 + state.len()].copy_from_slice(&state);
+        out[5 + state.len()..].copy_from_slice(&reply_bytes);
+        out
+        // state, reply_bytes dropped here
+    };
     halt_with_output(&out);
 }
 
