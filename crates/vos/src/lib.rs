@@ -35,6 +35,7 @@ pub use rkyv;
 
 pub mod actors;
 pub mod refine_payload;
+pub mod registry;
 
 #[cfg(feature = "std")]
 pub mod data_layer;

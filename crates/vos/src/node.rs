@@ -9,6 +9,7 @@
 //! state via merkle-CRDTs instead of blockchain consensus.
 
 use std::collections::HashMap;
+use std::string::String;
 use std::sync::mpsc;
 use std::thread;
 
@@ -47,6 +48,29 @@ pub struct AgentConfig {
     pub storage: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Pre-populated package registry for bootstrapping.
+/// Agents can resolve packages by name+version from this.
+#[derive(Default)]
+pub struct HostRegistry {
+    packages: HashMap<(String, String), Vec<u8>>,
+}
+
+impl HostRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a code blob under a name and version.
+    pub fn publish(&mut self, name: &str, version: &str, blob: Vec<u8>) {
+        self.packages.insert((name.to_string(), version.to_string()), blob);
+    }
+
+    /// Look up a code blob by name and version.
+    pub fn resolve(&self, name: &str, version: &str) -> Option<&Vec<u8>> {
+        self.packages.get(&(name.to_string(), version.to_string()))
+    }
+}
+
 /// A multi-agent VOS node.
 ///
 /// Each agent runs on its own thread with its own `VosRuntime`.
@@ -58,6 +82,8 @@ pub struct VosNode {
     /// The node reads from this to route messages.
     outbox_rx: mpsc::Receiver<Envelope>,
     next_id: u32,
+    /// Host-side package registry for bootstrapping.
+    pub registry: HostRegistry,
 }
 
 impl VosNode {
@@ -68,6 +94,7 @@ impl VosNode {
             outbox_tx,
             outbox_rx,
             next_id: 1,
+            registry: HostRegistry::new(),
         }
     }
 

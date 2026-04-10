@@ -19,6 +19,7 @@ pub struct Context<A: Actor> {
     pending_tells: Vec<PendingTell>,
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pending_spawns: Vec<[u8; 32]>,
+    pending_provides: Vec<([u8; 32], Vec<u8>)>,
 
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
@@ -47,6 +48,7 @@ impl<A: Actor> Context<A> {
             pending_tells: Vec::new(),
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
+            pending_provides: Vec::new(),
             reply: None,
             self_schedule: false,
             sleep_ticks: 0,
@@ -173,8 +175,28 @@ impl<A: Actor> Context<A> {
     }
 
     /// Queue a new service spawn from a code hash.
+    /// The code blob must already be available as a preimage (via [`provide`]).
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
         self.pending_spawns.push(code_hash);
+    }
+
+    /// Store a preimage (code blob, data, etc.) for later retrieval by hash.
+    /// Used with [`spawn`] to install a new service: provide the blob first,
+    /// then spawn with its hash.
+    pub fn provide(&mut self, hash: [u8; 32], data: Vec<u8>) {
+        self.pending_provides.push((hash, data));
+    }
+
+    /// Install a new child service from a code blob and its content hash.
+    /// Convenience that calls [`provide`] + [`spawn`] and returns the
+    /// assigned service ID (via the NEW hostcall return value).
+    ///
+    /// The caller must provide the correct content hash. Use
+    /// `blake2b_simd::blake2b(blob).as_bytes()` or the host's hashing
+    /// facility to compute it.
+    pub fn install(&mut self, hash: [u8; 32], code_blob: Vec<u8>) {
+        self.provide(hash, code_blob);
+        self.spawn(hash);
     }
 
     /// Request the actor to stop after the current message.
@@ -249,6 +271,10 @@ impl<A: Actor> Context<A> {
                 hostcalls::transfer(tell.target, 0, 0, &tell.payload);
             }
 
+            for (hash, data) in self.pending_provides.drain(..) {
+                hostcalls::provide(&hash, &data);
+            }
+
             for code_hash in self.pending_spawns.drain(..) {
                 hostcalls::new_service(&code_hash);
             }
@@ -258,6 +284,7 @@ impl<A: Actor> Context<A> {
         {
             self.pending_writes.clear();
             self.pending_tells.clear();
+            self.pending_provides.clear();
             self.pending_spawns.clear();
         }
     }
@@ -283,6 +310,9 @@ impl<A: Actor> Context<A> {
                 target: tell.target.0,
                 memo: tell.payload,
             });
+        }
+        for (hash, data) in self.pending_provides.drain(..) {
+            effects.push(Effect::Provide { hash, data });
         }
         for code_hash in self.pending_spawns.drain(..) {
             effects.push(Effect::New { code_hash });
