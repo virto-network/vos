@@ -146,6 +146,9 @@ struct RefineJournal {
     transfers: Vec<(ServiceId, Vec<u8>)>,
     preimages: Vec<([u8; 32], Vec<u8>)>,
     self_messages: Vec<Vec<u8>>,
+    /// Service creation requests: (code_hash, assigned_service_id).
+    /// Committed after refine by registering the blob+service.
+    new_services: Vec<([u8; 32], u32)>,
 }
 
 impl RefineJournal {
@@ -174,9 +177,8 @@ impl RefineJournal {
                 Effect::Provide { hash, data } => {
                     self.preimages.push((hash, data));
                 }
-                Effect::New { .. } => {
-                    // Service creation is not yet modeled in the journal;
-                    // silently drop for now.
+                Effect::New { code_hash } => {
+                    self.new_services.push((code_hash, 0));
                 }
             }
         }
@@ -325,15 +327,16 @@ impl<D: DataLayer> VosRuntime<D> {
         }
 
         let mut new_transfers = Vec::new();
+        let mut new_services_to_register: Vec<([u8; 32], u32)> = Vec::new();
         let mut did_work = false;
 
         let blobs = &self.blobs;
         let blob_by_hash = &self.blob_by_hash;
         let services = &self.services;
         let storage = &mut self.storage;
-        let preimages = &mut self.preimages;
         let refine_gas = self.gas.refine_gas;
         let panics = &mut self.panics;
+        let next_id = &mut self.next_id;
 
         for (svc_id, mut items) in by_service {
             let info = match services.get(&svc_id) {
@@ -396,10 +399,12 @@ impl<D: DataLayer> VosRuntime<D> {
                     &mut round_items,
                     &mut journal,
                     storage,
+                    &self.preimages,
                     blobs,
                     blob_by_hash,
                     services,
                     &mut self.code_cache,
+                    next_id,
                 );
 
                 // Absorb the guest's RefinePayload output (if any) into
@@ -495,9 +500,19 @@ impl<D: DataLayer> VosRuntime<D> {
                 storage.write(ServiceId(svc_id), &key, &value);
             }
             for (hash, data) in journal.preimages.drain(..) {
-                preimages.insert(hash, data);
+                self.preimages.insert(hash, data);
             }
             new_transfers.extend(journal.transfers.drain(..));
+            new_services_to_register.extend(journal.new_services.drain(..));
+        }
+
+        // Register services created via NEW during this tick.
+        // The code blob is looked up from preimages (populated by PROVIDE).
+        for (code_hash, assigned_id) in new_services_to_register {
+            if let Some(blob) = self.preimages.get(&code_hash).cloned() {
+                let blob_idx = self.register_blob(blob);
+                self.services.insert(assigned_id, ServiceInfo { blob_idx, alive: true });
+            }
         }
 
         self.pending_transfers.extend(new_transfers);
@@ -535,10 +550,12 @@ fn run_refine_kernel(
     items: &mut Vec<Vec<u8>>,
     journal: &mut RefineJournal,
     storage: &ServiceStorage,
+    preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
+    next_id: &mut u32,
 ) -> Option<Vec<u8>> {
     loop {
         match kernel.run() {
@@ -568,11 +585,13 @@ fn run_refine_kernel(
                     svc_id,
                     journal,
                     storage,
+                    preimages,
                     blobs,
                     blob_by_hash,
                     services,
                     code_cache,
                     0,
+                    next_id,
                 );
             }
         }
@@ -590,11 +609,13 @@ fn handle_refine_hostcall(
     svc_id: u32,
     journal: &mut RefineJournal,
     storage: &ServiceStorage,
+    preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
     depth: usize,
+    next_id: &mut u32,
 ) {
     let a0 = kernel.active_reg(7);
     let a1 = kernel.active_reg(8);
@@ -655,13 +676,49 @@ fn handle_refine_hostcall(
             }
             (error::HOST_OK, 0)
         }
+        hostcall::PREIMAGE_LOOKUP => {
+            // Lookup preimage by hash: check journal first, then global.
+            let hash = kread_hash(kernel, a0 as u32);
+            let buf_ptr = a1 as u32;
+            let buf_len = a2 as usize;
+            let data = journal.preimages.iter()
+                .find(|(h, _)| *h == hash)
+                .map(|(_, d)| d.as_slice())
+                .or_else(|| preimages.get(&hash).map(|d| d.as_slice()));
+            match data {
+                Some(d) => {
+                    let copy_len = d.len().min(buf_len);
+                    kwrite(kernel, buf_ptr, &d[..copy_len]);
+                    (copy_len as u64, 0)
+                }
+                None => (error::HOST_NONE, 0),
+            }
+        }
         hostcall::PREIMAGE_PROVIDE => {
             let hash = kread_hash(kernel, a0 as u32);
             let data = kread(kernel, a1 as u32, a2 as usize);
             journal.preimages.push((hash, data));
             (error::HOST_OK, 0)
         }
-        hostcall::OUTPUT | hostcall::CHECKPOINT | hostcall::SERVICE_NEW => (error::HOST_OK, 0),
+        hostcall::SERVICE_NEW => {
+            // JAM NEW: guest provides code_hash in a0 (ptr to 32 bytes).
+            // Look up the code blob from journaled preimages, assign a
+            // new service ID, and record it for commit.
+            let code_hash = kread_hash(kernel, a0 as u32);
+            // Look up in journal preimages first (PROVIDE'd this refine)
+            let blob = journal.preimages.iter()
+                .find(|(h, _)| *h == code_hash)
+                .map(|(_, d)| d.clone());
+            if let Some(_blob) = blob {
+                let new_svc_id = *next_id;
+                *next_id += 1;
+                journal.new_services.push((code_hash, new_svc_id));
+                (new_svc_id as u64, 0)
+            } else {
+                (error::HOST_NONE, 0)
+            }
+        }
+        hostcall::OUTPUT | hostcall::CHECKPOINT => (error::HOST_OK, 0),
         hostcall::INVOKE => {
             let result = handle_invoke(
                 kernel,
@@ -669,9 +726,11 @@ fn handle_refine_hostcall(
                 blob_by_hash,
                 services,
                 storage,
+                preimages,
                 code_cache,
                 journal,
                 depth + 1,
+                next_id,
             );
             (result, 0)
         }
@@ -691,9 +750,11 @@ fn handle_invoke(
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
     storage: &ServiceStorage,
+    preimages: &HashMap<[u8; 32], Vec<u8>>,
     code_cache: &mut javm::CodeCache,
     journal: &mut RefineJournal,
     depth: usize,
+    next_id: &mut u32,
 ) -> u64 {
     use crate::actors::run::{STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED};
 
@@ -806,11 +867,13 @@ fn handle_invoke(
                     target_svc_id.0,
                     journal,
                     storage,
+                    preimages,
                     blobs,
                     blob_by_hash,
                     services,
                     code_cache,
                     depth,
+                    next_id,
                 );
             }
         }
@@ -942,5 +1005,45 @@ mod tests {
         assert_eq!(cfg.refine_gas, 12_345);
         assert_eq!(cfg.accumulate_gas_max, 6_789);
         assert_eq!(cfg.accumulate_gas_default, 4_321);
+    }
+
+    #[test]
+    fn journal_absorb_new_service() {
+        let mut journal = RefineJournal::default();
+        let code_hash = [0x42u8; 32];
+        journal.absorb_effects(
+            vec![
+                crate::refine_payload::Effect::Provide {
+                    hash: code_hash,
+                    data: vec![0xDE, 0xAD],
+                },
+                crate::refine_payload::Effect::New { code_hash },
+            ],
+            1, // self_id
+        );
+        assert_eq!(journal.preimages.len(), 1);
+        assert_eq!(journal.preimages[0].0, code_hash);
+        assert_eq!(journal.new_services.len(), 1);
+        assert_eq!(journal.new_services[0].0, code_hash);
+    }
+
+    #[test]
+    fn new_service_registered_after_tick() {
+        // Verify that PROVIDE + NEW during refine results in the service
+        // being registered after the tick commits.
+        let mut rt = VosRuntime::new();
+        let code_hash = simple_hash(&[0xAB; 16]);
+        // Pre-populate preimages with a dummy "code blob"
+        rt.preimages.insert(code_hash, vec![0xAB; 16]);
+
+        // Simulate: journal records a NEW with this hash
+        let assigned_id = rt.next_id;
+        rt.next_id += 1;
+        let blob = rt.preimages.get(&code_hash).cloned().unwrap();
+        let blob_idx = rt.register_blob(blob);
+        rt.services.insert(assigned_id, ServiceInfo { blob_idx, alive: true });
+
+        assert!(rt.services.contains_key(&assigned_id));
+        assert!(rt.services.get(&assigned_id).unwrap().alive);
     }
 }

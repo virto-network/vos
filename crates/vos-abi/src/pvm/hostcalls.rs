@@ -77,6 +77,18 @@ pub fn fetch(hash: &[u8; 32], buf: &mut [u8]) -> u64 {
     )
 }
 
+/// Look up a preimage by hash. Returns bytes read into `buf`,
+/// or HOST_NONE if the preimage is not available.
+#[inline]
+pub fn preimage_lookup(hash: &[u8; 32], buf: &mut [u8]) -> u64 {
+    ecall3(
+        hostcall::PREIMAGE_LOOKUP,
+        hash.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
 // --- Accumulate-only (service feature) ---
 
 /// Read a value from per-service storage by key. Alias for [`peek`].
