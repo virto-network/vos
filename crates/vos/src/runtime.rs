@@ -33,14 +33,27 @@
 //! Nested `INVOKE` children also run at PC=0 under the same refine
 //! policy; their effects merge into the parent's journal.
 //!
-//! ## Continuations (warm restart)
+//! ## Continuations (JAM-compatible + VOS optimization)
 //!
-//! When a service's refine phase sets `continue_next = true`, the
-//! runtime captures `flat_mem` into the [`DataLayer`], writes a
-//! [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) to
-//! the journal, and on the next tick restores the kernel with that
-//! memory via `InvocationKernel::new_warm`. The service always
-//! re-enters at PC=0 but the heap, statics, and actor instance survive.
+//! When a service's refine phase sets `continue_next = true`:
+//!
+//! 1. **JAM-compatible path** (works on any conformant host): the
+//!    serialized actor state from the refine payload is written to
+//!    `STATE_KEY` in the journal, and a self-directed transfer is
+//!    enqueued. On the next tick the guest cold-starts at PC=0,
+//!    reads `STATE_KEY` via `READ`, and deserializes its actor —
+//!    no host cooperation required.
+//!
+//! 2. **VOS optimization** (transparent fast path): the runtime also
+//!    captures `flat_mem` into the [`DataLayer`] and writes a
+//!    [`ContinuationHeader`](crate::pvm_image::ContinuationHeader)
+//!    to the journal. On the next tick the kernel is restored via
+//!    `InvocationKernel::new_warm` — the guest's `ACTOR_HOLDER`
+//!    static is already populated so it skips the `READ` + deserialize.
+//!
+//! Path (1) ensures services work on JAR without modification.
+//! Path (2) is a host-side optimization that avoids serialization
+//! overhead when the host supports flat_mem overlay.
 //!
 //! ## Memory model
 //!
@@ -145,21 +158,21 @@ impl RefineJournal {
             .map(|(_, v)| v.as_slice())
     }
 
-    fn absorb_payload(&mut self, payload: &RefinePayload, self_id: u32) {
-        for eff in &payload.effects {
+    fn absorb_effects(&mut self, effects: Vec<Effect>, self_id: u32) {
+        for eff in effects {
             match eff {
                 Effect::Write { key, value } => {
-                    self.writes.push((key.clone(), value.clone()));
+                    self.writes.push((key, value));
                 }
                 Effect::Transfer { target, memo } => {
-                    if *target == self_id {
-                        self.self_messages.push(memo.clone());
+                    if target == self_id {
+                        self.self_messages.push(memo);
                     } else {
-                        self.transfers.push((ServiceId(*target), memo.clone()));
+                        self.transfers.push((ServiceId(target), memo));
                     }
                 }
                 Effect::Provide { hash, data } => {
-                    self.preimages.push((*hash, data.clone()));
+                    self.preimages.push((hash, data));
                 }
                 Effect::New { .. } => {
                     // Service creation is not yet modeled in the journal;
@@ -346,6 +359,7 @@ impl<D: DataLayer> VosRuntime<D> {
                 let mut kernel = if let Some((ref flat_mem, heap_base, heap_top)) = warm_mem {
                     match InvocationKernel::new_warm(
                         blob, &[], refine_gas, flat_mem, heap_base, heap_top,
+                        Some(&mut self.code_cache),
                     ) {
                         Ok(k) => k,
                         Err(e) => {
@@ -397,19 +411,38 @@ impl<D: DataLayer> VosRuntime<D> {
                     // Two output formats: RefinePayload (service actors) or
                     // old-style [status:u8][state_len:u32][state...][reply...]
                     // (invoked actors). Both can signal yield/continue.
-                    let continue_next = if let Some(payload) = RefinePayload::decode(&payload_bytes)
-                    {
-                        journal.absorb_payload(&payload, svc_id);
-                        payload.continue_next
-                    } else {
-                        // Old-style format: status byte 0x01 = yielded.
-                        !payload_bytes.is_empty()
-                            && payload_bytes[0] == crate::actors::run::STATUS_YIELDED
-                    };
+                    let (continue_next, actor_state) =
+                        if let Some(payload) = RefinePayload::decode(&payload_bytes) {
+                            let cn = payload.continue_next;
+                            let state = payload.state;
+                            journal.absorb_effects(payload.effects, svc_id);
+                            (cn, state)
+                        } else {
+                            // Old-style format: status byte 0x01 = yielded.
+                            let cn = !payload_bytes.is_empty()
+                                && payload_bytes[0] == crate::actors::run::STATUS_YIELDED;
+                            (cn, Vec::new())
+                        };
 
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
                         save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
+                        // JAM-compatible: persist actor state so a
+                        // cold-start guest can restore via READ(STATE_KEY)
+                        // on a host that doesn't support flat_mem overlay.
+                        if !actor_state.is_empty() {
+                            journal.writes.push((
+                                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                                actor_state,
+                            ));
+                        }
+                        // Spill any self-directed transfers from the
+                        // payload's effects as pending transfers for next
+                        // tick. On a JAM host, accumulate would replay
+                        // these via hostcalls; VOS must match.
+                        for msg in journal.self_messages.drain(..) {
+                            new_transfers.push((ServiceId(svc_id), msg));
+                        }
                         // Enqueue a wake-up transfer so the service is
                         // re-ticked next round (continuation resumes it
                         // with warm memory).
@@ -837,8 +870,9 @@ fn load_continuation<D: crate::data_layer::DataLayer>(
     Some((body, header.heap_base, header.heap_top))
 }
 
-/// Clear any prior continuation for a service by writing an empty header
-/// key and removing the body from the data layer.
+/// Clear any prior continuation for a service by writing empty header
+/// and state keys and removing the body from the data layer.
+/// No-op if the service has no continuation.
 fn clear_continuation<D: crate::data_layer::DataLayer>(
     journal: &mut RefineJournal,
     storage: &ServiceStorage,
@@ -846,17 +880,19 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
     svc_id: u32,
 ) {
     let id = ServiceId(svc_id);
-    // Check if there's a prior continuation to clean up.
-    if let Some(header_bytes) = storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY) {
-        if !header_bytes.is_empty() {
-            if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
-                pollster::block_on(data.remove(&header.commitment));
-            }
-        }
+    let header_bytes = match storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY) {
+        Some(b) if !b.is_empty() => b,
+        _ => return, // no prior continuation — nothing to clean up
+    };
+    if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
+        pollster::block_on(data.remove(&header.commitment));
     }
-    // Write empty value to clear the header key.
     journal.writes.push((
         crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+        vec![],
+    ));
+    journal.writes.push((
+        crate::lifecycle::STATE_KEY_BYTES.to_vec(),
         vec![],
     ));
 }

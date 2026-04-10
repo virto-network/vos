@@ -72,21 +72,14 @@ pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
 
 /// Persist actor state.
 ///
-/// Always saves the current (mutated) state — no replay needed across
-/// invocations. On services, also writes to storage as a side effect.
-/// Returns the serialized state bytes.
+/// Serializes the current (mutated) actor state. On service builds,
+/// also writes it to storage via hostcall. Returns the serialized bytes.
 #[cfg(feature = "pvm")]
 pub fn save_state<A: Actor>(
     actor: &A,
-    ctx: &Context<A>,
+    _ctx: &Context<A>,
 ) -> Vec<u8> {
-    let state = if ctx.self_scheduled() {
-        // Yielded — save current state for next invocation
-        actor.encode()
-    } else {
-        // Done — save current state
-        actor.encode()
-    };
+    let state = actor.encode();
 
     #[cfg(feature = "service")]
     {

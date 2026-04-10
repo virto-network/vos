@@ -231,28 +231,32 @@ pub fn run_refine_service<A: super::Actor>() {
     let mut ctx = super::Context::new(ServiceId(id));
 
     // Warm-restart actor holder. Lives in static rw_data, which sits
-    // inside the PVM's flat_mem; the host preserves flat_mem across
-    // suspended ticks (the DA continuation), so on a warm restart this
-    // pointer still references a valid heap-allocated `A` from the
-    // previous refine call and we skip cold init entirely.
+    // inside the PVM's flat_mem; VOS preserves flat_mem across ticks
+    // via `new_warm`, so on a warm restart this pointer still references
+    // a valid heap-allocated `A` and we skip cold init entirely.
+    //
+    // Cold start (ACTOR_HOLDER == 0): reads STATE_KEY via READ hostcall
+    // and deserializes the actor. This is the JAM-compatible path that
+    // works on any conformant host without flat_mem support.
     //
     // Per-service uniqueness: each service has its own PVM instance
     // with its own flat_mem, so each one gets its own copy of this
     // static — even when two services share the same blob. Type-erased
     // as `usize` because `A` differs per service; safe because PVM is
-    // single-threaded and the holder is only ever consulted by
-    // `run_refine_service::<A>` for the same `A` within one PVM image.
-    //
-    // No `STATE_KEY` involvement: under the CoreVM-on-JAM model the
-    // PVM image *is* the canonical state. Cold start = no DA image
-    // available, so we build a fresh actor (reading optional init args
-    // from `INIT_KEY` via `A::create`). Warm start = the actor is
-    // already alive in our heap; reuse it verbatim.
+    // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
     let actor_ref: &mut A = unsafe {
         if *holder_ptr == 0 {
-            let boxed = Box::new(lifecycle::load_or_create::<A>(None));
+            // Cold start: try to restore from persisted state in storage.
+            // This is the JAM-compatible path — the guest reads its own
+            // serialized state via READ (legal in refine) without any
+            // host cooperation. On VOS, this path is skipped because
+            // ACTOR_HOLDER is warm from the flat_mem overlay.
+            let mut state_buf = [0u8; BUF_SIZE];
+            let n = lifecycle::read_persisted_state(&mut state_buf);
+            let state = if n > 0 { Some(&state_buf[..n]) } else { None };
+            let boxed = Box::new(lifecycle::load_or_create::<A>(state));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
         &mut *(*holder_ptr as *mut A)
@@ -330,34 +334,37 @@ pub fn run_accumulate_service<A: super::Actor>() {
     let n = lifecycle::fetch_raw(&mut buf);
     if n > 0 {
         if let Some(payload) = RefinePayload::decode(&buf[..n]) {
-            for eff in payload.effects {
+            // Replay buffered effects via real accumulate-phase hostcalls.
+            for eff in &payload.effects {
                 match eff {
                     Effect::Write { key, value } => {
-                        hostcalls::write(&key, &value);
+                        hostcalls::write(key, value);
                     }
                     Effect::Transfer { target, memo } => {
-                        hostcalls::transfer(ServiceId(target), 0, 0, &memo);
+                        hostcalls::transfer(ServiceId(*target), 0, 0, memo);
                     }
                     Effect::Provide { hash, data } => {
-                        hostcalls::provide(&hash, &data);
+                        hostcalls::provide(hash, data);
                     }
                     Effect::New { code_hash } => {
-                        hostcalls::new_service(&code_hash);
+                        hostcalls::new_service(code_hash);
                     }
                 }
             }
+
+            // Persist actor state and self-schedule for next tick.
+            // This is the JAM-compatible continuation path: any
+            // conformant host can run this without special knowledge
+            // of continuation internals. The guest writes its own
+            // serialized state to STATE_KEY and issues a self-directed
+            // transfer so the service is re-ticked.
+            if payload.continue_next && !payload.state.is_empty() {
+                hostcalls::write(lifecycle::STATE_KEY_BYTES, &payload.state);
+                let self_id = lifecycle::service_id();
+                hostcalls::transfer(ServiceId(self_id), 0, 0, &[]);
+            }
         }
     }
-
-    // FETCH 2: continuation header bytes (possibly empty). The host
-    // captured the live PVM image after refine halted and built the
-    // small header here; we persist it via a real WRITE so storage
-    // mutation only ever flows through accumulate-phase hostcalls.
-    // Empty bytes mean "no continuation" — `is_suspended` rejects
-    // undecodable headers, so writing an empty value cleans up any
-    // prior continuation marker idempotently.
-    let n = lifecycle::fetch_raw(&mut buf);
-    hostcalls::write(lifecycle::CONTINUATION_HEADER_KEY, &buf[..n]);
 
     halt();
 }
