@@ -1,12 +1,16 @@
-//! `vosx` — run a manifest of VOS actors cooperatively.
+//! `vosx` — JAM-aligned PVM executor.
 //!
 //! Usage:
-//!     vosx [path/to/Kunekt.toml]             Run all actors
-//!     vosx --list [path/to/Kunekt.toml]      List actors and their messages
+//!     vosx run <program.pvm|program.elf> [--payload file] ...  Run any PVM program
+//!     vosx [path/to/Kunekt.toml]                               Run a manifest
+//!     vosx --list [path/to/Kunekt.toml]                        List actors
 //!
-//! vosx is functionally a single-node JAR chain: same hostcall semantics,
-//! same service lifecycle. Actor code is identical for offline (vosx) and
-//! online (JAR chain).
+//! `vosx run` is the "dumb host" mode: it loads a single PVM/ELF blob,
+//! delivers payload(s) via FETCH, runs refine, and prints the output.
+//! No manifest, no framework assumptions — any conformant JAM service works.
+//!
+//! The manifest mode (`vosx [Kunekt.toml]`) is sugar that translates a
+//! TOML manifest into the same transfer-based delivery.
 
 use vos::runtime::VosRuntime;
 use vos::metadata;
@@ -126,13 +130,20 @@ fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {
 }
 
 fn print_help() {
-    println!("vosx — run VOS actor manifests\n");
-    println!("Usage: vosx [OPTIONS] [MANIFEST]\n");
-    println!("Arguments:");
-    println!("  [MANIFEST]    Path to Kunekt.toml (default: ./Kunekt.toml)\n");
-    println!("Options:");
-    println!("  --list        List actors and their messages without running");
-    println!("  -h, --help    Show this help");
+    println!("vosx — JAM-aligned PVM executor\n");
+    println!("Usage:");
+    println!("  vosx run <program.pvm|.elf> [OPTIONS]    Run any PVM program");
+    println!("  vosx [MANIFEST]                          Run a TOML manifest");
+    println!("  vosx --list [MANIFEST]                   List actors\n");
+    println!("Run options:");
+    println!("  --payload <file>    Deliver file contents as a FETCH work item (repeatable)");
+    println!("  --payload -         Read payload from stdin");
+    println!("  --hex <hex>         Deliver hex-encoded bytes as a FETCH work item");
+    println!("  --gas <amount>      Set gas limit (default: 100_000_000)\n");
+    println!("Manifest options:");
+    println!("  --list              List actors and their messages without running\n");
+    println!("General:");
+    println!("  -h, --help          Show this help");
 }
 
 fn main() {
@@ -150,22 +161,27 @@ fn main() {
         return;
     }
 
-    let list_mode = args.iter().any(|a| a == "--list");
-    let manifest_path = args.iter()
-        .filter(|a| !a.starts_with('-') && *a != &args[0])
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("Kunekt.toml"));
-
-    let manifest = load_manifest(&manifest_path);
-    let manifest_dir = manifest_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-
-    if list_mode {
-        cmd_list(&manifest, manifest_dir);
+    // Subcommand dispatch: `vosx run <program>` vs `vosx [manifest]`
+    if args.len() > 1 && args[1] == "run" {
+        cmd_run_raw(&args[2..]);
     } else {
-        cmd_run(&manifest, manifest_dir);
+        let list_mode = args.iter().any(|a| a == "--list");
+        let manifest_path = args.iter()
+            .filter(|a| !a.starts_with('-') && *a != &args[0])
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("Kunekt.toml"));
+
+        let manifest = load_manifest(&manifest_path);
+        let manifest_dir = manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+
+        if list_mode {
+            cmd_list(&manifest, manifest_dir);
+        } else {
+            cmd_run_manifest(&manifest, manifest_dir);
+        }
     }
 }
 
@@ -227,8 +243,129 @@ fn print_actor_meta(name: &str, path: &Path, role: &str) {
     }
 }
 
+// ── Raw run mode ─────────────────────────────────────────────────────
+
+/// Run a single PVM/ELF program with optional payloads. This is the
+/// "dumb host" mode — no manifest, no framework assumptions.
+fn cmd_run_raw(args: &[String]) {
+    use std::io::Read;
+
+    if args.is_empty() {
+        eprintln!("error: `vosx run` requires a program path");
+        eprintln!("Usage: vosx run <program.pvm|.elf> [--payload file] ...");
+        process::exit(1);
+    }
+
+    let program_path = PathBuf::from(&args[0]);
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut gas: Option<u64> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--payload" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --payload requires a file path (or - for stdin)");
+                    process::exit(1);
+                }
+                let data = if args[i] == "-" {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
+                        eprintln!("error: reading stdin: {e}");
+                        process::exit(1);
+                    });
+                    buf
+                } else {
+                    load_file(Path::new(&args[i]), &args[i])
+                };
+                payloads.push(data);
+            }
+            "--hex" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --hex requires a hex string");
+                    process::exit(1);
+                }
+                let hex = args[i].trim_start_matches("0x");
+                let data = hex_decode(hex).unwrap_or_else(|| {
+                    eprintln!("error: invalid hex string");
+                    process::exit(1);
+                });
+                payloads.push(data);
+            }
+            "--gas" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --gas requires a number");
+                    process::exit(1);
+                }
+                gas = Some(args[i].replace('_', "").parse().unwrap_or_else(|_| {
+                    eprintln!("error: invalid gas value");
+                    process::exit(1);
+                }));
+            }
+            other => {
+                eprintln!("error: unknown option '{other}'");
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let data = load_file(&program_path, &program_path.display().to_string());
+    let ext = program_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let blob = match ext {
+        "pvm" => data,
+        _ => transpile_elf(&data, &program_path.display().to_string()),
+    };
+
+    let mut runtime = VosRuntime::new();
+    if let Some(g) = gas {
+        runtime = VosRuntime::with_gas_config(vos::runtime::GasConfig {
+            refine_gas: g,
+            accumulate_gas_max: g,
+            accumulate_gas_default: g,
+        });
+    }
+
+    let blob_idx = runtime.register_service_blob(blob);
+    let id = runtime.register_service(blob_idx);
+
+    eprintln!("vosx run: loaded '{}' as service {id:?}", program_path.display());
+
+    // Deliver payloads as transfers (each becomes a FETCH item)
+    if payloads.is_empty() {
+        // Send an empty transfer to kick-start the service
+        runtime.send_to(id, Vec::new());
+    } else {
+        for payload in payloads {
+            runtime.send_to(id, payload);
+        }
+    }
+
+    eprintln!("vosx run: executing...\n");
+    runtime.run_blocking();
+
+    if runtime.panics > 0 {
+        eprintln!("\nvosx run: program panicked ({} panic(s))", runtime.panics);
+        process::exit(1);
+    }
+    eprintln!("\nvosx run: done");
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 { return None; }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+// ── Manifest run mode ────────────────────────────────────────────────
+
 /// Run the full cooperative loop.
-fn cmd_run(manifest: &Manifest, manifest_dir: &Path) {
+fn cmd_run_manifest(manifest: &Manifest, manifest_dir: &Path) {
     eprintln!(
         "vosx: manifest '{}' — 1 service + {} actor(s)",
         manifest.manifest.name,
