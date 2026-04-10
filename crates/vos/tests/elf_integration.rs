@@ -240,7 +240,7 @@ fn data_layer_roundtrip_via_runtime() {
     let mut rt = VosRuntime::with_data_layer(da);
     let id = vos_abi::service::ServiceId(42);
     assert!(!rt.is_suspended(id));
-    rt.storage.write(id, b"\0__vos_cont", &encoded);
+    rt.storage.write(id, vos::lifecycle::CONTINUATION_HEADER_KEY, &encoded);
     assert!(
         rt.is_suspended(id),
         "runtime should see the continuation header in service storage"
@@ -278,7 +278,7 @@ fn data_layer_survives_runtime_teardown() {
     let blob = transpile_actor(&greeter_elf);
     let blob_idx = rt_a.register_service_blob(blob.clone());
     let svc_id = rt_a.register_service(blob_idx);
-    rt_a.storage.write(svc_id, b"\0__vos_cont", &header.encode());
+    rt_a.storage.write(svc_id, vos::lifecycle::CONTINUATION_HEADER_KEY, &header.encode());
     assert!(rt_a.is_suspended(svc_id));
 
     // Move data layer and storage to runtime B.

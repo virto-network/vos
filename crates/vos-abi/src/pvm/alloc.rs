@@ -110,15 +110,12 @@ unsafe impl GlobalAlloc for FreeListHeap {
                     unsafe { (*prev).next = leftover; }
                 }
             } else {
-                // Use entire block.
+                // Use entire block (no split).
                 if prev.is_null() {
                     *head = next;
                 } else {
                     unsafe { (*prev).next = next; }
                 }
-                // Account for the extra bytes we're consuming.
-                let used = block_size;
-                let _ = used; // block_size is the canonical size stored below
             }
 
             // Write header immediately before the payload.

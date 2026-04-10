@@ -408,25 +408,8 @@ impl<D: DataLayer> VosRuntime<D> {
                     };
 
                     if continue_next {
-                        // Capture flat_mem into the data layer and write
-                        // a continuation header to the journal.
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
-                        let commitment = crate::pvm_image::commit(&flat_mem);
-                        pollster::block_on(self.data.put(commitment, flat_mem.clone()));
-                        let header = crate::pvm_image::ContinuationHeader {
-                            pc: 0,
-                            heap_base,
-                            heap_top,
-                            need_gas_charge: false,
-                            iters: 0,
-                            flat_mem_len: flat_mem.len() as u32,
-                            commitment,
-                            registers: [0; 13],
-                        };
-                        journal.writes.push((
-                            crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
-                            header.encode(),
-                        ));
+                        save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
                         // Enqueue a wake-up transfer so the service is
                         // re-ticked next round (continuation resumes it
                         // with warm memory).
@@ -464,22 +447,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     // for the next tick. Capture a continuation so the
                     // service warm-restarts with its current heap/actor.
                     let (flat_mem, heap_base, heap_top) = captured;
-                    let commitment = crate::pvm_image::commit(&flat_mem);
-                    pollster::block_on(self.data.put(commitment, flat_mem.clone()));
-                    let header = crate::pvm_image::ContinuationHeader {
-                        pc: 0,
-                        heap_base,
-                        heap_top,
-                        need_gas_charge: false,
-                        iters: 0,
-                        flat_mem_len: flat_mem.len() as u32,
-                        commitment,
-                        registers: [0; 13],
-                    };
-                    journal.writes.push((
-                        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
-                        header.encode(),
-                    ));
+                    save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
                     // Re-queue leftover self-messages for next tick.
                     for msg in items.drain(..) {
                         new_transfers.push((ServiceId(svc_id), msg));
@@ -821,6 +789,34 @@ fn handle_invoke(
     let output = kread(&child, out_ptr, out_len);
     kwrite(caller, output_ptr, &output);
     out_len as u64
+}
+
+/// Capture a continuation: hash flat_mem, store in the data layer,
+/// and push a ContinuationHeader to the journal.
+fn save_continuation<D: crate::data_layer::DataLayer>(
+    flat_mem: Vec<u8>,
+    heap_base: u32,
+    heap_top: u32,
+    data: &mut D,
+    journal: &mut RefineJournal,
+) {
+    let commitment = crate::pvm_image::commit(&flat_mem);
+    let flat_mem_len = flat_mem.len() as u32;
+    pollster::block_on(data.put(commitment, flat_mem));
+    let header = crate::pvm_image::ContinuationHeader {
+        pc: 0,
+        heap_base,
+        heap_top,
+        need_gas_charge: false,
+        iters: 0,
+        flat_mem_len,
+        commitment,
+        registers: [0; 13],
+    };
+    journal.writes.push((
+        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+        header.encode(),
+    ));
 }
 
 /// Load a continuation for a service: read header from storage (checking
