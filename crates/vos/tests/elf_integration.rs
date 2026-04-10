@@ -32,7 +32,7 @@ fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos_abi::service::Service
 #[test]
 fn transpile_all_examples() {
     // Smoke test: all example ELFs transpile without error.
-    for name in &["greeter", "counter", "fizzbuzz", "hasher", "animation"] {
+    for name in &["greeter", "counter", "fizzbuzz", "hasher", "animation", "display"] {
         let elf = example_elf(name);
         let blob = transpile_actor(&elf);
         assert!(!blob.is_empty(), "{name} produced empty blob");
@@ -319,6 +319,36 @@ fn greeter_as_top_level_service() {
     rt.send_to(id, payload);
     rt.run_blocking();
     assert_eq!(rt.panics, 0, "greeter panicked running directly as top-level service");
+}
+
+#[test]
+fn display_multiple_vec_renders() {
+    // Regression test for the multi-deliver Vec bug (March 2025):
+    // under the old bump allocator, sequential messages containing
+    // Vec<u8> payloads would silently fail because heap memory was
+    // never freed. The freelist allocator should handle this.
+    let elf = example_elf("display");
+    let blob = transpile_actor(&elf);
+    let mut rt = VosRuntime::new();
+    let id = register_svc(&mut rt, blob);
+
+    use vos::value::{Msg, Value, TAG_DYNAMIC};
+    use vos::Encode;
+
+    // Send two render messages with Vec<u8> payloads in separate ticks.
+    // Each gets its own kernel invocation so both must independently
+    // allocate, process, and free Vec heap memory.
+    let pixels = vec![0xAAu8; 16 * 8];
+    for i in 0..2 {
+        let msg = Msg::new("render").with("pixels", Value::Bytes(pixels.clone()));
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        rt.send_to(id, payload);
+        rt.run_blocking();
+        assert_eq!(rt.panics, 0, "display panicked on render #{i}");
+    }
 }
 
 #[test]
