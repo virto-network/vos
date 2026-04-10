@@ -24,16 +24,32 @@ examples/
 
 ## What is VOS?
 
-VOS is a small actor framework built on the JAR JAVM. An **actor** is a Rust struct
-whose methods are message handlers. To you as an author, an actor looks like
-a long-running program: you can write `loop { ... }`, `await` other actors,
-sleep, and hold local variables across those awaits. Under the hood, nothing
-is actually long-lived — each time a message arrives, a fresh PVM (a minimal
-RISC-V virtual machine) is spun up, the actor's state is deserialized from
-storage, the handler runs, new state is written back, and the PVM halts.
-Yields and `ask()` calls checkpoint the handler so the next invocation can
-pick up where it left off. The result: code that reads like a normal async
-service, but every invocation is deterministic and cheap to replay.
+VOS is a small actor framework built on the JAR JAVM. An **actor** is a Rust
+struct whose methods are message handlers. To you as an author, an actor looks
+like a long-running program: you can write `loop { ... }`, `await` other
+actors, sleep, and hold local variables across those awaits.
+
+Under the hood, each service runs inside a PVM (a minimal RISC-V virtual
+machine). Every tick follows the JAM **refine→accumulate** split:
+
+- **Refine** (PC=0, pure): reads state, dispatches messages, buffers side
+  effects, and halts with a `RefinePayload` containing the new actor state
+  and queued effects. Cannot mutate storage.
+- **Accumulate** (commit): replays the buffered effects — storage writes,
+  transfers to other services, preimage provides — making them permanent.
+
+When a handler calls `ctx.yield_now()`, the framework sets `continue_next`
+in the refine output. The accumulate stage persists the serialized actor
+state to storage and issues a self-directed transfer so the service is
+re-ticked. On the next tick, refine reads the persisted state and the actor
+picks up where it left off. This continuation protocol is JAM-compatible:
+it relies only on standard `READ`, `WRITE`, and `TRANSFER` hostcalls, so
+services work on any conformant host without special runtime support.
+
+VOS adds a transparent optimization on top: when a service yields, the
+runtime also captures the PVM's flat memory image. On the next tick the
+kernel is warm-started with that image, so the actor's heap and statics
+survive without a serialize/deserialize round-trip.
 
 **Agents** are services that orchestrate actors. The `scheduler` agent keeps a
 list of children, sends each of them a `run` message on startup, and
@@ -48,32 +64,34 @@ vosx Agent.toml
   └─ kick-start the scheduler
      │
      ▼
-  scheduler (accumulate phase, PC=5)
+  scheduler (refine, PC=0)
      ├─ fetch "start" message
      ├─ for each child: invoke(child, Msg::new("run"))
      │     │
      │     ▼
-     │  actor (refine phase, PC=0)
-     │     ├─ fetch state + message
-     │     ├─ run handler
-     │     │    (may ctx.ask() another actor → suspends, replays on reply)
-     │     │    (may ctx.yield_now() → halts with Yielded status)
-     │     └─ write back [status][state][reply]
+     │  actor (refine, PC=0)
+     │     ├─ read persisted state (or create fresh)
+     │     ├─ fetch + dispatch messages
+     │     │    (may ctx.ask() → synchronous INVOKE hostcall)
+     │     │    (may ctx.yield_now() → sets continue_next flag)
+     │     └─ halt with RefinePayload(state, effects, reply)
      │
-     ├─ queue any yielded children for the next round
-     └─ self-schedule a "tick" until queue is empty
+     ├─ accumulate: replay effects (writes, transfers)
+     ├─ if continue_next: persist state + self-transfer
+     └─ repeat until no yielded children remain
 ```
 
 Handlers get an `&mut Context` that offers:
 
-- `ctx.tell(target, &Msg::new("foo"))` — fire-and-forget
-- `ctx.ask(target, &Msg::new("foo").with("a", 1)).await` — query, returns `Result<Value, InvokeError>`
+- `ctx.tell(target, &Msg::new("foo"))` — fire-and-forget transfer
+- `ctx.ask(target, &Msg::new("foo").with("a", 1)).await` — synchronous query via `INVOKE` hostcall, returns `Result<Value, InvokeError>`
 - `ctx.yield_now().await` — checkpoint state and let other actors run
 - `ctx.sleep(n).await` — sleep for N ticks
+- `ctx.store(key, value)` — queue a storage write (applied in accumulate)
 
-Under the hood, `ask()` uses an ask-replay pattern: the handler yields, the
-framework resolves the invoke, restores the pre-ask snapshot, and replays the
-handler with the cached reply. Actor code just looks like plain async Rust.
+`ask()` is synchronous: the host suspends the caller's PVM at the `INVOKE`
+ecall, runs the child to completion, and resumes the caller with the reply
+already in hand. No snapshots, no replay — just a nested PVM invocation.
 
 ## Running
 
@@ -98,4 +116,5 @@ target (configured per-crate in `.cargo/config.toml`).
 - **`actors/counter`** — persistent state across invocations
 - **`actors/pipeline`** — chained `ctx.ask()` calls to another actor
 - **`agents/scheduler`** — how an agent drives children via `lifecycle::invoke`
-- **`../crates/vos/src/actors/`** — the framework itself, starting with `run.rs`
+- **`../crates/vos/src/actors/run.rs`** — service entry points (`run_refine_service`, `run_accumulate_service`)
+- **`../crates/vos/src/runtime.rs`** — host-side runtime, journal, continuation wiring
