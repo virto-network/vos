@@ -298,6 +298,22 @@ impl<D: DataLayer> VosRuntime<D> {
         !self.pending_transfers.is_empty()
     }
 
+    /// Drain transfers destined for services not registered in this
+    /// runtime. Used by [`crate::node::VosNode`] to route cross-agent
+    /// messages through the node's mailbox.
+    pub fn drain_external_transfers(&mut self, _self_id: ServiceId) -> Vec<(ServiceId, Vec<u8>)> {
+        let mut external = Vec::new();
+        self.pending_transfers.retain(|(target, data)| {
+            if self.services.contains_key(&target.0) {
+                true // keep — local service
+            } else {
+                external.push((*target, data.clone()));
+                false // remove — route externally
+            }
+        });
+        external
+    }
+
     /// Check whether a service has a live continuation in the data layer.
     pub fn is_suspended(&self, id: ServiceId) -> bool {
         let Some(header_bytes) = self.storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)

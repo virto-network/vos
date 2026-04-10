@@ -70,6 +70,9 @@ pub mod operand;
 #[cfg(feature = "std")]
 pub mod runtime;
 
+#[cfg(feature = "std")]
+pub mod node;
+
 /// Re-export for use by generated print!/println! macros.
 #[cfg(feature = "pvm")]
 #[doc(hidden)]

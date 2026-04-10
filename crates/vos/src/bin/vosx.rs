@@ -133,6 +133,7 @@ fn print_help() {
     println!("vosx — JAM-aligned PVM executor\n");
     println!("Usage:");
     println!("  vosx run <program.pvm|.elf> [OPTIONS]    Run any PVM program");
+    println!("  vosx node <prog1> <prog2> ...            Run multiple agents concurrently");
     println!("  vosx [MANIFEST]                          Run a TOML manifest");
     println!("  vosx --list [MANIFEST]                   List actors\n");
     println!("Run options:");
@@ -161,9 +162,11 @@ fn main() {
         return;
     }
 
-    // Subcommand dispatch: `vosx run <program>` vs `vosx [manifest]`
+    // Subcommand dispatch
     if args.len() > 1 && args[1] == "run" {
         cmd_run_raw(&args[2..]);
+    } else if args.len() > 1 && args[1] == "node" {
+        cmd_node(&args[2..]);
     } else {
         let list_mode = args.iter().any(|a| a == "--list");
         let manifest_path = args.iter()
@@ -360,6 +363,60 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
+}
+
+// ── Multi-agent node mode ────────────────────────────────────────────
+
+/// Run multiple agents concurrently, each on its own thread.
+/// Cross-agent transfers are routed through the node's mailbox.
+fn cmd_node(args: &[String]) {
+    use vos::node::{VosNode, AgentConfig};
+
+    if args.is_empty() {
+        eprintln!("error: `vosx node` requires at least one program path");
+        eprintln!("Usage: vosx node <prog1.elf> <prog2.elf> ...");
+        process::exit(1);
+    }
+
+    let mut node = VosNode::new();
+
+    for arg in args {
+        if arg.starts_with('-') {
+            eprintln!("error: unknown option '{arg}' (node mode takes program paths only)");
+            process::exit(1);
+        }
+
+        let path = PathBuf::from(arg);
+        let data = load_file(&path, arg);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let blob = match ext {
+            "pvm" => data,
+            _ => transpile_elf(&data, arg),
+        };
+
+        let id = node.register(AgentConfig {
+            blob,
+            init_payloads: vec![],
+            storage: vec![],
+        });
+        eprintln!("vosx node: registered '{}' as agent {id:?}", path.display());
+    }
+
+    eprintln!("vosx node: running {} agent(s)...\n", args.len());
+    node.run();
+
+    let results = node.collect();
+    let total_panics: u32 = results.iter().map(|r| r.panics).sum();
+    for r in &results {
+        if r.panics > 0 {
+            eprintln!("vosx node: agent {:?} had {} panic(s)", r.id, r.panics);
+        }
+    }
+
+    eprintln!("\nvosx node: done");
+    if total_panics > 0 {
+        process::exit(1);
+    }
 }
 
 // ── Manifest run mode ────────────────────────────────────────────────
