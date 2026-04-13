@@ -1,17 +1,8 @@
 //! `vosx` — JAM-aligned PVM executor.
 //!
-//! Usage:
-//!     vosx run <program.pvm|program.elf> [--payload file] ...  Run any PVM program
-//!     vosx [path/to/Kunekt.toml]                               Run a manifest
-//!     vosx --list [path/to/Kunekt.toml]                        List actors
-//!
-//! `vosx run` is the "dumb host" mode: it loads a single PVM/ELF blob,
-//! delivers payload(s) via FETCH, runs refine, and prints the output.
-//! No manifest, no framework assumptions — any conformant JAM service works.
-//!
-//! The manifest mode (`vosx [Kunekt.toml]`) is sugar that translates a
-//! TOML manifest into the same transfer-based delivery.
+//! Run any PVM program, a TOML manifest, or multiple agents concurrently.
 
+use clap::{Parser, Subcommand};
 use vos::runtime::VosRuntime;
 use vos::metadata;
 use vos::init::{InitArgs, InitValue};
@@ -20,7 +11,64 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process;
 
-// --- Manifest (Kunekt.toml) ---
+// ── CLI ──────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "vosx", about = "JAM-aligned PVM executor")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Path to Kunekt.toml manifest (default mode)
+    #[arg(global = true)]
+    manifest: Option<PathBuf>,
+
+    /// List actors and their messages without running
+    #[arg(long)]
+    list: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run any PVM/ELF program (dumb JAM host)
+    Run(RunArgs),
+    /// Run multiple agents concurrently on separate threads
+    Node(NodeArgs),
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Path to PVM or ELF program
+    program: PathBuf,
+
+    /// Deliver file contents as a FETCH work item (repeatable)
+    #[arg(long, value_name = "FILE")]
+    payload: Vec<PathBuf>,
+
+    /// Deliver hex-encoded bytes as a FETCH work item (repeatable)
+    #[arg(long, value_name = "HEX")]
+    hex: Vec<String>,
+
+    /// Set gas limit
+    #[arg(long, default_value_t = 100_000_000)]
+    gas: u64,
+
+    /// Send a "start" message to kick-start a long-running service
+    #[arg(short, long)]
+    start: bool,
+}
+
+#[derive(clap::Args)]
+struct NodeArgs {
+    /// PVM/ELF programs to run as agents
+    programs: Vec<PathBuf>,
+
+    /// Send a "start" message to each agent
+    #[arg(short, long)]
+    start: bool,
+}
+
+// ── Manifest (Kunekt.toml) ───────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -57,6 +105,8 @@ struct ActorDef {
 
 fn default_format() -> String { "elf".to_string() }
 
+// ── Helpers ──────────────────────────────────────────────────────────
+
 fn load_manifest(path: &Path) -> Manifest {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -74,8 +124,6 @@ fn load_manifest(path: &Path) -> Manifest {
     }
 }
 
-// ---
-
 fn resolve_path(manifest_dir: &Path, path: &Option<PathBuf>, name: &str) -> PathBuf {
     match path {
         Some(p) => manifest_dir.join(p),
@@ -86,7 +134,7 @@ fn resolve_path(manifest_dir: &Path, path: &Option<PathBuf>, name: &str) -> Path
     }
 }
 
-fn load_file(path: &Path, _name: &str) -> Vec<u8> {
+fn load_file(path: &Path) -> Vec<u8> {
     match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -96,18 +144,37 @@ fn load_file(path: &Path, _name: &str) -> Vec<u8> {
     }
 }
 
-fn transpile_elf(data: &[u8], name: &str) -> Vec<u8> {
-    eprintln!("  transpiling '{name}' via link_elf");
-    match grey_transpiler::link_elf(data) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: transpiling '{name}': {e:?}");
-            process::exit(1);
+fn load_blob(path: &Path) -> Vec<u8> {
+    let data = load_file(path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "pvm" => data,
+        _ => {
+            let name = path.display().to_string();
+            eprintln!("  transpiling '{name}' via link_elf");
+            match grey_transpiler::link_elf(&data) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("error: transpiling '{name}': {e:?}");
+                    process::exit(1);
+                }
+            }
         }
     }
 }
 
-/// Convert a TOML value to an InitValue using the expected type from metadata.
+/// Encode a dynamic "start" message as a tagged work item.
+fn encode_start_msg() -> Vec<u8> {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let msg = Msg::new("start");
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    payload
+}
+
 fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {
     let ty = expected_ty.replace(' ', "");
     match (val, ty.as_str()) {
@@ -129,23 +196,16 @@ fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {
     }
 }
 
-fn print_help() {
-    println!("vosx — JAM-aligned PVM executor\n");
-    println!("Usage:");
-    println!("  vosx run <program.pvm|.elf> [OPTIONS]    Run any PVM program");
-    println!("  vosx node <prog1> <prog2> ...            Run multiple agents concurrently");
-    println!("  vosx [MANIFEST]                          Run a TOML manifest");
-    println!("  vosx --list [MANIFEST]                   List actors\n");
-    println!("Run options:");
-    println!("  --payload <file>    Deliver file contents as a FETCH work item (repeatable)");
-    println!("  --payload -         Read payload from stdin");
-    println!("  --hex <hex>         Deliver hex-encoded bytes as a FETCH work item");
-    println!("  --gas <amount>      Set gas limit (default: 100_000_000)\n");
-    println!("Manifest options:");
-    println!("  --list              List actors and their messages without running\n");
-    println!("General:");
-    println!("  -h, --help          Show this help");
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.trim_start_matches("0x");
+    if hex.len() % 2 != 0 { return None; }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
+
+// ── Main ─────────────────────────────────────────────────────────────
 
 fn main() {
     let _ = tracing_subscriber::fmt()
@@ -155,49 +215,144 @@ fn main() {
         )
         .with_writer(std::io::stderr)
         .try_init();
-    let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print_help();
-        return;
-    }
+    let cli = Cli::parse();
 
-    // Subcommand dispatch
-    if args.len() > 1 && args[1] == "run" {
-        cmd_run_raw(&args[2..]);
-    } else if args.len() > 1 && args[1] == "node" {
-        cmd_node(&args[2..]);
-    } else {
-        let list_mode = args.iter().any(|a| a == "--list");
-        let manifest_path = args.iter()
-            .filter(|a| !a.starts_with('-') && *a != &args[0])
-            .next()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("Kunekt.toml"));
+    match cli.command {
+        Some(Command::Run(args)) => cmd_run(args),
+        Some(Command::Node(args)) => cmd_node(args),
+        None => {
+            let manifest_path = cli.manifest.unwrap_or_else(|| PathBuf::from("Kunekt.toml"));
+            let manifest = load_manifest(&manifest_path);
+            let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
 
-        let manifest = load_manifest(&manifest_path);
-        let manifest_dir = manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-
-        if list_mode {
-            cmd_list(&manifest, manifest_dir);
-        } else {
-            cmd_run_manifest(&manifest, manifest_dir);
+            if cli.list {
+                cmd_list(&manifest, manifest_dir);
+            } else {
+                cmd_manifest(&manifest, manifest_dir);
+            }
         }
     }
 }
 
-/// List all actors and their messages by reading ELF metadata.
+// ── `vosx run` ───────────────────────────────────────────────────────
+
+fn cmd_run(args: RunArgs) {
+    let blob = load_blob(&args.program);
+
+    let mut runtime = VosRuntime::with_gas_config(vos::runtime::GasConfig {
+        refine_gas: args.gas,
+        accumulate_gas_max: args.gas,
+        accumulate_gas_default: args.gas,
+    });
+
+    let blob_idx = runtime.register_service_blob(blob);
+    let id = runtime.register_service(blob_idx);
+
+    eprintln!("vosx run: loaded '{}' as service {id:?}", args.program.display());
+
+    // Collect payloads from --payload and --hex flags
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+
+    for path in &args.payload {
+        let data = if path.as_os_str() == "-" {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
+                eprintln!("error: reading stdin: {e}");
+                process::exit(1);
+            });
+            buf
+        } else {
+            load_file(path)
+        };
+        payloads.push(data);
+    }
+
+    for hex_str in &args.hex {
+        let data = hex_decode(hex_str).unwrap_or_else(|| {
+            eprintln!("error: invalid hex string '{hex_str}'");
+            process::exit(1);
+        });
+        payloads.push(data);
+    }
+
+    if args.start {
+        payloads.insert(0, encode_start_msg());
+    }
+
+    if payloads.is_empty() {
+        runtime.send_to(id, Vec::new());
+    } else {
+        for payload in payloads {
+            runtime.send_to(id, payload);
+        }
+    }
+
+    eprintln!("vosx run: executing...\n");
+    runtime.run_blocking();
+
+    if runtime.panics > 0 {
+        eprintln!("\nvosx run: program panicked ({} panic(s))", runtime.panics);
+        process::exit(1);
+    }
+    eprintln!("\nvosx run: done");
+}
+
+// ── `vosx node` ──────────────────────────────────────────────────────
+
+fn cmd_node(args: NodeArgs) {
+    use vos::node::{VosNode, AgentConfig};
+
+    if args.programs.is_empty() {
+        eprintln!("error: `vosx node` requires at least one program path");
+        process::exit(1);
+    }
+
+    let mut node = VosNode::new();
+
+    for path in &args.programs {
+        let blob = load_blob(path);
+        let init_payloads = if args.start {
+            vec![encode_start_msg()]
+        } else {
+            vec![]
+        };
+
+        let id = node.register(AgentConfig {
+            blob,
+            init_payloads,
+            storage: vec![],
+        });
+        eprintln!("vosx node: registered '{}' as agent {id:?}", path.display());
+    }
+
+    eprintln!("vosx node: running {} agent(s)...\n", args.programs.len());
+    node.run();
+
+    let results = node.collect();
+    let total_panics: u32 = results.iter().map(|r| r.panics).sum();
+    for r in &results {
+        if r.panics > 0 {
+            eprintln!("vosx node: agent {:?} had {} panic(s)", r.id, r.panics);
+        }
+    }
+
+    eprintln!("\nvosx node: done");
+    if total_panics > 0 {
+        process::exit(1);
+    }
+}
+
+// ── `vosx [manifest]` ────────────────────────────────────────────────
+
 fn cmd_list(manifest: &Manifest, manifest_dir: &Path) {
     println!("{}", manifest.manifest.name);
     println!();
 
-    // Service
     let svc_path = resolve_path(manifest_dir, &manifest.service.path, &manifest.service.name);
     print_actor_meta(&manifest.service.name, &svc_path, "service");
 
-    // Actors
     for actor_def in &manifest.actors {
         let path = resolve_path(manifest_dir, &actor_def.path, &actor_def.name);
         print_actor_meta(&actor_def.name, &path, "actor");
@@ -246,183 +401,7 @@ fn print_actor_meta(name: &str, path: &Path, role: &str) {
     }
 }
 
-// ── Raw run mode ─────────────────────────────────────────────────────
-
-/// Run a single PVM/ELF program with optional payloads. This is the
-/// "dumb host" mode — no manifest, no framework assumptions.
-fn cmd_run_raw(args: &[String]) {
-    use std::io::Read;
-
-    if args.is_empty() {
-        eprintln!("error: `vosx run` requires a program path");
-        eprintln!("Usage: vosx run <program.pvm|.elf> [--payload file] ...");
-        process::exit(1);
-    }
-
-    let program_path = PathBuf::from(&args[0]);
-    let mut payloads: Vec<Vec<u8>> = Vec::new();
-    let mut gas: Option<u64> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--payload" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --payload requires a file path (or - for stdin)");
-                    process::exit(1);
-                }
-                let data = if args[i] == "-" {
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
-                        eprintln!("error: reading stdin: {e}");
-                        process::exit(1);
-                    });
-                    buf
-                } else {
-                    load_file(Path::new(&args[i]), &args[i])
-                };
-                payloads.push(data);
-            }
-            "--hex" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --hex requires a hex string");
-                    process::exit(1);
-                }
-                let hex = args[i].trim_start_matches("0x");
-                let data = hex_decode(hex).unwrap_or_else(|| {
-                    eprintln!("error: invalid hex string");
-                    process::exit(1);
-                });
-                payloads.push(data);
-            }
-            "--gas" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --gas requires a number");
-                    process::exit(1);
-                }
-                gas = Some(args[i].replace('_', "").parse().unwrap_or_else(|_| {
-                    eprintln!("error: invalid gas value");
-                    process::exit(1);
-                }));
-            }
-            other => {
-                eprintln!("error: unknown option '{other}'");
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    let data = load_file(&program_path, &program_path.display().to_string());
-    let ext = program_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let blob = match ext {
-        "pvm" => data,
-        _ => transpile_elf(&data, &program_path.display().to_string()),
-    };
-
-    let mut runtime = VosRuntime::new();
-    if let Some(g) = gas {
-        runtime = VosRuntime::with_gas_config(vos::runtime::GasConfig {
-            refine_gas: g,
-            accumulate_gas_max: g,
-            accumulate_gas_default: g,
-        });
-    }
-
-    let blob_idx = runtime.register_service_blob(blob);
-    let id = runtime.register_service(blob_idx);
-
-    eprintln!("vosx run: loaded '{}' as service {id:?}", program_path.display());
-
-    // Deliver payloads as transfers (each becomes a FETCH item)
-    if payloads.is_empty() {
-        // Send an empty transfer to kick-start the service
-        runtime.send_to(id, Vec::new());
-    } else {
-        for payload in payloads {
-            runtime.send_to(id, payload);
-        }
-    }
-
-    eprintln!("vosx run: executing...\n");
-    runtime.run_blocking();
-
-    if runtime.panics > 0 {
-        eprintln!("\nvosx run: program panicked ({} panic(s))", runtime.panics);
-        process::exit(1);
-    }
-    eprintln!("\nvosx run: done");
-}
-
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 { return None; }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
-}
-
-// ── Multi-agent node mode ────────────────────────────────────────────
-
-/// Run multiple agents concurrently, each on its own thread.
-/// Cross-agent transfers are routed through the node's mailbox.
-fn cmd_node(args: &[String]) {
-    use vos::node::{VosNode, AgentConfig};
-
-    if args.is_empty() {
-        eprintln!("error: `vosx node` requires at least one program path");
-        eprintln!("Usage: vosx node <prog1.elf> <prog2.elf> ...");
-        process::exit(1);
-    }
-
-    let mut node = VosNode::new();
-
-    for arg in args {
-        if arg.starts_with('-') {
-            eprintln!("error: unknown option '{arg}' (node mode takes program paths only)");
-            process::exit(1);
-        }
-
-        let path = PathBuf::from(arg);
-        let data = load_file(&path, arg);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let blob = match ext {
-            "pvm" => data,
-            _ => transpile_elf(&data, arg),
-        };
-
-        let id = node.register(AgentConfig {
-            blob,
-            init_payloads: vec![],
-            storage: vec![],
-        });
-        eprintln!("vosx node: registered '{}' as agent {id:?}", path.display());
-    }
-
-    eprintln!("vosx node: running {} agent(s)...\n", args.len());
-    node.run();
-
-    let results = node.collect();
-    let total_panics: u32 = results.iter().map(|r| r.panics).sum();
-    for r in &results {
-        if r.panics > 0 {
-            eprintln!("vosx node: agent {:?} had {} panic(s)", r.id, r.panics);
-        }
-    }
-
-    eprintln!("\nvosx node: done");
-    if total_panics > 0 {
-        process::exit(1);
-    }
-}
-
-// ── Manifest run mode ────────────────────────────────────────────────
-
-/// Run the full cooperative loop.
-fn cmd_run_manifest(manifest: &Manifest, manifest_dir: &Path) {
+fn cmd_manifest(manifest: &Manifest, manifest_dir: &Path) {
     eprintln!(
         "vosx: manifest '{}' — 1 service + {} actor(s)",
         manifest.manifest.name,
@@ -431,35 +410,33 @@ fn cmd_run_manifest(manifest: &Manifest, manifest_dir: &Path) {
 
     let mut runtime = VosRuntime::new();
 
-    // Step 1: Register the agent service (dual-entry blob with refine+accumulate)
+    // Step 1: Register the agent service
     let svc_path = resolve_path(manifest_dir, &manifest.service.path, &manifest.service.name);
-    let agent_data = load_file(&svc_path, &manifest.service.name);
+    let agent_data = load_file(&svc_path);
     eprintln!("  loading '{}' from {}", manifest.service.name, svc_path.display());
     let agent_blob = match manifest.service.format.as_str() {
         "pvm" => agent_data.clone(),
-        _ => transpile_elf(&agent_data, &manifest.service.name),
+        _ => load_blob(&svc_path),
     };
     let agent_blob_idx = runtime.register_service_blob(agent_blob);
     let agent_id = runtime.register_service(agent_blob_idx);
     eprintln!("  registered '{}' as service {agent_id:?}", manifest.service.name);
 
-    // Step 2: Register actor blobs (dual-entry: refine at PC=0, accumulate at PC=5)
-    // Actors use link_elf_service so PC=0 has a jump to _start (needed for invoke).
+    // Step 2: Register actor blobs
     let mut actor_ids = Vec::new();
     for actor_def in &manifest.actors {
         let path = resolve_path(manifest_dir, &actor_def.path, &actor_def.name);
-        let data = load_file(&path, &actor_def.name);
+        let data = load_file(&path);
         eprintln!("  loading '{}' from {}", actor_def.name, path.display());
         let blob = match actor_def.format.as_str() {
             "pvm" => data.clone(),
-            _ => transpile_elf(&data, &actor_def.name),
+            _ => load_blob(&path),
         };
         let blob_idx = runtime.register_service_blob(blob);
         let id = runtime.register_service(blob_idx);
         eprintln!("  registered '{}' as service {id:?}", actor_def.name);
         actor_ids.push(id);
 
-        // Write actor init args from manifest
         if !actor_def.init.is_empty() {
             let meta = metadata::from_elf(&data);
             let mut args = InitArgs::new();
@@ -475,19 +452,15 @@ fn cmd_run_manifest(manifest: &Manifest, manifest_dir: &Path) {
         }
     }
 
-    // Step 3: Build init args for the service.
-    // Convention: auto-inject "children" with registered actor IDs.
+    // Step 3: Build init args for the service
     {
         let mut args = InitArgs::new();
-
-        // Auto-inject children from [[actors]]
         let children: Vec<u32> = actor_ids.iter().map(|id| id.0).collect();
         args = args.with("children", InitValue::ListU32(children));
 
-        // Merge explicit init values from manifest
         if let Some(meta) = metadata::from_elf(&agent_data) {
             for field in &meta.constructor {
-                if field.name == "children" { continue; } // already injected
+                if field.name == "children" { continue; }
                 if let Some(val) = manifest.service.init.get(&field.name) {
                     args = args.with(&field.name, toml_to_init_value(val, &field.ty));
                 }
@@ -498,23 +471,10 @@ fn cmd_run_manifest(manifest: &Manifest, manifest_dir: &Path) {
         runtime.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
     }
 
-    // Send a dynamic "start" message to kick-start the agent. Encoded
-    // as a tagged Msg so the framework's dispatch_one decodes it via
-    // FromDynamic — the agent's `start` handler then runs.
-    {
-        use vos::value::{Msg, TAG_DYNAMIC};
-        use vos::Encode;
-        let msg = Msg::new("start");
-        let encoded = msg.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        runtime.send_to(agent_id, payload);
-    }
+    // Send "start" to kick-start the agent
+    runtime.send_to(agent_id, encode_start_msg());
 
     eprintln!("vosx: running...\n");
-
     runtime.run_blocking();
-
     eprintln!("\nvosx: done");
 }
