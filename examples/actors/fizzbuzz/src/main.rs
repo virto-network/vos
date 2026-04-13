@@ -17,7 +17,7 @@ impl FizzBuzz {
     }
 
     #[msg]
-    async fn run(&mut self, ctx: &mut Context<Self>) {
+    async fn start(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.n += 1;
             if self.n % 15 == 0 {

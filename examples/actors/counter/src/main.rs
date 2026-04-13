@@ -18,7 +18,7 @@ impl Counter {
     }
 
     #[msg]
-    async fn run(&mut self, ctx: &mut Context<Self>) {
+    async fn start(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.count += 1;
             println!("counter: count = {}", self.count);

@@ -304,7 +304,7 @@ fn data_layer_survives_runtime_teardown() {
 
 #[test]
 fn greeter_as_top_level_service() {
-    // Skip the scheduler; register greeter directly as a service and send it a run message.
+    // Skip the scheduler; register greeter directly as a service and send it a start message.
     let elf = example_elf("greeter");
     let blob = transpile_actor(&elf);
     let mut rt = VosRuntime::new();
@@ -312,7 +312,7 @@ fn greeter_as_top_level_service() {
 
     use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
-    let encoded = Msg::new("run").encode();
+    let encoded = Msg::new("start").encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);

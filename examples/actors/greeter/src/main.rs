@@ -1,6 +1,6 @@
 //! Greeter actor — one-shot actor that prints a greeting and exits.
 //!
-//! Demonstrates the simplest refine-only actor: a single `run()` handler
+//! Demonstrates the simplest refine-only actor: a single `start()` handler
 //! that executes once and completes.
 
 use vos::{actor, messages};
@@ -17,7 +17,7 @@ impl Greeter {
     }
 
     #[msg]
-    async fn run(&self, _ctx: &mut Context<Self>) {
+    async fn start(&self, _ctx: &mut Context<Self>) {
         println!("greeter: Hello n={}", self.n);
     }
 }

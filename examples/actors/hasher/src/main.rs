@@ -3,7 +3,7 @@
 //! Each invocation: hash once, print progress, yield to let the agent
 //! re-invoke us. The loop body runs once per invocation — `try_poll`
 //! returns `Yielded` on the first `.await`, and the agent re-sends
-//! the same `Run` message to drive the next iteration.
+//! the same `Start` message to drive the next iteration.
 
 use vos::{actor, messages};
 
@@ -34,10 +34,10 @@ impl Hasher {
         }
     }
 
-    /// Run the hash loop. Each invocation executes one iteration:
+    /// Start the hash loop. Each invocation executes one iteration:
     /// hash → print → yield. The agent re-invokes to drive the next one.
     #[msg]
-    async fn run(&mut self, ctx: &mut Context<Self>) {
+    async fn start(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.current_hash = simple_hash(&self.current_hash);
             self.iterations += 1;

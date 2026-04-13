@@ -16,13 +16,13 @@ impl Nushell {
         println!("nushell: init (stub)");
 
         let self_id = lifecycle::service_id();
-        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &NushellMsg::Run(Run).to_bytes());
+        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &NushellMsg::Start(Start).to_bytes());
 
         Nushell { children }
     }
 
     #[msg]
-    async fn run(&mut self, _ctx: &mut Context<Self>) {
+    async fn start(&mut self, _ctx: &mut Context<Self>) {
         println!("nushell: not yet implemented");
     }
 }

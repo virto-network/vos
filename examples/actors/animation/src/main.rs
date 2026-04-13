@@ -32,9 +32,9 @@ impl Animation {
         Animation { frame: 0, phase: 0, elapsed: 0 }
     }
 
-    /// Run the animation loop — renders spinner frames to the display.
+    /// Start the animation loop — renders spinner frames to the display.
     #[msg]
-    async fn run(&mut self, ctx: &mut Context<Self>) {
+    async fn start(&mut self, ctx: &mut Context<Self>) {
         let display = vos::actors::context::ServiceId(DISPLAY_ID);
 
         loop {

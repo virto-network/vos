@@ -4,8 +4,8 @@
 //! from init args (written to storage by the host), and accepts runtime
 //! `install` messages to register new actors dynamically.
 //!
-//! On start, sends a dynamic `run` message to each child. Actors without
-//! a `run` handler silently skip it. Actors that yield get re-invoked in
+//! On start, sends a dynamic `start` message to each child. Actors without
+//! a `start` handler silently skip it. Actors that yield get re-invoked in
 //! subsequent tick rounds.
 
 use vos::lifecycle::InvokeResult;
@@ -74,21 +74,21 @@ impl Agent {
         self.children.push(actor_id);
         println!("agent: installed actor {}", actor_id);
 
-        let run_msg = Msg::new("run");
-        if let Some(state) = invoke_child(actor_id, &run_msg, &[]) {
-            self.run_queue.push((actor_id, run_msg, state));
+        let start_msg = Msg::new("start");
+        if let Some(state) = invoke_child(actor_id, &start_msg, &[]) {
+            self.run_queue.push((actor_id, start_msg, state));
             self.maybe_schedule_tick(ctx);
         }
     }
 
-    /// Invoke all registered actors with a dynamic `run` message.
-    /// Actors without a `run` handler silently skip it.
+    /// Invoke all registered actors with a dynamic `start` message.
+    /// Actors without a `start` handler silently skip it.
     #[msg]
     async fn start(&mut self, ctx: &mut Context<Self>) {
-        let run_msg = Msg::new("run");
+        let start_msg = Msg::new("start");
         for &child_id in &self.children.clone() {
-            if let Some(state) = invoke_child(child_id, &run_msg, &[]) {
-                self.run_queue.push((child_id, run_msg.clone(), state));
+            if let Some(state) = invoke_child(child_id, &start_msg, &[]) {
+                self.run_queue.push((child_id, start_msg.clone(), state));
             }
         }
         self.maybe_schedule_tick(ctx);

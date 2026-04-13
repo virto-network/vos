@@ -29,9 +29,9 @@ impl Pipeline {
         Pipeline { step: 0, total: 0 }
     }
 
-    /// Run until accumulated total crosses the threshold, then return it.
+    /// Start until accumulated total crosses the threshold, then return it.
     #[msg]
-    async fn run(&mut self, ctx: &mut Context<Self>) -> u64 {
+    async fn start(&mut self, ctx: &mut Context<Self>) -> u64 {
         let math = vos::actors::context::ServiceId(MATH_ID);
 
         loop {

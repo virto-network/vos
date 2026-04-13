@@ -52,7 +52,7 @@ kernel is warm-started with that image, so the actor's heap and statics
 survive without a serialize/deserialize round-trip.
 
 **Agents** are services that orchestrate actors. The `scheduler` agent keeps a
-list of children, sends each of them a `run` message on startup, and
+list of children, sends each of them a `start` message on startup, and
 re-invokes any that yielded so cooperative loops can make progress.
 
 ### Execution flow
@@ -66,7 +66,7 @@ vosx Agent.toml
      ▼
   scheduler (refine, PC=0)
      ├─ fetch "start" message
-     ├─ for each child: invoke(child, Msg::new("run"))
+     ├─ for each child: invoke(child, Msg::new("start"))
      │     │
      │     ▼
      │  actor (refine, PC=0)
