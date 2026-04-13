@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn node_assigns_global_ids() {
-        let mut node = VosNode::with_prefix(0x0042);
+        let node = VosNode::with_prefix(0x0042);
         let id1 = node.alloc_id();
         let id2 = node.alloc_id();
         assert_eq!(id1, ServiceId::new(0x0042, 1));
