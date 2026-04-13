@@ -31,9 +31,10 @@ pub use run::{run_refine_service, run_accumulate_service};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 
-/// JAM refine entry (PC=0). On services, runs the pure refine body and
-/// halts with a `RefinePayload`. On invoked actors (no `service` feature),
-/// falls through to the existing `run_refine`.
+/// JAM refine entry (PC=0). Always uses the service lifecycle so
+/// actors can run both standalone (`vosx run actor.elf -s`) and as
+/// invoked children. State is read from storage on cold start; FETCH
+/// items are treated as messages.
 #[cfg(feature = "service")]
 pub fn run_refine_entry<A: Actor>() { run::run_refine_service::<A>() }
 #[cfg(all(feature = "pvm", not(feature = "service")))]

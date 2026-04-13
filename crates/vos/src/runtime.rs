@@ -565,7 +565,7 @@ fn run_refine_kernel(
     svc_id: u32,
     items: &mut Vec<Vec<u8>>,
     journal: &mut RefineJournal,
-    storage: &ServiceStorage,
+    storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
@@ -624,7 +624,7 @@ fn handle_refine_hostcall(
     items: &mut Vec<Vec<u8>>,
     svc_id: u32,
     journal: &mut RefineJournal,
-    storage: &ServiceStorage,
+    storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
@@ -765,7 +765,7 @@ fn handle_invoke(
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
-    storage: &ServiceStorage,
+    storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     code_cache: &mut javm::CodeCache,
     journal: &mut RefineJournal,
@@ -841,15 +841,21 @@ fn handle_invoke(
         .vm_mut(0)
         .transition(javm::vm_pool::VmState::Running);
 
-    // Children expect `[state_len:u32 LE][state][msg]` split into
-    // separate FETCH items (FETCH#1=state, FETCH#2=msg) so they can
-    // reuse the same fetch_raw → load_or_create → dispatch pattern as
-    // top-level service actors.
+    // Unpack invoke input: [state_len:u32 LE][state][msg].
+    // Write state to the child's storage under STATE_KEY so service
+    // children (run_refine_service) can cold-start via READ. Also
+    // deliver as FETCH items for legacy children (run_refine).
     let mut child_items = if input.len() >= 4 {
         let state_len =
             u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let state_end = (4 + state_len).min(input.len());
-        let mut items = vec![input[4..state_end].to_vec()];
+        let state = &input[4..state_end];
+
+        if !state.is_empty() {
+            storage.write(target_svc_id, crate::lifecycle::STATE_KEY_BYTES, state);
+        }
+
+        let mut items = vec![state.to_vec()];
         if state_end < input.len() {
             items.push(input[state_end..].to_vec());
         }
@@ -896,11 +902,36 @@ fn handle_invoke(
     }
 
     // Copy the child's halt output into the caller's output buffer.
+    // If the child is a service (outputs RefinePayload), convert to the
+    // invoke wire format [status:u8][state_len:u32][state][reply] so the
+    // caller's guest-side invoke_raw can parse it uniformly.
     let out_ptr = child.active_reg(7) as u32;
     let out_len = (child.active_reg(8) as usize).min(4096);
-    let output = kread(&child, out_ptr, out_len);
+    let raw_output = kread(&child, out_ptr, out_len);
+
+    let output = if let Some(payload) = RefinePayload::decode(&raw_output) {
+        // Service child: convert RefinePayload → invoke wire format.
+        // Absorb effects into the parent's journal.
+        journal.absorb_effects(payload.effects, target_svc_id.0);
+
+        let status = if payload.continue_next {
+            crate::actors::run::STATUS_YIELDED
+        } else {
+            crate::actors::run::STATUS_DONE
+        };
+        let sl = (payload.state.len() as u32).to_le_bytes();
+        let mut out = Vec::with_capacity(1 + 4 + payload.state.len() + payload.reply.len());
+        out.push(status);
+        out.extend_from_slice(&sl);
+        out.extend_from_slice(&payload.state);
+        out.extend_from_slice(&payload.reply);
+        out
+    } else {
+        raw_output
+    };
+
     kwrite(caller, output_ptr, &output);
-    out_len as u64
+    output.len() as u64
 }
 
 /// Capture a continuation: hash flat_mem, store in the data layer,
