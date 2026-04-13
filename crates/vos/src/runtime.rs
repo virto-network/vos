@@ -290,6 +290,18 @@ impl<D: DataLayer> VosRuntime<D> {
         ServiceId(id)
     }
 
+    /// Register a service with a specific externally-assigned ID.
+    /// Used by [`crate::node::VosNode`] to assign node-global IDs.
+    pub fn register_service_with_id(&mut self, blob_idx: usize, id: ServiceId) -> ServiceId {
+        self.services
+            .insert(id.0, ServiceInfo { blob_idx, alive: true });
+        // Keep next_id above any externally assigned ID to avoid collisions
+        if id.0 >= self.next_id {
+            self.next_id = id.0 + 1;
+        }
+        id
+    }
+
     pub fn send_to(&mut self, target: ServiceId, data: Vec<u8>) {
         self.pending_transfers.push((target, data));
     }

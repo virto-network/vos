@@ -1,20 +1,23 @@
 //! Multi-agent node — runs multiple services on separate threads.
 //!
 //! Each agent/service gets its own [`VosRuntime`] on a dedicated thread.
-//! Cross-agent communication uses channels that map to JAM's
-//! cross-service transfers: when service A transfers to service B, the
-//! message is routed through the node's mailbox system to B's runtime.
+//! All services on a node share a **global ID namespace** with a common
+//! node prefix:
 //!
-//! This is preparation for Kunekt's consensus layer where nodes sync
-//! state via merkle-CRDTs instead of blockchain consensus.
+//! ```text
+//! ServiceId = [node_prefix: 16 bits][local_id: 16 bits]
+//! ```
+//!
+//! Cross-agent transfers are routed by the node: if the target's prefix
+//! matches this node, the message is delivered locally. Otherwise it's
+//! forwarded to the network layer (future).
 
 use std::collections::HashMap;
-use std::string::String;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
 use crate::abi::service::ServiceId;
-
 use crate::runtime::VosRuntime;
 
 /// A message routed between agents via the node.
@@ -27,8 +30,6 @@ pub struct Envelope {
 
 /// Handle to a running agent thread.
 struct AgentHandle {
-    /// Send work items to this agent's runtime.
-    tx: mpsc::Sender<Envelope>,
     join: Option<thread::JoinHandle<AgentResult>>,
 }
 
@@ -48,113 +49,104 @@ pub struct AgentConfig {
     pub storage: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// Pre-populated package registry for bootstrapping.
-/// Agents can resolve packages by name+version from this.
-#[derive(Default)]
-pub struct HostRegistry {
-    packages: HashMap<(String, String), Vec<u8>>,
-}
-
-impl HostRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a code blob under a name and version.
-    pub fn publish(&mut self, name: &str, version: &str, blob: Vec<u8>) {
-        self.packages.insert((name.to_string(), version.to_string()), blob);
-    }
-
-    /// Look up a code blob by name and version.
-    pub fn resolve(&self, name: &str, version: &str) -> Option<&Vec<u8>> {
-        self.packages.get(&(name.to_string(), version.to_string()))
-    }
-}
-
 /// A multi-agent VOS node.
 ///
 /// Each agent runs on its own thread with its own `VosRuntime`.
-/// Cross-agent transfers are routed through a shared channel.
+/// All services share a global ID namespace scoped by `node_prefix`.
 pub struct VosNode {
-    agents: HashMap<u32, AgentHandle>,
-    /// Outbound channel — agents send cross-service transfers here.
+    node_prefix: u16,
+    next_local: AtomicU16,
+    /// Map from ServiceId → agent channel. Multiple services can map
+    /// to the same agent (an agent with child actors).
+    routes: HashMap<u32, mpsc::Sender<Envelope>>,
+    agents: Vec<AgentHandle>,
+    /// Outbound channel — agent threads send cross-service transfers here.
     outbox_tx: mpsc::Sender<Envelope>,
-    /// The node reads from this to route messages.
     outbox_rx: mpsc::Receiver<Envelope>,
-    next_id: u32,
-    /// Host-side package registry for bootstrapping.
-    pub registry: HostRegistry,
 }
 
 impl VosNode {
+    /// Create a node with the default prefix (0 = local/unscoped).
     pub fn new() -> Self {
+        Self::with_prefix(0)
+    }
+
+    /// Create a node with a specific network prefix.
+    pub fn with_prefix(node_prefix: u16) -> Self {
         let (outbox_tx, outbox_rx) = mpsc::channel();
         Self {
-            agents: HashMap::new(),
+            node_prefix,
+            next_local: AtomicU16::new(1), // 0 is reserved for registry
+            routes: HashMap::new(),
+            agents: Vec::new(),
             outbox_tx,
             outbox_rx,
-            next_id: 1,
-            registry: HostRegistry::new(),
         }
     }
 
-    /// Register an agent and return its service ID.
-    /// The agent is not started until [`run`] is called.
-    pub fn register(&mut self, config: AgentConfig) -> ServiceId {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let (tx, rx) = mpsc::channel();
-        let outbox = self.outbox_tx.clone();
-        let svc_id = ServiceId(id);
-
-        let join = thread::spawn(move || {
-            agent_thread(svc_id, config, rx, outbox)
-        });
-
-        self.agents.insert(id, AgentHandle {
-            tx,
-            join: Some(join),
-        });
-
-        svc_id
+    /// Allocate the next service ID on this node.
+    fn alloc_id(&self) -> ServiceId {
+        let local = self.next_local.fetch_add(1, Ordering::Relaxed);
+        ServiceId::new(self.node_prefix, local)
     }
 
-    /// Run the node: deliver initial payloads, then route cross-agent
-    /// messages until all agents are idle or finished.
+    /// Register an agent and return its service ID.
+    /// The agent starts immediately on a new thread.
+    pub fn register(&mut self, config: AgentConfig) -> ServiceId {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        let outbox = self.outbox_tx.clone();
+
+        // Route this service ID to this agent's inbox
+        self.routes.insert(id.0, tx.clone());
+
+        let join = thread::spawn(move || {
+            agent_thread(id, config, rx, outbox)
+        });
+
+        self.agents.push(AgentHandle { join: Some(join) });
+        id
+    }
+
+    /// Route messages until all agents are idle or finished.
     pub fn run(&mut self) {
-        // Route messages until no more activity.
-        // Use a timeout-based approach: if no message arrives within
-        // a short window and all agents are done, stop.
         loop {
             match self.outbox_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(envelope) => {
-                    if let Some(handle) = self.agents.get(&envelope.to.0) {
-                        let _ = handle.tx.send(envelope);
-                    }
-                }
+                Ok(envelope) => self.route(envelope),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Check if all agent threads have finished
-                    let all_done = self.agents.values().all(|h| {
+                    let all_done = self.agents.iter().all(|h| {
                         h.join.as_ref().map_or(true, |j| j.is_finished())
                     });
-                    if all_done {
-                        break;
-                    }
+                    if all_done { break; }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
 
+    /// Route a single envelope to its destination.
+    fn route(&self, envelope: Envelope) {
+        let target = envelope.to;
+
+        // Local delivery: prefix matches or target is unscoped (prefix 0)
+        if target.is_on_node(self.node_prefix) || target.is_local() {
+            if let Some(tx) = self.routes.get(&target.0) {
+                let _ = tx.send(envelope);
+            } else {
+                eprintln!("node: no route for {target}, dropping");
+            }
+        } else {
+            // Future: forward to network layer
+            eprintln!("node: no network layer, dropping remote target {target}");
+        }
+    }
+
     /// Collect results from all agent threads.
     pub fn collect(mut self) -> Vec<AgentResult> {
-        // Drop senders so agent threads can detect disconnect
         drop(self.outbox_tx);
-        self.agents.values_mut()
-            .filter_map(|h| {
-                h.join.take().and_then(|j| j.join().ok())
-            })
+        drop(self.routes); // drop agent inboxes so threads can detect disconnect
+        self.agents.iter_mut()
+            .filter_map(|h| h.join.take().and_then(|j| j.join().ok()))
             .collect()
     }
 }
@@ -165,7 +157,8 @@ impl Default for VosNode {
     }
 }
 
-/// The main loop for one agent's thread.
+// ── Agent thread ─────────────────────────────────────────────────────
+
 fn agent_thread(
     id: ServiceId,
     config: AgentConfig,
@@ -175,14 +168,12 @@ fn agent_thread(
     let mut runtime = VosRuntime::new();
 
     let blob_idx = runtime.register_service_blob(config.blob);
-    let svc_id = runtime.register_service(blob_idx);
+    let svc_id = runtime.register_service_with_id(blob_idx, id);
 
-    // Write pre-populated storage
     for (key, value) in &config.storage {
         runtime.storage.write(svc_id, key, value);
     }
 
-    // Deliver initial payloads
     if config.init_payloads.is_empty() {
         runtime.send_to(svc_id, Vec::new());
     } else {
@@ -192,11 +183,9 @@ fn agent_thread(
     }
 
     loop {
-        // Run until no more internal work
         runtime.run_blocking();
 
-        // Drain cross-service transfers from the runtime and route
-        // them through the node's outbox.
+        // Route outbound cross-service transfers through the node
         let external = runtime.drain_external_transfers(svc_id);
         let mut sent_any = false;
         for (target, memo) in external {
@@ -208,34 +197,26 @@ fn agent_thread(
             });
         }
 
-        // Check for incoming messages (non-blocking)
+        // Drain inbox
         let mut received = false;
         while let Ok(envelope) = inbox.try_recv() {
             runtime.send_to(svc_id, envelope.payload);
             received = true;
         }
 
-        if received {
-            continue; // Process new messages
-        }
+        if received { continue; }
 
         if sent_any {
-            // Wait briefly for responses
-            match inbox.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(envelope) => {
-                    runtime.send_to(svc_id, envelope.payload);
-                    continue;
-                }
-                Err(_) => {}
+            if let Ok(envelope) = inbox.recv_timeout(std::time::Duration::from_millis(50)) {
+                runtime.send_to(svc_id, envelope.payload);
+                continue;
             }
         }
 
-        // No more work — check if suspended or done
         if !runtime.has_work() && !runtime.is_suspended(svc_id) {
             break;
         }
 
-        // Brief wait for new messages before declaring done
         match inbox.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(envelope) => {
                 runtime.send_to(svc_id, envelope.payload);
@@ -244,10 +225,7 @@ fn agent_thread(
         }
     }
 
-    AgentResult {
-        id,
-        panics: runtime.panics,
-    }
+    AgentResult { id, panics: runtime.panics }
 }
 
 #[cfg(test)]
@@ -256,10 +234,53 @@ mod tests {
 
     #[test]
     fn node_lifecycle_basic() {
-        // Verify the node can be created and run with no agents.
         let mut node = VosNode::new();
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn service_id_topology() {
+        let id = ServiceId::new(0x00A3, 5);
+        assert_eq!(id.0, 0x00A3_0005);
+        assert_eq!(id.node_prefix(), 0x00A3);
+        assert_eq!(id.local_id(), 5);
+        assert!(id.is_on_node(0x00A3));
+        assert!(!id.is_on_node(0));
+        assert!(!id.is_local());
+    }
+
+    #[test]
+    fn backwards_compat_local_ids() {
+        let id = ServiceId(3);
+        assert_eq!(id.node_prefix(), 0);
+        assert_eq!(id.local_id(), 3);
+        assert!(id.is_local());
+        assert!(id.is_on_node(0));
+    }
+
+    #[test]
+    fn registry_is_zero() {
+        assert_eq!(ServiceId::REGISTRY.0, 0);
+        assert_eq!(ServiceId::REGISTRY.node_prefix(), 0);
+        assert_eq!(ServiceId::REGISTRY.local_id(), 0);
+    }
+
+    #[test]
+    fn node_assigns_global_ids() {
+        let mut node = VosNode::with_prefix(0x0042);
+        let id1 = node.alloc_id();
+        let id2 = node.alloc_id();
+        assert_eq!(id1, ServiceId::new(0x0042, 1));
+        assert_eq!(id2, ServiceId::new(0x0042, 2));
+        assert!(id1.is_on_node(0x0042));
+    }
+
+    #[test]
+    fn display_format() {
+        assert_eq!(format!("{}", ServiceId(3)), "svc:3");
+        assert_eq!(format!("{}", ServiceId::new(0x00A3, 5)), "svc:00a3:5");
+        assert_eq!(format!("{}", ServiceId::REGISTRY), "svc:0");
     }
 }
