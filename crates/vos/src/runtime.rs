@@ -465,9 +465,12 @@ impl<D: DataLayer> VosRuntime<D> {
                             new_transfers.push((ServiceId(svc_id), msg));
                         }
                         // Enqueue a wake-up transfer so the service is
-                        // re-ticked next round (continuation resumes it
-                        // with warm memory).
-                        new_transfers.push((ServiceId(svc_id), Vec::new()));
+                        // re-ticked next round. Must be non-empty so
+                        // the dispatch loop has a message to re-enter
+                        // the handler with warm actor state. We re-send
+                        // "start" — the handler re-enters from the top
+                        // but with preserved state, so loops continue.
+                        new_transfers.push((ServiceId(svc_id), encode_start_transfer()));
                         break;
                     }
 
@@ -1005,6 +1008,18 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
         crate::lifecycle::STATE_KEY_BYTES.to_vec(),
         vec![],
     ));
+}
+
+/// Encode a dynamic "start" message for continuation wake-ups.
+fn encode_start_transfer() -> Vec<u8> {
+    use crate::actors::value::TAG_DYNAMIC;
+    use crate::actors::codec::Encode;
+    let msg = crate::actors::value::Msg::new("start");
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    payload
 }
 
 fn simple_hash(data: &[u8]) -> [u8; 32] {
