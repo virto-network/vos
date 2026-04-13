@@ -111,7 +111,7 @@ impl Agent {
 
     fn maybe_schedule_tick(&self, ctx: &mut vos::Context<Self>) {
         if !self.run_queue.is_empty() && self.round < MAX_ROUNDS {
-            ctx.send_self(&AgentMsg::Tick(Tick));
+            ctx.tell(ctx.id(), &Msg::new("tick"));
         }
     }
 }

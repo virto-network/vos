@@ -3,7 +3,6 @@
 //! Receives a `route` message with a target service ID and a dynamic message,
 //! invokes the target with a one-off invoke, and returns the reply.
 
-use vos::actors::context::ServiceId;
 use vos::lifecycle::InvokeResult;
 use vos::value::Msg;
 use vos::{actor, messages, lifecycle, Decode};
@@ -17,11 +16,6 @@ struct Router {
 impl Router {
     fn new(children: Vec<u32>) -> Self {
         println!("router: init");
-
-        // Self-schedule Start
-        let self_id = lifecycle::service_id();
-        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &RouterMsg::Start(Start).to_bytes());
-
         Router { children }
     }
 

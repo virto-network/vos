@@ -235,12 +235,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // Generate the message struct with rkyv derives
+        // Generate the message struct with rkyv derives.
+        // Only Archive + Deserialize — messages are decoded from
+        // incoming bytes, never serialized by user code. The enum
+        // also only needs Archive + Deserialize since self-scheduling
+        // uses dynamic Msg via ctx.tell() instead of typed encoding.
         let msg_struct = if field_names.is_empty() {
             quote! {
                 #[derive(
                     vos::rkyv::Archive,
-                    vos::rkyv::Serialize,
                     vos::rkyv::Deserialize,
                 )]
                 #[rkyv(crate = vos::rkyv)]
@@ -250,7 +253,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 #[derive(
                     vos::rkyv::Archive,
-                    vos::rkyv::Serialize,
                     vos::rkyv::Deserialize,
                 )]
                 #[rkyv(crate = vos::rkyv)]
@@ -383,7 +385,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let aggregated_enum = quote! {
         #[derive(
             vos::rkyv::Archive,
-            vos::rkyv::Serialize,
             vos::rkyv::Deserialize,
         )]
         #[rkyv(crate = vos::rkyv)]
@@ -398,10 +399,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 match self {
                     #( #deliver_arms )*
                 }
-            }
-
-            pub fn to_bytes(&self) -> vos::rkyv::util::AlignedVec {
-                vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(self).unwrap()
             }
 
             pub fn is_query(&self) -> bool {

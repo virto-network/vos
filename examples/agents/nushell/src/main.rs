@@ -2,8 +2,7 @@
 //!
 //! Actors appear as pipeable commands in nu scripts. Not yet implemented.
 
-use vos::actors::context::ServiceId;
-use vos::{actor, messages, lifecycle};
+use vos::{actor, messages};
 
 #[actor]
 struct Nushell {
@@ -14,10 +13,6 @@ struct Nushell {
 impl Nushell {
     fn new(children: Vec<u32>) -> Self {
         println!("nushell: init (stub)");
-
-        let self_id = lifecycle::service_id();
-        vos::hostcalls::transfer(ServiceId(self_id), 0, 0, &NushellMsg::Start(Start).to_bytes());
-
         Nushell { children }
     }
 
