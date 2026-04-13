@@ -13,7 +13,7 @@ use std::string::String;
 use std::sync::mpsc;
 use std::thread;
 
-use vos_abi::service::ServiceId;
+use crate::abi::service::ServiceId;
 
 use crate::runtime::VosRuntime;
 

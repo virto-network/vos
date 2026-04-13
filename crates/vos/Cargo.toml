@@ -9,11 +9,10 @@ license.workspace = true
 default = ["std"]
 std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap"]
 macros = ["dep:vos-macros"]
-pvm = ["vos-abi/pvm"]
-service = ["pvm", "vos-abi/service"]
+pvm = []
+service = ["pvm"]
 
 [dependencies]
-vos-abi = { path = "../vos-abi" }
 vos-macros = { path = "../vos-macros", optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 

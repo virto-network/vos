@@ -69,9 +69,9 @@
 use javm::kernel::{InvocationKernel, KernelResult};
 use std::collections::HashMap;
 use std::io::Write;
-use vos_abi::error;
-use vos_abi::hostcall;
-use vos_abi::service::ServiceId;
+use crate::abi::error;
+use crate::abi::hostcall;
+use crate::abi::service::ServiceId;
 
 use crate::data_layer::{DataLayer, MemoryDataLayer};
 use crate::refine_payload::{Effect, RefinePayload};

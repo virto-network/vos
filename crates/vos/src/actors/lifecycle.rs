@@ -83,7 +83,7 @@ pub fn save_state<A: Actor>(
 
     #[cfg(feature = "service")]
     {
-        use vos_abi::pvm::hostcalls;
+        use crate::abi::pvm::hostcalls;
         hostcalls::write(STATE_KEY, &state);
     }
 
@@ -95,14 +95,14 @@ pub fn save_state<A: Actor>(
 /// Get the current service ID.
 #[cfg(feature = "service")]
 pub fn service_id() -> u32 {
-    vos_abi::pvm::hostcalls::info() as u32
+    crate::abi::pvm::hostcalls::info() as u32
 }
 
 /// Read persisted state from service storage.
 /// Returns the number of state bytes read.
 #[cfg(feature = "service")]
 pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
-    use vos_abi::pvm::hostcalls;
+    use crate::abi::pvm::hostcalls;
 
     let state_read = hostcalls::read(STATE_KEY, state_buf);
     if state_read > 0 && state_read < state_buf.len() as u64 {
@@ -116,8 +116,8 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
 /// Returns the number of bytes, or 0 if no more messages.
 #[cfg(feature = "pvm")]
 pub fn fetch_raw(buf: &mut [u8]) -> usize {
-    use vos_abi::pvm::ecall;
-    let n = ecall::ecall2(vos_abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
+    use crate::abi::pvm::ecall;
+    let n = ecall::ecall2(crate::abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
     if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
 }
 
@@ -142,7 +142,7 @@ pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
 /// Emit exit status via YIELD hostcall.
 #[cfg(feature = "service")]
 pub fn emit_status<A: Actor>(ctx: &Context<A>) {
-    vos_abi::pvm::hostcalls::yield_output(&exit_status::<A>(ctx));
+    crate::abi::pvm::hostcalls::yield_output(&exit_status::<A>(ctx));
 }
 
 // ── Storage ───────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ pub fn emit_status<A: Actor>(ctx: &Context<A>) {
 /// Returns the number of bytes read, or 0 if key not found.
 #[cfg(feature = "service")]
 pub fn read_storage(key: &[u8], buf: &mut [u8]) -> usize {
-    let n = vos_abi::pvm::hostcalls::read(key, buf);
+    let n = crate::abi::pvm::hostcalls::read(key, buf);
     if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
 }
 
@@ -217,7 +217,7 @@ pub fn invoke_raw(
 
     let hash = super::run::service_code_hash(service_id);
     let mut output = [0u8; BUF_SIZE];
-    let n = vos_abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
+    let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
     use super::run::{STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
 

@@ -24,7 +24,7 @@ fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
 }
 
 /// Register a service blob and create a service (dual-entry, accumulate at PC=5).
-fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos_abi::service::ServiceId {
+fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos::abi::service::ServiceId {
     let blob_idx = rt.register_service_blob(blob);
     rt.register_service(blob_idx)
 }
@@ -238,7 +238,7 @@ fn data_layer_roundtrip_via_runtime() {
     let encoded = header.encode();
 
     let mut rt = VosRuntime::with_data_layer(da);
-    let id = vos_abi::service::ServiceId(42);
+    let id = vos::abi::service::ServiceId(42);
     assert!(!rt.is_suspended(id));
     rt.storage.write(id, vos::lifecycle::CONTINUATION_HEADER_KEY, &encoded);
     assert!(

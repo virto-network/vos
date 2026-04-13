@@ -31,7 +31,7 @@ pub struct Context<A: Actor> {
     _phantom: core::marker::PhantomData<A>,
 }
 
-pub use vos_abi::service::ServiceId;
+pub use crate::abi::service::ServiceId;
 
 /// A queued transfer to another service (fire-and-forget).
 #[allow(dead_code)] // Fields read in cfg(pvm) path
@@ -261,7 +261,7 @@ impl<A: Actor> Context<A> {
                 return;
             }
 
-            use vos_abi::pvm::hostcalls;
+            use crate::abi::pvm::hostcalls;
 
             for (key, value) in self.pending_writes.drain(..) {
                 hostcalls::write(&key, &value);

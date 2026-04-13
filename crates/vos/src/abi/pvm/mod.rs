@@ -5,7 +5,6 @@
 //! - Bump allocator
 //! - Typed hostcall wrappers
 
-#[cfg(feature = "alloc")]
 mod alloc;
 
 pub mod ecall;

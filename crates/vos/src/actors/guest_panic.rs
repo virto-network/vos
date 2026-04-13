@@ -6,7 +6,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     struct PanicWriter;
     impl core::fmt::Write for PanicWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            vos_abi::pvm::hostcalls::debug_write(s.as_bytes());
+            crate::abi::pvm::hostcalls::debug_write(s.as_bytes());
             Ok(())
         }
     }

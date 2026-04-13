@@ -218,7 +218,7 @@ fn is_manifest(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
 }
 
-fn write_init_args(rt: &mut VosRuntime, id: vos_abi::service::ServiceId,
+fn write_init_args(rt: &mut VosRuntime, id: vos::abi::service::ServiceId,
     init: &BTreeMap<String, toml::Value>, elf_data: &[u8])
 {
     if init.is_empty() { return; }

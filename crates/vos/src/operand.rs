@@ -11,7 +11,7 @@
 //! Reference: GP §C.5 (work result encoding) and `grey-state`
 //! `accumulate.rs::encode_operand`.
 
-use vos_abi::service::ServiceId;
+use crate::abi::service::ServiceId;
 
 /// Outcome of a single refine PVM invocation, mirroring grey's
 /// `WorkResult` discriminated union.

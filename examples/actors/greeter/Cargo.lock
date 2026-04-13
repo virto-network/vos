@@ -151,13 +151,8 @@ name = "vos"
 version = "0.1.0"
 dependencies = [
  "rkyv",
- "vos-abi",
  "vos-macros",
 ]
-
-[[package]]
-name = "vos-abi"
-version = "0.1.0"
 
 [[package]]
 name = "vos-macros"

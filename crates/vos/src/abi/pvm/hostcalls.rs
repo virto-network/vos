@@ -4,7 +4,7 @@
 //! discipline (which calls are legal in refine vs accumulate) is enforced
 //! by the host runtime, not the ID namespace.
 
-use crate::hostcall;
+use crate::abi::hostcall;
 use super::ecall::*;
 
 // --- Shared across phases ---
@@ -126,7 +126,7 @@ pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]
-pub fn transfer(target: crate::service::ServiceId, amount: u64, gas_limit: u64, memo: &[u8]) -> u64 {
+pub fn transfer(target: crate::abi::service::ServiceId, amount: u64, gas_limit: u64, memo: &[u8]) -> u64 {
     ecall5(
         hostcall::TRANSFER,
         target.0 as u64,
@@ -168,6 +168,6 @@ pub fn info() -> u64 {
 /// Get the current service's own ID as ServiceId.
 #[cfg(feature = "service")]
 #[inline]
-pub fn info_self_id() -> crate::service::ServiceId {
-    crate::service::ServiceId(info() as u32)
+pub fn info_self_id() -> crate::abi::service::ServiceId {
+    crate::abi::service::ServiceId(info() as u32)
 }

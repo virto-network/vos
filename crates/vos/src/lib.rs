@@ -31,6 +31,10 @@ extern crate alloc;
 
 pub use rkyv;
 
+// --- ABI (hostcall IDs, error codes, ecall wrappers) ---
+
+pub mod abi;
+
 // --- Actor framework (always available, no_std compatible) ---
 
 pub mod actors;
@@ -60,7 +64,7 @@ pub use actors::{run_refine_entry, run_accumulate_entry};
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
 pub mod hostcalls {
-    pub use vos_abi::pvm::hostcalls::*;
+    pub use crate::abi::pvm::hostcalls::*;
 }
 
 // --- Runtime infrastructure (host-only) ---
@@ -78,5 +82,5 @@ pub mod node;
 #[cfg(feature = "pvm")]
 #[doc(hidden)]
 pub mod __io {
-    pub use vos_abi::pvm::hostcalls::debug_write;
+    pub use crate::abi::pvm::hostcalls::debug_write;
 }

@@ -10,7 +10,7 @@
 use grey_transpiler::assembler::{Assembler, Reg};
 use javm::ExitReason;
 use javm::program::initialize_program;
-use vos_abi::hostcall::{self, accumulate};
+use vos::abi::hostcall::{self, accumulate};
 
 /// Program that immediately halts.
 fn program_halt() -> Vec<u8> {

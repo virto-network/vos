@@ -314,8 +314,8 @@ pub fn run_refine_service<A: super::Actor>() {
 pub fn run_accumulate_service<A: super::Actor>() {
     use super::lifecycle::{self, BUF_SIZE};
     use crate::refine_payload::{Effect, RefinePayload};
-    use vos_abi::pvm::hostcalls;
-    use vos_abi::service::ServiceId;
+    use crate::abi::pvm::hostcalls;
+    use crate::abi::service::ServiceId;
 
     set_refine_mode(false);
 

@@ -57,7 +57,7 @@ pub trait Actor: Sized + Encode + Decode {
             struct ErrorWriter;
             impl core::fmt::Write for ErrorWriter {
                 fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    vos_abi::pvm::hostcalls::debug_write(s.as_bytes());
+                    crate::abi::pvm::hostcalls::debug_write(s.as_bytes());
                     Ok(())
                 }
             }
