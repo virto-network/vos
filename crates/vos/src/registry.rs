@@ -1,23 +1,20 @@
-//! Package registry protocol for VOS agents.
+//! Registry protocol for VOS services.
 //!
-//! Defines the wire protocol for a registry service that stores and
-//! resolves PVM code blobs by name and version. Any agent can query the
-//! registry to resolve dependencies and install child services.
+//! Defines the wire protocol for a registry service that:
+//! - Stores and resolves PVM code blobs by name+version
+//! - Maps service names to ServiceIds (address resolution)
 //!
-//! ## Protocol
+//! The registry is itself a VOS service at well-known `ServiceId(0)`.
+//! Any service can query it via TRANSFER/INVOKE.
 //!
-//! The registry is a regular VOS service. Other agents communicate with
-//! it via transfers (FETCH items):
+//! ## Protocol tags
 //!
-//! - **Publish**: `[0x01][name_len:u16 LE][name][version_len:u16 LE][version][blob]`
-//!   Stores the code blob under `(name, version)`.
-//!
-//! - **Resolve**: `[0x02][name_len:u16 LE][name][version_len:u16 LE][version]`
-//!   Returns the code hash for the named package. The agent can then
-//!   use PREIMAGE_LOOKUP to fetch the blob and NEW to install it.
-//!
-//! This module provides encoding/decoding helpers for the protocol.
-//! The actual registry service implementation is a guest-side actor.
+//! | Tag | Operation | Payload |
+//! |-----|-----------|---------|
+//! | 0x01 | Publish blob | `[name][version][blob]` |
+//! | 0x02 | Resolve blob | `[name][version]` → code hash |
+//! | 0x03 | Register address | `[name][service_id: u32 LE]` |
+//! | 0x04 | Resolve address | `[name]` → service_id |
 
 use alloc::string::String;
 use alloc::vec;
@@ -25,6 +22,8 @@ use alloc::vec::Vec;
 
 pub const TAG_PUBLISH: u8 = 0x01;
 pub const TAG_RESOLVE: u8 = 0x02;
+pub const TAG_REGISTER_ADDR: u8 = 0x03;
+pub const TAG_RESOLVE_ADDR: u8 = 0x04;
 
 /// A package identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,6 +128,88 @@ impl RegistryResponse {
     }
 }
 
+// ── Address resolution ────────────────────────────────────────────────
+
+/// An address resolution request.
+#[derive(Debug, Clone)]
+pub enum AddrRequest {
+    /// Register a name → ServiceId mapping.
+    Register { name: String, service_id: u32 },
+    /// Resolve a name to its ServiceId.
+    Resolve { name: String },
+}
+
+/// An address resolution response.
+#[derive(Debug, Clone)]
+pub enum AddrResponse {
+    Found(u32),
+    NotFound,
+}
+
+impl AddrRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::Register { name, service_id } => {
+                out.push(TAG_REGISTER_ADDR);
+                push_str(&mut out, name);
+                out.extend_from_slice(&service_id.to_le_bytes());
+            }
+            Self::Resolve { name } => {
+                out.push(TAG_RESOLVE_ADDR);
+                push_str(&mut out, name);
+            }
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() { return None; }
+        let mut pos = 1;
+        match bytes[0] {
+            TAG_REGISTER_ADDR => {
+                let name = read_str(bytes, &mut pos)?;
+                if pos + 4 > bytes.len() { return None; }
+                let service_id = u32::from_le_bytes([
+                    bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                ]);
+                Some(Self::Register { name, service_id })
+            }
+            TAG_RESOLVE_ADDR => {
+                let name = read_str(bytes, &mut pos)?;
+                Some(Self::Resolve { name })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl AddrResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Found(id) => {
+                let mut out = Vec::with_capacity(5);
+                out.push(0x01);
+                out.extend_from_slice(&id.to_le_bytes());
+                out
+            }
+            Self::NotFound => vec![0x00],
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() { return None; }
+        match bytes[0] {
+            0x01 if bytes.len() >= 5 => {
+                let id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                Some(Self::Found(id))
+            }
+            0x00 => Some(Self::NotFound),
+            _ => None,
+        }
+    }
+}
+
 // --- Wire helpers ---
 
 fn push_str(out: &mut Vec<u8>, s: &str) {
@@ -193,6 +274,46 @@ mod tests {
             }
             _ => panic!("expected Resolve"),
         }
+    }
+
+    #[test]
+    fn addr_register_roundtrip() {
+        let req = AddrRequest::Register {
+            name: String::from("greeter"),
+            service_id: 0x00A3_0005,
+        };
+        let encoded = req.encode();
+        match AddrRequest::decode(&encoded).unwrap() {
+            AddrRequest::Register { name, service_id } => {
+                assert_eq!(name, "greeter");
+                assert_eq!(service_id, 0x00A3_0005);
+            }
+            _ => panic!("expected Register"),
+        }
+    }
+
+    #[test]
+    fn addr_resolve_roundtrip() {
+        let req = AddrRequest::Resolve { name: String::from("counter") };
+        let encoded = req.encode();
+        match AddrRequest::decode(&encoded).unwrap() {
+            AddrRequest::Resolve { name } => assert_eq!(name, "counter"),
+            _ => panic!("expected Resolve"),
+        }
+    }
+
+    #[test]
+    fn addr_response_roundtrip() {
+        let found = AddrResponse::Found(0x00A3_0005);
+        let enc = found.encode();
+        match AddrResponse::decode(&enc).unwrap() {
+            AddrResponse::Found(id) => assert_eq!(id, 0x00A3_0005),
+            _ => panic!("expected Found"),
+        }
+
+        let not_found = AddrResponse::NotFound;
+        let enc = not_found.encode();
+        assert!(matches!(AddrResponse::decode(&enc).unwrap(), AddrResponse::NotFound));
     }
 
     #[test]

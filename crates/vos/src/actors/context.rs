@@ -150,6 +150,41 @@ impl<A: Actor> Context<A> {
         }
     }
 
+    // --- Name resolution (via registry at ServiceId::REGISTRY) ---
+
+    /// Resolve a service name to a ServiceId via the registry.
+    ///
+    /// Sends a `TAG_RESOLVE_ADDR` request to `ServiceId::REGISTRY` (ID 0).
+    /// Returns `None` if the registry is unreachable or the name is unknown.
+    #[cfg(feature = "pvm")]
+    pub fn resolve(&mut self, name: &str) -> Option<ServiceId> {
+        let req = crate::registry::AddrRequest::Resolve {
+            name: alloc::string::String::from(name),
+        };
+        let encoded = req.encode();
+        let result = self.ask_raw(ServiceId::REGISTRY, &encoded);
+        // ask_raw returns an Ask future that's immediately ready
+        match crate::actors::run::try_poll(async { result.await }) {
+            crate::actors::run::RunResult::Complete(Ok(value)) => {
+                // The reply is the raw AddrResponse bytes
+                let bytes = value.as_bytes()?;
+                match crate::registry::AddrResponse::decode(&bytes)? {
+                    crate::registry::AddrResponse::Found(id) => Some(ServiceId(id)),
+                    crate::registry::AddrResponse::NotFound => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Send a dynamic message to a named service (resolve + tell).
+    #[cfg(feature = "pvm")]
+    pub fn tell_named(&mut self, name: &str, msg: &super::value::Msg) {
+        if let Some(target) = self.resolve(name) {
+            self.tell(target, msg);
+        }
+    }
+
     // --- Cooperative scheduling ---
 
     /// Checkpoint state and yield to other actors. Resumes next tick.

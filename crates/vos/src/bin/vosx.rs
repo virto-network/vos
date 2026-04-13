@@ -45,6 +45,9 @@ enum Command {
         /// Send a "start" message to each agent
         #[arg(short, long)]
         start: bool,
+        /// Load a registry service at ServiceId(0)
+        #[arg(long, value_name = "FILE")]
+        registry: Option<PathBuf>,
     },
     /// List actors in a manifest
     List {
@@ -60,8 +63,8 @@ fn main() {
         Some(Command::Run { program, payload, hex, gas, start }) => {
             cmd_run(&program, &payload, &hex, gas, start);
         }
-        Some(Command::Node { programs, start }) => {
-            cmd_node(&programs, start);
+        Some(Command::Node { programs, start, registry }) => {
+            cmd_node(&programs, start, registry.as_deref());
         }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
@@ -106,10 +109,22 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64, start
     exit_with_status(rt.panics);
 }
 
-fn cmd_node(programs: &[PathBuf], start: bool) {
+fn cmd_node(programs: &[PathBuf], start: bool, registry: Option<&Path>) {
     use vos::node::{AgentConfig, VosNode};
 
     let mut node = VosNode::new();
+
+    // Load registry at ServiceId(0) if specified
+    if let Some(reg_path) = registry {
+        let blob = load_blob(reg_path);
+        let id = node.register(AgentConfig {
+            blob,
+            init_payloads: if start { vec![encode_start_msg()] } else { vec![] },
+            storage: vec![],
+        });
+        eprintln!("vosx: registry '{}' as {id}", reg_path.display());
+    }
+
     for path in programs {
         let id = node.register(AgentConfig {
             blob: load_blob(path),
