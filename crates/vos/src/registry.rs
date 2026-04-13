@@ -20,6 +20,7 @@
 //! The actual registry service implementation is a guest-side actor.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub const TAG_PUBLISH: u8 = 0x01;
