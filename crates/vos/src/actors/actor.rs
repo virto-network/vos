@@ -3,11 +3,20 @@ use super::codec::{Encode, Decode};
 use super::run::RunResult;
 
 /// The core actor trait. Defines the full lifecycle of a VOS actor:
-/// construction, message dispatch, and error handling.
+/// construction, startup, message dispatch, checkpointing, and error handling.
 ///
 /// Serialization is handled by the `Encode + Decode` supertraits, which
 /// are blanket-implemented for any type with rkyv derives. The `#[actor]`
 /// macro adds these derives automatically.
+///
+/// ## Lifecycle hooks
+///
+/// - [`on_start`](Actor::on_start) — runs once on cold start, after
+///   `create()`, before the message loop. Long-running actors place their
+///   main loop here; `yield_now`/`sleep` work as usual.
+/// - [`on_checkpoint`](Actor::on_checkpoint) — runs during the accumulate
+///   phase to commit refine effects. Override to customize how state is
+///   persisted (e.g. summarization on JAM, proof generation on vosx).
 ///
 /// ## With macros
 ///
@@ -15,6 +24,7 @@ use super::run::RunResult;
 /// - `type Message` = the `{Name}Msg` enum (from `#[messages]`)
 /// - `create` → calls `Self::new()`
 /// - `dispatch` → forwards to `msg.deliver(self, ctx)`
+/// - `on_start` → forwards to `start` handler if one is defined
 ///
 /// ## Without macros
 ///
@@ -44,9 +54,36 @@ pub trait Actor: Sized + Encode + Decode {
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;
 
+    /// Called once on cold start, after `create()`, before the message
+    /// dispatch loop. The default is a no-op.
+    ///
+    /// Use this for long-running actor loops (`yield_now` / `sleep` work
+    /// normally) or one-shot initialization that needs the context.
+    ///
+    /// The `#[actor]` macro auto-generates this to forward to the `start`
+    /// message handler if one is defined via `#[messages]`.
+    async fn on_start(&mut self, _ctx: &mut Context<Self>) -> core::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Dispatch a typed message to the appropriate handler.
     /// Returns `Complete(true)` to stop, `Complete(false)` to continue, `Yielded` to suspend.
     fn dispatch(&mut self, msg: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool>;
+
+    /// Called during the accumulate phase to commit refine effects.
+    ///
+    /// The default implementation replays all buffered effects (WRITE,
+    /// TRANSFER, PROVIDE, NEW) via accumulate-phase hostcalls — this is
+    /// the standard JAM-compatible path.
+    ///
+    /// Override to customize accumulate behavior:
+    /// - **JAM**: summarize or aggregate data before on-chain storage
+    /// - **vosx**: generate a ZK proof to send to external actors
+    /// - **Custom**: any accumulate-phase commit logic
+    #[cfg(feature = "service")]
+    fn on_checkpoint(&self, payload: &crate::refine_payload::RefinePayload) {
+        payload.replay_effects();
+    }
 
     /// Called when a message handler returns an error. Return `true` to
     /// stop processing remaining messages in this batch, `false` to continue.

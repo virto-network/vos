@@ -111,6 +111,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Self::__vos_create()
             }
 
+            async fn on_start(
+                &mut self,
+                ctx: &mut vos::Context<Self>,
+            ) -> core::result::Result<(), #error_ty> {
+                self.__vos_on_start(ctx).await
+            }
+
             fn dispatch(
                 &mut self,
                 msg: Self::Message,
@@ -166,6 +173,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
+    let mut has_start_handler = false;
+    let mut start_returns_result = false;
 
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
@@ -197,6 +206,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         let method_name = &method.sig.ident;
+        if method_name == "start" {
+            has_start_handler = true;
+            start_returns_result = match &method.sig.output {
+                ReturnType::Default => false,
+                ReturnType::Type(_, ty) => result_ok_type(ty).is_some(),
+            };
+        }
         let struct_name = format_ident!(
             "{}",
             to_pascal_case(&method_name.to_string())
@@ -459,10 +475,48 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Re-emit the impl block with non-message methods + __vos_create
+    // Generate __vos_on_start — forwards to start handler if defined, else no-op
+    let vos_on_start = if has_start_handler {
+        // The start handler is a Message<Start> impl. Call it directly.
+        // If it returns Result, map Ok to Ok(()) and propagate Err.
+        // If it returns (), just wrap in Ok(()).
+        if start_returns_result {
+            quote! {
+                async fn __vos_on_start(
+                    &mut self,
+                    ctx: &mut vos::Context<Self>,
+                ) -> core::result::Result<(), <Self as vos::Actor>::Error> {
+                    <Self as vos::Message<Start>>::handle(self, Start, ctx).await?;
+                    Ok(())
+                }
+            }
+        } else {
+            quote! {
+                async fn __vos_on_start(
+                    &mut self,
+                    ctx: &mut vos::Context<Self>,
+                ) -> core::result::Result<(), <Self as vos::Actor>::Error> {
+                    <Self as vos::Message<Start>>::handle(self, Start, ctx).await;
+                    Ok(())
+                }
+            }
+        }
+    } else {
+        quote! {
+            async fn __vos_on_start(
+                &mut self,
+                _ctx: &mut vos::Context<Self>,
+            ) -> core::result::Result<(), <Self as vos::Actor>::Error> {
+                Ok(())
+            }
+        }
+    };
+
+    // Re-emit the impl block with non-message methods + __vos_create + __vos_on_start
     let passthrough_impl = quote! {
         impl #actor_ty {
             #vos_create
+            #vos_on_start
             #( #passthrough_items )*
         }
     };

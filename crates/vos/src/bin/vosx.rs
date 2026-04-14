@@ -15,10 +15,6 @@ struct Cli {
 
     /// Program or manifest to run (auto-detected by extension)
     file: Option<PathBuf>,
-
-    /// Send a "start" message to kick-start the service
-    #[arg(short, long)]
-    start: bool,
 }
 
 #[derive(Subcommand)]
@@ -35,16 +31,10 @@ enum Command {
         /// Set gas limit
         #[arg(long, default_value_t = 100_000_000)]
         gas: u64,
-        /// Send a "start" message to kick-start the service
-        #[arg(short, long)]
-        start: bool,
     },
     /// Run multiple agents concurrently
     Node {
         programs: Vec<PathBuf>,
-        /// Send a "start" message to each agent
-        #[arg(short, long)]
-        start: bool,
         /// Load a registry service at ServiceId(0)
         #[arg(long, value_name = "FILE")]
         registry: Option<PathBuf>,
@@ -60,18 +50,18 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Run { program, payload, hex, gas, start }) => {
-            cmd_run(&program, &payload, &hex, gas, start);
+        Some(Command::Run { program, payload, hex, gas }) => {
+            cmd_run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, start, registry }) => {
-            cmd_node(&programs, start, registry.as_deref());
+        Some(Command::Node { programs, registry }) => {
+            cmd_node(&programs, registry.as_deref());
         }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             cmd_list(&m, &dir);
         }
         None if cli.file.as_ref().is_some_and(|p| !is_manifest(p)) => {
-            cmd_run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000, cli.start);
+            cmd_run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);
         }
         None => {
             let (m, dir) = manifest_from(cli.file);
@@ -82,7 +72,7 @@ fn main() {
 
 // ── Commands ─────────────────────────────────────────────────────────
 
-fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64, start: bool) {
+fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
     let blob = load_blob(program);
     let mut rt = VosRuntime::with_gas_config(vos::runtime::GasConfig {
         refine_gas: gas, accumulate_gas_max: gas, accumulate_gas_default: gas,
@@ -93,7 +83,6 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64, start
     eprintln!("vosx: loaded '{}' as {id:?}", program.display());
 
     let mut items: Vec<Vec<u8>> = Vec::new();
-    if start { items.push(encode_start_msg()); }
     for p in payloads {
         items.push(if p.as_os_str() == "-" { read_stdin() } else { load_file(p) });
     }
@@ -109,7 +98,7 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64, start
     exit_with_status(rt.panics);
 }
 
-fn cmd_node(programs: &[PathBuf], start: bool, registry: Option<&Path>) {
+fn cmd_node(programs: &[PathBuf], registry: Option<&Path>) {
     use vos::node::{AgentConfig, VosNode};
 
     let mut node = VosNode::new();
@@ -119,7 +108,7 @@ fn cmd_node(programs: &[PathBuf], start: bool, registry: Option<&Path>) {
         let blob = load_blob(reg_path);
         let id = node.register(AgentConfig {
             blob,
-            init_payloads: if start { vec![encode_start_msg()] } else { vec![] },
+            init_payloads: vec![],
             storage: vec![],
         });
         eprintln!("vosx: registry '{}' as {id}", reg_path.display());
@@ -128,7 +117,7 @@ fn cmd_node(programs: &[PathBuf], start: bool, registry: Option<&Path>) {
     for path in programs {
         let id = node.register(AgentConfig {
             blob: load_blob(path),
-            init_payloads: if start { vec![encode_start_msg()] } else { vec![] },
+            init_payloads: vec![],
             storage: vec![],
         });
         eprintln!("vosx: registered '{}' as {id:?}", path.display());
@@ -184,7 +173,8 @@ fn cmd_manifest(manifest: &Manifest, dir: &Path) {
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
-    rt.send_to(agent_id, encode_start_msg());
+    // Trigger first tick — the actor's on_start hook runs automatically on cold start.
+    rt.send_to(agent_id, Vec::new());
     eprintln!("vosx: running...\n");
     rt.run_blocking();
     eprintln!("\nvosx: done");
@@ -278,15 +268,6 @@ fn read_stdin() -> Vec<u8> {
     let mut buf = Vec::new();
     std::io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| die(&format!("stdin: {e}")));
     buf
-}
-
-fn encode_start_msg() -> Vec<u8> {
-    use vos::{Encode, value::{Msg, TAG_DYNAMIC}};
-    let encoded = Msg::new("start").encode();
-    let mut payload = Vec::with_capacity(1 + encoded.len());
-    payload.push(TAG_DYNAMIC);
-    payload.extend_from_slice(&encoded);
-    payload
 }
 
 fn resolve_path(dir: &Path, path: &Option<PathBuf>, name: &str) -> PathBuf {

@@ -74,6 +74,42 @@ impl RefinePayload {
         Self::default()
     }
 
+    /// Replay all buffered effects via accumulate-phase hostcalls.
+    ///
+    /// This is the default accumulate commit path: each effect queued
+    /// during refine is applied via the corresponding real hostcall
+    /// (WRITE, TRANSFER, PROVIDE, NEW). Also handles self-scheduling
+    /// when `continue_next` is set.
+    #[cfg(feature = "service")]
+    pub fn replay_effects(&self) {
+        use crate::abi::pvm::hostcalls;
+        use crate::abi::service::ServiceId;
+        use crate::actors::lifecycle;
+
+        for eff in &self.effects {
+            match eff {
+                Effect::Write { key, value } => {
+                    hostcalls::write(key, value);
+                }
+                Effect::Transfer { target, memo } => {
+                    hostcalls::transfer(ServiceId(*target), 0, 0, memo);
+                }
+                Effect::Provide { hash, data } => {
+                    hostcalls::provide(hash, data);
+                }
+                Effect::New { code_hash } => {
+                    hostcalls::new_service(code_hash);
+                }
+            }
+        }
+
+        if self.continue_next && !self.state.is_empty() {
+            hostcalls::write(lifecycle::STATE_KEY_BYTES, &self.state);
+            let self_id = lifecycle::service_id();
+            hostcalls::transfer(ServiceId(self_id), 0, 0, &[]);
+        }
+    }
+
     /// Encode to the wire format.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();

@@ -246,8 +246,10 @@ pub fn run_refine_service<A: super::Actor>() {
     // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
+    let mut cold_start = false;
     let actor_ref: &mut A = unsafe {
         if *holder_ptr == 0 {
+            cold_start = true;
             // Cold start: try to restore from persisted state in storage.
             // This is the JAM-compatible path — the guest reads its own
             // serialized state via READ (legal in refine) without any
@@ -263,14 +265,34 @@ pub fn run_refine_service<A: super::Actor>() {
     };
     let mut buf = [0u8; BUF_SIZE];
 
+    // On cold start, run the on_start lifecycle hook before the message
+    // loop. If on_start yields, the actor self-schedules and we skip
+    // the message loop (same as a yielded dispatch).
+    let mut started = true;
+    if cold_start {
+        match try_poll(actor_ref.on_start(&mut ctx)) {
+            RunResult::Yielded => {
+                ctx.flush_effects();
+                started = false;
+            }
+            RunResult::Complete(Ok(())) => {}
+            RunResult::Complete(Err(e)) => {
+                actor_ref.on_error(&e);
+                started = false;
+            }
+        }
+    }
+
     // Dispatch messages. flush_effects() inside dispatch_one is a no-op
     // in refine mode — effects accumulate in the context's pending_* vecs.
-    loop {
-        let n = lifecycle::fetch_raw(&mut buf);
-        if n == 0 { break; }
-        let result = lifecycle::dispatch_one::<A>(&buf[..n], actor_ref, &mut ctx);
-        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
-            break;
+    if started {
+        loop {
+            let n = lifecycle::fetch_raw(&mut buf);
+            if n == 0 { break; }
+            let result = lifecycle::dispatch_one::<A>(&buf[..n], actor_ref, &mut ctx);
+            if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
+                break;
+            }
         }
     }
 
@@ -313,9 +335,7 @@ pub fn run_refine_service<A: super::Actor>() {
 #[cfg(feature = "service")]
 pub fn run_accumulate_service<A: super::Actor>() {
     use super::lifecycle::{self, BUF_SIZE};
-    use crate::refine_payload::{Effect, RefinePayload};
-    use crate::abi::pvm::hostcalls;
-    use crate::abi::service::ServiceId;
+    use crate::refine_payload::RefinePayload;
 
     set_refine_mode(false);
 
@@ -334,35 +354,12 @@ pub fn run_accumulate_service<A: super::Actor>() {
     let n = lifecycle::fetch_raw(&mut buf);
     if n > 0 {
         if let Some(payload) = RefinePayload::decode(&buf[..n]) {
-            // Replay buffered effects via real accumulate-phase hostcalls.
-            for eff in &payload.effects {
-                match eff {
-                    Effect::Write { key, value } => {
-                        hostcalls::write(key, value);
-                    }
-                    Effect::Transfer { target, memo } => {
-                        hostcalls::transfer(ServiceId(*target), 0, 0, memo);
-                    }
-                    Effect::Provide { hash, data } => {
-                        hostcalls::provide(hash, data);
-                    }
-                    Effect::New { code_hash } => {
-                        hostcalls::new_service(code_hash);
-                    }
-                }
-            }
-
-            // Persist actor state and self-schedule for next tick.
-            // This is the JAM-compatible continuation path: any
-            // conformant host can run this without special knowledge
-            // of continuation internals. The guest writes its own
-            // serialized state to STATE_KEY and issues a self-directed
-            // transfer so the service is re-ticked.
-            if payload.continue_next && !payload.state.is_empty() {
-                hostcalls::write(lifecycle::STATE_KEY_BYTES, &payload.state);
-                let self_id = lifecycle::service_id();
-                hostcalls::transfer(ServiceId(self_id), 0, 0, &[]);
-            }
+            // Deserialize the actor from refine state for on_checkpoint.
+            // With rkyv this is essentially zero-copy (pointer cast).
+            let actor = lifecycle::load_or_create::<A>(
+                if payload.state.is_empty() { None } else { Some(&payload.state) }
+            );
+            actor.on_checkpoint(&payload);
         }
     }
 
