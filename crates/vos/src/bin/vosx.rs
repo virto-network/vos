@@ -38,6 +38,9 @@ enum Command {
         /// Load a registry service at ServiceId(0)
         #[arg(long, value_name = "FILE")]
         registry: Option<PathBuf>,
+        /// Load native worker plugins (.so files)
+        #[arg(long, value_name = "FILE")]
+        worker: Vec<PathBuf>,
     },
     /// List actors in a manifest
     List {
@@ -53,8 +56,8 @@ fn main() {
         Some(Command::Run { program, payload, hex, gas }) => {
             cmd_run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry }) => {
-            cmd_node(&programs, registry.as_deref());
+        Some(Command::Node { programs, registry, worker }) => {
+            cmd_node(&programs, registry.as_deref(), &worker);
         }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
@@ -98,8 +101,8 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
     exit_with_status(rt.panics);
 }
 
-fn cmd_node(programs: &[PathBuf], registry: Option<&Path>) {
-    use vos::node::{AgentConfig, VosNode};
+fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[PathBuf]) {
+    use vos::node::{AgentConfig, WorkerConfig, VosNode};
 
     let mut node = VosNode::new();
 
@@ -123,7 +126,16 @@ fn cmd_node(programs: &[PathBuf], registry: Option<&Path>) {
         eprintln!("vosx: registered '{}' as {id:?}", path.display());
     }
 
-    eprintln!("vosx: running {} agent(s)...\n", programs.len());
+    for path in workers {
+        let id = node.register_worker(WorkerConfig {
+            path: path.clone(),
+        });
+        eprintln!("vosx: worker '{}' as {id:?}", path.display());
+    }
+
+    let total = programs.len() + workers.len();
+    eprintln!("vosx: running {total} service(s) ({} PVM + {} worker)...\n",
+        programs.len(), workers.len());
     node.run();
 
     let panics: u32 = node.collect().iter().map(|r| r.panics).sum();

@@ -49,6 +49,12 @@ pub struct AgentConfig {
     pub storage: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Configuration for registering a native worker in the node.
+pub struct WorkerConfig {
+    /// Path to the worker `.so` file.
+    pub path: std::path::PathBuf,
+}
+
 /// A multi-agent VOS node.
 ///
 /// Each agent runs on its own thread with its own `VosRuntime`.
@@ -102,6 +108,23 @@ impl VosNode {
 
         let join = thread::spawn(move || {
             agent_thread(id, config, rx, outbox)
+        });
+
+        self.agents.push(AgentHandle { join: Some(join) });
+        id
+    }
+
+    /// Register a native worker and return its service ID.
+    /// The worker starts immediately on a new thread.
+    pub fn register_worker(&mut self, config: WorkerConfig) -> ServiceId {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        let outbox = self.outbox_tx.clone();
+
+        self.routes.insert(id.0, tx);
+
+        let join = thread::spawn(move || {
+            worker_thread(id, config, rx, outbox)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -226,6 +249,115 @@ fn agent_thread(
     }
 
     AgentResult { id, panics: runtime.panics }
+}
+
+// ── Worker thread ────────────────────────────────────────────────────
+
+fn worker_thread(
+    id: ServiceId,
+    config: WorkerConfig,
+    inbox: mpsc::Receiver<Envelope>,
+    outbox: mpsc::Sender<Envelope>,
+) -> AgentResult {
+    use crate::worker::{WorkerPlugin, POLL_READY, POLL_PENDING};
+
+    let plugin = match unsafe { WorkerPlugin::load(&config.path) } {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("worker {id}: failed to load: {e}");
+            return AgentResult { id, panics: 1 };
+        }
+    };
+
+    if let Some(meta) = plugin.meta() {
+        eprintln!("worker {id}: loaded '{}' from {}", meta.actor_name, config.path.display());
+    }
+
+    let mut instance = plugin.create();
+
+    loop {
+        // Wait for a message
+        let envelope = match inbox.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(e) => e,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Start dispatch
+        instance.dispatch_start(&envelope.payload);
+
+        // Poll loop with host I/O fulfillment
+        loop {
+            let result = instance.poll_once();
+            match result.status {
+                POLL_READY => {
+                    // If there's a reply, send it back to the caller
+                    if !result.ptr.is_null() && result.len > 0 {
+                        let reply_bytes = unsafe {
+                            std::slice::from_raw_parts(result.ptr, result.len)
+                        }.to_vec();
+                        instance.free_reply(&result);
+
+                        // Send reply as a transfer back to the sender
+                        let _ = outbox.send(Envelope {
+                            from: id,
+                            to: envelope.from,
+                            payload: reply_bytes,
+                        });
+                    } else {
+                        instance.free_reply(&result);
+                    }
+                    break;
+                }
+                POLL_PENDING => {
+                    // Read pending host effect
+                    let effect = instance.pending_effect();
+                    if effect.len() >= 4 {
+                        // Protocol: [target:u32 LE][payload...]
+                        // This is an ask/tell to another service
+                        let target_id = u32::from_le_bytes(
+                            effect[..4].try_into().unwrap()
+                        );
+                        let payload = effect[4..].to_vec();
+
+                        // Route via outbox and wait for reply
+                        // For now: send and provide empty result
+                        // TODO: implement request-reply correlation
+                        let _ = outbox.send(Envelope {
+                            from: id,
+                            to: ServiceId(target_id),
+                            payload,
+                        });
+                        // Provide empty result to unblock the handler
+                        instance.provide_result(&[]);
+                    } else {
+                        // Unknown effect, provide empty result
+                        instance.provide_result(&[]);
+                    }
+                }
+                _ => {
+                    eprintln!("worker {id}: poll error {}", result.status);
+                    break;
+                }
+            }
+        }
+
+        // Drain any additional queued messages
+        while let Ok(next) = inbox.try_recv() {
+            instance.dispatch_start(&next.payload);
+            // Simple poll to completion for queued messages
+            loop {
+                let r = instance.poll_once();
+                if r.status != POLL_PENDING {
+                    instance.free_reply(&r);
+                    break;
+                }
+                instance.provide_result(&[]);
+            }
+        }
+    }
+
+    AgentResult { id, panics: 0 }
 }
 
 #[cfg(test)]
