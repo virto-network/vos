@@ -33,6 +33,7 @@ where
     T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
     fn decode(bytes: &[u8]) -> Self {
+        assert!(!bytes.is_empty(), "Decode::decode called with empty bytes");
         // Ensure alignment — rkyv requires the buffer to be aligned
         // to access archived data. Input from FETCH/socket may not be.
         let aligned = if (bytes.as_ptr() as usize) % core::mem::align_of::<T::Archived>() != 0 {

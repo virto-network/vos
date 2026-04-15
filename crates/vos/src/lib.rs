@@ -90,18 +90,5 @@ pub mod __io {
 /// Re-export for use by generated worker entry points.
 #[doc(hidden)]
 pub mod __worker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-
-    fn noop_raw_waker() -> RawWaker {
-        fn noop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-
-    pub fn noop_waker() -> Waker {
-        unsafe { Waker::from_raw(noop_raw_waker()) }
-    }
+    pub use crate::actors::run::noop_waker;
 }

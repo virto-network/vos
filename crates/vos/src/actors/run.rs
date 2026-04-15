@@ -38,6 +38,14 @@ fn noop_raw_waker() -> RawWaker {
     RawWaker::new(core::ptr::null(), &VTABLE)
 }
 
+/// Create a no-op [`Waker`]. Used by the single-threaded executor and
+/// worker entry points to satisfy the `poll` API.
+pub fn noop_waker() -> Waker {
+    // SAFETY: noop_raw_waker returns a valid RawWaker with a static
+    // vtable whose methods are all no-ops (no resources to manage).
+    unsafe { Waker::from_raw(noop_raw_waker()) }
+}
+
 /// Result of a single poll: either the future completed or it yielded.
 pub enum RunResult<T> {
     Complete(T),
@@ -46,8 +54,10 @@ pub enum RunResult<T> {
 
 /// Poll a future exactly once. Returns `Complete(val)` if ready, `Yielded` if pending.
 pub fn try_poll<F: Future>(mut fut: F) -> RunResult<F::Output> {
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local that we never move after pinning; it
+    // lives until the function returns and is not accessed again.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(val) => RunResult::Complete(val),
@@ -58,12 +68,13 @@ pub fn try_poll<F: Future>(mut fut: F) -> RunResult<F::Output> {
 /// Poll a future to completion. Used by worker mode where handlers
 /// run natively and can block.
 ///
-/// Panics if the future yields (returns `Pending`). Worker handlers
-/// should not use `ctx.yield_now()` — yielding is a PVM concept.
-/// For async I/O, workers should bring their own async runtime.
+/// # Panics
+/// Panics if the future yields (`Pending`). Worker handlers should
+/// not use `ctx.yield_now()` — yielding is a PVM concept.
 pub fn run_blocking<F: Future>(mut fut: F) -> F::Output {
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: same as try_poll — local fut, never moved after pin.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(val) => val,
@@ -174,7 +185,17 @@ pub struct HostIo {
 }
 
 impl HostIo {
-    pub fn new(result_slot: *mut Option<alloc::vec::Vec<u8>>) -> Self {
+    /// Create a new HostIo future that reads its result from `result_slot`.
+    ///
+    /// # Safety contract (enforced by caller, not by this function):
+    /// - `result_slot` must point to a valid `Option<Vec<u8>>` that
+    ///   outlives this future (guaranteed: it lives in `Context` which
+    ///   is owned by `WorkerState` alongside the future).
+    /// - The host must write `Some(bytes)` to the slot before the
+    ///   second poll (guaranteed: `provide_result` does this).
+    /// - Only one `HostIo` is in flight per context at a time
+    ///   (guaranteed: single-threaded, one dispatch at a time).
+    pub(crate) fn new(result_slot: *mut Option<alloc::vec::Vec<u8>>) -> Self {
         Self { polled: false, result_slot }
     }
 }
@@ -186,7 +207,10 @@ impl Future for HostIo {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<alloc::vec::Vec<u8>> {
         if self.polled {
-            // Second poll: host has provided the result
+            // Second poll: host has provided the result.
+            // SAFETY: result_slot points into Context which outlives
+            // this future (both owned by WorkerState). The host called
+            // provide_result before re-polling.
             let result = unsafe { &mut *self.result_slot };
             Poll::Ready(result.take().unwrap_or_default())
         } else {

@@ -284,6 +284,9 @@ fn agent_thread(
     AgentResult { id, panics: runtime.panics }
 }
 
+/// Max deferred messages held while waiting for a specific reply.
+const MAX_DEFERRED: usize = 256;
+
 // ── Worker thread ────────────────────────────────────────────────────
 
 fn worker_thread(
@@ -311,15 +314,22 @@ fn worker_thread(
 
     let mut instance = plugin.create();
     // Messages that arrived while we were waiting for a specific reply.
+    // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
     let mut handled_any = false;
 
     loop {
-        // Check for synchronous invoke requests from PVM agents first
-        while let Ok(req) = invoke_rx.try_recv() {
-            handled_any = true;
-            let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
-            let _ = req.reply_tx.send(reply);
+        // Process up to a few invoke requests per iteration to avoid
+        // starving the regular inbox.
+        for _ in 0..4 {
+            match invoke_rx.try_recv() {
+                Ok(req) => {
+                    handled_any = true;
+                    let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
+                    let _ = req.reply_tx.send(reply);
+                }
+                Err(_) => break,
+            }
         }
 
         // Take next message: deferred first, then inbox
@@ -429,7 +439,11 @@ fn wait_for_reply(
             }
             Ok(other) => {
                 // Not the reply we're waiting for — defer it
-                deferred.push_back(other);
+                if deferred.len() < MAX_DEFERRED {
+                    deferred.push_back(other);
+                } else {
+                    eprintln!("worker: deferred queue full, dropping message from {}", other.from);
+                }
             }
             Err(_) => {
                 eprintln!("worker: ask timeout waiting for reply from svc:{target_id}");
