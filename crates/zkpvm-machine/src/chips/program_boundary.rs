@@ -69,14 +69,14 @@ impl BuiltInComponent for ProgramBoundaryChip {
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         if !side_note.steps.is_empty() {
+            let first_step = &side_note.steps[0];
             let last_step = side_note.steps.last().unwrap();
-            let num_steps = side_note.steps.len() as u64;
 
-            // Row 0: the boundary
-            trace.fill_columns_bytes(0, &0u32.to_le_bytes(), Column::InitialPc);
-            trace.fill_columns(0, 0u64, Column::InitialTimestamp);
+            // Row 0: the boundary — matches first step's (ts, pc) and last step's (next_ts, next_pc)
+            trace.fill_columns_bytes(0, &first_step.pc.to_le_bytes(), Column::InitialPc);
+            trace.fill_columns(0, first_step.timestamp, Column::InitialTimestamp);
             trace.fill_columns_bytes(0, &last_step.next_pc.to_le_bytes(), Column::FinalNextPc);
-            trace.fill_columns(0, num_steps, Column::FinalNextTimestamp);
+            trace.fill_columns(0, last_step.timestamp + 1, Column::FinalNextTimestamp);
             trace.fill_columns(0, true, Column::IsReal);
         }
         // Remaining rows are padding (all zero, IsReal=0)

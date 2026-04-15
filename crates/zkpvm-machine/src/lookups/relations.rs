@@ -27,11 +27,18 @@ stwo_constraint_framework::relation!(
     REL_PROG_MEMORY_LOOKUP_SIZE
 );
 
-// (addr[4], value[8], timestamp[8], is_write[1], size[1])
-const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + WORD_SIZE + TS_SIZE + 2;
+// Byte-level: (addr[4], value[1], timestamp[8], is_write[1])
+const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + 1 + TS_SIZE + 1;
 stwo_constraint_framework::relation!(
     MemoryAccessLookupElements,
     REL_MEMORY_ACCESS_LOOKUP_SIZE
+);
+
+// (shift_amount[1], power_val[8]) — proves val_d = 2^shift_amount
+const REL_POWER_OF_TWO_LOOKUP_SIZE: usize = 1 + WORD_SIZE;
+stwo_constraint_framework::relation!(
+    PowerOfTwoLookupElements,
+    REL_POWER_OF_TWO_LOOKUP_SIZE
 );
 
 // (a, b, a_and_b) — per-byte bitwise AND lookup

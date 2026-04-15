@@ -18,7 +18,7 @@ impl TracingPvm {
         Self {
             pvm,
             steps: Vec::new(),
-            timestamp: 0,
+            timestamp: 1, // 0 is reserved for initial memory entries
         }
     }
 

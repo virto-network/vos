@@ -129,6 +129,43 @@ fn profile_log10() { profile_at_log_size(10); }
 #[test]
 fn profile_log14() { profile_at_log_size(14); }
 
+/// Sweep log_sizes with test-config (8-bit security) to find the scale breaking point.
+#[test]
+fn scale_sweep() {
+    let test_config = PcsConfig { pow_bits: 5, fri_config: FriConfig::new(0, 1, 3) };
+    eprintln!("=== Scale sweep (test security, rough memory estimate) ===");
+    eprintln!("  main_cols=286, interaction_cols=~90, constraint_blowup=4");
+    eprintln!();
+    for log_size in [10, 12, 14, 16, 17, 18, 19].iter() {
+        let n_steps = 1usize << log_size;
+        let (code, bitmask) = generate_add_program(n_steps);
+        let mut regs = [0u64; PVM_REGISTER_COUNT];
+        for i in 0..13 { regs[i] = (i as u64) + 1; }
+        let gas = (n_steps as u64 + 100) * 100;
+        let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 64 * 1024], gas, 16);
+        let mut tracing = TracingPvm::new(pvm);
+        let _exit = tracing.run();
+        let steps = tracing.into_trace();
+        let mut side_note = zkpvm_machine::SideNote::new(steps, code, bitmask);
+
+        let t = std::time::Instant::now();
+        match zkpvm_machine::prove_with_config(&mut side_note, test_config) {
+            Ok(p) => {
+                let elapsed = t.elapsed();
+                let kb = bincode::serialize(&p).unwrap().len() as f64 / 1024.0;
+                // Rough memory estimate: main + interaction + quotient at blowup*4
+                let rows = 1u64 << log_size;
+                let fft_rows = rows * 16; // constraint blowup 2^4
+                let field_bytes = 4u64;
+                let main_mb = rows * 286 * field_bytes / (1024 * 1024);
+                let fft_mb = fft_rows * 286 * field_bytes / (1024 * 1024);
+                eprintln!("  log_size={log_size:>2} ({n_steps:>7} steps): prove={elapsed:>8.2?}, proof={kb:>5.1} KB, main_trace≈{main_mb}MB, fft_domain≈{fft_mb}MB");
+            }
+            Err(e) => { eprintln!("  log_size={log_size:>2} ({n_steps:>7} steps): FAIL {e}"); break; }
+        }
+    }
+}
+
 // ── Security parameter benchmarks ──
 
 fn bench_security(log_size: u32, pow_bits: u32, log_blowup: u32, n_queries: usize) {

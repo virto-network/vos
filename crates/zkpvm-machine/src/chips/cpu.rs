@@ -23,8 +23,8 @@ use crate::{
     framework::BuiltInComponent,
     lookups::{
         AllLookupElements, BitwiseAndLookupElements, LogupTraceBuilder,
-        MemoryAccessLookupElements, ProgramExecutionLookupElements,
-        Range256LookupElements,
+        MemoryAccessLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, Range256LookupElements,
     },
     side_note::SideNote,
 };
@@ -167,6 +167,9 @@ pub enum Column {
     ShiftAmount,
     #[size = 1]
     ShiftOp,
+    /// 1 when is_shift AND shift_op ∈ {0,1} (left shift or logical right shift)
+    #[size = 1]
+    IsShiftConstrained,
     // ── Control flow ──
     /// Conditional branch (BranchEq/Ne/Lt/Ge + imm variants)
     #[size = 1]
@@ -215,6 +218,9 @@ pub enum Column {
     /// Number of bytes accessed (1, 2, 4, or 8)
     #[size = 1]
     MemSize,
+    /// Per-byte active flags for memory lookup (1 if byte_i < mem_size)
+    #[size = 8]
+    MemByteActive,
     // ── Program execution sequencing ──
     /// timestamp + 1 (8 limbs), used for the program execution lookup
     #[size = 8]
@@ -391,7 +397,7 @@ impl BuiltInComponent for CpuChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements);
+    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements, PowerOfTwoLookupElements);
 
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         FinalizedTrace::empty()
@@ -436,16 +442,18 @@ impl BuiltInComponent for CpuChip {
 
             let flags = classify_opcode(step.opcode);
 
-            // For left/right shifts: replace val_d with 2^shift_amount
-            // Left shift reuses mul constraint, right shift reuses divrem constraint
+            // For left/right shifts: save shift amount, then replace val_d with 2^shift_amount
+            let mut saved_shift_amount: u8 = 0;
             if flags.is_shift && (flags.shift_op == 0 || flags.shift_op == 1) {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
                 let shift = val_d % modulus;
+                saved_shift_amount = shift as u8;
                 val_d = 1u64 << shift;
+                side_note.power_of_two_counts[shift as usize] += 1;
             }
 
-            // Truncate for 32-bit ALU ops
-            if flags.is_32bit && (flags.is_add || flags.is_sub || flags.is_mul) {
+            // Truncate for 32-bit ALU ops (including divrem for right shifts)
+            if flags.is_32bit && (flags.is_add || flags.is_sub || flags.is_mul || flags.is_div_rem) {
                 val_b &= 0xFFFF_FFFF;
                 val_d &= 0xFFFF_FFFF;
             }
@@ -583,13 +591,19 @@ impl BuiltInComponent for CpuChip {
 
             // ── Shift auxiliary ──
             let shift_amount = if flags.is_shift {
-                let modulus = if flags.is_32bit { 32u64 } else { 64 };
-                (val_d % modulus) as u8
+                if flags.shift_op == 0 || flags.shift_op == 1 {
+                    saved_shift_amount // saved before val_d was replaced
+                } else {
+                    let modulus = if flags.is_32bit { 32u64 } else { 64 };
+                    (val_d % modulus) as u8 // for non-constrained shifts, val_d is original
+                }
             } else {
                 0
             };
             trace.fill_columns(row, shift_amount, Column::ShiftAmount);
             trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
+            let is_shift_constrained = flags.is_shift && (flags.shift_op == 0 || flags.shift_op == 1);
+            trace.fill_columns(row, is_shift_constrained, Column::IsShiftConstrained);
 
             // ── Flags ──
             trace.fill_columns(row, false, Column::IsPadding);
@@ -672,16 +686,15 @@ impl BuiltInComponent for CpuChip {
             // ── Memory access columns ──
             trace.fill_columns(row, flags.is_load, Column::IsLoad);
             trace.fill_columns(row, flags.is_store, Column::IsStore);
-            if let Some(ref r) = step.mem_read {
-                trace.fill_columns_bytes(row, &r.address.to_le_bytes(), Column::MemAddr);
-                trace.fill_columns(row, r.value, Column::MemValue);
-                trace.fill_columns(row, r.size, Column::MemSize);
-            } else if let Some(ref w) = step.mem_write {
-                trace.fill_columns_bytes(row, &w.address.to_le_bytes(), Column::MemAddr);
-                trace.fill_columns(row, w.value, Column::MemValue);
-                trace.fill_columns(row, w.size, Column::MemSize);
+            let mem = step.mem_read.as_ref().or(step.mem_write.as_ref());
+            if let Some(m) = mem {
+                trace.fill_columns_bytes(row, &m.address.to_le_bytes(), Column::MemAddr);
+                trace.fill_columns(row, m.value, Column::MemValue);
+                trace.fill_columns(row, m.size, Column::MemSize);
+                let mut byte_active = [0u8; 8];
+                for i in 0..m.size as usize { byte_active[i] = 1; }
+                trace.fill_columns_bytes(row, &byte_active, Column::MemByteActive);
             }
-            // else: no memory access, columns stay 0 (default)
 
             // NextTimestamp = timestamp + 1
             trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
@@ -739,31 +752,43 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
-        // Memory access lookups (producer side, positive)
+        // Memory access lookups — byte-level (up to 8 entries per memory op)
         let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
-        let is_load = zkpvm_trace::original_base_column!(component_trace, Column::IsLoad);
         let is_store = zkpvm_trace::original_base_column!(component_trace, Column::IsStore);
         let mem_addr = zkpvm_trace::original_base_column!(component_trace, Column::MemAddr);
         let mem_value = zkpvm_trace::original_base_column!(component_trace, Column::MemValue);
         let timestamp = zkpvm_trace::original_base_column!(component_trace, Column::Timestamp);
-        let mem_size = zkpvm_trace::original_base_column!(component_trace, Column::MemSize);
+        let mem_byte_active = zkpvm_trace::original_base_column!(component_trace, Column::MemByteActive);
 
-        // Build tuple: (addr[4], value[8], timestamp[8], is_write[1], size[1])
-        let mut mem_tuple: Vec<_> = mem_addr.to_vec();
-        mem_tuple.extend_from_slice(&mem_value);
-        mem_tuple.extend_from_slice(&timestamp);
-        mem_tuple.push(is_store[0].clone()); // is_write = is_store
-        mem_tuple.push(mem_size[0].clone());
-
-        // Multiplicity = is_load + is_store (positive, producer side)
-        logup.add_to_relation_with(
-            mem_lookup,
-            [is_load[0].clone(), is_store[0].clone()],
-            |[load, store]| {
-                (load + store).into()
-            },
-            &mem_tuple,
-        );
+        // For each byte offset 0..8, produce a byte-level lookup entry
+        // Tuple: (addr+i [4], value_byte_i [1], timestamp[8], is_write[1])
+        // Multiplicity: mem_byte_active[i] (1 if byte is within access size, 0 otherwise)
+        for byte_idx in 0..8usize {
+            let byte_offset = PackedBaseField::broadcast(BaseField::from(byte_idx as u32));
+            let mem_addr_c = mem_addr.clone();
+            let mem_value_c = mem_value.clone();
+            let timestamp_c = timestamp.clone();
+            let is_store_c = is_store.clone();
+            logup.add_to_relation_computed(
+                mem_lookup,
+                [mem_byte_active[byte_idx].clone()],
+                |[active]| active.into(),
+                14, // tuple size: addr[4] + value[1] + timestamp[8] + is_write[1]
+                |vec_idx| {
+                    let mut tuple = Vec::with_capacity(14);
+                    // addr + byte_idx (add offset to low byte)
+                    tuple.push(mem_addr_c[0].at(vec_idx) + byte_offset);
+                    for j in 1..4 { tuple.push(mem_addr_c[j].at(vec_idx)); }
+                    // value byte
+                    tuple.push(mem_value_c[byte_idx].at(vec_idx));
+                    // timestamp
+                    for col in &timestamp_c { tuple.push(col.at(vec_idx)); }
+                    // is_write
+                    tuple.push(is_store_c[0].at(vec_idx));
+                    tuple
+                },
+            );
+        }
 
         // Program execution lookup: consume (ts, pc), produce (ts+1, next_pc)
         let prog_exec: &ProgramExecutionLookupElements = lookup_elements.as_ref();
@@ -838,6 +863,23 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // Power-of-two lookup: (shift_amount, val_d[8]) when is_shift && shift_op ∈ {0,1}
+        // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained
+        let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
+        let shift_amount_col = zkpvm_trace::original_base_column!(component_trace, Column::ShiftAmount);
+        let is_shift_constrained = zkpvm_trace::original_base_column!(component_trace, Column::IsShiftConstrained);
+        let val_d_cols = zkpvm_trace::original_base_column!(component_trace, Column::ValD);
+        {
+            let mut tuple: Vec<_> = vec![shift_amount_col[0].clone()];
+            tuple.extend_from_slice(&val_d_cols);
+            logup.add_to_relation_with(
+                pow2_lookup,
+                [is_shift_constrained[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
+        }
+
         logup.finalize()
     }
 
@@ -847,9 +889,9 @@ impl BuiltInComponent for CpuChip {
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements),
+        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements, PowerOfTwoLookupElements),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup) = lookup_elements;
         let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1333,25 +1375,32 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
         // Memory access lookup (producer side)
         // ════════════════════════════════════════════════════════════════════
-        let is_load_col = zkpvm_trace::trace_eval!(trace_eval, Column::IsLoad);
         let is_store_col = zkpvm_trace::trace_eval!(trace_eval, Column::IsStore);
         let mem_addr = zkpvm_trace::trace_eval!(trace_eval, Column::MemAddr);
         let mem_value = zkpvm_trace::trace_eval!(trace_eval, Column::MemValue);
         let timestamp = zkpvm_trace::trace_eval!(trace_eval, Column::Timestamp);
-        let mem_size = zkpvm_trace::trace_eval!(trace_eval, Column::MemSize);
+        let mem_byte_active = zkpvm_trace::trace_eval!(trace_eval, Column::MemByteActive);
 
-        let mut mem_tuple: Vec<E::F> = mem_addr.to_vec();
-        mem_tuple.extend_from_slice(&mem_value);
-        mem_tuple.extend_from_slice(&timestamp);
-        mem_tuple.push(is_store_col[0].clone()); // is_write = is_store
-        mem_tuple.push(mem_size[0].clone());
+        // Byte-level memory lookups: one per byte offset
+        for byte_idx in 0..WORD_SIZE {
+            let byte_offset = E::F::from(BaseField::from(byte_idx as u32));
+            let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+            // addr + byte_idx
+            tuple.push(mem_addr[0].clone() + byte_offset);
+            for j in 1..4 { tuple.push(mem_addr[j].clone()); }
+            // value byte
+            tuple.push(mem_value[byte_idx].clone());
+            // timestamp
+            tuple.extend_from_slice(&timestamp);
+            // is_write
+            tuple.push(is_store_col[0].clone());
 
-        let mem_mult = is_load_col[0].clone() + is_store_col[0].clone();
-        eval.add_to_relation(RelationEntry::new(
-            mem_lookup,
-            mem_mult.into(),
-            &mem_tuple,
-        ));
+            eval.add_to_relation(RelationEntry::new(
+                mem_lookup,
+                mem_byte_active[byte_idx].clone().into(),
+                &tuple,
+            ));
+        }
 
         // ════════════════════════════════════════════════════════════════════
         // Program execution lookup: step sequencing
@@ -1406,6 +1455,19 @@ impl BuiltInComponent for CpuChip {
                     &[b_lo, d_lo, and_lo],
                 ));
             }
+        }
+
+        // Power-of-two lookup: proves val_d = 2^shift_amount for constrained shifts
+        {
+            let shift_amount = zkpvm_trace::trace_eval!(trace_eval, Column::ShiftAmount);
+            let is_shift_c = zkpvm_trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
+            let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
+            tuple.extend_from_slice(&val_d);
+            eval.add_to_relation(RelationEntry::new(
+                pow2_lookup,
+                is_shift_c[0].clone().into(),
+                &tuple,
+            ));
         }
 
         eval.finalize_logup_in_pairs();

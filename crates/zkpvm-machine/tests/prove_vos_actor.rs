@@ -26,7 +26,8 @@ fn load_fibonacci_blob() -> Vec<u8> {
 }
 
 /// Set up an Interpreter from a JAR blob's CODE + DATA capabilities.
-fn interpreter_from_blob(blob: &[u8], gas: u64) -> Interpreter {
+/// Returns (interpreter, flat_mem) so flat_mem can be passed to SideNote.
+fn interpreter_from_blob(blob: &[u8], gas: u64) -> (Interpreter, Vec<u8>) {
     let parsed = program::parse_blob(blob).expect("failed to parse JAR blob");
 
     // Find CODE cap and extract code/bitmask/jump_table
@@ -77,7 +78,8 @@ fn interpreter_from_blob(blob: &[u8], gas: u64) -> Interpreter {
 
     let mem_cycles = javm::compute_mem_cycles(parsed.header.memory_pages);
 
-    Interpreter::new(
+    let flat_mem_copy = flat_mem.clone();
+    let interp = Interpreter::new(
         code_blob.code.to_vec(),
         code_blob.bitmask.to_vec(),
         code_blob.jump_table.to_vec(),
@@ -85,7 +87,8 @@ fn interpreter_from_blob(blob: &[u8], gas: u64) -> Interpreter {
         flat_mem,
         gas,
         mem_cycles,
-    )
+    );
+    (interp, flat_mem_copy)
 }
 
 #[test]
@@ -93,7 +96,7 @@ fn trace_fibonacci_actor() {
     let blob = load_fibonacci_blob();
     eprintln!("PVM blob: {} bytes", blob.len());
 
-    let interp = interpreter_from_blob(&blob, 10_000_000);
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
     eprintln!("Interpreter: code={} bytes, flat_mem={} bytes",
         interp.code.len(), interp.flat_mem.len());
 
@@ -135,7 +138,7 @@ fn prove_fibonacci_actor() {
     let code_data = code_data.expect("no CODE capability in blob");
     let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
 
-    let interp = interpreter_from_blob(&blob, 10_000_000);
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run();
     let steps = tracing.into_trace();
@@ -168,7 +171,7 @@ fn profile_fibonacci_actor() {
     let code_data = code_data.expect("no CODE capability in blob");
     let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
 
-    let interp = interpreter_from_blob(&blob, 10_000_000);
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
     let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run();
@@ -237,7 +240,7 @@ fn profile_actor(name: &str, gas: u64) {
         }
     }
     let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
-    let interp = interpreter_from_blob(&blob, gas);
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, gas);
 
     let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
@@ -296,7 +299,7 @@ fn profile_hash_bench() {
         }
     }
     let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
-    let interp = interpreter_from_blob(&blob, 100_000_000);
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
 
     let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
@@ -324,14 +327,136 @@ fn profile_hash_bench() {
 
     let mut side_note = zkpvm_machine::SideNote::new(
         steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    );
+    ).with_memory(flat_mem);
 
-    eprintln!("\nProve:");
-    let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
+    let t = std::time::Instant::now();
+    let proof = prove(&mut side_note).expect("proving failed");
+    let prove_time = t.elapsed();
     let proof_bytes = bincode::serialize(&proof).expect("serialize");
-    eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
 
     let t = std::time::Instant::now();
     verify(proof, &side_note).expect("verification failed");
-    eprintln!("Verify: {:?}", t.elapsed());
+    let verify_time = t.elapsed();
+    eprintln!("Prove: {prove_time:.2?}, Proof: {:.1} KB, Verify: {verify_time:.2?}", proof_bytes.len() as f64 / 1024.0);
+}
+
+/// Profile a specific hash variant by PVM blob name
+fn profile_hash_variant(name: &str) {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let pvm_path = format!("{base}hash-{name}.pvm");
+    let elf_path = format!("{base}hash-{name}.elf");
+    let blob = std::fs::read(&pvm_path)
+        .or_else(|_| {
+            let elf = std::fs::read(&elf_path).unwrap_or_else(|_| panic!("hash-{name} ELF not found"));
+            Ok::<_, std::io::Error>(grey_transpiler::link_elf(&elf).expect("transpile"))
+        })
+        .unwrap();
+
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+
+    let n = steps.len();
+
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    ).with_memory(flat_mem);
+
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_ops: String = sorted.iter().take(5).map(|(op, c)| format!("{op}:{c}")).collect::<Vec<_>>().join(" ");
+
+    let t = std::time::Instant::now();
+    match prove(&mut side_note) {
+        Ok(proof) => {
+            let prove_time = t.elapsed();
+            let kb = bincode::serialize(&proof).unwrap().len() as f64 / 1024.0;
+            verify(proof, &side_note).expect("verify");
+            eprintln!("  {name:>10}: {n:>5} steps | prove={prove_time:>8.2?} | proof={kb:>5.1} KB | {top_ops}");
+        }
+        Err(_) => {
+            eprintln!("  {name:>10}: {n:>5} steps | CONSTRAINT FAIL | {top_ops}");
+        }
+    }
+}
+
+#[test]
+fn compare_hash_algorithms() {
+    eprintln!("=== Hash algorithm comparison (10 rounds + 4-level Merkle, 96-bit security) ===");
+    for name in &["toy", "blake2s", "sha256"] {
+        profile_hash_variant(name);
+    }
+}
+
+#[test]
+fn debug_blake2s_prefix() {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let blob = std::fs::read(format!("{base}hash-blake2s.pvm")).expect("blake2s PVM");
+    let parsed = program::parse_blob(&blob).expect("parse");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("blake2s: {} total steps", steps.len());
+
+    let config = zkpvm_machine::PcsConfig { pow_bits: 5, fri_config: zkpvm_machine::FriConfig::new(0, 1, 3) };
+    // Scan for first failing prefix (fresh side_note each time)
+    let test_sizes = [steps.len()];
+    for &n in &test_sizes {
+        let n = n.min(steps.len());
+        let trunc: Vec<_> = steps.iter().take(n).cloned().collect();
+        let mut sn = zkpvm_machine::SideNote::new(trunc, code_blob.code.to_vec(), code_blob.bitmask.to_vec()).with_memory(flat_mem.clone());
+        let ok = zkpvm_machine::prove_with_config(&mut sn, config).is_ok();
+        eprintln!("  {n:>5} steps: {}", if ok {"OK"} else {"FAIL"});
+        if !ok { break; }
+    }
+    // Try the full trace
+    eprintln!("Trying full trace ({} steps):", steps.len());
+    let mut sn = zkpvm_machine::SideNote::new(
+        steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec()
+    ).with_memory(flat_mem);
+    match zkpvm_machine::prove_with_config(&mut sn, config) {
+        Ok(proof) => {
+            verify(proof, &sn).expect("verify");
+            eprintln!("  PASS!");
+        }
+        Err(e) => { eprintln!("  FAIL: {e}"); }
+    }
+}
+
+#[test]
+fn trace_keccak_steps() {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let blob = std::fs::read(format!("{base}hash-keccak.pvm")).expect("keccak PVM");
+    let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("Keccak: {} steps", steps.len());
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, c) in sorted.iter().take(10) { eprintln!("  {op}: {c}"); }
 }

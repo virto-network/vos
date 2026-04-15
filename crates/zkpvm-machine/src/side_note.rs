@@ -14,6 +14,14 @@ pub struct SideNote {
     pub range256_counts: Vec<u32>,
     /// Bitwise AND lookup counts: (a, b) → multiplicity.
     pub bitwise_and_counts: HashMap<(u8, u8), u32>,
+    /// Initial memory state (flat_mem from the PVM interpreter).
+    /// The MemoryChip injects synthetic writes at timestamp 0 for addresses
+    /// that are read without a prior write.
+    pub initial_memory: Vec<u8>,
+    /// Number of initial memory entries injected (set by MemoryChip).
+    pub num_initial_mem_entries: usize,
+    /// Power-of-two lookup counts: shift_amount → multiplicity (set by CpuChip).
+    pub power_of_two_counts: Vec<u32>,
 }
 
 impl SideNote {
@@ -24,7 +32,15 @@ impl SideNote {
             bitmask,
             range256_counts: vec![0u32; 256],
             bitwise_and_counts: HashMap::new(),
+            initial_memory: Vec::new(),
+            num_initial_mem_entries: 0,
+            power_of_two_counts: vec![0u32; 64],
         }
+    }
+
+    pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {
+        self.initial_memory = flat_mem;
+        self
     }
 
     pub fn num_steps(&self) -> usize {

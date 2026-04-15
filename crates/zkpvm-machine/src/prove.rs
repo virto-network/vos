@@ -94,6 +94,36 @@ pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -
     prove_impl(side_note, config, true)
 }
 
+/// Debug: print per-component claimed sums (logup) and check if they balance.
+pub fn debug_claimed_sums(side_note: &mut SideNote) {
+    use num_traits::Zero;
+    let components = BASE_COMPONENTS;
+    let component_names = ["CpuChip", "Range256", "MemoryChip", "MemBoundary", "ProgBoundary", "BitwiseLookup", "PowerOfTwo"];
+
+    let traces: Vec<ComponentTrace> = components
+        .iter()
+        .map(|c| c.generate_component_trace(side_note))
+        .collect();
+
+    let mut lookup_elements = AllLookupElements::default();
+    let channel = &mut Blake2sChannel::default();
+    for c in components { c.draw_lookup_elements(&mut lookup_elements, channel); }
+
+    let mut total = SecureField::zero();
+    for (i, (c, trace)) in components.iter().zip(traces).enumerate() {
+        let (_, claimed_sum) = c.generate_interaction_trace(trace, side_note, &lookup_elements);
+        let name = component_names.get(i).unwrap_or(&"?");
+        eprintln!("  {name:>15}: {claimed_sum:?}");
+        total += claimed_sum;
+    }
+    eprintln!("  {:>15}: {total:?}", "total");
+    if total.is_zero() {
+        eprintln!("  Logup sums BALANCE (zero)");
+    } else {
+        eprintln!("  Logup sums DO NOT BALANCE");
+    }
+}
+
 fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
     let components = BASE_COMPONENTS;

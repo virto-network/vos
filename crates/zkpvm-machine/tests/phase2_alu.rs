@@ -553,3 +553,17 @@ fn prove_mul_upper_uu_large() {
     test_three_reg_op(Opcode::MulUpperUU, 0x0102030405060708, 0x0807060504030201,
         ((0x0102030405060708u128 * 0x0807060504030201u128) >> 64) as u64);
 }
+
+#[test]
+fn prove_shlo_l64_negative_value() {
+    // Exact values from blake2s step 242: left shift of a large (negative-looking) 64-bit value
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0xFFFF_FFFF_B363_2DF8; // val_b: large 64-bit value
+    // ShloLImm64: ra=0, rb=0, imm=16 (shift left by 16)
+    let steps = run_two_reg_imm(Opcode::ShloLImm64, 0, 0, 16, regs);
+    let expected = 0xFFFF_FFFF_B363_2DF8u64.wrapping_shl(16);
+    assert_eq!(steps[0].regs_after[0], expected);
+    let code = vec![Opcode::ShloLImm64 as u8, 0x00, 16, 0, 0, 0, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
