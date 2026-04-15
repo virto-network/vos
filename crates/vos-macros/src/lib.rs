@@ -475,6 +475,32 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate __vos_create_with_args — for workers, reads init args from provided bytes
+    let vos_create_with_args = if constructor_params.is_empty() {
+        quote! {
+            fn __vos_create_with_args(_args_bytes: &[u8]) -> Self {
+                Self::new()
+            }
+        }
+    } else {
+        let extractions: Vec<_> = constructor_params.iter().map(|(name, ty)| {
+            let name_str = name.to_string();
+            let accessor = type_to_accessor(ty);
+            quote! {
+                let #name: #ty = args.#accessor(#name_str)
+                    .expect(concat!("missing init arg '", #name_str, "'"));
+            }
+        }).collect();
+        let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
+        quote! {
+            fn __vos_create_with_args(args_bytes: &[u8]) -> Self {
+                let args: vos::value::Args = vos::Decode::decode(args_bytes);
+                #( #extractions )*
+                Self::new(#( #names ),*)
+            }
+        }
+    };
+
     // Generate __vos_on_start — forwards to start handler if defined, else no-op
     let vos_on_start = if has_start_handler {
         // The start handler is a Message<Start> impl. Call it directly.
@@ -516,6 +542,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let passthrough_impl = quote! {
         impl #actor_ty {
             #vos_create
+            #vos_create_with_args
             #vos_on_start
             #( #passthrough_items )*
         }
@@ -608,9 +635,19 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_create() -> *mut () {
+            pub extern "C" fn vos_worker_create(
+                args_ptr: *const u8,
+                args_len: usize,
+            ) -> *mut () {
                 use vos::Actor as _;
-                let mut actor = <#actor_name as vos::Actor>::create();
+                let mut actor = if args_ptr.is_null() || args_len == 0 {
+                    <#actor_name as vos::Actor>::create()
+                } else {
+                    let args_bytes = unsafe {
+                        core::slice::from_raw_parts(args_ptr, args_len)
+                    };
+                    #actor_name::__vos_create_with_args(args_bytes)
+                };
                 let mut ctx = vos::Context::<#actor_name>::new(
                     vos::actors::context::ServiceId(0),
                 );

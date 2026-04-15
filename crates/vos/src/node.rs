@@ -55,6 +55,12 @@ pub struct WorkerConfig {
     pub path: std::path::PathBuf,
 }
 
+/// Synchronous invoke request to a worker.
+struct InvokeRequest {
+    msg: Vec<u8>,
+    reply_tx: mpsc::Sender<Vec<u8>>,
+}
+
 /// A multi-agent VOS node.
 ///
 /// Each agent runs on its own thread with its own `VosRuntime`.
@@ -69,6 +75,10 @@ pub struct VosNode {
     /// Outbound channel — agent threads send cross-service transfers here.
     outbox_tx: mpsc::Sender<Envelope>,
     outbox_rx: mpsc::Receiver<Envelope>,
+    /// Map from worker ServiceId → synchronous invoke channel.
+    /// Used by PVM agents' external_invoke handlers to dispatch
+    /// directly to workers.
+    worker_invoke: HashMap<u32, mpsc::Sender<InvokeRequest>>,
 }
 
 impl VosNode {
@@ -87,6 +97,7 @@ impl VosNode {
             agents: Vec::new(),
             outbox_tx,
             outbox_rx,
+            worker_invoke: HashMap::new(),
         }
     }
 
@@ -106,8 +117,11 @@ impl VosNode {
         // Route this service ID to this agent's inbox
         self.routes.insert(id.0, tx.clone());
 
+        // Clone worker invoke channels so the PVM agent can call workers
+        let worker_invoke = self.worker_invoke.clone();
+
         let join = thread::spawn(move || {
-            agent_thread(id, config, rx, outbox)
+            agent_thread(id, config, rx, outbox, worker_invoke)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -119,12 +133,14 @@ impl VosNode {
     pub fn register_worker(&mut self, config: WorkerConfig) -> ServiceId {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
+        let (invoke_tx, invoke_rx) = mpsc::channel();
         let outbox = self.outbox_tx.clone();
 
         self.routes.insert(id.0, tx);
+        self.worker_invoke.insert(id.0, invoke_tx);
 
         let join = thread::spawn(move || {
-            worker_thread(id, config, rx, outbox)
+            worker_thread(id, config, rx, invoke_rx, outbox)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -168,6 +184,7 @@ impl VosNode {
     pub fn collect(mut self) -> Vec<AgentResult> {
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
+        drop(self.worker_invoke); // drop invoke channels so worker threads can detect disconnect
         self.agents.iter_mut()
             .filter_map(|h| h.join.take().and_then(|j| j.join().ok()))
             .collect()
@@ -187,8 +204,24 @@ fn agent_thread(
     config: AgentConfig,
     inbox: mpsc::Receiver<Envelope>,
     outbox: mpsc::Sender<Envelope>,
+    worker_invoke: HashMap<u32, mpsc::Sender<InvokeRequest>>,
 ) -> AgentResult {
     let mut runtime = VosRuntime::new();
+
+    // Set up external invoke handler for PVM → worker calls.
+    // When a PVM actor calls ctx.ask() on a worker ServiceId, this
+    // handler dispatches synchronously via the invoke channel.
+    if !worker_invoke.is_empty() {
+        runtime.set_external_invoke(Box::new(move |target, msg| {
+            let tx = worker_invoke.get(&target.0)?;
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(InvokeRequest {
+                msg: msg.to_vec(),
+                reply_tx,
+            }).ok()?;
+            reply_rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+        }));
+    }
 
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
@@ -257,9 +290,10 @@ fn worker_thread(
     id: ServiceId,
     config: WorkerConfig,
     inbox: mpsc::Receiver<Envelope>,
+    invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
 ) -> AgentResult {
-    use crate::worker::{WorkerPlugin, POLL_READY, POLL_PENDING};
+    use crate::worker::WorkerPlugin;
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -281,6 +315,13 @@ fn worker_thread(
     let mut handled_any = false;
 
     loop {
+        // Check for synchronous invoke requests from PVM agents first
+        while let Ok(req) = invoke_rx.try_recv() {
+            handled_any = true;
+            let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
+            let _ = req.reply_tx.send(reply);
+        }
+
         // Take next message: deferred first, then inbox
         let envelope = if let Some(e) = deferred.pop_front() {
             e
@@ -299,66 +340,76 @@ fn worker_thread(
         };
         handled_any = true;
 
-        // Start dispatch
-        instance.dispatch_start(&envelope.payload);
-
-        // Poll loop with host I/O fulfillment
-        loop {
-            let result = instance.poll_once();
-            match result.status {
-                POLL_READY => {
-                    // If there's a reply, send it back to the caller
-                    if !result.ptr.is_null() && result.len > 0 {
-                        let reply_bytes = unsafe {
-                            std::slice::from_raw_parts(result.ptr, result.len)
-                        }.to_vec();
-                        instance.free_reply(&result);
-
-                        let _ = outbox.send(Envelope {
-                            from: id,
-                            to: envelope.from,
-                            payload: reply_bytes,
-                        });
-                    } else {
-                        instance.free_reply(&result);
-                    }
-                    break;
-                }
-                POLL_PENDING => {
-                    let effect = instance.pending_effect();
-                    if effect.len() >= 4 {
-                        // Host effect protocol: [target:u32 LE][payload...]
-                        let target_id = u32::from_le_bytes(
-                            effect[..4].try_into().unwrap()
-                        );
-                        let payload = effect[4..].to_vec();
-
-                        // Send ask to target via node routing
-                        let _ = outbox.send(Envelope {
-                            from: id,
-                            to: ServiceId(target_id),
-                            payload,
-                        });
-
-                        // Wait for reply from the target. Messages from
-                        // other senders are deferred for later processing.
-                        let reply = wait_for_reply(
-                            &inbox, target_id, &mut deferred,
-                        );
-                        instance.provide_result(&reply);
-                    } else {
-                        instance.provide_result(&[]);
-                    }
-                }
-                _ => {
-                    eprintln!("worker {id}: poll error {}", result.status);
-                    break;
-                }
-            }
+        let reply = dispatch_and_poll(
+            &mut instance, &envelope.payload,
+            &inbox, &outbox, id, &mut deferred,
+        );
+        if !reply.is_empty() {
+            let _ = outbox.send(Envelope {
+                from: id,
+                to: envelope.from,
+                payload: reply,
+            });
         }
     }
 
     AgentResult { id, panics: 0 }
+}
+
+/// Dispatch a message to a worker instance and poll to completion.
+/// Returns the reply bytes (rkyv-encoded Value).
+fn dispatch_and_poll(
+    instance: &mut crate::worker::WorkerInstance<'_>,
+    msg: &[u8],
+    inbox: &mpsc::Receiver<Envelope>,
+    outbox: &mpsc::Sender<Envelope>,
+    worker_id: ServiceId,
+    deferred: &mut std::collections::VecDeque<Envelope>,
+) -> Vec<u8> {
+    use crate::worker::{POLL_READY, POLL_PENDING};
+
+    instance.dispatch_start(msg);
+
+    loop {
+        let result = instance.poll_once();
+        match result.status {
+            POLL_READY => {
+                let reply = if !result.ptr.is_null() && result.len > 0 {
+                    unsafe {
+                        std::slice::from_raw_parts(result.ptr, result.len)
+                    }.to_vec()
+                } else {
+                    Vec::new()
+                };
+                instance.free_reply(&result);
+                return reply;
+            }
+            POLL_PENDING => {
+                let effect = instance.pending_effect();
+                if effect.len() >= 4 {
+                    let target_id = u32::from_le_bytes(
+                        effect[..4].try_into().unwrap()
+                    );
+                    let payload = effect[4..].to_vec();
+
+                    let _ = outbox.send(Envelope {
+                        from: worker_id,
+                        to: ServiceId(target_id),
+                        payload,
+                    });
+
+                    let reply = wait_for_reply(inbox, target_id, deferred);
+                    instance.provide_result(&reply);
+                } else {
+                    instance.provide_result(&[]);
+                }
+            }
+            _ => {
+                eprintln!("worker {worker_id}: poll error {}", result.status);
+                return Vec::new();
+            }
+        }
+    }
 }
 
 /// Block until a reply arrives from a specific target service.

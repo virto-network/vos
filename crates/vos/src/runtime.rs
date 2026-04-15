@@ -217,6 +217,15 @@ struct ServiceInfo {
     alive: bool,
 }
 
+/// Callback for handling INVOKE hostcalls to services not in this runtime.
+///
+/// Receives `(target_service_id, message_bytes)`. Returns `Some(reply_bytes)`
+/// if the target is handled externally (e.g. a worker), or `None` to fall
+/// through to STATUS_NOT_FOUND.
+///
+/// The reply bytes are rkyv-encoded Value (same format as `ctx.take_reply_bytes()`).
+pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<Vec<u8>> + Send>;
+
 pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
     blob_by_hash: HashMap<[u8; 32], usize>,
@@ -234,6 +243,8 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// JIT compile cache — avoids re-compiling the same PVM blob on
     /// every child invocation.
     code_cache: javm::CodeCache,
+    /// Optional handler for INVOKE targets not in this runtime.
+    external_invoke: Option<ExternalInvokeFn>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -264,11 +275,18 @@ impl<D: DataLayer> VosRuntime<D> {
             gas,
             data,
             code_cache: javm::CodeCache::new(),
+            external_invoke: None,
         }
     }
 
     pub fn gas_config(&self) -> &GasConfig {
         &self.gas
+    }
+
+    /// Set a callback for INVOKE targets not in this runtime.
+    /// Used by VosNode to route invocations to workers.
+    pub fn set_external_invoke(&mut self, handler: ExternalInvokeFn) {
+        self.external_invoke = Some(handler);
     }
 
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
@@ -433,6 +451,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     services,
                     &mut self.code_cache,
                     next_id,
+                    &self.external_invoke,
                 );
 
                 // Absorb the guest's RefinePayload output (if any) into
@@ -584,6 +603,7 @@ fn run_refine_kernel(
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
     next_id: &mut u32,
+    external_invoke: &Option<ExternalInvokeFn>,
 ) -> Option<Vec<u8>> {
     loop {
         match kernel.run() {
@@ -620,6 +640,7 @@ fn run_refine_kernel(
                     code_cache,
                     0,
                     next_id,
+                    external_invoke,
                 );
             }
         }
@@ -644,6 +665,7 @@ fn handle_refine_hostcall(
     code_cache: &mut javm::CodeCache,
     depth: usize,
     next_id: &mut u32,
+    external_invoke: &Option<ExternalInvokeFn>,
 ) {
     let a0 = kernel.active_reg(7);
     let a1 = kernel.active_reg(8);
@@ -759,6 +781,7 @@ fn handle_refine_hostcall(
                 journal,
                 depth + 1,
                 next_id,
+                external_invoke,
             );
             (result, 0)
         }
@@ -783,6 +806,7 @@ fn handle_invoke(
     journal: &mut RefineJournal,
     depth: usize,
     next_id: &mut u32,
+    external_invoke: &Option<ExternalInvokeFn>,
 ) -> u64 {
     use crate::actors::run::{STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED};
 
@@ -816,6 +840,29 @@ fn handle_invoke(
         match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
             None => {
+                // Target not in this runtime — try external invoke (e.g. worker)
+                if let Some(handler) = external_invoke {
+                    let input = kread(caller, input_ptr, input_len);
+                    // Extract message from invoke input: [state_len:u32][state][msg]
+                    let msg = if input.len() >= 4 {
+                        let state_len = u32::from_le_bytes(
+                            input[..4].try_into().unwrap()
+                        ) as usize;
+                        let msg_start = (4 + state_len).min(input.len());
+                        input[msg_start..].to_vec()
+                    } else {
+                        input
+                    };
+                    if let Some(reply) = handler(target_svc_id, &msg) {
+                        // Pack as invoke output: [STATUS_DONE][state_len=0:u32][reply]
+                        let mut output = Vec::with_capacity(5 + reply.len());
+                        output.push(crate::actors::run::STATUS_DONE);
+                        output.extend_from_slice(&0u32.to_le_bytes());
+                        output.extend_from_slice(&reply);
+                        kwrite(caller, output_ptr, &output);
+                        return output.len() as u64;
+                    }
+                }
                 kwrite(caller, output_ptr, &[STATUS_NOT_FOUND]);
                 return 1;
             }
@@ -908,6 +955,7 @@ fn handle_invoke(
                     code_cache,
                     depth,
                     next_id,
+                    external_invoke,
                 );
             }
         }

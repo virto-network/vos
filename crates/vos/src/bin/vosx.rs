@@ -106,6 +106,14 @@ fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[PathBuf]) 
 
     let mut node = VosNode::new();
 
+    // Register workers first so PVM agents can invoke them.
+    for path in workers {
+        let id = node.register_worker(WorkerConfig {
+            path: path.clone(),
+        });
+        eprintln!("vosx: worker '{}' as {id:?}", path.display());
+    }
+
     // Load registry at ServiceId(0) if specified
     if let Some(reg_path) = registry {
         let blob = load_blob(reg_path);
@@ -124,13 +132,6 @@ fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[PathBuf]) 
             storage: vec![],
         });
         eprintln!("vosx: registered '{}' as {id:?}", path.display());
-    }
-
-    for path in workers {
-        let id = node.register_worker(WorkerConfig {
-            path: path.clone(),
-        });
-        eprintln!("vosx: worker '{}' as {id:?}", path.display());
     }
 
     let total = programs.len() + workers.len();

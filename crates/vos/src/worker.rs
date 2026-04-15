@@ -100,7 +100,7 @@ mod host {
 
     /// Type signatures for the C ABI functions exported by worker `.so` files.
     type MetaFn = unsafe extern "C" fn(out_ptr: *mut *const u8, out_len: *mut usize);
-    type CreateFn = unsafe extern "C" fn() -> *mut ();
+    type CreateFn = unsafe extern "C" fn(args_ptr: *const u8, args_len: usize) -> *mut ();
     type DispatchFn = unsafe extern "C" fn(state: *mut (), msg: *const u8, msg_len: usize);
     type PollFn = unsafe extern "C" fn(state: *mut ()) -> WorkerPollResult;
     type PendingEffectFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *const u8, out_len: *mut usize);
@@ -179,9 +179,15 @@ mod host {
             crate::actors::metadata::decode(&self.meta_bytes)
         }
 
-        /// Create a new worker instance.
+        /// Create a new worker instance with no init args.
         pub fn create(&self) -> WorkerInstance<'_> {
-            let state = unsafe { (self.create_fn)() };
+            let state = unsafe { (self.create_fn)(std::ptr::null(), 0) };
+            WorkerInstance { plugin: self, state }
+        }
+
+        /// Create a new worker instance with rkyv-encoded init args.
+        pub fn create_with_args(&self, args: &[u8]) -> WorkerInstance<'_> {
+            let state = unsafe { (self.create_fn)(args.as_ptr(), args.len()) };
             WorkerInstance { plugin: self, state }
         }
     }
