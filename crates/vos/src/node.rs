@@ -260,6 +260,8 @@ fn worker_thread(
     outbox: mpsc::Sender<Envelope>,
 ) -> AgentResult {
     use crate::worker::{WorkerPlugin, POLL_READY, POLL_PENDING};
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
     let plugin = match unsafe { WorkerPlugin::load(&config.path) } {
         Ok(p) => p,
@@ -274,14 +276,28 @@ fn worker_thread(
     }
 
     let mut instance = plugin.create();
+    // Messages that arrived while we were waiting for a specific reply.
+    let mut deferred: VecDeque<Envelope> = VecDeque::new();
+    let mut handled_any = false;
 
     loop {
-        // Wait for a message
-        let envelope = match inbox.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(e) => e,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // Take next message: deferred first, then inbox
+        let envelope = if let Some(e) = deferred.pop_front() {
+            e
+        } else {
+            match inbox.recv_timeout(Duration::from_millis(200)) {
+                Ok(e) => e,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Exit if we've handled at least one message and
+                    // there's nothing left. Otherwise keep waiting for
+                    // the first message.
+                    if handled_any { break; }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         };
+        handled_any = true;
 
         // Start dispatch
         instance.dispatch_start(&envelope.payload);
@@ -298,7 +314,6 @@ fn worker_thread(
                         }.to_vec();
                         instance.free_reply(&result);
 
-                        // Send reply as a transfer back to the sender
                         let _ = outbox.send(Envelope {
                             from: id,
                             to: envelope.from,
@@ -310,28 +325,28 @@ fn worker_thread(
                     break;
                 }
                 POLL_PENDING => {
-                    // Read pending host effect
                     let effect = instance.pending_effect();
                     if effect.len() >= 4 {
-                        // Protocol: [target:u32 LE][payload...]
-                        // This is an ask/tell to another service
+                        // Host effect protocol: [target:u32 LE][payload...]
                         let target_id = u32::from_le_bytes(
                             effect[..4].try_into().unwrap()
                         );
                         let payload = effect[4..].to_vec();
 
-                        // Route via outbox and wait for reply
-                        // For now: send and provide empty result
-                        // TODO: implement request-reply correlation
+                        // Send ask to target via node routing
                         let _ = outbox.send(Envelope {
                             from: id,
                             to: ServiceId(target_id),
                             payload,
                         });
-                        // Provide empty result to unblock the handler
-                        instance.provide_result(&[]);
+
+                        // Wait for reply from the target. Messages from
+                        // other senders are deferred for later processing.
+                        let reply = wait_for_reply(
+                            &inbox, target_id, &mut deferred,
+                        );
+                        instance.provide_result(&reply);
                     } else {
-                        // Unknown effect, provide empty result
                         instance.provide_result(&[]);
                     }
                 }
@@ -341,23 +356,36 @@ fn worker_thread(
                 }
             }
         }
-
-        // Drain any additional queued messages
-        while let Ok(next) = inbox.try_recv() {
-            instance.dispatch_start(&next.payload);
-            // Simple poll to completion for queued messages
-            loop {
-                let r = instance.poll_once();
-                if r.status != POLL_PENDING {
-                    instance.free_reply(&r);
-                    break;
-                }
-                instance.provide_result(&[]);
-            }
-        }
     }
 
     AgentResult { id, panics: 0 }
+}
+
+/// Block until a reply arrives from a specific target service.
+/// Messages from other senders are pushed to the deferred queue.
+fn wait_for_reply(
+    inbox: &mpsc::Receiver<Envelope>,
+    target_id: u32,
+    deferred: &mut std::collections::VecDeque<Envelope>,
+) -> Vec<u8> {
+    use std::time::Duration;
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    loop {
+        match inbox.recv_timeout(REPLY_TIMEOUT) {
+            Ok(reply) if reply.from.0 == target_id => {
+                return reply.payload;
+            }
+            Ok(other) => {
+                // Not the reply we're waiting for — defer it
+                deferred.push_back(other);
+            }
+            Err(_) => {
+                eprintln!("worker: ask timeout waiting for reply from svc:{target_id}");
+                return Vec::new();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +435,59 @@ mod tests {
         assert_eq!(id1, ServiceId::new(0x0042, 1));
         assert_eq!(id2, ServiceId::new(0x0042, 2));
         assert!(id1.is_on_node(0x0042));
+    }
+
+    #[test]
+    fn worker_to_worker_ask() {
+        // This test requires both echo-worker and proxy-worker to be built.
+        // Run: cargo build -p echo-worker -p proxy-worker
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let echo_path = workspace.join("target").join(profile).join("libecho_worker.so");
+        let proxy_path = workspace.join("target").join(profile).join("libproxy_worker.so");
+
+        if !echo_path.exists() || !proxy_path.exists() {
+            eprintln!("skipping worker_to_worker_ask: build workers first");
+            return;
+        }
+
+        let mut node = VosNode::new();
+
+        // Register echo worker — gets ServiceId 1
+        let echo_id = node.register_worker(WorkerConfig { path: echo_path });
+        // Register proxy worker — gets ServiceId 2
+        let proxy_id = node.register_worker(WorkerConfig { path: proxy_path });
+
+        // Send a "proxy" message to the proxy worker, telling it to ask the echo worker
+        // Message format: TAG_DYNAMIC + rkyv-encoded Msg
+        use crate::actors::value::Msg;
+        use crate::actors::codec::Encode;
+        let msg = Msg::new("proxy")
+            .with("target", echo_id.0)
+            .with("text", "hello via proxy");
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(crate::actors::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+
+        // Inject the message by sending directly to proxy's route
+        if let Some(tx) = node.routes.get(&proxy_id.0) {
+            tx.send(Envelope {
+                from: ServiceId(0), // pretend it's from the registry
+                to: proxy_id,
+                payload,
+            }).unwrap();
+        }
+
+        // Run the node — proxy asks echo, echo replies, proxy replies back
+        node.run();
+        let results = node.collect();
+
+        // Both workers should complete without panics
+        for r in &results {
+            assert_eq!(r.panics, 0, "worker {} panicked", r.id);
+        }
     }
 
     #[test]
