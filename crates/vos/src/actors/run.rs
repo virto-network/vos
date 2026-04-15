@@ -55,6 +55,22 @@ pub fn try_poll<F: Future>(mut fut: F) -> RunResult<F::Output> {
     }
 }
 
+/// Poll a future to completion. Used by worker mode where handlers
+/// run natively and can block.
+///
+/// Panics if the future yields (returns `Pending`). Worker handlers
+/// should not use `ctx.yield_now()` — yielding is a PVM concept.
+/// For async I/O, workers should bring their own async runtime.
+pub fn run_blocking<F: Future>(mut fut: F) -> F::Output {
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(val) => val,
+        Poll::Pending => panic!("worker handler yielded — use an async runtime for I/O"),
+    }
+}
+
 /// A future that yields once then completes.
 pub struct Yield {
     yielded: bool,
@@ -81,43 +97,102 @@ impl Future for Yield {
     }
 }
 
-/// A future returned by `ctx.ask()`. Always `Ready` from the first
-/// poll: the synchronous `INVOKE` hostcall has already populated the
-/// reply bytes by the time the guest returns from `ask_raw`. The
-/// `Future` impl exists purely so handlers can `.await` for ergonomics.
+/// A future returned by `ctx.ask()`.
+///
+/// Two modes:
+/// - **PVM**: `Ready` from the first poll — the synchronous `INVOKE`
+///   hostcall has already populated the reply bytes.
+/// - **Worker**: wraps a `HostIo` future — yields `Pending` on first
+///   poll so the host can fulfill the request, then `Ready` on re-poll.
 pub struct Ask {
-    result: Result<alloc::vec::Vec<u8>, super::value::InvokeError>,
+    inner: AskInner,
+}
+
+enum AskInner {
+    /// Immediate result (PVM path or error).
+    Immediate(Result<alloc::vec::Vec<u8>, super::value::InvokeError>),
+    /// Deferred host I/O (worker path).
+    HostIo(HostIo),
 }
 
 impl Ask {
     pub fn ready(result: alloc::vec::Vec<u8>) -> Self {
-        Self { result: Ok(result) }
+        Self { inner: AskInner::Immediate(Ok(result)) }
     }
     pub fn ready_err(err: super::value::InvokeError) -> Self {
-        Self { result: Err(err) }
+        Self { inner: AskInner::Immediate(Err(err)) }
+    }
+    pub fn host_io(io: HostIo) -> Self {
+        Self { inner: AskInner::HostIo(io) }
+    }
+}
+
+fn decode_reply(bytes: alloc::vec::Vec<u8>) -> super::value::Value {
+    if bytes.is_empty() {
+        super::value::Value::Unit
+    } else {
+        <super::value::Value as super::codec::Decode>::decode(&bytes)
     }
 }
 
 impl Future for Ask {
     type Output = Result<super::value::Value, super::value::InvokeError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Move out by replacing with a sentinel error.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let result = core::mem::replace(
-            &mut this.result,
-            Err(super::value::InvokeError::Panicked),
-        );
-        match result {
-            Ok(bytes) => {
-                let value = if bytes.is_empty() {
-                    super::value::Value::Unit
-                } else {
-                    <super::value::Value as super::codec::Decode>::decode(&bytes)
-                };
-                Poll::Ready(Ok(value))
+        match &mut this.inner {
+            AskInner::Immediate(result) => {
+                let result = core::mem::replace(
+                    result,
+                    Err(super::value::InvokeError::Panicked),
+                );
+                match result {
+                    Ok(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             }
-            Err(e) => Poll::Ready(Err(e)),
+            AskInner::HostIo(io) => {
+                match Pin::new(io).poll(cx) {
+                    Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// A future that yields once to let the host fulfill an I/O request,
+/// then returns the result on re-poll.
+///
+/// Used by workers for async host calls (ask, fs_read, etc.).
+/// The request is stored in `Context::host_io_request` before this
+/// future is created. The host reads it, performs the I/O, writes
+/// the result to the result slot, then re-polls.
+pub struct HostIo {
+    polled: bool,
+    result_slot: *mut Option<alloc::vec::Vec<u8>>,
+}
+
+impl HostIo {
+    pub fn new(result_slot: *mut Option<alloc::vec::Vec<u8>>) -> Self {
+        Self { polled: false, result_slot }
+    }
+}
+
+impl Unpin for HostIo {}
+
+impl Future for HostIo {
+    type Output = alloc::vec::Vec<u8>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<alloc::vec::Vec<u8>> {
+        if self.polled {
+            // Second poll: host has provided the result
+            let result = unsafe { &mut *self.result_slot };
+            Poll::Ready(result.take().unwrap_or_default())
+        } else {
+            // First poll: yield so the host can fulfill the request
+            self.polled = true;
+            Poll::Pending
         }
     }
 }

@@ -7,10 +7,11 @@ license.workspace = true
 
 [features]
 default = ["std"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
+worker = ["macros"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
@@ -25,6 +26,7 @@ blake2b_simd = { version = "1", optional = true }
 pollster = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+libloading = { version = "0.8", optional = true }
 
 [[bin]]
 name = "vosx"

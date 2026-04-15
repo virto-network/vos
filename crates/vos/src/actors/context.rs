@@ -28,6 +28,11 @@ pub struct Context<A: Actor> {
     self_schedule: bool,
     sleep_ticks: u32,
 
+    // Worker host I/O: the handler yields with a request, the host
+    // fulfills it and provides the result before re-polling.
+    host_io_request: Option<Vec<u8>>,
+    host_io_result: Option<Vec<u8>>,
+
     _phantom: core::marker::PhantomData<A>,
 }
 
@@ -52,6 +57,8 @@ impl<A: Actor> Context<A> {
             reply: None,
             self_schedule: false,
             sleep_ticks: 0,
+            host_io_request: None,
+            host_io_result: None,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -145,8 +152,12 @@ impl<A: Actor> Context<A> {
         }
         #[cfg(not(feature = "pvm"))]
         {
-            let _ = (target, payload);
-            super::run::Ask::ready_err(super::value::InvokeError::NotFound)
+            // Worker mode: encode as host I/O request and yield to host.
+            // Protocol: [target:u32 LE][payload...]
+            let mut request = Vec::with_capacity(4 + payload.len());
+            request.extend_from_slice(&target.0.to_le_bytes());
+            request.extend_from_slice(payload);
+            super::run::Ask::host_io(self.host_call(request))
         }
     }
 
@@ -183,6 +194,39 @@ impl<A: Actor> Context<A> {
         if let Some(target) = self.resolve(name) {
             self.tell(target, msg);
         }
+    }
+
+    // --- Host I/O (worker mode) ---
+
+    /// Issue an async host call. The handler yields `Pending`; the host
+    /// reads the request via `vos_worker_pending_effect`, fulfills it,
+    /// writes the result via `vos_worker_provide_result`, then re-polls.
+    ///
+    /// Used internally by `ask()` in worker mode.  Future extensions:
+    /// `fs_read`, `http_get`, etc.
+    pub fn host_call(&mut self, request: Vec<u8>) -> super::run::HostIo {
+        self.host_io_request = Some(request);
+        // SAFETY: single-threaded, context outlives the future, one
+        // host call in flight at a time.
+        let result_slot = &mut self.host_io_result as *mut Option<Vec<u8>>;
+        super::run::HostIo::new(result_slot)
+    }
+
+    /// Take the pending host I/O request bytes (for the C ABI to expose).
+    pub fn take_host_io_request(&mut self) -> Option<Vec<u8>> {
+        self.host_io_request.take()
+    }
+
+    /// Peek at the pending host I/O request bytes without consuming.
+    /// Returns a pointer into the stored bytes — valid until the next
+    /// dispatch or take_host_io_request call.
+    pub fn peek_host_io_request(&self) -> Option<&[u8]> {
+        self.host_io_request.as_deref()
+    }
+
+    /// Provide the host I/O result (for the C ABI to inject).
+    pub fn set_host_io_result(&mut self, result: Vec<u8>) {
+        self.host_io_result = Some(result);
     }
 
     // --- Cooperative scheduling ---

@@ -33,7 +33,17 @@ where
     T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
     fn decode(bytes: &[u8]) -> Self {
-        let archived = unsafe { rkyv::access_unchecked::<T::Archived>(bytes) };
+        // Ensure alignment — rkyv requires the buffer to be aligned
+        // to access archived data. Input from FETCH/socket may not be.
+        let aligned = if (bytes.as_ptr() as usize) % core::mem::align_of::<T::Archived>() != 0 {
+            let mut av = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+            av.extend_from_slice(bytes);
+            let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&av) };
+            return rkyv::deserialize::<T, rkyv::rancor::Error>(archived).unwrap();
+        } else {
+            bytes
+        };
+        let archived = unsafe { rkyv::access_unchecked::<T::Archived>(aligned) };
         rkyv::deserialize::<T, rkyv::rancor::Error>(archived).unwrap()
     }
 }

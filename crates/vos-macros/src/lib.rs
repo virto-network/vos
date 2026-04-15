@@ -521,8 +521,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Entry points and preamble
-    let entry_points = quote! {
+    // Preamble — always emitted
+    let preamble = quote! {
         extern crate alloc;
 
         /// Result type alias using this actor's error type.
@@ -530,30 +530,37 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         type Result<T> = core::result::Result<T, <#actor_name as vos::Actor>::Error>;
 
         #[allow(unused_imports)]
-        use vos::{print, println, eprint, eprintln};
-        #[allow(unused_imports)]
         use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
-        // PC=0 entry — JAM refine. Pure: state mutations are buffered in
-        // the context and emitted as a `RefinePayload` via halt_with_output.
+        const _VOS_META_ENCODED: ([u8; 4096], usize) =
+            vos::metadata::encode::<4096>(&#enum_name::META);
+    };
+
+    // PVM entry points — only when targeting PVM
+    let pvm_entries = quote! {
+        #[cfg(feature = "pvm")]
+        #[allow(unused_imports)]
+        use vos::{print, println, eprint, eprintln};
+
+        // PC=0 entry — JAM refine.
+        #[cfg(feature = "pvm")]
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             vos::run_refine_entry::<#actor_name>();
         }
 
-        // PC=5 entry — JAM accumulate. The only stage allowed to mutate
-        // state. Replays the effects encoded in each refine output.
+        // PC=5 entry — JAM accumulate.
+        #[cfg(feature = "pvm")]
         #[unsafe(no_mangle)]
         pub extern "C" fn accumulate() {
             vos::run_accumulate_entry::<#actor_name>();
         }
 
+        #[cfg(feature = "pvm")]
         #[used]
         static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
 
-        const _VOS_META_ENCODED: ([u8; 4096], usize) =
-            vos::metadata::encode::<4096>(&#enum_name::META);
-
+        #[cfg(feature = "pvm")]
         #[unsafe(link_section = ".vos_meta")]
         #[used]
         static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
@@ -565,12 +572,182 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     };
 
+    // Worker entry points — native .so plugins (poll-based async ABI)
+    let worker_entries = quote! {
+        #[cfg(feature = "worker")]
+        mod __vos_worker {
+            use super::*;
+            use core::future::Future;
+            use core::pin::Pin;
+
+            /// Persistent worker state: actor + context + in-flight future.
+            /// One dispatch at a time per instance.
+            struct WorkerState {
+                actor: #actor_name,
+                ctx: vos::Context<#actor_name>,
+                in_flight: Option<Pin<Box<dyn Future<Output = bool>>>>,
+            }
+
+            static _VOS_WORKER_META: [u8; _VOS_META_ENCODED.1] = {
+                let (src, len) = _VOS_META_ENCODED;
+                let mut out = [0u8; _VOS_META_ENCODED.1];
+                let mut i = 0;
+                while i < len { out[i] = src[i]; i += 1; }
+                out
+            };
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_meta(
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) {
+                unsafe {
+                    *out_ptr = _VOS_WORKER_META.as_ptr();
+                    *out_len = _VOS_WORKER_META.len();
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_create() -> *mut () {
+                use vos::Actor as _;
+                let mut actor = <#actor_name as vos::Actor>::create();
+                let mut ctx = vos::Context::<#actor_name>::new(
+                    vos::actors::context::ServiceId(0),
+                );
+                // Run on_start to completion (blocking).
+                let _ = vos::run_blocking(actor.on_start(&mut ctx));
+                let state = Box::new(WorkerState {
+                    actor,
+                    ctx,
+                    in_flight: None,
+                });
+                Box::into_raw(state) as *mut ()
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_dispatch(
+                state: *mut (),
+                msg_ptr: *const u8,
+                msg_len: usize,
+            ) {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
+
+                // Decode: TAG_DYNAMIC prefix → dynamic Msg → typed enum
+                let msg = if !raw.is_empty() && raw[0] == vos::value::TAG_DYNAMIC {
+                    let dynamic: vos::value::Msg = vos::Decode::decode(&raw[1..]);
+                    match <#enum_name as vos::value::FromDynamic>::from_dynamic(&dynamic) {
+                        Some(m) => m,
+                        None => return, // poll will return error
+                    }
+                } else {
+                    vos::Decode::decode(raw)
+                };
+
+                // Create the handler future. Uses raw pointers because
+                // the future borrows actor+ctx from the same WorkerState.
+                // SAFETY: WorkerState is heap-allocated and never moved
+                // while a future is in flight. Single-threaded.
+                let actor_ptr = &mut ws.actor as *mut #actor_name;
+                let ctx_ptr = &mut ws.ctx as *mut vos::Context<#actor_name>;
+                let future: Pin<Box<dyn Future<Output = bool>>> = Box::pin(async move {
+                    let actor = unsafe { &mut *actor_ptr };
+                    let ctx = unsafe { &mut *ctx_ptr };
+                    msg.deliver(actor, ctx).await
+                });
+                ws.in_flight = Some(future);
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_poll(
+                state: *mut (),
+            ) -> vos::worker::WorkerPollResult {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                let Some(future) = ws.in_flight.as_mut() else {
+                    return vos::worker::WorkerPollResult::error(
+                        vos::worker::POLL_ERR_NO_FUTURE,
+                    );
+                };
+
+                // Poll the future once
+                let waker = vos::__worker::noop_waker();
+                let mut cx = core::task::Context::from_waker(&waker);
+                match future.as_mut().poll(&mut cx) {
+                    core::task::Poll::Ready(_stop) => {
+                        ws.in_flight = None;
+                        let reply_bytes = ws.ctx.take_reply_bytes();
+                        if reply_bytes.is_empty() {
+                            vos::worker::WorkerPollResult::ready_empty()
+                        } else {
+                            vos::worker::WorkerPollResult::ready(reply_bytes)
+                        }
+                    }
+                    core::task::Poll::Pending => {
+                        vos::worker::WorkerPollResult::pending()
+                    }
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_pending_effect(
+                state: *mut (),
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                // Peek — pointer valid until next dispatch/poll
+                if let Some(request) = ws.ctx.peek_host_io_request() {
+                    unsafe {
+                        *out_ptr = request.as_ptr();
+                        *out_len = request.len();
+                    }
+                } else {
+                    unsafe {
+                        *out_ptr = core::ptr::null();
+                        *out_len = 0;
+                    }
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_provide_result(
+                state: *mut (),
+                ptr: *const u8,
+                len: usize,
+            ) {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                let result = if ptr.is_null() || len == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+                };
+                ws.ctx.set_host_io_result(result);
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_drop(state: *mut ()) {
+                if !state.is_null() {
+                    unsafe { drop(Box::from_raw(state as *mut WorkerState)) };
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_free(ptr: *mut u8, len: usize, cap: usize) {
+                if !ptr.is_null() && cap > 0 {
+                    unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
+                }
+            }
+        }
+    };
+
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
         #passthrough_impl
-        #entry_points
+        #preamble
+        #pvm_entries
+        #worker_entries
     };
 
     expanded.into()
