@@ -98,6 +98,45 @@ impl LogupTraceBuilder {
         }
     }
 
+    /// Like `add_to_relation_with`, but the tuple values are computed per-row
+    /// from a closure instead of read directly from columns.
+    pub fn add_to_relation_computed<const N: usize, R, F, G>(
+        &mut self,
+        relation: &R,
+        mult_columns: [FinalizedColumn<'_>; N],
+        mult_expr: F,
+        tuple_len: usize,
+        tuple_expr: G,
+    ) where
+        R: RegisteredLookupBound,
+        F: Fn([PackedBaseField; N]) -> PackedSecureField,
+        G: Fn(usize) -> Vec<PackedBaseField>,
+    {
+        let num_vecs = 1 << (self.log_size - LOG_N_LANES);
+        let frac_iter = (0..num_vecs).map(|vec_idx| {
+            let mult_vals = mult_columns.clone().map(|col| col.at(vec_idx));
+            let p0 = mult_expr(mult_vals);
+            let tuple = tuple_expr(vec_idx);
+            debug_assert_eq!(tuple.len(), tuple_len);
+            let p1: PackedSecureField = relation.as_relation_ref().combine(&tuple);
+            (p0, p1)
+        });
+
+        if self.pending_logup.is_empty() {
+            self.pending_logup.extend(frac_iter);
+        } else {
+            let mut logup_col_gen = self.logup_trace_gen.new_col();
+
+            for (vec_row, (a, b)) in frac_iter.enumerate() {
+                let (c, d) = self.pending_logup[vec_row];
+                logup_col_gen.write_frac(vec_row, a * d + b * c, b * d);
+            }
+
+            logup_col_gen.finalize_col();
+            self.pending_logup.clear();
+        }
+    }
+
     pub fn finalize(
         mut self,
     ) -> (

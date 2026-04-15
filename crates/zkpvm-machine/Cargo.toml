@@ -19,6 +19,7 @@ javm = { workspace = true }
 
 [dev-dependencies]
 grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+bincode = "1"
 
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }

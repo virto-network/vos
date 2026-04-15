@@ -5,7 +5,7 @@ use javm::program::{self, CapEntryType};
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm_core::tracing::TracingPvm;
-use zkpvm_machine::{prove, verify};
+use zkpvm_machine::{prove, prove_profiled, verify};
 
 /// Load fibonacci PVM blob (transpiled from ELF).
 fn load_fibonacci_blob() -> Vec<u8> {
@@ -151,4 +151,187 @@ fn prove_fibonacci_actor() {
 
     verify(proof, &side_note).expect("verification failed");
     eprintln!("Verification passed!");
+}
+
+#[test]
+fn profile_fibonacci_actor() {
+    let blob = load_fibonacci_blob();
+    let parsed = program::parse_blob(&blob).expect("failed to parse JAR blob");
+
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_data = code_data.expect("no CODE capability in blob");
+    let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
+
+    let interp = interpreter_from_blob(&blob, 10_000_000);
+    let t0 = std::time::Instant::now();
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run();
+    let steps = tracing.into_trace();
+    let trace_time = t0.elapsed();
+
+    eprintln!("=== Fibonacci Actor Profile ===");
+    eprintln!("PVM execution: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+
+    // Opcode distribution
+    let mut counts = std::collections::HashMap::new();
+    let mut mem_ops = 0u32;
+    let mut branches = 0u32;
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
+        if s.branch_taken { branches += 1; }
+    }
+    eprintln!("Memory ops: {mem_ops}, Branches taken: {branches}");
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, count) in sorted.iter().take(10) {
+        eprintln!("  {op}: {count}");
+    }
+
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps,
+        code_blob.code.to_vec(),
+        code_blob.bitmask.to_vec(),
+    );
+
+    eprintln!("\n=== Prove Pipeline Profile ===");
+    let (proof, _profile) = prove_profiled(&mut side_note).expect("proving failed");
+
+    // Proof size
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Proof size: {} bytes ({:.1} KB)", proof_bytes.len(), proof_bytes.len() as f64 / 1024.0);
+
+    let t = std::time::Instant::now();
+    verify(proof, &side_note).expect("verification failed");
+    eprintln!("Verify: {:?}", t.elapsed());
+}
+
+// ── Generic actor profile helper ──
+
+fn load_actor_blob(name: &str) -> Vec<u8> {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/");
+    let pvm_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.pvm");
+    if let Ok(data) = std::fs::read(&pvm_path) {
+        return data;
+    }
+    let elf_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.elf");
+    let elf_data = std::fs::read(&elf_path)
+        .unwrap_or_else(|_| panic!("{name} ELF not found — build first"));
+    grey_transpiler::link_elf(&elf_data).expect("failed to transpile ELF")
+}
+
+fn profile_actor(name: &str, gas: u64) {
+    let blob = load_actor_blob(name);
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let interp = interpreter_from_blob(&blob, gas);
+
+    let t0 = std::time::Instant::now();
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run();
+    let steps = tracing.into_trace();
+    let trace_time = t0.elapsed();
+
+    eprintln!("=== {name} actor ===");
+    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+
+    // Opcode stats
+    let mut mem_ops = 0u32;
+    let mut branches = 0u32;
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
+        if s.branch_taken { branches += 1; }
+    }
+    eprintln!("Memory ops: {mem_ops}, Branches taken: {branches}");
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, count) in sorted.iter().take(8) {
+        eprintln!("  {op}: {count}");
+    }
+
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    );
+
+    eprintln!("\nProve (96-bit security):");
+    let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
+
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
+
+    let t = std::time::Instant::now();
+    verify(proof, &side_note).expect("verification failed");
+    eprintln!("Verify: {:?}\n", t.elapsed());
+}
+
+#[test]
+fn profile_hasher_actor() {
+    profile_actor("hasher", 10_000_000);
+}
+
+#[test]
+fn profile_hash_bench() {
+    let blob = load_actor_blob("hash-bench");
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let interp = interpreter_from_blob(&blob, 100_000_000);
+
+    let t0 = std::time::Instant::now();
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run();
+    let steps = tracing.into_trace();
+    let trace_time = t0.elapsed();
+
+    eprintln!("=== hash-bench (bare metal) ===");
+    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+
+    let mut mem_ops = 0u32;
+    let mut branches = 0u32;
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
+        if s.branch_taken { branches += 1; }
+    }
+    eprintln!("Memory ops: {mem_ops}, Branches: {branches}");
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, count) in sorted.iter().take(10) {
+        eprintln!("  {op}: {count}");
+    }
+
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    );
+
+    eprintln!("\nProve:");
+    let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
+
+    let t = std::time::Instant::now();
+    verify(proof, &side_note).expect("verification failed");
+    eprintln!("Verify: {:?}", t.elapsed());
 }

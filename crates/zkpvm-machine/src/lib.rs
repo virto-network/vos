@@ -15,6 +15,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::BitwiseLookupChip,
 ];
 
-pub use prove::{prove, Proof};
+pub use prove::{prove, prove_with_config, prove_profiled, prove_profiled_with_config, Proof, ProveProfile, production_pcs_config};
+pub use stwo::core::pcs::PcsConfig;
+pub use stwo::core::fri::FriConfig;
 pub use verify::verify;
 pub use side_note::SideNote;

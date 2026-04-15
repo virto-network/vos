@@ -23,21 +23,21 @@ use crate::{
     side_note::SideNote,
 };
 
-/// BitwiseLookupChip: 256×256 table for byte-level AND.
+/// BitwiseLookupChip: 16×16 table for nibble-level AND.
 ///
-/// Each row provides (a, b, a&b) with multiplicity = number of times
-/// this combination was used by bitwise instructions.
-/// The CpuChip produces positive entries, this chip consumes them.
+/// Each row provides (a, b, a&b) for 4-bit values with multiplicity = number
+/// of times this combination was used. The CpuChip splits bytes into nibbles
+/// and produces 16 lookups per bitwise op (2 nibbles × 8 bytes).
 pub struct BitwiseLookupChip;
 
-const BITWISE_LOG_SIZE: u32 = 16; // 2^16 = 65536 rows = 256×256
+const BITWISE_LOG_SIZE: u32 = 8; // 2^8 = 256 rows = 16×16
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Byte value a (0-255)
+    /// Nibble value a (0-15)
     #[size = 1]
     A,
-    /// Byte value b (0-255)
+    /// Nibble value b (0-15)
     #[size = 1]
     B,
     /// a AND b
@@ -73,9 +73,9 @@ impl BuiltInComponent for BitwiseLookupChip {
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
-            if row < 65536 {
-                let a = (row / 256) as u8;
-                let b = (row % 256) as u8;
+            if row < 256 {
+                let a = (row / 16) as u8;
+                let b = (row % 16) as u8;
                 trace.fill_columns(row, a, PreprocessedColumn::A);
                 trace.fill_columns(row, b, PreprocessedColumn::B);
                 trace.fill_columns(row, a & b, PreprocessedColumn::AndResult);
@@ -91,9 +91,9 @@ impl BuiltInComponent for BitwiseLookupChip {
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
-            if row < 65536 {
-                let a = (row / 256) as u8;
-                let b = (row % 256) as u8;
+            if row < 256 {
+                let a = (row / 16) as u8;
+                let b = (row % 16) as u8;
                 trace.fill_columns(row, a, Column::A);
                 trace.fill_columns(row, b, Column::B);
                 trace.fill_columns(row, a & b, Column::AndResult);

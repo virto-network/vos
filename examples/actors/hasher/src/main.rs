@@ -1,13 +1,10 @@
-//! Hasher actor — endless compute loop demonstrating yield_now().
+//! Hasher actor — computes N iterations of a simple hash chain.
 //!
-//! Each invocation: hash once, print progress, yield to let the agent
-//! re-invoke us. The loop body runs once per invocation — `try_poll`
-//! returns `Yielded` on the first `.await`, and the agent re-sends
-//! the same `Start` message to drive the next iteration.
+//! Pure-compute actor for ZK proving benchmarks: no yield, no I/O.
 
 use vos::{actor, messages};
 
-/// Simple hash: XOR-fold with rotation.
+/// Simple hash: XOR-fold with rotation (no external deps needed).
 fn simple_hash(input: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..32 {
@@ -21,28 +18,23 @@ fn simple_hash(input: &[u8; 32]) -> [u8; 32] {
 
 #[actor]
 struct Hasher {
-    current_hash: [u8; 32],
-    iterations: u64,
+    iterations: u32,
 }
 
 #[messages]
 impl Hasher {
     fn new() -> Self {
-        Hasher {
-            current_hash: [42u8; 32],
-            iterations: 0,
-        }
+        Hasher { iterations: 100 }
     }
 
-    /// Start the hash loop. Each invocation executes one iteration:
-    /// hash → print → yield. The agent re-invokes to drive the next one.
     #[msg]
-    async fn start(&mut self, ctx: &mut Context<Self>) {
-        loop {
-            self.current_hash = simple_hash(&self.current_hash);
-            self.iterations += 1;
-            println!("hasher: iteration {}", self.iterations);
-            ctx.yield_now().await;
+    async fn start(&self, _ctx: &mut Context<Self>) {
+        let mut hash = [42u8; 32];
+        for _ in 0..self.iterations {
+            hash = simple_hash(&hash);
         }
+        // Print first 4 bytes as a checksum
+        let checksum = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        println!("hasher: {} iterations, checksum={checksum:#x}", self.iterations);
     }
 }

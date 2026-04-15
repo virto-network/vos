@@ -36,6 +36,12 @@ impl SideNote {
     }
 
     pub fn add_bitwise_and(&mut self, a: u8, b: u8) {
-        *self.bitwise_and_counts.entry((a, b)).or_insert(0) += 1;
+        // Split each byte into nibbles for the 16×16 lookup table
+        let a_lo = a & 0x0F;
+        let a_hi = (a >> 4) & 0x0F;
+        let b_lo = b & 0x0F;
+        let b_hi = (b >> 4) & 0x0F;
+        *self.bitwise_and_counts.entry((a_lo, b_lo)).or_insert(0) += 1;
+        *self.bitwise_and_counts.entry((a_hi, b_hi)).or_insert(0) += 1;
     }
 }

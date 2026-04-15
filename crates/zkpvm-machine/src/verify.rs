@@ -26,6 +26,7 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
         stark_proof: proof,
         claimed_sums,
         log_sizes: claimed_log_sizes,
+        pcs_config: config,
         ..
     } = proof;
 
@@ -39,15 +40,13 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
             "log sizes len mismatch".to_string(),
         ));
     }
-
-    let config = PcsConfig::default();
     let verifier_channel = &mut Blake2sChannel::default();
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
 
     // Verify preprocessed trace commitment
-    verify_preprocessed_trace(&proof, side_note, verifier_channel, &claimed_log_sizes)?;
+    verify_preprocessed_trace(&proof, side_note, verifier_channel, &claimed_log_sizes, &config)?;
 
     let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
     let sizes: Vec<TreeVec<Vec<u32>>> = components
@@ -104,6 +103,7 @@ fn verify_preprocessed_trace(
     side_note: &SideNote,
     verifier_channel: &Blake2sChannel,
     log_sizes: &[u32],
+    config: &PcsConfig,
 ) -> Result<(), VerificationError> {
     let components = BASE_COMPONENTS;
     let max_constraint_log_degree_bound = components
@@ -112,8 +112,6 @@ fn verify_preprocessed_trace(
         .map(|(c, &log_size)| c.max_constraint_log_degree_bound(log_size))
         .max()
         .unwrap_or(0);
-
-    let config = PcsConfig::default();
     let verifier_channel = &mut verifier_channel.clone();
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
@@ -121,7 +119,7 @@ fn verify_preprocessed_trace(
             .half_coset,
     );
     let commitment_scheme =
-        &mut CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+        &mut CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(*config, &twiddles);
 
     let mut tree_builder = commitment_scheme.tree_builder();
     for (c, log_size) in components.iter().zip(log_sizes) {

@@ -5,7 +5,7 @@ use stwo::{
         ColumnVec,
     },
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
+        backend::simd::{m31::{LOG_N_LANES, PackedBaseField}, SimdBackend},
         poly::{circle::CircleEvaluation, BitReversedOrder},
     },
 };
@@ -88,9 +88,19 @@ pub enum Column {
     IsMove,
     #[size = 1]
     Is32Bit,
-    /// Bitwise sub-op: 0=AND, 1=OR, 2=XOR, 3=AndInv, 4=OrInv, 5=Xnor
+    /// Bitwise sub-op flags (exactly one is 1 when IsBitwise=1)
     #[size = 1]
-    BitwiseOp,
+    IsAnd,
+    #[size = 1]
+    IsOr,
+    #[size = 1]
+    IsXor,
+    #[size = 1]
+    IsAndInv,
+    #[size = 1]
+    IsOrInv,
+    #[size = 1]
+    IsXnor,
     #[size = 1]
     IsNegAdd,
     // ── Mul auxiliary: high 64 bits of full product ──
@@ -107,13 +117,36 @@ pub enum Column {
     /// and_result[i] = val_b[i] AND val_d[i] (8 bytes)
     #[size = 8]
     AndResult,
+    /// High nibble of val_b[i] (val_b[i] >> 4), for nibble-level AND lookup
+    #[size = 8]
+    ValBHiNib,
+    /// High nibble of val_d[i] (val_d[i] >> 4), for nibble-level AND lookup
+    #[size = 8]
+    ValDHiNib,
+    /// High nibble of and_result[i] (and_result[i] >> 4), for nibble-level AND lookup
+    #[size = 8]
+    AndResultHiNib,
     // ── Compare auxiliary ──
     /// Subtraction carry for comparison (8 limbs, reuses sub logic)
     #[size = 8]
     CmpCarry,
-    /// Compare sub-op: 0=SetLtU, 1=SetLtS, 2=CmovIz, 3=CmovNz, 4=Min, 5=MinU, 6=Max, 7=MaxU
+    /// Compare sub-op flags (exactly one is 1 when IsCompare=1)
     #[size = 1]
-    CompareOp,
+    IsSetLtU,
+    #[size = 1]
+    IsSetLtS,
+    #[size = 1]
+    IsCmovIz,
+    #[size = 1]
+    IsCmovNz,
+    #[size = 1]
+    IsMinS,
+    #[size = 1]
+    IsMinU,
+    #[size = 1]
+    IsMaxS,
+    #[size = 1]
+    IsMaxU,
     /// The "less-than" flag derived from cmp_carry (1 if val_b < val_d unsigned)
     #[size = 1]
     CmpLtFlag,
@@ -206,9 +239,21 @@ struct OpcodeFlags {
     is_compare: bool,
     is_move: bool,
     is_32bit: bool,
-    bitwise_op: u8,
+    is_and: bool,
+    is_or: bool,
+    is_xor: bool,
+    is_and_inv: bool,
+    is_or_inv: bool,
+    is_xnor: bool,
     is_neg_add: bool,
-    compare_op: u8,
+    is_set_lt_u: bool,
+    is_set_lt_s: bool,
+    is_cmov_iz: bool,
+    is_cmov_nz: bool,
+    is_min_s: bool,
+    is_min_u: bool,
+    is_max_s: bool,
+    is_max_u: bool,
     shift_op: u8,
     is_branch: bool,
     is_jump: bool,
@@ -232,12 +277,12 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::Mul32 | Opcode::MulImm32 => { f.is_mul = true; f.is_32bit = true; }
         // MulUpper: result = high 64 bits of 128-bit product
         Opcode::MulUpperUU | Opcode::MulUpperSS | Opcode::MulUpperSU => { f.is_mul = true; f.is_mul_upper = true; }
-        Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.bitwise_op = 0; }
-        Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.bitwise_op = 1; }
-        Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.bitwise_op = 2; }
-        Opcode::AndInv => { f.is_bitwise = true; f.bitwise_op = 3; }
-        Opcode::OrInv  => { f.is_bitwise = true; f.bitwise_op = 4; }
-        Opcode::Xnor   => { f.is_bitwise = true; f.bitwise_op = 5; }
+        Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.is_and = true; }
+        Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.is_or = true; }
+        Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.is_xor = true; }
+        Opcode::AndInv => { f.is_bitwise = true; f.is_and_inv = true; }
+        Opcode::OrInv  => { f.is_bitwise = true; f.is_or_inv = true; }
+        Opcode::Xnor   => { f.is_bitwise = true; f.is_xnor = true; }
         // Left shifts: constrained via mul (val_d = 2^shift_amount)
         Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; }
         Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; f.is_32bit = true; }
@@ -251,16 +296,16 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::RotR64 | Opcode::RotR64Imm | Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
         Opcode::RotR32 | Opcode::RotR32Imm | Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
         // Compare
-        Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.compare_op = 0; }
-        Opcode::SetLtS | Opcode::SetLtSImm => { f.is_compare = true; f.compare_op = 1; }
-        Opcode::SetGtUImm => { f.is_compare = true; f.compare_op = 0; } // SetGt = swap + SetLt
-        Opcode::SetGtSImm => { f.is_compare = true; f.compare_op = 1; }
-        Opcode::CmovIz | Opcode::CmovIzImm => { f.is_compare = true; f.compare_op = 2; }
-        Opcode::CmovNz | Opcode::CmovNzImm => { f.is_compare = true; f.compare_op = 3; }
-        Opcode::Min  => { f.is_compare = true; f.compare_op = 4; }
-        Opcode::MinU => { f.is_compare = true; f.compare_op = 5; }
-        Opcode::Max  => { f.is_compare = true; f.compare_op = 6; }
-        Opcode::MaxU => { f.is_compare = true; f.compare_op = 7; }
+        Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.is_set_lt_u = true; }
+        Opcode::SetLtS | Opcode::SetLtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
+        Opcode::SetGtUImm => { f.is_compare = true; f.is_set_lt_u = true; } // SetGt = swap + SetLt
+        Opcode::SetGtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
+        Opcode::CmovIz | Opcode::CmovIzImm => { f.is_compare = true; f.is_cmov_iz = true; }
+        Opcode::CmovNz | Opcode::CmovNzImm => { f.is_compare = true; f.is_cmov_nz = true; }
+        Opcode::Min  => { f.is_compare = true; f.is_min_s = true; }
+        Opcode::MinU => { f.is_compare = true; f.is_min_u = true; }
+        Opcode::Max  => { f.is_compare = true; f.is_max_s = true; }
+        Opcode::MaxU => { f.is_compare = true; f.is_max_u = true; }
         // Move
         Opcode::MoveReg | Opcode::LoadImm | Opcode::LoadImm64 => { f.is_move = true; }
         // BitManip (TwoReg unary ops — prover-trusted, classified to avoid false constraints)
@@ -342,7 +387,7 @@ fn dest_reg(step: &zkpvm_core::step::PvmStep) -> usize {
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 4; // degree-10 constraints (compare gate * conditional result)
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2; // max degree 4 (flag * flag * flag * linear)
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -483,6 +528,20 @@ impl BuiltInComponent for CpuChip {
                 }
             }
             trace.fill_columns_bytes(row, &and_result, Column::AndResult);
+            // High nibbles for nibble-level AND lookup
+            let mut val_b_hi_nib = [0u8; WORD_SIZE];
+            let mut val_d_hi_nib = [0u8; WORD_SIZE];
+            let mut and_result_hi_nib = [0u8; WORD_SIZE];
+            if flags.is_bitwise {
+                for i in 0..WORD_SIZE {
+                    val_b_hi_nib[i] = val_b_bytes[i] >> 4;
+                    val_d_hi_nib[i] = val_d_bytes[i] >> 4;
+                    and_result_hi_nib[i] = and_result[i] >> 4;
+                }
+            }
+            trace.fill_columns_bytes(row, &val_b_hi_nib, Column::ValBHiNib);
+            trace.fill_columns_bytes(row, &val_d_hi_nib, Column::ValDHiNib);
+            trace.fill_columns_bytes(row, &and_result_hi_nib, Column::AndResultHiNib);
 
             // ── Compare auxiliary ──
             let mut cmp_carry = [0u8; WORD_SIZE];
@@ -513,7 +572,14 @@ impl BuiltInComponent for CpuChip {
                 cmp_lt_flag // same sign → unsigned comparison
             };
             trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
-            trace.fill_columns(row, flags.compare_op, Column::CompareOp);
+            trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
+            trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
+            trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);
+            trace.fill_columns(row, flags.is_cmov_nz, Column::IsCmovNz);
+            trace.fill_columns(row, flags.is_min_s, Column::IsMinS);
+            trace.fill_columns(row, flags.is_min_u, Column::IsMinU);
+            trace.fill_columns(row, flags.is_max_s, Column::IsMaxS);
+            trace.fill_columns(row, flags.is_max_u, Column::IsMaxU);
 
             // ── Shift auxiliary ──
             let shift_amount = if flags.is_shift {
@@ -538,7 +604,12 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, flags.is_compare, Column::IsCompare);
             trace.fill_columns(row, flags.is_move, Column::IsMove);
             trace.fill_columns(row, flags.is_32bit, Column::Is32Bit);
-            trace.fill_columns(row, flags.bitwise_op, Column::BitwiseOp);
+            trace.fill_columns(row, flags.is_and, Column::IsAnd);
+            trace.fill_columns(row, flags.is_or, Column::IsOr);
+            trace.fill_columns(row, flags.is_xor, Column::IsXor);
+            trace.fill_columns(row, flags.is_and_inv, Column::IsAndInv);
+            trace.fill_columns(row, flags.is_or_inv, Column::IsOrInv);
+            trace.fill_columns(row, flags.is_xnor, Column::IsXnor);
             trace.fill_columns(row, flags.is_neg_add, Column::IsNegAdd);
             trace.fill_columns(row, flags.is_branch, Column::IsBranch);
             trace.fill_columns(row, flags.is_jump, Column::IsJump);
@@ -726,18 +797,44 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
-        // Bitwise AND lookup: (val_b[i], val_d[i], and_result[i]) for each byte
+        // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
+        // For each byte i: lookup (hi_nib_b, hi_nib_d, hi_nib_and) and (lo_nib_b, lo_nib_d, lo_nib_and)
         let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
         let is_bitwise = zkpvm_trace::original_base_column!(component_trace, Column::IsBitwise);
-        let and_result_cols = zkpvm_trace::original_base_column!(component_trace, Column::AndResult);
         let val_b_cols = zkpvm_trace::original_base_column!(component_trace, Column::ValB);
         let val_d_cols = zkpvm_trace::original_base_column!(component_trace, Column::ValD);
+        let and_result_cols = zkpvm_trace::original_base_column!(component_trace, Column::AndResult);
+        let val_b_hi_nib = zkpvm_trace::original_base_column!(component_trace, Column::ValBHiNib);
+        let val_d_hi_nib = zkpvm_trace::original_base_column!(component_trace, Column::ValDHiNib);
+        let and_result_hi_nib = zkpvm_trace::original_base_column!(component_trace, Column::AndResultHiNib);
+        let sixteen = PackedBaseField::broadcast(BaseField::from(16));
         for i in 0..WORD_SIZE {
+            // High nibble lookup: (val_b_hi[i], val_d_hi[i], and_result_hi[i])
             logup.add_to_relation_with(
                 bitwise_and,
                 [is_bitwise[0].clone()],
                 |[bw]| bw.into(),
-                &[val_b_cols[i].clone(), val_d_cols[i].clone(), and_result_cols[i].clone()],
+                &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
+            );
+            // Low nibble lookup: (val_b_lo[i], val_d_lo[i], and_result_lo[i])
+            // lo = byte - hi * 16
+            let val_b_col_i = val_b_cols[i].clone();
+            let val_d_col_i = val_d_cols[i].clone();
+            let and_result_col_i = and_result_cols[i].clone();
+            let val_b_hi_i = val_b_hi_nib[i].clone();
+            let val_d_hi_i = val_d_hi_nib[i].clone();
+            let and_hi_i = and_result_hi_nib[i].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [is_bitwise[0].clone()],
+                |[bw]| bw.into(),
+                3,
+                |vec_idx| {
+                    let b_lo = val_b_col_i.at(vec_idx) - val_b_hi_i.at(vec_idx) * sixteen;
+                    let d_lo = val_d_col_i.at(vec_idx) - val_d_hi_i.at(vec_idx) * sixteen;
+                    let and_lo = and_result_col_i.at(vec_idx) - and_hi_i.at(vec_idx) * sixteen;
+                    vec![b_lo, d_lo, and_lo]
+                },
             );
         }
 
@@ -759,14 +856,19 @@ impl BuiltInComponent for CpuChip {
         let is_add = zkpvm_trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub = zkpvm_trace::trace_eval!(trace_eval, Column::IsSub);
         let is_mul = zkpvm_trace::trace_eval!(trace_eval, Column::IsMul);
-        let is_bitwise = zkpvm_trace::trace_eval!(trace_eval, Column::IsBitwise);
+        let _is_bitwise = zkpvm_trace::trace_eval!(trace_eval, Column::IsBitwise);
         let is_shift = zkpvm_trace::trace_eval!(trace_eval, Column::IsShift);
         let is_compare = zkpvm_trace::trace_eval!(trace_eval, Column::IsCompare);
         let is_move = zkpvm_trace::trace_eval!(trace_eval, Column::IsMove);
         let is_neg_add = zkpvm_trace::trace_eval!(trace_eval, Column::IsNegAdd);
         let is_32bit = zkpvm_trace::trace_eval!(trace_eval, Column::Is32Bit);
         let is_64bit = E::F::one() - is_32bit[0].clone();
-        let bitwise_op = zkpvm_trace::trace_eval!(trace_eval, Column::BitwiseOp);
+        let is_and_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsAnd);
+        let is_or_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsOr);
+        let is_xor_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsXor);
+        let is_and_inv_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsAndInv);
+        let is_or_inv_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsOrInv);
+        let is_xnor_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsXnor);
 
         let val_b = zkpvm_trace::trace_eval!(trace_eval, Column::ValB);
         let val_d = zkpvm_trace::trace_eval!(trace_eval, Column::ValD);
@@ -777,7 +879,14 @@ impl BuiltInComponent for CpuChip {
         let and_result = zkpvm_trace::trace_eval!(trace_eval, Column::AndResult);
         let cmp_carry = zkpvm_trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = zkpvm_trace::trace_eval!(trace_eval, Column::CmpLtFlag);
-        let compare_op = zkpvm_trace::trace_eval!(trace_eval, Column::CompareOp);
+        let is_set_lt_u_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsSetLtU);
+        let is_set_lt_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsSetLtS);
+        let is_cmov_iz_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsCmovIz);
+        let is_cmov_nz_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsCmovNz);
+        let _is_min_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsMinS);
+        let is_min_u_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsMinU);
+        let _is_max_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsMaxS);
+        let is_max_u_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsMaxU);
 
         let f256 = E::F::from(BaseField::from(256u32));
         let f255 = E::F::from(BaseField::from(255u32));
@@ -922,50 +1031,6 @@ impl BuiltInComponent for CpuChip {
             // op=5 (Xnor):   r = 255 - a - b + 2*ar
             let c_xnor = r.clone() - f255.clone() + a.clone() + b.clone() - f2.clone() * ar.clone();
 
-            // Select constraint based on bitwise_op using indicator:
-            // bitwise_op = 0,1,2,3,4,5. We use: is_bitwise * constraint_for_op = 0
-            // Since bitwise_op is a field element, we build:
-            // is_bitwise * (op*(op-1)*(op-2)*(op-3)*(op-4)/120 * c_xnor + ...) = 0
-            // This is too high degree. Instead, use the simpler approach:
-            // is_bitwise * (c_and * indicator_0 + c_or * indicator_1 + ...) = 0
-            // where indicator_k = product_{j!=k} (bitwise_op - j) / product_{j!=k} (k - j)
-            // But this is degree 5 per indicator.
-            //
-            // Simplest sound approach: one constraint per op, gated by is_op_k flag.
-            // But we only have one BitwiseOp column. Let's use:
-            //   is_bitwise * [(bitwise_op - 0) * ... all except c_and's matching ...] doesn't work.
-            //
-            // Practical approach: constrain that result equals the EXPECTED value based on
-            // and_result and the op. We write 6 separate constraints, each gated by
-            // is_bitwise * (bitwise_op == k). For (bitwise_op == k), we use the product
-            // of (bitwise_op - j) for all j != k. But degree = 5+1+1 = 7 per constraint.
-            //
-            // Much simpler: just use one universal formula.
-            // Let's define expected_result based on bitwise_op:
-            //   expected = ar                        if op=0
-            //   expected = a + b - ar                if op=1
-            //   expected = a + b - 2*ar              if op=2
-            //   expected = a - ar                    if op=3
-            //   expected = 255 - b + ar              if op=4
-            //   expected = 255 - a - b + 2*ar        if op=5
-            //
-            // Use Lagrange interpolation over op ∈ {0..5}:
-            //   expected(op) = Σ_k L_k(op) * expected_k
-            // This is a degree-5 polynomial in op, making the total constraint degree 5+1(is_bitwise) = 6.
-            // With LOG_CONSTRAINT_DEGREE_BOUND=3, max degree = 2^3 = 8. Fine.
-            //
-            // But Lagrange over 6 points in M31 is messy. Simpler: express as polynomial in op directly.
-            // expected(op) values at op=0..5:
-            //   f(0) = ar
-            //   f(1) = a + b - ar
-            //   f(2) = a + b - 2*ar
-            //   f(3) = a - ar
-            //   f(4) = 255 - b + ar
-            //   f(5) = 255 - a - b + 2*ar
-            //
-            // Actually, let's just do it the simple way with separate constraints.
-            // We already have LOG_CONSTRAINT_DEGREE_BOUND = 3 which allows degree 8.
-            // Use: is_bitwise * Π_{j≠k}(op-j) * c_k = 0 for each k.
             // Degree: 1 + 5 + 1 = 7 ≤ 8. ✓
             // But 6 constraints × 8 limbs = 48 constraints. That's a lot but fine.
             //
@@ -995,71 +1060,13 @@ impl BuiltInComponent for CpuChip {
             // Degree = 1 + max(5, 1) = 6 with the product terms. Still fine.
             //
             // Let me just hardcode the 6 Lagrange basis values:
-            let op = &bitwise_op[0];
-            // L_k(op) = Π_{j≠k}(op - j) / Π_{j≠k}(k - j)
-            // For k=0: L_0 = (op-1)(op-2)(op-3)(op-4)(op-5) / (0-1)(0-2)(0-3)(0-4)(0-5)
-            //        = (op-1)(op-2)(op-3)(op-4)(op-5) / (-1)(-2)(-3)(-4)(-5) = ... / (-120)
-            // Denominator values:
-            // k=0: (-1)(-2)(-3)(-4)(-5) = -120
-            // k=1: (1)(-1)(-2)(-3)(-4) = 24
-            // k=2: (2)(1)(-1)(-2)(-3) = -12
-            // k=3: (3)(2)(1)(-1)(-2) = 12
-            // k=4: (4)(3)(2)(1)(-1) = -24
-            // k=5: (5)(4)(3)(2)(1) = 120
-            //
-            // This is getting complex. Let me use a much simpler approach:
-            // Just have 6 separate constraints, one per op, gated by a product check.
-            // But actually, the absolute simplest that works:
-            // Constrain result - expected = 0 where expected is computed from the op.
-            // I'll use the linear combination approach.
-
-            // expected = ar * α(op) + a * β(op) + b * γ(op) + 255 * δ(op)
-            // where α,β,γ,δ are degree-5 interpolations. Too complex.
-            //
-            // PRAGMATIC APPROACH: just write all 6 constraints separately, each gated:
-            // is_bitwise * (op) * (op-1) * (op-2) * (op-3) * (op-4) * c_and = 0 ... NO wrong.
-            // For op=0: we want c_and = 0. The gate should be zero when op≠0.
-            // Factor: for op=0, Π_{j=1..5}(op-j) = (-1)(-2)(-3)(-4)(-5) = -120 ≠ 0.
-            // For op=1, Π_{j=1..5}(op-j) = 0 since (op-1)=0. ✓
-            // So: is_bitwise * Π_{j=1..5}(op-j) * c_and = 0 constrains c_and=0 when op=0. ✓
-            // Degree: 1 + 5 + 1 = 7. OK with degree bound 8.
-            //
-            // But 6 constraints × 8 bytes = 48 extra constraints. The degree bound means
-            // the blowup factor is 2^3 = 8x. That's acceptable.
-            //
-            // Actually this doesn't work: Π_{j=1..5}(op-j) * c_and = 0 is satisfied when
-            // op=1 OR op=2 OR ... OR op=5 regardless of c_and. But for op=0, we need c_and=0.
-            // The issue is that Π_{j=1..5}(op-j) is non-zero only when op=0. So the constraint
-            // forces c_and=0 when op=0 but doesn't care otherwise. That's exactly what we want!
-            //
-            // Let me just implement this directly. For each op k, the constraint is:
-            // is_bitwise * Π_{j≠k, j∈0..5}(op-j) * c_k = 0
-            // This forces c_k=0 when op=k (the product is non-zero).
-            // When op≠k, the product includes (op-k)=0 wait no, j≠k means we DON'T include j=k.
-            // Hmm: Π_{j∈{0..5}, j≠k}(op - j). When op=k, this product = Π_{j≠k}(k-j) ≠ 0. ✓
-            // When op=m≠k, the product includes factor (op-m) = (m-m) = 0. ✓
-            // So the constraint is zero for all op≠k, and forces c_k=0 for op=k. Perfect.
-
-            // Gate products for each op (the product of (op-j) for j≠k, j in 0..5)
-            let op1 = op.clone() - E::F::one();
-            let op2 = op.clone() - E::F::from(BaseField::from(2u32));
-            let op3 = op.clone() - E::F::from(BaseField::from(3u32));
-            let op4 = op.clone() - E::F::from(BaseField::from(4u32));
-            let op5 = op.clone() - E::F::from(BaseField::from(5u32));
-
-            let gate0 = op1.clone() * op2.clone() * op3.clone() * op4.clone() * op5.clone(); // nonzero at op=0
-            let gate1 = op.clone() * op2.clone() * op3.clone() * op4.clone() * op5.clone(); // nonzero at op=1
-            let gate2 = op.clone() * op1.clone() * op3.clone() * op4.clone() * op5.clone(); // nonzero at op=2
-            let gate3 = op.clone() * op1.clone() * op2.clone() * op4.clone() * op5.clone(); // nonzero at op=3
-            let gate4 = op.clone() * op1.clone() * op2.clone() * op3.clone() * op5.clone(); // nonzero at op=4
-            let gate5 = op.clone() * op1.clone() * op2.clone() * op3.clone() * op4.clone(); // nonzero at op=5
-
-            eval.add_constraint(is_bitwise[0].clone() * gate0 * c_and);
-            eval.add_constraint(is_bitwise[0].clone() * gate1 * c_or);
-            eval.add_constraint(is_bitwise[0].clone() * gate2 * c_xor);
-            eval.add_constraint(is_bitwise[0].clone() * gate3 * c_andinv);
-            eval.add_constraint(is_bitwise[0].clone() * gate4 * c_orinv);
-            eval.add_constraint(is_bitwise[0].clone() * gate5 * c_xnor);
+            // Each bitwise op has its own flag column (degree-2 constraints)
+            eval.add_constraint(is_and_flag[0].clone() * c_and);
+            eval.add_constraint(is_or_flag[0].clone() * c_or);
+            eval.add_constraint(is_xor_flag[0].clone() * c_xor);
+            eval.add_constraint(is_and_inv_flag[0].clone() * c_andinv);
+            eval.add_constraint(is_or_inv_flag[0].clone() * c_orinv);
+            eval.add_constraint(is_xnor_flag[0].clone() * c_xnor);
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1096,20 +1103,8 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(
             is_compare[0].clone() * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
         );
-        // For SetLtU (compare_op = 0): result[0] = cmp_lt_flag, result[1..7] = 0
-        // We use the same gate-product approach as bitwise
+        // Compare sub-ops use per-op flag columns (degree-2 to degree-4 constraints)
         {
-            let cop = &compare_op[0];
-            // For compare_op=0 (SetLtU): result[0] = cmp_lt_flag
-            let cop1 = cop.clone() - E::F::one();
-            let cop2 = cop.clone() - E::F::from(BaseField::from(2u32));
-            let cop3 = cop.clone() - E::F::from(BaseField::from(3u32));
-            let cop4 = cop.clone() - E::F::from(BaseField::from(4u32));
-            let cop5 = cop.clone() - E::F::from(BaseField::from(5u32));
-            let cop6 = cop.clone() - E::F::from(BaseField::from(6u32));
-            let cop7 = cop.clone() - E::F::from(BaseField::from(7u32));
-            let gate_setltu = cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
-
             let val_d_is_zero = zkpvm_trace::trace_eval!(trace_eval, Column::ValDIsZero);
 
             // Constrain val_d_is_zero: if flag=1, all val_d limbs must be 0
@@ -1119,85 +1114,64 @@ impl BuiltInComponent for CpuChip {
                 );
             }
 
-            // SetLtU (compare_op=0): result = cmp_lt_flag (zero-extended)
-            // result[0] = cmp_lt_flag, result[1..7] = 0
+            // SetLtU: result = cmp_lt_flag (zero-extended)
             eval.add_constraint(
-                is_compare[0].clone() * gate_setltu.clone() * (result[0].clone() - cmp_lt_flag[0].clone())
+                is_set_lt_u_flag[0].clone() * (result[0].clone() - cmp_lt_flag[0].clone())
             );
             for i in 1..WORD_SIZE {
-                eval.add_constraint(
-                    is_compare[0].clone() * gate_setltu.clone() * result[i].clone()
-                );
+                eval.add_constraint(is_set_lt_u_flag[0].clone() * result[i].clone());
             }
 
-            // SetLtS (compare_op=1): result = cmp_lt_s_flag (zero-extended)
-            let gate_setlts = cop.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            // SetLtS: result = cmp_lt_s_flag (zero-extended)
             {
                 let cmp_lt_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
                 let sign_b = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitB);
                 let sign_d = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitD);
 
-                // Constrain cmp_lt_s_flag:
-                // signs_differ = sign_b XOR sign_d (= sign_b + sign_d - 2*sign_b*sign_d)
-                // cmp_lt_s_flag = signs_differ * sign_b + (1 - signs_differ) * cmp_lt_flag
                 let signs_differ = sign_b[0].clone() + sign_d[0].clone()
                     - E::F::from(BaseField::from(2u32)) * sign_b[0].clone() * sign_d[0].clone();
                 let expected_s = signs_differ.clone() * sign_b[0].clone()
                     + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
                 eval.add_constraint(
-                    is_compare[0].clone() * gate_setlts.clone()
-                    * (cmp_lt_s_flag[0].clone() - expected_s)
+                    is_set_lt_s_flag[0].clone() * (cmp_lt_s_flag[0].clone() - expected_s)
                 );
 
-                // result[0] = cmp_lt_s_flag, result[1..7] = 0
                 eval.add_constraint(
-                    is_compare[0].clone() * gate_setlts.clone()
-                    * (result[0].clone() - cmp_lt_s_flag[0].clone())
+                    is_set_lt_s_flag[0].clone() * (result[0].clone() - cmp_lt_s_flag[0].clone())
                 );
                 for i in 1..WORD_SIZE {
-                    eval.add_constraint(
-                        is_compare[0].clone() * gate_setlts.clone() * result[i].clone()
-                    );
+                    eval.add_constraint(is_set_lt_s_flag[0].clone() * result[i].clone());
                 }
             }
 
-            // CmovIz (compare_op=2): if val_d==0, result=val_b
-            let gate_cmoviz = cop.clone() * cop1.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            // CmovIz: if val_d==0, result=val_b
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_compare[0].clone() * gate_cmoviz.clone()
+                    is_cmov_iz_flag[0].clone()
                     * val_d_is_zero[0].clone() * (result[i].clone() - val_b[i].clone())
                 );
             }
 
-            // CmovNz (compare_op=3): if val_d!=0, result=val_b (i.e. if val_d_is_zero==0)
-            let gate_cmovnz = cop.clone() * cop1.clone() * cop2.clone() * cop4.clone() * cop5.clone() * cop6.clone() * cop7.clone();
+            // CmovNz: if val_d!=0, result=val_b
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_compare[0].clone() * gate_cmovnz.clone()
+                    is_cmov_nz_flag[0].clone()
                     * (E::F::one() - val_d_is_zero[0].clone()) * (result[i].clone() - val_b[i].clone())
                 );
             }
 
-            // MinU (compare_op=5): result = (val_b < val_d) ? val_b : val_d
-            // = cmp_lt_flag * val_b + (1 - cmp_lt_flag) * val_d
-            let gate_minu = cop.clone() * cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop6.clone() * cop7.clone();
+            // MinU: result = (val_b < val_d) ? val_b : val_d
             for i in 0..WORD_SIZE {
                 let expected = cmp_lt_flag[0].clone() * val_b[i].clone()
                     + (E::F::one() - cmp_lt_flag[0].clone()) * val_d[i].clone();
-                eval.add_constraint(
-                    is_compare[0].clone() * gate_minu.clone() * (result[i].clone() - expected)
-                );
+                eval.add_constraint(is_min_u_flag[0].clone() * (result[i].clone() - expected));
             }
 
-            // MaxU (compare_op=7): result = (val_b < val_d) ? val_d : val_b
-            let gate_maxu = cop.clone() * cop1.clone() * cop2.clone() * cop3.clone() * cop4.clone() * cop5.clone() * cop6.clone();
+            // MaxU: result = (val_b < val_d) ? val_d : val_b
             for i in 0..WORD_SIZE {
                 let expected = cmp_lt_flag[0].clone() * val_d[i].clone()
                     + (E::F::one() - cmp_lt_flag[0].clone()) * val_b[i].clone();
-                eval.add_constraint(
-                    is_compare[0].clone() * gate_maxu.clone() * (result[i].clone() - expected)
-                );
+                eval.add_constraint(is_max_u_flag[0].clone() * (result[i].clone() - expected));
             }
         }
 
@@ -1407,15 +1381,29 @@ impl BuiltInComponent for CpuChip {
             ));
         }
 
-        // Bitwise AND lookup: (val_b[i], val_d[i], and_result[i]) per byte
+        // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
         {
             let and_result = zkpvm_trace::trace_eval!(trace_eval, Column::AndResult);
             let is_bitwise_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsBitwise);
+            let val_b_hi_nib = zkpvm_trace::trace_eval!(trace_eval, Column::ValBHiNib);
+            let val_d_hi_nib = zkpvm_trace::trace_eval!(trace_eval, Column::ValDHiNib);
+            let and_result_hi_nib = zkpvm_trace::trace_eval!(trace_eval, Column::AndResultHiNib);
+            let sixteen: E::F = E::F::from(BaseField::from(16));
             for i in 0..WORD_SIZE {
+                // High nibble lookup
                 eval.add_to_relation(RelationEntry::new(
                     bitwise_and_lookup,
                     is_bitwise_flag[0].clone().into(),
-                    &[val_b[i].clone(), val_d[i].clone(), and_result[i].clone()],
+                    &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
+                ));
+                // Low nibble lookup: lo = byte - hi * 16
+                let b_lo = val_b[i].clone() - val_b_hi_nib[i].clone() * sixteen.clone();
+                let d_lo = val_d[i].clone() - val_d_hi_nib[i].clone() * sixteen.clone();
+                let and_lo = and_result[i].clone() - and_result_hi_nib[i].clone() * sixteen.clone();
+                eval.add_to_relation(RelationEntry::new(
+                    bitwise_and_lookup,
+                    is_bitwise_flag[0].clone().into(),
+                    &[b_lo, d_lo, and_lo],
                 ));
             }
         }
