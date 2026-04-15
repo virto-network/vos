@@ -322,6 +322,78 @@ fn greeter_as_top_level_service() {
 }
 
 #[test]
+fn pvm_agent_invokes_worker_via_external_handler() {
+    // The scheduler agent invokes its children via lifecycle::invoke().
+    // We register a fake "child" ServiceId that maps to a worker via
+    // the external_invoke callback. This tests the full PVM→worker path.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let echo_so = {
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
+        std::path::PathBuf::from(p)
+    };
+    if !echo_so.exists() {
+        eprintln!("SKIP: echo-worker not built (cargo build -p echo-worker)");
+        return;
+    }
+
+    let blob = transpile_actor(&agent_data);
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    // The "worker child" gets ServiceId 99 — not registered in the runtime,
+    // so INVOKE will fall through to external_invoke.
+    let worker_child_id = vos::abi::service::ServiceId(99);
+    let invoke_count = std::sync::Arc::new(AtomicU32::new(0));
+    let count_clone = invoke_count.clone();
+
+    // Load the worker plugin for the external handler.
+    // Leak the plugin so the WorkerInstance is 'static (test only).
+    let plugin: &'static _ = Box::leak(Box::new(
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+    ));
+    let instance = std::sync::Mutex::new(plugin.create());
+
+    rt.set_external_invoke(Box::new(move |target, msg| {
+        if target != worker_child_id { return None; }
+        count_clone.fetch_add(1, Ordering::Relaxed);
+        let mut inst = instance.lock().unwrap();
+        match inst.dispatch_raw(msg) {
+            Ok(reply) => Some(reply),
+            Err(_) => Some(Vec::new()),
+        }
+    }));
+
+    // Init scheduler with children = [99] (our worker)
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(agent_id, Vec::new());
+    rt.run_blocking();
+
+    assert_eq!(rt.panics, 0, "scheduler panicked when invoking worker child");
+    let invokes = invoke_count.load(Ordering::Relaxed);
+    assert!(invokes > 0, "external_invoke should have been called at least once, got {invokes}");
+    eprintln!("pvm_agent_invokes_worker: {invokes} invoke(s) routed to worker");
+}
+
+#[test]
 fn display_multiple_vec_renders() {
     // Regression test for the multi-deliver Vec bug (March 2025):
     // under the old bump allocator, sequential messages containing
