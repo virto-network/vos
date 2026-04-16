@@ -212,18 +212,26 @@ impl<A: Actor> Context<A> {
         super::run::HostIo::new(result_slot)
     }
 
-    /// Perform an HTTP request via the host. Available in worker / WASM
-    /// builds; returns a no-op response otherwise.
+    /// Build an HTTP request to send via the host. Returns a builder
+    /// that implements `IntoFuture`, so awaiting it sends the request
+    /// and returns the response.
     ///
     /// ```ignore
-    /// let resp = ctx.fetch(FetchRequest::get("https://api.example.com")).await;
-    /// if let Some(text) = resp.text() { /* ... */ }
+    /// // GET (default method):
+    /// let resp = ctx.fetch("https://api.example.com").await;
+    ///
+    /// // POST with a JSON body and custom header:
+    /// let resp = ctx.fetch("https://api.example.com/items")
+    ///     .post()
+    ///     .header("Authorization", "Bearer xyz")
+    ///     .json(r#"{"name":"foo"}"#)
+    ///     .await;
     /// ```
-    pub async fn fetch(&mut self, request: crate::effects::FetchRequest) -> crate::effects::FetchResponse {
-        let bytes = request.to_effect_bytes();
-        let result = self.host_call(bytes).await;
-        crate::effects::FetchResponse::decode(&result)
-            .unwrap_or_else(|| crate::effects::FetchResponse::host_error("malformed host response"))
+    pub fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A> {
+        FetchBuilder {
+            ctx: self,
+            request: crate::effects::FetchRequest::get(url),
+        }
     }
 
     /// Take the pending host I/O request bytes (for the C ABI to expose).
@@ -411,5 +419,77 @@ impl<A: Actor> Context<A> {
             effects.push(Effect::New { code_hash });
         }
         RefinePayload { state, reply, effects, continue_next: self.self_schedule }
+    }
+}
+
+// ── FetchBuilder ─────────────────────────────────────────────────────
+
+/// Builder returned by [`Context::fetch`].
+///
+/// Chain method/header/body modifiers, then `.await` to send.
+/// Implements [`IntoFuture`] so the builder itself is awaitable.
+pub struct FetchBuilder<'ctx, A: Actor> {
+    ctx: &'ctx mut Context<A>,
+    request: crate::effects::FetchRequest,
+}
+
+impl<'ctx, A: Actor> FetchBuilder<'ctx, A> {
+    /// Set the HTTP method explicitly.
+    pub fn method(mut self, method: crate::effects::HttpMethod) -> Self {
+        self.request.method = method;
+        self
+    }
+
+    pub fn get(self) -> Self    { self.method(crate::effects::HttpMethod::Get) }
+    pub fn post(self) -> Self   { self.method(crate::effects::HttpMethod::Post) }
+    pub fn put(self) -> Self    { self.method(crate::effects::HttpMethod::Put) }
+    pub fn delete(self) -> Self { self.method(crate::effects::HttpMethod::Delete) }
+    pub fn patch(self) -> Self  { self.method(crate::effects::HttpMethod::Patch) }
+    pub fn head(self) -> Self   { self.method(crate::effects::HttpMethod::Head) }
+
+    /// Add a header. Repeat to add multiple values.
+    pub fn header(
+        mut self,
+        name: impl Into<alloc::string::String>,
+        value: impl Into<alloc::string::String>,
+    ) -> Self {
+        self.request.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the request body (raw bytes).
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.request.body = body.into();
+        self
+    }
+
+    /// Set a JSON body. Adds `Content-Type: application/json` header.
+    pub fn json(mut self, body: impl AsRef<str>) -> Self {
+        self.request.body = body.as_ref().as_bytes().to_vec();
+        self.header("Content-Type", "application/json")
+    }
+
+    /// Set a plain text body. Adds `Content-Type: text/plain; charset=utf-8`.
+    pub fn text(mut self, body: impl AsRef<str>) -> Self {
+        self.request.body = body.as_ref().as_bytes().to_vec();
+        self.header("Content-Type", "text/plain; charset=utf-8")
+    }
+}
+
+impl<'ctx, A: Actor> core::future::IntoFuture for FetchBuilder<'ctx, A> {
+    type Output = crate::effects::FetchResponse;
+    type IntoFuture = core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Self::Output> + 'ctx>
+    >;
+
+    fn into_future(self) -> Self::IntoFuture {
+        alloc::boxed::Box::pin(async move {
+            let bytes = self.request.to_effect_bytes();
+            let result = self.ctx.host_call(bytes).await;
+            crate::effects::FetchResponse::decode(&result)
+                .unwrap_or_else(|| {
+                    crate::effects::FetchResponse::host_error("malformed host response")
+                })
+        })
     }
 }

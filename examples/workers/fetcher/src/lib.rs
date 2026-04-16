@@ -16,7 +16,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
 }
 
-use vos::{actor, messages, effects::FetchRequest};
+use vos::{actor, messages};
 
 #[actor]
 struct Fetcher;
@@ -31,7 +31,7 @@ impl Fetcher {
     /// Returns the body text on 2xx, "ERROR: <status>" otherwise.
     #[msg]
     async fn get(&mut self, url: String, ctx: &mut Context<Self>) -> String {
-        let resp = ctx.fetch(FetchRequest::get(url)).await;
+        let resp = ctx.fetch(url).await;
         if resp.ok() {
             resp.text().unwrap_or("(non-utf8 body)").into()
         } else {
@@ -42,7 +42,25 @@ impl Fetcher {
     /// Fetch a URL and return the HTTP status code.
     #[msg]
     async fn status(&mut self, url: String, ctx: &mut Context<Self>) -> u32 {
-        let resp = ctx.fetch(FetchRequest::get(url)).await;
+        let resp = ctx.fetch(url).await;
         resp.status as u32
+    }
+
+    /// POST a JSON body to a URL with an Authorization header.
+    /// Demonstrates the builder chain.
+    #[msg]
+    async fn post_json(
+        &mut self,
+        url: String,
+        token: String,
+        body: String,
+        ctx: &mut Context<Self>,
+    ) -> String {
+        let resp = ctx.fetch(url)
+            .post()
+            .header("Authorization", format!("Bearer {token}"))
+            .json(body)
+            .await;
+        format!("{}: {}", resp.status, resp.text().unwrap_or(""))
     }
 }
