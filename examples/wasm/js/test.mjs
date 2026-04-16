@@ -23,7 +23,17 @@ console.log('actor name:', meta.actor_name);
 console.log('messages:', meta.messages.map(m => `${m.name}(${m.fields.map(f => f.name + ':' + f.ty).join(', ')}) ${m.is_query ? 'query' : 'cmd'}`));
 console.log('constructor params:', meta.constructor.map(f => `${f.name}: ${f.ty}`));
 
-// We don't have rkyv encoding in JS yet, so skip dispatch.
-// The metadata roundtrip + WASM load is the smoke test.
+// Dispatch real messages now that we have JS-side encoding.
+const reply1 = await actor.ask('echo', { text: 'hello from JS' });
+console.log('reply 1:', reply1);
+const reply2 = await actor.ask('echo', { text: 'second message' });
+console.log('reply 2:', reply2);
+const count = await actor.ask('count');
+console.log('count:', count);
+
+if (reply1 !== 'echo #1: hello from JS') throw new Error(`unexpected reply: ${reply1}`);
+if (reply2 !== 'echo #2: second message') throw new Error(`unexpected reply: ${reply2}`);
+if (count !== 2) throw new Error(`unexpected count: ${count}`);
+
 actor.drop();
 console.log('OK');

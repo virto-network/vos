@@ -986,6 +986,51 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     unsafe { drop(Box::from_raw(state as *mut WasmState)) };
                 }
             }
+
+            /// Encode a JS-friendly MsgDesc into a TAG_DYNAMIC-prefixed
+            /// rkyv-encoded Msg, ready to pass to `vos_wasm_dispatch`.
+            ///
+            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
+            /// Returns 0 on decode error.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_encode_msg(desc_ptr: u32, desc_len: u32) -> u64 {
+                if desc_ptr == 0 || desc_len == 0 { return 0; }
+                let desc = unsafe {
+                    core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
+                };
+                let Some(msg) = vos::value::desc::decode_msg(desc) else {
+                    return 0;
+                };
+                use vos::Encode;
+                let encoded = msg.encode();
+                let mut out: Vec<u8> = Vec::with_capacity(1 + encoded.len());
+                out.push(vos::value::TAG_DYNAMIC);
+                out.extend_from_slice(&encoded);
+                out.shrink_to_fit();
+                let len = out.len();
+                let ptr = out.as_mut_ptr();
+                core::mem::forget(out);
+                pack_buf(ptr as u32, len as u32)
+            }
+
+            /// Decode a rkyv-encoded Value into the JS-friendly ValueDesc format.
+            ///
+            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
+            /// Returns 0 on empty input or decode error.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_decode_value(value_ptr: u32, value_len: u32) -> u64 {
+                if value_ptr == 0 || value_len == 0 { return 0; }
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
+                };
+                let value: vos::value::Value = vos::Decode::decode(bytes);
+                let mut out = vos::value::desc::encode_value(&value);
+                out.shrink_to_fit();
+                let len = out.len();
+                let ptr = out.as_mut_ptr();
+                core::mem::forget(out);
+                pack_buf(ptr as u32, len as u32)
+            }
         }
     };
 
