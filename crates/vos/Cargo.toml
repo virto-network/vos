@@ -12,6 +12,7 @@ macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
 worker = ["macros"]
+wasm = ["macros"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }

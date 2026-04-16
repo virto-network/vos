@@ -17,6 +17,10 @@ build-crates:
 build-workers:
     cargo build -p echo-worker -p proxy-worker
 
+# Build WASM actors (wasm32-unknown-unknown target)
+build-wasm:
+    cd examples/wasm/echo && cargo build --target wasm32-unknown-unknown --release
+
 # Build all PVM actors and agents (riscv64 targets, requires custom toolchain)
 build-pvm:
     cd examples && just build
@@ -30,6 +34,10 @@ test: build-workers
 # Run only worker tests
 test-workers: build-workers
     cargo test -p vos worker -- --nocapture
+
+# Smoke test the WASM actor in Node
+test-wasm: build-wasm
+    node examples/wasm/js/test.mjs
 
 # Run PVM-related integration tests (requires built PVM actors)
 test-pvm: build-workers

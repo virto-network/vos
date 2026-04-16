@@ -777,6 +777,218 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // WASM entry points — for browser / WASI hosts.
+    //
+    // WASM is 32-bit and lacks multi-value returns in many toolchains,
+    // so we pack two u32s (ptr + len) into a u64 for "buffer" returns:
+    //   high 32 bits = ptr, low 32 bits = len
+    //
+    // The host (JS/WASI) drives the poll loop just like the worker host,
+    // reading effects from WASM linear memory directly.
+    let wasm_entries = quote! {
+        #[cfg(feature = "wasm")]
+        mod __vos_wasm {
+            use super::*;
+            use core::future::Future;
+            use core::pin::Pin;
+
+            /// Persistent WASM actor state: actor + context + in-flight future.
+            /// Mirrors the worker model — one dispatch at a time.
+            ///
+            /// `last_reply` holds the bytes from the most recent Ready poll
+            /// so the host can read them via `vos_wasm_take_reply`.
+            struct WasmState {
+                actor: #actor_name,
+                ctx: vos::Context<#actor_name>,
+                in_flight: Option<Pin<Box<dyn Future<Output = bool>>>>,
+                last_reply: Option<Vec<u8>>,
+            }
+
+            static _VOS_WASM_META: [u8; _VOS_META_ENCODED.1] = {
+                let (src, len) = _VOS_META_ENCODED;
+                let mut out = [0u8; _VOS_META_ENCODED.1];
+                let mut i = 0;
+                while i < len { out[i] = src[i]; i += 1; }
+                out
+            };
+
+            /// Pack (ptr, len) into a u64 for returning across the WASM ABI.
+            #[inline]
+            fn pack_buf(ptr: u32, len: u32) -> u64 {
+                ((ptr as u64) << 32) | (len as u64)
+            }
+
+            /// Returns metadata bytes as packed (ptr, len).
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_meta() -> u64 {
+                pack_buf(
+                    _VOS_WASM_META.as_ptr() as u32,
+                    _VOS_WASM_META.len() as u32,
+                )
+            }
+
+            /// Allocate a buffer in WASM memory. Used by the host to write
+            /// init args / messages / I/O results before passing pointers
+            /// to other functions. Caller must free via `vos_wasm_free`.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_alloc(size: u32) -> u32 {
+                let mut buf: Vec<u8> = Vec::with_capacity(size as usize);
+                // SAFETY: capacity is at least size; bytes are uninitialized
+                // but the host writes to them before reading.
+                unsafe { buf.set_len(size as usize); }
+                let ptr = buf.as_mut_ptr() as u32;
+                core::mem::forget(buf);
+                ptr
+            }
+
+            /// Free a buffer previously returned by `vos_wasm_alloc` or
+            /// `vos_wasm_take_reply`.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_free(ptr: u32, size: u32) {
+                if ptr != 0 && size > 0 {
+                    unsafe {
+                        drop(Vec::from_raw_parts(
+                            ptr as *mut u8,
+                            size as usize,
+                            size as usize,
+                        ));
+                    }
+                }
+            }
+
+            /// Create a new actor instance. `args_ptr` may be 0 (no init args).
+            /// Returns the state pointer (opaque handle).
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_create(args_ptr: u32, args_len: u32) -> u32 {
+                use vos::Actor as _;
+                let mut actor = if args_ptr == 0 || args_len == 0 {
+                    <#actor_name as vos::Actor>::create()
+                } else {
+                    let args_bytes = unsafe {
+                        core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize)
+                    };
+                    #actor_name::__vos_create_with_args(args_bytes)
+                };
+                let mut ctx = vos::Context::<#actor_name>::new(
+                    vos::actors::context::ServiceId(0),
+                );
+                let _ = vos::run_blocking(actor.on_start(&mut ctx));
+                let state = Box::new(WasmState {
+                    actor,
+                    ctx,
+                    in_flight: None,
+                    last_reply: None,
+                });
+                Box::into_raw(state) as u32
+            }
+
+            /// Start dispatching a message. Caller must drive with `vos_wasm_poll`.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_dispatch(state: u32, msg_ptr: u32, msg_len: u32) {
+                let ws = unsafe { &mut *(state as *mut WasmState) };
+                let raw = unsafe {
+                    core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize)
+                };
+
+                let msg = if !raw.is_empty() && raw[0] == vos::value::TAG_DYNAMIC {
+                    let dynamic: vos::value::Msg = vos::Decode::decode(&raw[1..]);
+                    match <#enum_name as vos::value::FromDynamic>::from_dynamic(&dynamic) {
+                        Some(m) => m,
+                        None => return,
+                    }
+                } else {
+                    vos::Decode::decode(raw)
+                };
+
+                let actor_ptr = &mut ws.actor as *mut #actor_name;
+                let ctx_ptr = &mut ws.ctx as *mut vos::Context<#actor_name>;
+                let future: Pin<Box<dyn Future<Output = bool>>> = Box::pin(async move {
+                    let actor = unsafe { &mut *actor_ptr };
+                    let ctx = unsafe { &mut *ctx_ptr };
+                    msg.deliver(actor, ctx).await
+                });
+                ws.in_flight = Some(future);
+            }
+
+            /// Poll the in-flight handler once.
+            /// Returns: 0 = Ready, 1 = Pending, -1 = no future, -2 = decode error
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_poll(state: u32) -> i32 {
+                let ws = unsafe { &mut *(state as *mut WasmState) };
+                let Some(future) = ws.in_flight.as_mut() else {
+                    return -1;
+                };
+                let waker = vos::__worker::noop_waker();
+                let mut cx = core::task::Context::from_waker(&waker);
+                match future.as_mut().poll(&mut cx) {
+                    core::task::Poll::Ready(_stop) => {
+                        ws.in_flight = None;
+                        let reply = ws.ctx.take_reply_bytes();
+                        ws.last_reply = if reply.is_empty() { None } else { Some(reply) };
+                        0
+                    }
+                    core::task::Poll::Pending => 1,
+                }
+            }
+
+            /// Take the reply bytes from the last Ready poll. Returns
+            /// packed (ptr, len) — caller owns the buffer and must free
+            /// via `vos_wasm_free(ptr, len)`.
+            ///
+            /// Returns 0 if no reply is available.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_take_reply(state: u32) -> u64 {
+                let ws = unsafe { &mut *(state as *mut WasmState) };
+                match ws.last_reply.take() {
+                    Some(bytes) => {
+                        // Shrink to exact size so cap == len for free
+                        let mut bytes = bytes;
+                        bytes.shrink_to_fit();
+                        let len = bytes.len();
+                        let ptr = bytes.as_mut_ptr();
+                        core::mem::forget(bytes);
+                        pack_buf(ptr as u32, len as u32)
+                    }
+                    None => 0,
+                }
+            }
+
+            /// Read the pending host I/O request. Returns packed (ptr, len)
+            /// into worker memory — pointer valid until next dispatch/poll.
+            /// Returns 0 if no pending effect.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_pending_effect(state: u32) -> u64 {
+                let ws = unsafe { &mut *(state as *mut WasmState) };
+                match ws.ctx.peek_host_io_request() {
+                    Some(bytes) => pack_buf(bytes.as_ptr() as u32, bytes.len() as u32),
+                    None => 0,
+                }
+            }
+
+            /// Provide the result for the pending host I/O request.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_provide_result(state: u32, ptr: u32, len: u32) {
+                let ws = unsafe { &mut *(state as *mut WasmState) };
+                let result = if ptr == 0 || len == 0 {
+                    Vec::new()
+                } else {
+                    unsafe {
+                        core::slice::from_raw_parts(ptr as *const u8, len as usize)
+                    }.to_vec()
+                };
+                ws.ctx.set_host_io_result(result);
+            }
+
+            /// Drop the actor instance.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_drop(state: u32) {
+                if state != 0 {
+                    unsafe { drop(Box::from_raw(state as *mut WasmState)) };
+                }
+            }
+        }
+    };
+
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
@@ -785,6 +997,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #preamble
         #pvm_entries
         #worker_entries
+        #wasm_entries
     };
 
     expanded.into()
