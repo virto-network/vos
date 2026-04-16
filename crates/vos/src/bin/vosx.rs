@@ -38,9 +38,14 @@ enum Command {
         /// Load a registry service at ServiceId(0)
         #[arg(long, value_name = "FILE")]
         registry: Option<PathBuf>,
-        /// Load native worker plugins (.so files)
-        #[arg(long, value_name = "FILE")]
-        worker: Vec<PathBuf>,
+        /// Load native worker plugins. Optional init args after a colon:
+        ///   --worker libfoo.so
+        ///   --worker libfoo.so:key=hello,n=42
+        ///
+        /// Values are auto-typed: integers → U64, true/false → Bool,
+        /// everything else → Str. For explicit types use TOML manifest.
+        #[arg(long, value_name = "FILE[:KEY=VAL,...]")]
+        worker: Vec<String>,
     },
     /// List actors in a manifest
     List {
@@ -59,6 +64,8 @@ fn main() {
         Some(Command::Node { programs, registry, worker }) => {
             cmd_node(&programs, registry.as_deref(), &worker);
         }
+
+
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             cmd_list(&m, &dir);
@@ -101,16 +108,35 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
     exit_with_status(rt.panics);
 }
 
-fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[PathBuf]) {
+fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[String]) {
     use vos::node::{AgentConfig, WorkerConfig, VosNode};
+    use vos::value::Args;
 
     let mut node = VosNode::new();
 
     // Register workers first so PVM agents can invoke them.
-    for path in workers {
-        let id = node.register_worker(WorkerConfig {
-            path: path.clone(),
-        });
+    for spec in workers {
+        let (path_str, args_str) = match spec.split_once(':') {
+            Some((p, a)) => (p, Some(a)),
+            None => (spec.as_str(), None),
+        };
+        let path = PathBuf::from(path_str);
+
+        let config = match args_str {
+            Some(s) if !s.is_empty() => {
+                let mut args = Args::new();
+                for kv in s.split(',') {
+                    let Some((k, v)) = kv.split_once('=') else {
+                        die(&format!("invalid worker arg '{kv}', expected KEY=VALUE"));
+                    };
+                    args = args.with(k, parse_cli_value(v));
+                }
+                WorkerConfig::with_args(path.clone(), &args)
+            }
+            _ => WorkerConfig::new(path.clone()),
+        };
+
+        let id = node.register_worker(config);
         eprintln!("vosx: worker '{}' as {id:?}", path.display());
     }
 
@@ -286,6 +312,17 @@ fn read_stdin() -> Vec<u8> {
 fn resolve_path(dir: &Path, path: &Option<PathBuf>, name: &str) -> PathBuf {
     path.as_ref().map(|p| dir.join(p))
         .unwrap_or_else(|| die(&format!("'{name}' has no path")))
+}
+
+/// Parse a CLI value string into a `Value`. Auto-types: integers → U64,
+/// `true`/`false` → Bool, anything else → Str.
+fn parse_cli_value(s: &str) -> vos::value::Value {
+    use vos::value::Value;
+    if let Ok(b) = s.parse::<bool>() { return Value::Bool(b); }
+    if let Ok(n) = s.parse::<i64>() {
+        return if n >= 0 { Value::U64(n as u64) } else { Value::I64(n) };
+    }
+    Value::Str(s.into())
 }
 
 fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {

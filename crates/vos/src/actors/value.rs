@@ -230,6 +230,18 @@ pub mod desc {
     pub fn decode_msg(bytes: &[u8]) -> Option<Msg> {
         let mut c = Cursor::new(bytes);
         let name = c.read_str()?;
+        let args = read_args(&mut c)?;
+        Some(Msg { name, args })
+    }
+
+    /// Decode an `ArgsDesc` blob (the args portion alone, no name).
+    /// Used for actor init args from non-Rust hosts.
+    pub fn decode_args(bytes: &[u8]) -> Option<Args> {
+        let mut c = Cursor::new(bytes);
+        read_args(&mut c)
+    }
+
+    fn read_args(c: &mut Cursor<'_>) -> Option<Args> {
         let arg_count = c.read_u32()? as usize;
         let mut args = Args::new();
         for _ in 0..arg_count {
@@ -237,7 +249,7 @@ pub mod desc {
             let value = c.read_value()?;
             args = args.with(key, value);
         }
-        Some(Msg { name, args })
+        Some(args)
     }
 
     /// Encode a `Value` into the description format.

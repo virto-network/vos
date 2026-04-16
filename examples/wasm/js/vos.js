@@ -14,7 +14,11 @@
  *
  * @param {string|Response|ArrayBuffer|Promise<Response>} source
  * @param {object} [options]
- * @param {Uint8Array} [options.initArgs] - rkyv-encoded init args
+ * @param {Uint8Array|object} [options.initArgs] - init args for the
+ *   actor's constructor. Either a rkyv-encoded byte buffer (advanced)
+ *   OR a plain JS object like `{ target: 1, name: 'foo' }`. Values
+ *   are auto-tagged like in `ask()` — use `{ type, val }` for explicit
+ *   types.
  * @param {object} [options.imports] - extra WebAssembly imports
  * @param {function} [options.onEffect] - async (effectBytes, instance) => resultBytes
  * @returns {Promise<VosActor>}
@@ -59,16 +63,40 @@ export class VosActor {
     this.memory = wasmInstance.exports.memory;
     this.onEffect = options.onEffect || defaultEffectHandler;
 
-    // Allocate state with optional init args
-    const initArgs = options.initArgs || null;
+    // Allocate state with optional init args. initArgs can be either:
+    //   - a Uint8Array of pre-encoded rkyv Args bytes
+    //   - a plain JS object: { key: value, ... } encoded via the desc path
+    let argsBytes = null;
+    if (options.initArgs instanceof Uint8Array) {
+      argsBytes = options.initArgs;
+    } else if (options.initArgs && typeof options.initArgs === 'object') {
+      argsBytes = this._encodeArgsObject(options.initArgs);
+    }
+
     let argsPtr = 0, argsLen = 0;
-    if (initArgs && initArgs.length > 0) {
-      argsPtr = this.exports.vos_wasm_alloc(initArgs.length);
-      this._writeBytes(argsPtr, initArgs);
-      argsLen = initArgs.length;
+    if (argsBytes && argsBytes.length > 0) {
+      argsPtr = this.exports.vos_wasm_alloc(argsBytes.length);
+      this._writeBytes(argsPtr, argsBytes);
+      argsLen = argsBytes.length;
     }
     this.state = this.exports.vos_wasm_create(argsPtr, argsLen);
     if (argsPtr) this.exports.vos_wasm_free(argsPtr, argsLen);
+  }
+
+  /** Encode a JS object as rkyv-encoded Args bytes via the WASM helper. */
+  _encodeArgsObject(obj) {
+    const desc = encodeArgsDesc(obj);
+    const descPtr = this.exports.vos_wasm_alloc(desc.length);
+    this._writeBytes(descPtr, desc);
+    const packed = this.exports.vos_wasm_encode_args(descPtr, desc.length);
+    this.exports.vos_wasm_free(descPtr, desc.length);
+    if (packed === 0n || packed === 0) {
+      throw new Error('vos: failed to encode init args');
+    }
+    const { ptr, len } = unpackBuf(packed);
+    const bytes = this._readBytes(ptr, len).slice();
+    this.exports.vos_wasm_free(ptr, len);
+    return bytes;
   }
 
   /**
@@ -373,6 +401,18 @@ function encodeMsgDesc(name, args) {
   const nameBytes = ENCODER.encode(name);
   w.u32(nameBytes.length);
   w.bytes(nameBytes);
+  writeArgs(w, args);
+  return w.toBytes();
+}
+
+/** Build the ArgsDesc bytes (just the args portion, no name). */
+function encodeArgsDesc(args) {
+  const w = new BinWriter();
+  writeArgs(w, args);
+  return w.toBytes();
+}
+
+function writeArgs(w, args) {
   const entries = Object.entries(args);
   w.u32(entries.length);
   for (const [k, v] of entries) {
@@ -381,7 +421,6 @@ function encodeMsgDesc(name, args) {
     w.bytes(kb);
     writeValueDesc(w, autoTag(v));
   }
-  return w.toBytes();
 }
 
 /** Decode ValueDesc bytes into a JS value. */

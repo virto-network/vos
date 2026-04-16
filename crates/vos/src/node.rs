@@ -53,6 +53,24 @@ pub struct AgentConfig {
 pub struct WorkerConfig {
     /// Path to the worker `.so` file.
     pub path: std::path::PathBuf,
+    /// rkyv-encoded `vos::value::Args` for the worker's constructor.
+    /// Empty if the constructor takes no parameters.
+    pub init_args: Vec<u8>,
+}
+
+impl WorkerConfig {
+    /// Convenience: build a config with no init args.
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into(), init_args: Vec::new() }
+    }
+
+    /// Convenience: build a config with rkyv-encoded init args.
+    pub fn with_args(path: impl Into<std::path::PathBuf>, args: &crate::value::Args) -> Self {
+        let bytes = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(args)
+            .expect("rkyv encode Args")
+            .to_vec();
+        Self { path: path.into(), init_args: bytes }
+    }
 }
 
 /// Synchronous invoke request to a worker.
@@ -312,7 +330,11 @@ fn worker_thread(
         eprintln!("worker {id}: loaded '{}' from {}", meta.actor_name, config.path.display());
     }
 
-    let mut instance = plugin.create();
+    let mut instance = if config.init_args.is_empty() {
+        plugin.create()
+    } else {
+        plugin.create_with_args(&config.init_args)
+    };
     // Messages that arrived while we were waiting for a specific reply.
     // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
@@ -520,16 +542,19 @@ mod tests {
         let mut node = VosNode::new();
 
         // Register echo worker — gets ServiceId 1
-        let echo_id = node.register_worker(WorkerConfig { path: echo_path });
-        // Register proxy worker — gets ServiceId 2
-        let proxy_id = node.register_worker(WorkerConfig { path: proxy_path });
+        let echo_id = node.register_worker(WorkerConfig::new(echo_path));
 
-        // Send a "proxy" message to the proxy worker, telling it to ask the echo worker
-        // Message format: TAG_DYNAMIC + rkyv-encoded Msg
-        use crate::actors::value::Msg;
+        // Build init args for proxy: target = echo's ServiceId
+        use crate::actors::value::{Args, Msg};
         use crate::actors::codec::Encode;
+        let proxy_args = Args::new().with("target", echo_id.0);
+        let proxy_id = node.register_worker(
+            WorkerConfig::with_args(proxy_path, &proxy_args),
+        );
+
+        // Send a "proxy" message to the proxy worker (no target arg now —
+        // the proxy already knows its target from init args)
         let msg = Msg::new("proxy")
-            .with("target", echo_id.0)
             .with("text", "hello via proxy");
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());

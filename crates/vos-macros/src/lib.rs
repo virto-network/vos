@@ -465,12 +465,24 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }).collect();
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
+        // PVM service path reads init args from storage. Worker/WASM
+        // builds receive args via __vos_create_with_args; bare create()
+        // is an error there.
         quote! {
             fn __vos_create() -> Self {
-                let args: vos::value::Args = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
-                    .expect("actor init args not found in storage");
-                #( #extractions )*
-                Self::new(#( #names ),*)
+                #[cfg(feature = "service")]
+                {
+                    let args: vos::value::Args = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
+                        .expect("actor init args not found in storage");
+                    #( #extractions )*
+                    return Self::new(#( #names ),*);
+                }
+                #[cfg(not(feature = "service"))]
+                panic!(
+                    "actor has constructor parameters — workers and WASM \
+                     must be created with init args (see vos_worker_create / \
+                     vos_wasm_create with non-null args)"
+                );
             }
         }
     };
@@ -1010,6 +1022,29 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let len = out.len();
                 let ptr = out.as_mut_ptr();
                 core::mem::forget(out);
+                pack_buf(ptr as u32, len as u32)
+            }
+
+            /// Encode an ArgsDesc into rkyv-encoded `Args` bytes, ready
+            /// to pass to `vos_wasm_create` as init args.
+            ///
+            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
+            /// Returns 0 on decode error.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_encode_args(desc_ptr: u32, desc_len: u32) -> u64 {
+                if desc_ptr == 0 || desc_len == 0 { return 0; }
+                let desc = unsafe {
+                    core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
+                };
+                let Some(args) = vos::value::desc::decode_args(desc) else {
+                    return 0;
+                };
+                use vos::Encode;
+                let mut encoded = args.encode();
+                encoded.shrink_to_fit();
+                let len = encoded.len();
+                let ptr = encoded.as_mut_ptr();
+                core::mem::forget(encoded);
                 pack_buf(ptr as u32, len as u32)
             }
 
