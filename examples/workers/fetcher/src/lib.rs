@@ -2,19 +2,10 @@
 //!
 //! Same source compiles as a native worker (.so) AND a WASM module.
 //! The fetch effect is handled by the host: ureq for native, the
-//! browser's fetch() for WASM.
+//! browser's fetch() for WASM. WASM bootstrap (allocator + panic
+//! handler) lives in vos behind the `wasm-bootstrap` feature.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
-
-#[cfg(target_arch = "wasm32")]
-#[global_allocator]
-static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
-
-#[cfg(target_arch = "wasm32")]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
 
 use vos::{actor, messages};
 

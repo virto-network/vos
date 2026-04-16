@@ -44,6 +44,26 @@ pub mod registry;
 pub mod effects;
 pub mod worker;
 
+// ── WASM bootstrap (allocator + panic handler) ───────────────────────
+//
+// no_std cdylib WASM modules need a global allocator and a panic
+// handler. With the `wasm-bootstrap` feature enabled, vos provides
+// both, so the actor crate only needs `#![no_std]` plus its actor
+// definitions — no manual allocator/panic plumbing.
+//
+// Both items are crate-unique; if you need a custom allocator or
+// panic behaviour, omit this feature and provide them yourself.
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bootstrap"))]
+#[global_allocator]
+static __VOS_ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bootstrap"))]
+#[panic_handler]
+fn __vos_panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
 #[cfg(feature = "std")]
 pub mod data_layer;
 #[cfg(feature = "std")]

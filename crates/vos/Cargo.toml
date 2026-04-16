@@ -13,6 +13,9 @@ pvm = []
 service = ["pvm"]
 worker = ["macros"]
 wasm = ["macros"]
+# WASM bootstrap: provides global allocator (dlmalloc) and panic
+# handler so the actor crate just needs `#![no_std]` and `use vos::*`.
+wasm-bootstrap = ["wasm", "dep:dlmalloc"]
 # Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
 http = ["dep:ureq"]
 
@@ -31,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 
 [[bin]]
 name = "vosx"

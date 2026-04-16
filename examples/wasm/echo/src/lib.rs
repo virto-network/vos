@@ -7,9 +7,6 @@
 
 #![no_std]
 
-#[global_allocator]
-static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
-
 use vos::{actor, messages};
 
 #[actor]
@@ -36,8 +33,3 @@ impl EchoWasm {
     }
 }
 
-// Provide a panic handler for no_std WASM.
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
