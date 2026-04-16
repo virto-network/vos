@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["std", "http"]
+default = ["std", "http", "storage"]
 std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
@@ -18,6 +18,8 @@ wasm = ["macros"]
 wasm-bootstrap = ["wasm", "dep:dlmalloc"]
 # Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
 http = ["dep:ureq"]
+# Enables redb-backed worker state persistence in the worker host.
+storage = ["dep:redb"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
@@ -35,6 +37,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
+redb = { version = "2", optional = true }
 
 [[bin]]
 name = "vosx"

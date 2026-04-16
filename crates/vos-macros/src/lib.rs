@@ -786,6 +786,51 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
                 }
             }
+
+            /// Restore a worker instance from previously saved state.
+            /// Caller takes ownership of the returned pointer.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_load(
+                state_ptr: *const u8,
+                state_len: usize,
+            ) -> *mut () {
+                use vos::Actor as _;
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(state_ptr, state_len)
+                };
+                let mut actor: #actor_name = vos::Decode::decode(bytes);
+                let mut ctx = vos::Context::<#actor_name>::new(
+                    vos::actors::context::ServiceId(0),
+                );
+                let _ = vos::run_blocking(actor.on_start(&mut ctx));
+                let state = Box::new(WorkerState {
+                    actor,
+                    ctx,
+                    in_flight: None,
+                });
+                Box::into_raw(state) as *mut ()
+            }
+
+            /// Serialize the current actor state. Returns a heap-allocated
+            /// buffer; caller frees via `vos_worker_free(ptr, len, len)`.
+            ///
+            /// out_ptr / out_len receive the buffer location and size.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_worker_state(
+                state: *mut (),
+                out_ptr: *mut *mut u8,
+                out_len: *mut usize,
+            ) {
+                use vos::Encode;
+                let ws = unsafe { &*(state as *const WorkerState) };
+                let mut bytes = ws.actor.encode();
+                bytes.shrink_to_fit();
+                unsafe {
+                    *out_ptr = bytes.as_mut_ptr();
+                    *out_len = bytes.len();
+                }
+                core::mem::forget(bytes);
+            }
         }
     };
 
@@ -997,6 +1042,42 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 if state != 0 {
                     unsafe { drop(Box::from_raw(state as *mut WasmState)) };
                 }
+            }
+
+            /// Restore an actor instance from previously saved state.
+            /// Returns the new state pointer.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_load(state_ptr: u32, state_len: u32) -> u32 {
+                use vos::Actor as _;
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(state_ptr as *const u8, state_len as usize)
+                };
+                let mut actor: #actor_name = vos::Decode::decode(bytes);
+                let mut ctx = vos::Context::<#actor_name>::new(
+                    vos::actors::context::ServiceId(0),
+                );
+                let _ = vos::run_blocking(actor.on_start(&mut ctx));
+                let state = Box::new(WasmState {
+                    actor,
+                    ctx,
+                    in_flight: None,
+                    last_reply: None,
+                });
+                Box::into_raw(state) as u32
+            }
+
+            /// Serialize the current actor state. Returns packed (ptr, len).
+            /// Caller frees via `vos_wasm_free(ptr, len)`.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_state(state: u32) -> u64 {
+                use vos::Encode;
+                let ws = unsafe { &*(state as *const WasmState) };
+                let mut bytes = ws.actor.encode();
+                bytes.shrink_to_fit();
+                let len = bytes.len();
+                let ptr = bytes.as_mut_ptr();
+                core::mem::forget(bytes);
+                pack_buf(ptr as u32, len as u32)
             }
 
             /// Encode a JS-friendly MsgDesc into a TAG_DYNAMIC-prefixed

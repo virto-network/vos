@@ -56,12 +56,27 @@ pub struct WorkerConfig {
     /// rkyv-encoded `vos::value::Args` for the worker's constructor.
     /// Empty if the constructor takes no parameters.
     pub init_args: Vec<u8>,
+    /// Optional state persistence. When set, the worker thread loads
+    /// state from this store on startup (if present) and writes back
+    /// after every dispatch that mutates state.
+    pub storage: Option<WorkerStorage>,
+}
+
+/// Where to persist a worker's actor state.
+#[derive(Clone)]
+pub enum WorkerStorage {
+    /// redb database file. The worker keys its state by `key_name`.
+    #[cfg(feature = "storage")]
+    Redb {
+        path: std::path::PathBuf,
+        key_name: String,
+    },
 }
 
 impl WorkerConfig {
     /// Convenience: build a config with no init args.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into(), init_args: Vec::new() }
+        Self { path: path.into(), init_args: Vec::new(), storage: None }
     }
 
     /// Convenience: build a config with rkyv-encoded init args.
@@ -69,7 +84,23 @@ impl WorkerConfig {
         let bytes = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(args)
             .expect("rkyv encode Args")
             .to_vec();
-        Self { path: path.into(), init_args: bytes }
+        Self { path: path.into(), init_args: bytes, storage: None }
+    }
+
+    /// Persist state to a redb file under the given key.
+    /// Existing state is loaded on startup; init args are ignored if
+    /// state exists for `key`.
+    #[cfg(feature = "storage")]
+    pub fn persist_redb(
+        mut self,
+        db_path: impl Into<std::path::PathBuf>,
+        key: impl Into<String>,
+    ) -> Self {
+        self.storage = Some(WorkerStorage::Redb {
+            path: db_path.into(),
+            key_name: key.into(),
+        });
+        self
     }
 }
 
@@ -330,11 +361,21 @@ fn worker_thread(
         eprintln!("worker {id}: loaded '{}' from {}", meta.actor_name, config.path.display());
     }
 
-    let mut instance = if config.init_args.is_empty() {
-        plugin.create()
-    } else {
-        plugin.create_with_args(&config.init_args)
+    // Open optional state store and try to restore prior state.
+    let storage_handle = config.storage.as_ref().and_then(|s| open_storage(s));
+    let saved_state = storage_handle.as_ref().and_then(|h| read_state(h));
+
+    let mut instance = match saved_state {
+        Some(bytes) => {
+            eprintln!("worker {id}: restored {} bytes of state", bytes.len());
+            plugin.load_state(&bytes)
+        }
+        None if config.init_args.is_empty() => plugin.create(),
+        None => plugin.create_with_args(&config.init_args),
     };
+
+    // Track last-saved bytes to skip writes when state is unchanged.
+    let mut last_saved: Vec<u8> = Vec::new();
     // Messages that arrived while we were waiting for a specific reply.
     // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
@@ -349,6 +390,7 @@ fn worker_thread(
                     handled_any = true;
                     let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
                     let _ = req.reply_tx.send(reply);
+                    persist_if_changed(&storage_handle, &instance, &mut last_saved, id);
                 }
                 Err(_) => break,
             }
@@ -383,6 +425,7 @@ fn worker_thread(
                 payload: reply,
             });
         }
+        persist_if_changed(&storage_handle, &instance, &mut last_saved, id);
     }
 
     AgentResult { id, panics: 0 }
@@ -533,6 +576,96 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
     FetchResponse { status, headers, body }
 }
 
+// ── State persistence ───────────────────────────────────────────────
+
+/// Storage handle bound to a specific worker's key.
+#[cfg(feature = "storage")]
+struct StorageHandle {
+    db: redb::Database,
+    key: String,
+}
+
+#[cfg(not(feature = "storage"))]
+struct StorageHandle;
+
+#[cfg(feature = "storage")]
+const STATE_TABLE: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("vos_worker_state");
+
+fn open_storage(spec: &WorkerStorage) -> Option<StorageHandle> {
+    #[cfg(feature = "storage")]
+    {
+        match spec {
+            WorkerStorage::Redb { path, key_name } => {
+                match redb::Database::create(path) {
+                    Ok(db) => Some(StorageHandle { db, key: key_name.clone() }),
+                    Err(e) => {
+                        eprintln!("worker storage: failed to open {}: {e}", path.display());
+                        None
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "storage"))]
+    {
+        let _ = spec;
+        None
+    }
+}
+
+fn read_state(h: &StorageHandle) -> Option<Vec<u8>> {
+    #[cfg(feature = "storage")]
+    {
+        let txn = h.db.begin_read().ok()?;
+        let table = txn.open_table(STATE_TABLE).ok()?;
+        let val = table.get(h.key.as_str()).ok().flatten()?;
+        Some(val.value().to_vec())
+    }
+    #[cfg(not(feature = "storage"))]
+    {
+        let _ = h;
+        None
+    }
+}
+
+fn write_state(h: &StorageHandle, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(feature = "storage")]
+    {
+        let txn = h.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = txn.open_table(STATE_TABLE).map_err(|e| e.to_string())?;
+            table.insert(h.key.as_str(), bytes).map_err(|e| e.to_string())?;
+        }
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(feature = "storage"))]
+    {
+        let _ = (h, bytes);
+        Err("storage feature disabled".into())
+    }
+}
+
+/// After a dispatch, serialize the worker's state and persist if changed.
+fn persist_if_changed(
+    storage: &Option<StorageHandle>,
+    instance: &crate::worker::WorkerInstance<'_>,
+    last_saved: &mut Vec<u8>,
+    id: ServiceId,
+) {
+    let Some(h) = storage else { return };
+    let bytes = instance.save_state();
+    if bytes == *last_saved {
+        return;
+    }
+    if let Err(e) = write_state(h, &bytes) {
+        eprintln!("worker {id}: failed to persist state: {e}");
+    } else {
+        *last_saved = bytes;
+    }
+}
+
 /// Block until a reply arrives from a specific target service.
 /// Messages from other senders are pushed to the deferred queue.
 fn wait_for_reply(
@@ -611,6 +744,82 @@ mod tests {
         assert_eq!(id1, ServiceId::new(0x0042, 1));
         assert_eq!(id2, ServiceId::new(0x0042, 2));
         assert!(id1.is_on_node(0x0042));
+    }
+
+    #[test]
+    #[cfg(feature = "storage")]
+    fn worker_state_persists_across_restarts() {
+        // EchoWorker has a `count` field that increments on each echo.
+        // Run the worker, send a few messages, shut down. Restart with
+        // the same redb path — the count should resume where it left off.
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let echo_path = workspace.join("target").join(profile).join("libecho_worker.so");
+        if !echo_path.exists() {
+            eprintln!("skipping: build echo-worker first");
+            return;
+        }
+
+        // Use a temp redb file
+        let db_path = std::env::temp_dir().join(format!(
+            "vos_test_persist_{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        use crate::actors::value::Msg;
+        use crate::actors::codec::Encode;
+        let send_echo = |node: &VosNode, target: ServiceId, text: &str| {
+            let msg = Msg::new("echo").with("text", text);
+            let encoded = msg.encode();
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(crate::actors::value::TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            if let Some(tx) = node.routes.get(&target.0) {
+                tx.send(Envelope { from: ServiceId(0), to: target, payload }).unwrap();
+            }
+        };
+
+        // ── First run: send 2 echoes ────────────────────────────────
+        {
+            let mut node = VosNode::new();
+            let id = node.register_worker(
+                WorkerConfig::new(echo_path.clone())
+                    .persist_redb(&db_path, "echo")
+            );
+            send_echo(&node, id, "first");
+            send_echo(&node, id, "second");
+            node.run();
+            let _ = node.collect();
+        }
+
+        // ── Second run: state should be restored, count starts at 2 ──
+        {
+            let mut node = VosNode::new();
+            let id = node.register_worker(
+                WorkerConfig::new(echo_path)
+                    .persist_redb(&db_path, "echo")
+            );
+            // After this, count should be 3 (was 2, plus this one)
+            send_echo(&node, id, "third");
+            node.run();
+            let _ = node.collect();
+        }
+
+        // Verify by opening the db directly and checking the persisted state
+        let db = redb::Database::open(&db_path).expect("open db");
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(STATE_TABLE).unwrap();
+        let bytes = table.get("echo").unwrap().expect("state present").value().to_vec();
+
+        // EchoWorker has a single u32 `count` field — rkyv packs it to
+        // exactly 4 bytes. After 3 echoes, count = 3.
+        assert_eq!(bytes.len(), 4, "EchoWorker state is one u32");
+        let count = u32::from_le_bytes(bytes.try_into().unwrap());
+        assert_eq!(count, 3, "expected 3 echoes total across both runs");
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

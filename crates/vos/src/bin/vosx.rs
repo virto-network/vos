@@ -46,6 +46,11 @@ enum Command {
         /// everything else → Str. For explicit types use TOML manifest.
         #[arg(long, value_name = "FILE[:KEY=VAL,...]")]
         worker: Vec<String>,
+        /// Persist worker state to a redb file. Each worker is keyed
+        /// by the .so filename (without extension) — same .so always
+        /// resumes its prior state.
+        #[arg(long, value_name = "FILE")]
+        state_db: Option<PathBuf>,
     },
     /// List actors in a manifest
     List {
@@ -61,8 +66,8 @@ fn main() {
         Some(Command::Run { program, payload, hex, gas }) => {
             cmd_run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry, worker }) => {
-            cmd_node(&programs, registry.as_deref(), &worker);
+        Some(Command::Node { programs, registry, worker, state_db }) => {
+            cmd_node(&programs, registry.as_deref(), &worker, state_db.as_deref());
         }
 
 
@@ -108,7 +113,12 @@ fn cmd_run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
     exit_with_status(rt.panics);
 }
 
-fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[String]) {
+fn cmd_node(
+    programs: &[PathBuf],
+    registry: Option<&Path>,
+    workers: &[String],
+    state_db: Option<&Path>,
+) {
     use vos::node::{AgentConfig, WorkerConfig, VosNode};
     use vos::value::Args;
 
@@ -122,7 +132,7 @@ fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[String]) {
         };
         let path = PathBuf::from(path_str);
 
-        let config = match args_str {
+        let mut config = match args_str {
             Some(s) if !s.is_empty() => {
                 let mut args = Args::new();
                 for kv in s.split(',') {
@@ -135,6 +145,12 @@ fn cmd_node(programs: &[PathBuf], registry: Option<&Path>, workers: &[String]) {
             }
             _ => WorkerConfig::new(path.clone()),
         };
+
+        if let Some(db) = state_db {
+            let key = path.file_stem().and_then(|s| s.to_str())
+                .unwrap_or("worker").to_string();
+            config = config.persist_redb(db, key);
+        }
 
         let id = node.register_worker(config);
         eprintln!("vosx: worker '{}' as {id:?}", path.display());

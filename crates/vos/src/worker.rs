@@ -107,6 +107,8 @@ mod host {
     type ProvideResultFn = unsafe extern "C" fn(state: *mut (), ptr: *const u8, len: usize);
     type DropFn = unsafe extern "C" fn(state: *mut ());
     type FreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize);
+    type LoadFn = unsafe extern "C" fn(state_ptr: *const u8, state_len: usize) -> *mut ();
+    type StateFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *mut u8, out_len: *mut usize);
 
     /// A loaded worker plugin.
     pub struct WorkerPlugin {
@@ -118,6 +120,8 @@ mod host {
         provide_result_fn: ProvideResultFn,
         drop_fn: DropFn,
         free_fn: FreeFn,
+        load_fn: LoadFn,
+        state_fn: StateFn,
         meta_bytes: Vec<u8>,
     }
 
@@ -149,6 +153,10 @@ mod host {
                     .map_err(|e| format!("missing vos_worker_drop: {e}"))?;
                 let free_fn = *lib.get::<FreeFn>(b"vos_worker_free")
                     .map_err(|e| format!("missing vos_worker_free: {e}"))?;
+                let load_fn = *lib.get::<LoadFn>(b"vos_worker_load")
+                    .map_err(|e| format!("missing vos_worker_load: {e}"))?;
+                let state_fn = *lib.get::<StateFn>(b"vos_worker_state")
+                    .map_err(|e| format!("missing vos_worker_state: {e}"))?;
 
                 // Read metadata
                 let mut meta_ptr: *const u8 = std::ptr::null();
@@ -169,6 +177,8 @@ mod host {
                     provide_result_fn,
                     drop_fn,
                     free_fn,
+                    load_fn,
+                    state_fn,
                     meta_bytes,
                 })
             }
@@ -189,6 +199,12 @@ mod host {
         pub fn create_with_args(&self, args: &[u8]) -> WorkerInstance<'_> {
             let state = unsafe { (self.create_fn)(args.as_ptr(), args.len()) };
             WorkerInstance { plugin: self, state }
+        }
+
+        /// Restore a worker instance from previously serialized state.
+        pub fn load_state(&self, state: &[u8]) -> WorkerInstance<'_> {
+            let s = unsafe { (self.load_fn)(state.as_ptr(), state.len()) };
+            WorkerInstance { plugin: self, state: s }
         }
     }
 
@@ -300,6 +316,23 @@ mod host {
             unsafe {
                 (self.plugin.free_fn)(result.ptr, result.len, result.cap);
             }
+        }
+
+        /// Serialize the current actor state to bytes.
+        /// Useful for persistence — write the bytes to your storage,
+        /// later restore via `WorkerPlugin::load_state`.
+        pub fn save_state(&self) -> Vec<u8> {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut len: usize = 0;
+            unsafe {
+                (self.plugin.state_fn)(self.state, &mut ptr, &mut len);
+            }
+            if ptr.is_null() || len == 0 {
+                return Vec::new();
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { (self.plugin.free_fn)(ptr, len, len) };
+            bytes
         }
     }
 

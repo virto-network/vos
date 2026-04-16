@@ -40,6 +40,7 @@ test-workers: build-workers
 test-wasm: build-wasm
     node examples/wasm/js/test.mjs
     node examples/wasm/js/test-fetch.mjs
+    node examples/wasm/js/test-persist.mjs
 
 # Run PVM-related integration tests (requires built PVM actors)
 test-pvm: build-workers

@@ -21,11 +21,18 @@
  *   types.
  * @param {object} [options.imports] - extra WebAssembly imports
  * @param {function} [options.onEffect] - async (effectBytes, instance) => resultBytes
+ * @param {string} [options.storageKey] - persist actor state to
+ *   IndexedDB under this key. On load, restores any prior state;
+ *   after each dispatch, writes back if changed.
  * @returns {Promise<VosActor>}
  */
 export async function loadActor(source, options = {}) {
   const wasmInstance = await loadWasm(source, options.imports || {});
-  return new VosActor(wasmInstance, options);
+  const actor = new VosActor(wasmInstance, options);
+  if (options.storageKey) {
+    await actor._initStorage(options.storageKey);
+  }
+  return actor;
 }
 
 async function loadWasm(source, imports) {
@@ -83,6 +90,37 @@ export class VosActor {
     if (argsPtr) this.exports.vos_wasm_free(argsPtr, argsLen);
   }
 
+  /** Initialize storage backing — load prior state if any. */
+  async _initStorage(key) {
+    this._storageKey = key;
+    this._db = await openVosDb();
+    const saved = await idbGet(this._db, key);
+    if (saved && saved.byteLength > 0) {
+      // Replace the freshly-created state with the restored one
+      this.exports.vos_wasm_drop(this.state);
+      const ptr = this.exports.vos_wasm_alloc(saved.byteLength);
+      this._writeBytes(ptr, new Uint8Array(saved));
+      this.state = this.exports.vos_wasm_load(ptr, saved.byteLength);
+      this.exports.vos_wasm_free(ptr, saved.byteLength);
+      this._lastSaved = new Uint8Array(saved);
+    } else {
+      this._lastSaved = null;
+    }
+  }
+
+  /** Serialize current state and write to IndexedDB if changed. */
+  async _persistState() {
+    if (!this._storageKey) return;
+    const packed = this.exports.vos_wasm_state(this.state);
+    if (packed === 0n || packed === 0) return;
+    const { ptr, len } = unpackBuf(packed);
+    const bytes = this._readBytes(ptr, len).slice();
+    this.exports.vos_wasm_free(ptr, len);
+    if (this._lastSaved && bytesEqual(bytes, this._lastSaved)) return;
+    await idbSet(this._db, this._storageKey, bytes);
+    this._lastSaved = bytes;
+  }
+
   /** Encode a JS object as rkyv-encoded Args bytes via the WASM helper. */
   _encodeArgsObject(obj) {
     const desc = encodeArgsDesc(obj);
@@ -133,10 +171,16 @@ export class VosActor {
       if (status === 0) {
         // Ready — take the reply
         const packed = this.exports.vos_wasm_take_reply(this.state);
-        if (packed === 0n || packed === 0) return new Uint8Array(0);
-        const { ptr, len } = unpackBuf(packed);
-        const reply = this._readBytes(ptr, len).slice(); // copy out
-        this.exports.vos_wasm_free(ptr, len);
+        let reply;
+        if (packed === 0n || packed === 0) {
+          reply = new Uint8Array(0);
+        } else {
+          const { ptr, len } = unpackBuf(packed);
+          reply = this._readBytes(ptr, len).slice();
+          this.exports.vos_wasm_free(ptr, len);
+        }
+        // Persist any state changes before returning
+        await this._persistState();
         return reply;
       }
       if (status === 1) {
@@ -582,4 +626,60 @@ class BinReader {
     this.pos += n;
     return v;
   }
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// ── IndexedDB persistence ───────────────────────────────────────────
+//
+// One database "vos-actors" with one object store "state". Keys are
+// the user-supplied storageKey strings; values are Uint8Array blobs
+// (rkyv-encoded actor state).
+//
+// In Node (no IndexedDB), falls back to an in-memory map — useful for
+// tests but obviously not durable across processes.
+
+const DB_NAME = 'vos-actors';
+const STORE_NAME = 'state';
+const _memStore = new Map(); // fallback for Node
+
+function hasIndexedDb() {
+  return typeof indexedDB !== 'undefined';
+}
+
+async function openVosDb() {
+  if (!hasIndexedDb()) return null; // memory fallback used by helpers
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE_NAME);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(db, key) {
+  if (!db) return _memStore.get(key) || null;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(db, key, bytes) {
+  if (!db) {
+    _memStore.set(key, bytes);
+    return;
+  }
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(bytes, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
