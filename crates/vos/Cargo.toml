@@ -6,13 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["std"]
+default = ["std", "http"]
 std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
 worker = ["macros"]
 wasm = ["macros"]
+# Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
+http = ["dep:ureq"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
@@ -28,6 +30,7 @@ pollster = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 
 [[bin]]
 name = "vosx"

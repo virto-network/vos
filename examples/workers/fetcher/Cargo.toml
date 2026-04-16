@@ -1,0 +1,18 @@
+[package]
+name = "fetcher-worker"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["worker"]
+worker = ["vos/worker"]
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vos = { path = "../../../crates/vos", default-features = false, features = ["worker"] }

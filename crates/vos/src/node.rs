@@ -418,23 +418,8 @@ fn dispatch_and_poll(
             }
             POLL_PENDING => {
                 let effect = instance.pending_effect();
-                if effect.len() >= 4 {
-                    let target_id = u32::from_le_bytes(
-                        effect[..4].try_into().unwrap()
-                    );
-                    let payload = effect[4..].to_vec();
-
-                    let _ = outbox.send(Envelope {
-                        from: worker_id,
-                        to: ServiceId(target_id),
-                        payload,
-                    });
-
-                    let reply = wait_for_reply(inbox, target_id, deferred);
-                    instance.provide_result(&reply);
-                } else {
-                    instance.provide_result(&[]);
-                }
+                let result = handle_effect(&effect, inbox, outbox, worker_id, deferred);
+                instance.provide_result(&result);
             }
             _ => {
                 eprintln!("worker {worker_id}: poll error {}", result.status);
@@ -442,6 +427,110 @@ fn dispatch_and_poll(
             }
         }
     }
+}
+
+/// Fulfill a host I/O effect. Dispatches by the effect tag byte.
+fn handle_effect(
+    effect: &[u8],
+    inbox: &mpsc::Receiver<Envelope>,
+    outbox: &mpsc::Sender<Envelope>,
+    worker_id: ServiceId,
+    deferred: &mut std::collections::VecDeque<Envelope>,
+) -> Vec<u8> {
+    use crate::effects::{EFFECT_ASK, EFFECT_FETCH};
+
+    if effect.is_empty() {
+        return Vec::new();
+    }
+    let tag = effect[0];
+    let rest = &effect[1..];
+
+    match tag {
+        EFFECT_ASK => {
+            // [target:u32 LE][payload...]
+            if rest.len() < 4 { return Vec::new(); }
+            let target_id = u32::from_le_bytes(rest[..4].try_into().unwrap());
+            let payload = rest[4..].to_vec();
+            let _ = outbox.send(Envelope {
+                from: worker_id,
+                to: ServiceId(target_id),
+                payload,
+            });
+            wait_for_reply(inbox, target_id, deferred)
+        }
+        EFFECT_FETCH => {
+            #[cfg(feature = "http")]
+            {
+                handle_fetch(rest)
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                let _ = rest;
+                crate::effects::FetchResponse::host_error(
+                    "vos: built without 'http' feature — EFFECT_FETCH unavailable"
+                ).encode()
+            }
+        }
+        other => {
+            eprintln!("worker {worker_id}: unknown effect tag 0x{other:02x}");
+            Vec::new()
+        }
+    }
+}
+
+/// Perform an HTTP request via ureq. Blocking; runs on the worker thread.
+#[cfg(feature = "http")]
+fn handle_fetch(payload: &[u8]) -> Vec<u8> {
+    use crate::effects::{FetchRequest, FetchResponse, HttpMethod};
+
+    let Some(req) = FetchRequest::decode(payload) else {
+        return FetchResponse::host_error("malformed FetchRequest").encode();
+    };
+
+    let mut ureq_req = match req.method {
+        HttpMethod::Get => ureq::get(&req.url),
+        HttpMethod::Post => ureq::post(&req.url),
+        HttpMethod::Put => ureq::put(&req.url),
+        HttpMethod::Delete => ureq::delete(&req.url),
+        HttpMethod::Patch => ureq::patch(&req.url),
+        HttpMethod::Head => ureq::head(&req.url),
+        HttpMethod::Options => ureq::request("OPTIONS", &req.url),
+    };
+    for (name, value) in &req.headers {
+        ureq_req = ureq_req.set(name, value);
+    }
+
+    let result = if req.body.is_empty() {
+        ureq_req.call()
+    } else {
+        ureq_req.send_bytes(&req.body)
+    };
+
+    let response = match result {
+        Ok(r) => ureq_response_to(r),
+        Err(ureq::Error::Status(code, r)) => {
+            let mut resp = ureq_response_to(r);
+            resp.status = code;
+            resp
+        }
+        Err(e) => FetchResponse::host_error(format!("network error: {e}")),
+    };
+
+    response.encode()
+}
+
+#[cfg(feature = "http")]
+fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
+    use crate::effects::FetchResponse;
+    let status = r.status();
+    let headers: Vec<(String, String)> = r
+        .headers_names()
+        .into_iter()
+        .filter_map(|n| r.header(&n).map(|v| (n, v.to_string())))
+        .collect();
+    let mut body = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut r.into_reader(), &mut body);
+    FetchResponse { status, headers, body }
 }
 
 /// Block until a reply arrives from a specific target service.
@@ -522,6 +611,42 @@ mod tests {
         assert_eq!(id1, ServiceId::new(0x0042, 1));
         assert_eq!(id2, ServiceId::new(0x0042, 2));
         assert!(id1.is_on_node(0x0042));
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn worker_does_http_fetch() {
+        // Loads fetcher-worker and asks it to GET a URL.
+        // Uses example.com which is stable and small. Skips on no network.
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let path = workspace.join("target").join(profile).join("libfetcher_worker.so");
+        if !path.exists() {
+            eprintln!("skipping worker_does_http_fetch: build fetcher-worker first");
+            return;
+        }
+
+        let mut node = VosNode::new();
+        let fetcher_id = node.register_worker(WorkerConfig::new(path));
+
+        use crate::actors::value::Msg;
+        use crate::actors::codec::Encode;
+        let msg = Msg::new("status").with("url", "https://example.com");
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(crate::actors::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+
+        if let Some(tx) = node.routes.get(&fetcher_id.0) {
+            tx.send(Envelope { from: ServiceId(0), to: fetcher_id, payload }).unwrap();
+        }
+
+        node.run();
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(r.panics, 0, "fetcher worker {} panicked", r.id);
+        }
     }
 
     #[test]

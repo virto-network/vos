@@ -41,6 +41,7 @@ pub mod actors;
 pub mod refine_payload;
 pub mod registry;
 
+pub mod effects;
 pub mod worker;
 
 #[cfg(feature = "std")]

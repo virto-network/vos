@@ -15,11 +15,12 @@ build-crates:
 
 # Build native worker plugins (.so files)
 build-workers:
-    cargo build -p echo-worker -p proxy-worker
+    cargo build -p echo-worker -p proxy-worker -p fetcher-worker
 
 # Build WASM actors (wasm32-unknown-unknown target)
 build-wasm:
     cd examples/wasm/echo && cargo build --target wasm32-unknown-unknown --release
+    cd examples/wasm/fetcher && cargo build --target wasm32-unknown-unknown --release
 
 # Build all PVM actors and agents (riscv64 targets, requires custom toolchain)
 build-pvm:
@@ -35,9 +36,10 @@ test: build-workers
 test-workers: build-workers
     cargo test -p vos worker -- --nocapture
 
-# Smoke test the WASM actor in Node
+# Smoke test the WASM actors in Node
 test-wasm: build-wasm
     node examples/wasm/js/test.mjs
+    node examples/wasm/js/test-fetch.mjs
 
 # Run PVM-related integration tests (requires built PVM actors)
 test-pvm: build-workers

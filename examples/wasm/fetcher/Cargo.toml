@@ -1,0 +1,29 @@
+[package]
+name = "fetcher-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = ["wasm"]
+wasm = ["vos/wasm"]
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+
+[lib]
+crate-type = ["cdylib"]
+# Reuse the shared source from the native worker — same DSL, same code.
+path = "../../workers/fetcher/src/lib.rs"
+
+[dependencies]
+vos = { path = "../../../crates/vos", default-features = false, features = ["wasm"] }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

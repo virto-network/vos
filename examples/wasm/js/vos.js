@@ -238,10 +238,76 @@ export class VosActor {
   }
 }
 
-// Default effect handler: provides empty result (no-op).
-// Override via options.onEffect to handle ask/fetch/etc.
-function defaultEffectHandler(_eff, _actor) {
+// Effect tags — must match crates/vos/src/effects.rs
+const EFFECT_ASK = 0x01;
+const EFFECT_FETCH = 0x02;
+
+const HTTP_METHODS = ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'];
+
+// Default effect handler. Handles EFFECT_FETCH via the global fetch().
+// EFFECT_ASK and unknown tags fall through to an empty response —
+// override via options.onEffect to route asks to other actors.
+async function defaultEffectHandler(eff, _actor) {
+  if (eff.length === 0) return new Uint8Array(0);
+  const tag = eff[0];
+  const rest = eff.subarray(1);
+  if (tag === EFFECT_FETCH) {
+    return handleFetch(rest);
+  }
+  // EFFECT_ASK or unknown — host doesn't know how to fulfill on its own
   return new Uint8Array(0);
+}
+
+async function handleFetch(payload) {
+  // Decode FetchRequest (matches FetchRequest::encode in effects.rs)
+  const r = new BinReader(payload);
+  const method = HTTP_METHODS[r.u8()] || 'GET';
+  const url = readLenStr(r);
+  const headerCount = r.u16();
+  const headers = {};
+  for (let i = 0; i < headerCount; i++) {
+    const name = readLenStr(r);
+    const value = readLenStr(r);
+    headers[name] = value;
+  }
+  const bodyLen = r.u32();
+  const body = bodyLen > 0 ? r.bytes(bodyLen) : null;
+
+  let response;
+  try {
+    const init = { method, headers };
+    if (body && method !== 'GET' && method !== 'HEAD') init.body = body;
+    response = await fetch(url, init);
+  } catch (e) {
+    return encodeFetchResponse(0, [], ENCODER.encode(`network error: ${e.message || e}`));
+  }
+
+  const respHeaders = [];
+  response.headers.forEach((v, k) => respHeaders.push([k, v]));
+  const respBody = new Uint8Array(await response.arrayBuffer());
+  return encodeFetchResponse(response.status, respHeaders, respBody);
+}
+
+function readLenStr(r) {
+  const len = r.u32();
+  return DECODER.decode(r.bytes(len));
+}
+
+function encodeFetchResponse(status, headers, body) {
+  const w = new BinWriter();
+  w.u16(status);
+  w.u16(headers.length);
+  for (const [name, value] of headers) {
+    const nb = ENCODER.encode(name);
+    w.u32(nb.length);
+    w.bytes(nb);
+    const vb = ENCODER.encode(value);
+    w.u32(vb.length);
+    w.bytes(vb);
+  }
+  w.u32(body.length);
+  w.bytes(body);
+  return w.toBytes();
 }
 
 // Unpack a u64 (high 32 = ptr, low 32 = len) from the WASM ABI.

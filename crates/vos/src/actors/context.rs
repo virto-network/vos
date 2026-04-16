@@ -152,9 +152,10 @@ impl<A: Actor> Context<A> {
         }
         #[cfg(not(feature = "pvm"))]
         {
-            // Worker mode: encode as host I/O request and yield to host.
-            // Protocol: [target:u32 LE][payload...]
-            let mut request = Vec::with_capacity(4 + payload.len());
+            // Worker / WASM: yield to host with an EFFECT_ASK request.
+            // Wire format: [tag:u8=EFFECT_ASK][target:u32 LE][payload...]
+            let mut request = Vec::with_capacity(5 + payload.len());
+            request.push(crate::effects::EFFECT_ASK);
             request.extend_from_slice(&target.0.to_le_bytes());
             request.extend_from_slice(payload);
             super::run::Ask::host_io(self.host_call(request))
@@ -202,14 +203,27 @@ impl<A: Actor> Context<A> {
     /// reads the request via `vos_worker_pending_effect`, fulfills it,
     /// writes the result via `vos_worker_provide_result`, then re-polls.
     ///
-    /// Used internally by `ask()` in worker mode.  Future extensions:
-    /// `fs_read`, `http_get`, etc.
+    /// Used internally by `ask()`, `fetch()`, etc.
     pub fn host_call(&mut self, request: Vec<u8>) -> super::run::HostIo {
         self.host_io_request = Some(request);
         // SAFETY: single-threaded, context outlives the future, one
         // host call in flight at a time.
         let result_slot = &mut self.host_io_result as *mut Option<Vec<u8>>;
         super::run::HostIo::new(result_slot)
+    }
+
+    /// Perform an HTTP request via the host. Available in worker / WASM
+    /// builds; returns a no-op response otherwise.
+    ///
+    /// ```ignore
+    /// let resp = ctx.fetch(FetchRequest::get("https://api.example.com")).await;
+    /// if let Some(text) = resp.text() { /* ... */ }
+    /// ```
+    pub async fn fetch(&mut self, request: crate::effects::FetchRequest) -> crate::effects::FetchResponse {
+        let bytes = request.to_effect_bytes();
+        let result = self.host_call(bytes).await;
+        crate::effects::FetchResponse::decode(&result)
+            .unwrap_or_else(|| crate::effects::FetchResponse::host_error("malformed host response"))
     }
 
     /// Take the pending host I/O request bytes (for the C ABI to expose).
