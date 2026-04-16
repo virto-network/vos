@@ -47,6 +47,9 @@ pub enum Column {
     Opcode,
     #[size = 1]
     SkipLen,
+    /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len
+    #[size = 3]
+    PcCarry,
     #[size = 1]
     RegA,
     #[size = 1]
@@ -162,6 +165,13 @@ pub enum Column {
     /// Signed less-than flag: 1 if val_b < val_d (signed).
     #[size = 1]
     CmpLtSFlag,
+    /// Per-byte equality flag: 1 if val_b[i] == val_d[i]
+    #[size = 8]
+    ByteEq,
+    /// Per-byte diff inverse: val_b[i] != val_d[i] → (val_b[i]-val_d[i])*ByteDiffInv[i] = 1
+    ///                         val_b[i] == val_d[i] → ByteDiffInv[i] can be 0 (unused)
+    #[size = 8]
+    ByteDiffInv,
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
@@ -174,6 +184,27 @@ pub enum Column {
     /// Conditional branch (BranchEq/Ne/Lt/Ge + imm variants)
     #[size = 1]
     IsBranch,
+    /// Branch comparison type flags (exactly one is set when IsBranch=1)
+    #[size = 1]
+    IsBrEq,
+    #[size = 1]
+    IsBrNe,
+    #[size = 1]
+    IsBrLtU,
+    #[size = 1]
+    IsBrGeU,
+    #[size = 1]
+    IsBrLeU,
+    #[size = 1]
+    IsBrGtU,
+    #[size = 1]
+    IsBrLtS,
+    #[size = 1]
+    IsBrGeS,
+    #[size = 1]
+    IsBrLeS,
+    #[size = 1]
+    IsBrGtS,
     /// Unconditional jump (Jump, JumpInd, Fallthrough, Unlikely, LoadImmJump)
     #[size = 1]
     IsJump,
@@ -204,6 +235,8 @@ pub enum Column {
     DivByZero,
     // ── Memory access ──
     /// 1 if this is a load instruction
+    #[size = 1]
+    IsExit,
     #[size = 1]
     IsLoad,
     /// 1 if this is a store instruction
@@ -262,12 +295,23 @@ struct OpcodeFlags {
     is_max_u: bool,
     shift_op: u8,
     is_branch: bool,
+    is_br_eq: bool,
+    is_br_ne: bool,
+    is_br_lt_u: bool,
+    is_br_ge_u: bool,
+    is_br_le_u: bool,
+    is_br_gt_u: bool,
+    is_br_lt_s: bool,
+    is_br_ge_s: bool,
+    is_br_le_s: bool,
+    is_br_gt_s: bool,
     is_jump: bool,
     is_div_rem: bool,
     div_rem_op: u8,
     is_load: bool,
     is_store: bool,
     is_mul_upper: bool,
+    is_exit: bool,
 }
 
 fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -322,13 +366,33 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         | Opcode::ZeroExtend16 | Opcode::ReverseBytes
         | Opcode::Sbrk
             => {}
-        // Branches (conditional)
-        Opcode::BranchEq | Opcode::BranchNe | Opcode::BranchLtU | Opcode::BranchLtS
-        | Opcode::BranchGeU | Opcode::BranchGeS
-        | Opcode::BranchEqImm | Opcode::BranchNeImm
-        | Opcode::BranchLtUImm | Opcode::BranchLeUImm | Opcode::BranchGeUImm | Opcode::BranchGtUImm
-        | Opcode::BranchLtSImm | Opcode::BranchLeSImm | Opcode::BranchGeSImm | Opcode::BranchGtSImm
-            => { f.is_branch = true; }
+        // Branches (conditional) — classify by comparison type
+        // For Le/Gt variants we'll flip the operand order / invert
+        Opcode::BranchEq | Opcode::BranchEqImm
+            => { f.is_branch = true; f.is_br_eq = true; }
+        Opcode::BranchNe | Opcode::BranchNeImm
+            => { f.is_branch = true; f.is_br_ne = true; }
+        // Unsigned: branch_taken = val_b < val_d
+        Opcode::BranchLtU | Opcode::BranchLtUImm
+            => { f.is_branch = true; f.is_br_lt_u = true; }
+        // Unsigned: branch_taken = val_b >= val_d (= !lt)
+        Opcode::BranchGeU | Opcode::BranchGeUImm
+            => { f.is_branch = true; f.is_br_ge_u = true; }
+        // Unsigned: branch_taken = val_b <= val_d (imm only; swap operands vs ge)
+        Opcode::BranchLeUImm
+            => { f.is_branch = true; f.is_br_le_u = true; }
+        // Unsigned: branch_taken = val_b > val_d (imm only)
+        Opcode::BranchGtUImm
+            => { f.is_branch = true; f.is_br_gt_u = true; }
+        // Signed: branch_taken = val_b < val_d (signed)
+        Opcode::BranchLtS | Opcode::BranchLtSImm
+            => { f.is_branch = true; f.is_br_lt_s = true; }
+        Opcode::BranchGeS | Opcode::BranchGeSImm
+            => { f.is_branch = true; f.is_br_ge_s = true; }
+        Opcode::BranchLeSImm
+            => { f.is_branch = true; f.is_br_le_s = true; }
+        Opcode::BranchGtSImm
+            => { f.is_branch = true; f.is_br_gt_s = true; }
         // DivRem
         Opcode::DivU64 => { f.is_div_rem = true; f.div_rem_op = 0; }
         Opcode::DivU32 => { f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
@@ -355,12 +419,12 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
             => { f.is_jump = true; }
         // Fallthrough/Unlikely: sequential terminators, no special control flow constraint
         Opcode::Fallthrough | Opcode::Unlikely => {}
-        // JumpInd/LoadImmJumpInd: dynamic jumps (prover-trusted target for now)
-        Opcode::JumpInd | Opcode::LoadImmJumpInd => {}
+        // JumpInd/LoadImmJumpInd: dynamic jumps (target prover-trusted, exclude from sequential PC)
+        Opcode::JumpInd | Opcode::LoadImmJumpInd => { f.is_exit = true; }
         // Ecalli: host call (execution exits, no ALU constraint)
-        Opcode::Ecalli | Opcode::Ecall => {}
+        Opcode::Ecalli | Opcode::Ecall => { f.is_exit = true; }
         // Trap: causes panic exit
-        Opcode::Trap => {}
+        Opcode::Trap => { f.is_exit = true; }
     }
     f
 }
@@ -419,6 +483,17 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns_bytes(row, &step.next_pc.to_le_bytes(), Column::NextPc);
             trace.fill_columns(row, step.opcode as u8, Column::Opcode);
             trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
+            // PC carry for sequential next_pc = pc + 1 + skip_len
+            {
+                let pc_bytes = step.pc.to_le_bytes();
+                let sum0 = pc_bytes[0] as u16 + 1 + step.skip_len as u16;
+                let c0 = (sum0 >> 8) as u8;
+                let sum1 = pc_bytes[1] as u16 + c0 as u16;
+                let c1 = (sum1 >> 8) as u8;
+                let sum2 = pc_bytes[2] as u16 + c1 as u16;
+                let c2 = (sum2 >> 8) as u8;
+                trace.fill_columns_bytes(row, &[c0, c1, c2], Column::PcCarry);
+            }
             trace.fill_columns(row, step.reg_a as u8, Column::RegA);
             trace.fill_columns(row, step.reg_b as u8, Column::RegB);
             trace.fill_columns(row, step.reg_d as u8, Column::RegD);
@@ -433,6 +508,10 @@ impl BuiltInComponent for CpuChip {
                 }
                 javm::instruction::InstructionCategory::TwoReg => {
                     (0, step.regs_before[step.reg_b])
+                }
+                javm::instruction::InstructionCategory::OneRegImmOffset => {
+                    // BranchEqImm/NeImm/LtImm/etc: compare regs[ra] vs imm
+                    (step.regs_before[step.reg_a], step.imm)
                 }
                 _ if uses_immediate(step.opcode) => {
                     (0, step.imm)
@@ -551,10 +630,10 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns_bytes(row, &val_d_hi_nib, Column::ValDHiNib);
             trace.fill_columns_bytes(row, &and_result_hi_nib, Column::AndResultHiNib);
 
-            // ── Compare auxiliary ──
+            // ── Compare auxiliary (populated for is_compare OR is_branch) ──
             let mut cmp_carry = [0u8; WORD_SIZE];
             let mut cmp_lt_flag: u8 = 0;
-            if flags.is_compare {
+            if flags.is_compare || flags.is_branch {
                 // Unsigned comparison via subtraction: val_b - val_d
                 let mut c: u16 = 1;
                 for i in 0..WORD_SIZE {
@@ -580,6 +659,24 @@ impl BuiltInComponent for CpuChip {
                 cmp_lt_flag // same sign → unsigned comparison
             };
             trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
+            // Per-byte equality flags (for branch eq/ne)
+            let mut byte_eq = [0u8; 8];
+            let mut byte_diff_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
+            if flags.is_branch {
+                for i in 0..8 {
+                    if val_b_bytes[i] == val_d_bytes[i] {
+                        byte_eq[i] = 1;
+                    } else {
+                        // Compute in M31 field directly to match constraint arithmetic
+                        let b = stwo::core::fields::m31::BaseField::from(val_b_bytes[i] as u32);
+                        let d = stwo::core::fields::m31::BaseField::from(val_d_bytes[i] as u32);
+                        let diff_field = b - d;
+                        byte_diff_inv[i] = diff_field.inverse();
+                    }
+                }
+            }
+            trace.fill_columns_bytes(row, &byte_eq, Column::ByteEq);
+            trace.fill_columns_base_field(row, &byte_diff_inv, Column::ByteDiffInv);
             trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
             trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
             trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);
@@ -626,6 +723,16 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, flags.is_xnor, Column::IsXnor);
             trace.fill_columns(row, flags.is_neg_add, Column::IsNegAdd);
             trace.fill_columns(row, flags.is_branch, Column::IsBranch);
+            trace.fill_columns(row, flags.is_br_eq, Column::IsBrEq);
+            trace.fill_columns(row, flags.is_br_ne, Column::IsBrNe);
+            trace.fill_columns(row, flags.is_br_lt_u, Column::IsBrLtU);
+            trace.fill_columns(row, flags.is_br_ge_u, Column::IsBrGeU);
+            trace.fill_columns(row, flags.is_br_le_u, Column::IsBrLeU);
+            trace.fill_columns(row, flags.is_br_gt_u, Column::IsBrGtU);
+            trace.fill_columns(row, flags.is_br_lt_s, Column::IsBrLtS);
+            trace.fill_columns(row, flags.is_br_ge_s, Column::IsBrGeS);
+            trace.fill_columns(row, flags.is_br_le_s, Column::IsBrLeS);
+            trace.fill_columns(row, flags.is_br_gt_s, Column::IsBrGtS);
             trace.fill_columns(row, flags.is_jump, Column::IsJump);
             trace.fill_columns(row, step.branch_taken, Column::BranchTaken);
             trace.fill_columns_bytes(row, &step.branch_target.to_le_bytes(), Column::BranchTarget);
@@ -684,6 +791,7 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
 
             // ── Memory access columns ──
+            trace.fill_columns(row, flags.is_exit, Column::IsExit);
             trace.fill_columns(row, flags.is_load, Column::IsLoad);
             trace.fill_columns(row, flags.is_store, Column::IsStore);
             let mem = step.mem_read.as_ref().or(step.mem_write.as_ref());
@@ -921,6 +1029,8 @@ impl BuiltInComponent for CpuChip {
         let and_result = zkpvm_trace::trace_eval!(trace_eval, Column::AndResult);
         let cmp_carry = zkpvm_trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = zkpvm_trace::trace_eval!(trace_eval, Column::CmpLtFlag);
+        let cmp_lt_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
+        let is_branch = zkpvm_trace::trace_eval!(trace_eval, Column::IsBranch);
         let is_set_lt_u_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsSetLtU);
         let is_set_lt_s_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsSetLtS);
         let is_cmov_iz_flag = zkpvm_trace::trace_eval!(trace_eval, Column::IsCmovIz);
@@ -1141,10 +1251,23 @@ impl BuiltInComponent for CpuChip {
             // The carries are constrained to be boolean:
             let _ = c; // unused, we'll do it differently
         }
-        // Constrain cmp_lt_flag = 1 - cmp_carry[7]
+        // Constrain cmp_lt_flag = 1 - cmp_carry[7] for compare AND branch
+        let is_cmp_or_branch = is_compare[0].clone() + is_branch[0].clone();
         eval.add_constraint(
-            is_compare[0].clone() * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
+            is_cmp_or_branch.clone() * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
         );
+        // Constrain cmp_lt_s_flag via sign-bit analysis (also for branches)
+        {
+            let sign_b_b = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_b_d = zkpvm_trace::trace_eval!(trace_eval, Column::SignBitD);
+            let signs_differ = sign_b_b[0].clone() + sign_b_d[0].clone()
+                - E::F::from(BaseField::from(2u32)) * sign_b_b[0].clone() * sign_b_d[0].clone();
+            let expected_s = signs_differ.clone() * sign_b_b[0].clone()
+                + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
+            eval.add_constraint(
+                is_cmp_or_branch * (cmp_lt_s_flag[0].clone() - expected_s)
+            );
+        }
         // Compare sub-ops use per-op flag columns (degree-2 to degree-4 constraints)
         {
             let val_d_is_zero = zkpvm_trace::trace_eval!(trace_eval, Column::ValDIsZero);
@@ -1319,7 +1442,6 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
         // CONTROL FLOW: constrain next_pc based on branch/jump
         // ════════════════════════════════════════════════════════════════════
-        let is_branch = zkpvm_trace::trace_eval!(trace_eval, Column::IsBranch);
         let is_jump = zkpvm_trace::trace_eval!(trace_eval, Column::IsJump);
         let branch_taken = zkpvm_trace::trace_eval!(trace_eval, Column::BranchTaken);
         let branch_target = zkpvm_trace::trace_eval!(trace_eval, Column::BranchTarget);
@@ -1355,11 +1477,129 @@ impl BuiltInComponent for CpuChip {
             is_branch[0].clone() * branch_taken[0].clone() * (E::F::one() - branch_taken[0].clone())
         );
 
-        // For non-branch, non-jump ALU ops: next_pc = pc + 1 + skip_len
-        // This is implicitly enforced by the trace (javm computes it), and would require
-        // a full multi-byte addition constraint on PC to prove in the circuit.
-        // For now, the trace is trusted for sequential PC advancement.
-        // Full soundness requires constraining: (1-is_branch-is_jump) * (next_pc - seq_pc) = 0
+        // ── Branch condition constraints ──
+        // Constrain that branch_taken matches the comparison semantics per type
+        let is_br_eq = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrEq);
+        let is_br_ne = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrNe);
+        let is_br_lt_u = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrLtU);
+        let is_br_ge_u = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrGeU);
+        let is_br_le_u = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrLeU);
+        let is_br_gt_u = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrGtU);
+        let is_br_lt_s = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrLtS);
+        let is_br_ge_s = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrGeS);
+        let is_br_le_s = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrLeS);
+        let is_br_gt_s = zkpvm_trace::trace_eval!(trace_eval, Column::IsBrGtS);
+        let byte_eq_cols = zkpvm_trace::trace_eval!(trace_eval, Column::ByteEq);
+        let byte_diff_inv = zkpvm_trace::trace_eval!(trace_eval, Column::ByteDiffInv);
+
+        // TEST 3: full byte_eq constraint
+        for i in 0..WORD_SIZE {
+            let diff = val_b[i].clone() - val_d[i].clone();
+            eval.add_constraint(
+                is_branch[0].clone() * byte_eq_cols[i].clone()
+                * (E::F::one() - byte_eq_cols[i].clone())
+            );
+            eval.add_constraint(
+                is_branch[0].clone() * byte_eq_cols[i].clone() * diff.clone()
+            );
+            eval.add_constraint(
+                is_branch[0].clone() * (E::F::one() - byte_eq_cols[i].clone())
+                * (diff * byte_diff_inv[i].clone() - E::F::one())
+            );
+        }
+
+        // Equality: EqFlag = AND of all byte_eq[i]. Expressed as:
+        //   EqFlag = byte_eq[0] * byte_eq[1] * ... * byte_eq[7]  (degree 8, too high)
+        // Instead, use: eq_flag = 1 iff sum of (1 - byte_eq[i]) = 0
+        // Since each (1 - byte_eq[i]) ∈ {0,1}, the sum is 0 iff all byte_eq[i]=1.
+        // sum ∈ [0,8]. Use an eq_flag witness + sum*inv constraint similar to byte_eq.
+        // For simplicity, constrain BranchEq/BranchNe using the bytewise eq flags directly:
+        //   BranchEq taken ⇔ all byte_eq[i] = 1
+        //   This is equivalent to: branch_taken * (1 - byte_eq[i]) = 0 for all i (if taken, all must be equal)
+        //   AND: (1 - branch_taken) * (sum (1 - byte_eq[i])) = (1 - branch_taken) * (something nonzero)
+        // Simpler: introduce EqFlag column... but we don't have one.
+        //
+        // Use per-byte constraints for eq/ne:
+        //   is_br_eq * branch_taken * (1 - byte_eq[i]) = 0 (if eq branch taken, all bytes equal)
+        //   is_br_ne * (1 - branch_taken) * (1 - byte_eq[i]) = 0 (if ne branch NOT taken, all bytes equal)
+        // The converse (if bytes equal, eq branch MUST be taken) requires a witness.
+        // Skip strict converse for now — this catches the main class of prover malice.
+        // BranchEq taken: val_b == val_d ⇒ all byte_eq[i] = 1
+        // BranchNe not-taken: val_b == val_d ⇒ all byte_eq[i] = 1
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_br_eq[0].clone() * branch_taken[0].clone()
+                * (E::F::one() - byte_eq_cols[i].clone())
+            );
+            eval.add_constraint(
+                is_br_ne[0].clone() * (E::F::one() - branch_taken[0].clone())
+                * (E::F::one() - byte_eq_cols[i].clone())
+            );
+        }
+
+        // Unsigned Lt: branch_taken = cmp_lt_flag
+        eval.add_constraint(
+            is_br_lt_u[0].clone() * (branch_taken[0].clone() - cmp_lt_flag[0].clone())
+        );
+        // Unsigned Ge: branch_taken = 1 - cmp_lt_flag
+        eval.add_constraint(
+            is_br_ge_u[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_flag[0].clone()))
+        );
+        // Signed Lt: branch_taken = cmp_lt_s_flag
+        eval.add_constraint(
+            is_br_lt_s[0].clone() * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone())
+        );
+        // Signed Ge: branch_taken = 1 - cmp_lt_s_flag
+        eval.add_constraint(
+            is_br_ge_s[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone()))
+        );
+        // Silence unused warnings for the le/gt variants (constraints skipped above)
+        let _ = (is_br_le_u, is_br_gt_u, is_br_le_s, is_br_gt_s);
+
+        // Sequential PC: next_pc = pc + 1 + skip_len (4-byte addition with carry)
+        // Fires for: non-jump AND (non-branch OR branch-not-taken)
+        // is_sequential = (1 - is_jump) * (1 - is_branch * branch_taken)
+        //              = 1 - is_jump - is_branch*branch_taken + is_jump*is_branch*branch_taken
+        // Since is_jump and is_branch are mutually exclusive, is_jump*is_branch=0, so:
+        // is_sequential = 1 - is_jump - is_branch*branch_taken
+        // But we can also just constrain each case separately:
+        // For byte 0: next_pc[0] + pc_carry[0]*256 = pc[0] + 1 + skip_len
+        // For byte i>0: next_pc[i] + pc_carry[i]*256 = pc[i] + pc_carry[i-1]
+        // For byte 3: next_pc[3] = pc[3] + pc_carry[2] (no overflow for valid programs)
+        {
+            let pc = zkpvm_trace::trace_eval!(trace_eval, Column::Pc);
+            let skip_len = zkpvm_trace::trace_eval!(trace_eval, Column::SkipLen);
+            let pc_carry = zkpvm_trace::trace_eval!(trace_eval, Column::PcCarry);
+            let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
+            let is_exit = zkpvm_trace::trace_eval!(trace_eval, Column::IsExit);
+            let is_sequential = E::F::one() - is_pad[0].clone()
+                - is_jump[0].clone()
+                - is_branch[0].clone() * branch_taken[0].clone()
+                - is_exit[0].clone();
+
+            // Byte 0: next_pc[0] + carry[0]*256 = pc[0] + 1 + skip_len
+            eval.add_constraint(
+                is_sequential.clone() * (
+                    next_pc[0].clone() + pc_carry[0].clone() * f256.clone()
+                    - pc[0].clone() - E::F::one() - skip_len[0].clone()
+                )
+            );
+            // Bytes 1,2: next_pc[i] + carry[i]*256 = pc[i] + carry[i-1]
+            for i in 1..3 {
+                eval.add_constraint(
+                    is_sequential.clone() * (
+                        next_pc[i].clone() + pc_carry[i].clone() * f256.clone()
+                        - pc[i].clone() - pc_carry[i - 1].clone()
+                    )
+                );
+            }
+            // Byte 3: next_pc[3] = pc[3] + carry[2]
+            eval.add_constraint(
+                is_sequential.clone() * (
+                    next_pc[3].clone() - pc[3].clone() - pc_carry[2].clone()
+                )
+            );
+        }
 
         // ════════════════════════════════════════════════════════════════════
         // Range256 checks for result byte limbs

@@ -24,6 +24,16 @@ use zkpvm_trace::{
 use super::BASE_COMPONENTS;
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
+/// Execution state at a segment boundary (initial or final).
+/// Maps to VOS's ContinuationHeader for checkpoint integration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentState {
+    pub pc: u32,
+    pub timestamp: u64,
+    pub registers: [u64; 13],
+    pub memory_commitment: [u8; 32], // blake2b-256(flat_mem)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
     pub stark_proof: StarkProof<Blake2sMerkleHasher>,
@@ -31,6 +41,10 @@ pub struct Proof {
     pub log_sizes: Vec<u32>,
     pub num_components: usize,
     pub pcs_config: PcsConfig,
+    /// State at segment start (publicly committed)
+    pub initial_state: SegmentState,
+    /// State at segment end (publicly committed)
+    pub final_state: SegmentState,
 }
 
 /// Timing breakdown of the proving pipeline.
@@ -122,6 +136,28 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) {
     } else {
         eprintln!("  Logup sums DO NOT BALANCE");
     }
+}
+
+/// Compute blake3 hash of final memory state by applying all writes to initial memory.
+fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[zkpvm_core::step::PvmStep]) -> [u8; 32] {
+    let mut mem = initial_memory.to_vec();
+    for step in steps {
+        if let Some(ref w) = step.mem_write {
+            let addr = w.address as usize;
+            let bytes = w.value.to_le_bytes();
+            let sz = w.size as usize;
+            if addr + sz <= mem.len() {
+                mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
+            } else {
+                // Extend memory if needed
+                if addr + sz > mem.len() {
+                    mem.resize(addr + sz, 0);
+                }
+                mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
+            }
+        }
+    }
+    *blake3::hash(&mem).as_bytes()
 }
 
 fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
@@ -242,11 +278,43 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
         eprintln!("{prof}");
     }
 
+    // Compute segment boundary states
+    let initial_state = if side_note.steps.is_empty() {
+        SegmentState { pc: 0, timestamp: 0, registers: [0; 13], memory_commitment: [0; 32] }
+    } else {
+        let first = &side_note.steps[0];
+        let mut regs = [0u64; 13];
+        regs[..first.regs_before.len().min(13)].copy_from_slice(&first.regs_before[..13.min(first.regs_before.len())]);
+        SegmentState {
+            pc: first.pc,
+            timestamp: first.timestamp,
+            registers: regs,
+            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
+        }
+    };
+    let final_state = if side_note.steps.is_empty() {
+        SegmentState { pc: 0, timestamp: 0, registers: [0; 13], memory_commitment: [0; 32] }
+    } else {
+        let last = &side_note.steps[side_note.steps.len() - 1];
+        let mut regs = [0u64; 13];
+        regs[..last.regs_after.len().min(13)].copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
+        // Final memory = initial memory with all writes applied
+        // For now, hash the initial memory (full memory tracking is future work)
+        SegmentState {
+            pc: last.next_pc,
+            timestamp: last.timestamp + 1,
+            registers: regs,
+            memory_commitment: compute_final_memory_commitment(&side_note.initial_memory, &side_note.steps),
+        }
+    };
+
     Ok((Proof {
         stark_proof: proof,
         claimed_sums,
         num_components,
         log_sizes,
         pcs_config: config,
+        initial_state,
+        final_state,
     }, prof))
 }

@@ -20,6 +20,30 @@ use zkpvm_trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_
 use super::{Proof, BASE_COMPONENTS};
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
+/// Verify a chain of segment proofs. Each segment's final state must match
+/// the next segment's initial state. Each segment is verified independently.
+pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), VerificationError> {
+    if proofs.len() != side_notes.len() {
+        return Err(VerificationError::InvalidStructure(
+            "proofs and side_notes length mismatch".to_string(),
+        ));
+    }
+    // Check segment continuity
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(
+                format!("segment chain broken: final state at ts={} doesn't match next initial at ts={}",
+                    window[0].final_state.timestamp, window[1].initial_state.timestamp),
+            ));
+        }
+    }
+    // Verify each segment independently
+    for (proof, side_note) in proofs.iter().zip(side_notes) {
+        verify(proof.clone(), side_note)?;
+    }
+    Ok(())
+}
+
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
     let components = BASE_COMPONENTS;
     let Proof {

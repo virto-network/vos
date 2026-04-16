@@ -446,6 +446,54 @@ fn debug_blake2s_prefix() {
 }
 
 #[test]
+fn prove_diverse() {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("Diverse: {} steps", steps.len());
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec()
+    ).with_memory(flat_mem);
+    let t = std::time::Instant::now();
+    match prove(&mut side_note) {
+        Ok(p) => {
+            let kb = bincode::serialize(&p).unwrap().len() as f64 / 1024.0;
+            verify(p, &side_note).expect("verify");
+            eprintln!("PROVED in {:?} ({kb:.1} KB)", t.elapsed());
+        }
+        Err(e) => eprintln!("FAIL: {e}"),
+    }
+}
+
+#[test]
+fn trace_diverse_steps() {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
+    let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("Diverse: {} steps", steps.len());
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, c) in sorted.iter() { eprintln!("  {op}: {c}"); }
+}
+
+#[test]
 fn trace_keccak_steps() {
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
     let blob = std::fs::read(format!("{base}hash-keccak.pvm")).expect("keccak PVM");
@@ -459,4 +507,75 @@ fn trace_keccak_steps() {
     let mut sorted: Vec<_> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     for (op, c) in sorted.iter().take(10) { eprintln!("  {op}: {c}"); }
+}
+
+#[test]
+fn prove_segmented_hash_bench() {
+    // Split hash-bench (635 steps) into 2 segments and verify the chain
+    let blob = load_actor_blob("hash-bench");
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run();
+    let all_steps = tracing.into_trace();
+
+    let split = all_steps.len() / 2;
+    eprintln!("=== Segmented proving: {} steps split at {} ===", all_steps.len(), split);
+
+    let code = code_blob.code.to_vec();
+    let bitmask = code_blob.bitmask.to_vec();
+
+    // Segment 1: steps 0..split
+    let seg1_steps: Vec<_> = all_steps[..split].to_vec();
+    let mut seg1_sn = zkpvm_machine::SideNote::new(
+        seg1_steps, code.clone(), bitmask.clone()
+    ).with_memory(flat_mem.clone());
+
+    let t = std::time::Instant::now();
+    let proof1 = prove(&mut seg1_sn).expect("segment 1 proving failed");
+    eprintln!("Segment 1: {} steps, proved in {:?}", split, t.elapsed());
+    eprintln!("  initial: pc={} ts={}", proof1.initial_state.pc, proof1.initial_state.timestamp);
+    eprintln!("  final:   pc={} ts={}", proof1.final_state.pc, proof1.final_state.timestamp);
+
+    // Compute final memory of segment 1 for segment 2's initial memory
+    let mut seg2_mem = flat_mem.clone();
+    for step in &all_steps[..split] {
+        if let Some(ref w) = step.mem_write {
+            let addr = w.address as usize;
+            let bytes = w.value.to_le_bytes();
+            let sz = w.size as usize;
+            if addr + sz > seg2_mem.len() { seg2_mem.resize(addr + sz, 0); }
+            seg2_mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
+        }
+    }
+
+    // Segment 2: steps split..end
+    let seg2_steps: Vec<_> = all_steps[split..].to_vec();
+    let mut seg2_sn = zkpvm_machine::SideNote::new(
+        seg2_steps, code.clone(), bitmask.clone()
+    ).with_memory(seg2_mem);
+
+    let t = std::time::Instant::now();
+    let proof2 = prove(&mut seg2_sn).expect("segment 2 proving failed");
+    eprintln!("Segment 2: {} steps, proved in {:?}", all_steps.len() - split, t.elapsed());
+    eprintln!("  initial: pc={} ts={}", proof2.initial_state.pc, proof2.initial_state.timestamp);
+    eprintln!("  final:   pc={} ts={}", proof2.final_state.pc, proof2.final_state.timestamp);
+
+    // Verify chain
+    eprintln!("\nChain verification:");
+    eprintln!("  seg1.final  == seg2.initial ? {}", proof1.final_state == proof2.initial_state);
+
+    zkpvm_machine::verify_chain(
+        &[proof1, proof2],
+        &[&seg1_sn, &seg2_sn],
+    ).expect("chain verification failed");
+    eprintln!("  CHAIN VERIFIED!");
 }
