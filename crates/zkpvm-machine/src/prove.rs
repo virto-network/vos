@@ -112,7 +112,7 @@ pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -
 pub fn debug_claimed_sums(side_note: &mut SideNote) {
     use num_traits::Zero;
     let components = BASE_COMPONENTS;
-    let component_names = ["CpuChip", "Range256", "MemoryChip", "MemBoundary", "ProgBoundary", "BitwiseLookup", "PowerOfTwo"];
+    let component_names = ["CpuChip", "Blake2b", "MemoryChip", "MemBoundary", "ProgBoundary", "Range256", "BitwiseLookup", "PowerOfTwo"];
 
     let traces: Vec<ComponentTrace> = components
         .iter()

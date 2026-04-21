@@ -106,6 +106,38 @@ impl BuiltInComponent for MemoryChip {
             }
         }
 
+        // Blake2b precompile memory ops: 64 byte reads at h_ptr + 128 byte
+        // reads at m_ptr + 64 byte writes back at h_ptr, all at the ECALL
+        // step's ts.  Reads are pushed before writes so the stable
+        // `sort_by_key(|e| (e.address, e.timestamp))` at the end keeps the
+        // (read, then write) order at the same (addr, ts) pair.
+        for op in &side_note.blake2b_mem_ops {
+            for (i, &b) in op.h_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.h_ptr + i as u32,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
+                });
+            }
+            for (i, &b) in op.m_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.m_ptr + i as u32,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
+                });
+            }
+            for (i, &b) in op.out_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.h_ptr + i as u32,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: true,
+                });
+            }
+        }
+
         // Inject initial memory writes at timestamp 0 for byte addresses read without prior write.
         if !side_note.initial_memory.is_empty() {
             let mut first_access: HashMap<u32, bool> = HashMap::new();

@@ -1,3 +1,4 @@
+pub mod blake2b;
 pub mod bitwise_lookup;
 pub mod cpu;
 pub mod memory;
@@ -6,6 +7,7 @@ pub mod power_of_two;
 pub mod program_boundary;
 pub mod range_multiplicity;
 
+pub use blake2b::{Blake2bChip, Blake2bCall, blake2b_compress};
 pub use bitwise_lookup::BitwiseLookupChip;
 pub use cpu::CpuChip;
 pub use memory::MemoryChip;

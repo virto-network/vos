@@ -22,12 +22,13 @@ use zkpvm_trace::{
 use crate::{
     framework::BuiltInComponent,
     lookups::{
-        AllLookupElements, BitwiseAndLookupElements, LogupTraceBuilder,
-        MemoryAccessLookupElements, PowerOfTwoLookupElements,
+        AllLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements,
+        LogupTraceBuilder, MemoryAccessLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, Range256LookupElements,
     },
     side_note::SideNote,
 };
+use zkpvm_core::tracing::ECALL_BLAKE2B_COMPRESS;
 
 pub struct CpuChip;
 
@@ -165,6 +166,14 @@ pub enum Column {
     /// Signed less-than flag: 1 if val_b < val_d (signed).
     #[size = 1]
     CmpLtSFlag,
+    /// Subtraction result bytes: (val_b[i] + 255 - val_d[i] + carry_in) mod 256
+    /// Range-checked to prove carry chain correctness.
+    #[size = 8]
+    CmpSubResult,
+    /// 1 iff val_b == val_d (all bytes equal). Used for Le/Gt branches.
+    /// Constrained via: eq_flag=1 ⇒ all byte_eq[i]=1 AND eq_flag=0 ⇒ NOT all equal
+    #[size = 1]
+    EqFlag,
     /// Per-byte equality flag: 1 if val_b[i] == val_d[i]
     #[size = 8]
     ByteEq,
@@ -258,6 +267,28 @@ pub enum Column {
     /// timestamp + 1 (8 limbs), used for the program execution lookup
     #[size = 8]
     NextTimestamp,
+    // ── Blake2b ECALL binding (Phase 8c) ──
+    /// 1 iff this step is the blake2b hostcall (Ecalli opcode with imm =
+    /// ECALL_BLAKE2B_COMPRESS).  Prover-witnessed; logup balance with
+    /// Blake2bChip forces this to be set correctly for every blake2b call.
+    #[size = 1]
+    IsBlakeEcall,
+    /// φ[10] at this step's regs_before (h_ptr).  Full u64 witnessed so the
+    /// upper 32 bits don't have to match anything; only low 4 bytes flow into
+    /// the Blake2bCall lookup tuple.
+    #[size = 8]
+    Phi10,
+    /// φ[11] at this step's regs_before (m_ptr).
+    #[size = 8]
+    Phi11,
+    /// φ[12] at this step's regs_before (t_low for blake2b_compress).
+    #[size = 8]
+    Phi12,
+    /// Boolean version of φ[7] (finalise flag): 1 if regs_before[7] != 0.
+    /// The prover fills this and the lookup balance keeps it tied to the
+    /// Blake2bChip.F column at the matching compression.
+    #[size = 1]
+    Phi7Bool,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -339,8 +370,10 @@ fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
         Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; }
         Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
-        Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => { f.is_shift = true; f.shift_op = 2; }
-        Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => { f.is_shift = true; f.shift_op = 2; f.is_32bit = true; }
+        // Arithmetic right shifts: same as logical right but with sign extension
+        // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
+        Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; }
+        Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
         Opcode::RotL64 => { f.is_shift = true; f.shift_op = 3; }
         Opcode::RotL32 => { f.is_shift = true; f.shift_op = 3; f.is_32bit = true; }
         Opcode::RotR64 | Opcode::RotR64Imm | Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
@@ -461,7 +494,14 @@ impl BuiltInComponent for CpuChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = (Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements, PowerOfTwoLookupElements);
+    type LookupElements = (
+        Range256LookupElements,
+        MemoryAccessLookupElements,
+        ProgramExecutionLookupElements,
+        BitwiseAndLookupElements,
+        PowerOfTwoLookupElements,
+        Blake2bCallLookupElements,
+    );
 
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         FinalizedTrace::empty()
@@ -523,7 +563,7 @@ impl BuiltInComponent for CpuChip {
 
             // For left/right shifts: save shift amount, then replace val_d with 2^shift_amount
             let mut saved_shift_amount: u8 = 0;
-            if flags.is_shift && (flags.shift_op == 0 || flags.shift_op == 1) {
+            if flags.is_shift && (flags.shift_op <= 2) {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
                 let shift = val_d % modulus;
                 saved_shift_amount = shift as u8;
@@ -632,12 +672,14 @@ impl BuiltInComponent for CpuChip {
 
             // ── Compare auxiliary (populated for is_compare OR is_branch) ──
             let mut cmp_carry = [0u8; WORD_SIZE];
+            let mut cmp_sub_result = [0u8; WORD_SIZE];
             let mut cmp_lt_flag: u8 = 0;
             if flags.is_compare || flags.is_branch {
-                // Unsigned comparison via subtraction: val_b - val_d
+                // Unsigned comparison via subtraction: val_b + ~val_d + 1
                 let mut c: u16 = 1;
                 for i in 0..WORD_SIZE {
                     let sum = val_b_bytes[i] as u16 + (val_d_bytes[i] ^ 0xFF) as u16 + c;
+                    cmp_sub_result[i] = (sum & 0xFF) as u8;
                     cmp_carry[i] = (sum >> 8) as u8;
                     c = cmp_carry[i] as u16;
                 }
@@ -645,6 +687,7 @@ impl BuiltInComponent for CpuChip {
                 cmp_lt_flag = 1 - cmp_carry[WORD_SIZE - 1];
             }
             trace.fill_columns_bytes(row, &cmp_carry, Column::CmpCarry);
+            trace.fill_columns_bytes(row, &cmp_sub_result, Column::CmpSubResult);
             trace.fill_columns(row, cmp_lt_flag, Column::CmpLtFlag);
             let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
             trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);
@@ -659,6 +702,8 @@ impl BuiltInComponent for CpuChip {
                 cmp_lt_flag // same sign → unsigned comparison
             };
             trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
+            let eq_flag: u8 = if val_b == val_d { 1 } else { 0 };
+            trace.fill_columns(row, eq_flag, Column::EqFlag);
             // Per-byte equality flags (for branch eq/ne)
             let mut byte_eq = [0u8; 8];
             let mut byte_diff_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
@@ -688,7 +733,7 @@ impl BuiltInComponent for CpuChip {
 
             // ── Shift auxiliary ──
             let shift_amount = if flags.is_shift {
-                if flags.shift_op == 0 || flags.shift_op == 1 {
+                if flags.shift_op <= 2 {
                     saved_shift_amount // saved before val_d was replaced
                 } else {
                     let modulus = if flags.is_32bit { 32u64 } else { 64 };
@@ -699,7 +744,7 @@ impl BuiltInComponent for CpuChip {
             };
             trace.fill_columns(row, shift_amount, Column::ShiftAmount);
             trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
-            let is_shift_constrained = flags.is_shift && (flags.shift_op == 0 || flags.shift_op == 1);
+            let is_shift_constrained = flags.is_shift && (flags.shift_op <= 2);
             trace.fill_columns(row, is_shift_constrained, Column::IsShiftConstrained);
 
             // ── Flags ──
@@ -807,8 +852,28 @@ impl BuiltInComponent for CpuChip {
             // NextTimestamp = timestamp + 1
             trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
 
+            // ── Blake2b ECALL binding (Phase 8c) ──
+            // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
+            // regs_before values that the precompile reads (φ[10], [11], [12])
+            // plus the derived boolean form of φ[7].
+            let is_blake_ecall = matches!(step.opcode,
+                    zkpvm_core::opcode::Opcode::Ecalli | zkpvm_core::opcode::Opcode::Ecall)
+                && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+            trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
+            trace.fill_columns(row, step.regs_before[10], Column::Phi10);
+            trace.fill_columns(row, step.regs_before[11], Column::Phi11);
+            trace.fill_columns(row, step.regs_before[12], Column::Phi12);
+            let phi7_bool: u8 = if step.regs_before[7] != 0 { 1 } else { 0 };
+            trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
+
             for &b in &result_bytes {
                 range_bytes.push(b);
+            }
+            // Range-check cmp_sub_result bytes for carry chain soundness
+            if flags.is_compare || flags.is_branch {
+                for &b in &cmp_sub_result {
+                    range_bytes.push(b);
+                }
             }
         }
 
@@ -856,6 +921,19 @@ impl BuiltInComponent for CpuChip {
                     use stwo::prover::backend::simd::m31::PackedBaseField;
                     (PackedBaseField::one() - pad).into()
                 },
+                &[col.clone()],
+            );
+        }
+
+        // Range256 lookups for cmp_sub_result bytes (carry chain soundness)
+        let is_compare_col = zkpvm_trace::original_base_column!(component_trace, Column::IsCompare);
+        let is_branch_col = zkpvm_trace::original_base_column!(component_trace, Column::IsBranch);
+        let cmp_sub_result = zkpvm_trace::original_base_column!(component_trace, Column::CmpSubResult);
+        for col in &cmp_sub_result {
+            logup.add_to_relation_with(
+                range256,
+                [is_compare_col[0].clone(), is_branch_col[0].clone()],
+                |[cmp, br]| (cmp + br).into(),
                 &[col.clone()],
             );
         }
@@ -988,6 +1066,32 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // ── Blake2b call binding (Phase 8c) ──
+        // Producer side: at any step where IsBlakeEcall is set, emit
+        //   (phi10[0..4], phi11[0..4], phi12[0..8], phi7_bool, timestamp[0..8])
+        // Blake2bChip emits the matching consumer at IsFirstOfCompression so
+        // the tuple values must agree.
+        let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
+        let is_blake_ecall = zkpvm_trace::original_base_column!(component_trace, Column::IsBlakeEcall);
+        let phi10 = zkpvm_trace::original_base_column!(component_trace, Column::Phi10);
+        let phi11 = zkpvm_trace::original_base_column!(component_trace, Column::Phi11);
+        let phi12 = zkpvm_trace::original_base_column!(component_trace, Column::Phi12);
+        let phi7_bool = zkpvm_trace::original_base_column!(component_trace, Column::Phi7Bool);
+        {
+            let mut tuple: Vec<_> = Vec::with_capacity(25);
+            tuple.extend_from_slice(&phi10[0..4]);
+            tuple.extend_from_slice(&phi11[0..4]);
+            tuple.extend_from_slice(&phi12);
+            tuple.push(phi7_bool[0].clone());
+            tuple.extend_from_slice(&timestamp);
+            logup.add_to_relation_with(
+                blake2b_call,
+                [is_blake_ecall[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
+        }
+
         logup.finalize()
     }
 
@@ -997,9 +1101,16 @@ impl BuiltInComponent for CpuChip {
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &(Range256LookupElements, MemoryAccessLookupElements, ProgramExecutionLookupElements, BitwiseAndLookupElements, PowerOfTwoLookupElements),
+        lookup_elements: &(
+            Range256LookupElements,
+            MemoryAccessLookupElements,
+            ProgramExecutionLookupElements,
+            BitwiseAndLookupElements,
+            PowerOfTwoLookupElements,
+            Blake2bCallLookupElements,
+        ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup) = lookup_elements;
         let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1229,30 +1340,23 @@ impl BuiltInComponent for CpuChip {
         // For SetLtS (compare_op=1): needs sign bit analysis (prover-trusted for now)
         // For CmovIz/Nz, Min/Max: prover-trusted (constrained result via execution semantics)
         // ════════════════════════════════════════════════════════════════════
-        // Constrain the cmp_carry chain
+        let is_cmp_or_branch = is_compare[0].clone() + is_branch[0].clone();
+        // Constrain the cmp_carry chain: val_b + ~val_d + 1 (two's complement subtraction)
+        // sub_result[i] + carry[i]*256 = val_b[i] + 255 - val_d[i] + carry_in
+        // sub_result[i] is range-checked via Range256 lookup below.
+        let cmp_sub_result = zkpvm_trace::trace_eval!(trace_eval, Column::CmpSubResult);
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 { E::F::one() } else { cmp_carry[i - 1].clone() };
-            let c = val_b[i].clone() + f255.clone() - val_d[i].clone() + carry_in
-                - result[i].clone() // wait, cmp sub doesn't produce result. Let me reconsider.
-                ;
-            // Actually, the cmp subtraction is an AUXILIARY computation, not producing result.
-            // The cmp_carry chain computes: for each byte k, partial = val_b[k] + ~val_d[k] + carry_in
-            // But we don't store the subtraction result (it's not needed). We only care about the carries.
-            // The constraint is: cmp_carry[k] * 256 + (subtraction_byte[k]) = val_b[k] + 255 - val_d[k] + carry_in
-            // where subtraction_byte[k] = (val_b[k] + 255 - val_d[k] + carry_in) % 256
-            // Since we don't store subtraction_byte, we need it as an auxiliary column... or we can
-            // derive it. Actually: cmp_carry[k]*256 + sub_byte[k] = val_b[k] + 255 - val_d[k] + carry_in
-            // sub_byte[k] is in [0,255]. If cmp_carry[k] ∈ {0,1}, then the constraint determines sub_byte.
-            // The constraint becomes: val_b[k] + 255 - val_d[k] + carry_in - cmp_carry[k]*256 ∈ [0,255]
-            // This is a range check on (val_b[k] + 255 - val_d[k] + carry_in - cmp_carry[k]*256).
-            // But we don't have a range check for arbitrary expressions.
-            //
-            // Simpler: just constrain cmp_carry boolean + the final flag.
-            // The carries are constrained to be boolean:
-            let _ = c; // unused, we'll do it differently
+            eval.add_constraint(
+                is_cmp_or_branch.clone() * (
+                    cmp_sub_result[i].clone() + cmp_carry[i].clone() * f256.clone()
+                    - val_b[i].clone() - f255.clone() + val_d[i].clone() - carry_in
+                )
+            );
         }
+        // NOTE: Range-check of cmp_sub_result bytes is done later (after result range256)
+        // to match the interaction trace logup entry ORDER.
         // Constrain cmp_lt_flag = 1 - cmp_carry[7] for compare AND branch
-        let is_cmp_or_branch = is_compare[0].clone() + is_branch[0].clone();
         eval.add_constraint(
             is_cmp_or_branch.clone() * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
         );
@@ -1265,7 +1369,7 @@ impl BuiltInComponent for CpuChip {
             let expected_s = signs_differ.clone() * sign_b_b[0].clone()
                 + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
             eval.add_constraint(
-                is_cmp_or_branch * (cmp_lt_s_flag[0].clone() - expected_s)
+                is_cmp_or_branch.clone() * (cmp_lt_s_flag[0].clone() - expected_s)
             );
         }
         // Compare sub-ops use per-op flag columns (degree-2 to degree-4 constraints)
@@ -1553,8 +1657,41 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(
             is_br_ge_s[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone()))
         );
-        // Silence unused warnings for the le/gt variants (constraints skipped above)
-        let _ = (is_br_le_u, is_br_gt_u, is_br_le_s, is_br_gt_s);
+        // EqFlag: constrain val_b == val_d flag
+        let eq_flag = zkpvm_trace::trace_eval!(trace_eval, Column::EqFlag);
+        // eq_flag boolean
+        eval.add_constraint(
+            is_cmp_or_branch.clone() * eq_flag[0].clone() * (E::F::one() - eq_flag[0].clone())
+        );
+        // eq_flag=1 ⇒ all sub_result bytes = 0 (val_b == val_d)
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_cmp_or_branch.clone() * eq_flag[0].clone() * cmp_sub_result[i].clone()
+            );
+        }
+        // eq_flag=0 ⇒ cmp_lt_flag or NOT equal. Constrain: eq_flag + cmp_lt_flag <= 1 wouldn't work.
+        // Use: (1 - eq_flag) means at least one sub_result byte is non-zero.
+        // Sufficient for Le/Gt: branch_taken = cmp_lt_flag + eq_flag for LeU (≤ = < OR ==)
+        // This is sound because eq_flag=1 forces all sub_result=0 (proven above).
+
+        // Unsigned Le: branch_taken = cmp_lt_flag + eq_flag - cmp_lt_flag*eq_flag (OR)
+        // Simpler since cmp_lt_flag and eq_flag can't both be 1 (if lt, not equal):
+        // branch_taken = cmp_lt_flag + eq_flag
+        eval.add_constraint(
+            is_br_le_u[0].clone() * (branch_taken[0].clone() - cmp_lt_flag[0].clone() - eq_flag[0].clone())
+        );
+        // Unsigned Gt: branch_taken = 1 - (cmp_lt_flag + eq_flag)
+        eval.add_constraint(
+            is_br_gt_u[0].clone() * (branch_taken[0].clone() - E::F::one() + cmp_lt_flag[0].clone() + eq_flag[0].clone())
+        );
+        // Signed Le: branch_taken = cmp_lt_s_flag + eq_flag
+        eval.add_constraint(
+            is_br_le_s[0].clone() * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone() - eq_flag[0].clone())
+        );
+        // Signed Gt: branch_taken = 1 - (cmp_lt_s_flag + eq_flag)
+        eval.add_constraint(
+            is_br_gt_s[0].clone() * (branch_taken[0].clone() - E::F::one() + cmp_lt_s_flag[0].clone() + eq_flag[0].clone())
+        );
 
         // Sequential PC: next_pc = pc + 1 + skip_len (4-byte addition with carry)
         // Fires for: non-jump AND (non-branch OR branch-not-taken)
@@ -1609,6 +1746,16 @@ impl BuiltInComponent for CpuChip {
                 range256_lookup,
                 is_real.clone().into(),
                 &[result[i].clone()],
+            ));
+        }
+
+        // Range256 checks for cmp_sub_result bytes (carry chain soundness)
+        // Must be AFTER result range256 to match interaction trace entry order.
+        for i in 0..WORD_SIZE {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_cmp_or_branch.clone().into(),
+                &[cmp_sub_result[i].clone()],
             ));
         }
 
@@ -1708,6 +1855,36 @@ impl BuiltInComponent for CpuChip {
                 is_shift_c[0].clone().into(),
                 &tuple,
             ));
+        }
+
+        // Blake2b call binding (Phase 8c): mirror of the prover-side producer.
+        {
+            let is_blake_ecall = zkpvm_trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
+            let phi10 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi10);
+            let phi11 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi11);
+            let phi12 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi12);
+            let phi7_bool = zkpvm_trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            let mut tuple: Vec<E::F> = Vec::with_capacity(25);
+            for i in 0..4 { tuple.push(phi10[i].clone()); }
+            for i in 0..4 { tuple.push(phi11[i].clone()); }
+            for i in 0..WORD_SIZE { tuple.push(phi12[i].clone()); }
+            tuple.push(phi7_bool[0].clone());
+            for i in 0..WORD_SIZE { tuple.push(timestamp[i].clone()); }
+            eval.add_to_relation(RelationEntry::new(
+                blake2b_call_lookup,
+                is_blake_ecall[0].clone().into(),
+                &tuple,
+            ));
+
+            // Phi7Bool must be boolean (0 or 1) at all real rows, gated by
+            // is_real so padding rows aren't constrained.
+            eval.add_constraint(
+                is_real.clone() * phi7_bool[0].clone() * (phi7_bool[0].clone() - E::F::one())
+            );
+            // IsBlakeEcall must be boolean too.
+            eval.add_constraint(
+                is_real.clone() * is_blake_ecall[0].clone() * (is_blake_ecall[0].clone() - E::F::one())
+            );
         }
 
         eval.finalize_logup_in_pairs();

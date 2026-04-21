@@ -22,6 +22,12 @@ pub struct SideNote {
     pub num_initial_mem_entries: usize,
     /// Power-of-two lookup counts: shift_amount → multiplicity (set by CpuChip).
     pub power_of_two_counts: Vec<u32>,
+    /// Blake2b compression calls to prove via the Blake2bChip.
+    pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
+    /// Per-byte memory operations for each blake2b ECALL (reads for h, m;
+    /// writes for output).  MemoryChip ingests these into the ledger so the
+    /// Blake2bChip memory-consumer lookups balance.
+    pub blake2b_mem_ops: Vec<zkpvm_core::tracing::Blake2bMemOp>,
 }
 
 impl SideNote {
@@ -35,6 +41,8 @@ impl SideNote {
             initial_memory: Vec::new(),
             num_initial_mem_entries: 0,
             power_of_two_counts: vec![0u32; 64],
+            blake2b_calls: Vec::new(),
+            blake2b_mem_ops: Vec::new(),
         }
     }
 

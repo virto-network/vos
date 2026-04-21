@@ -11,7 +11,8 @@ pub use self::{
     logup_trace_builder::LogupTraceBuilder,
     range_check::Range256LookupElements,
     relations::{
-        BitwiseAndLookupElements, MemoryAccessLookupElements,
+        BitwiseAndLookupElements, Blake2bCallLookupElements,
+        Blake2bStateLookupElements, MemoryAccessLookupElements,
         PowerOfTwoLookupElements, ProgramExecutionLookupElements,
         ProgramMemoryLookupElements, RegisterMemoryLookupElements,
     },
@@ -26,6 +27,8 @@ macros::register_relation! {
         MemoryAccessLookupElements,
         BitwiseAndLookupElements,
         PowerOfTwoLookupElements,
+        Blake2bStateLookupElements,
+        Blake2bCallLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

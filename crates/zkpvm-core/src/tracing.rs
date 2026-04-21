@@ -7,9 +7,46 @@ use javm::PVM_REGISTER_COUNT;
 use crate::step::{MemAccess, PvmStep};
 
 /// A tracing wrapper around javm's Pvm that records a full execution trace.
+/// Hostcall ID for blake2b_compress precompile.
+/// Convention: φ[10]=ptr_h, φ[11]=ptr_m, φ[12]=t_low (counter bytes in message).
+/// h is read (64 bytes), m is read (128 bytes). Result overwrites h.
+pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
+
+/// A recorded blake2b call for the precompile chip.
+#[derive(Clone, Debug)]
+pub struct Blake2bRecord {
+    pub h: [u64; 8],
+    pub m: [u64; 16],
+    pub t: u128,
+    pub f: bool,
+}
+
+/// Per-byte memory operations for a single blake2b_compress ECALL, so the
+/// MemoryChip ledger can account for the reads (h, m) and writes (output
+/// overwrites h) that happened atomically inside the precompile.  All
+/// entries share a single `ts` matching the ECALL step's timestamp; the
+/// MemoryChip insertion order keeps reads before writes at tie-break.
+#[derive(Clone, Debug)]
+pub struct Blake2bMemOp {
+    /// Pointer register φ[10] — base of h and also base of the output write.
+    pub h_ptr: u32,
+    /// Pointer register φ[11] — base of m.
+    pub m_ptr: u32,
+    /// Timestamp of the ECALL step that triggered the precompile.
+    pub ts: u64,
+    /// 64 bytes of h (little-endian u64 words 0..8) read at (h_ptr + i, ts).
+    pub h_bytes: [u8; 64],
+    /// 128 bytes of m (LE u64 words 0..16) read at (m_ptr + k, ts).
+    pub m_bytes: [u8; 128],
+    /// 64 bytes of blake2b output written at (h_ptr + i, ts).
+    pub out_bytes: [u8; 64],
+}
+
 pub struct TracingPvm {
     pub pvm: Interpreter,
     pub steps: Vec<PvmStep>,
+    pub blake2b_records: Vec<Blake2bRecord>,
+    pub blake2b_mem_ops: Vec<Blake2bMemOp>,
     timestamp: u64,
 }
 
@@ -18,6 +55,8 @@ impl TracingPvm {
         Self {
             pvm,
             steps: Vec::new(),
+            blake2b_records: Vec::new(),
+            blake2b_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
     }
@@ -106,10 +145,147 @@ impl TracingPvm {
         }
     }
 
+    /// Run with precompile support. Blake2b ecalls are intercepted,
+    /// executed natively, and recorded for the Blake2bChip.
+    pub fn run_with_precompiles(&mut self) -> ExitReason {
+        loop {
+            if let Some(exit) = self.step() {
+                match exit {
+                    ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
+                        self.handle_blake2b_ecall();
+                        // Continue execution — advance PC past the ecall
+                        // The PVM already recorded the step; we just resume
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
+
+    fn handle_blake2b_ecall(&mut self) {
+        // Read h (64 bytes) from memory at address in φ[10]
+        let h_ptr_u = self.pvm.registers[10] as usize;
+        let m_ptr_u = self.pvm.registers[11] as usize;
+        let h_ptr = self.pvm.registers[10] as u32;
+        let m_ptr = self.pvm.registers[11] as u32;
+        let t_low = self.pvm.registers[12];
+        let f = self.pvm.registers[7] != 0; // φ[7] as finalization flag
+
+        let mut h = [0u64; 8];
+        let mut m = [0u64; 16];
+        let mut h_bytes = [0u8; 64];
+        let mut m_bytes = [0u8; 128];
+
+        for i in 0..8 {
+            let off = h_ptr_u + i * 8;
+            if off + 8 <= self.pvm.flat_mem.len() {
+                h[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off+8].try_into().unwrap());
+                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off+8]);
+            }
+        }
+        for i in 0..16 {
+            let off = m_ptr_u + i * 8;
+            if off + 8 <= self.pvm.flat_mem.len() {
+                m[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off+8].try_into().unwrap());
+                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off+8]);
+            }
+        }
+
+        let t = t_low as u128;
+
+        // Execute blake2b compression
+        let result = blake2b_compress_sw(&h, &m, t, f);
+
+        // Write result back to h_ptr and capture the exact bytes that hit memory
+        let mut out_bytes = [0u8; 64];
+        for i in 0..8 {
+            let off = h_ptr_u + i * 8;
+            let bytes = result[i].to_le_bytes();
+            out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+            if off + 8 <= self.pvm.flat_mem.len() {
+                self.pvm.flat_mem[off..off+8].copy_from_slice(&bytes);
+            }
+        }
+
+        // The ECALL step's timestamp was already assigned and incremented by
+        // the preceding self.step() call; its value is self.timestamp - 1.
+        let ts = self.timestamp - 1;
+
+        self.blake2b_records.push(Blake2bRecord { h, m, t, f });
+        self.blake2b_mem_ops.push(Blake2bMemOp {
+            h_ptr, m_ptr, ts, h_bytes, m_bytes, out_bytes,
+        });
+    }
+
     /// Consume and return the recorded trace.
     pub fn into_trace(self) -> Vec<PvmStep> {
         self.steps
     }
+
+    /// Return recorded blake2b calls for the precompile chip.
+    pub fn blake2b_calls(&self) -> &[Blake2bRecord] {
+        &self.blake2b_records
+    }
+}
+
+// ── Software blake2b for the precompile ──────────────────────
+
+const BLAKE2B_IV: [u64; 8] = [
+    0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+];
+
+const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+];
+
+fn blake2b_compress_sw(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
+    let mut v = [0u64; 16];
+    v[..8].copy_from_slice(h);
+    v[8..].copy_from_slice(&BLAKE2B_IV);
+    v[12] ^= t as u64;
+    v[13] ^= (t >> 64) as u64;
+    if f { v[14] = !v[14]; }
+
+    for round in 0..12 {
+        let s = &BLAKE2B_SIGMA[round];
+        g_sw(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+        g_sw(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+        g_sw(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        g_sw(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        g_sw(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+        g_sw(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        g_sw(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+        g_sw(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+    }
+
+    let mut result = [0u64; 8];
+    for i in 0..8 { result[i] = h[i] ^ v[i] ^ v[i + 8]; }
+    result
+}
+
+fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: u64) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
+    v[d] = (v[d] ^ v[a]).rotate_right(32);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(24);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(63);
 }
 
 /// Compute skip(i) — distance to next instruction minus 1.

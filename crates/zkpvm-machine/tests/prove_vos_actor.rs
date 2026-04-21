@@ -579,3 +579,137 @@ fn prove_segmented_hash_bench() {
     ).expect("chain verification failed");
     eprintln!("  CHAIN VERIFIED!");
 }
+
+#[test]
+fn prove_blake2b_precompile() {
+    use zkpvm_machine::chips::blake2b::blake2b_compress;
+    use zkpvm_core::tracing::ECALL_BLAKE2B_COMPRESS;
+
+    // Runs a minimal PVM program that just ECALLs blake2b.  Needs to go
+    // through TracingPvm.run_with_precompiles so the CpuChip gets an ECALL
+    // step (Phase 8c producer) and the tracer captures the matching
+    // blake2b_mem_op (Phase 8a/8b consumer pre-image).
+    let h = [
+        0x6A09E667F3BCC908u64, 0xBB67AE8584CAA73B,
+        0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
+        0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
+        0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+    ];
+    let m = [0u64; 16];
+    let expected = blake2b_compress(&h, &m, 0, true);
+    eprintln!("blake2b(empty) first word: {:#x}", expected[0]);
+
+    let h_addr: u64 = 0x1000;
+    let m_addr: u64 = 0x1040;
+    let mut flat_mem = vec![0u8; 0x2000];
+    for i in 0..8 {
+        flat_mem[h_addr as usize + i*8 .. h_addr as usize + i*8+8]
+            .copy_from_slice(&h[i].to_le_bytes());
+    }
+    // m left all zero.
+
+    let code = vec![
+        javm::instruction::Opcode::Ecalli as u8, ECALL_BLAKE2B_COMPRESS as u8, 0, 0, 0,
+        javm::instruction::Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[10] = h_addr;
+    regs[11] = m_addr;
+    regs[12] = 0;
+    regs[7] = 1;
+
+    let pvm = javm::interpreter::Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _exit = tracing.run_with_precompiles();
+    let steps = tracing.steps.clone();
+    let blake2b_records = tracing.blake2b_records.clone();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps, code, bitmask,
+    ).with_memory(flat_mem);
+    for rec in &blake2b_records {
+        side_note.blake2b_calls.push(zkpvm_machine::chips::blake2b::Blake2bCall {
+            h: rec.h, m: rec.m, t: rec.t, f: rec.f,
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+
+    let config = zkpvm_machine::PcsConfig { pow_bits: 5, fri_config: zkpvm_machine::FriConfig::new(0, 1, 3) };
+    let proof = zkpvm_machine::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
+    verify(proof, &side_note).expect("blake2b verification failed");
+    eprintln!("Blake2b precompile: PROVED!");
+}
+
+#[test]
+fn prove_blake2b_via_ecall() {
+    use zkpvm_core::tracing::{ECALL_BLAKE2B_COMPRESS, Blake2bRecord};
+
+    // Build a PVM program that stores h and m in memory, calls ecall, reads result
+    // For simplicity: manually set up interpreter with h/m in memory and call ecall
+
+    let iv: [u64; 8] = [
+        0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
+        0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
+        0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
+        0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+    ];
+
+    // Lay out memory: h at 0x1000 (64 bytes), m at 0x1040 (128 bytes)
+    let h_addr: u64 = 0x1000;
+    let m_addr: u64 = 0x1040;
+    let mut flat_mem = vec![0u8; 0x2000];
+    for i in 0..8 {
+        flat_mem[h_addr as usize + i*8 .. h_addr as usize + i*8+8].copy_from_slice(&iv[i].to_le_bytes());
+    }
+    // m is all zeros (already)
+
+    // PVM program: ecalli 100 (blake2b), then trap
+    // ecalli encoding: opcode byte + immediate
+    let code = vec![
+        javm::instruction::Opcode::Ecalli as u8, ECALL_BLAKE2B_COMPRESS as u8, 0, 0, 0,
+        javm::instruction::Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[10] = h_addr;  // φ[10] = h pointer
+    regs[11] = m_addr;  // φ[11] = m pointer
+    regs[12] = 0;       // φ[12] = t (counter)
+    regs[7] = 1;        // φ[7] = f (finalize flag)
+
+    let pvm = javm::interpreter::Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run_with_precompiles();
+    eprintln!("Exit: {exit:?}, steps: {}, blake2b_calls: {}",
+        tracing.steps.len(), tracing.blake2b_records.len());
+
+    assert_eq!(tracing.blake2b_records.len(), 1, "should have 1 blake2b call");
+
+    let steps = tracing.steps.clone();
+    let blake2b_records = tracing.blake2b_records.clone();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+
+    // Build SideNote with blake2b calls
+    let mut side_note = zkpvm_machine::SideNote::new(
+        steps, code.clone(), bitmask.clone()
+    ).with_memory(flat_mem);
+
+    for rec in &blake2b_records {
+        side_note.blake2b_calls.push(zkpvm_machine::chips::blake2b::Blake2bCall {
+            h: rec.h, m: rec.m, t: rec.t, f: rec.f,
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+
+    let config = zkpvm_machine::PcsConfig { pow_bits: 5, fri_config: zkpvm_machine::FriConfig::new(0, 1, 3) };
+    let proof = zkpvm_machine::prove_with_config(&mut side_note, config).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+    eprintln!("Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
+        side_note.steps.len(), blake2b_records.len() * 96);
+}

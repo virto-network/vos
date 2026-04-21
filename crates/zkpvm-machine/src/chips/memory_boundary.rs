@@ -151,20 +151,47 @@ fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
         return Vec::new();
     }
 
-    // Decompose all accesses to byte level, find first access per byte address
-    let mut first_is_write: HashMap<u32, bool> = HashMap::new();
+    // Decompose all accesses to byte level, find first access per byte address.
+    // Blake2b precompile memory ops are interleaved by (addr, ts): for a byte
+    // address touched by the precompile AND nothing earlier, the first access
+    // is either the blake2b read (is_write=false) or write (is_write=true)
+    // depending on which sorted first.  Since reads and writes at the same
+    // ts sort stably with reads-before-writes by MemoryChip's insertion order,
+    // AND regular steps have ts ≥ 1 while blake2b mem_ops also have ts ≥ 1
+    // (matching their ECALL step), we need to compare ts across both sources.
+    //
+    // For first-read detection we only care about the minimum ts per address.
+    let mut first_ts_is_write: HashMap<u32, (u64, bool)> = HashMap::new();
+    let mut note = |addr: u32, ts: u64, is_write: bool| {
+        first_ts_is_write
+            .entry(addr)
+            .and_modify(|cur| if ts < cur.0 { *cur = (ts, is_write); })
+            .or_insert((ts, is_write));
+    };
     for step in &side_note.steps {
         if let Some(ref r) = step.mem_read {
             for i in 0..r.size as u32 {
-                first_is_write.entry(r.address + i).or_insert(false);
+                note(r.address + i, step.timestamp, false);
             }
         }
         if let Some(ref w) = step.mem_write {
             for i in 0..w.size as u32 {
-                first_is_write.entry(w.address + i).or_insert(true);
+                note(w.address + i, step.timestamp, true);
             }
         }
     }
+    for op in &side_note.blake2b_mem_ops {
+        // Reads logged before writes at the same ts; note reads first so the
+        // "is_write at earliest ts" resolves to false on ties.
+        for i in 0..64u32 { note(op.h_ptr + i, op.ts, false); }
+        for k in 0..128u32 { note(op.m_ptr + k, op.ts, false); }
+        for i in 0..64u32 { note(op.h_ptr + i, op.ts, true); }
+    }
+    // Convert to (addr, is_write) of the first event.
+    let first_is_write: HashMap<u32, bool> = first_ts_is_write
+        .into_iter()
+        .map(|(a, (_ts, w))| (a, w))
+        .collect();
 
     let flat_mem = &side_note.initial_memory;
     let mut result: Vec<(u32, u8)> = Vec::new();

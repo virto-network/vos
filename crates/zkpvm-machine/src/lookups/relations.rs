@@ -47,3 +47,22 @@ stwo_constraint_framework::relation!(
     BitwiseAndLookupElements,
     REL_BITWISE_AND_LOOKUP_SIZE
 );
+
+// (cid[4], slot[1], value[8]) — Blake2b state lookup between boundary chip
+// and main Blake2b chip for initial-state + final-state authentication.
+const REL_BLAKE2B_STATE_LOOKUP_SIZE: usize = 4 + 1 + WORD_SIZE;
+stwo_constraint_framework::relation!(
+    Blake2bStateLookupElements,
+    REL_BLAKE2B_STATE_LOOKUP_SIZE
+);
+
+// (h_ptr[4], m_ptr[4], t_low[8], f[1], ts[8]) — binds Blake2bChip's HPtr,
+// MPtr, T[0..8], F and CallTs to CpuChip's ECALL-step register snapshot +
+// timestamp so the precompile can't fabricate the pointer / counter /
+// finalise-flag triple.  CpuChip emits 1 producer per blake2b ECALL step,
+// Blake2bChip emits 1 consumer per compression.
+const REL_BLAKE2B_CALL_LOOKUP_SIZE: usize = 4 + 4 + WORD_SIZE + 1 + TS_SIZE;
+stwo_constraint_framework::relation!(
+    Blake2bCallLookupElements,
+    REL_BLAKE2B_CALL_LOOKUP_SIZE
+);
