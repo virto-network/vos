@@ -914,6 +914,7 @@ dependencies = [
 name = "merkle-crdt"
 version = "0.1.0"
 dependencies = [
+ "redb",
  "sha2",
 ]
 

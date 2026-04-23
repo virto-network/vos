@@ -8,6 +8,10 @@ license.workspace = true
 [features]
 default = ["std"]
 std = []
+redb = ["std", "dep:redb"]
+
+[dependencies]
+redb = { version = "2", optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"

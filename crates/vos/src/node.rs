@@ -56,51 +56,45 @@ pub struct WorkerConfig {
     /// rkyv-encoded `vos::value::Args` for the worker's constructor.
     /// Empty if the constructor takes no parameters.
     pub init_args: Vec<u8>,
-    /// Optional state persistence. When set, the worker thread loads
-    /// state from this store on startup (if present) and writes back
-    /// after every dispatch that mutates state.
-    pub storage: Option<WorkerStorage>,
-}
-
-/// Where to persist a worker's actor state.
-#[derive(Clone)]
-pub enum WorkerStorage {
-    /// redb database file. The worker keys its state by `key_name`.
-    #[cfg(feature = "storage")]
-    Redb {
-        path: std::path::PathBuf,
-        key_name: String,
-    },
+    /// Optional data directory for state persistence.
+    /// When set, the worker's redb file is created at
+    /// `{data_dir}/workers/{name}.redb`.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl WorkerConfig {
-    /// Convenience: build a config with no init args.
+    /// Build a config with no init args and no persistence.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into(), init_args: Vec::new(), storage: None }
+        Self { path: path.into(), init_args: Vec::new(), data_dir: None }
     }
 
-    /// Convenience: build a config with rkyv-encoded init args.
+    /// Build a config with rkyv-encoded init args.
     pub fn with_args(path: impl Into<std::path::PathBuf>, args: &crate::value::Args) -> Self {
         let bytes = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(args)
             .expect("rkyv encode Args")
             .to_vec();
-        Self { path: path.into(), init_args: bytes, storage: None }
+        Self { path: path.into(), init_args: bytes, data_dir: None }
     }
 
-    /// Persist state to a redb file under the given key.
-    /// Existing state is loaded on startup; init args are ignored if
-    /// state exists for `key`.
-    #[cfg(feature = "storage")]
-    pub fn persist_redb(
-        mut self,
-        db_path: impl Into<std::path::PathBuf>,
-        key: impl Into<String>,
-    ) -> Self {
-        self.storage = Some(WorkerStorage::Redb {
-            path: db_path.into(),
-            key_name: key.into(),
-        });
+    /// Enable state persistence under the given data directory.
+    /// The worker's state is stored in `{data_dir}/workers/{name}.redb`
+    /// where `name` is derived from the `.so` filename.
+    pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
         self
+    }
+
+    /// Derive the redb path from the data directory and the .so filename.
+    #[cfg(feature = "storage")]
+    fn db_path(&self) -> Option<std::path::PathBuf> {
+        let data_dir = self.data_dir.as_ref()?;
+        let name = self.path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worker")
+            .trim_start_matches("lib");
+        let dir = data_dir.join("workers");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("{name}.redb")))
     }
 }
 
@@ -362,7 +356,10 @@ fn worker_thread(
     }
 
     // Open optional state store and try to restore prior state.
-    let storage_handle = config.storage.as_ref().and_then(|s| open_storage(s));
+    #[cfg(feature = "storage")]
+    let storage_handle = config.db_path().and_then(|p| open_redb(&p));
+    #[cfg(not(feature = "storage"))]
+    let storage_handle: Option<StorageHandle> = None;
     let saved_state = storage_handle.as_ref().and_then(|h| read_state(h));
 
     let mut instance = match saved_state {
@@ -578,39 +575,30 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
 
 // ── State persistence ───────────────────────────────────────────────
 
-/// Storage handle bound to a specific worker's key.
+/// Handle to a redb database for actor state persistence.
+/// Used by both workers and (future) agents.
 #[cfg(feature = "storage")]
-struct StorageHandle {
+pub(crate) struct StorageHandle {
     db: redb::Database,
-    key: String,
 }
 
 #[cfg(not(feature = "storage"))]
-struct StorageHandle;
+pub(crate) struct StorageHandle;
 
+/// Well-known redb table for actor state (keyed by a label string).
 #[cfg(feature = "storage")]
-const STATE_TABLE: redb::TableDefinition<&str, &[u8]> =
-    redb::TableDefinition::new("vos_worker_state");
+pub(crate) const STATE_TABLE: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("state");
 
-fn open_storage(spec: &WorkerStorage) -> Option<StorageHandle> {
-    #[cfg(feature = "storage")]
-    {
-        match spec {
-            WorkerStorage::Redb { path, key_name } => {
-                match redb::Database::create(path) {
-                    Ok(db) => Some(StorageHandle { db, key: key_name.clone() }),
-                    Err(e) => {
-                        eprintln!("worker storage: failed to open {}: {e}", path.display());
-                        None
-                    }
-                }
-            }
+/// Open (or create) a redb database at the given path.
+#[cfg(feature = "storage")]
+fn open_redb(path: &std::path::Path) -> Option<StorageHandle> {
+    match redb::Database::create(path) {
+        Ok(db) => Some(StorageHandle { db }),
+        Err(e) => {
+            eprintln!("storage: failed to open {}: {e}", path.display());
+            None
         }
-    }
-    #[cfg(not(feature = "storage"))]
-    {
-        let _ = spec;
-        None
     }
 }
 
@@ -619,7 +607,7 @@ fn read_state(h: &StorageHandle) -> Option<Vec<u8>> {
     {
         let txn = h.db.begin_read().ok()?;
         let table = txn.open_table(STATE_TABLE).ok()?;
-        let val = table.get(h.key.as_str()).ok().flatten()?;
+        let val = table.get("actor").ok().flatten()?;
         Some(val.value().to_vec())
     }
     #[cfg(not(feature = "storage"))]
@@ -635,7 +623,7 @@ fn write_state(h: &StorageHandle, bytes: &[u8]) -> Result<(), String> {
         let txn = h.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = txn.open_table(STATE_TABLE).map_err(|e| e.to_string())?;
-            table.insert(h.key.as_str(), bytes).map_err(|e| e.to_string())?;
+            table.insert("actor", bytes).map_err(|e| e.to_string())?;
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(())
@@ -761,12 +749,12 @@ mod tests {
             return;
         }
 
-        // Use a temp redb file
-        let db_path = std::env::temp_dir().join(format!(
-            "vos_test_persist_{}.redb",
+        // Use a temp data directory
+        let data_dir = std::env::temp_dir().join(format!(
+            "vos_test_persist_{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
 
         use crate::actors::value::Msg;
         use crate::actors::codec::Encode;
@@ -785,8 +773,7 @@ mod tests {
         {
             let mut node = VosNode::new();
             let id = node.register_worker(
-                WorkerConfig::new(echo_path.clone())
-                    .persist_redb(&db_path, "echo")
+                WorkerConfig::new(echo_path.clone()).persist(&data_dir)
             );
             send_echo(&node, id, "first");
             send_echo(&node, id, "second");
@@ -798,20 +785,19 @@ mod tests {
         {
             let mut node = VosNode::new();
             let id = node.register_worker(
-                WorkerConfig::new(echo_path)
-                    .persist_redb(&db_path, "echo")
+                WorkerConfig::new(echo_path).persist(&data_dir)
             );
-            // After this, count should be 3 (was 2, plus this one)
             send_echo(&node, id, "third");
             node.run();
             let _ = node.collect();
         }
 
         // Verify by opening the db directly and checking the persisted state
+        let db_path = data_dir.join("workers").join("echo_worker.redb");
         let db = redb::Database::open(&db_path).expect("open db");
         let txn = db.begin_read().unwrap();
         let table = txn.open_table(STATE_TABLE).unwrap();
-        let bytes = table.get("echo").unwrap().expect("state present").value().to_vec();
+        let bytes = table.get("actor").unwrap().expect("state present").value().to_vec();
 
         // EchoWorker has a single u32 `count` field — rkyv packs it to
         // exactly 4 bytes. After 3 echoes, count = 3.
@@ -819,7 +805,7 @@ mod tests {
         let count = u32::from_le_bytes(bytes.try_into().unwrap());
         assert_eq!(count, 3, "expected 3 echoes total across both runs");
 
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

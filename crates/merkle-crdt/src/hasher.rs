@@ -1,4 +1,5 @@
 use core::fmt::Debug;
+use crate::encode::Decode;
 
 /// A cryptographic hash function used for content addressing.
 ///
@@ -21,7 +22,7 @@ use core::fmt::Debug;
 /// ```
 pub trait Hasher {
     /// The fixed-size hash digest (e.g. `[u8; 32]` for SHA-256).
-    type Output: Clone + Eq + Ord + core::hash::Hash + Debug + AsRef<[u8]>;
+    type Output: Clone + Eq + Ord + core::hash::Hash + Debug + AsRef<[u8]> + Decode;
 
     /// Hash arbitrary bytes and return the digest.
     fn hash(data: &[u8]) -> Self::Output;

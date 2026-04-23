@@ -46,11 +46,13 @@ enum Command {
         /// everything else → Str. For explicit types use TOML manifest.
         #[arg(long, value_name = "FILE[:KEY=VAL,...]")]
         worker: Vec<String>,
-        /// Persist worker state to a redb file. Each worker is keyed
-        /// by the .so filename (without extension) — same .so always
-        /// resumes its prior state.
-        #[arg(long, value_name = "FILE")]
-        state_db: Option<PathBuf>,
+        /// Data directory for state persistence. Workers are stored in
+        /// `{data_dir}/workers/{name}.redb`. Default: no persistence.
+        #[arg(long, value_name = "DIR", default_value = "data")]
+        data_dir: Option<PathBuf>,
+        /// Disable state persistence (overrides --data-dir).
+        #[arg(long)]
+        no_persist: bool,
     },
     /// List actors in a manifest
     List {
@@ -66,8 +68,9 @@ fn main() {
         Some(Command::Run { program, payload, hex, gas }) => {
             cmd_run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry, worker, state_db }) => {
-            cmd_node(&programs, registry.as_deref(), &worker, state_db.as_deref());
+        Some(Command::Node { programs, registry, worker, data_dir, no_persist }) => {
+            let dir = if no_persist { None } else { data_dir.as_deref() };
+            cmd_node(&programs, registry.as_deref(), &worker, dir);
         }
 
 
@@ -117,7 +120,7 @@ fn cmd_node(
     programs: &[PathBuf],
     registry: Option<&Path>,
     workers: &[String],
-    state_db: Option<&Path>,
+    data_dir: Option<&Path>,
 ) {
     use vos::node::{AgentConfig, WorkerConfig, VosNode};
     use vos::value::Args;
@@ -146,10 +149,8 @@ fn cmd_node(
             _ => WorkerConfig::new(path.clone()),
         };
 
-        if let Some(db) = state_db {
-            let key = path.file_stem().and_then(|s| s.to_str())
-                .unwrap_or("worker").to_string();
-            config = config.persist_redb(db, key);
+        if let Some(dir) = data_dir {
+            config = config.persist(dir);
         }
 
         let id = node.register_worker(config);
