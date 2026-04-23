@@ -266,7 +266,7 @@ pub fn invoke_raw(
 /// `ctx.ask()` resolves synchronously inside the handler via the
 /// `INVOKE` hostcall, so there is no ask-replay loop and no actor
 /// snapshot — a `Yielded` result here always means a real
-/// `yield_now` / `sleep` checkpoint, not an in-flight query.
+/// `yield_now` / `sleep` commit, not an in-flight query.
 #[cfg(feature = "pvm")]
 pub fn dispatch_one<A: Actor>(
     raw: &[u8],

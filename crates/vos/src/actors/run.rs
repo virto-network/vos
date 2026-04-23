@@ -453,12 +453,12 @@ pub fn run_accumulate_service<A: super::Actor>() {
     let n = lifecycle::fetch_raw(&mut buf);
     if n > 0 {
         if let Some(payload) = RefinePayload::decode(&buf[..n]) {
-            // Deserialize the actor from refine state for on_checkpoint.
+            // Deserialize the actor from refine state for on_commit.
             // With rkyv this is essentially zero-copy (pointer cast).
             let actor = lifecycle::load_or_create::<A>(
                 if payload.state.is_empty() { None } else { Some(&payload.state) }
             );
-            actor.on_checkpoint(&payload);
+            actor.on_commit(&payload);
         }
     }
 

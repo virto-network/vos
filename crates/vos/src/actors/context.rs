@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 /// Also provides cooperative async primitives:
 /// - `tell()` — fire-and-forget dynamic message
 /// - `ask()` — query another actor, suspends until reply (returns `Value`)
-/// - `yield_now()` — checkpoint state and yield to other actors
-/// - `sleep(n)` — checkpoint state and sleep for N ticks
+/// - `yield_now()` — commit state and yield to other actors
+/// - `sleep(n)` — commit state and sleep for N ticks
 pub struct Context<A: Actor> {
     id: ServiceId,
     stop_requested: bool,

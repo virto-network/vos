@@ -9,8 +9,8 @@
 //!
 //! - `ctx.tell(target, payload)` — fire-and-forget message (queues transfer)
 //! - `ctx.ask(target, payload)` — synchronous query (suspends until result)
-//! - `ctx.yield_now()` — checkpoint state, self-schedule, halt
-//! - `ctx.sleep(n)` — checkpoint state, sleep N ticks, halt
+//! - `ctx.yield_now()` — commit state, self-schedule, halt
+//! - `ctx.sleep(n)` — commit state, sleep N ticks, halt
 
 mod actor;
 pub mod codec;

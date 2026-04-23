@@ -3,7 +3,7 @@ use super::codec::{Encode, Decode};
 use super::run::RunResult;
 
 /// The core actor trait. Defines the full lifecycle of a VOS actor:
-/// construction, startup, message dispatch, checkpointing, and error handling.
+/// construction, startup, message dispatch, commit, and error handling.
 ///
 /// Serialization is handled by the `Encode + Decode` supertraits, which
 /// are blanket-implemented for any type with rkyv derives. The `#[actor]`
@@ -14,7 +14,7 @@ use super::run::RunResult;
 /// - [`on_start`](Actor::on_start) — runs once on cold start, after
 ///   `create()`, before the message loop. Long-running actors place their
 ///   main loop here; `yield_now`/`sleep` work as usual.
-/// - [`on_checkpoint`](Actor::on_checkpoint) — runs during the accumulate
+/// - [`on_commit`](Actor::on_commit) — runs during the accumulate
 ///   phase to commit refine effects. Override to customize how state is
 ///   persisted (e.g. summarization on JAM, proof generation on vosx).
 ///
@@ -81,7 +81,7 @@ pub trait Actor: Sized + Encode + Decode {
     /// - **vosx**: generate a ZK proof to send to external actors
     /// - **Custom**: any accumulate-phase commit logic
     #[cfg(feature = "service")]
-    fn on_checkpoint(&self, payload: &crate::refine_payload::RefinePayload) {
+    fn on_commit(&self, payload: &crate::refine_payload::RefinePayload) {
         payload.replay_effects();
     }
 
