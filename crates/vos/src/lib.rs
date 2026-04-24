@@ -101,6 +101,9 @@ pub mod runtime;
 #[cfg(feature = "std")]
 pub mod node;
 
+#[cfg(feature = "std")]
+pub mod commit;
+
 /// Re-export for use by generated print!/println! macros.
 #[cfg(feature = "pvm")]
 #[doc(hidden)]

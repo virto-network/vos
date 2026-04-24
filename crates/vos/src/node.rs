@@ -355,12 +355,13 @@ fn worker_thread(
         eprintln!("worker {id}: loaded '{}' from {}", meta.actor_name, config.path.display());
     }
 
-    // Open optional state store and try to restore prior state.
-    #[cfg(feature = "storage")]
-    let storage_handle = config.db_path().and_then(|p| open_redb(&p));
-    #[cfg(not(feature = "storage"))]
-    let storage_handle: Option<StorageHandle> = None;
-    let saved_state = storage_handle.as_ref().and_then(|h| read_state(h));
+    // Pick a persistence strategy. Workers always get LocalCommit
+    // when a data directory is configured, NoCommit otherwise;
+    // replication strategies (CRDT, Raft) are not available to
+    // workers since they live outside the deterministic universe.
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
+        build_worker_strategy(&config, id);
+    let saved_state = strategy.restore();
 
     let mut instance = match saved_state {
         Some(bytes) => {
@@ -371,8 +372,6 @@ fn worker_thread(
         None => plugin.create_with_args(&config.init_args),
     };
 
-    // Track last-saved bytes to skip writes when state is unchanged.
-    let mut last_saved: Vec<u8> = Vec::new();
     // Messages that arrived while we were waiting for a specific reply.
     // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
@@ -387,7 +386,7 @@ fn worker_thread(
                     handled_any = true;
                     let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
                     let _ = req.reply_tx.send(reply);
-                    persist_if_changed(&storage_handle, &instance, &mut last_saved, id);
+                    persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,
             }
@@ -422,7 +421,7 @@ fn worker_thread(
                 payload: reply,
             });
         }
-        persist_if_changed(&storage_handle, &instance, &mut last_saved, id);
+        persist(strategy.as_mut(), &instance, id);
     }
 
     AgentResult { id, panics: 0 }
@@ -575,82 +574,44 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
 
 // ── State persistence ───────────────────────────────────────────────
 
-/// Handle to a redb database for actor state persistence.
-/// Used by both workers and (future) agents.
-#[cfg(feature = "storage")]
-pub(crate) struct StorageHandle {
-    db: redb::Database,
-}
-
-#[cfg(not(feature = "storage"))]
-pub(crate) struct StorageHandle;
-
-/// Well-known redb table for actor state (keyed by a label string).
-#[cfg(feature = "storage")]
-pub(crate) const STATE_TABLE: redb::TableDefinition<&str, &[u8]> =
-    redb::TableDefinition::new("state");
-
-/// Open (or create) a redb database at the given path.
-#[cfg(feature = "storage")]
-fn open_redb(path: &std::path::Path) -> Option<StorageHandle> {
-    match redb::Database::create(path) {
-        Ok(db) => Some(StorageHandle { db }),
-        Err(e) => {
-            eprintln!("storage: failed to open {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-fn read_state(h: &StorageHandle) -> Option<Vec<u8>> {
+/// Pick the worker's commit strategy from its config.
+///
+/// Workers never get CRDT or Raft commits — they live outside the
+/// deterministic universe. If a data directory is configured and the
+/// `storage` feature is on, use [`LocalCommit`]; otherwise fall back
+/// to [`NoCommit`] (state is held in memory only).
+///
+/// [`LocalCommit`]: crate::commit::LocalCommit
+/// [`NoCommit`]: crate::commit::NoCommit
+fn build_worker_strategy(
+    config: &WorkerConfig,
+    id: ServiceId,
+) -> Box<dyn crate::commit::CommitStrategy> {
     #[cfg(feature = "storage")]
     {
-        let txn = h.db.begin_read().ok()?;
-        let table = txn.open_table(STATE_TABLE).ok()?;
-        let val = table.get("actor").ok().flatten()?;
-        Some(val.value().to_vec())
+        if let Some(path) = config.db_path() {
+            match crate::commit::LocalCommit::open(&path) {
+                Ok(lc) => return Box::new(lc),
+                Err(e) => eprintln!("worker {id}: failed to open storage: {e}"),
+            }
+        }
     }
     #[cfg(not(feature = "storage"))]
     {
-        let _ = h;
-        None
+        let _ = (config, id);
     }
+    Box::new(crate::commit::NoCommit)
 }
 
-fn write_state(h: &StorageHandle, bytes: &[u8]) -> Result<(), String> {
-    #[cfg(feature = "storage")]
-    {
-        let txn = h.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = txn.open_table(STATE_TABLE).map_err(|e| e.to_string())?;
-            table.insert("actor", bytes).map_err(|e| e.to_string())?;
-        }
-        txn.commit().map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    #[cfg(not(feature = "storage"))]
-    {
-        let _ = (h, bytes);
-        Err("storage feature disabled".into())
-    }
-}
-
-/// After a dispatch, serialize the worker's state and persist if changed.
-fn persist_if_changed(
-    storage: &Option<StorageHandle>,
+/// Serialize the worker's state and hand it to the commit strategy.
+fn persist(
+    strategy: &mut dyn crate::commit::CommitStrategy,
     instance: &crate::worker::WorkerInstance<'_>,
-    last_saved: &mut Vec<u8>,
     id: ServiceId,
 ) {
-    let Some(h) = storage else { return };
     let bytes = instance.save_state();
-    if bytes == *last_saved {
-        return;
-    }
-    if let Err(e) = write_state(h, &bytes) {
+    if let Err(e) = strategy.commit(&bytes) {
         eprintln!("worker {id}: failed to persist state: {e}");
-    } else {
-        *last_saved = bytes;
     }
 }
 
@@ -793,6 +754,7 @@ mod tests {
         }
 
         // Verify by opening the db directly and checking the persisted state
+        use crate::commit::STATE_TABLE;
         let db_path = data_dir.join("workers").join("echo_worker.redb");
         let db = redb::Database::open(&db_path).expect("open db");
         let txn = db.begin_read().unwrap();
