@@ -717,6 +717,56 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     let _ = ServiceId(0);
     let _ = Envelope { from: agent_id, to: agent_id, payload: Vec::new() };
 
+    // ── Second run: reuse the same data-dir. The agent_thread
+    //    should hit the restore fast path and the existing DAG
+    //    should pick up a second commit from the new dispatch,
+    //    growing without panicking or clobbering the prior state.
+    let dag_count_after_first = {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let t = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("dag"))
+            .unwrap();
+        use redb::ReadableTableMetadata;
+        t.len().unwrap()
+    };
+
+    let blob2 = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let init_bytes2 = {
+        let args = vos::init::InitArgs::new()
+            .with("children", vos::init::InitValue::ListU32(Vec::new()));
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
+            .unwrap()
+            .to_vec()
+    };
+
+    let mut node2 = VosNode::new();
+    let _agent_id2 = node2.register(
+        AgentConfig::new(blob2)
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes2)])
+            .with_consistency(Consistency::Crdt)
+            .persist(&data_dir),
+    );
+    node2.run();
+    let results2 = node2.collect();
+    for r in &results2 {
+        assert_eq!(r.panics, 0, "agent {} panicked on restart", r.id);
+    }
+
+    let dag_count_after_second = {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let t = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("dag"))
+            .unwrap();
+        use redb::ReadableTableMetadata;
+        t.len().unwrap()
+    };
+    assert!(
+        dag_count_after_second > dag_count_after_first,
+        "second run should have appended at least one new DAG node (first={dag_count_after_first}, second={dag_count_after_second})",
+    );
+
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 

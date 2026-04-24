@@ -17,6 +17,23 @@ struct Cli {
     file: Option<PathBuf>,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ConsistencyArg {
+    Ephemeral,
+    Local,
+    Crdt,
+}
+
+impl From<ConsistencyArg> for vos::node::Consistency {
+    fn from(a: ConsistencyArg) -> Self {
+        match a {
+            ConsistencyArg::Ephemeral => vos::node::Consistency::Ephemeral,
+            ConsistencyArg::Local => vos::node::Consistency::Local,
+            ConsistencyArg::Crdt => vos::node::Consistency::Crdt,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run a PVM/ELF program
@@ -53,6 +70,13 @@ enum Command {
         /// Disable state persistence (overrides --data-dir).
         #[arg(long)]
         no_persist: bool,
+        /// Replication / persistence semantics for the PVM agents.
+        ///   ephemeral — in-memory only (default)
+        ///   local     — redb-backed, no replication
+        ///   crdt      — merkle-CRDT: state + DAG + roots committed
+        ///               atomically, effect logs recorded for sync
+        #[arg(long, value_name = "MODE", default_value = "ephemeral")]
+        consistency: ConsistencyArg,
     },
     /// List actors in a manifest
     List {
@@ -68,9 +92,9 @@ fn main() {
         Some(Command::Run { program, payload, hex, gas }) => {
             cmd_run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry, worker, data_dir, no_persist }) => {
+        Some(Command::Node { programs, registry, worker, data_dir, no_persist, consistency }) => {
             let dir = if no_persist { None } else { data_dir.as_deref() };
-            cmd_node(&programs, registry.as_deref(), &worker, dir);
+            cmd_node(&programs, registry.as_deref(), &worker, dir, consistency.into());
         }
 
 
@@ -121,6 +145,7 @@ fn cmd_node(
     registry: Option<&Path>,
     workers: &[String],
     data_dir: Option<&Path>,
+    consistency: vos::node::Consistency,
 ) {
     use vos::node::{AgentConfig, WorkerConfig, VosNode};
     use vos::value::Args;
@@ -157,15 +182,23 @@ fn cmd_node(
         eprintln!("vosx: worker '{}' as {id:?}", path.display());
     }
 
+    // Helper: apply shared consistency + data_dir to an AgentConfig.
+    let mk_agent = |blob: Vec<u8>| -> AgentConfig {
+        let mut c = AgentConfig::new(blob).with_consistency(consistency);
+        if let Some(dir) = data_dir {
+            c = c.persist(dir);
+        }
+        c
+    };
+
     // Load registry at ServiceId(0) if specified
     if let Some(reg_path) = registry {
-        let blob = load_blob(reg_path);
-        let id = node.register(AgentConfig::new(blob));
+        let id = node.register(mk_agent(load_blob(reg_path)));
         eprintln!("vosx: registry '{}' as {id}", reg_path.display());
     }
 
     for path in programs {
-        let id = node.register(AgentConfig::new(load_blob(path)));
+        let id = node.register(mk_agent(load_blob(path)));
         eprintln!("vosx: registered '{}' as {id:?}", path.display());
     }
 
