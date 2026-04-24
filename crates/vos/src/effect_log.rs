@@ -118,6 +118,60 @@ impl EffectLog {
     }
 }
 
+/// In-flight recording state for one dispatch.
+///
+/// The host creates a session when a CRDT/Raft actor is about to
+/// dispatch a message, passes it through the invoke handler so
+/// each observed reply gets appended, then takes back the finished
+/// [`EffectLog`] to attach to the commit.
+///
+/// Only used on the recording side; replay reads directly from a
+/// stored [`EffectLog`] via [`EffectCursor`].
+pub struct EffectSession {
+    log: EffectLog,
+    cap: usize,
+}
+
+impl EffectSession {
+    /// Start a session for the given incoming dispatch message.
+    pub fn new(msg: Vec<u8>) -> Self {
+        Self {
+            log: EffectLog::for_msg(msg),
+            cap: DEFAULT_REPLY_CAP,
+        }
+    }
+
+    /// Override the default per-reply size cap.
+    pub fn with_cap(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Current per-reply size cap in bytes.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Append an observed reply.
+    ///
+    /// Cap enforcement (replacing over-size replies with an error
+    /// marker before calling this) is the caller's responsibility —
+    /// the session stores whatever bytes it is given.
+    pub fn record(&mut self, reply: Vec<u8>) {
+        self.log.record_reply(reply);
+    }
+
+    /// Number of replies recorded so far.
+    pub fn reply_count(&self) -> usize {
+        self.log.reply_count()
+    }
+
+    /// Consume the session and return the finished log.
+    pub fn into_log(self) -> EffectLog {
+        self.log
+    }
+}
+
 /// Walks the reply log in dispatch order during replay.
 ///
 /// The handler is expected to consume replies at the same
@@ -260,5 +314,26 @@ mod tests {
     #[test]
     fn default_cap_is_16k() {
         assert_eq!(DEFAULT_REPLY_CAP, 16 * 1024);
+    }
+
+    #[test]
+    fn session_defaults_and_records() {
+        let mut s = EffectSession::new(b"dispatch".to_vec());
+        assert_eq!(s.cap(), DEFAULT_REPLY_CAP);
+        assert_eq!(s.reply_count(), 0);
+
+        s.record(b"r1".to_vec());
+        s.record(b"r2".to_vec());
+        assert_eq!(s.reply_count(), 2);
+
+        let log = s.into_log();
+        assert_eq!(log.msg, b"dispatch");
+        assert_eq!(log.replies, alloc::vec![b"r1".to_vec(), b"r2".to_vec()]);
+    }
+
+    #[test]
+    fn session_with_cap_override() {
+        let s = EffectSession::new(Vec::new()).with_cap(1024);
+        assert_eq!(s.cap(), 1024);
     }
 }

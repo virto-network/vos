@@ -245,6 +245,14 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     code_cache: javm::CodeCache,
     /// Optional handler for INVOKE targets not in this runtime.
     external_invoke: Option<ExternalInvokeFn>,
+    /// Active recording session for the current dispatch.
+    ///
+    /// When `Some`, every top-level INVOKE hostcall issued by the
+    /// service being refined appends its output bytes to the
+    /// session's log. The host sets this before a CRDT/Raft
+    /// dispatch and takes it back afterward to attach to the
+    /// commit. `None` = no recording (LocalCommit, NoCommit).
+    effect_session: Option<crate::effect_log::EffectSession>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -276,6 +284,7 @@ impl<D: DataLayer> VosRuntime<D> {
             data,
             code_cache: javm::CodeCache::new(),
             external_invoke: None,
+            effect_session: None,
         }
     }
 
@@ -287,6 +296,35 @@ impl<D: DataLayer> VosRuntime<D> {
     /// Used by VosNode to route invocations to workers.
     pub fn set_external_invoke(&mut self, handler: ExternalInvokeFn) {
         self.external_invoke = Some(handler);
+    }
+
+    /// Begin recording the observed reply bytes of every top-level
+    /// INVOKE made during the next dispatch. The log is keyed by
+    /// `msg` — typically the incoming dispatch bytes — and will be
+    /// returned by [`finish_recording`](Self::finish_recording)
+    /// after the dispatch completes.
+    pub fn begin_recording(&mut self, msg: Vec<u8>) {
+        self.effect_session = Some(crate::effect_log::EffectSession::new(msg));
+    }
+
+    /// Begin recording with a custom per-reply size cap (overrides
+    /// [`crate::effect_log::DEFAULT_REPLY_CAP`]).
+    pub fn begin_recording_with_cap(&mut self, msg: Vec<u8>, cap: usize) {
+        self.effect_session =
+            Some(crate::effect_log::EffectSession::new(msg).with_cap(cap));
+    }
+
+    /// Take the recorded [`EffectLog`](crate::effect_log::EffectLog)
+    /// and clear the active session.
+    ///
+    /// Returns `None` if no recording was in progress.
+    pub fn finish_recording(&mut self) -> Option<crate::effect_log::EffectLog> {
+        self.effect_session.take().map(|s| s.into_log())
+    }
+
+    /// Whether a recording session is active.
+    pub fn is_recording(&self) -> bool {
+        self.effect_session.is_some()
     }
 
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
@@ -449,6 +487,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     blobs,
                     blob_by_hash,
                     services,
+                    &mut self.effect_session,
                     &mut self.code_cache,
                     next_id,
                     &self.external_invoke,
@@ -601,6 +640,7 @@ fn run_refine_kernel(
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
+    session: &mut Option<crate::effect_log::EffectSession>,
     code_cache: &mut javm::CodeCache,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
@@ -641,6 +681,7 @@ fn run_refine_kernel(
                     0,
                     next_id,
                     external_invoke,
+                    session,
                 );
             }
         }
@@ -666,6 +707,7 @@ fn handle_refine_hostcall(
     depth: usize,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
+    session: &mut Option<crate::effect_log::EffectSession>,
 ) {
     let a0 = kernel.active_reg(7);
     let a1 = kernel.active_reg(8);
@@ -782,6 +824,7 @@ fn handle_refine_hostcall(
                 depth + 1,
                 next_id,
                 external_invoke,
+                session,
             );
             (result, 0)
         }
@@ -789,6 +832,29 @@ fn handle_refine_hostcall(
     };
 
     kernel.resume_protocol_call(r7, r8);
+}
+
+/// Write an invoke output into the caller's buffer, and — when a
+/// recording session is active at depth 1 — append the same bytes
+/// to the session log so replay can reproduce the caller's
+/// observation byte-for-byte without re-running the child.
+///
+/// Nested invokes (depth >= 2) belong to a child's refine and
+/// are irrelevant to the caller's session.
+fn record_and_write_invoke(
+    caller: &mut InvocationKernel,
+    output_ptr: u32,
+    output: &[u8],
+    depth: usize,
+    session: &mut Option<crate::effect_log::EffectSession>,
+) -> u64 {
+    if depth == 1 {
+        if let Some(s) = session.as_mut() {
+            s.record(output.to_vec());
+        }
+    }
+    kwrite(caller, output_ptr, output);
+    output.len() as u64
 }
 
 /// Handle INVOKE: run a child PVM at PC=0 (refine). The child reads
@@ -807,6 +873,7 @@ fn handle_invoke(
     depth: usize,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
+    session: &mut Option<crate::effect_log::EffectSession>,
 ) -> u64 {
     use crate::actors::run::{STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED};
 
@@ -859,23 +926,19 @@ fn handle_invoke(
                         output.push(crate::actors::run::STATUS_DONE);
                         output.extend_from_slice(&0u32.to_le_bytes());
                         output.extend_from_slice(&reply);
-                        kwrite(caller, output_ptr, &output);
-                        return output.len() as u64;
+                        return record_and_write_invoke(caller, output_ptr, &output, depth, session);
                     }
                 }
-                kwrite(caller, output_ptr, &[STATUS_NOT_FOUND]);
-                return 1;
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
             }
         }
     } else {
-        kwrite(caller, output_ptr, &[STATUS_NOT_FOUND]);
-        return 1;
+        return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
         None => {
-            kwrite(caller, output_ptr, &[STATUS_NOT_FOUND]);
-            return 1;
+            return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
         }
     };
 
@@ -890,8 +953,7 @@ fn handle_invoke(
     let mut child = match InvocationKernel::new_cached(blob, &[], gas, code_cache) {
         Ok(k) => k,
         Err(_) => {
-            kwrite(caller, output_ptr, &[STATUS_PANICKED]);
-            return 1;
+            return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
         }
     };
     child.set_active_reg(7, 0); // refine
@@ -929,18 +991,18 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 eprintln!("vosx: child invoke panicked at PC={pc} (target svc {target_svc_id:?})");
-                kwrite(caller, output_ptr, &[STATUS_PANICKED]);
-                return 1;
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
             }
             KernelResult::OutOfGas => {
-                kwrite(caller, output_ptr, &[STATUS_OOG]);
-                return 1;
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, session);
             }
             KernelResult::PageFault(_addr) => {
-                kwrite(caller, output_ptr, &[STATUS_PANICKED]);
-                return 1;
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
             }
             KernelResult::ProtocolCall { slot } => {
+                // Nested invokes by the child actor are not part of
+                // the recording caller's session; feed `None` here.
+                let mut child_session = None;
                 handle_refine_hostcall(
                     &mut child,
                     slot as u32,
@@ -956,6 +1018,7 @@ fn handle_invoke(
                     depth,
                     next_id,
                     external_invoke,
+                    &mut child_session,
                 );
             }
         }
@@ -990,8 +1053,7 @@ fn handle_invoke(
         raw_output
     };
 
-    kwrite(caller, output_ptr, &output);
-    output.len() as u64
+    record_and_write_invoke(caller, output_ptr, &output, depth, session)
 }
 
 /// Capture a continuation: hash flat_mem, store in the data layer,

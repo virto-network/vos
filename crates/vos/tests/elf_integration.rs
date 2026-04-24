@@ -394,6 +394,103 @@ fn pvm_agent_invokes_worker_via_external_handler() {
 }
 
 #[test]
+fn recording_session_captures_invoke_replies() {
+    // Same setup as pvm_agent_invokes_worker_via_external_handler,
+    // but this time the runtime is in a recording session: every
+    // invoke the scheduler issues should end up in the session's
+    // EffectLog, ready to be attached to a CRDT commit.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let echo_so = {
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
+        std::path::PathBuf::from(p)
+    };
+    if !echo_so.exists() {
+        eprintln!("SKIP: echo-worker not built");
+        return;
+    }
+
+    let blob = transpile_actor(&agent_data);
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    let worker_child_id = vos::abi::service::ServiceId(99);
+    let invoke_count = std::sync::Arc::new(AtomicU32::new(0));
+    let count_clone = invoke_count.clone();
+
+    let plugin: &'static _ = Box::leak(Box::new(
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+    ));
+    let instance = std::sync::Mutex::new(plugin.create());
+
+    rt.set_external_invoke(Box::new(move |target, msg| {
+        if target != worker_child_id { return None; }
+        count_clone.fetch_add(1, Ordering::Relaxed);
+        let mut inst = instance.lock().unwrap();
+        match inst.dispatch_raw(msg) {
+            Ok(reply) => Some(reply),
+            Err(_) => Some(Vec::new()),
+        }
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    // Begin a recording session before the dispatch. The msg bytes
+    // here would normally be the incoming envelope payload; we pass
+    // a tag so we can assert it came through.
+    let dispatch_msg = b"test-dispatch".to_vec();
+    rt.begin_recording(dispatch_msg.clone());
+    assert!(rt.is_recording(), "session should be active after begin_recording");
+
+    rt.send_to(agent_id, Vec::new());
+    rt.run_blocking();
+
+    let log = rt.finish_recording().expect("session should be in flight");
+    assert!(!rt.is_recording(), "session should be cleared after finish_recording");
+
+    assert_eq!(rt.panics, 0, "scheduler panicked under recording");
+    let invokes = invoke_count.load(Ordering::Relaxed);
+    assert!(invokes > 0, "external_invoke should have fired");
+
+    // The session's msg is exactly what we handed to begin_recording.
+    assert_eq!(log.msg, dispatch_msg);
+
+    // Every top-level invoke issued during this tick got its output
+    // captured, so reply_count should match the invoke count. Nested
+    // invokes (depth > 1) are excluded, but the scheduler → worker
+    // path is depth 1 so all of them should appear.
+    assert_eq!(
+        log.reply_count() as u32,
+        invokes,
+        "each external invoke should have been recorded",
+    );
+
+    // Each recorded output is a valid invoke wire frame: it starts
+    // with a status byte (STATUS_DONE for the external path).
+    for reply in &log.replies {
+        assert!(!reply.is_empty(), "recorded output should not be empty");
+        assert_eq!(reply[0], vos::STATUS_DONE, "expected successful invoke");
+    }
+}
+
+#[test]
 fn display_multiple_vec_renders() {
     // Regression test for the multi-deliver Vec bug (March 2025):
     // under the old bump allocator, sequential messages containing
