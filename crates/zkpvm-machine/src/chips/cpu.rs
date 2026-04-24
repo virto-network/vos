@@ -25,6 +25,7 @@ use crate::{
         AllLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements,
         LogupTraceBuilder, MemoryAccessLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, Range256LookupElements,
+        RegisterMemoryLookupElements,
     },
     side_note::SideNote,
 };
@@ -189,6 +190,30 @@ pub enum Column {
     /// 1 when is_shift AND shift_op ∈ {0,1} (left shift or logical right shift)
     #[size = 1]
     IsShiftConstrained,
+    /// Phase 9g: raw u64 of `regs_before[reg_a_or_b]` whenever ValBIsReg=1.
+    /// For 64-bit ops ValB == RegValB (constrained byte-wise); for 32-bit
+    /// ALU ops ValB is truncated to `RegValB & 0xFFFFFFFF` so the upper
+    /// bytes of ValB are zero while RegValB carries the full register value.
+    /// Ledger producer uses RegValB; ALU constraints keep using ValB.
+    #[size = 8]
+    RegValB,
+    /// Phase 9g: 1 iff Is32Bit · (IsAdd + IsSub + IsMul + IsDivRem), so the
+    /// ValB/ValD upper-4-bytes-equal-zero constraints gate correctly.  Tied
+    /// to that product via a validity constraint below.
+    #[size = 1]
+    IsTruncated,
+    /// Phase 9f: raw u64 of `regs_before[reg_b]` whenever ValDIsReg=1.
+    /// For non-shift non-32-bit ops ValD == RegValD (constrained below); for
+    /// shifts ValD gets rewritten to `2^shift_amount` but RegValD keeps the
+    /// raw register value so the ledger producer can authenticate it.  Zero
+    /// when ValDIsReg=0.
+    #[size = 8]
+    RegValD,
+    /// Phase 9f: quotient in `RegValD = ShiftAmount + modulus · q` for
+    /// shift ops.  modulus = 32 for 32-bit shifts, 64 otherwise.  Ties
+    /// the prover-chosen ShiftAmount to the authenticated RegValD.
+    #[size = 8]
+    ShiftQuotient,
     // ── Control flow ──
     /// Conditional branch (BranchEq/Ne/Lt/Ge + imm variants)
     #[size = 1]
@@ -284,11 +309,43 @@ pub enum Column {
     /// φ[12] at this step's regs_before (t_low for blake2b_compress).
     #[size = 8]
     Phi12,
+    /// Full u64 value of φ[7] (8 LE bytes).  Used for the register-memory
+    /// producer at ECALL steps — the register ledger needs the raw value;
+    /// the Blake2bCall relation uses Phi7Bool for the finalise flag.
+    #[size = 8]
+    Phi7,
+    /// Inversion witness: if Phi7 (as field element) != 0, Phi7Inv =
+    /// 1 / Phi7_combined; else 0.  Used to constrain
+    /// Phi7Bool = (Phi7 != 0) in-circuit (Phase 9e).
+    #[size = 8]
+    Phi7Inv,
     /// Boolean version of φ[7] (finalise flag): 1 if regs_before[7] != 0.
     /// The prover fills this and the lookup balance keeps it tied to the
     /// Blake2bChip.F column at the matching compression.
     #[size = 1]
     Phi7Bool,
+    // ── Register-memory binding (Phase 9d) ──
+    /// 1 iff ValB was sourced from a register read at this step.  See
+    /// `val_b_read_reg` for the per-category mapping.  Gates the ValB
+    /// register-memory producer emission.
+    #[size = 1]
+    ValBIsReg,
+    /// Register index that ValB was read from when ValBIsReg=1.
+    #[size = 1]
+    ValBRegIdx,
+    /// 1 iff ValD was sourced from a register read.
+    #[size = 1]
+    ValDIsReg,
+    /// Register index that ValD was read from when ValDIsReg=1.
+    #[size = 1]
+    ValDRegIdx,
+    /// 1 iff Result was written to a register at this step (tracer's
+    /// step.reg_write is Some).  Gates the Result register-memory producer.
+    #[size = 1]
+    ResultIsReg,
+    /// Register index that Result was written to when ResultIsReg=1.
+    #[size = 1]
+    ResultRegIdx,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -487,6 +544,74 @@ fn dest_reg(step: &zkpvm_core::step::PvmStep) -> usize {
     }
 }
 
+/// Phase 9d: register-access descriptor for a single PVM step.  Used by both
+/// CpuChip (to fill the ValB/ValD/Result register-source flags + indices) and
+/// RegisterMemoryChip (to build the ledger).  Must stay in sync across the two
+/// chips because the logup balance depends on matching (reg_idx, value, ts)
+/// tuples on both sides.
+pub(crate) struct StepRegAccesses {
+    /// (reg_idx, value) if ValB came from a register read at this step.
+    pub val_b_read: Option<(u8, u64)>,
+    /// (reg_idx, value) if ValD came from a register read at this step.
+    pub val_d_read: Option<(u8, u64)>,
+    /// (reg_idx, value) if the step wrote a register.
+    pub result_write: Option<(u8, u64)>,
+    /// Phase 9e: ECALL-specific register reads.  Blake2b hostcall reads φ[7],
+    /// φ[10], φ[11], φ[12] at the ECALL step's timestamp; these entries land
+    /// in the ledger alongside the regular ValB/ValD reads and match the
+    /// producers CpuChip emits gated by IsBlakeEcall.  Empty for non-blake2b
+    /// steps.
+    pub ecall_reads: Vec<(u8, u64)>,
+}
+
+/// Mirrors the ValB/ValD assignment matrix in generate_main_trace.
+///
+/// Skipped cases (follow-up 9g): in-trace ValB/ValD get rewritten mid-step
+/// for these, so the ledger tuple wouldn't match what the logup emits.
+///   - shifts with `shift_op <= 2` rewrite ValD to `2^shift_amount`
+///   - 32-bit add/sub/mul/divrem truncate both ValB and ValD to 32 bits
+/// These emissions are dropped here (authentication lost for those reads);
+/// a later phase can add RegValB/RegValD dedicated columns and cross-
+/// constraints so the ledger sees the raw register values.
+pub(crate) fn step_reg_accesses(step: &zkpvm_core::step::PvmStep) -> StepRegAccesses {
+    use javm::instruction::InstructionCategory::*;
+    // Phase 9g: the previous skip for 32-bit Add/Sub/Mul/DivRem is lifted.
+    // Cross-constraints in add_constraints handle the truncation: ValB low
+    // 4 bytes match RegValB; upper 4 bytes match only when !IsTruncated.
+    let val_b_read = match step.opcode.category() {
+        ThreeReg => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
+        TwoRegOneImm => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
+        OneRegImmOffset => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
+        TwoReg => None,
+        _ if uses_immediate(step.opcode) => None,
+        _ => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
+    };
+    // Shifts with shift_op ≤ 2 rewrite ValD mid-step; Phase 9f restores the
+    // ledger emission using the RegValD column (holds raw regs[reg_b]).
+    let val_d_read = match step.opcode.category() {
+        ThreeReg | TwoReg => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
+        TwoRegOneImm | OneRegImmOffset => None,
+        _ if uses_immediate(step.opcode) => None,
+        _ => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
+    };
+    let result_write = step.reg_write.map(|idx| (idx as u8, step.regs_after[idx]));
+    // Phase 9e: blake2b ECALL reads φ[7], φ[10], φ[11], φ[12] at this step's ts.
+    let is_blake_ecall = matches!(step.opcode,
+            zkpvm_core::opcode::Opcode::Ecalli | zkpvm_core::opcode::Opcode::Ecall)
+        && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+    let ecall_reads = if is_blake_ecall {
+        vec![
+            (7u8, step.regs_before[7]),
+            (10u8, step.regs_before[10]),
+            (11u8, step.regs_before[11]),
+            (12u8, step.regs_before[12]),
+        ]
+    } else {
+        Vec::new()
+    };
+    StepRegAccesses { val_b_read, val_d_read, result_write, ecall_reads }
+}
+
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
@@ -501,6 +626,7 @@ impl BuiltInComponent for CpuChip {
         BitwiseAndLookupElements,
         PowerOfTwoLookupElements,
         Blake2bCallLookupElements,
+        RegisterMemoryLookupElements,
     );
 
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
@@ -863,8 +989,82 @@ impl BuiltInComponent for CpuChip {
             trace.fill_columns(row, step.regs_before[10], Column::Phi10);
             trace.fill_columns(row, step.regs_before[11], Column::Phi11);
             trace.fill_columns(row, step.regs_before[12], Column::Phi12);
-            let phi7_bool: u8 = if step.regs_before[7] != 0 { 1 } else { 0 };
+            let phi7_u64 = step.regs_before[7];
+            trace.fill_columns(row, phi7_u64, Column::Phi7);
+            let phi7_bool: u8 = if phi7_u64 != 0 { 1 } else { 0 };
             trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
+            // Phi7Inv = field-element inverse of (Phi7 interpreted as u64, mod M31).
+            // If Phi7 == 0 we store 0; the boolean-identity constraint
+            //   Phi7Bool · (1 - Phi7_combined · Phi7Inv_combined) = 0
+            // forces Phi7Inv to be the real inverse whenever Phi7Bool = 1.
+            let phi7_inv_u64: u64 = if phi7_u64 != 0 {
+                // Combine bytes with powers of 256 modulo the M31 prime,
+                // then invert.  Rust's u128 multiplication + manual mod is
+                // enough since M31 = 2^31 - 1.
+                const M31_P: u64 = (1u64 << 31) - 1;
+                let mut combined: u64 = 0;
+                let bytes = phi7_u64.to_le_bytes();
+                let mut pow: u64 = 1;
+                for b in bytes {
+                    combined = (combined + (b as u64) * pow) % M31_P;
+                    pow = (pow * 256) % M31_P;
+                }
+                // Fermat's little theorem: inverse = combined^(p-2) mod p.
+                let mut result: u64 = 1;
+                let mut base = combined;
+                let mut exp = M31_P - 2;
+                while exp > 0 {
+                    if exp & 1 == 1 {
+                        result = (result * base) % M31_P;
+                    }
+                    base = (base * base) % M31_P;
+                    exp >>= 1;
+                }
+                result
+            } else {
+                0
+            };
+            trace.fill_columns(row, phi7_inv_u64, Column::Phi7Inv);
+
+            // ── Register-memory producer descriptors (Phase 9d) ──
+            let accesses = step_reg_accesses(step);
+            trace.fill_columns(row, accesses.val_b_read.is_some(), Column::ValBIsReg);
+            trace.fill_columns(
+                row,
+                accesses.val_b_read.map(|(a, _)| a).unwrap_or(0),
+                Column::ValBRegIdx,
+            );
+            trace.fill_columns(row, accesses.val_d_read.is_some(), Column::ValDIsReg);
+            trace.fill_columns(
+                row,
+                accesses.val_d_read.map(|(a, _)| a).unwrap_or(0),
+                Column::ValDRegIdx,
+            );
+            trace.fill_columns(row, accesses.result_write.is_some(), Column::ResultIsReg);
+            trace.fill_columns(
+                row,
+                accesses.result_write.map(|(a, _)| a).unwrap_or(0),
+                Column::ResultRegIdx,
+            );
+
+            // Phase 9g: raw register value behind ValB + IsTruncated flag.
+            let reg_val_b_u64 = accesses.val_b_read.map(|(_, v)| v).unwrap_or(0);
+            trace.fill_columns(row, reg_val_b_u64, Column::RegValB);
+            let is_truncated: u8 = if flags.is_32bit
+                && (flags.is_add || flags.is_sub || flags.is_mul || flags.is_div_rem)
+            { 1 } else { 0 };
+            trace.fill_columns(row, is_truncated, Column::IsTruncated);
+
+            // Phase 9f: raw register value behind ValD + the shift quotient.
+            let reg_val_d_u64 = accesses.val_d_read.map(|(_, v)| v).unwrap_or(0);
+            trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
+            let shift_q: u64 = if flags.is_shift && flags.shift_op <= 2 {
+                let modulus = if flags.is_32bit { 32u64 } else { 64 };
+                reg_val_d_u64 / modulus
+            } else {
+                0
+            };
+            trace.fill_columns(row, shift_q, Column::ShiftQuotient);
 
             for &b in &result_bytes {
                 range_bytes.push(b);
@@ -1066,16 +1266,102 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // ── Register-memory producer emissions (Phase 9d) ──
+        // Three potential register accesses per step: ValB read, ValD read,
+        // Result write.  Each is gated by its Is* flag and emits a tuple
+        // (reg_idx[1], value[8], timestamp[8]) matching RegisterMemoryChip's
+        // ledger consumers.  Flags are 0 when the corresponding slot isn't
+        // a register access (immediate source, or no register write).
+        let reg_lookup: &RegisterMemoryLookupElements = lookup_elements.as_ref();
+        let val_b_is_reg = zkpvm_trace::original_base_column!(component_trace, Column::ValBIsReg);
+        let val_b_reg_idx = zkpvm_trace::original_base_column!(component_trace, Column::ValBRegIdx);
+        let val_d_is_reg = zkpvm_trace::original_base_column!(component_trace, Column::ValDIsReg);
+        let val_d_reg_idx = zkpvm_trace::original_base_column!(component_trace, Column::ValDRegIdx);
+        let result_is_reg = zkpvm_trace::original_base_column!(component_trace, Column::ResultIsReg);
+        let result_reg_idx = zkpvm_trace::original_base_column!(component_trace, Column::ResultRegIdx);
+        let result_cols = zkpvm_trace::original_base_column!(component_trace, Column::Result);
+        {
+            // Phase 9g: use RegValB (raw register value) rather than ValB so
+            // 32-bit-truncated ops still emit the authentic register value.
+            let reg_val_b_cols = zkpvm_trace::original_base_column!(component_trace, Column::RegValB);
+            let mut tuple: Vec<_> = vec![val_b_reg_idx[0].clone()];
+            tuple.extend_from_slice(&reg_val_b_cols);
+            tuple.extend_from_slice(&timestamp);
+            logup.add_to_relation_with(
+                reg_lookup,
+                [val_b_is_reg[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
+        }
+        {
+            // Phase 9f: use RegValD (raw register value) instead of ValD
+            // (which gets rewritten to 2^shift_amount for shift ops).
+            let reg_val_d_cols = zkpvm_trace::original_base_column!(component_trace, Column::RegValD);
+            let mut tuple: Vec<_> = vec![val_d_reg_idx[0].clone()];
+            tuple.extend_from_slice(&reg_val_d_cols);
+            tuple.extend_from_slice(&timestamp);
+            logup.add_to_relation_with(
+                reg_lookup,
+                [val_d_is_reg[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
+        }
+        {
+            let mut tuple: Vec<_> = vec![result_reg_idx[0].clone()];
+            tuple.extend_from_slice(&result_cols);
+            tuple.extend_from_slice(&timestamp);
+            logup.add_to_relation_with(
+                reg_lookup,
+                [result_is_reg[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
+        }
+
+        // ── Phase 9e: blake2b ECALL register reads (φ[7], [10], [11], [12]) ──
+        // 4 extra register-memory producers emitted only at blake2b ECALL
+        // steps.  Values come from the dedicated Phi7/Phi10/Phi11/Phi12
+        // columns; indices are hardcoded constants.
+        let is_blake_ecall = zkpvm_trace::original_base_column!(component_trace, Column::IsBlakeEcall);
+        let phi7 = zkpvm_trace::original_base_column!(component_trace, Column::Phi7);
+        let phi10 = zkpvm_trace::original_base_column!(component_trace, Column::Phi10);
+        let phi11 = zkpvm_trace::original_base_column!(component_trace, Column::Phi11);
+        let phi12 = zkpvm_trace::original_base_column!(component_trace, Column::Phi12);
+        use stwo::prover::backend::simd::m31::PackedBaseField;
+        const ECALL_REG_IDXS: [u32; 4] = [7, 10, 11, 12];
+        let phi_cols: [_; 4] = [
+            phi7.clone(),
+            phi10.clone(),
+            phi11.clone(),
+            phi12.clone(),
+        ];
+        for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
+            let idx_const = PackedBaseField::broadcast(BaseField::from(reg_idx));
+            let val_c = phi_cols[slot].clone();
+            let ts_c = timestamp.clone();
+            logup.add_to_relation_computed(
+                reg_lookup,
+                [is_blake_ecall[0].clone()],
+                |[active]| active.into(),
+                17,
+                move |v| {
+                    let mut t = Vec::with_capacity(17);
+                    t.push(idx_const);
+                    for c in &val_c { t.push(c.at(v)); }
+                    for c in &ts_c { t.push(c.at(v)); }
+                    t
+                },
+            );
+        }
+
         // ── Blake2b call binding (Phase 8c) ──
         // Producer side: at any step where IsBlakeEcall is set, emit
         //   (phi10[0..4], phi11[0..4], phi12[0..8], phi7_bool, timestamp[0..8])
         // Blake2bChip emits the matching consumer at IsFirstOfCompression so
         // the tuple values must agree.
         let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
-        let is_blake_ecall = zkpvm_trace::original_base_column!(component_trace, Column::IsBlakeEcall);
-        let phi10 = zkpvm_trace::original_base_column!(component_trace, Column::Phi10);
-        let phi11 = zkpvm_trace::original_base_column!(component_trace, Column::Phi11);
-        let phi12 = zkpvm_trace::original_base_column!(component_trace, Column::Phi12);
         let phi7_bool = zkpvm_trace::original_base_column!(component_trace, Column::Phi7Bool);
         {
             let mut tuple: Vec<_> = Vec::with_capacity(25);
@@ -1108,9 +1394,10 @@ impl BuiltInComponent for CpuChip {
             BitwiseAndLookupElements,
             PowerOfTwoLookupElements,
             Blake2bCallLookupElements,
+            RegisterMemoryLookupElements,
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup) = lookup_elements;
         let is_pad = zkpvm_trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1855,6 +2142,224 @@ impl BuiltInComponent for CpuChip {
                 is_shift_c[0].clone().into(),
                 &tuple,
             ));
+        }
+
+        // Register-memory producers (Phase 9d): mirror of the interaction
+        // trace emissions in the same order (ValB read → ValD read → Result
+        // write) so finalize_logup_in_pairs pairs correctly.
+        {
+            let val_b_is_reg = zkpvm_trace::trace_eval!(trace_eval, Column::ValBIsReg);
+            let val_b_reg_idx = zkpvm_trace::trace_eval!(trace_eval, Column::ValBRegIdx);
+            let val_d_is_reg = zkpvm_trace::trace_eval!(trace_eval, Column::ValDIsReg);
+            let val_d_reg_idx = zkpvm_trace::trace_eval!(trace_eval, Column::ValDRegIdx);
+            let result_is_reg = zkpvm_trace::trace_eval!(trace_eval, Column::ResultIsReg);
+            let result_reg_idx = zkpvm_trace::trace_eval!(trace_eval, Column::ResultRegIdx);
+            let result_c = zkpvm_trace::trace_eval!(trace_eval, Column::Result);
+
+            // Phase 9g: RegValB carries the full u64 register value; ValB
+            // may be truncated (for 32-bit ALU ops).  Producer uses RegValB.
+            let reg_val_b = zkpvm_trace::trace_eval!(trace_eval, Column::RegValB);
+            let mut tuple: Vec<E::F> = vec![val_b_reg_idx[0].clone()];
+            for b in &reg_val_b { tuple.push(b.clone()); }
+            for ts in &timestamp { tuple.push(ts.clone()); }
+            eval.add_to_relation(RelationEntry::new(
+                reg_lookup,
+                val_b_is_reg[0].clone().into(),
+                &tuple,
+            ));
+
+            // Phase 9f: RegValD (raw reg_b value) drives the ledger, not ValD
+            // (which gets rewritten to 2^shift_amount for shift ops).
+            let reg_val_d = zkpvm_trace::trace_eval!(trace_eval, Column::RegValD);
+            let mut tuple: Vec<E::F> = vec![val_d_reg_idx[0].clone()];
+            for b in &reg_val_d { tuple.push(b.clone()); }
+            for ts in &timestamp { tuple.push(ts.clone()); }
+            eval.add_to_relation(RelationEntry::new(
+                reg_lookup,
+                val_d_is_reg[0].clone().into(),
+                &tuple,
+            ));
+
+            // Phase 9g: IsTruncated is 1 iff Is32Bit AND (IsAdd + IsSub +
+            // IsMul + IsDivRem).  Validity constraint ties it to the op flags
+            // so a prover can't flip it independently.
+            let is_truncated = zkpvm_trace::trace_eval!(trace_eval, Column::IsTruncated);
+            eval.add_constraint(
+                is_real.clone() * is_truncated[0].clone() * (is_truncated[0].clone() - E::F::one())
+            );
+            let trunc_sum = is_add[0].clone() + is_sub[0].clone()
+                + is_mul[0].clone() + is_div_rem[0].clone();
+            eval.add_constraint(
+                is_real.clone()
+                    * (is_truncated[0].clone() - is_32bit[0].clone() * trunc_sum)
+            );
+
+            // ValB byte-wise cross-constraint.  ValB is not affected by shifts.
+            //   - low 4 bytes: ValB[i] == RegValB[i] whenever ValBIsReg=1
+            //   - upper 4 bytes: match when NOT truncated, zero when truncated.
+            for i in 0..4 {
+                eval.add_constraint(
+                    is_real.clone() * val_b_is_reg[0].clone()
+                        * (val_b[i].clone() - reg_val_b[i].clone())
+                );
+            }
+            for i in 4..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone() * val_b_is_reg[0].clone()
+                        * (E::F::one() - is_truncated[0].clone())
+                        * (val_b[i].clone() - reg_val_b[i].clone())
+                );
+                eval.add_constraint(
+                    is_real.clone() * val_b_is_reg[0].clone()
+                        * is_truncated[0].clone() * val_b[i].clone()
+                );
+            }
+
+            // ValD byte-wise cross-constraint.  Skip shift rows (handled by
+            // the ShiftQuotient identity below).
+            let is_shift_c = zkpvm_trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
+            let non_shift_gate = is_real.clone()
+                * val_d_is_reg[0].clone()
+                * (E::F::one() - is_shift_c[0].clone());
+            for i in 0..4 {
+                eval.add_constraint(
+                    non_shift_gate.clone() * (val_d[i].clone() - reg_val_d[i].clone())
+                );
+            }
+            for i in 4..WORD_SIZE {
+                eval.add_constraint(
+                    non_shift_gate.clone()
+                        * (E::F::one() - is_truncated[0].clone())
+                        * (val_d[i].clone() - reg_val_d[i].clone())
+                );
+                eval.add_constraint(
+                    non_shift_gate.clone()
+                        * is_truncated[0].clone()
+                        * val_d[i].clone()
+                );
+            }
+
+            // Shift-amount identity: RegValD = ShiftAmount + modulus · ShiftQuotient.
+            // Combine bytes into field elements, pick modulus from Is32Bit
+            // (32 if 32-bit shift, 64 otherwise — expressible as 32 · (2 - is_32bit)).
+            let shift_q = zkpvm_trace::trace_eval!(trace_eval, Column::ShiftQuotient);
+            let is_32b = zkpvm_trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let b256_1 = E::F::from(BaseField::from(256u32));
+            let b256_2 = b256_1.clone() * b256_1.clone();
+            let b256_3 = b256_2.clone() * b256_1.clone();
+            let b256_4 = b256_3.clone() * b256_1.clone();
+            let b256_5 = b256_4.clone() * b256_1.clone();
+            let b256_6 = b256_5.clone() * b256_1.clone();
+            let b256_7 = b256_6.clone() * b256_1.clone();
+            let combine8 = |bs: &[E::F]| -> E::F {
+                bs[0].clone()
+                    + bs[1].clone() * b256_1.clone()
+                    + bs[2].clone() * b256_2.clone()
+                    + bs[3].clone() * b256_3.clone()
+                    + bs[4].clone() * b256_4.clone()
+                    + bs[5].clone() * b256_5.clone()
+                    + bs[6].clone() * b256_6.clone()
+                    + bs[7].clone() * b256_7.clone()
+            };
+            let reg_val_d_field = combine8(&reg_val_d);
+            let shift_q_field = combine8(&shift_q);
+            let shift_amount_e = zkpvm_trace::trace_eval!(trace_eval, Column::ShiftAmount);
+            let two = E::F::from(BaseField::from(2u32));
+            let thirty_two = E::F::from(BaseField::from(32u32));
+            let modulus = thirty_two * (two - is_32b[0].clone());
+            // Gated on ValDIsReg too: for 32-bit shifts the ValD read is
+            // skipped (truncated_32bit) and RegValD = 0, so the constraint
+            // must not fire there — 9g will extend this.
+            eval.add_constraint(
+                is_real.clone()
+                    * val_d_is_reg[0].clone()
+                    * is_shift_c[0].clone()
+                    * (reg_val_d_field - shift_amount_e[0].clone() - modulus * shift_q_field)
+            );
+
+            let mut tuple: Vec<E::F> = vec![result_reg_idx[0].clone()];
+            for b in &result_c { tuple.push(b.clone()); }
+            for ts in &timestamp { tuple.push(ts.clone()); }
+            eval.add_to_relation(RelationEntry::new(
+                reg_lookup,
+                result_is_reg[0].clone().into(),
+                &tuple,
+            ));
+
+            // IsReg flags must be boolean.
+            eval.add_constraint(
+                is_real.clone() * val_b_is_reg[0].clone() * (val_b_is_reg[0].clone() - E::F::one())
+            );
+            eval.add_constraint(
+                is_real.clone() * val_d_is_reg[0].clone() * (val_d_is_reg[0].clone() - E::F::one())
+            );
+            eval.add_constraint(
+                is_real.clone() * result_is_reg[0].clone() * (result_is_reg[0].clone() - E::F::one())
+            );
+        }
+
+        // ── Phase 9e: blake2b ECALL register-read producers + Phi7Bool tie ──
+        {
+            let is_blake_ecall = zkpvm_trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
+            let phi7 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi7);
+            let phi7_inv = zkpvm_trace::trace_eval!(trace_eval, Column::Phi7Inv);
+            let phi7_bool = zkpvm_trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            let phi10 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi10);
+            let phi11 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi11);
+            let phi12 = zkpvm_trace::trace_eval!(trace_eval, Column::Phi12);
+
+            const ECALL_REG_IDXS: [u32; 4] = [7, 10, 11, 12];
+            let phi_cols: [&[E::F]; 4] = [&phi7, &phi10, &phi11, &phi12];
+            for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
+                let mut tuple: Vec<E::F> = Vec::with_capacity(17);
+                tuple.push(E::F::from(BaseField::from(reg_idx)));
+                for c in phi_cols[slot] { tuple.push(c.clone()); }
+                for c in &timestamp { tuple.push(c.clone()); }
+                eval.add_to_relation(RelationEntry::new(
+                    reg_lookup,
+                    is_blake_ecall[0].clone().into(),
+                    &tuple,
+                ));
+            }
+
+            // Phi7Bool ↔ Phi7 (the u64-combined field value) tie, gated only
+            // by is_real (at non-ECALL rows the Phi7Bool is still consistent
+            // with Phi7 because trace gen derives both from regs_before[7]).
+            let b256_1 = E::F::from(BaseField::from(256u32));
+            let b256_2 = b256_1.clone() * b256_1.clone();
+            let b256_3 = b256_2.clone() * b256_1.clone();
+            let b256_4 = b256_3.clone() * b256_1.clone();
+            let b256_5 = b256_4.clone() * b256_1.clone();
+            let b256_6 = b256_5.clone() * b256_1.clone();
+            let b256_7 = b256_6.clone() * b256_1.clone();
+            let combine8 = |bytes: &[E::F]| -> E::F {
+                bytes[0].clone()
+                    + bytes[1].clone() * b256_1.clone()
+                    + bytes[2].clone() * b256_2.clone()
+                    + bytes[3].clone() * b256_3.clone()
+                    + bytes[4].clone() * b256_4.clone()
+                    + bytes[5].clone() * b256_5.clone()
+                    + bytes[6].clone() * b256_6.clone()
+                    + bytes[7].clone() * b256_7.clone()
+            };
+            let phi7_field = combine8(&phi7);
+            let phi7_inv_field = combine8(&phi7_inv);
+            // Phi7Bool is boolean.
+            eval.add_constraint(
+                is_real.clone() * phi7_bool[0].clone() * (phi7_bool[0].clone() - E::F::one())
+            );
+            // If Phi7Bool = 0, then Phi7 (as field) = 0.
+            eval.add_constraint(
+                is_real.clone()
+                    * (E::F::one() - phi7_bool[0].clone())
+                    * phi7_field.clone()
+            );
+            // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 (so Phi7 is non-zero).
+            eval.add_constraint(
+                is_real.clone()
+                    * phi7_bool[0].clone()
+                    * (phi7_field * phi7_inv_field - E::F::one())
+            );
         }
 
         // Blake2b call binding (Phase 8c): mirror of the prover-side producer.

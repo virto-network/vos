@@ -15,6 +15,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::Blake2bChip, // consumes Bitwise AND lookup
     &chips::MemoryChip,
     &chips::MemoryBoundaryChip,
+    &chips::RegisterMemoryChip,
+    &chips::RegisterMemoryBoundaryChip,
     &chips::ProgramBoundaryChip,
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,

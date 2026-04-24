@@ -6,6 +6,8 @@ pub mod memory_boundary;
 pub mod power_of_two;
 pub mod program_boundary;
 pub mod range_multiplicity;
+pub mod register_memory;
+pub mod register_memory_boundary;
 
 pub use blake2b::{Blake2bChip, Blake2bCall, blake2b_compress};
 pub use bitwise_lookup::BitwiseLookupChip;
@@ -15,3 +17,5 @@ pub use memory_boundary::MemoryBoundaryChip;
 pub use power_of_two::PowerOfTwoChip;
 pub use program_boundary::ProgramBoundaryChip;
 pub use range_multiplicity::RangeMultiplicity256;
+pub use register_memory::RegisterMemoryChip;
+pub use register_memory_boundary::RegisterMemoryBoundaryChip;

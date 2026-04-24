@@ -112,7 +112,11 @@ pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -
 pub fn debug_claimed_sums(side_note: &mut SideNote) {
     use num_traits::Zero;
     let components = BASE_COMPONENTS;
-    let component_names = ["CpuChip", "Blake2b", "MemoryChip", "MemBoundary", "ProgBoundary", "Range256", "BitwiseLookup", "PowerOfTwo"];
+    let component_names = [
+        "CpuChip", "Blake2b", "MemoryChip", "MemBoundary",
+        "RegMemory", "RegMemBoundary",
+        "ProgBoundary", "Range256", "BitwiseLookup", "PowerOfTwo",
+    ];
 
     let traces: Vec<ComponentTrace> = components
         .iter()
@@ -163,6 +167,18 @@ fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[zkpvm_core::s
 fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
     let components = BASE_COMPONENTS;
+
+    // Phase 9a: backfill initial_regs from the first step's regs_before if the
+    // caller left it at the default all-zero but the tracer recorded non-zero
+    // initial state.  Pre-Phase-9 tests won't notice since nothing consumes
+    // this yet; downstream RegisterMemoryBoundaryChip (9b) needs it populated.
+    if !side_note.steps.is_empty()
+        && side_note.initial_regs.iter().all(|&r| r == 0)
+    {
+        let first = &side_note.steps[0];
+        let n = zkpvm_core::step::NUM_REGS.min(first.regs_before.len());
+        side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
+    }
 
     let t = Instant::now();
     let traces: Vec<ComponentTrace> = components

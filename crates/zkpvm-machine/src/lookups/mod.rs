@@ -84,10 +84,10 @@ impl<T: RegisteredLookupBound> ComponentLookupElements for T {
     }
 }
 
-#[impl_for_tuples(6)]
+#[impl_for_tuples(7)]
 impl private::Sealed for T {}
 
-#[impl_for_tuples(6)]
+#[impl_for_tuples(7)]
 #[allow(clippy::unused_unit)]
 impl ComponentLookupElements for T {
     fn dummy() -> Self {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use zkpvm_core::step::PvmStep;
+use zkpvm_core::step::{PvmStep, NUM_REGS};
 
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
@@ -28,6 +28,12 @@ pub struct SideNote {
     /// writes for output).  MemoryChip ingests these into the ledger so the
     /// Blake2bChip memory-consumer lookups balance.
     pub blake2b_mem_ops: Vec<zkpvm_core::tracing::Blake2bMemOp>,
+    /// Initial register state at the start of the traced execution.  Seeds
+    /// the RegisterMemoryBoundaryChip producers at ts=0 and surfaces in the
+    /// public SegmentState boundary.  Default all-zero; callers that care
+    /// (ECALL tests, actor entry points with non-zero regs) override via
+    /// with_initial_regs or direct assignment.
+    pub initial_regs: [u64; NUM_REGS],
 }
 
 impl SideNote {
@@ -43,11 +49,17 @@ impl SideNote {
             power_of_two_counts: vec![0u32; 64],
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            initial_regs: [0u64; NUM_REGS],
         }
     }
 
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {
         self.initial_memory = flat_mem;
+        self
+    }
+
+    pub fn with_initial_regs(mut self, regs: [u64; NUM_REGS]) -> Self {
+        self.initial_regs = regs;
         self
     }
 
