@@ -118,6 +118,46 @@ impl EffectLog {
     }
 }
 
+/// Side-channel state for one dispatch under a CRDT/Raft strategy.
+///
+/// Exactly one mode is active at a time — a dispatch is either
+/// observed for the first time (`Recording`) or being replayed from
+/// a stored log (`Replaying`). `Inactive` means the actor is under
+/// a `LocalCommit` (or `NoCommit`) strategy and the invoke handler
+/// runs in the same way it always has.
+///
+/// The runtime holds one of these per tick and threads a
+/// mutable reference down through the refine/invoke call chain.
+pub enum EffectMode {
+    /// No recording or replay — the default.
+    Inactive,
+    /// The host captures every top-level invoke output so the
+    /// finished log can be attached to the commit.
+    Recording(EffectSession),
+    /// The host short-circuits every top-level invoke, replaying
+    /// the observed output bytes from the log instead of running
+    /// the child.
+    Replaying(EffectReplay),
+}
+
+impl Default for EffectMode {
+    fn default() -> Self {
+        EffectMode::Inactive
+    }
+}
+
+impl EffectMode {
+    /// `true` when actively recording.
+    pub fn is_recording(&self) -> bool {
+        matches!(self, EffectMode::Recording(_))
+    }
+
+    /// `true` when actively replaying.
+    pub fn is_replaying(&self) -> bool {
+        matches!(self, EffectMode::Replaying(_))
+    }
+}
+
 /// In-flight recording state for one dispatch.
 ///
 /// The host creates a session when a CRDT/Raft actor is about to
@@ -167,6 +207,65 @@ impl EffectSession {
     }
 
     /// Consume the session and return the finished log.
+    pub fn into_log(self) -> EffectLog {
+        self.log
+    }
+}
+
+/// Replay state for one dispatch: owns the log and walks it in
+/// order as the handler re-issues its asks.
+///
+/// `EffectReplay::next_reply` returns the next recorded output.
+/// If the handler asks more than was recorded, `next_reply`
+/// returns `None` and marks the replay as exhausted — callers
+/// should treat this as a non-determinism failure and surface a
+/// PANICKED status back to the PVM.
+pub struct EffectReplay {
+    log: EffectLog,
+    pos: usize,
+    exhausted: bool,
+}
+
+impl EffectReplay {
+    /// Wrap a stored [`EffectLog`] for replay.
+    pub fn new(log: EffectLog) -> Self {
+        Self { log, pos: 0, exhausted: false }
+    }
+
+    /// The incoming dispatch message associated with this log.
+    pub fn msg(&self) -> &[u8] {
+        &self.log.msg
+    }
+
+    /// Consume the next recorded reply. `None` means the log is
+    /// exhausted — the handler is asking more than was recorded.
+    pub fn next_reply(&mut self) -> Option<&[u8]> {
+        if self.pos >= self.log.replies.len() {
+            self.exhausted = true;
+            return None;
+        }
+        let r = &self.log.replies[self.pos];
+        self.pos += 1;
+        Some(r.as_slice())
+    }
+
+    /// Number of replies already consumed.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Did the replay consume every recorded reply?
+    pub fn is_complete(&self) -> bool {
+        !self.exhausted && self.pos == self.log.replies.len()
+    }
+
+    /// Did the handler ask for more replies than were recorded?
+    pub fn was_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Recover the original log (e.g. if the dispatch failed and
+    /// you want to retry).
     pub fn into_log(self) -> EffectLog {
         self.log
     }

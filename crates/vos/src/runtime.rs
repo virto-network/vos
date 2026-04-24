@@ -245,14 +245,15 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     code_cache: javm::CodeCache,
     /// Optional handler for INVOKE targets not in this runtime.
     external_invoke: Option<ExternalInvokeFn>,
-    /// Active recording session for the current dispatch.
+    /// Side-channel mode for the current dispatch.
     ///
-    /// When `Some`, every top-level INVOKE hostcall issued by the
-    /// service being refined appends its output bytes to the
-    /// session's log. The host sets this before a CRDT/Raft
-    /// dispatch and takes it back afterward to attach to the
-    /// commit. `None` = no recording (LocalCommit, NoCommit).
-    effect_session: Option<crate::effect_log::EffectSession>,
+    /// - `Inactive` — regular execution; no recording or replay.
+    /// - `Recording` — every top-level INVOKE output is captured
+    ///   into the session's log for attachment to the commit.
+    /// - `Replaying` — every top-level INVOKE short-circuits and
+    ///   returns the next logged output instead of running the
+    ///   child.
+    effect_mode: crate::effect_log::EffectMode,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -284,7 +285,7 @@ impl<D: DataLayer> VosRuntime<D> {
             data,
             code_cache: javm::CodeCache::new(),
             external_invoke: None,
-            effect_session: None,
+            effect_mode: crate::effect_log::EffectMode::Inactive,
         }
     }
 
@@ -304,27 +305,69 @@ impl<D: DataLayer> VosRuntime<D> {
     /// returned by [`finish_recording`](Self::finish_recording)
     /// after the dispatch completes.
     pub fn begin_recording(&mut self, msg: Vec<u8>) {
-        self.effect_session = Some(crate::effect_log::EffectSession::new(msg));
+        self.effect_mode = crate::effect_log::EffectMode::Recording(
+            crate::effect_log::EffectSession::new(msg),
+        );
     }
 
     /// Begin recording with a custom per-reply size cap (overrides
     /// [`crate::effect_log::DEFAULT_REPLY_CAP`]).
     pub fn begin_recording_with_cap(&mut self, msg: Vec<u8>, cap: usize) {
-        self.effect_session =
-            Some(crate::effect_log::EffectSession::new(msg).with_cap(cap));
+        self.effect_mode = crate::effect_log::EffectMode::Recording(
+            crate::effect_log::EffectSession::new(msg).with_cap(cap),
+        );
     }
 
     /// Take the recorded [`EffectLog`](crate::effect_log::EffectLog)
-    /// and clear the active session.
+    /// and return to the inactive mode.
     ///
-    /// Returns `None` if no recording was in progress.
+    /// Returns `None` if no recording was in progress (the mode was
+    /// `Inactive` or `Replaying`).
     pub fn finish_recording(&mut self) -> Option<crate::effect_log::EffectLog> {
-        self.effect_session.take().map(|s| s.into_log())
+        match std::mem::take(&mut self.effect_mode) {
+            crate::effect_log::EffectMode::Recording(s) => Some(s.into_log()),
+            other => {
+                self.effect_mode = other;
+                None
+            }
+        }
+    }
+
+    /// Begin replay: every top-level INVOKE during the next
+    /// dispatch will return the corresponding logged bytes instead
+    /// of running the child. Use this when restoring a CRDT actor
+    /// from its DAG.
+    pub fn begin_replay(&mut self, log: crate::effect_log::EffectLog) {
+        self.effect_mode = crate::effect_log::EffectMode::Replaying(
+            crate::effect_log::EffectReplay::new(log),
+        );
+    }
+
+    /// Take the replay state and return to the inactive mode. The
+    /// returned [`EffectReplay`](crate::effect_log::EffectReplay)
+    /// can be inspected for completion (`is_complete`) or
+    /// exhaustion (`was_exhausted`) to detect non-deterministic
+    /// handlers during rebuild.
+    ///
+    /// Returns `None` if no replay was in progress.
+    pub fn finish_replay(&mut self) -> Option<crate::effect_log::EffectReplay> {
+        match std::mem::take(&mut self.effect_mode) {
+            crate::effect_log::EffectMode::Replaying(r) => Some(r),
+            other => {
+                self.effect_mode = other;
+                None
+            }
+        }
     }
 
     /// Whether a recording session is active.
     pub fn is_recording(&self) -> bool {
-        self.effect_session.is_some()
+        self.effect_mode.is_recording()
+    }
+
+    /// Whether replay is active.
+    pub fn is_replaying(&self) -> bool {
+        self.effect_mode.is_replaying()
     }
 
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
@@ -487,7 +530,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     blobs,
                     blob_by_hash,
                     services,
-                    &mut self.effect_session,
+                    &mut self.effect_mode,
                     &mut self.code_cache,
                     next_id,
                     &self.external_invoke,
@@ -640,7 +683,7 @@ fn run_refine_kernel(
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
     services: &HashMap<u32, ServiceInfo>,
-    session: &mut Option<crate::effect_log::EffectSession>,
+    mode: &mut crate::effect_log::EffectMode,
     code_cache: &mut javm::CodeCache,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
@@ -681,7 +724,7 @@ fn run_refine_kernel(
                     0,
                     next_id,
                     external_invoke,
-                    session,
+                    mode,
                 );
             }
         }
@@ -707,7 +750,7 @@ fn handle_refine_hostcall(
     depth: usize,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
-    session: &mut Option<crate::effect_log::EffectSession>,
+    mode: &mut crate::effect_log::EffectMode,
 ) {
     let a0 = kernel.active_reg(7);
     let a1 = kernel.active_reg(8);
@@ -824,7 +867,7 @@ fn handle_refine_hostcall(
                 depth + 1,
                 next_id,
                 external_invoke,
-                session,
+                mode,
             );
             (result, 0)
         }
@@ -846,10 +889,10 @@ fn record_and_write_invoke(
     output_ptr: u32,
     output: &[u8],
     depth: usize,
-    session: &mut Option<crate::effect_log::EffectSession>,
+    mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
     if depth == 1 {
-        if let Some(s) = session.as_mut() {
+        if let crate::effect_log::EffectMode::Recording(s) = mode {
             s.record(output.to_vec());
         }
     }
@@ -873,7 +916,7 @@ fn handle_invoke(
     depth: usize,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
-    session: &mut Option<crate::effect_log::EffectSession>,
+    mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
     use crate::actors::run::{STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED};
 
@@ -883,9 +926,25 @@ fn handle_invoke(
     let gas_limit = caller.active_reg(10);
     let output_ptr = caller.active_reg(11) as u32;
 
+    // Replay fast path: at the top-level invoke under a replay
+    // session, return the next recorded output instead of running
+    // the child. If the log is exhausted we surface STATUS_PANICKED
+    // — the handler has become non-deterministic (asking more than
+    // we recorded), and the caller should treat the whole rebuild
+    // as a failure.
+    if depth == 1 {
+        if let crate::effect_log::EffectMode::Replaying(replay) = mode {
+            let out: alloc::vec::Vec<u8> = match replay.next_reply() {
+                Some(bytes) => bytes.to_vec(),
+                None => alloc::vec![STATUS_PANICKED],
+            };
+            kwrite(caller, output_ptr, &out);
+            return out.len() as u64;
+        }
+    }
+
     if depth >= MAX_INVOKE_DEPTH {
-        kwrite(caller, output_ptr, &[STATUS_OOG]);
-        return 1;
+        return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
     }
 
     let code_hash = kread_hash(caller, hash_ptr);
@@ -926,19 +985,19 @@ fn handle_invoke(
                         output.push(crate::actors::run::STATUS_DONE);
                         output.extend_from_slice(&0u32.to_le_bytes());
                         output.extend_from_slice(&reply);
-                        return record_and_write_invoke(caller, output_ptr, &output, depth, session);
+                        return record_and_write_invoke(caller, output_ptr, &output, depth, mode);
                     }
                 }
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
             }
         }
     } else {
-        return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
+        return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
         None => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, session);
+            return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
         }
     };
 
@@ -953,7 +1012,7 @@ fn handle_invoke(
     let mut child = match InvocationKernel::new_cached(blob, &[], gas, code_cache) {
         Ok(k) => k,
         Err(_) => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
+            return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
         }
     };
     child.set_active_reg(7, 0); // refine
@@ -991,18 +1050,19 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 eprintln!("vosx: child invoke panicked at PC={pc} (target svc {target_svc_id:?})");
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
             }
             KernelResult::OutOfGas => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, session);
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
             }
             KernelResult::PageFault(_addr) => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, session);
+                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
             }
             KernelResult::ProtocolCall { slot } => {
-                // Nested invokes by the child actor are not part of
-                // the recording caller's session; feed `None` here.
-                let mut child_session = None;
+                // Nested invokes by the child actor are not part
+                // of the caller's recording/replay session. Feed
+                // them an Inactive mode so they run normally.
+                let mut child_mode = crate::effect_log::EffectMode::Inactive;
                 handle_refine_hostcall(
                     &mut child,
                     slot as u32,
@@ -1018,7 +1078,7 @@ fn handle_invoke(
                     depth,
                     next_id,
                     external_invoke,
-                    &mut child_session,
+                    &mut child_mode,
                 );
             }
         }
@@ -1053,7 +1113,7 @@ fn handle_invoke(
         raw_output
     };
 
-    record_and_write_invoke(caller, output_ptr, &output, depth, session)
+    record_and_write_invoke(caller, output_ptr, &output, depth, mode)
 }
 
 /// Capture a continuation: hash flat_mem, store in the data layer,

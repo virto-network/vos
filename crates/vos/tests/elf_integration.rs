@@ -491,6 +491,130 @@ fn recording_session_captures_invoke_replies() {
 }
 
 #[test]
+fn replay_session_short_circuits_external_invoke() {
+    // Two runs: record the first, replay the second. In replay mode
+    // the runtime should NOT call external_invoke at all — the
+    // logged outputs are handed back verbatim at the top-level
+    // invoke. Both runs should produce identical scheduler behaviour.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let echo_so = {
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
+        std::path::PathBuf::from(p)
+    };
+    if !echo_so.exists() {
+        eprintln!("SKIP: echo-worker not built");
+        return;
+    }
+
+    let blob = transpile_actor(&agent_data);
+    let worker_child_id = vos::abi::service::ServiceId(99);
+
+    // ── Run 1: record ───────────────────────────────────────────────
+    let invoke_count_rec = std::sync::Arc::new(AtomicU32::new(0));
+    let count_rec_clone = invoke_count_rec.clone();
+
+    let plugin: &'static _ = Box::leak(Box::new(
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+    ));
+    let instance_rec = std::sync::Mutex::new(plugin.create());
+
+    let recorded_log = {
+        let mut rt = VosRuntime::new();
+        let agent_id = register_svc(&mut rt, blob.clone());
+
+        rt.set_external_invoke(Box::new(move |target, msg| {
+            if target != worker_child_id { return None; }
+            count_rec_clone.fetch_add(1, Ordering::Relaxed);
+            let mut inst = instance_rec.lock().unwrap();
+            match inst.dispatch_raw(msg) {
+                Ok(reply) => Some(reply),
+                Err(_) => Some(Vec::new()),
+            }
+        }));
+
+        let args = vos::init::InitArgs::new()
+            .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+        let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+        rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+        rt.begin_recording(Vec::new());
+        rt.send_to(agent_id, Vec::new());
+        rt.run_blocking();
+        let log = rt.finish_recording().expect("recording");
+        assert_eq!(rt.panics, 0);
+        log
+    };
+
+    let rec_invokes = invoke_count_rec.load(Ordering::Relaxed);
+    assert!(rec_invokes > 0, "recording run should have invoked");
+    assert_eq!(
+        recorded_log.reply_count() as u32, rec_invokes,
+        "log should have one entry per top-level invoke",
+    );
+
+    // ── Run 2: replay with a fresh runtime + a callback that
+    //           MUST NOT fire ─────────────────────────────────────────
+    let invoke_count_rep = std::sync::Arc::new(AtomicU32::new(0));
+    let count_rep_clone = invoke_count_rep.clone();
+
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    rt.set_external_invoke(Box::new(move |_target, _msg| {
+        count_rep_clone.fetch_add(1, Ordering::Relaxed);
+        // Return something obviously wrong so that if the test
+        // accidentally hits this path, the assertions below will fail.
+        Some(alloc_bogus_reply())
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.begin_replay(recorded_log);
+    assert!(rt.is_replaying());
+    rt.send_to(agent_id, Vec::new());
+    rt.run_blocking();
+    let replay = rt.finish_replay().expect("replay");
+    assert!(!rt.is_replaying(), "replay should be cleared");
+
+    assert_eq!(rt.panics, 0, "scheduler panicked during replay");
+
+    // The crucial invariant: replay did NOT call external_invoke.
+    let rep_invokes = invoke_count_rep.load(Ordering::Relaxed);
+    assert_eq!(rep_invokes, 0, "replay must not issue external invokes");
+
+    // All recorded replies consumed — no drift.
+    assert!(
+        replay.is_complete(),
+        "replay should consume all recorded replies (pos={}, exhausted={})",
+        replay.position(), replay.was_exhausted(),
+    );
+}
+
+fn alloc_bogus_reply() -> Vec<u8> {
+    // rkyv-encoded "this-should-not-appear" string bytes — doesn't
+    // matter what exactly, just something recognizably wrong.
+    b"BOGUS".to_vec()
+}
+
+#[test]
 fn display_multiple_vec_renders() {
     // Regression test for the multi-deliver Vec bug (March 2025):
     // under the old bump allocator, sequential messages containing
