@@ -26,6 +26,23 @@ use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnT
 /// struct Counter { count: i32 }
 /// ```
 ///
+/// ## Pure actors
+///
+/// Add `pure` to declare a deterministic state machine:
+/// ```ignore
+/// #[actor(pure)]
+/// struct Ledger { balances: BTreeMap<ServiceId, u64> }
+///
+/// #[messages(pure)]
+/// impl Ledger { /* no ctx.ask / ctx.fetch — caught at compile time */ }
+/// ```
+///
+/// `#[actor(pure)]` emits `impl PureActor for Self`; `#[messages(pure)]`
+/// makes the handler's `ctx` a [`PureContext`] that lacks the
+/// observation methods (`ask`, `resolve`, `fetch`, ...). Both must
+/// be present: `#[messages(pure)]` contains a compile-time assertion
+/// that the paired `#[actor(pure)]` exists.
+///
 /// ## Without this macro
 ///
 /// If you need custom construction (e.g. init payload), skip `#[actor]` and
@@ -36,30 +53,14 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &input.ident;
     let msg_enum = format_ident!("{}Msg", name);
 
-    // Parse optional error type from #[actor(error = Type)]
-    let error_ty = if attr.is_empty() {
-        quote! { () }
-    } else {
-        let meta = syn::parse_macro_input!(attr as syn::Meta);
-        match meta {
-            syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
-                let val = &nv.value;
-                quote! { #val }
-            }
-            syn::Meta::List(list) => {
-                let mut ty = None;
-                let _ = list.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("error") {
-                        let value = meta.value()?;
-                        ty = Some(value.parse::<syn::Type>()?);
-                    }
-                    Ok(())
-                });
-                ty.map(|t| quote! { #t }).unwrap_or_else(|| quote! { () })
-            }
-            _ => quote! { () },
-        }
-    };
+    // Parse optional attributes:
+    //   #[actor(error = Type)]  — custom error type for Actor::Error
+    //   #[actor(pure)]          — actor is a pure state machine; no
+    //                             ctx.ask / fetch / resolve allowed.
+    //                             Must be paired with #[messages(pure)]
+    //                             for compile-time enforcement.
+    //   #[actor(error = Type, pure)] — both
+    let (error_ty, is_pure) = parse_actor_attrs(attr);
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -100,6 +101,16 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
+    // If `pure` was declared, also emit the PureActor marker impl
+    // so paired `#[messages(pure)]` can statically verify it.
+    let pure_impl = if is_pure {
+        quote! {
+            impl #impl_generics vos::PureActor for #name #ty_generics #where_clause {}
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #struct_def
 
@@ -128,6 +139,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 })
             }
         }
+
+        #pure_impl
     };
 
     expanded.into()
@@ -152,7 +165,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `_start` / `accumulate` PVM entry points
 /// - `.vos_meta` section with actor metadata
 #[proc_macro_attribute]
-pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Parse `#[messages(pure)]` — when present, handler bodies are
+    // wrapped so that `ctx` becomes a `PureContext<Self>` instead of
+    // a `Context<Self>`. A pure actor whose handler calls
+    // `ctx.ask` / `ctx.fetch` / `ctx.resolve` then fails to compile.
+    let is_pure = parse_pure_attr(attr);
     let input = parse_macro_input!(item as ItemImpl);
     let actor_ty = &input.self_ty;
 
@@ -287,7 +305,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { let #struct_name { #( #field_names ),* } = msg; }
         };
 
+        // For pure actors, restrict `ctx` inside the handler body to
+        // a PureContext. This shadows the outer `ctx: &mut Context`
+        // with `&mut PureContext`, so any user-facing call to
+        // `ctx.ask`, `ctx.fetch`, etc. fails to compile.
+        let pure_preamble = if is_pure {
+            quote! { let ctx = vos::PureContext::wrap(ctx); }
+        } else {
+            quote! {}
+        };
+
         let handler_body = quote! {
+            #pure_preamble
             #field_binds
             #body
         };
@@ -560,9 +589,26 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Compile-time assertion: `#[messages(pure)]` requires the
+    // actor to implement `vos::PureActor` — normally via
+    // `#[actor(pure)]`. A missing declaration surfaces as a clear
+    // "not implemented for" error pointing at the assertion.
+    let pure_assert = if is_pure {
+        quote! {
+            const _: fn() = || {
+                fn __vos_require_pure_actor<T: vos::PureActor>() {}
+                __vos_require_pure_actor::<#actor_name>();
+            };
+        }
+    } else {
+        quote! {}
+    };
+
     // Preamble — always emitted
     let preamble = quote! {
         extern crate alloc;
+
+        #pure_assert
 
         /// Result type alias using this actor's error type.
         #[allow(dead_code)]
@@ -1164,19 +1210,87 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Check if a type is a reference to `Context` (either `&Context<..>` or `&mut Context<..>`).
+/// Check if a type is a reference to `Context` or `PureContext`
+/// (either `&Context<..>` / `&mut Context<..>`).
 fn is_context_type(ty: &syn::Type) -> bool {
     if let syn::Type::Reference(r) = ty {
         return match r.elem.as_ref() {
-            syn::Type::Path(p) => p
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "Context"),
+            syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| {
+                s.ident == "Context" || s.ident == "PureContext"
+            }),
             _ => false,
         };
     }
     false
+}
+
+/// Parse `#[actor(...)]` attributes. Returns `(error_ty, is_pure)`.
+///
+/// Accepted forms:
+///   #[actor]
+///   #[actor(error = Type)]
+///   #[actor(pure)]
+///   #[actor(error = Type, pure)]
+fn parse_actor_attrs(attr: TokenStream) -> (proc_macro2::TokenStream, bool) {
+    let default_err = quote! { () };
+    if attr.is_empty() {
+        return (default_err, false);
+    }
+    let meta = match syn::parse::<syn::Meta>(attr) {
+        Ok(m) => m,
+        Err(_) => return (default_err, false),
+    };
+    match meta {
+        syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
+            let val = &nv.value;
+            (quote! { #val }, false)
+        }
+        syn::Meta::Path(p) if p.is_ident("pure") => (default_err, true),
+        syn::Meta::List(list) => {
+            let mut err_ty: Option<syn::Type> = None;
+            let mut pure = false;
+            let _ = list.parse_nested_meta(|meta| {
+                if meta.path.is_ident("error") {
+                    let value = meta.value()?;
+                    err_ty = Some(value.parse::<syn::Type>()?);
+                } else if meta.path.is_ident("pure") {
+                    pure = true;
+                }
+                Ok(())
+            });
+            let err = err_ty
+                .map(|t| quote! { #t })
+                .unwrap_or_else(|| default_err.clone());
+            (err, pure)
+        }
+        _ => (default_err, false),
+    }
+}
+
+/// Parse the `pure` attribute off `#[messages(pure)]`. Returns `true`
+/// when present. Any other form of `#[messages(...)]` is silently
+/// ignored (the macro only accepts `pure` today).
+fn parse_pure_attr(attr: TokenStream) -> bool {
+    if attr.is_empty() {
+        return false;
+    }
+    let Ok(meta) = syn::parse::<syn::Meta>(attr) else {
+        return false;
+    };
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("pure"),
+        syn::Meta::List(list) => {
+            let mut pure = false;
+            let _ = list.parse_nested_meta(|meta| {
+                if meta.path.is_ident("pure") {
+                    pure = true;
+                }
+                Ok(())
+            });
+            pure
+        }
+        _ => false,
+    }
 }
 
 /// If `ty` is `Result<T>` or `Result<T, E>`, return the `T`.

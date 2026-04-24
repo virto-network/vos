@@ -104,6 +104,26 @@ pub trait Actor: Sized + Encode + Decode {
     }
 }
 
+/// Marker trait declaring that an actor is **pure**.
+///
+/// A pure actor's handlers may not observe external state: they
+/// must not call `ctx.ask`, `ctx.ask_raw`, `ctx.resolve`,
+/// `ctx.tell_named`, `ctx.fetch`, or `ctx.host_call`. This makes
+/// the actor's state a deterministic function of its inputs — the
+/// property that trustless mini-chains and zkVM-provable actors
+/// need.
+///
+/// Implemented automatically by `#[actor(pure)]`. Paired with
+/// `#[messages(pure)]`, which generates handler bodies that see a
+/// [`PureContext`](super::context::PureContext) instead of a
+/// [`Context`](super::context::Context) — so a stray `ctx.ask`
+/// fails to compile rather than silently breaking replay.
+///
+/// Can also be implemented manually for actors that don't use the
+/// macros.
+#[allow(dead_code)]
+pub trait PureActor: Actor {}
+
 /// Defines how an actor handles a specific message type.
 ///
 /// `Output` is the raw return type of the handler:
