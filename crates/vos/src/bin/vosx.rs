@@ -160,20 +160,12 @@ fn cmd_node(
     // Load registry at ServiceId(0) if specified
     if let Some(reg_path) = registry {
         let blob = load_blob(reg_path);
-        let id = node.register(AgentConfig {
-            blob,
-            init_payloads: vec![],
-            storage: vec![],
-        });
+        let id = node.register(AgentConfig::new(blob));
         eprintln!("vosx: registry '{}' as {id}", reg_path.display());
     }
 
     for path in programs {
-        let id = node.register(AgentConfig {
-            blob: load_blob(path),
-            init_payloads: vec![],
-            storage: vec![],
-        });
+        let id = node.register(AgentConfig::new(load_blob(path)));
         eprintln!("vosx: registered '{}' as {id:?}", path.display());
     }
 

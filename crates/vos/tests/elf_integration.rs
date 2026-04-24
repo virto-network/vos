@@ -615,6 +615,112 @@ fn alloc_bogus_reply() -> Vec<u8> {
 }
 
 #[test]
+fn crdt_agent_populates_dag_and_state_on_dispatch() {
+    // End-to-end: register a PVM agent with Crdt consistency + a
+    // data-dir, kick a dispatch, and verify the agent's redb file
+    // holds both a materialized state entry and at least one DAG
+    // node. This exercises the agent_thread → runtime →
+    // record_and_write_invoke → commit_with_log path.
+    use vos::node::{AgentConfig, Consistency, Envelope, VosNode};
+    use vos::abi::service::ServiceId;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "vos_crdt_agent_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+
+    // Scheduler needs its `children` init arg in storage before
+    // dispatch — an empty list is fine, we're just proving the
+    // CRDT wire-up fires.
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(Vec::new()));
+    let init_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
+        .unwrap()
+        .to_vec();
+
+    let mut node = VosNode::new();
+    let agent_id = node.register(
+        AgentConfig::new(blob)
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes)])
+            .with_consistency(Consistency::Crdt)
+            .persist(&data_dir),
+    );
+
+    node.run();
+    let results = node.collect();
+    for r in &results {
+        assert_eq!(r.panics, 0, "agent {} panicked", r.id);
+    }
+
+    // Verify the redb file exists at the expected path.
+    let db_path = data_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", agent_id.0));
+    assert!(db_path.exists(), "CRDT redb not created at {}", db_path.display());
+
+    // Open the db and check both tables.
+    let db = redb::Database::open(&db_path).expect("open db");
+    let txn = db.begin_read().unwrap();
+
+    // State table: must hold the roots key at minimum. The actor
+    // state row may be empty for stateless refine-only agents (the
+    // scheduler doesn't yield a continuation when its children
+    // list is empty), but the roots entry always exists once a
+    // commit has fired.
+    let state_table = txn
+        .open_table(redb::TableDefinition::<&str, &[u8]>::new("state"))
+        .expect("state table exists");
+    let roots_bytes = state_table
+        .get("crdt_roots")
+        .unwrap()
+        .expect("crdt_roots persisted")
+        .value()
+        .to_vec();
+    assert!(roots_bytes.len() >= 8, "roots must encode at least count");
+    let roots_count = u64::from_le_bytes(roots_bytes[..8].try_into().unwrap());
+    assert!(roots_count >= 1, "expected at least one root CID");
+
+    // DAG table: at least one node was appended.
+    let dag_table = txn
+        .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("dag"))
+        .expect("dag table exists");
+    use redb::ReadableTableMetadata;
+    let n = dag_table.len().unwrap();
+    assert!(n >= 1, "expected at least one DAG node, found {n}");
+
+    drop(dag_table);
+    drop(state_table);
+    drop(txn);
+    drop(db);
+
+    // Silence unused warnings for ids that aren't otherwise used here.
+    let _ = ServiceId(0);
+    let _ = Envelope { from: agent_id, to: agent_id, payload: Vec::new() };
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
 fn display_multiple_vec_renders() {
     // Regression test for the multi-deliver Vec bug (March 2025):
     // under the old bump allocator, sequential messages containing

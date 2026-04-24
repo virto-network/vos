@@ -39,6 +39,26 @@ pub struct AgentResult {
     pub panics: u32,
 }
 
+/// Replication / persistence semantics selected per agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consistency {
+    /// In-memory only — state is lost when the agent exits. The
+    /// default; matches the pre-persistence behaviour.
+    Ephemeral,
+    /// redb-backed local persistence (no replication, no log).
+    Local,
+    /// Merkle-CRDT replication: state + DAG + roots are written
+    /// atomically on every dispatch, and the observed-effect log
+    /// is attached to each DAG node for deterministic replay.
+    Crdt,
+}
+
+impl Default for Consistency {
+    fn default() -> Self {
+        Self::Ephemeral
+    }
+}
+
 /// Configuration for registering an agent in the node.
 pub struct AgentConfig {
     /// PVM blob (already transpiled).
@@ -47,6 +67,59 @@ pub struct AgentConfig {
     pub init_payloads: Vec<Vec<u8>>,
     /// Pre-populated storage entries (key, value).
     pub storage: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Optional data directory for state persistence. When set and
+    /// `consistency` isn't `Ephemeral`, the agent's redb file is
+    /// created at `{data_dir}/agents/{svc_id}.redb`.
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Replication / persistence semantics for this agent.
+    pub consistency: Consistency,
+}
+
+impl AgentConfig {
+    /// Build a config with no persistence (the default).
+    pub fn new(blob: Vec<u8>) -> Self {
+        Self {
+            blob,
+            init_payloads: Vec::new(),
+            storage: Vec::new(),
+            data_dir: None,
+            consistency: Consistency::Ephemeral,
+        }
+    }
+
+    /// Attach initial payloads dispatched on cold start.
+    pub fn with_init_payloads(mut self, payloads: Vec<Vec<u8>>) -> Self {
+        self.init_payloads = payloads;
+        self
+    }
+
+    /// Attach pre-populated storage (key, value) entries.
+    pub fn with_storage(mut self, storage: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// Pick the replication/persistence strategy.
+    pub fn with_consistency(mut self, c: Consistency) -> Self {
+        self.consistency = c;
+        self
+    }
+
+    /// Enable persistence under the given data directory.
+    pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Derive the redb path for this agent from its data directory
+    /// and service ID.
+    #[allow(dead_code)] // only read when the `storage` feature is on
+    fn db_path(&self, id: ServiceId) -> Option<std::path::PathBuf> {
+        let data_dir = self.data_dir.as_ref()?;
+        let dir = data_dir.join("agents");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("{:08x}.redb", id.0)))
+    }
 }
 
 /// Configuration for registering a native worker in the node.
@@ -249,6 +322,9 @@ fn agent_thread(
     outbox: mpsc::Sender<Envelope>,
     worker_invoke: HashMap<u32, mpsc::Sender<InvokeRequest>>,
 ) -> AgentResult {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
     let mut runtime = VosRuntime::new();
 
     // Set up external invoke handler for PVM → worker calls.
@@ -266,6 +342,11 @@ fn agent_thread(
         }));
     }
 
+    let consistency = config.consistency;
+    let recording_enabled = consistency == Consistency::Crdt;
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
+        build_agent_strategy(&config, id);
+
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
 
@@ -273,58 +354,171 @@ fn agent_thread(
         runtime.storage.write(svc_id, key, value);
     }
 
-    if config.init_payloads.is_empty() {
-        runtime.send_to(svc_id, Vec::new());
-    } else {
-        for payload in config.init_payloads {
-            runtime.send_to(svc_id, payload);
+    // Restore state or rebuild from the DAG.
+    if let Some(state_bytes) = strategy.restore() {
+        runtime
+            .storage
+            .write(svc_id, crate::lifecycle::STATE_KEY_BYTES, &state_bytes);
+        eprintln!("agent {id}: restored {} bytes of state", state_bytes.len());
+    } else if recording_enabled {
+        match strategy.replay_logs() {
+            Ok(logs) if !logs.is_empty() => {
+                eprintln!("agent {id}: rebuilding state from {} DAG nodes", logs.len());
+                for log in logs {
+                    let msg = log.msg.clone();
+                    runtime.begin_replay(log);
+                    runtime.send_to(svc_id, msg);
+                    runtime.run_blocking();
+                    // Drop any external transfers emitted during
+                    // replay — those had their original effects at
+                    // record time; we are not re-issuing them.
+                    let _ = runtime.drain_external_transfers(svc_id);
+                    if let Some(replay) = runtime.finish_replay() {
+                        if !replay.is_complete() {
+                            eprintln!(
+                                "agent {id}: replay incomplete (pos={}, exhausted={}) — \
+                                 handler may be non-deterministic",
+                                replay.position(), replay.was_exhausted(),
+                            );
+                        }
+                    }
+                }
+                // Materialize the state into the strategy so
+                // subsequent cold starts hit the fast path.
+                let state = runtime
+                    .storage
+                    .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
+                    .map(|v| v.to_vec())
+                    .unwrap_or_default();
+                if !state.is_empty() {
+                    let _ = strategy.commit(&state);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("agent {id}: replay_logs failed: {e}"),
         }
     }
 
+    // Queue initial payloads. When no init payloads are supplied we
+    // still kick the actor with an empty envelope so `on_start`
+    // fires — matches the pre-refactor behaviour.
+    let mut pending: VecDeque<Vec<u8>> = config.init_payloads.into_iter().collect();
+    if pending.is_empty() {
+        pending.push_back(Vec::new());
+    }
+
+    let mut handled_any = false;
+
     loop {
-        runtime.run_blocking();
-
-        // Route outbound cross-service transfers through the node
-        let external = runtime.drain_external_transfers(svc_id);
-        let mut sent_any = false;
-        for (target, memo) in external {
-            sent_any = true;
-            let _ = outbox.send(Envelope {
-                from: id,
-                to: target,
-                payload: memo,
-            });
-        }
-
-        // Drain inbox
-        let mut received = false;
-        while let Ok(envelope) = inbox.try_recv() {
-            runtime.send_to(svc_id, envelope.payload);
-            received = true;
-        }
-
-        if received { continue; }
-
-        if sent_any {
-            if let Ok(envelope) = inbox.recv_timeout(std::time::Duration::from_millis(50)) {
-                runtime.send_to(svc_id, envelope.payload);
-                continue;
+        // Prefer the local queue, otherwise wait on the inbox.
+        let msg = if let Some(m) = pending.pop_front() {
+            m
+        } else if runtime.has_work() || runtime.is_suspended(svc_id) {
+            // Residual work (self-messages, suspended continuation)
+            // — drive the runtime and loop, no new external event.
+            dispatch_once(&mut runtime, svc_id, &outbox, id, None,
+                strategy.as_mut(), recording_enabled);
+            continue;
+        } else {
+            match inbox.recv_timeout(Duration::from_millis(200)) {
+                Ok(env) => env.payload,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if handled_any { break; }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
-
-        if !runtime.has_work() && !runtime.is_suspended(svc_id) {
-            break;
-        }
-
-        match inbox.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(envelope) => {
-                runtime.send_to(svc_id, envelope.payload);
-            }
-            Err(_) => break,
-        }
+        };
+        handled_any = true;
+        dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
+            strategy.as_mut(), recording_enabled);
     }
 
     AgentResult { id, panics: runtime.panics }
+}
+
+/// Run one dispatch cycle: optionally begin recording, deliver the
+/// message (or just drive residual work), route external transfers,
+/// then commit the resulting state via the strategy.
+fn dispatch_once(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+    outbox: &mpsc::Sender<Envelope>,
+    from_id: ServiceId,
+    msg: Option<Vec<u8>>,
+    strategy: &mut dyn crate::commit::CommitStrategy,
+    recording_enabled: bool,
+) {
+    let recorded = msg.is_some() && recording_enabled;
+    if recorded {
+        runtime.begin_recording(msg.as_ref().unwrap().clone());
+    }
+    if let Some(payload) = msg {
+        runtime.send_to(svc_id, payload);
+    }
+    runtime.run_blocking();
+
+    let external = runtime.drain_external_transfers(svc_id);
+    for (target, memo) in external {
+        let _ = outbox.send(Envelope {
+            from: from_id,
+            to: target,
+            payload: memo,
+        });
+    }
+
+    let state = runtime
+        .storage
+        .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
+        .map(|v| v.to_vec())
+        .unwrap_or_default();
+
+    if recorded {
+        let log = runtime.finish_recording().unwrap_or_default();
+        if let Err(e) = strategy.commit_with_log(&state, &log) {
+            eprintln!("agent {svc_id}: CRDT commit failed: {e}");
+        }
+    } else if !state.is_empty() {
+        if let Err(e) = strategy.commit(&state) {
+            eprintln!("agent {svc_id}: commit failed: {e}");
+        }
+    }
+}
+
+/// Select the agent's commit strategy from its config.
+fn build_agent_strategy(
+    config: &AgentConfig,
+    id: ServiceId,
+) -> Box<dyn crate::commit::CommitStrategy> {
+    #[cfg(feature = "storage")]
+    {
+        match config.consistency {
+            Consistency::Ephemeral => Box::new(crate::commit::NoCommit),
+            Consistency::Local => {
+                if let Some(path) = config.db_path(id) {
+                    match crate::commit::LocalCommit::open(&path) {
+                        Ok(lc) => return Box::new(lc),
+                        Err(e) => eprintln!("agent {id}: failed to open Local storage: {e}"),
+                    }
+                }
+                Box::new(crate::commit::NoCommit)
+            }
+            Consistency::Crdt => {
+                if let Some(path) = config.db_path(id) {
+                    match crate::commit::CrdtCommit::open(&path) {
+                        Ok(cc) => return Box::new(cc),
+                        Err(e) => eprintln!("agent {id}: failed to open CRDT storage: {e}"),
+                    }
+                }
+                Box::new(crate::commit::NoCommit)
+            }
+        }
+    }
+    #[cfg(not(feature = "storage"))]
+    {
+        let _ = (config, id);
+        Box::new(crate::commit::NoCommit)
+    }
 }
 
 /// Max deferred messages held while waiting for a specific reply.
