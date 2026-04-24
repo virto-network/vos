@@ -1689,6 +1689,7 @@ dependencies = [
  "grey-transpiler",
  "javm",
  "libloading",
+ "merkle-crdt",
  "pollster",
  "redb",
  "rkyv",

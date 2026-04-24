@@ -19,7 +19,7 @@ wasm-bootstrap = ["wasm", "dep:dlmalloc"]
 # Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
 http = ["dep:ureq"]
 # Enables redb-backed worker state persistence in the worker host.
-storage = ["dep:redb"]
+storage = ["dep:redb", "dep:merkle-crdt"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
@@ -38,6 +38,7 @@ libloading = { version = "0.8", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
+merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
 
 [[bin]]
 name = "vosx"
