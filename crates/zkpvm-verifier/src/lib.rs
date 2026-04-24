@@ -23,9 +23,9 @@ use stwo::{
 use stwo_constraint_framework::TraceLocationAllocator;
 
 // Re-export the Proof type
-pub use zkpvm_machine::Proof;
+pub use zkpvm::Proof;
 
-use zkpvm_machine::framework_access::{
+use zkpvm::framework_access::{
     create_verifier_components, draw_all_lookup_elements, AllLookupElements,
 };
 
@@ -51,6 +51,7 @@ pub fn verify_standalone(
         claimed_sums,
         log_sizes: claimed_log_sizes,
         num_components,
+        ..
     } = proof;
 
     if claimed_sums.len() != num_components {
@@ -131,5 +132,5 @@ pub fn verify_standalone(
 }
 
 // Also re-export the original verify for backward compatibility
-pub use zkpvm_machine::verify;
-pub use zkpvm_machine::SideNote;
+pub use zkpvm::verify;
+pub use zkpvm::SideNote;

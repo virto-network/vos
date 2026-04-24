@@ -5,3 +5,4 @@ target/
 data/
 node.key
 *.local.toml
+.claude/

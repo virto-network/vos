@@ -1,0 +1,23 @@
+[package]
+name = "zkpvm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+zkpvm-derive = { workspace = true }
+javm = { workspace = true }
+stwo = { workspace = true }
+stwo-constraint-framework = { workspace = true }
+serde = { workspace = true }
+num-traits = { workspace = true }
+impl-trait-for-tuples = { workspace = true }
+rayon = { workspace = true }
+blake3 = "1"
+
+[dev-dependencies]
+grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+bincode = "1"
+
+[lints.clippy]
+module-inception = { level = "allow", priority = 0 }

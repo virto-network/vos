@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/*",
-    "crates/zkpvm-air-column/air-column-derive",
     "examples/workers/*",
 ]
 exclude = [
@@ -25,11 +24,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Internal crates
-zkpvm-air-column = { path = "crates/zkpvm-air-column" }
-zkpvm-air-column-derive = { path = "crates/zkpvm-air-column/air-column-derive" }
-zkpvm-core = { path = "crates/zkpvm-core" }
-zkpvm-trace = { path = "crates/zkpvm-trace" }
-zkpvm-machine = { path = "crates/zkpvm-machine" }
+zkpvm = { path = "crates/zkpvm" }
+zkpvm-derive = { path = "crates/zkpvm-derive" }
 zkpvm-verifier = { path = "crates/zkpvm-verifier" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 

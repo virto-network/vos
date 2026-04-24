@@ -1,8 +1,0 @@
-[package]
-name = "zkpvm-air-column"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
-
-[dependencies]
-zkpvm-air-column-derive = { workspace = true }
