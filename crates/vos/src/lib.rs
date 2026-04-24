@@ -42,6 +42,7 @@ pub mod refine_payload;
 pub mod registry;
 
 pub mod effects;
+pub mod effect_log;
 pub mod worker;
 
 // ── WASM bootstrap (allocator + panic handler) ───────────────────────
