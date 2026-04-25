@@ -6,11 +6,7 @@ use javm::PVM_REGISTER_COUNT;
 
 use crate::core::step::{MemAccess, PvmStep};
 
-/// A tracing wrapper around javm's Pvm that records a full execution trace.
-/// Hostcall ID for blake2b_compress precompile.
-/// Convention: φ[10]=ptr_h, φ[11]=ptr_m, φ[12]=t_low (counter bytes in message).
-/// h is read (64 bytes), m is read (128 bytes). Result overwrites h.
-pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
+pub use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
 
 /// A recorded blake2b call for the precompile chip.
 #[derive(Clone, Debug)]

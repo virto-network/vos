@@ -131,6 +131,31 @@ run-workers: build-workers
 list manifest="examples/space.toml": build-pvm
     cargo run --bin vosx -- list {{manifest}}
 
+# ── zkpvm verifier ──────────────────────────────────────────────────
+
+# Host-side no_std build of the verifier surface.  Catches std-only imports
+# leaking into the always-compiled path without needing the wasm toolchain.
+check-no-std:
+    cargo build -p zkpvm --no-default-features
+    cargo build -p zkpvm-verifier
+
+# WASM smoke build of zkpvm-verifier.  Currently blocked on an upstream javm
+# fix: `pub const CODE_WINDOW_SIZE: usize = 1 << 32` in
+# olanod/jar/grey/crates/javm/src/backing.rs overflows on 32-bit usize.
+# Until that lands the recipe will fail at javm const-eval; the
+# `check-no-std` recipe above is the host-side substitute.
+wasm-verifier:
+    rustup target add wasm32-unknown-unknown
+    cargo build -p zkpvm-verifier --target wasm32-unknown-unknown
+
+# Run the full zkpvm test suite (prover side).
+test-zkpvm:
+    cargo test -p zkpvm
+
+# Run only the fast zkpvm tests.
+test-zkpvm-fast:
+    cargo test -p zkpvm --lib --test add64_e2e --test memory --test control_flow
+
 # ── Maintenance ─────────────────────────────────────────────────────
 
 # Remove build artifacts

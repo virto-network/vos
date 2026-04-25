@@ -1,6 +1,9 @@
+use alloc::{boxed::Box, vec, vec::Vec};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -11,17 +14,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, ProgramExecutionLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{ProgramExecutionLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// ProgramBoundaryChip: closes the program execution lookup loop.
 ///
@@ -60,7 +69,42 @@ impl BuiltInComponent for ProgramBoundaryChip {
     type MainColumn = Column;
     type LookupElements = ProgramExecutionLookupElements;
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &ProgramExecutionLookupElements,
+    ) {
+        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        let init_ts = crate::trace::trace_eval!(trace_eval, Column::InitialTimestamp);
+        let init_pc = crate::trace::trace_eval!(trace_eval, Column::InitialPc);
+        let final_next_ts = crate::trace::trace_eval!(trace_eval, Column::FinalNextTimestamp);
+        let final_next_pc = crate::trace::trace_eval!(trace_eval, Column::FinalNextPc);
 
+        // Produce (initial_timestamp, initial_pc)
+        let mut produce_tuple: Vec<E::F> = init_ts.to_vec();
+        produce_tuple.extend_from_slice(&init_pc);
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            is_real[0].clone().into(),
+            &produce_tuple,
+        ));
+
+        // Consume (final_next_timestamp, final_next_pc)
+        let mut consume_tuple: Vec<E::F> = final_next_ts.to_vec();
+        consume_tuple.extend_from_slice(&final_next_pc);
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-is_real[0].clone()).into(),
+            &consume_tuple,
+        ));
+
+        eval.finalize_logup_in_pairs();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for ProgramBoundaryChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
         let log_size = LOG_N_LANES; // minimum size, only 1 real row
         let mut trace = TraceBuilder::<Column>::new(log_size);
@@ -125,38 +169,5 @@ impl BuiltInComponent for ProgramBoundaryChip {
         }
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &ProgramExecutionLookupElements,
-    ) {
-        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
-        let init_ts = crate::trace::trace_eval!(trace_eval, Column::InitialTimestamp);
-        let init_pc = crate::trace::trace_eval!(trace_eval, Column::InitialPc);
-        let final_next_ts = crate::trace::trace_eval!(trace_eval, Column::FinalNextTimestamp);
-        let final_next_pc = crate::trace::trace_eval!(trace_eval, Column::FinalNextPc);
-
-        // Produce (initial_timestamp, initial_pc)
-        let mut produce_tuple: Vec<E::F> = init_ts.to_vec();
-        produce_tuple.extend_from_slice(&init_pc);
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            is_real[0].clone().into(),
-            &produce_tuple,
-        ));
-
-        // Consume (final_next_timestamp, final_next_pc)
-        let mut consume_tuple: Vec<E::F> = final_next_ts.to_vec();
-        consume_tuple.extend_from_slice(&final_next_pc);
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-is_real[0].clone()).into(),
-            &consume_tuple,
-        ));
-
-        eval.finalize_logup_in_pairs();
     }
 }

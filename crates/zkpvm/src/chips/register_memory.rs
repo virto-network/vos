@@ -1,7 +1,10 @@
+use alloc::{boxed::Box, vec, vec::Vec};
 use num_traits::One;
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -13,17 +16,23 @@ use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::core::step::NUM_REGS;
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, RegisterMemoryLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{RegisterMemoryLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// RegisterMemoryChip: PVM register-file ledger, analogous to MemoryChip but
 /// indexed by register number (0..NUM_REGS-1) and valued as full u64s.
@@ -80,6 +89,52 @@ impl BuiltInComponent for RegisterMemoryChip {
     type LookupElements = RegisterMemoryLookupElements;
 
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &RegisterMemoryLookupElements,
+    ) {
+        let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
+        let is_real = E::F::one() - is_pad[0].clone();
+
+        let reg_addr = crate::trace::trace_eval!(trace_eval, Column::RegAddr);
+        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
+        let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
+        let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
+        let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
+
+        // Read consistency: for a read (is_write=0) that follows a same-reg
+        // entry, the byte-wise value must equal prev_value.  Phase 9b's
+        // ledger only has ts=0 writes so this constraint is a no-op here;
+        // it becomes load-bearing in Phase 9d once CpuChip starts emitting
+        // reads interleaved with writes.
+        let is_read = E::F::one() - is_write[0].clone();
+        for i in 0..8 {
+            eval.add_constraint(
+                is_real.clone() * is_read.clone() * (value[i].clone() - prev_value[i].clone())
+            );
+        }
+
+        // Consumer lookup (negative multiplicity) — tuple mirrors the prover
+        // side: (reg_addr[1], value[8], timestamp[8]).
+        let mut tuple: Vec<E::F> = Vec::with_capacity(17);
+        tuple.push(reg_addr[0].clone());
+        for col in &value { tuple.push(col.clone()); }
+        for col in &timestamp { tuple.push(col.clone()); }
+
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-is_real.clone()).into(),
+            &tuple,
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for RegisterMemoryChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
         let mut entries: Vec<RegEntry> = Vec::new();
 
@@ -196,49 +251,6 @@ impl BuiltInComponent for RegisterMemoryChip {
         );
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &RegisterMemoryLookupElements,
-    ) {
-        let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-        let is_real = E::F::one() - is_pad[0].clone();
-
-        let reg_addr = crate::trace::trace_eval!(trace_eval, Column::RegAddr);
-        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
-        let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
-        let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
-        let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
-
-        // Read consistency: for a read (is_write=0) that follows a same-reg
-        // entry, the byte-wise value must equal prev_value.  Phase 9b's
-        // ledger only has ts=0 writes so this constraint is a no-op here;
-        // it becomes load-bearing in Phase 9d once CpuChip starts emitting
-        // reads interleaved with writes.
-        let is_read = E::F::one() - is_write[0].clone();
-        for i in 0..8 {
-            eval.add_constraint(
-                is_real.clone() * is_read.clone() * (value[i].clone() - prev_value[i].clone())
-            );
-        }
-
-        // Consumer lookup (negative multiplicity) — tuple mirrors the prover
-        // side: (reg_addr[1], value[8], timestamp[8]).
-        let mut tuple: Vec<E::F> = Vec::with_capacity(17);
-        tuple.push(reg_addr[0].clone());
-        for col in &value { tuple.push(col.clone()); }
-        for col in &timestamp { tuple.push(col.clone()); }
-
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-is_real.clone()).into(),
-            &tuple,
-        ));
-
-        eval.finalize_logup();
     }
 }
 

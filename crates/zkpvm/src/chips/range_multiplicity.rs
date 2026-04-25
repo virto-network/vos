@@ -1,6 +1,9 @@
+use alloc::{boxed::Box, vec, vec::Vec};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -11,17 +14,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, Range256LookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{Range256LookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// Range multiplicity chip: proves that all byte values (0-255) are valid.
 /// This is the "receiver" side of the range check lookup.
@@ -52,6 +61,28 @@ impl BuiltInComponent for RangeMultiplicity256 {
     type MainColumn = Column;
     type LookupElements = Range256LookupElements;
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &Range256LookupElements,
+    ) {
+        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
+        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+
+        // Negative multiplicity (receiver side)
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-mult[0].clone()).into(),
+            &[value[0].clone()],
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for RangeMultiplicity256 {
     fn generate_preprocessed_trace(
         &self,
         _log_size: u32,
@@ -118,24 +149,5 @@ impl BuiltInComponent for RangeMultiplicity256 {
         );
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &Range256LookupElements,
-    ) {
-        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
-        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
-
-        // Negative multiplicity (receiver side)
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-mult[0].clone()).into(),
-            &[value[0].clone()],
-        ));
-
-        eval.finalize_logup();
     }
 }

@@ -1,4 +1,5 @@
-use std::{array, marker::PhantomData};
+use core::{array, marker::PhantomData};
+use alloc::{borrow::ToOwned, vec::Vec};
 
 use num_traits::Zero;
 use stwo_constraint_framework::{preprocessed_columns::PreProcessedColumnId, EvalAtRow};
@@ -24,7 +25,7 @@ impl<P: PreprocessedAirColumn, C: AirColumn, E: EvalAtRow> TraceEval<P, C, E> {
             .collect();
         let evals = <C as AirColumn>::ALL_VARIANTS
             .iter()
-            .flat_map(|col| std::iter::repeat_n(col, col.size()))
+            .flat_map(|col| core::iter::repeat_n(col, col.size()))
             .map(|col| {
                 if col.mask_next_row() {
                     eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1])

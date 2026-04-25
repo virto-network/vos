@@ -3,6 +3,7 @@
 //! This module re-exports the types and functions needed by `zkpvm-verifier`
 //! without requiring the full `SideNote` / trace generation infrastructure.
 
+use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::{
     core::{
         air::Component,

@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 pub use zkpvm_derive::{AirColumn, PreprocessedAirColumn};
 

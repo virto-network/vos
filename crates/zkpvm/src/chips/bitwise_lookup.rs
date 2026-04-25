@@ -1,6 +1,9 @@
+use alloc::{boxed::Box, vec, vec::Vec};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -11,17 +14,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, BitwiseAndLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{BitwiseAndLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// BitwiseLookupChip: 16×16 table for nibble-level AND.
 ///
@@ -67,6 +76,30 @@ impl BuiltInComponent for BitwiseLookupChip {
     type MainColumn = Column;
     type LookupElements = BitwiseAndLookupElements;
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &BitwiseAndLookupElements,
+    ) {
+        let a = crate::trace::trace_eval!(trace_eval, Column::A);
+        let b = crate::trace::trace_eval!(trace_eval, Column::B);
+        let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
+        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+
+        // Consumer: negative multiplicity
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-mult[0].clone()).into(),
+            &[a[0].clone(), b[0].clone(), and_result[0].clone()],
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for BitwiseLookupChip {
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         let log_size = BITWISE_LOG_SIZE.max(LOG_N_LANES);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
@@ -136,26 +169,5 @@ impl BuiltInComponent for BitwiseLookupChip {
         );
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &BitwiseAndLookupElements,
-    ) {
-        let a = crate::trace::trace_eval!(trace_eval, Column::A);
-        let b = crate::trace::trace_eval!(trace_eval, Column::B);
-        let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
-        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
-
-        // Consumer: negative multiplicity
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-mult[0].clone()).into(),
-            &[a[0].clone(), b[0].clone(), and_result[0].clone()],
-        ));
-
-        eval.finalize_logup();
     }
 }

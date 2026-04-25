@@ -1,14 +1,17 @@
-use std::{any::TypeId, collections::HashMap};
+use core::any::TypeId;
+use alloc::collections::BTreeMap;
 
 use impl_trait_for_tuples::impl_for_tuples;
 
+#[cfg(feature = "prover")]
 mod logup_trace_builder;
 mod macros;
 mod range_check;
 mod relations;
 
+#[cfg(feature = "prover")]
+pub use self::logup_trace_builder::LogupTraceBuilder;
 pub use self::{
-    logup_trace_builder::LogupTraceBuilder,
     range_check::Range256LookupElements,
     relations::{
         BitwiseAndLookupElements, Blake2bCallLookupElements,
@@ -34,7 +37,7 @@ macros::register_relation! {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct AllLookupElements(HashMap<TypeId, RelationVariant>);
+pub struct AllLookupElements(BTreeMap<TypeId, RelationVariant>);
 
 impl<T: RegisteredLookupBound> AsRef<T> for AllLookupElements {
     fn as_ref(&self) -> &T {

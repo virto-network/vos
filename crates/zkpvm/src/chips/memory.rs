@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::collections::BTreeMap;
 use num_traits::One;
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -13,17 +16,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, MemoryAccessLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{MemoryAccessLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// MemoryChip: proves read/write consistency of RAM accesses.
 ///
@@ -89,6 +98,46 @@ impl BuiltInComponent for MemoryChip {
     type LookupElements = MemoryAccessLookupElements;
 
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &MemoryAccessLookupElements,
+    ) {
+        let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
+        let is_real = E::F::one() - is_pad[0].clone();
+
+        let address = crate::trace::trace_eval!(trace_eval, Column::Address);
+        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
+        let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
+        let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
+        let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
+
+        // Read consistency: for reads, byte value must equal prev byte value
+        let is_read = E::F::one() - is_write[0].clone();
+        eval.add_constraint(
+            is_real.clone() * is_read.clone() * (value[0].clone() - prev_value[0].clone())
+        );
+
+        // Consumer lookup (negative multiplicity)
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
+        let mut tuple: Vec<E::F> = address.to_vec();
+        tuple.push(value[0].clone());
+        tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write[0].clone());
+
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-is_real.clone()).into(),
+            &tuple,
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for MemoryChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
         let mut entries: Vec<MemEntry> = Vec::new();
 
@@ -136,7 +185,7 @@ impl BuiltInComponent for MemoryChip {
 
         // Inject initial memory writes at timestamp 0 for byte addresses read without prior write.
         if !side_note.initial_memory.is_empty() {
-            let mut first_access: HashMap<u32, bool> = HashMap::new();
+            let mut first_access: BTreeMap<u32, bool> = BTreeMap::new();
             for e in &entries {
                 first_access.entry(e.address).or_insert(e.is_write);
             }
@@ -234,42 +283,5 @@ impl BuiltInComponent for MemoryChip {
         );
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &MemoryAccessLookupElements,
-    ) {
-        let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-        let is_real = E::F::one() - is_pad[0].clone();
-
-        let address = crate::trace::trace_eval!(trace_eval, Column::Address);
-        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
-        let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
-        let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
-        let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
-
-        // Read consistency: for reads, byte value must equal prev byte value
-        let is_read = E::F::one() - is_write[0].clone();
-        eval.add_constraint(
-            is_real.clone() * is_read.clone() * (value[0].clone() - prev_value[0].clone())
-        );
-
-        // Consumer lookup (negative multiplicity)
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
-        let mut tuple: Vec<E::F> = address.to_vec();
-        tuple.push(value[0].clone());
-        tuple.extend_from_slice(&timestamp);
-        tuple.push(is_write[0].clone());
-
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-is_real.clone()).into(),
-            &tuple,
-        ));
-
-        eval.finalize_logup();
     }
 }

@@ -6,8 +6,9 @@
 //! they emit, otherwise the logup balance breaks.  Centralising the
 //! derivation here keeps them in sync.
 
+use alloc::{boxed::Box, vec, vec::Vec};
 use super::classify::uses_immediate;
-use crate::core::tracing::ECALL_BLAKE2B_COMPRESS;
+use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
 
 /// Phase 9d: register-access descriptor for a single PVM step.  Used by both
 /// CpuChip (to fill the ValB/ValD/Result register-source flags + indices) and

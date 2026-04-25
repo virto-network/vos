@@ -4,11 +4,17 @@
 // execution trace (SideNote). It only needs the proof and the expected
 // preprocessed trace commitment (which is deterministic per program).
 //
-// For true #![no_std] support, this crate would need to be in a separate
-// workspace with stwo features = [] (no std/prover/parallel). The current
-// implementation shares the workspace with zkpvm-machine, so features are
-// unified. The API is designed to be no_std-ready.
+// no_std-ready: the verifier path of zkpvm pulls only verifier-side stwo,
+// alloc::*, and core::*.  The wasm32-unknown-unknown smoke test (11d) is
+// blocked on an upstream javm fix (CODE_WINDOW_SIZE = 1 << 32 overflows on
+// 32-bit usize); the host-side `cargo build --no-default-features` still
+// validates no_std compatibility.
 
+#![no_std]
+
+extern crate alloc;
+
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::{
     core::{
@@ -131,6 +137,3 @@ pub fn verify_standalone(
     )
 }
 
-// Also re-export the original verify for backward compatibility
-pub use zkpvm::verify;
-pub use zkpvm::SideNote;

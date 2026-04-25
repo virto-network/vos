@@ -1,6 +1,9 @@
+use alloc::{boxed::Box, vec, vec::Vec};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -11,17 +14,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, PowerOfTwoLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{PowerOfTwoLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// PowerOfTwoChip: 64-row lookup table proving val_d = 2^shift_amount.
 ///
@@ -61,6 +70,31 @@ impl BuiltInComponent for PowerOfTwoChip {
     type MainColumn = Column;
     type LookupElements = PowerOfTwoLookupElements;
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &PowerOfTwoLookupElements,
+    ) {
+        let shift_amount = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
+        let power_val = crate::trace::trace_eval!(trace_eval, Column::PowerVal);
+        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+
+        let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
+        tuple.extend_from_slice(&power_val);
+
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            (-mult[0].clone()).into(),
+            &tuple,
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for PowerOfTwoChip {
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         let log_size = POW2_LOG_SIZE.max(LOG_N_LANES);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
@@ -129,27 +163,5 @@ impl BuiltInComponent for PowerOfTwoChip {
         );
 
         logup.finalize()
-    }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &PowerOfTwoLookupElements,
-    ) {
-        let shift_amount = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
-        let power_val = crate::trace::trace_eval!(trace_eval, Column::PowerVal);
-        let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
-
-        let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
-        tuple.extend_from_slice(&power_val);
-
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-mult[0].clone()).into(),
-            &tuple,
-        ));
-
-        eval.finalize_logup();
     }
 }

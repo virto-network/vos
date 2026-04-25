@@ -1,7 +1,10 @@
+use alloc::{boxed::Box, vec, vec::Vec};
 use num_traits::{One, Zero};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -12,17 +15,23 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{AllLookupElements, LogupTraceBuilder, MemoryAccessLookupElements},
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{MemoryAccessLookupElements},
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 /// MemoryBoundaryChip: produces logup entries for initial memory state.
 ///
@@ -54,6 +63,34 @@ impl BuiltInComponent for MemoryBoundaryChip {
     type LookupElements = MemoryAccessLookupElements;
 
 
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        lookup_elements: &MemoryAccessLookupElements,
+    ) {
+        let addr = crate::trace::trace_eval!(trace_eval, Column::Address);
+        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
+        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+
+        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1)
+        let mut tuple: Vec<E::F> = addr.to_vec();
+        tuple.push(value[0].clone());
+        for _ in 0..8 { tuple.push(E::F::zero()); }
+        tuple.push(E::F::one());
+
+        eval.add_to_relation(RelationEntry::new(
+            lookup_elements,
+            is_real[0].clone().into(),
+            &tuple,
+        ));
+
+        eval.finalize_logup();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for MemoryBoundaryChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
         // Collect byte addresses that need initial values
         let initial_bytes = collect_initial_bytes(side_note);
@@ -113,34 +150,10 @@ impl BuiltInComponent for MemoryBoundaryChip {
 
         logup.finalize()
     }
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &MemoryAccessLookupElements,
-    ) {
-        let addr = crate::trace::trace_eval!(trace_eval, Column::Address);
-        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
-        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
-
-        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1)
-        let mut tuple: Vec<E::F> = addr.to_vec();
-        tuple.push(value[0].clone());
-        for _ in 0..8 { tuple.push(E::F::zero()); }
-        tuple.push(E::F::one());
-
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            is_real[0].clone().into(),
-            &tuple,
-        ));
-
-        eval.finalize_logup();
-    }
 }
 
 /// Collect byte addresses that need initial values (read without prior write).
+#[cfg(feature = "prover")]
 fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
     use std::collections::HashMap;
 

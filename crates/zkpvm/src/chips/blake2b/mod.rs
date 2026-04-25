@@ -9,10 +9,13 @@
 //! Each G-row emits 64 nibble-AND lookups (4 ANDs × 8 bytes × 2 nibbles) to
 //! the BitwiseLookupChip, constraining the AND witnesses used in XOR derivations.
 
+use alloc::{boxed::Box, vec, vec::Vec};
 use num_traits::{One, Zero};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
 use stwo::{
     core::{
-        fields::{m31::BaseField, qm31::SecureField},
+        fields::qm31::SecureField,
         ColumnVec,
     },
     prover::{
@@ -22,20 +25,23 @@ use stwo::{
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
-    eval::TraceEval,
 };
 
 use crate::{
-    framework::BuiltInComponent,
-    lookups::{
-        AllLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements,
-        LogupTraceBuilder, MemoryAccessLookupElements, Range256LookupElements,
-    },
-    side_note::SideNote,
+    framework::{BuiltInComponent},
+    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements, Range256LookupElements, },
 };
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 
 mod call;
 mod columns;
@@ -65,885 +71,6 @@ impl BuiltInComponent for Blake2bChip {
         MemoryAccessLookupElements,
         Blake2bCallLookupElements,
     );
-
-    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        // Schedule is deterministic per-row: r mod 8 picks g_idx, r mod 96
-        // identifies position in a compression.  Every row gets a value
-        // (including padding rows past the real compression span) — the
-        // IsReal witness gates the state-chain constraint.
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let num_rows = trace.num_rows();
-        const GIDX_COLS: [PreprocessedColumn; 8] = [
-            PreprocessedColumn::IsGIdx0, PreprocessedColumn::IsGIdx1,
-            PreprocessedColumn::IsGIdx2, PreprocessedColumn::IsGIdx3,
-            PreprocessedColumn::IsGIdx4, PreprocessedColumn::IsGIdx5,
-            PreprocessedColumn::IsGIdx6, PreprocessedColumn::IsGIdx7,
-        ];
-        const MX_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMxSlot0, PreprocessedColumn::IsMxSlot1,
-            PreprocessedColumn::IsMxSlot2, PreprocessedColumn::IsMxSlot3,
-            PreprocessedColumn::IsMxSlot4, PreprocessedColumn::IsMxSlot5,
-            PreprocessedColumn::IsMxSlot6, PreprocessedColumn::IsMxSlot7,
-            PreprocessedColumn::IsMxSlot8, PreprocessedColumn::IsMxSlot9,
-            PreprocessedColumn::IsMxSlot10, PreprocessedColumn::IsMxSlot11,
-            PreprocessedColumn::IsMxSlot12, PreprocessedColumn::IsMxSlot13,
-            PreprocessedColumn::IsMxSlot14, PreprocessedColumn::IsMxSlot15,
-        ];
-        const MY_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMySlot0, PreprocessedColumn::IsMySlot1,
-            PreprocessedColumn::IsMySlot2, PreprocessedColumn::IsMySlot3,
-            PreprocessedColumn::IsMySlot4, PreprocessedColumn::IsMySlot5,
-            PreprocessedColumn::IsMySlot6, PreprocessedColumn::IsMySlot7,
-            PreprocessedColumn::IsMySlot8, PreprocessedColumn::IsMySlot9,
-            PreprocessedColumn::IsMySlot10, PreprocessedColumn::IsMySlot11,
-            PreprocessedColumn::IsMySlot12, PreprocessedColumn::IsMySlot13,
-            PreprocessedColumn::IsMySlot14, PreprocessedColumn::IsMySlot15,
-        ];
-        for row in 0..num_rows {
-            let g_idx = row % 8;
-            trace.fill_columns(row, true, GIDX_COLS[g_idx]);
-            let pos_in_compression = row % 96;
-            if pos_in_compression == 0 {
-                trace.fill_columns(row, true, PreprocessedColumn::IsFirstOfCompression);
-            }
-            if pos_in_compression == 95 {
-                trace.fill_columns(row, true, PreprocessedColumn::IsLastOfCompression);
-            }
-            // Derive mx_idx / my_idx from SIGMA: round = (r%96)/8, g_idx = r%8.
-            let round = pos_in_compression / 8;
-            let mx_idx = SIGMA[round][2 * g_idx];
-            let my_idx = SIGMA[round][2 * g_idx + 1];
-            trace.fill_columns(row, true, MX_SLOT_COLS[mx_idx]);
-            trace.fill_columns(row, true, MY_SLOT_COLS[my_idx]);
-        }
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
-        if side_note.blake2b_calls.is_empty() {
-            let log_size = LOG_N_LANES;
-            let trace = TraceBuilder::<Column>::new(log_size);
-            return trace.finalize_bit_reversed();
-        }
-
-        let mut rows: Vec<GRow> = Vec::new();
-        for (call_idx, call) in side_note.blake2b_calls.iter().enumerate() {
-            let mut v = [0u64; 16];
-            v[..8].copy_from_slice(&call.h);
-            v[8..].copy_from_slice(&IV);
-            v[12] ^= call.t as u64;
-            v[13] ^= (call.t >> 64) as u64;
-            if call.f { v[14] = !v[14]; }
-
-            // Phase 8b ECALL-binding data for this compression, if a matching
-            // blake2b_mem_op was recorded by the tracer.
-            let mem_op = side_note.blake2b_mem_ops.get(call_idx);
-            let h_ptr = mem_op.map(|o| o.h_ptr).unwrap_or(0).to_le_bytes();
-            let m_ptr = mem_op.map(|o| o.m_ptr).unwrap_or(0).to_le_bytes();
-            let call_ts_u = mem_op.map(|o| o.ts).unwrap_or(0);
-            let call_ts = call_ts_u.to_le_bytes();
-            let h_ptr_u32 = u32::from_le_bytes(h_ptr);
-            let m_ptr_u32 = u32::from_le_bytes(m_ptr);
-            let mut h_rd_addr = [0u8; 256];
-            for i in 0..64 {
-                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-                h_rd_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-            }
-            let mut m_rd_addr = [0u8; 512];
-            for k in 0..128 {
-                let addr = m_ptr_u32.wrapping_add(k as u32).to_le_bytes();
-                m_rd_addr[k * 4..k * 4 + 4].copy_from_slice(&addr);
-            }
-            let mut h_wr_addr = [0u8; 256];
-            for i in 0..64 {
-                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-                h_wr_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-            }
-
-            for round in 0..12 {
-                let s = &SIGMA[round];
-                for g_idx in 0..8 {
-                    let [ai, bi, ci, di] = G_INDICES[g_idx];
-                    let mx = call.m[s[2 * g_idx]];
-                    let my = call.m[s[2 * g_idx + 1]];
-
-                    let mut row = g_traced(
-                        &v, &call.m, &call.h, call.t, call.f,
-                        v[ai], v[bi], v[ci], v[di], mx, my,
-                    );
-
-                    v[ai] = u64::from_le_bytes(row.a_out);
-                    v[bi] = u64::from_le_bytes(row.b_out);
-                    v[ci] = u64::from_le_bytes(row.c_out);
-                    v[di] = u64::from_le_bytes(row.d_out);
-
-                    // Final G-call of this compression → populate Phase 2b
-                    // output witnesses from the just-updated v.
-                    if round == 11 && g_idx == 7 {
-                        fill_output_witnesses(&mut row, &v);
-                    }
-
-                    // Phase 8b ECALL-binding fields, constant across 96 rows.
-                    row.h_ptr = h_ptr;
-                    row.m_ptr = m_ptr;
-                    row.call_ts = call_ts;
-                    row.h_rd_addr = h_rd_addr;
-                    row.m_rd_addr = m_rd_addr;
-                    row.h_wr_addr = h_wr_addr;
-
-                    rows.push(row);
-                }
-            }
-        }
-
-        let num_rows = rows.len();
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows);
-        let mut trace = TraceBuilder::<Column>::new(log_size);
-
-        for (row_idx, r) in rows.iter().enumerate() {
-            trace.fill_columns_bytes(row_idx, &r.a_in, Column::AIn);
-            trace.fill_columns_bytes(row_idx, &r.b_in, Column::BIn);
-            trace.fill_columns_bytes(row_idx, &r.c_in, Column::CIn);
-            trace.fill_columns_bytes(row_idx, &r.d_in, Column::DIn);
-            trace.fill_columns_bytes(row_idx, &r.mx, Column::Mx);
-            trace.fill_columns_bytes(row_idx, &r.my, Column::My);
-            trace.fill_columns_bytes(row_idx, &r.a1, Column::A1);
-            trace.fill_columns_bytes(row_idx, &r.carry1, Column::Carry1);
-            trace.fill_columns_bytes(row_idx, &r.and1, Column::And1);
-            trace.fill_columns_bytes(row_idx, &r.c1, Column::C1);
-            trace.fill_columns_bytes(row_idx, &r.carry2, Column::Carry2);
-            trace.fill_columns_bytes(row_idx, &r.and2, Column::And2);
-            trace.fill_columns_bytes(row_idx, &r.a_out, Column::AOut);
-            trace.fill_columns_bytes(row_idx, &r.carry3, Column::Carry3);
-            trace.fill_columns_bytes(row_idx, &r.and3, Column::And3);
-            trace.fill_columns_bytes(row_idx, &r.c_out, Column::COut);
-            trace.fill_columns_bytes(row_idx, &r.carry4, Column::Carry4);
-            trace.fill_columns_bytes(row_idx, &r.and4, Column::And4);
-            trace.fill_columns_bytes(row_idx, &r.b_out, Column::BOut);
-            trace.fill_columns_bytes(row_idx, &r.rot63_carry, Column::Rot63Carry);
-            trace.fill_columns_bytes(row_idx, &r.and1_a_hi, Column::And1AHi);
-            trace.fill_columns_bytes(row_idx, &r.and1_b_hi, Column::And1BHi);
-            trace.fill_columns_bytes(row_idx, &r.and1_res_hi, Column::And1ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_a_hi, Column::And2AHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_b_hi, Column::And2BHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_res_hi, Column::And2ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_a_hi, Column::And3AHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_b_hi, Column::And3BHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_res_hi, Column::And3ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_a_hi, Column::And4AHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_b_hi, Column::And4BHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
-            trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
-            const V_COLS: [Column; 16] = [
-                Column::V0, Column::V1, Column::V2, Column::V3,
-                Column::V4, Column::V5, Column::V6, Column::V7,
-                Column::V8, Column::V9, Column::V10, Column::V11,
-                Column::V12, Column::V13, Column::V14, Column::V15,
-            ];
-            for k in 0..16 {
-                trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
-            }
-            const M_COLS: [Column; 16] = [
-                Column::M0, Column::M1, Column::M2, Column::M3,
-                Column::M4, Column::M5, Column::M6, Column::M7,
-                Column::M8, Column::M9, Column::M10, Column::M11,
-                Column::M12, Column::M13, Column::M14, Column::M15,
-            ];
-            for k in 0..16 {
-                trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
-            }
-            // Compression-level inputs.
-            const H_COLS: [Column; 8] = [
-                Column::H0, Column::H1, Column::H2, Column::H3,
-                Column::H4, Column::H5, Column::H6, Column::H7,
-            ];
-            for k in 0..8 {
-                trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
-            }
-            trace.fill_columns_bytes(row_idx, &r.t, Column::T);
-            trace.fill_columns(row_idx, r.f, Column::F);
-            trace.fill_columns_bytes(row_idx, &r.t_hi, Column::THi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_lo, Column::AndTLo);
-            trace.fill_columns_bytes(row_idx, &r.and_t_hi, Column::AndTHi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, Column::AndTLoHi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, Column::AndTHiHi);
-            // Phase 2b output-derivation witnesses (0 on non-last rows).
-            trace.fill_columns_bytes(row_idx, &r.output, Column::Output);
-            trace.fill_columns_bytes(row_idx, &r.h_hi, Column::HHi);
-            trace.fill_columns_bytes(row_idx, &r.v_after_hi, Column::VAfterHi);
-            trace.fill_columns_bytes(row_idx, &r.out_and1, Column::OutAnd1);
-            trace.fill_columns_bytes(row_idx, &r.out_and1_hi, Column::OutAnd1Hi);
-            trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, Column::OutXor1Hi);
-            trace.fill_columns_bytes(row_idx, &r.out_and2, Column::OutAnd2);
-            trace.fill_columns_bytes(row_idx, &r.out_and2_hi, Column::OutAnd2Hi);
-            // Phase 8b ECALL-binding witnesses.
-            trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
-            trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
-            trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
-            // Split 4-byte-wide address arrays into per-byte slices.
-            {
-                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
-                for i in 0..64 {
-                    b0[i] = r.h_rd_addr[i * 4];
-                    b1[i] = r.h_rd_addr[i * 4 + 1];
-                    b2[i] = r.h_rd_addr[i * 4 + 2];
-                    b3[i] = r.h_rd_addr[i * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
-            }
-            {
-                let mut b0 = [0u8; 128]; let mut b1 = [0u8; 128];
-                let mut b2 = [0u8; 128]; let mut b3 = [0u8; 128];
-                for k in 0..128 {
-                    b0[k] = r.m_rd_addr[k * 4];
-                    b1[k] = r.m_rd_addr[k * 4 + 1];
-                    b2[k] = r.m_rd_addr[k * 4 + 2];
-                    b3[k] = r.m_rd_addr[k * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
-            }
-            {
-                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
-                for i in 0..64 {
-                    b0[i] = r.h_wr_addr[i * 4];
-                    b1[i] = r.h_wr_addr[i * 4 + 1];
-                    b2[i] = r.h_wr_addr[i * 4 + 2];
-                    b3[i] = r.h_wr_addr[i * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
-            }
-            trace.fill_columns(row_idx, true, Column::IsReal);
-
-            // Emit per-byte nibble counts.  add_bitwise_and increments both the
-            // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
-            // multiplicity table.
-            //
-            // And3 A-side is d1[k] = (d^a1 rotated right 32) = xor byte at
-            // position (k+4)%8.  We reconstruct the true byte value from the
-            // trace columns via the XOR identity d_in + a1 - 2·and1 so the
-            // multiplicity table stays in sync with the constraint-side
-            // derivation.  Same story for And4 A-side (b1).
-            for i in 0..8 {
-                side_note.add_bitwise_and(r.d_in[i], r.a1[i]);
-                side_note.add_bitwise_and(r.b_in[i], r.c1[i]);
-                let k3 = (i + 4) % 8;
-                let d1_i = r.d_in[k3] ^ r.a1[k3];
-                side_note.add_bitwise_and(d1_i, r.a_out[i]);
-                let k4 = (i + 3) % 8;
-                let b1_i = r.b_in[k4] ^ r.c1[k4];
-                side_note.add_bitwise_and(b1_i, r.c_out[i]);
-                // Initial-state XOR witnesses: IV[4]/IV[5] are constants, so the
-                // nibble multiplicity for their hi/lo nibbles is added here.
-                let iv4 = IV[4].to_le_bytes();
-                let iv5 = IV[5].to_le_bytes();
-                side_note.add_bitwise_and(iv4[i], r.t[i]);
-                side_note.add_bitwise_and(iv5[i], r.t[8 + i]);
-            }
-
-            // Range-check the inputs/outputs that are not covered by an AND
-            // lookup.  D_in/B_in/A1/C1/A_out/C_out/And{1-4} and the derived
-            // D1/B1 are all nibble-and-lookup-constrained (hi+lo*16 = byte).
-            // The remaining bytes need an explicit Range256 consumer:
-            //   A_in, C_in, Mx, My — add-chain operands read by the prover
-            //   B_out — rotation output derived from xor4
-            for i in 0..8 {
-                side_note.add_range256(r.a_in[i]);
-                side_note.add_range256(r.c_in[i]);
-                side_note.add_range256(r.mx[i]);
-                side_note.add_range256(r.my[i]);
-                side_note.add_range256(r.b_out[i]);
-            }
-
-            // Phase 2b AND counts — only at the last row of each compression.
-            // 64 And1 bytes (H & V_after[0..8]) + 64 And2 bytes (Xor1 &
-            // V_after[8..16]) = 128 nibble-AND multiplicity increments.
-            if row_idx % 96 == 95 {
-                let v_after = row_v_after(r);
-                for word in 0..8 {
-                    for byte in 0..8 {
-                        let h_b = r.h[word][byte];
-                        let v1 = v_after[word][byte];
-                        let v2 = v_after[word + 8][byte];
-                        let xor1 = h_b ^ v1;
-                        side_note.add_bitwise_and(h_b, v1);
-                        side_note.add_bitwise_and(xor1, v2);
-                    }
-                }
-            }
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
-        let log_size = component_trace.log_size();
-        let mut logup = LogupTraceBuilder::new(log_size);
-
-        let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
-        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let a_in = crate::trace::original_base_column!(component_trace, Column::AIn);
-        let c_in = crate::trace::original_base_column!(component_trace, Column::CIn);
-        let mx = crate::trace::original_base_column!(component_trace, Column::Mx);
-        let my = crate::trace::original_base_column!(component_trace, Column::My);
-        let b_out = crate::trace::original_base_column!(component_trace, Column::BOut);
-        let d_in = crate::trace::original_base_column!(component_trace, Column::DIn);
-        let a1 = crate::trace::original_base_column!(component_trace, Column::A1);
-        let and1 = crate::trace::original_base_column!(component_trace, Column::And1);
-        let b_in = crate::trace::original_base_column!(component_trace, Column::BIn);
-        let c1 = crate::trace::original_base_column!(component_trace, Column::C1);
-        let and2 = crate::trace::original_base_column!(component_trace, Column::And2);
-        let a_out = crate::trace::original_base_column!(component_trace, Column::AOut);
-        let and3 = crate::trace::original_base_column!(component_trace, Column::And3);
-        let c_out = crate::trace::original_base_column!(component_trace, Column::COut);
-        let d_out = crate::trace::original_base_column!(component_trace, Column::DOut);
-        let and4 = crate::trace::original_base_column!(component_trace, Column::And4);
-        let and1_a_hi = crate::trace::original_base_column!(component_trace, Column::And1AHi);
-        let and1_b_hi = crate::trace::original_base_column!(component_trace, Column::And1BHi);
-        let and1_res_hi = crate::trace::original_base_column!(component_trace, Column::And1ResHi);
-        let and2_a_hi = crate::trace::original_base_column!(component_trace, Column::And2AHi);
-        let and2_b_hi = crate::trace::original_base_column!(component_trace, Column::And2BHi);
-        let and2_res_hi = crate::trace::original_base_column!(component_trace, Column::And2ResHi);
-        let and3_a_hi = crate::trace::original_base_column!(component_trace, Column::And3AHi);
-        let and3_b_hi = crate::trace::original_base_column!(component_trace, Column::And3BHi);
-        let and3_res_hi = crate::trace::original_base_column!(component_trace, Column::And3ResHi);
-        let and4_a_hi = crate::trace::original_base_column!(component_trace, Column::And4AHi);
-        let and4_b_hi = crate::trace::original_base_column!(component_trace, Column::And4BHi);
-        let and4_res_hi = crate::trace::original_base_column!(component_trace, Column::And4ResHi);
-
-        let sixteen = PackedBaseField::broadcast(BaseField::from(16));
-        let two = PackedBaseField::broadcast(BaseField::from(2));
-
-        // For each byte i, emit 8 nibble lookups in order:
-        //   And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3 lo, And4 hi, And4 lo
-        // The constraint-side emission MUST match this order exactly;
-        // finalize_logup_in_pairs will pair (hi, lo) per AND.
-        for i in 0..8usize {
-            // ── And1 = D_in & A1, bytes at position i ──
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone()],
-            );
-            let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
-            let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) =
-                (and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone());
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let a_lo = d_in_i.at(v) - and1_a_hi_i.at(v) * sixteen;
-                    let b_lo = a1_i.at(v) - and1_b_hi_i.at(v) * sixteen;
-                    let r_lo = and1_i.at(v) - and1_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And2 = B_in & C1, bytes at position i ──
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone()],
-            );
-            let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
-            let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) =
-                (and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone());
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let a_lo = b_in_i.at(v) - and2_a_hi_i.at(v) * sixteen;
-                    let b_lo = c1_i.at(v) - and2_b_hi_i.at(v) * sixteen;
-                    let r_lo = and2_i.at(v) - and2_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And3 = D1 & A_out, bytes at position i ──
-            // D1[i] is derived: D1[i] = D_in[j] + A1[j] - 2·And1[j] where j=(i+4)%8.
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone()],
-            );
-            let j3 = (i + 4) % 8;
-            let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
-            let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
-            let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) =
-                (and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone());
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let d1_i = d_in_j.at(v) + a1_j.at(v) - two * and1_j.at(v);
-                    let a_lo = d1_i - and3_a_hi_i.at(v) * sixteen;
-                    let b_lo = a_out_i.at(v) - and3_b_hi_i.at(v) * sixteen;
-                    let r_lo = and3_i.at(v) - and3_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And4 = B1 & C_out, bytes at position i ──
-            // B1[i] is derived: B1[i] = B_in[j] + C1[j] - 2·And2[j] where j=(i+3)%8.
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone()],
-            );
-            let j4 = (i + 3) % 8;
-            let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
-            let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
-            let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) =
-                (and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone());
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let b1_i = b_in_j.at(v) + c1_j.at(v) - two * and2_j.at(v);
-                    let a_lo = b1_i - and4_a_hi_i.at(v) * sixteen;
-                    let b_lo = c_out_i.at(v) - and4_b_hi_i.at(v) * sixteen;
-                    let r_lo = and4_i.at(v) - and4_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── AndTLo = IV[4] & T_lo at byte i ──
-            // IV[4] is constant, so a_hi / a_lo are inline.
-            let iv4_byte = IV[4].to_le_bytes()[i];
-            let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
-            let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
-            let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
-            let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
-            let and_t_lo_cols = crate::trace::original_base_column!(component_trace, Column::AndTLo);
-            let and_t_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHi);
-            let and_t_lo_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
-            let and_t_hi_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
-            let iv4_hi_bcast_tuple = iv4_hi;
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                {
-                    let t_hi_i = t_hi_cols[i].clone();
-                    let and_hi_i = and_t_lo_hi_cols[i].clone();
-                    move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
-                },
-            );
-            {
-                let iv4_lo_const = iv4_lo;
-                let t_i = t_cols[i].clone();
-                let t_hi_i = t_hi_cols[i].clone();
-                let and_i = and_t_lo_cols[i].clone();
-                let and_hi_i = and_t_lo_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| {
-                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                        vec![iv4_lo_const, b_lo, r_lo]
-                    },
-                );
-            }
-
-            // ── AndTHi = IV[5] & T_hi (bytes 8..16 of T) at byte i ──
-            let iv5_byte = IV[5].to_le_bytes()[i];
-            let iv5_hi = PackedBaseField::broadcast(BaseField::from((iv5_byte >> 4) as u32));
-            let iv5_lo = PackedBaseField::broadcast(BaseField::from((iv5_byte & 0x0F) as u32));
-            let iv5_hi_bcast = iv5_hi;
-            {
-                let t_hi_i = t_hi_cols[8 + i].clone();
-                let and_hi_i = and_t_hi_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| vec![iv5_hi_bcast, t_hi_i.at(v), and_hi_i.at(v)],
-                );
-            }
-            {
-                let iv5_lo_const = iv5_lo;
-                let t_i = t_cols[8 + i].clone();
-                let t_hi_i = t_hi_cols[8 + i].clone();
-                let and_i = and_t_hi_cols[i].clone();
-                let and_hi_i = and_t_hi_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| {
-                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                        vec![iv5_lo_const, b_lo, r_lo]
-                    },
-                );
-            }
-        }
-
-        // ── Range256 lookups for non-AND-constrained byte columns ──
-        // A_in, C_in, Mx, My, B_out.  Issued in a fixed (column, byte) order
-        // that the constraint side mirrors.
-        for col_cols in [&a_in, &c_in, &mx, &my, &b_out] {
-            for i in 0..8 {
-                logup.add_to_relation_with(
-                    range256,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    &[col_cols[i].clone()],
-                );
-            }
-        }
-
-        // ── Phase 2b: output-derivation AND-nibble lookups ──────
-        // Fire only at IsLastOfCompression · IsReal.  128 AND bytes
-        // (And1 and And2 pairs) × 2 nibbles = 256 lookup entries per row
-        // (non-last rows have multiplicity 0).
-        //
-        // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
-        // numeric index below because the column-fetch macro requires a
-        // literal path.
-        let is_last_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::IsLastOfCompression
-        );
-        let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
-        let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
-        let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
-        let out_and1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
-        let out_xor1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
-        let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
-        let out_and2_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
-        let h_by_word: [_; 8] = [
-            crate::trace::original_base_column!(component_trace, Column::H0),
-            crate::trace::original_base_column!(component_trace, Column::H1),
-            crate::trace::original_base_column!(component_trace, Column::H2),
-            crate::trace::original_base_column!(component_trace, Column::H3),
-            crate::trace::original_base_column!(component_trace, Column::H4),
-            crate::trace::original_base_column!(component_trace, Column::H5),
-            crate::trace::original_base_column!(component_trace, Column::H6),
-            crate::trace::original_base_column!(component_trace, Column::H7),
-        ];
-        let v_by_slot: [_; 16] = [
-            crate::trace::original_base_column!(component_trace, Column::V0),
-            crate::trace::original_base_column!(component_trace, Column::V1),
-            crate::trace::original_base_column!(component_trace, Column::V2),
-            crate::trace::original_base_column!(component_trace, Column::V3),
-            crate::trace::original_base_column!(component_trace, Column::V4),
-            crate::trace::original_base_column!(component_trace, Column::V5),
-            crate::trace::original_base_column!(component_trace, Column::V6),
-            crate::trace::original_base_column!(component_trace, Column::V7),
-            crate::trace::original_base_column!(component_trace, Column::V8),
-            crate::trace::original_base_column!(component_trace, Column::V9),
-            crate::trace::original_base_column!(component_trace, Column::V10),
-            crate::trace::original_base_column!(component_trace, Column::V11),
-            crate::trace::original_base_column!(component_trace, Column::V12),
-            crate::trace::original_base_column!(component_trace, Column::V13),
-            crate::trace::original_base_column!(component_trace, Column::V14),
-            crate::trace::original_base_column!(component_trace, Column::V15),
-        ];
-
-        // G_INDICES[7] = [3, 4, 9, 14] — at row 95 (g_idx=7, always true at
-        // IsLastOfCompression) slot k is touched iff k ∈ {3,4,9,14}:
-        //   slot 3 ← a_out;  slot 4 ← b_out;
-        //   slot 9 ← c_out;  slot 14 ← d_out;
-        //   else slot k keeps V[k].
-        // Pick the column for V_after[slot][byte] — element type mirrors
-        // whatever `original_base_column!` returns (a FinalizedColumn clone).
-        let v_after_byte = |k: usize, byte: usize| match k {
-            3 => a_out[byte].clone(),
-            4 => b_out[byte].clone(),
-            9 => c_out[byte].clone(),
-            14 => d_out[byte].clone(),
-            _ => v_by_slot[k][byte].clone(),
-        };
-
-        for word in 0..8 {
-            for byte in 0..8 {
-                let slot = word * 8 + byte;
-                let v1_src = v_after_byte(word, byte);
-                let v2_src = v_after_byte(word + 8, byte);
-                let h_b = h_by_word[word][byte].clone();
-
-                // And1 hi
-                {
-                    let h_hi_s = h_hi_cols[slot].clone();
-                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
-                    let and1_hi_s = out_and1_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| vec![h_hi_s.at(v), v_after_hi_s.at(v), and1_hi_s.at(v)],
-                    );
-                }
-                // And1 lo
-                {
-                    let h_b2 = h_b.clone();
-                    let h_hi_s = h_hi_cols[slot].clone();
-                    let v1_src2 = v1_src.clone();
-                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
-                    let and1_s = out_and1_cols[slot].clone();
-                    let and1_hi_s = out_and1_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| {
-                            let a_lo = h_b2.at(v) - h_hi_s.at(v) * sixteen;
-                            let b_lo = v1_src2.at(v) - v_after_hi_s.at(v) * sixteen;
-                            let r_lo = and1_s.at(v) - and1_hi_s.at(v) * sixteen;
-                            vec![a_lo, b_lo, r_lo]
-                        },
-                    );
-                }
-                // And2 hi
-                {
-                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
-                    let and2_hi_s = out_and2_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| vec![xor1_hi_s.at(v), v_after_hi_s2.at(v), and2_hi_s.at(v)],
-                    );
-                }
-                // And2 lo with xor1_expr = H + v1 - 2·And1
-                {
-                    let h_b2 = h_b.clone();
-                    let v1_src2 = v1_src.clone();
-                    let v2_src2 = v2_src.clone();
-                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
-                    let and1_s = out_and1_cols[slot].clone();
-                    let and2_s = out_and2_cols[slot].clone();
-                    let and2_hi_s = out_and2_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| {
-                            let xor1_v = h_b2.at(v) + v1_src2.at(v) - two * and1_s.at(v);
-                            let a_lo = xor1_v - xor1_hi_s.at(v) * sixteen;
-                            let b_lo = v2_src2.at(v) - v_after_hi_s2.at(v) * sixteen;
-                            let r_lo = and2_s.at(v) - and2_hi_s.at(v) * sixteen;
-                            vec![a_lo, b_lo, r_lo]
-                        },
-                    );
-                }
-            }
-        }
-
-        // ── Phase 8b: per-byte memory-access consumer lookups ──
-        // Tuple (addr[4], value[1], ts[8], is_write[1]) mirroring the
-        // MemoryChip ledger entries for h reads, m reads, output writes.
-        // Fire only at IsFirstOfCompression · IsReal (once per compression).
-        let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
-        let is_first_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::IsFirstOfCompression
-        );
-        let h_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB0);
-        let h_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB1);
-        let h_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB2);
-        let h_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB3);
-        let m_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB0);
-        let m_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB1);
-        let m_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB2);
-        let m_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB3);
-        let h_wr_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB0);
-        let h_wr_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB1);
-        let h_wr_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB2);
-        let h_wr_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB3);
-        let call_ts_cols = crate::trace::original_base_column!(component_trace, Column::CallTs);
-        let h_word_cols: [_; 8] = [
-            crate::trace::original_base_column!(component_trace, Column::H0),
-            crate::trace::original_base_column!(component_trace, Column::H1),
-            crate::trace::original_base_column!(component_trace, Column::H2),
-            crate::trace::original_base_column!(component_trace, Column::H3),
-            crate::trace::original_base_column!(component_trace, Column::H4),
-            crate::trace::original_base_column!(component_trace, Column::H5),
-            crate::trace::original_base_column!(component_trace, Column::H6),
-            crate::trace::original_base_column!(component_trace, Column::H7),
-        ];
-        let m_word_cols: [_; 16] = [
-            crate::trace::original_base_column!(component_trace, Column::M0),
-            crate::trace::original_base_column!(component_trace, Column::M1),
-            crate::trace::original_base_column!(component_trace, Column::M2),
-            crate::trace::original_base_column!(component_trace, Column::M3),
-            crate::trace::original_base_column!(component_trace, Column::M4),
-            crate::trace::original_base_column!(component_trace, Column::M5),
-            crate::trace::original_base_column!(component_trace, Column::M6),
-            crate::trace::original_base_column!(component_trace, Column::M7),
-            crate::trace::original_base_column!(component_trace, Column::M8),
-            crate::trace::original_base_column!(component_trace, Column::M9),
-            crate::trace::original_base_column!(component_trace, Column::M10),
-            crate::trace::original_base_column!(component_trace, Column::M11),
-            crate::trace::original_base_column!(component_trace, Column::M12),
-            crate::trace::original_base_column!(component_trace, Column::M13),
-            crate::trace::original_base_column!(component_trace, Column::M14),
-            crate::trace::original_base_column!(component_trace, Column::M15),
-        ];
-        let output_cols = crate::trace::original_base_column!(component_trace, Column::Output);
-
-        // 64 h reads: (HRdAddr[i], H[i/8][i%8], CallTs, 0)
-        for i in 0..64usize {
-            let word = i / 8;
-            let byte = i % 8;
-            let addr0 = h_rd_addr_b0[i].clone();
-            let addr1 = h_rd_addr_b1[i].clone();
-            let addr2 = h_rd_addr_b2[i].clone();
-            let addr3 = h_rd_addr_b3[i].clone();
-            let h_b = h_word_cols[word][byte].clone();
-            let ts_c = call_ts_cols.clone();
-            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
-            logup.add_to_relation_computed(
-                mem_lookup,
-                [is_real[0].clone(), is_first_pp[0].clone()],
-                |[r, f]| (r * f).into(),
-                14,
-                move |v| {
-                    let mut t = Vec::with_capacity(14);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(h_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
-                    t.push(zero_val);
-                    t
-                },
-            );
-        }
-        // 128 m reads
-        for k in 0..128usize {
-            let word = k / 8;
-            let byte = k % 8;
-            let addr0 = m_rd_addr_b0[k].clone();
-            let addr1 = m_rd_addr_b1[k].clone();
-            let addr2 = m_rd_addr_b2[k].clone();
-            let addr3 = m_rd_addr_b3[k].clone();
-            let m_b = m_word_cols[word][byte].clone();
-            let ts_c = call_ts_cols.clone();
-            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
-            logup.add_to_relation_computed(
-                mem_lookup,
-                [is_real[0].clone(), is_first_pp[0].clone()],
-                |[r, f]| (r * f).into(),
-                14,
-                move |v| {
-                    let mut t = Vec::with_capacity(14);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(m_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
-                    t.push(zero_val);
-                    t
-                },
-            );
-        }
-        // 64 output writes — gated by IsLastOfCompression, since the Output
-        // column is only populated on the last row of each compression
-        // (Phase 2b witness).  HWrAddr/CallTs are inter-row-constant so they
-        // have the correct values on that row too.
-        for i in 0..64usize {
-            let addr0 = h_wr_addr_b0[i].clone();
-            let addr1 = h_wr_addr_b1[i].clone();
-            let addr2 = h_wr_addr_b2[i].clone();
-            let addr3 = h_wr_addr_b3[i].clone();
-            let out_b = output_cols[i].clone();
-            let ts_c = call_ts_cols.clone();
-            let one_val = PackedBaseField::broadcast(BaseField::from(1u32));
-            logup.add_to_relation_computed(
-                mem_lookup,
-                [is_real[0].clone(), is_last_pp[0].clone()],
-                |[r, l]| (r * l).into(),
-                14,
-                move |v| {
-                    let mut t = Vec::with_capacity(14);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(out_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
-                    t.push(one_val);
-                    t
-                },
-            );
-        }
-
-        // ── Phase 8c: Blake2b-call consumer linking to CpuChip ECALL step ──
-        // Tuple (h_ptr[0..4], m_ptr[0..4], t[0..8], F[1], CallTs[0..8]) = 25 limbs.
-        // Fires at IsFirstOfCompression · IsReal (once per compression),
-        // with multiplicity -1 so CpuChip's matching producer balances.
-        let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
-        let h_ptr_cols = crate::trace::original_base_column!(component_trace, Column::HPtr);
-        let m_ptr_cols = crate::trace::original_base_column!(component_trace, Column::MPtr);
-        let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
-        let f_col = crate::trace::original_base_column!(component_trace, Column::F);
-        logup.add_to_relation_computed(
-            blake2b_call,
-            [is_real[0].clone(), is_first_pp[0].clone()],
-            |[r, f]| (-(r * f)).into(),
-            25,
-            {
-                let h_ptr_c = h_ptr_cols.clone();
-                let m_ptr_c = m_ptr_cols.clone();
-                let t_c = t_cols.clone();
-                let f_c = f_col[0].clone();
-                let ts_c = call_ts_cols.clone();
-                move |v| {
-                    let mut t = Vec::with_capacity(25);
-                    for i in 0..4 { t.push(h_ptr_c[i].at(v)); }
-                    for i in 0..4 { t.push(m_ptr_c[i].at(v)); }
-                    for i in 0..8 { t.push(t_c[i].at(v)); }
-                    t.push(f_c.at(v));
-                    for i in 0..8 { t.push(ts_c[i].at(v)); }
-                    t
-                }
-            },
-        );
-
-        logup.finalize()
-    }
 
     fn add_constraints<E: EvalAtRow>(
         &self,
@@ -1827,6 +954,888 @@ impl BuiltInComponent for Blake2bChip {
         }
 
         eval.finalize_logup_in_pairs();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for Blake2bChip {
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        // Schedule is deterministic per-row: r mod 8 picks g_idx, r mod 96
+        // identifies position in a compression.  Every row gets a value
+        // (including padding rows past the real compression span) — the
+        // IsReal witness gates the state-chain constraint.
+        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
+        let num_rows = trace.num_rows();
+        const GIDX_COLS: [PreprocessedColumn; 8] = [
+            PreprocessedColumn::IsGIdx0, PreprocessedColumn::IsGIdx1,
+            PreprocessedColumn::IsGIdx2, PreprocessedColumn::IsGIdx3,
+            PreprocessedColumn::IsGIdx4, PreprocessedColumn::IsGIdx5,
+            PreprocessedColumn::IsGIdx6, PreprocessedColumn::IsGIdx7,
+        ];
+        const MX_SLOT_COLS: [PreprocessedColumn; 16] = [
+            PreprocessedColumn::IsMxSlot0, PreprocessedColumn::IsMxSlot1,
+            PreprocessedColumn::IsMxSlot2, PreprocessedColumn::IsMxSlot3,
+            PreprocessedColumn::IsMxSlot4, PreprocessedColumn::IsMxSlot5,
+            PreprocessedColumn::IsMxSlot6, PreprocessedColumn::IsMxSlot7,
+            PreprocessedColumn::IsMxSlot8, PreprocessedColumn::IsMxSlot9,
+            PreprocessedColumn::IsMxSlot10, PreprocessedColumn::IsMxSlot11,
+            PreprocessedColumn::IsMxSlot12, PreprocessedColumn::IsMxSlot13,
+            PreprocessedColumn::IsMxSlot14, PreprocessedColumn::IsMxSlot15,
+        ];
+        const MY_SLOT_COLS: [PreprocessedColumn; 16] = [
+            PreprocessedColumn::IsMySlot0, PreprocessedColumn::IsMySlot1,
+            PreprocessedColumn::IsMySlot2, PreprocessedColumn::IsMySlot3,
+            PreprocessedColumn::IsMySlot4, PreprocessedColumn::IsMySlot5,
+            PreprocessedColumn::IsMySlot6, PreprocessedColumn::IsMySlot7,
+            PreprocessedColumn::IsMySlot8, PreprocessedColumn::IsMySlot9,
+            PreprocessedColumn::IsMySlot10, PreprocessedColumn::IsMySlot11,
+            PreprocessedColumn::IsMySlot12, PreprocessedColumn::IsMySlot13,
+            PreprocessedColumn::IsMySlot14, PreprocessedColumn::IsMySlot15,
+        ];
+        for row in 0..num_rows {
+            let g_idx = row % 8;
+            trace.fill_columns(row, true, GIDX_COLS[g_idx]);
+            let pos_in_compression = row % 96;
+            if pos_in_compression == 0 {
+                trace.fill_columns(row, true, PreprocessedColumn::IsFirstOfCompression);
+            }
+            if pos_in_compression == 95 {
+                trace.fill_columns(row, true, PreprocessedColumn::IsLastOfCompression);
+            }
+            // Derive mx_idx / my_idx from SIGMA: round = (r%96)/8, g_idx = r%8.
+            let round = pos_in_compression / 8;
+            let mx_idx = SIGMA[round][2 * g_idx];
+            let my_idx = SIGMA[round][2 * g_idx + 1];
+            trace.fill_columns(row, true, MX_SLOT_COLS[mx_idx]);
+            trace.fill_columns(row, true, MY_SLOT_COLS[my_idx]);
+        }
+        trace.finalize_bit_reversed()
+    }
+
+    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+        if side_note.blake2b_calls.is_empty() {
+            let log_size = LOG_N_LANES;
+            let trace = TraceBuilder::<Column>::new(log_size);
+            return trace.finalize_bit_reversed();
+        }
+
+        let mut rows: Vec<GRow> = Vec::new();
+        for (call_idx, call) in side_note.blake2b_calls.iter().enumerate() {
+            let mut v = [0u64; 16];
+            v[..8].copy_from_slice(&call.h);
+            v[8..].copy_from_slice(&IV);
+            v[12] ^= call.t as u64;
+            v[13] ^= (call.t >> 64) as u64;
+            if call.f { v[14] = !v[14]; }
+
+            // Phase 8b ECALL-binding data for this compression, if a matching
+            // blake2b_mem_op was recorded by the tracer.
+            let mem_op = side_note.blake2b_mem_ops.get(call_idx);
+            let h_ptr = mem_op.map(|o| o.h_ptr).unwrap_or(0).to_le_bytes();
+            let m_ptr = mem_op.map(|o| o.m_ptr).unwrap_or(0).to_le_bytes();
+            let call_ts_u = mem_op.map(|o| o.ts).unwrap_or(0);
+            let call_ts = call_ts_u.to_le_bytes();
+            let h_ptr_u32 = u32::from_le_bytes(h_ptr);
+            let m_ptr_u32 = u32::from_le_bytes(m_ptr);
+            let mut h_rd_addr = [0u8; 256];
+            for i in 0..64 {
+                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
+                h_rd_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
+            }
+            let mut m_rd_addr = [0u8; 512];
+            for k in 0..128 {
+                let addr = m_ptr_u32.wrapping_add(k as u32).to_le_bytes();
+                m_rd_addr[k * 4..k * 4 + 4].copy_from_slice(&addr);
+            }
+            let mut h_wr_addr = [0u8; 256];
+            for i in 0..64 {
+                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
+                h_wr_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
+            }
+
+            for round in 0..12 {
+                let s = &SIGMA[round];
+                for g_idx in 0..8 {
+                    let [ai, bi, ci, di] = G_INDICES[g_idx];
+                    let mx = call.m[s[2 * g_idx]];
+                    let my = call.m[s[2 * g_idx + 1]];
+
+                    let mut row = g_traced(
+                        &v, &call.m, &call.h, call.t, call.f,
+                        v[ai], v[bi], v[ci], v[di], mx, my,
+                    );
+
+                    v[ai] = u64::from_le_bytes(row.a_out);
+                    v[bi] = u64::from_le_bytes(row.b_out);
+                    v[ci] = u64::from_le_bytes(row.c_out);
+                    v[di] = u64::from_le_bytes(row.d_out);
+
+                    // Final G-call of this compression → populate Phase 2b
+                    // output witnesses from the just-updated v.
+                    if round == 11 && g_idx == 7 {
+                        fill_output_witnesses(&mut row, &v);
+                    }
+
+                    // Phase 8b ECALL-binding fields, constant across 96 rows.
+                    row.h_ptr = h_ptr;
+                    row.m_ptr = m_ptr;
+                    row.call_ts = call_ts;
+                    row.h_rd_addr = h_rd_addr;
+                    row.m_rd_addr = m_rd_addr;
+                    row.h_wr_addr = h_wr_addr;
+
+                    rows.push(row);
+                }
+            }
+        }
+
+        let num_rows = rows.len();
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows);
+        let mut trace = TraceBuilder::<Column>::new(log_size);
+
+        for (row_idx, r) in rows.iter().enumerate() {
+            trace.fill_columns_bytes(row_idx, &r.a_in, Column::AIn);
+            trace.fill_columns_bytes(row_idx, &r.b_in, Column::BIn);
+            trace.fill_columns_bytes(row_idx, &r.c_in, Column::CIn);
+            trace.fill_columns_bytes(row_idx, &r.d_in, Column::DIn);
+            trace.fill_columns_bytes(row_idx, &r.mx, Column::Mx);
+            trace.fill_columns_bytes(row_idx, &r.my, Column::My);
+            trace.fill_columns_bytes(row_idx, &r.a1, Column::A1);
+            trace.fill_columns_bytes(row_idx, &r.carry1, Column::Carry1);
+            trace.fill_columns_bytes(row_idx, &r.and1, Column::And1);
+            trace.fill_columns_bytes(row_idx, &r.c1, Column::C1);
+            trace.fill_columns_bytes(row_idx, &r.carry2, Column::Carry2);
+            trace.fill_columns_bytes(row_idx, &r.and2, Column::And2);
+            trace.fill_columns_bytes(row_idx, &r.a_out, Column::AOut);
+            trace.fill_columns_bytes(row_idx, &r.carry3, Column::Carry3);
+            trace.fill_columns_bytes(row_idx, &r.and3, Column::And3);
+            trace.fill_columns_bytes(row_idx, &r.c_out, Column::COut);
+            trace.fill_columns_bytes(row_idx, &r.carry4, Column::Carry4);
+            trace.fill_columns_bytes(row_idx, &r.and4, Column::And4);
+            trace.fill_columns_bytes(row_idx, &r.b_out, Column::BOut);
+            trace.fill_columns_bytes(row_idx, &r.rot63_carry, Column::Rot63Carry);
+            trace.fill_columns_bytes(row_idx, &r.and1_a_hi, Column::And1AHi);
+            trace.fill_columns_bytes(row_idx, &r.and1_b_hi, Column::And1BHi);
+            trace.fill_columns_bytes(row_idx, &r.and1_res_hi, Column::And1ResHi);
+            trace.fill_columns_bytes(row_idx, &r.and2_a_hi, Column::And2AHi);
+            trace.fill_columns_bytes(row_idx, &r.and2_b_hi, Column::And2BHi);
+            trace.fill_columns_bytes(row_idx, &r.and2_res_hi, Column::And2ResHi);
+            trace.fill_columns_bytes(row_idx, &r.and3_a_hi, Column::And3AHi);
+            trace.fill_columns_bytes(row_idx, &r.and3_b_hi, Column::And3BHi);
+            trace.fill_columns_bytes(row_idx, &r.and3_res_hi, Column::And3ResHi);
+            trace.fill_columns_bytes(row_idx, &r.and4_a_hi, Column::And4AHi);
+            trace.fill_columns_bytes(row_idx, &r.and4_b_hi, Column::And4BHi);
+            trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
+            trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
+            const V_COLS: [Column; 16] = [
+                Column::V0, Column::V1, Column::V2, Column::V3,
+                Column::V4, Column::V5, Column::V6, Column::V7,
+                Column::V8, Column::V9, Column::V10, Column::V11,
+                Column::V12, Column::V13, Column::V14, Column::V15,
+            ];
+            for k in 0..16 {
+                trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
+            }
+            const M_COLS: [Column; 16] = [
+                Column::M0, Column::M1, Column::M2, Column::M3,
+                Column::M4, Column::M5, Column::M6, Column::M7,
+                Column::M8, Column::M9, Column::M10, Column::M11,
+                Column::M12, Column::M13, Column::M14, Column::M15,
+            ];
+            for k in 0..16 {
+                trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
+            }
+            // Compression-level inputs.
+            const H_COLS: [Column; 8] = [
+                Column::H0, Column::H1, Column::H2, Column::H3,
+                Column::H4, Column::H5, Column::H6, Column::H7,
+            ];
+            for k in 0..8 {
+                trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
+            }
+            trace.fill_columns_bytes(row_idx, &r.t, Column::T);
+            trace.fill_columns(row_idx, r.f, Column::F);
+            trace.fill_columns_bytes(row_idx, &r.t_hi, Column::THi);
+            trace.fill_columns_bytes(row_idx, &r.and_t_lo, Column::AndTLo);
+            trace.fill_columns_bytes(row_idx, &r.and_t_hi, Column::AndTHi);
+            trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, Column::AndTLoHi);
+            trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, Column::AndTHiHi);
+            // Phase 2b output-derivation witnesses (0 on non-last rows).
+            trace.fill_columns_bytes(row_idx, &r.output, Column::Output);
+            trace.fill_columns_bytes(row_idx, &r.h_hi, Column::HHi);
+            trace.fill_columns_bytes(row_idx, &r.v_after_hi, Column::VAfterHi);
+            trace.fill_columns_bytes(row_idx, &r.out_and1, Column::OutAnd1);
+            trace.fill_columns_bytes(row_idx, &r.out_and1_hi, Column::OutAnd1Hi);
+            trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, Column::OutXor1Hi);
+            trace.fill_columns_bytes(row_idx, &r.out_and2, Column::OutAnd2);
+            trace.fill_columns_bytes(row_idx, &r.out_and2_hi, Column::OutAnd2Hi);
+            // Phase 8b ECALL-binding witnesses.
+            trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
+            trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
+            trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
+            // Split 4-byte-wide address arrays into per-byte slices.
+            {
+                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
+                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
+                for i in 0..64 {
+                    b0[i] = r.h_rd_addr[i * 4];
+                    b1[i] = r.h_rd_addr[i * 4 + 1];
+                    b2[i] = r.h_rd_addr[i * 4 + 2];
+                    b3[i] = r.h_rd_addr[i * 4 + 3];
+                }
+                trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
+                trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
+                trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
+                trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
+            }
+            {
+                let mut b0 = [0u8; 128]; let mut b1 = [0u8; 128];
+                let mut b2 = [0u8; 128]; let mut b3 = [0u8; 128];
+                for k in 0..128 {
+                    b0[k] = r.m_rd_addr[k * 4];
+                    b1[k] = r.m_rd_addr[k * 4 + 1];
+                    b2[k] = r.m_rd_addr[k * 4 + 2];
+                    b3[k] = r.m_rd_addr[k * 4 + 3];
+                }
+                trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
+                trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
+                trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
+                trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
+            }
+            {
+                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
+                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
+                for i in 0..64 {
+                    b0[i] = r.h_wr_addr[i * 4];
+                    b1[i] = r.h_wr_addr[i * 4 + 1];
+                    b2[i] = r.h_wr_addr[i * 4 + 2];
+                    b3[i] = r.h_wr_addr[i * 4 + 3];
+                }
+                trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
+                trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
+                trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
+                trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
+            }
+            trace.fill_columns(row_idx, true, Column::IsReal);
+
+            // Emit per-byte nibble counts.  add_bitwise_and increments both the
+            // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
+            // multiplicity table.
+            //
+            // And3 A-side is d1[k] = (d^a1 rotated right 32) = xor byte at
+            // position (k+4)%8.  We reconstruct the true byte value from the
+            // trace columns via the XOR identity d_in + a1 - 2·and1 so the
+            // multiplicity table stays in sync with the constraint-side
+            // derivation.  Same story for And4 A-side (b1).
+            for i in 0..8 {
+                side_note.add_bitwise_and(r.d_in[i], r.a1[i]);
+                side_note.add_bitwise_and(r.b_in[i], r.c1[i]);
+                let k3 = (i + 4) % 8;
+                let d1_i = r.d_in[k3] ^ r.a1[k3];
+                side_note.add_bitwise_and(d1_i, r.a_out[i]);
+                let k4 = (i + 3) % 8;
+                let b1_i = r.b_in[k4] ^ r.c1[k4];
+                side_note.add_bitwise_and(b1_i, r.c_out[i]);
+                // Initial-state XOR witnesses: IV[4]/IV[5] are constants, so the
+                // nibble multiplicity for their hi/lo nibbles is added here.
+                let iv4 = IV[4].to_le_bytes();
+                let iv5 = IV[5].to_le_bytes();
+                side_note.add_bitwise_and(iv4[i], r.t[i]);
+                side_note.add_bitwise_and(iv5[i], r.t[8 + i]);
+            }
+
+            // Range-check the inputs/outputs that are not covered by an AND
+            // lookup.  D_in/B_in/A1/C1/A_out/C_out/And{1-4} and the derived
+            // D1/B1 are all nibble-and-lookup-constrained (hi+lo*16 = byte).
+            // The remaining bytes need an explicit Range256 consumer:
+            //   A_in, C_in, Mx, My — add-chain operands read by the prover
+            //   B_out — rotation output derived from xor4
+            for i in 0..8 {
+                side_note.add_range256(r.a_in[i]);
+                side_note.add_range256(r.c_in[i]);
+                side_note.add_range256(r.mx[i]);
+                side_note.add_range256(r.my[i]);
+                side_note.add_range256(r.b_out[i]);
+            }
+
+            // Phase 2b AND counts — only at the last row of each compression.
+            // 64 And1 bytes (H & V_after[0..8]) + 64 And2 bytes (Xor1 &
+            // V_after[8..16]) = 128 nibble-AND multiplicity increments.
+            if row_idx % 96 == 95 {
+                let v_after = row_v_after(r);
+                for word in 0..8 {
+                    for byte in 0..8 {
+                        let h_b = r.h[word][byte];
+                        let v1 = v_after[word][byte];
+                        let v2 = v_after[word + 8][byte];
+                        let xor1 = h_b ^ v1;
+                        side_note.add_bitwise_and(h_b, v1);
+                        side_note.add_bitwise_and(xor1, v2);
+                    }
+                }
+            }
+        }
+
+        trace.finalize_bit_reversed()
+    }
+
+    fn generate_interaction_trace(
+        &self,
+        component_trace: ComponentTrace,
+        _side_note: &SideNote,
+        lookup_elements: &AllLookupElements,
+    ) -> (ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
+        let log_size = component_trace.log_size();
+        let mut logup = LogupTraceBuilder::new(log_size);
+
+        let range256: &Range256LookupElements = lookup_elements.as_ref();
+        let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
+        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
+        let a_in = crate::trace::original_base_column!(component_trace, Column::AIn);
+        let c_in = crate::trace::original_base_column!(component_trace, Column::CIn);
+        let mx = crate::trace::original_base_column!(component_trace, Column::Mx);
+        let my = crate::trace::original_base_column!(component_trace, Column::My);
+        let b_out = crate::trace::original_base_column!(component_trace, Column::BOut);
+        let d_in = crate::trace::original_base_column!(component_trace, Column::DIn);
+        let a1 = crate::trace::original_base_column!(component_trace, Column::A1);
+        let and1 = crate::trace::original_base_column!(component_trace, Column::And1);
+        let b_in = crate::trace::original_base_column!(component_trace, Column::BIn);
+        let c1 = crate::trace::original_base_column!(component_trace, Column::C1);
+        let and2 = crate::trace::original_base_column!(component_trace, Column::And2);
+        let a_out = crate::trace::original_base_column!(component_trace, Column::AOut);
+        let and3 = crate::trace::original_base_column!(component_trace, Column::And3);
+        let c_out = crate::trace::original_base_column!(component_trace, Column::COut);
+        let d_out = crate::trace::original_base_column!(component_trace, Column::DOut);
+        let and4 = crate::trace::original_base_column!(component_trace, Column::And4);
+        let and1_a_hi = crate::trace::original_base_column!(component_trace, Column::And1AHi);
+        let and1_b_hi = crate::trace::original_base_column!(component_trace, Column::And1BHi);
+        let and1_res_hi = crate::trace::original_base_column!(component_trace, Column::And1ResHi);
+        let and2_a_hi = crate::trace::original_base_column!(component_trace, Column::And2AHi);
+        let and2_b_hi = crate::trace::original_base_column!(component_trace, Column::And2BHi);
+        let and2_res_hi = crate::trace::original_base_column!(component_trace, Column::And2ResHi);
+        let and3_a_hi = crate::trace::original_base_column!(component_trace, Column::And3AHi);
+        let and3_b_hi = crate::trace::original_base_column!(component_trace, Column::And3BHi);
+        let and3_res_hi = crate::trace::original_base_column!(component_trace, Column::And3ResHi);
+        let and4_a_hi = crate::trace::original_base_column!(component_trace, Column::And4AHi);
+        let and4_b_hi = crate::trace::original_base_column!(component_trace, Column::And4BHi);
+        let and4_res_hi = crate::trace::original_base_column!(component_trace, Column::And4ResHi);
+
+        let sixteen = PackedBaseField::broadcast(BaseField::from(16));
+        let two = PackedBaseField::broadcast(BaseField::from(2));
+
+        // For each byte i, emit 8 nibble lookups in order:
+        //   And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3 lo, And4 hi, And4 lo
+        // The constraint-side emission MUST match this order exactly;
+        // finalize_logup_in_pairs will pair (hi, lo) per AND.
+        for i in 0..8usize {
+            // ── And1 = D_in & A1, bytes at position i ──
+            logup.add_to_relation_with(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                &[and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone()],
+            );
+            let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
+            let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) =
+                (and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone());
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let a_lo = d_in_i.at(v) - and1_a_hi_i.at(v) * sixteen;
+                    let b_lo = a1_i.at(v) - and1_b_hi_i.at(v) * sixteen;
+                    let r_lo = and1_i.at(v) - and1_res_hi_i.at(v) * sixteen;
+                    vec![a_lo, b_lo, r_lo]
+                },
+            );
+
+            // ── And2 = B_in & C1, bytes at position i ──
+            logup.add_to_relation_with(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                &[and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone()],
+            );
+            let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
+            let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) =
+                (and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone());
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let a_lo = b_in_i.at(v) - and2_a_hi_i.at(v) * sixteen;
+                    let b_lo = c1_i.at(v) - and2_b_hi_i.at(v) * sixteen;
+                    let r_lo = and2_i.at(v) - and2_res_hi_i.at(v) * sixteen;
+                    vec![a_lo, b_lo, r_lo]
+                },
+            );
+
+            // ── And3 = D1 & A_out, bytes at position i ──
+            // D1[i] is derived: D1[i] = D_in[j] + A1[j] - 2·And1[j] where j=(i+4)%8.
+            logup.add_to_relation_with(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                &[and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone()],
+            );
+            let j3 = (i + 4) % 8;
+            let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
+            let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
+            let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) =
+                (and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone());
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let d1_i = d_in_j.at(v) + a1_j.at(v) - two * and1_j.at(v);
+                    let a_lo = d1_i - and3_a_hi_i.at(v) * sixteen;
+                    let b_lo = a_out_i.at(v) - and3_b_hi_i.at(v) * sixteen;
+                    let r_lo = and3_i.at(v) - and3_res_hi_i.at(v) * sixteen;
+                    vec![a_lo, b_lo, r_lo]
+                },
+            );
+
+            // ── And4 = B1 & C_out, bytes at position i ──
+            // B1[i] is derived: B1[i] = B_in[j] + C1[j] - 2·And2[j] where j=(i+3)%8.
+            logup.add_to_relation_with(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                &[and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone()],
+            );
+            let j4 = (i + 3) % 8;
+            let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
+            let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
+            let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) =
+                (and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone());
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let b1_i = b_in_j.at(v) + c1_j.at(v) - two * and2_j.at(v);
+                    let a_lo = b1_i - and4_a_hi_i.at(v) * sixteen;
+                    let b_lo = c_out_i.at(v) - and4_b_hi_i.at(v) * sixteen;
+                    let r_lo = and4_i.at(v) - and4_res_hi_i.at(v) * sixteen;
+                    vec![a_lo, b_lo, r_lo]
+                },
+            );
+
+            // ── AndTLo = IV[4] & T_lo at byte i ──
+            // IV[4] is constant, so a_hi / a_lo are inline.
+            let iv4_byte = IV[4].to_le_bytes()[i];
+            let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
+            let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
+            let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
+            let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
+            let and_t_lo_cols = crate::trace::original_base_column!(component_trace, Column::AndTLo);
+            let and_t_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHi);
+            let and_t_lo_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
+            let and_t_hi_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
+            let iv4_hi_bcast_tuple = iv4_hi;
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                {
+                    let t_hi_i = t_hi_cols[i].clone();
+                    let and_hi_i = and_t_lo_hi_cols[i].clone();
+                    move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
+                },
+            );
+            {
+                let iv4_lo_const = iv4_lo;
+                let t_i = t_cols[i].clone();
+                let t_hi_i = t_hi_cols[i].clone();
+                let and_i = and_t_lo_cols[i].clone();
+                let and_hi_i = and_t_lo_hi_cols[i].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone()],
+                    |[r]| r.into(),
+                    3,
+                    move |v| {
+                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
+                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
+                        vec![iv4_lo_const, b_lo, r_lo]
+                    },
+                );
+            }
+
+            // ── AndTHi = IV[5] & T_hi (bytes 8..16 of T) at byte i ──
+            let iv5_byte = IV[5].to_le_bytes()[i];
+            let iv5_hi = PackedBaseField::broadcast(BaseField::from((iv5_byte >> 4) as u32));
+            let iv5_lo = PackedBaseField::broadcast(BaseField::from((iv5_byte & 0x0F) as u32));
+            let iv5_hi_bcast = iv5_hi;
+            {
+                let t_hi_i = t_hi_cols[8 + i].clone();
+                let and_hi_i = and_t_hi_hi_cols[i].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone()],
+                    |[r]| r.into(),
+                    3,
+                    move |v| vec![iv5_hi_bcast, t_hi_i.at(v), and_hi_i.at(v)],
+                );
+            }
+            {
+                let iv5_lo_const = iv5_lo;
+                let t_i = t_cols[8 + i].clone();
+                let t_hi_i = t_hi_cols[8 + i].clone();
+                let and_i = and_t_hi_cols[i].clone();
+                let and_hi_i = and_t_hi_hi_cols[i].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone()],
+                    |[r]| r.into(),
+                    3,
+                    move |v| {
+                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
+                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
+                        vec![iv5_lo_const, b_lo, r_lo]
+                    },
+                );
+            }
+        }
+
+        // ── Range256 lookups for non-AND-constrained byte columns ──
+        // A_in, C_in, Mx, My, B_out.  Issued in a fixed (column, byte) order
+        // that the constraint side mirrors.
+        for col_cols in [&a_in, &c_in, &mx, &my, &b_out] {
+            for i in 0..8 {
+                logup.add_to_relation_with(
+                    range256,
+                    [is_real[0].clone()],
+                    |[r]| r.into(),
+                    &[col_cols[i].clone()],
+                );
+            }
+        }
+
+        // ── Phase 2b: output-derivation AND-nibble lookups ──────
+        // Fire only at IsLastOfCompression · IsReal.  128 AND bytes
+        // (And1 and And2 pairs) × 2 nibbles = 256 lookup entries per row
+        // (non-last rows have multiplicity 0).
+        //
+        // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
+        // numeric index below because the column-fetch macro requires a
+        // literal path.
+        let is_last_pp = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::IsLastOfCompression
+        );
+        let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
+        let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
+        let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
+        let out_and1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
+        let out_xor1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
+        let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
+        let out_and2_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
+        let h_by_word: [_; 8] = [
+            crate::trace::original_base_column!(component_trace, Column::H0),
+            crate::trace::original_base_column!(component_trace, Column::H1),
+            crate::trace::original_base_column!(component_trace, Column::H2),
+            crate::trace::original_base_column!(component_trace, Column::H3),
+            crate::trace::original_base_column!(component_trace, Column::H4),
+            crate::trace::original_base_column!(component_trace, Column::H5),
+            crate::trace::original_base_column!(component_trace, Column::H6),
+            crate::trace::original_base_column!(component_trace, Column::H7),
+        ];
+        let v_by_slot: [_; 16] = [
+            crate::trace::original_base_column!(component_trace, Column::V0),
+            crate::trace::original_base_column!(component_trace, Column::V1),
+            crate::trace::original_base_column!(component_trace, Column::V2),
+            crate::trace::original_base_column!(component_trace, Column::V3),
+            crate::trace::original_base_column!(component_trace, Column::V4),
+            crate::trace::original_base_column!(component_trace, Column::V5),
+            crate::trace::original_base_column!(component_trace, Column::V6),
+            crate::trace::original_base_column!(component_trace, Column::V7),
+            crate::trace::original_base_column!(component_trace, Column::V8),
+            crate::trace::original_base_column!(component_trace, Column::V9),
+            crate::trace::original_base_column!(component_trace, Column::V10),
+            crate::trace::original_base_column!(component_trace, Column::V11),
+            crate::trace::original_base_column!(component_trace, Column::V12),
+            crate::trace::original_base_column!(component_trace, Column::V13),
+            crate::trace::original_base_column!(component_trace, Column::V14),
+            crate::trace::original_base_column!(component_trace, Column::V15),
+        ];
+
+        // G_INDICES[7] = [3, 4, 9, 14] — at row 95 (g_idx=7, always true at
+        // IsLastOfCompression) slot k is touched iff k ∈ {3,4,9,14}:
+        //   slot 3 ← a_out;  slot 4 ← b_out;
+        //   slot 9 ← c_out;  slot 14 ← d_out;
+        //   else slot k keeps V[k].
+        // Pick the column for V_after[slot][byte] — element type mirrors
+        // whatever `original_base_column!` returns (a FinalizedColumn clone).
+        let v_after_byte = |k: usize, byte: usize| match k {
+            3 => a_out[byte].clone(),
+            4 => b_out[byte].clone(),
+            9 => c_out[byte].clone(),
+            14 => d_out[byte].clone(),
+            _ => v_by_slot[k][byte].clone(),
+        };
+
+        for word in 0..8 {
+            for byte in 0..8 {
+                let slot = word * 8 + byte;
+                let v1_src = v_after_byte(word, byte);
+                let v2_src = v_after_byte(word + 8, byte);
+                let h_b = h_by_word[word][byte].clone();
+
+                // And1 hi
+                {
+                    let h_hi_s = h_hi_cols[slot].clone();
+                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
+                    let and1_hi_s = out_and1_hi_cols[slot].clone();
+                    logup.add_to_relation_computed(
+                        bitwise,
+                        [is_real[0].clone(), is_last_pp[0].clone()],
+                        |[r, l]| (r * l).into(),
+                        3,
+                        move |v| vec![h_hi_s.at(v), v_after_hi_s.at(v), and1_hi_s.at(v)],
+                    );
+                }
+                // And1 lo
+                {
+                    let h_b2 = h_b.clone();
+                    let h_hi_s = h_hi_cols[slot].clone();
+                    let v1_src2 = v1_src.clone();
+                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
+                    let and1_s = out_and1_cols[slot].clone();
+                    let and1_hi_s = out_and1_hi_cols[slot].clone();
+                    logup.add_to_relation_computed(
+                        bitwise,
+                        [is_real[0].clone(), is_last_pp[0].clone()],
+                        |[r, l]| (r * l).into(),
+                        3,
+                        move |v| {
+                            let a_lo = h_b2.at(v) - h_hi_s.at(v) * sixteen;
+                            let b_lo = v1_src2.at(v) - v_after_hi_s.at(v) * sixteen;
+                            let r_lo = and1_s.at(v) - and1_hi_s.at(v) * sixteen;
+                            vec![a_lo, b_lo, r_lo]
+                        },
+                    );
+                }
+                // And2 hi
+                {
+                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
+                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
+                    let and2_hi_s = out_and2_hi_cols[slot].clone();
+                    logup.add_to_relation_computed(
+                        bitwise,
+                        [is_real[0].clone(), is_last_pp[0].clone()],
+                        |[r, l]| (r * l).into(),
+                        3,
+                        move |v| vec![xor1_hi_s.at(v), v_after_hi_s2.at(v), and2_hi_s.at(v)],
+                    );
+                }
+                // And2 lo with xor1_expr = H + v1 - 2·And1
+                {
+                    let h_b2 = h_b.clone();
+                    let v1_src2 = v1_src.clone();
+                    let v2_src2 = v2_src.clone();
+                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
+                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
+                    let and1_s = out_and1_cols[slot].clone();
+                    let and2_s = out_and2_cols[slot].clone();
+                    let and2_hi_s = out_and2_hi_cols[slot].clone();
+                    logup.add_to_relation_computed(
+                        bitwise,
+                        [is_real[0].clone(), is_last_pp[0].clone()],
+                        |[r, l]| (r * l).into(),
+                        3,
+                        move |v| {
+                            let xor1_v = h_b2.at(v) + v1_src2.at(v) - two * and1_s.at(v);
+                            let a_lo = xor1_v - xor1_hi_s.at(v) * sixteen;
+                            let b_lo = v2_src2.at(v) - v_after_hi_s2.at(v) * sixteen;
+                            let r_lo = and2_s.at(v) - and2_hi_s.at(v) * sixteen;
+                            vec![a_lo, b_lo, r_lo]
+                        },
+                    );
+                }
+            }
+        }
+
+        // ── Phase 8b: per-byte memory-access consumer lookups ──
+        // Tuple (addr[4], value[1], ts[8], is_write[1]) mirroring the
+        // MemoryChip ledger entries for h reads, m reads, output writes.
+        // Fire only at IsFirstOfCompression · IsReal (once per compression).
+        let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
+        let is_first_pp = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::IsFirstOfCompression
+        );
+        let h_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB0);
+        let h_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB1);
+        let h_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB2);
+        let h_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB3);
+        let m_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB0);
+        let m_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB1);
+        let m_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB2);
+        let m_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB3);
+        let h_wr_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB0);
+        let h_wr_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB1);
+        let h_wr_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB2);
+        let h_wr_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB3);
+        let call_ts_cols = crate::trace::original_base_column!(component_trace, Column::CallTs);
+        let h_word_cols: [_; 8] = [
+            crate::trace::original_base_column!(component_trace, Column::H0),
+            crate::trace::original_base_column!(component_trace, Column::H1),
+            crate::trace::original_base_column!(component_trace, Column::H2),
+            crate::trace::original_base_column!(component_trace, Column::H3),
+            crate::trace::original_base_column!(component_trace, Column::H4),
+            crate::trace::original_base_column!(component_trace, Column::H5),
+            crate::trace::original_base_column!(component_trace, Column::H6),
+            crate::trace::original_base_column!(component_trace, Column::H7),
+        ];
+        let m_word_cols: [_; 16] = [
+            crate::trace::original_base_column!(component_trace, Column::M0),
+            crate::trace::original_base_column!(component_trace, Column::M1),
+            crate::trace::original_base_column!(component_trace, Column::M2),
+            crate::trace::original_base_column!(component_trace, Column::M3),
+            crate::trace::original_base_column!(component_trace, Column::M4),
+            crate::trace::original_base_column!(component_trace, Column::M5),
+            crate::trace::original_base_column!(component_trace, Column::M6),
+            crate::trace::original_base_column!(component_trace, Column::M7),
+            crate::trace::original_base_column!(component_trace, Column::M8),
+            crate::trace::original_base_column!(component_trace, Column::M9),
+            crate::trace::original_base_column!(component_trace, Column::M10),
+            crate::trace::original_base_column!(component_trace, Column::M11),
+            crate::trace::original_base_column!(component_trace, Column::M12),
+            crate::trace::original_base_column!(component_trace, Column::M13),
+            crate::trace::original_base_column!(component_trace, Column::M14),
+            crate::trace::original_base_column!(component_trace, Column::M15),
+        ];
+        let output_cols = crate::trace::original_base_column!(component_trace, Column::Output);
+
+        // 64 h reads: (HRdAddr[i], H[i/8][i%8], CallTs, 0)
+        for i in 0..64usize {
+            let word = i / 8;
+            let byte = i % 8;
+            let addr0 = h_rd_addr_b0[i].clone();
+            let addr1 = h_rd_addr_b1[i].clone();
+            let addr2 = h_rd_addr_b2[i].clone();
+            let addr3 = h_rd_addr_b3[i].clone();
+            let h_b = h_word_cols[word][byte].clone();
+            let ts_c = call_ts_cols.clone();
+            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
+            logup.add_to_relation_computed(
+                mem_lookup,
+                [is_real[0].clone(), is_first_pp[0].clone()],
+                |[r, f]| (r * f).into(),
+                14,
+                move |v| {
+                    let mut t = Vec::with_capacity(14);
+                    t.push(addr0.at(v));
+                    t.push(addr1.at(v));
+                    t.push(addr2.at(v));
+                    t.push(addr3.at(v));
+                    t.push(h_b.at(v));
+                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    t.push(zero_val);
+                    t
+                },
+            );
+        }
+        // 128 m reads
+        for k in 0..128usize {
+            let word = k / 8;
+            let byte = k % 8;
+            let addr0 = m_rd_addr_b0[k].clone();
+            let addr1 = m_rd_addr_b1[k].clone();
+            let addr2 = m_rd_addr_b2[k].clone();
+            let addr3 = m_rd_addr_b3[k].clone();
+            let m_b = m_word_cols[word][byte].clone();
+            let ts_c = call_ts_cols.clone();
+            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
+            logup.add_to_relation_computed(
+                mem_lookup,
+                [is_real[0].clone(), is_first_pp[0].clone()],
+                |[r, f]| (r * f).into(),
+                14,
+                move |v| {
+                    let mut t = Vec::with_capacity(14);
+                    t.push(addr0.at(v));
+                    t.push(addr1.at(v));
+                    t.push(addr2.at(v));
+                    t.push(addr3.at(v));
+                    t.push(m_b.at(v));
+                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    t.push(zero_val);
+                    t
+                },
+            );
+        }
+        // 64 output writes — gated by IsLastOfCompression, since the Output
+        // column is only populated on the last row of each compression
+        // (Phase 2b witness).  HWrAddr/CallTs are inter-row-constant so they
+        // have the correct values on that row too.
+        for i in 0..64usize {
+            let addr0 = h_wr_addr_b0[i].clone();
+            let addr1 = h_wr_addr_b1[i].clone();
+            let addr2 = h_wr_addr_b2[i].clone();
+            let addr3 = h_wr_addr_b3[i].clone();
+            let out_b = output_cols[i].clone();
+            let ts_c = call_ts_cols.clone();
+            let one_val = PackedBaseField::broadcast(BaseField::from(1u32));
+            logup.add_to_relation_computed(
+                mem_lookup,
+                [is_real[0].clone(), is_last_pp[0].clone()],
+                |[r, l]| (r * l).into(),
+                14,
+                move |v| {
+                    let mut t = Vec::with_capacity(14);
+                    t.push(addr0.at(v));
+                    t.push(addr1.at(v));
+                    t.push(addr2.at(v));
+                    t.push(addr3.at(v));
+                    t.push(out_b.at(v));
+                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    t.push(one_val);
+                    t
+                },
+            );
+        }
+
+        // ── Phase 8c: Blake2b-call consumer linking to CpuChip ECALL step ──
+        // Tuple (h_ptr[0..4], m_ptr[0..4], t[0..8], F[1], CallTs[0..8]) = 25 limbs.
+        // Fires at IsFirstOfCompression · IsReal (once per compression),
+        // with multiplicity -1 so CpuChip's matching producer balances.
+        let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
+        let h_ptr_cols = crate::trace::original_base_column!(component_trace, Column::HPtr);
+        let m_ptr_cols = crate::trace::original_base_column!(component_trace, Column::MPtr);
+        let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
+        let f_col = crate::trace::original_base_column!(component_trace, Column::F);
+        logup.add_to_relation_computed(
+            blake2b_call,
+            [is_real[0].clone(), is_first_pp[0].clone()],
+            |[r, f]| (-(r * f)).into(),
+            25,
+            {
+                let h_ptr_c = h_ptr_cols.clone();
+                let m_ptr_c = m_ptr_cols.clone();
+                let t_c = t_cols.clone();
+                let f_c = f_col[0].clone();
+                let ts_c = call_ts_cols.clone();
+                move |v| {
+                    let mut t = Vec::with_capacity(25);
+                    for i in 0..4 { t.push(h_ptr_c[i].at(v)); }
+                    for i in 0..4 { t.push(m_ptr_c[i].at(v)); }
+                    for i in 0..8 { t.push(t_c[i].at(v)); }
+                    t.push(f_c.at(v));
+                    for i in 0..8 { t.push(ts_c[i].at(v)); }
+                    t
+                }
+            },
+        );
+
+        logup.finalize()
     }
 }
 

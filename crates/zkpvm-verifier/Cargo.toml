@@ -5,10 +5,11 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-zkpvm = { workspace = true }
+zkpvm = { path = "../zkpvm", default-features = false }
 stwo = { workspace = true }
 stwo-constraint-framework = { workspace = true }
 num-traits = { workspace = true }
 
 [dev-dependencies]
 javm = { workspace = true }
+zkpvm = { path = "../zkpvm" } # tests use the prover too
