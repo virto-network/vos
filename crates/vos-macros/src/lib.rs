@@ -657,8 +657,21 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     };
 
-    // Worker entry points — native .so plugins (poll-based async ABI)
+    // Worker entry points — native .so plugins (poll-based async ABI).
+    //
+    // Building with the `worker` feature also marks the actor as a
+    // [`vos::WorkerActor`], which unlocks the [`vos::WorkerCtx`]
+    // extension methods (`ctx.fetch`, etc.) inside handler bodies.
+    // The trait import below brings those methods into scope so user
+    // handlers can call `ctx.fetch(...)` without an extra `use`.
     let worker_entries = quote! {
+        #[cfg(feature = "worker")]
+        impl vos::WorkerActor for #actor_name {}
+
+        #[cfg(feature = "worker")]
+        #[allow(unused_imports)]
+        use vos::WorkerCtx as _;
+
         #[cfg(feature = "worker")]
         mod __vos_worker {
             use super::*;

@@ -212,28 +212,6 @@ impl<A: Actor> Context<A> {
         super::run::HostIo::new(result_slot)
     }
 
-    /// Build an HTTP request to send via the host. Returns a builder
-    /// that implements `IntoFuture`, so awaiting it sends the request
-    /// and returns the response.
-    ///
-    /// ```ignore
-    /// // GET (default method):
-    /// let resp = ctx.fetch("https://api.example.com").await;
-    ///
-    /// // POST with a JSON body and custom header:
-    /// let resp = ctx.fetch("https://api.example.com/items")
-    ///     .post()
-    ///     .header("Authorization", "Bearer xyz")
-    ///     .json(r#"{"name":"foo"}"#)
-    ///     .await;
-    /// ```
-    pub fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A> {
-        FetchBuilder {
-            ctx: self,
-            request: crate::effects::FetchRequest::get(url),
-        }
-    }
-
     /// Take the pending host I/O request bytes (for the C ABI to expose).
     pub fn take_host_io_request(&mut self) -> Option<Vec<u8>> {
         self.host_io_request.take()
@@ -473,6 +451,68 @@ impl<'ctx, A: Actor> FetchBuilder<'ctx, A> {
     pub fn text(mut self, body: impl AsRef<str>) -> Self {
         self.request.body = body.as_ref().as_bytes().to_vec();
         self.header("Content-Type", "text/plain; charset=utf-8")
+    }
+}
+
+// ── Worker-only context extensions ───────────────────────────────────
+
+/// Marker trait declaring an actor is a **native worker** — i.e.,
+/// runs as a host plugin (`.so`/dylib) rather than as a deterministic
+/// PVM service. Implementations get access to non-deterministic I/O
+/// methods via [`WorkerCtx`]: HTTP `fetch`, raw `host_call`, etc.
+///
+/// PVM actors deliberately do not implement this. A PVM actor that
+/// needs HTTP routes through a worker via `ctx.ask`/`ctx.tell`; the
+/// type system enforces this separation by hiding the I/O methods.
+///
+/// The `#[actor]`/`#[messages]` macro emits the `impl` automatically
+/// when the actor crate is built with the `worker` feature on.
+pub trait WorkerActor: Actor {}
+
+/// HTTP / host-call API exposed only on actors that implement
+/// [`WorkerActor`].
+///
+/// Bring this trait into scope inside a worker crate to get access
+/// to `ctx.fetch(...)` and friends:
+///
+/// ```ignore
+/// use vos::WorkerCtx;
+///
+/// #[messages]
+/// impl MyWorker {
+///     #[msg]
+///     async fn lookup(&mut self, ctx: &mut Context<Self>) -> u64 {
+///         ctx.fetch("https://api.example.com/rate").await.status as u64
+///     }
+/// }
+/// ```
+///
+/// In a PVM actor crate the trait is unavailable, so `ctx.fetch`
+/// produces a clear "method not found" error at compile time.
+pub trait WorkerCtx<A: Actor> {
+    /// Build an HTTP request via the host. Returns a builder that
+    /// implements `IntoFuture`, so awaiting it sends the request
+    /// and returns the response.
+    fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A>;
+}
+
+impl<A: WorkerActor> WorkerCtx<A> for Context<A> {
+    /// ```ignore
+    /// // GET (default method):
+    /// let resp = ctx.fetch("https://api.example.com").await;
+    ///
+    /// // POST with a JSON body and custom header:
+    /// let resp = ctx.fetch("https://api.example.com/items")
+    ///     .post()
+    ///     .header("Authorization", "Bearer xyz")
+    ///     .json(r#"{"name":"foo"}"#)
+    ///     .await;
+    /// ```
+    fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A> {
+        FetchBuilder {
+            ctx: self,
+            request: crate::effects::FetchRequest::get(url),
+        }
     }
 }
 
