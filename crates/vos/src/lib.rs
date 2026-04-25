@@ -71,7 +71,7 @@ pub mod data_layer;
 pub mod pvm_image;
 
 // Re-export core actor types at crate root for `use vos::*`
-pub use actors::{Actor, Message, PureActor, Context, PureContext, WorkerActor, WorkerCtx, Yield, Ask, RunResult, try_poll, run_blocking, metadata};
+pub use actors::{Actor, Message, Context, WorkerActor, WorkerCtx, Yield, Ask, RunResult, try_poll, run_blocking, metadata};
 pub use actors::{Encode, Decode};
 pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
 pub use actors::InvokeError;
