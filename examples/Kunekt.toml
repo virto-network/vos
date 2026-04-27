@@ -6,64 +6,83 @@
 #
 # Run with:
 #   vosx start examples/Kunekt.toml
+#   vosx list  examples/Kunekt.toml
 #
-# List the actors and workers:
-#   vosx list examples/Kunekt.toml
+# Per-instance config (libp2p identity, listen addrs, data dir)
+# typically lives in a gitignored `Kunekt.local.toml` overlay so
+# different operators can run the same space with their own
+# `[node]` block.
 
-[space]
-name = "demo"
+# ── Space identity ────────────────────────────────────────────────
+#
+# Top-level keys define the space itself. There is no [space]
+# wrapper.
+
+space = "demo"
+version = "0.1.0"
 
 # Optional. When set, this space announces itself to the named
-# hyperspace and discovers peer spaces through it. A hyperspace is
-# just another space whose `well_known = "hyperspace"` actor keeps
-# the membership list. Leave unset for standalone spaces.
-# hyperspace = "kunekt://hub.example/registry"
+# hyperspace and inherits its registry transitively. A hyperspace
+# is just another space whose agent provides = ["registry"]
+# tracks the membership list. Standalone spaces leave this unset.
+# hyperspace = "main-hub"
 
-# Optional libp2p identity material (path to keypair, or "auto" to
-# derive on first run). Read by the networking layer.
-# identity = "auto"
+# ── Agents ────────────────────────────────────────────────────────
+#
+# Each [[agent]] is a deterministic PVM service running on this
+# space's node. Agents can host child actors inline via `actors`.
+#
+# `consistency`:
+#   ephemeral  — in-memory only (default)
+#   local      — redb-backed
+#   crdt       — merkle-CRDT (state + DAG + roots committed atomically;
+#                effect logs recorded for cross-replica replay)
+#
+# `provides`: opt-in role tags. Other actors / operators address
+# the agent by role rather than by local name. Future runtime will
+# expose `@role` lookup in init values; today these are surfaced in
+# the boot log and `vosx list`.
+#
+# Either `path` (development) or `service` (registry lookup;
+# requires the networking layer) — not both.
 
-# ── Actors / services ───────────────────────────────────────────────
-#
-# Each [[actor]] is a PVM service running on this space's node.
-# `consistency` picks the persistence/replication strategy:
-#   ephemeral  — in-memory only, lost on exit (default)
-#   local      — redb-backed, no replication
-#   crdt       — merkle-CRDT: state + DAG + roots committed atomically,
-#                effect logs recorded for cross-replica replay (sync
-#                lands with the networking layer)
-#
-# `well_known` optionally tags the actor with a known role
-# (`registry`, `hyperspace`, ...) — visible in `vosx list` and used
-# by in-space discovery.
-#
-# `[actor.init]` carries init args. String values that match another
-# declared actor or worker name are resolved to the peer's ServiceId
-# at startup. References resolve in declaration order; forward refs
-# are caught with a clear error.
-
-[[actor]]
+[[agent]]
 name = "scheduler"
 path = "agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
 consistency = "ephemeral"
-[actor.init]
-# `children` resolves each name to the corresponding actor's
-# ServiceId so the scheduler can invoke them by ID.
-children = []
+init = { children = [] }
 
-# ── Workers ─────────────────────────────────────────────────────────
+# Child actors. Each one gets its own ServiceId and inherits the
+# agent's consistency. Reference them by name from the agent's own
+# init args:
+#   init = { children = ["ledger", "audit"] }
+# actors = [
+#   { name = "ledger", path = "...", init = { opening_balance = 100 } },
+#   { name = "audit",  path = "...", init = { peer = "ledger" } },
+# ]
+
+# ── Workers ──────────────────────────────────────────────────────
 #
-# Native plugins (`.so`/`.dylib`). Workers are the I/O surface of
-# the space — actors that need HTTP, the wall clock, the filesystem,
-# etc. route through workers via `ctx.ask` / `ctx.tell`. Each
-# observed reply is captured in the actor's effect log so CRDT
-# actors can replay deterministically across replicas.
-#
-# `[worker.init]` populates the worker's constructor args. Same
-# name-to-ServiceId resolution rules as actor init.
+# Native plugins (.so / .dylib) — the I/O surface of the space.
+# PVM agents that need HTTP, the wall clock, the filesystem, or
+# hardware access route through workers via ctx.ask / ctx.tell.
+# Each observed reply is captured in the calling actor's effect
+# log so CRDT actors replay deterministically across replicas.
 
 # [[worker]]
 # name = "rate-oracle"
 # path = "target/debug/librate_oracle.so"
-# [worker.init]
-# endpoint = "https://api.example.com"
+# provides = ["rates"]
+# init = { endpoint = "https://api.example.com" }
+
+# ── Per-instance configuration ────────────────────────────────────
+#
+# The [node] section holds settings that vary per running instance.
+# In practice, ship the manifest above without [node] and put
+# operator-specific config in a gitignored Kunekt.local.toml
+# overlay. CLI flags --data-dir / --no-persist take precedence.
+
+# [node]
+# identity = "auto"                       # libp2p keypair (reserved)
+# listen   = ["/ip4/0.0.0.0/tcp/4001"]    # libp2p listen addrs (reserved)
+# data_dir = "./data"                     # persistence dir

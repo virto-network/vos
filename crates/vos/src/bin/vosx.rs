@@ -240,74 +240,144 @@ fn cmd_node(
 }
 
 fn cmd_list(manifest: &Manifest, dir: &Path) {
-    let space = &manifest.space;
-    println!("space: {}", space.name);
-    if let Some(hs) = &space.hyperspace {
+    println!("space: {}", manifest.space);
+    if let Some(v) = &manifest.version {
+        println!("  version: {v}");
+    }
+    if let Some(hs) = &manifest.hyperspace {
         println!("  hyperspace: {hs}");
     }
     println!();
-    for a in &manifest.actor {
-        let role = match (&a.well_known, a.consistency) {
-            (Some(wk), c) => format!("actor [{wk}] {c:?}"),
-            (None, c) => format!("actor {c:?}"),
-        };
-        print_actor_meta(&a.name, &dir.join(&a.path), &role);
-    }
-    for w in &manifest.worker {
-        let path = dir.join(&w.path);
-        if path.exists() {
-            println!("  {} (worker) — {}", w.name, path.display());
-        } else {
-            println!("  {} (worker) — not built ({})", w.name, path.display());
+
+    for a in &manifest.agent {
+        let role = format!(
+            "agent {:?}{}",
+            a.consistency,
+            if a.provides.is_empty() {
+                String::new()
+            } else {
+                format!(" provides={:?}", a.provides)
+            }
+        );
+        let path = resolve_entry_path_for_listing(&a.name, &a.path, &a.service, dir);
+        print_actor_meta(&a.name, &path, &role);
+
+        for child in &a.actors {
+            let role = format!(
+                "actor (child of {}){}",
+                a.name,
+                if child.provides.is_empty() {
+                    String::new()
+                } else {
+                    format!(" provides={:?}", child.provides)
+                }
+            );
+            let path = resolve_entry_path_for_listing(&child.name, &child.path, &child.service, dir);
+            print_actor_meta(&child.name, &path, &role);
         }
+    }
+
+    for w in &manifest.worker {
+        let path = resolve_entry_path_for_listing(&w.name, &w.path, &w.service, dir);
+        let role_tag = if w.provides.is_empty() {
+            String::new()
+        } else {
+            format!(" provides={:?}", w.provides)
+        };
+        if path.exists() {
+            println!("  {} (worker{role_tag}) — {}", w.name, path.display());
+        } else {
+            println!("  {} (worker{role_tag}) — not built ({})", w.name, path.display());
+        }
+    }
+}
+
+/// Like `resolve_entry_path` but for `vosx list` — doesn't `die` on
+/// `service` since list is a read-only inspection command.
+fn resolve_entry_path_for_listing(
+    name: &str,
+    path: &Option<PathBuf>,
+    service: &Option<String>,
+    dir: &Path,
+) -> PathBuf {
+    if let Some(p) = path {
+        dir.join(p)
+    } else if let Some(s) = service {
+        // Display-only placeholder.
+        PathBuf::from(format!("<service: {s}>"))
+    } else {
+        PathBuf::from(format!("<unspecified for '{name}'>"))
     }
 }
 
 /// Run the space defined by `manifest`.
 ///
-/// Workers register first (they're the I/O boundary, and PVM agents
-/// often hold worker IDs in their init args); then actors register
-/// in declaration order. The `name_ids` map is built incrementally,
-/// so an actor / worker can reference any peer declared earlier in
-/// the manifest by name in its init args. Forward references error
-/// out at startup with a clear message.
-fn cmd_start(manifest: &Manifest, dir: &Path, data_dir: Option<&Path>) {
+/// Registration order:
+/// 1. All `[[worker]]` entries — their IDs become resolvable for
+///    everything below.
+/// 2. For each `[[agent]]`, its `actors` (child actors) first so the
+///    agent's own `init` can reference them by name, then the agent
+///    itself.
+///
+/// String values in `init` tables that match a previously-declared
+/// name resolve to that peer's ServiceId. Forward references error
+/// out cleanly. Cross-agent actor refs require the target agent's
+/// children to be registered before the referring agent.
+fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
     use vos::node::{AgentConfig, VosNode, WorkerConfig};
     use vos::value::Args;
 
-    let space = &manifest.space;
     eprintln!(
-        "vosx: starting space '{}' ({} actor(s), {} worker(s))",
-        space.name,
-        manifest.actor.len(),
+        "vosx: starting space '{}' ({} agent(s), {} worker(s))",
+        manifest.space,
+        manifest.agent.len(),
         manifest.worker.len(),
     );
-    if let Some(hs) = &space.hyperspace {
-        eprintln!("vosx: hyperspace '{hs}' (declared; networking lands separately)");
+    if let Some(hs) = &manifest.hyperspace {
+        eprintln!(
+            "vosx: hyperspace '{hs}' (declared; registry inherited from there \
+             once networking lands)",
+        );
     }
 
-    // Sanity: no two declarations share a name.
+    // CLI --data-dir wins; otherwise fall back to the manifest's
+    // [node].data_dir; otherwise no persistence directory at all
+    // (Local/Crdt actors will fail loudly via build_agent_strategy).
+    let data_dir = data_dir_cli
+        .map(|p| p.to_path_buf())
+        .or_else(|| manifest.node.data_dir.clone());
+
+    // Sanity: no two declarations share a name across agents,
+    // child actors, and workers.
     {
-        let mut seen = BTreeMap::<&str, &str>::new();
-        for a in &manifest.actor {
-            if seen.insert(a.name.as_str(), "actor").is_some() {
-                die(&format!("duplicate name '{}' in manifest", a.name));
+        let mut seen = BTreeMap::<String, &str>::new();
+        let mut check = |name: &str, kind: &'static str| {
+            if let Some(prev) = seen.insert(name.to_string(), kind) {
+                die(&format!(
+                    "duplicate name '{name}' in manifest (already used as {prev})",
+                ));
+            }
+        };
+        for a in &manifest.agent {
+            check(&a.name, "agent");
+            for child in &a.actors {
+                check(&child.name, "actor");
             }
         }
         for w in &manifest.worker {
-            if seen.insert(w.name.as_str(), "worker").is_some() {
-                die(&format!("duplicate name '{}' in manifest", w.name));
-            }
+            check(&w.name, "worker");
         }
     }
 
     let mut node = VosNode::new();
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
+    // Note: `provides` lists are surfaced in the boot log but not
+    // yet wired into runtime role lookup. That comes alongside the
+    // registry / `@role` resolver in the networking pass.
 
-    // Workers first: their IDs become resolvable for actor init args
-    // that reference workers by name (the common case).
+    // ── Workers ─────────────────────────────────────────────────────
     for w in &manifest.worker {
-        let path = dir.join(&w.path);
+        let path = resolve_entry_path(&w.name, &w.path, &w.service, dir);
         let mut cfg = if w.init.is_empty() {
             WorkerConfig::new(path)
         } else {
@@ -317,55 +387,71 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir: Option<&Path>) {
             }
             WorkerConfig::with_args(path, &args)
         };
-        if let Some(d) = data_dir {
+        if let Some(d) = &data_dir {
             cfg = cfg.persist(d);
         }
         let id = node.register_worker(cfg);
-        eprintln!("vosx: worker '{}' as {id}", w.name);
+        let role_tag = format_provides(&w.provides);
+        eprintln!("vosx: worker '{}' as {id}{role_tag}", w.name);
         name_ids.insert(w.name.clone(), id.0);
+        if !w.provides.is_empty() {
+            // (provides recorded via boot log; runtime use deferred)
+        }
     }
 
-    // Actors next, in declaration order. Init args resolve against
-    // workers + already-registered actors.
-    for a in &manifest.actor {
-        let path = dir.join(&a.path);
+    // ── Agents and their child actors ──────────────────────────────
+    for a in &manifest.agent {
+        // 1. Child actors first.
+        for child in &a.actors {
+            let path = resolve_entry_path(&child.name, &child.path, &child.service, dir);
+            let elf_data = load_file(&path);
+            let blob = load_blob(&path);
+
+            // Child actors inherit the agent's consistency by
+            // default. Override would land as a per-actor field if
+            // we ever need it; for now they're all the agent's tier.
+            let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
+            if let Some(d) = &data_dir {
+                cfg = cfg.persist(d);
+            }
+            cfg = apply_init(cfg, &child.init, &elf_data, &name_ids);
+
+            let id = node.register(cfg);
+            let role_tag = format_provides(&child.provides);
+            eprintln!(
+                "vosx: actor '{}' (child of '{}') as {id} ({:?}){role_tag}",
+                child.name, a.name, a.consistency,
+            );
+            name_ids.insert(child.name.clone(), id.0);
+            if !child.provides.is_empty() {
+                // (provides recorded via boot log; runtime use deferred)
+            }
+        }
+
+        // 2. Agent itself.
+        let path = resolve_entry_path(&a.name, &a.path, &a.service, dir);
         let elf_data = load_file(&path);
         let blob = load_blob(&path);
 
         let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
-        if let Some(d) = data_dir {
+        if let Some(d) = &data_dir {
             cfg = cfg.persist(d);
         }
-
-        if !a.init.is_empty() {
-            let meta = vos::metadata::from_elf(&elf_data);
-            let mut args = InitArgs::new();
-            for (key, val) in &a.init {
-                let ty = meta
-                    .as_ref()
-                    .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
-                    .map(|f| f.ty.as_str())
-                    .unwrap_or("String");
-                args = args.with(key, toml_to_init_value(val, ty, &name_ids));
-            }
-            let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-            cfg = cfg.with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded.to_vec())]);
-        }
+        cfg = apply_init(cfg, &a.init, &elf_data, &name_ids);
 
         let id = node.register(cfg);
-        let role = a
-            .well_known
-            .as_deref()
-            .map(|r| format!(" [{r}]"))
-            .unwrap_or_default();
+        let role_tag = format_provides(&a.provides);
         eprintln!(
-            "vosx: actor '{}' as {id} ({:?}{role})",
+            "vosx: agent '{}' as {id} ({:?}){role_tag}",
             a.name, a.consistency,
         );
         name_ids.insert(a.name.clone(), id.0);
+        if !a.provides.is_empty() {
+            // (provides recorded via boot log; runtime use deferred)
+        }
     }
 
-    eprintln!("vosx: running space '{}'...\n", space.name);
+    eprintln!("vosx: running space '{}'...\n", manifest.space);
     node.run();
 
     let results = node.collect();
@@ -383,47 +469,149 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir: Option<&Path>) {
     exit_with_status(panics);
 }
 
+fn format_provides(provides: &[String]) -> String {
+    if provides.is_empty() {
+        String::new()
+    } else {
+        format!(" provides={provides:?}")
+    }
+}
+
+fn apply_init(
+    mut cfg: vos::node::AgentConfig,
+    init: &BTreeMap<String, toml::Value>,
+    elf_data: &[u8],
+    name_ids: &BTreeMap<String, u32>,
+) -> vos::node::AgentConfig {
+    if init.is_empty() {
+        return cfg;
+    }
+    let meta = vos::metadata::from_elf(elf_data);
+    let mut args = InitArgs::new();
+    for (key, val) in init {
+        let ty = meta
+            .as_ref()
+            .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
+            .map(|f| f.ty.as_str())
+            .unwrap_or("String");
+        args = args.with(key, toml_to_init_value(val, ty, name_ids));
+    }
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    cfg = cfg.with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded.to_vec())]);
+    cfg
+}
+
 // ── Manifest ─────────────────────────────────────────────────────────
 //
-// One vosx instance runs one space. The manifest declares the space's
-// identity, the actors and workers it hosts, and (when networking
-// lands) its membership in a hyperspace. Spaces with the same manifest
-// will be able to join as peers.
+// One vosx instance runs one space. Space-level properties live at
+// the TOML root (no `[space]` wrapper). `[[agent]]` lists the PVM
+// services running here; each agent can host child actors inline.
+// `[[worker]]` lists native plugins (.so / .dylib) — the I/O surface
+// of the space. `[node]` is the per-instance section (libp2p
+// identity, listen addresses, data dir).
+//
+// Schema overview:
+//
+//   space      = "demo"                # required
+//   version    = "0.1.0"               # optional, the space's own version
+//   hyperspace = "main-hub"            # optional; inherits registry + peers
+//
+//   [[agent]]
+//     name = "scheduler"
+//     path | service = ...             # exactly one
+//     consistency = "ephemeral" | "local" | "crdt"
+//     provides = ["role-1", ...]
+//     init = { ... }
+//     actors = [ { name = "ledger", path = "...", init = { ... } }, ... ]
+//
+//   [[worker]]
+//     name = "rate-oracle"
+//     path | service = ...
+//     provides = ["rates"]
+//     init = { ... }
+//
+//   [node]
+//     identity = "auto"
+//     listen   = ["/ip4/0.0.0.0/tcp/4001"]
+//     data_dir = "./data"
 
 #[derive(Deserialize)]
 struct Manifest {
-    space: SpaceMeta,
+    space: String,
     #[serde(default)]
-    actor: Vec<ActorDef>,
-    #[serde(default)]
-    worker: Vec<WorkerDef>,
-}
-
-#[derive(Deserialize)]
-struct SpaceMeta {
-    name: String,
-    /// Optional hyperspace this space joins. Reserved for the
-    /// networking layer — currently parsed and reported but inert.
+    #[allow(dead_code)]
+    version: Option<String>,
+    /// Optional hyperspace to inherit registry / peers from.
+    /// Reserved for the networking layer — parsed and reported
+    /// today but inert until libp2p lands.
     #[serde(default)]
     hyperspace: Option<String>,
-    /// Optional libp2p identity material (path to keypair, or
-    /// "auto" to derive on first run). Reserved field — read
-    /// when the networking layer lands.
+    #[serde(default)]
+    agent: Vec<AgentDef>,
+    #[serde(default)]
+    worker: Vec<WorkerDef>,
+    /// Per-instance configuration (libp2p identity, data dir, ...).
+    /// In normal use this lives in a gitignored `Kunekt.local.toml`
+    /// overlay — different operators get different `[node]`s while
+    /// sharing the rest of the manifest.
+    #[serde(default)]
+    node: NodeMeta,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeMeta {
+    /// libp2p keypair material (path to file, or `"auto"` to
+    /// derive on first run). Reserved.
     #[serde(default)]
     #[allow(dead_code)]
     identity: Option<String>,
+    /// libp2p listen multiaddrs. Reserved.
+    #[serde(default)]
+    #[allow(dead_code)]
+    listen: Vec<String>,
+    /// Per-actor redb files live under `{data_dir}/agents/...` and
+    /// `{data_dir}/workers/...`. CLI `--data-dir` takes precedence.
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct AgentDef {
+    name: String,
+    /// Local path to an ELF or pre-compiled .pvm. Mutually exclusive
+    /// with `service`.
+    #[serde(default)]
+    path: Option<PathBuf>,
+    /// Registry lookup, e.g. `"kunekt/scheduler@1.2"`. Production
+    /// path. Currently errors out — registry resolution lands with
+    /// the networking layer.
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    consistency: ConsistencyDef,
+    /// Roles this agent provides (e.g. `["registry"]`). Other actors
+    /// can address by role via `init` values prefixed `@role-name`.
+    /// Operators see this in `vosx list`.
+    #[serde(default)]
+    provides: Vec<String>,
+    #[serde(default)]
+    init: BTreeMap<String, toml::Value>,
+    /// Child actors hosted by this agent. Each becomes its own
+    /// registered service; the agent typically references them by
+    /// name in its own `init` (e.g. `init = { children = [...] }`).
+    #[serde(default)]
+    actors: Vec<ActorDef>,
 }
 
 #[derive(Deserialize)]
 struct ActorDef {
     name: String,
-    path: PathBuf,
     #[serde(default)]
-    consistency: ConsistencyDef,
-    /// Optional named role within the space (e.g. `"registry"`).
-    /// Surfaced to operators and reserved for in-space discovery.
+    path: Option<PathBuf>,
     #[serde(default)]
-    well_known: Option<String>,
+    service: Option<String>,
+    #[serde(default)]
+    provides: Vec<String>,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
 }
@@ -450,9 +638,39 @@ impl From<ConsistencyDef> for vos::node::Consistency {
 #[derive(Deserialize)]
 struct WorkerDef {
     name: String,
-    path: PathBuf,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    service: Option<String>,
+    /// Roles this worker provides (e.g. `["rates"]`).
+    #[serde(default)]
+    provides: Vec<String>,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
+}
+
+/// Resolve the local file path for an entry that may use `path` (dev)
+/// or `service` (registry lookup). Today only `path` is supported;
+/// `service` errors out with a clear pointer to networking work.
+fn resolve_entry_path(
+    name: &str,
+    path: &Option<PathBuf>,
+    service: &Option<String>,
+    dir: &Path,
+) -> PathBuf {
+    match (path, service) {
+        (Some(_), Some(_)) => die(&format!(
+            "'{name}': 'service' and 'path' are mutually exclusive — pick one",
+        )),
+        (None, None) => die(&format!(
+            "'{name}': either 'service' or 'path' is required",
+        )),
+        (None, Some(s)) => die(&format!(
+            "'{name}': 'service = {s:?}' requires registry resolution which lands \
+             with the networking layer; use 'path' for now",
+        )),
+        (Some(p), None) => dir.join(p),
+    }
 }
 
 fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
