@@ -54,6 +54,9 @@ pub(super) struct OpcodeFlags {
     /// Phase 12b-1: BitManip permutation/zero-extend ops.
     pub is_reverse_bytes: bool,
     pub is_zero_ext_16: bool,
+    /// Phase 12b-2: BitManip sign-extend ops.
+    pub is_sign_ext_8: bool,
+    pub is_sign_ext_16: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -108,10 +111,11 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // SignExtend8/16, Sbrk — see Phase 12a/12b-2/12f.
         Opcode::ZeroExtend16 => { f.is_zero_ext_16 = true; }
         Opcode::ReverseBytes => { f.is_reverse_bytes = true; }
+        Opcode::SignExtend8 => { f.is_sign_ext_8 = true; }
+        Opcode::SignExtend16 => { f.is_sign_ext_16 = true; }
         Opcode::CountSetBits64 | Opcode::CountSetBits32
         | Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
         | Opcode::TrailingZeroBits64 | Opcode::TrailingZeroBits32
-        | Opcode::SignExtend8 | Opcode::SignExtend16
         | Opcode::Sbrk
             => {}
         // Branches (conditional) — classify by comparison type

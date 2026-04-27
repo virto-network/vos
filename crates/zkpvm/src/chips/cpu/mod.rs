@@ -535,6 +535,47 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // BITMANIP — SIGN_EXTEND_8 / SIGN_EXTEND_16  (ground constraints only;
+        // the sign-bit-pinning AND lookups live just before finalize_logup
+        // — see "Sign-extend nibble lookups" near end of add_constraints).
+        // ════════════════════════════════════════════════════════════════════
+        let is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
+        let is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
+        let sign_ext_bit = crate::trace::trace_eval!(trace_eval, Column::SignExtBit);
+        let _sign_ext_hi_nib_unused = crate::trace::trace_eval!(trace_eval, Column::SignExtSrcHiNib);
+        let is_sign_ext = is_sign_ext_8[0].clone() + is_sign_ext_16[0].clone();
+        let ff_se: E::F = E::F::from(BaseField::from(255));
+
+        // SignExtBit ∈ {0, 1}.
+        eval.add_constraint(
+            is_sign_ext.clone()
+                * sign_ext_bit[0].clone()
+                * (sign_ext_bit[0].clone() - E::F::one()),
+        );
+        // SE8 + SE16 both copy byte 0.
+        eval.add_constraint(
+            is_sign_ext.clone() * (result[0].clone() - val_d[0].clone()),
+        );
+        // SE16 also copies byte 1.
+        eval.add_constraint(
+            is_sign_ext_16[0].clone() * (result[1].clone() - val_d[1].clone()),
+        );
+        // SE8: bytes 1..8 = 0xFF · sign_bit.
+        for i in 1..WORD_SIZE {
+            eval.add_constraint(
+                is_sign_ext_8[0].clone()
+                    * (result[i].clone() - ff_se.clone() * sign_ext_bit[0].clone()),
+            );
+        }
+        // SE16: bytes 2..8 = 0xFF · sign_bit.
+        for i in 2..WORD_SIZE {
+            eval.add_constraint(
+                is_sign_ext_16[0].clone()
+                    * (result[i].clone() - ff_se.clone() * sign_ext_bit[0].clone()),
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // CONTROL FLOW: constrain next_pc based on branch/jump
         // ════════════════════════════════════════════════════════════════════
         let is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
@@ -1062,6 +1103,61 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // BITMANIP — SignExtend8/16 nibble lookups (Phase 12b-2)
+        //
+        // Placed immediately before finalize_logup_in_pairs so the 4 emissions
+        // (2a, 2b, 3a, 3b) pair within themselves and don't reshuffle existing
+        // pair constraints.  Reshuffling could push a downstream pair past the
+        // chip's degree bound — reasoning detailed in the 12-investigate note.
+        //
+        // Tuples (degree-1 each, kept simple to stay within bound):
+        //   (2a) gated on IsSE8: (SignExtSrcHiNib, 8, 8·SignExtBit)
+        //   (2b) gated on IsSE16: same tuple
+        //   (3a) gated on IsSE8: (val_d[0] - 16·SignExtSrcHiNib, 0xF, same)
+        //   (3b) gated on IsSE16: (val_d[1] - 16·SignExtSrcHiNib, 0xF, same)
+        // ════════════════════════════════════════════════════════════════════
+        {
+            let sign_ext_hi_nib = crate::trace::trace_eval!(trace_eval, Column::SignExtSrcHiNib);
+            let sixteen_se: E::F = E::F::from(BaseField::from(16));
+            let eight_se: E::F = E::F::from(BaseField::from(8));
+            let fifteen_se: E::F = E::F::from(BaseField::from(15));
+            // (2a)
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_sign_ext_8[0].clone().into(),
+                &[
+                    sign_ext_hi_nib[0].clone(),
+                    eight_se.clone(),
+                    sign_ext_bit[0].clone() * eight_se.clone(),
+                ],
+            ));
+            // (2b)
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_sign_ext_16[0].clone().into(),
+                &[
+                    sign_ext_hi_nib[0].clone(),
+                    eight_se.clone(),
+                    sign_ext_bit[0].clone() * eight_se,
+                ],
+            ));
+            // (3a)
+            let lo_8 = val_d[0].clone() - sign_ext_hi_nib[0].clone() * sixteen_se.clone();
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_sign_ext_8[0].clone().into(),
+                &[lo_8.clone(), fifteen_se.clone(), lo_8],
+            ));
+            // (3b)
+            let lo_16 = val_d[1].clone() - sign_ext_hi_nib[0].clone() * sixteen_se;
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_sign_ext_16[0].clone().into(),
+                &[lo_16.clone(), fifteen_se, lo_16],
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -1346,6 +1442,28 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.div_rem_op, Column::DivRemOp);
             trace.fill_columns(row, flags.is_reverse_bytes, Column::IsReverseBytes);
             trace.fill_columns(row, flags.is_zero_ext_16, Column::IsZeroExt16);
+            trace.fill_columns(row, flags.is_sign_ext_8, Column::IsSignExt8);
+            trace.fill_columns(row, flags.is_sign_ext_16, Column::IsSignExt16);
+            // Sign-extend witnesses (Phase 12b-2): high nibble + bit-7 of the
+            // sign-source byte.  val_d[0] for SE8, val_d[1] for SE16.  Zero on
+            // non-SE rows; the lookup multiplicities below are gated to match.
+            let (se_src_byte, se_active) = if flags.is_sign_ext_8 {
+                (val_d_bytes[0], true)
+            } else if flags.is_sign_ext_16 {
+                (val_d_bytes[1], true)
+            } else {
+                (0u8, false)
+            };
+            if se_active {
+                let hi = se_src_byte >> 4;
+                let lo = se_src_byte & 0xF;
+                let bit = (se_src_byte >> 7) & 1;
+                trace.fill_columns(row, hi, Column::SignExtSrcHiNib);
+                trace.fill_columns(row, bit, Column::SignExtBit);
+                // Charge BitwiseLookupChip for the two nibble lookups this row emits.
+                *side_note.bitwise_and_counts.entry((hi, 8)).or_insert(0) += 1;
+                *side_note.bitwise_and_counts.entry((lo, 0xF)).or_insert(0) += 1;
+            }
 
             // ── DivRem auxiliary ──
             let mut div_quotient = [0u8; WORD_SIZE];
@@ -1812,6 +1930,61 @@ impl BuiltInProverComponent for CpuChip {
                 [is_blake_ecall[0].clone()],
                 |[active]| active.into(),
                 &tuple,
+            );
+        }
+
+        // ── BitManip SE nibble lookups (Phase 12b-2) ──
+        // 4 emissions paired with verifier-side (2a, 2b, 3a, 3b).  Last block
+        // before finalize() so they pair within themselves.
+        {
+            let is_se8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
+            let is_se16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
+            let se_bit = crate::trace::original_base_column!(component_trace, Column::SignExtBit);
+            let se_hi = crate::trace::original_base_column!(component_trace, Column::SignExtSrcHiNib);
+            let eight_p = PackedBaseField::broadcast(BaseField::from(8));
+            let fifteen_p = PackedBaseField::broadcast(BaseField::from(15));
+            let val_d_0 = val_d_cols[0].clone();
+            let val_d_1 = val_d_cols[1].clone();
+
+            let hi_2a = se_hi[0].clone();
+            let bit_2a = se_bit[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [is_se8[0].clone()],
+                |[m]| m.into(),
+                3,
+                |i| vec![hi_2a.at(i), eight_p, bit_2a.at(i) * eight_p],
+            );
+            let hi_2b = se_hi[0].clone();
+            let bit_2b = se_bit[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [is_se16[0].clone()],
+                |[m]| m.into(),
+                3,
+                |i| vec![hi_2b.at(i), eight_p, bit_2b.at(i) * eight_p],
+            );
+            let hi_3a = se_hi[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [is_se8[0].clone()],
+                |[m]| m.into(),
+                3,
+                |i| {
+                    let lo = val_d_0.at(i) - hi_3a.at(i) * sixteen;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+            let hi_3b = se_hi[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [is_se16[0].clone()],
+                |[m]| m.into(),
+                3,
+                |i| {
+                    let lo = val_d_1.at(i) - hi_3b.at(i) * sixteen;
+                    vec![lo, fifteen_p, lo]
+                },
             );
         }
 

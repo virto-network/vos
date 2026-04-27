@@ -327,6 +327,21 @@ pub enum Column {
     /// 1 iff this step is `ZeroExtend16` (result[0..1] = val_d[0..1]; result[2..7] = 0).
     #[size = 1]
     IsZeroExt16,
+    // ── BitManip sign-extend (Phase 12b-2) ──
+    /// 1 iff this step is `SignExtend8`.
+    #[size = 1]
+    IsSignExt8,
+    /// 1 iff this step is `SignExtend16`.
+    #[size = 1]
+    IsSignExt16,
+    /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
+    /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
+    #[size = 1]
+    SignExtBit,
+    /// High nibble of the sign-source byte.  Together with a (lo_nib, 0xF, lo_nib)
+    /// AND-lookup it pins the byte decomposition `src = 16·hi_nib + lo_nib`.
+    #[size = 1]
+    SignExtSrcHiNib,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
