@@ -69,6 +69,7 @@
 use javm::kernel::{InvocationKernel, KernelResult};
 use std::collections::HashMap;
 use std::io::Write;
+use tracing::error;
 use crate::abi::error;
 use crate::abi::hostcall;
 use crate::abi::service::ServiceId;
@@ -497,7 +498,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     ) {
                         Ok(k) => k,
                         Err(e) => {
-                            eprintln!("vosx: service {svc_id} warm kernel init failed: {e}");
+                            error!(svc_id, error = %e, "service: warm kernel init failed");
                             break;
                         }
                     }
@@ -505,7 +506,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     match InvocationKernel::new_cached(blob, &[], refine_gas, &mut self.code_cache) {
                         Ok(k) => k,
                         Err(e) => {
-                            eprintln!("vosx: service {svc_id} kernel init failed: {e}");
+                            error!(svc_id, error = %e, "service: kernel init failed");
                             break;
                         }
                     }
@@ -707,15 +708,15 @@ fn run_refine_kernel(
             }
             KernelResult::Panic => {
                 let pc = kernel.vm_arena.vm(kernel.active_vm).pc;
-                eprintln!("vosx: service {svc_id} panicked in refine at PC={pc}");
+                error!(svc_id, pc, "service: panicked in refine");
                 return None;
             }
             KernelResult::OutOfGas => {
-                eprintln!("vosx: service {svc_id} out of gas in refine");
+                error!(svc_id, "service: out of gas in refine");
                 return None;
             }
             KernelResult::PageFault(addr) => {
-                eprintln!("vosx: service {svc_id} page fault in refine at {addr:#x}");
+                error!(svc_id, addr = format!("{addr:#x}"), "service: page fault in refine");
                 return None;
             }
             KernelResult::ProtocolCall { slot } => {
@@ -1076,7 +1077,7 @@ fn handle_invoke(
             KernelResult::Halt(_) => break,
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
-                eprintln!("vosx: child invoke panicked at PC={pc} (target svc {target_svc_id:?})");
+                error!(pc, ?target_svc_id, "child invoke panicked");
                 return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
             }
             KernelResult::OutOfGas => {

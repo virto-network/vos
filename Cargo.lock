@@ -1695,6 +1695,7 @@ dependencies = [
  "rkyv",
  "serde",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "ureq",
  "vos-macros",

@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use tracing::{error, info, warn};
+
 use crate::abi::service::ServiceId;
 use crate::runtime::VosRuntime;
 
@@ -302,11 +304,11 @@ impl VosNode {
             if let Some(tx) = self.routes.get(&target.0) {
                 let _ = tx.send(envelope);
             } else {
-                eprintln!("node: no route for {target}, dropping");
+                warn!(%target, "node: no route for target, dropping");
             }
         } else {
             // Future: forward to network layer
-            eprintln!("node: no network layer, dropping remote target {target}");
+            warn!(%target, "node: no network layer, dropping remote target");
         }
     }
 
@@ -363,7 +365,7 @@ fn agent_thread(
             Ok(s) => s,
             Err(e) => {
                 let err = format!("strategy build failed: {e}");
-                eprintln!("agent {id}: {err}");
+                error!(%id, "{err}");
                 return AgentResult { id, panics: 0, error: Some(err) };
             }
         };
@@ -380,11 +382,11 @@ fn agent_thread(
         runtime
             .storage
             .write(svc_id, crate::lifecycle::STATE_KEY_BYTES, &state_bytes);
-        eprintln!("agent {id}: restored {} bytes of state", state_bytes.len());
+        info!(%id, bytes = state_bytes.len(), "agent: restored state");
     } else if recording_enabled {
         match strategy.replay_logs() {
             Ok(logs) if !logs.is_empty() => {
-                eprintln!("agent {id}: rebuilding state from {} DAG nodes", logs.len());
+                info!(%id, dag_nodes = logs.len(), "agent: rebuilding state from DAG");
                 for (i, log) in logs.into_iter().enumerate() {
                     let msg = log.msg.clone();
                     runtime.begin_replay(log);
@@ -403,7 +405,7 @@ fn agent_thread(
                             replay.position(),
                             replay.was_exhausted(),
                         );
-                        eprintln!("agent {id}: {err}");
+                        error!(%id, "{err}");
                         return AgentResult {
                             id,
                             panics: runtime.panics,
@@ -421,7 +423,7 @@ fn agent_thread(
                 if !state.is_empty() {
                     if let Err(e) = strategy.commit(&state) {
                         let err = format!("post-replay commit failed: {e}");
-                        eprintln!("agent {id}: {err}");
+                        error!(%id, "{err}");
                         return AgentResult {
                             id,
                             panics: runtime.panics,
@@ -433,7 +435,7 @@ fn agent_thread(
             Ok(_) => {}
             Err(e) => {
                 let err = format!("replay_logs failed: {e}");
-                eprintln!("agent {id}: {err}");
+                error!(%id, "{err}");
                 return AgentResult {
                     id,
                     panics: runtime.panics,
@@ -486,7 +488,7 @@ fn agent_thread(
     }
 
     if let Some(err) = &fatal_error {
-        eprintln!("agent {id}: {err}");
+        error!(%id, "{err}");
     }
     AgentResult { id, panics: runtime.panics, error: fatal_error }
 }
@@ -606,13 +608,13 @@ fn worker_thread(
         Ok(p) => p,
         Err(e) => {
             let err = format!("failed to load worker plugin: {e}");
-            eprintln!("worker {id}: {err}");
+            error!(%id, "worker: {err}");
             return AgentResult { id, panics: 1, error: Some(err) };
         }
     };
 
     if let Some(meta) = plugin.meta() {
-        eprintln!("worker {id}: loaded '{}' from {}", meta.actor_name, config.path.display());
+        info!(%id, actor = %meta.actor_name, path = %config.path.display(), "worker: loaded plugin");
     }
 
     // Pick a persistence strategy. Workers always get LocalCommit
@@ -625,7 +627,7 @@ fn worker_thread(
 
     let mut instance = match saved_state {
         Some(bytes) => {
-            eprintln!("worker {id}: restored {} bytes of state", bytes.len());
+            info!(%id, bytes = bytes.len(), "worker: restored state");
             plugin.load_state(&bytes)
         }
         None if config.init_args.is_empty() => plugin.create(),
@@ -721,7 +723,7 @@ fn dispatch_and_poll(
                 instance.provide_result(&result);
             }
             _ => {
-                eprintln!("worker {worker_id}: poll error {}", result.status);
+                error!(%worker_id, status = result.status, "worker: poll returned error");
                 return Vec::new();
             }
         }
@@ -771,7 +773,7 @@ fn handle_effect(
             }
         }
         other => {
-            eprintln!("worker {worker_id}: unknown effect tag 0x{other:02x}");
+            error!(%worker_id, tag = format!("{other:#04x}"), "worker: unknown effect tag");
             Vec::new()
         }
     }
@@ -852,7 +854,7 @@ fn build_worker_strategy(
         if let Some(path) = config.db_path() {
             match crate::commit::LocalCommit::open(&path) {
                 Ok(lc) => return Box::new(lc),
-                Err(e) => eprintln!("worker {id}: failed to open storage: {e}"),
+                Err(e) => warn!(%id, error = %e, "worker: failed to open storage; continuing without persistence"),
             }
         }
     }
@@ -871,7 +873,7 @@ fn persist(
 ) {
     let bytes = instance.save_state();
     if let Err(e) = strategy.commit(&bytes) {
-        eprintln!("worker {id}: failed to persist state: {e}");
+        warn!(%id, error = %e, "worker: failed to persist state");
     }
 }
 
@@ -895,11 +897,11 @@ fn wait_for_reply(
                 if deferred.len() < MAX_DEFERRED {
                     deferred.push_back(other);
                 } else {
-                    eprintln!("worker: deferred queue full, dropping message from {}", other.from);
+                    warn!(from = %other.from, "worker: deferred queue full, dropping message");
                 }
             }
             Err(_) => {
-                eprintln!("worker: ask timeout waiting for reply from svc:{target_id}");
+                warn!(target_id, "worker: ask timeout waiting for reply");
                 return Vec::new();
             }
         }

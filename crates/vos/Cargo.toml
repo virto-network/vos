@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["std", "http", "storage"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -32,6 +32,7 @@ toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 blake2b_simd = { version = "1", optional = true }
 pollster = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }

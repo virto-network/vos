@@ -212,7 +212,7 @@ fn cmd_node(
     let mut host_errors = 0usize;
     for r in &results {
         if let Some(err) = &r.error {
-            eprintln!("vosx: agent {} failed: {err}", r.id);
+            tracing::error!(id = %r.id, "{err}");
             host_errors += 1;
         }
     }
