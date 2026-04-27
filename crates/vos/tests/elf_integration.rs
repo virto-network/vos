@@ -656,6 +656,118 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 }
 
 #[test]
+fn crdt_cross_agent_invoke_records_reply_in_dag() {
+    // Cross-agent invoke under CRDT recording must capture peer
+    // replies in the caller's DAG, just as worker replies are
+    // captured (the existing CRDT path). Combines the cross-agent
+    // routing with the CRDT recording machinery.
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let scheduler_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let greeter_path = format!(
+        "{}/../../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        workspace,
+    );
+    let scheduler_data = match std::fs::read(&scheduler_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let greeter_data = match std::fs::read(&greeter_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: greeter actor not built");
+            return;
+        }
+    };
+
+    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile");
+    let greeter_blob = grey_transpiler::link_elf(&greeter_data).expect("transpile");
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "vos_crdt_xagent_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    let mut node = VosNode::new();
+
+    // Greeter is Ephemeral (it doesn't persist anything); the
+    // SCHEDULER is the CRDT actor whose DAG we're inspecting.
+    let greeter_id = node.register(AgentConfig::new(greeter_blob));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![greeter_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
+        .unwrap()
+        .to_vec();
+    let scheduler_id = node.register(
+        AgentConfig::new(scheduler_blob)
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded)])
+            .with_consistency(Consistency::Crdt)
+            .persist(&data_dir),
+    );
+
+    node.run();
+    let results = node.collect();
+    for r in &results {
+        assert!(r.is_ok(), "agent {} failed: {:?}", r.id, r.error);
+    }
+
+    // Inspect the scheduler's CRDT DAG. We expect at least one
+    // node (the dispatch that triggered the invoke) and the
+    // captured effect log should contain at least one reply entry
+    // from the greeter cross-agent invoke.
+    let db_path = data_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", scheduler_id.0));
+    assert!(db_path.exists(), "scheduler's redb missing: {}", db_path.display());
+
+    let db = redb::Database::open(&db_path).unwrap();
+    let txn = db.begin_read().unwrap();
+
+    use redb::{ReadableTable, ReadableTableMetadata};
+    const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("dag");
+    let dag_table = txn.open_table(DAG_TABLE).unwrap();
+    let dag_count = dag_table.len().unwrap();
+    assert!(
+        dag_count >= 1,
+        "expected at least one CRDT DAG node, got {dag_count}",
+    );
+
+    // Decode every DAG node and check each effect log; at least
+    // one should carry a recorded reply (the greeter invoke).
+    let mut total_replies = 0usize;
+    for entry in dag_table.iter().unwrap() {
+        let (_key, value) = entry.unwrap();
+        let bytes: &[u8] = value.value();
+        // DagNode wire format: [payload_len:u64 LE][payload][n_children:u64 LE][children...]
+        let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let payload_bytes = &bytes[8..8 + payload_len];
+        let log = vos::effect_log::EffectLog::from_bytes(payload_bytes)
+            .expect("decode EffectLog");
+        total_replies += log.reply_count();
+    }
+    assert!(
+        total_replies >= 1,
+        "expected at least one cross-agent reply captured in the DAG, got {total_replies}",
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
 fn cross_agent_invoke_routes_through_node() {
     // Two PVM agents on the same VosNode: scheduler (parent) and
     // greeter (child). Scheduler's `init.children = [greeter_id]`,
