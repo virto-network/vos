@@ -1,0 +1,69 @@
+# Kunekt.toml — example space manifest.
+#
+# One vosx instance runs one space. Other vosx instances pointed at
+# the same manifest will be able to join as peers when the libp2p
+# layer lands; today this still runs as a standalone node.
+#
+# Run with:
+#   vosx start examples/Kunekt.toml
+#
+# List the actors and workers:
+#   vosx list examples/Kunekt.toml
+
+[space]
+name = "demo"
+
+# Optional. When set, this space announces itself to the named
+# hyperspace and discovers peer spaces through it. A hyperspace is
+# just another space whose `well_known = "hyperspace"` actor keeps
+# the membership list. Leave unset for standalone spaces.
+# hyperspace = "kunekt://hub.example/registry"
+
+# Optional libp2p identity material (path to keypair, or "auto" to
+# derive on first run). Read by the networking layer.
+# identity = "auto"
+
+# ── Actors / services ───────────────────────────────────────────────
+#
+# Each [[actor]] is a PVM service running on this space's node.
+# `consistency` picks the persistence/replication strategy:
+#   ephemeral  — in-memory only, lost on exit (default)
+#   local      — redb-backed, no replication
+#   crdt       — merkle-CRDT: state + DAG + roots committed atomically,
+#                effect logs recorded for cross-replica replay (sync
+#                lands with the networking layer)
+#
+# `well_known` optionally tags the actor with a known role
+# (`registry`, `hyperspace`, ...) — visible in `vosx list` and used
+# by in-space discovery.
+#
+# `[actor.init]` carries init args. String values that match another
+# declared actor or worker name are resolved to the peer's ServiceId
+# at startup. References resolve in declaration order; forward refs
+# are caught with a clear error.
+
+[[actor]]
+name = "scheduler"
+path = "agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
+consistency = "ephemeral"
+[actor.init]
+# `children` resolves each name to the corresponding actor's
+# ServiceId so the scheduler can invoke them by ID.
+children = []
+
+# ── Workers ─────────────────────────────────────────────────────────
+#
+# Native plugins (`.so`/`.dylib`). Workers are the I/O surface of
+# the space — actors that need HTTP, the wall clock, the filesystem,
+# etc. route through workers via `ctx.ask` / `ctx.tell`. Each
+# observed reply is captured in the actor's effect log so CRDT
+# actors can replay deterministically across replicas.
+#
+# `[worker.init]` populates the worker's constructor args. Same
+# name-to-ServiceId resolution rules as actor init.
+
+# [[worker]]
+# name = "rate-oracle"
+# path = "target/debug/librate_oracle.so"
+# [worker.init]
+# endpoint = "https://api.example.com"

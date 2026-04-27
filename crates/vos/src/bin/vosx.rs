@@ -78,6 +78,18 @@ enum Command {
         #[arg(long, value_name = "MODE", default_value = "ephemeral")]
         consistency: ConsistencyArg,
     },
+    /// Start the space defined by a manifest. With no path, looks
+    /// for `Kunekt.toml` in the current directory.
+    Start {
+        manifest: Option<PathBuf>,
+        /// Override the data directory (default: `data`). Per-actor
+        /// persistence is gated by each actor's `consistency` field.
+        #[arg(long, value_name = "DIR", default_value = "data")]
+        data_dir: Option<PathBuf>,
+        /// Disable state persistence entirely (overrides --data-dir).
+        #[arg(long)]
+        no_persist: bool,
+    },
     /// List actors in a manifest
     List {
         manifest: Option<PathBuf>,
@@ -98,6 +110,11 @@ fn main() {
         }
 
 
+        Some(Command::Start { manifest, data_dir, no_persist }) => {
+            let (m, dir) = manifest_from(manifest);
+            let pers_dir = if no_persist { None } else { data_dir.as_deref() };
+            cmd_start(&m, &dir, pers_dir);
+        }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             cmd_list(&m, &dir);
@@ -107,7 +124,7 @@ fn main() {
         }
         None => {
             let (m, dir) = manifest_from(cli.file);
-            cmd_manifest(&m, &dir);
+            cmd_start(&m, &dir, Some(Path::new("data")));
         }
     }
 }
@@ -223,80 +240,217 @@ fn cmd_node(
 }
 
 fn cmd_list(manifest: &Manifest, dir: &Path) {
-    println!("{}\n", manifest.manifest.name);
-    print_actor_meta(&manifest.service.name,
-        &resolve_path(dir, &manifest.service.path, &manifest.service.name), "service");
-    for a in &manifest.actors {
-        print_actor_meta(&a.name, &resolve_path(dir, &a.path, &a.name), "actor");
+    let space = &manifest.space;
+    println!("space: {}", space.name);
+    if let Some(hs) = &space.hyperspace {
+        println!("  hyperspace: {hs}");
+    }
+    println!();
+    for a in &manifest.actor {
+        let role = match (&a.well_known, a.consistency) {
+            (Some(wk), c) => format!("actor [{wk}] {c:?}"),
+            (None, c) => format!("actor {c:?}"),
+        };
+        print_actor_meta(&a.name, &dir.join(&a.path), &role);
+    }
+    for w in &manifest.worker {
+        let path = dir.join(&w.path);
+        if path.exists() {
+            println!("  {} (worker) — {}", w.name, path.display());
+        } else {
+            println!("  {} (worker) — not built ({})", w.name, path.display());
+        }
     }
 }
 
-fn cmd_manifest(manifest: &Manifest, dir: &Path) {
-    eprintln!("vosx: '{}' — 1 service + {} actor(s)",
-        manifest.manifest.name, manifest.actors.len());
+/// Run the space defined by `manifest`.
+///
+/// Workers register first (they're the I/O boundary, and PVM agents
+/// often hold worker IDs in their init args); then actors register
+/// in declaration order. The `name_ids` map is built incrementally,
+/// so an actor / worker can reference any peer declared earlier in
+/// the manifest by name in its init args. Forward references error
+/// out at startup with a clear message.
+fn cmd_start(manifest: &Manifest, dir: &Path, data_dir: Option<&Path>) {
+    use vos::node::{AgentConfig, VosNode, WorkerConfig};
+    use vos::value::Args;
 
-    let mut rt = VosRuntime::new();
+    let space = &manifest.space;
+    eprintln!(
+        "vosx: starting space '{}' ({} actor(s), {} worker(s))",
+        space.name,
+        manifest.actor.len(),
+        manifest.worker.len(),
+    );
+    if let Some(hs) = &space.hyperspace {
+        eprintln!("vosx: hyperspace '{hs}' (declared; networking lands separately)");
+    }
 
-    let agent_data = load_file(&resolve_path(dir, &manifest.service.path, &manifest.service.name));
-    let agent_blob = load_blob(&resolve_path(dir, &manifest.service.path, &manifest.service.name));
-    let idx = rt.register_service_blob(agent_blob);
-    let agent_id = rt.register_service(idx);
-
-    let actor_ids: Vec<_> = manifest.actors.iter().map(|a| {
-        let path = resolve_path(dir, &a.path, &a.name);
-        let data = load_file(&path);
-        let blob = load_blob(&path);
-        let idx = rt.register_service_blob(blob);
-        let id = rt.register_service(idx);
-        write_init_args(&mut rt, id, &a.init, &data);
-        id
-    }).collect();
-
-    // Agent init: inject children + manifest overrides
-    let mut args = InitArgs::new()
-        .with("children", InitValue::ListU32(actor_ids.iter().map(|id| id.0).collect()));
-    if let Some(meta) = vos::metadata::from_elf(&agent_data) {
-        for f in meta.constructor.iter().filter(|f| f.name != "children") {
-            if let Some(val) = manifest.service.init.get(&f.name) {
-                args = args.with(&f.name, toml_to_init_value(val, &f.ty));
+    // Sanity: no two declarations share a name.
+    {
+        let mut seen = BTreeMap::<&str, &str>::new();
+        for a in &manifest.actor {
+            if seen.insert(a.name.as_str(), "actor").is_some() {
+                die(&format!("duplicate name '{}' in manifest", a.name));
+            }
+        }
+        for w in &manifest.worker {
+            if seen.insert(w.name.as_str(), "worker").is_some() {
+                die(&format!("duplicate name '{}' in manifest", w.name));
             }
         }
     }
-    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
-    // Trigger first tick — the actor's on_start hook runs automatically on cold start.
-    rt.send_to(agent_id, Vec::new());
-    eprintln!("vosx: running...\n");
-    rt.run_blocking();
-    eprintln!("\nvosx: done");
+    let mut node = VosNode::new();
+    let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
+
+    // Workers first: their IDs become resolvable for actor init args
+    // that reference workers by name (the common case).
+    for w in &manifest.worker {
+        let path = dir.join(&w.path);
+        let mut cfg = if w.init.is_empty() {
+            WorkerConfig::new(path)
+        } else {
+            let mut args = Args::new();
+            for (k, v) in &w.init {
+                args = args.with(k, toml_to_value(v, &name_ids));
+            }
+            WorkerConfig::with_args(path, &args)
+        };
+        if let Some(d) = data_dir {
+            cfg = cfg.persist(d);
+        }
+        let id = node.register_worker(cfg);
+        eprintln!("vosx: worker '{}' as {id}", w.name);
+        name_ids.insert(w.name.clone(), id.0);
+    }
+
+    // Actors next, in declaration order. Init args resolve against
+    // workers + already-registered actors.
+    for a in &manifest.actor {
+        let path = dir.join(&a.path);
+        let elf_data = load_file(&path);
+        let blob = load_blob(&path);
+
+        let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
+        if let Some(d) = data_dir {
+            cfg = cfg.persist(d);
+        }
+
+        if !a.init.is_empty() {
+            let meta = vos::metadata::from_elf(&elf_data);
+            let mut args = InitArgs::new();
+            for (key, val) in &a.init {
+                let ty = meta
+                    .as_ref()
+                    .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
+                    .map(|f| f.ty.as_str())
+                    .unwrap_or("String");
+                args = args.with(key, toml_to_init_value(val, ty, &name_ids));
+            }
+            let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+            cfg = cfg.with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded.to_vec())]);
+        }
+
+        let id = node.register(cfg);
+        let role = a
+            .well_known
+            .as_deref()
+            .map(|r| format!(" [{r}]"))
+            .unwrap_or_default();
+        eprintln!(
+            "vosx: actor '{}' as {id} ({:?}{role})",
+            a.name, a.consistency,
+        );
+        name_ids.insert(a.name.clone(), id.0);
+    }
+
+    eprintln!("vosx: running space '{}'...\n", space.name);
+    node.run();
+
+    let results = node.collect();
+    let panics: u32 = results.iter().map(|r| r.panics).sum();
+    let mut host_errors = 0usize;
+    for r in &results {
+        if let Some(err) = &r.error {
+            tracing::error!(id = %r.id, "{err}");
+            host_errors += 1;
+        }
+    }
+    if host_errors > 0 {
+        std::process::exit(2);
+    }
+    exit_with_status(panics);
 }
 
 // ── Manifest ─────────────────────────────────────────────────────────
+//
+// One vosx instance runs one space. The manifest declares the space's
+// identity, the actors and workers it hosts, and (when networking
+// lands) its membership in a hyperspace. Spaces with the same manifest
+// will be able to join as peers.
 
 #[derive(Deserialize)]
 struct Manifest {
-    manifest: ManifestMeta,
-    service: ServiceDef,
+    space: SpaceMeta,
     #[serde(default)]
-    actors: Vec<ActorDef>,
+    actor: Vec<ActorDef>,
+    #[serde(default)]
+    worker: Vec<WorkerDef>,
 }
 
 #[derive(Deserialize)]
-struct ManifestMeta { name: String }
-
-#[derive(Deserialize)]
-struct ServiceDef {
+struct SpaceMeta {
     name: String,
-    path: Option<PathBuf>,
+    /// Optional hyperspace this space joins. Reserved for the
+    /// networking layer — currently parsed and reported but inert.
     #[serde(default)]
-    init: BTreeMap<String, toml::Value>,
+    hyperspace: Option<String>,
+    /// Optional libp2p identity material (path to keypair, or
+    /// "auto" to derive on first run). Reserved field — read
+    /// when the networking layer lands.
+    #[serde(default)]
+    #[allow(dead_code)]
+    identity: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ActorDef {
     name: String,
-    path: Option<PathBuf>,
+    path: PathBuf,
+    #[serde(default)]
+    consistency: ConsistencyDef,
+    /// Optional named role within the space (e.g. `"registry"`).
+    /// Surfaced to operators and reserved for in-space discovery.
+    #[serde(default)]
+    well_known: Option<String>,
+    #[serde(default)]
+    init: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy, Debug)]
+#[serde(rename_all = "lowercase")]
+enum ConsistencyDef {
+    #[default]
+    Ephemeral,
+    Local,
+    Crdt,
+}
+
+impl From<ConsistencyDef> for vos::node::Consistency {
+    fn from(c: ConsistencyDef) -> Self {
+        match c {
+            ConsistencyDef::Ephemeral => vos::node::Consistency::Ephemeral,
+            ConsistencyDef::Local => vos::node::Consistency::Local,
+            ConsistencyDef::Crdt => vos::node::Consistency::Crdt,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkerDef {
+    name: String,
+    path: PathBuf,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
 }
@@ -315,22 +469,6 @@ fn is_manifest(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
 }
 
-fn write_init_args(rt: &mut VosRuntime, id: vos::abi::service::ServiceId,
-    init: &BTreeMap<String, toml::Value>, elf_data: &[u8])
-{
-    if init.is_empty() { return; }
-    let meta = vos::metadata::from_elf(elf_data);
-    let mut args = InitArgs::new();
-    for (key, val) in init {
-        let ty = meta.as_ref()
-            .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
-            .map(|f| f.ty.as_str())
-            .unwrap_or("String");
-        args = args.with(key, toml_to_init_value(val, ty));
-    }
-    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
-}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -362,11 +500,6 @@ fn read_stdin() -> Vec<u8> {
     buf
 }
 
-fn resolve_path(dir: &Path, path: &Option<PathBuf>, name: &str) -> PathBuf {
-    path.as_ref().map(|p| dir.join(p))
-        .unwrap_or_else(|| die(&format!("'{name}' has no path")))
-}
-
 /// Parse a CLI value string into a `Value`. Auto-types: integers → U64,
 /// `true`/`false` → Bool, anything else → Str.
 fn parse_cli_value(s: &str) -> vos::value::Value {
@@ -378,17 +511,73 @@ fn parse_cli_value(s: &str) -> vos::value::Value {
     Value::Str(s.into())
 }
 
-fn toml_to_init_value(val: &toml::Value, expected_ty: &str) -> InitValue {
+/// Convert a TOML value to a typed `InitValue`, resolving string
+/// references against the running map of declared peers.
+///
+/// Supported coercions:
+/// - integer → `u32`/`u64`/`i32` (unchanged)
+/// - bool → `bool`
+/// - string → `String`, OR a `u32` ServiceId when the string
+///   matches a declared actor/worker name and the expected type is
+///   `u32`
+/// - array → `Vec<u32>`, accepting integers or name-strings
+fn toml_to_init_value(
+    val: &toml::Value,
+    expected_ty: &str,
+    name_ids: &BTreeMap<String, u32>,
+) -> InitValue {
     let ty = expected_ty.replace(' ', "");
+    let resolve_name = |s: &str| -> u32 {
+        name_ids.get(s).copied().unwrap_or_else(|| {
+            die(&format!(
+                "init value '{s}' is not a declared actor or worker (forward reference?)",
+            ))
+        })
+    };
     match (val, ty.as_str()) {
         (toml::Value::Integer(n), "u32") => InitValue::U32(*n as u32),
         (toml::Value::Integer(n), "u64") => InitValue::U64(*n as u64),
         (toml::Value::Integer(n), "i32") => InitValue::I32(*n as i32),
         (toml::Value::Boolean(b), "bool") => InitValue::Bool(*b),
         (toml::Value::String(s), "String") => InitValue::Str(s.clone()),
+        (toml::Value::String(s), "u32") => InitValue::U32(resolve_name(s)),
         (toml::Value::Array(arr), "Vec<u32>") => InitValue::ListU32(
-            arr.iter().map(|v| v.as_integer().expect("integer") as u32).collect()),
+            arr.iter()
+                .map(|v| match v {
+                    toml::Value::Integer(n) => *n as u32,
+                    toml::Value::String(s) => resolve_name(s),
+                    other => die(&format!(
+                        "Vec<u32> array element must be integer or actor/worker name, got {other:?}",
+                    )),
+                })
+                .collect(),
+        ),
         _ => die(&format!("cannot convert TOML value to {expected_ty}")),
+    }
+}
+
+/// Convert a TOML value into a `vos::value::Value` for worker init
+/// args (which are untyped — we infer from the TOML shape, with
+/// strings resolving to ServiceIds when they match a declared name).
+fn toml_to_value(val: &toml::Value, name_ids: &BTreeMap<String, u32>) -> vos::value::Value {
+    use vos::value::Value;
+    match val {
+        toml::Value::Integer(n) => {
+            if *n >= 0 {
+                Value::U64(*n as u64)
+            } else {
+                Value::I64(*n)
+            }
+        }
+        toml::Value::Boolean(b) => Value::Bool(*b),
+        toml::Value::String(s) => {
+            if let Some(&id) = name_ids.get(s) {
+                Value::U32(id)
+            } else {
+                Value::Str(s.clone())
+            }
+        }
+        other => die(&format!("worker init value of unsupported TOML kind: {other:?}")),
     }
 }
 
