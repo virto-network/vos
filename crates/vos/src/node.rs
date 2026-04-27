@@ -188,10 +188,54 @@ impl WorkerConfig {
     }
 }
 
-/// Synchronous invoke request to a worker.
+/// Synchronous invoke request routed through `invoke_routes`.
+///
+/// `chain` carries the ServiceIds of the agents already on the
+/// stack of synchronous invokes leading to this hop, including the
+/// caller. Each agent's `external_invoke` checks the chain before
+/// forwarding so an A→B→A cycle aborts immediately at the second
+/// hop instead of deadlocking until the 10 s reply timeout. The
+/// chain doubles as a depth counter — capped at
+/// [`MAX_CROSS_AGENT_DEPTH`] hops.
 struct InvokeRequest {
     msg: Vec<u8>,
     reply_tx: mpsc::Sender<Vec<u8>>,
+    // Read by agent_thread via `&req.chain` before moving `req`
+    // into handle_invoke_request; rustc's read analysis misses
+    // that pattern when the rest of the struct is then consumed.
+    #[allow(dead_code)]
+    chain: Vec<u32>,
+}
+
+/// Maximum number of cross-agent invoke hops in one synchronous
+/// chain. Each agent's external_invoke aborts forwarding when
+/// `chain.len()` reaches this. Picked generously — typical chains
+/// are 1–3 deep; 32 catches runaway recursion without limiting
+/// realistic compositions.
+const MAX_CROSS_AGENT_DEPTH: usize = 32;
+
+/// Result of the pre-forward safety check on a synchronous invoke.
+#[derive(Debug, PartialEq, Eq)]
+enum InvokeForwardCheck {
+    Allowed,
+    /// Target is already in the chain — forwarding would form a
+    /// cycle (and deadlock until the 10 s reply timeout).
+    Cycle,
+    /// Chain has reached the depth cap.
+    DepthExceeded,
+}
+
+/// Decide whether to forward an invoke to `target` given the
+/// caller's current chain. Pulled out as a free function so the
+/// rule is testable without spinning up agent threads.
+fn check_invoke_forward(chain: &[u32], target: u32) -> InvokeForwardCheck {
+    if chain.contains(&target) {
+        InvokeForwardCheck::Cycle
+    } else if chain.len() >= MAX_CROSS_AGENT_DEPTH {
+        InvokeForwardCheck::DepthExceeded
+    } else {
+        InvokeForwardCheck::Allowed
+    }
 }
 
 /// A multi-agent VOS node.
@@ -444,12 +488,49 @@ fn agent_thread(
     let mut runtime = VosRuntime::new();
     let bump = || *activity.lock().unwrap() = Instant::now();
 
+    // The chain of ServiceIds currently on the synchronous-invoke
+    // stack leading to this thread, including this agent itself.
+    // Updated at the entry of every dispatch and read by the
+    // `external_invoke` closure to short-circuit cycles and cap
+    // total depth. Wrapped in Arc<Mutex<...>> rather than
+    // Rc<RefCell<...>> so the closure satisfies the `Send` bound
+    // on `ExternalInvokeFn`.
+    let current_chain: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
     // External invoke handler for ctx.ask targets that live on a
     // different thread (workers OR other agents). Looks up the
-    // target's invoke channel in the shared route table and blocks
-    // on the reply.
+    // target's invoke channel in the shared route table and
+    // blocks on the reply, with two safety checks first:
+    //
+    //   - Cycle: if `target` already appears in the current chain,
+    //     forwarding would deadlock. Abort with `None`, which
+    //     surfaces to the caller's PVM as `InvokeError::NotFound`.
+    //   - Depth: cap at MAX_CROSS_AGENT_DEPTH hops. Same abort.
     let invoke_routes_for_ext = invoke_routes.clone();
+    let chain_for_ext = current_chain.clone();
     runtime.set_external_invoke(Box::new(move |target, msg| {
+        let chain_snapshot = chain_for_ext.lock().ok()?.clone();
+
+        match check_invoke_forward(&chain_snapshot, target.0) {
+            InvokeForwardCheck::Allowed => {}
+            InvokeForwardCheck::Cycle => {
+                warn!(
+                    target = target.0,
+                    chain = ?chain_snapshot,
+                    "cross-agent invoke would form a cycle; aborting forward",
+                );
+                return None;
+            }
+            InvokeForwardCheck::DepthExceeded => {
+                warn!(
+                    depth = chain_snapshot.len(),
+                    cap = MAX_CROSS_AGENT_DEPTH,
+                    "cross-agent invoke chain exceeded depth cap; aborting forward",
+                );
+                return None;
+            }
+        }
+
         let tx = {
             let map = invoke_routes_for_ext.lock().ok()?;
             map.get(&target.0).cloned()?
@@ -458,6 +539,7 @@ fn agent_thread(
         tx.send(InvokeRequest {
             msg: msg.to_vec(),
             reply_tx,
+            chain: chain_snapshot,
         }).ok()?;
         reply_rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
     }));
@@ -575,6 +657,15 @@ fn agent_thread(
                 Ok(req) => {
                     serviced_invoke = true;
                     bump();
+                    // Set the chain to the caller's chain plus our
+                    // own ID, so any outgoing invokes during this
+                    // dispatch see the full lineage.
+                    {
+                        let mut chain = current_chain.lock().unwrap();
+                        chain.clear();
+                        chain.extend_from_slice(&req.chain);
+                        chain.push(id.0);
+                    }
                     let outcome = handle_invoke_request(
                         &mut runtime, svc_id, &outbox, id, req,
                         strategy.as_mut(), recording_enabled,
@@ -595,9 +686,13 @@ fn agent_thread(
 
         let msg = if let Some(m) = pending.pop_front() {
             bump();
+            // Fresh inbox-style dispatch; chain starts at us.
+            *current_chain.lock().unwrap() = vec![id.0];
             m
         } else if runtime.has_work() || runtime.is_suspended(svc_id) {
             bump();
+            // Residual work — keep the chain set by the dispatch
+            // that produced it.
             if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
                 strategy.as_mut(), recording_enabled) {
                 fatal_error = Some(format!("commit failed during residual work: {e}"));
@@ -610,6 +705,7 @@ fn agent_thread(
             match inbox.recv_timeout(Duration::from_millis(50)) {
                 Ok(env) => {
                     bump();
+                    *current_chain.lock().unwrap() = vec![id.0];
                     env.payload
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1110,6 +1206,38 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn invoke_forward_check_detects_cycle() {
+        // Self-invoke (target already in chain).
+        let chain = [1u32];
+        assert_eq!(check_invoke_forward(&chain, 1), InvokeForwardCheck::Cycle);
+
+        // A→B with B trying to call A.
+        let chain = [1u32, 2u32];
+        assert_eq!(check_invoke_forward(&chain, 1), InvokeForwardCheck::Cycle);
+
+        // A→B→C, fresh target D — allowed.
+        let chain = [1u32, 2u32, 3u32];
+        assert_eq!(check_invoke_forward(&chain, 4), InvokeForwardCheck::Allowed);
+    }
+
+    #[test]
+    fn invoke_forward_check_caps_depth() {
+        let chain: Vec<u32> = (1..=MAX_CROSS_AGENT_DEPTH as u32).collect();
+        assert_eq!(chain.len(), MAX_CROSS_AGENT_DEPTH);
+        // At cap, even a fresh target is rejected.
+        assert_eq!(
+            check_invoke_forward(&chain, 9999),
+            InvokeForwardCheck::DepthExceeded,
+        );
+        // One under cap is fine.
+        let chain = &chain[..MAX_CROSS_AGENT_DEPTH - 1];
+        assert_eq!(
+            check_invoke_forward(chain, 9999),
+            InvokeForwardCheck::Allowed,
+        );
     }
 
     #[test]
