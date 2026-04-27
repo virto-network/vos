@@ -51,6 +51,9 @@ pub(super) struct OpcodeFlags {
     pub is_store: bool,
     pub is_mul_upper: bool,
     pub is_exit: bool,
+    /// Phase 12b-1: BitManip permutation/zero-extend ops.
+    pub is_reverse_bytes: bool,
+    pub is_zero_ext_16: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -99,12 +102,16 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::MaxU => { f.is_compare = true; f.is_max_u = true; }
         // Move
         Opcode::MoveReg | Opcode::LoadImm | Opcode::LoadImm64 => { f.is_move = true; }
-        // BitManip (TwoReg unary ops — prover-trusted, classified to avoid false constraints)
+        // BitManip (TwoReg unary ops).
+        // Constrained (Phase 12b): ZeroExtend16, ReverseBytes (this commit).
+        // Still prover-trusted: CountSetBits, LeadingZeroBits, TrailingZeroBits,
+        // SignExtend8/16, Sbrk — see Phase 12a/12b-2/12f.
+        Opcode::ZeroExtend16 => { f.is_zero_ext_16 = true; }
+        Opcode::ReverseBytes => { f.is_reverse_bytes = true; }
         Opcode::CountSetBits64 | Opcode::CountSetBits32
         | Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
         | Opcode::TrailingZeroBits64 | Opcode::TrailingZeroBits32
         | Opcode::SignExtend8 | Opcode::SignExtend16
-        | Opcode::ZeroExtend16 | Opcode::ReverseBytes
         | Opcode::Sbrk
             => {}
         // Branches (conditional) — classify by comparison type

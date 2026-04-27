@@ -320,6 +320,13 @@ pub enum Column {
     /// Register index that Result was written to when ResultIsReg=1.
     #[size = 1]
     ResultRegIdx,
+    // ── BitManip permutation/zero-extend (Phase 12b-1) ──
+    /// 1 iff this step is `ReverseBytes` (result[i] = val_d[7-i]).
+    #[size = 1]
+    IsReverseBytes,
+    /// 1 iff this step is `ZeroExtend16` (result[0..1] = val_d[0..1]; result[2..7] = 0).
+    #[size = 1]
+    IsZeroExt16,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

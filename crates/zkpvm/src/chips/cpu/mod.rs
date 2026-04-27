@@ -510,6 +510,31 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // BITMANIP — REVERSE_BYTES: result[i] = val_d[7-i]
+        // ════════════════════════════════════════════════════════════════════
+        let is_reverse_bytes = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_reverse_bytes[0].clone()
+                    * (result[i].clone() - val_d[WORD_SIZE - 1 - i].clone())
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // BITMANIP — ZERO_EXTEND_16: result[0..2] = val_d[0..2]; result[2..8] = 0
+        // ════════════════════════════════════════════════════════════════════
+        let is_zero_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
+        eval.add_constraint(
+            is_zero_ext_16[0].clone() * (result[0].clone() - val_d[0].clone())
+        );
+        eval.add_constraint(
+            is_zero_ext_16[0].clone() * (result[1].clone() - val_d[1].clone())
+        );
+        for i in 2..WORD_SIZE {
+            eval.add_constraint(is_zero_ext_16[0].clone() * result[i].clone());
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // CONTROL FLOW: constrain next_pc based on branch/jump
         // ════════════════════════════════════════════════════════════════════
         let is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
@@ -1319,6 +1344,8 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns_bytes(row, &step.branch_target.to_le_bytes(), Column::BranchTarget);
             trace.fill_columns(row, flags.is_div_rem, Column::IsDivRem);
             trace.fill_columns(row, flags.div_rem_op, Column::DivRemOp);
+            trace.fill_columns(row, flags.is_reverse_bytes, Column::IsReverseBytes);
+            trace.fill_columns(row, flags.is_zero_ext_16, Column::IsZeroExt16);
 
             // ── DivRem auxiliary ──
             let mut div_quotient = [0u8; WORD_SIZE];
