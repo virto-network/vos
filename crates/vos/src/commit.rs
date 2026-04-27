@@ -367,10 +367,14 @@ mod crdt {
             state: &[u8],
             log: Option<&EffectLog>,
         ) -> Result<(), CommitError> {
-            // When there's no log entry and the state is unchanged
-            // from the previous commit, skip the write entirely —
-            // same change-detection LocalCommit uses.
-            if log.is_none() && state == self.last_state.as_slice() {
+            // Skip when the state is unchanged from the previous
+            // commit, even if a log was supplied. A dispatch that
+            // observed external replies but didn't mutate state is
+            // a pure read — appending a DAG node for it would
+            // pollute consensus history with no-op events. Replay
+            // can skip this dispatch entirely; the next state-
+            // changing commit will produce a fresh DAG node.
+            if state == self.last_state.as_slice() {
                 return Ok(());
             }
 

@@ -125,8 +125,9 @@ impl AgentConfig {
     }
 
     /// Derive the redb path for this agent from its data directory
-    /// and service ID.
-    #[allow(dead_code)] // only read when the `storage` feature is on
+    /// and service ID. Only meaningful when the `storage` feature
+    /// is enabled.
+    #[cfg(feature = "storage")]
     fn db_path(&self, id: ServiceId) -> Option<std::path::PathBuf> {
         let data_dir = self.data_dir.as_ref()?;
         let dir = data_dir.join("agents");

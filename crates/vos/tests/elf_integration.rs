@@ -897,9 +897,16 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
         use redb::ReadableTableMetadata;
         t.len().unwrap()
     };
+    // The scheduler with empty children produces the same state on
+    // every dispatch — the unchanged-state skip rule (correctly)
+    // refuses to pollute the DAG with no-op events. So we assert
+    // monotone growth, not strict growth: the second run either
+    // skipped (state unchanged) or appended (state diverged for
+    // some reason). Both are acceptable; what matters is the
+    // restart didn't blow up and the existing DAG is preserved.
     assert!(
-        dag_count_after_second > dag_count_after_first,
-        "second run should have appended at least one new DAG node (first={dag_count_after_first}, second={dag_count_after_second})",
+        dag_count_after_second >= dag_count_after_first,
+        "second run should not have shrunk the DAG (first={dag_count_after_first}, second={dag_count_after_second})",
     );
 
     let _ = std::fs::remove_dir_all(&data_dir);
