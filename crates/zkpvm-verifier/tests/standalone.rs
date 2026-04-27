@@ -3,8 +3,8 @@ use javm::interpreter::Interpreter;
 // Memory is now flat_mem in Interpreter
 use javm::PVM_REGISTER_COUNT;
 
-use zkpvm_core::tracing::TracingPvm;
-use zkpvm_machine::{prove, SideNote};
+use zkpvm::core::tracing::TracingPvm;
+use zkpvm::{prove, SideNote};
 use zkpvm_verifier::verify_standalone;
 
 #[test]

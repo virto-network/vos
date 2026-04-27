@@ -18,6 +18,8 @@ pub mod side_note;
 mod prove;
 #[cfg(feature = "prover")]
 mod verify;
+#[cfg(feature = "prover")]
+mod program_id;
 
 // Re-export AirColumn + PreprocessedAirColumn at crate root so the derive-
 // generated impls (which target `::zkpvm::AirColumn`) resolve correctly.
@@ -67,3 +69,5 @@ pub use stwo::core::fri::FriConfig;
 pub use verify::{verify, verify_chain};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
+#[cfg(feature = "prover")]
+pub use program_id::{program_commitment_of_proof, program_commitment_hex, ProgramCommitment};

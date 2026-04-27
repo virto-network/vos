@@ -25,6 +25,7 @@ blake3 = { version = "1", optional = true }
 [dev-dependencies]
 grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 bincode = "1"
+zkpvm-verifier = { workspace = true }
 
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }

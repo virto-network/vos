@@ -57,6 +57,7 @@ pub fn verify_standalone(
         claimed_sums,
         log_sizes: claimed_log_sizes,
         num_components,
+        pcs_config,
         ..
     } = proof;
 
@@ -71,7 +72,11 @@ pub fn verify_standalone(
         ));
     }
 
-    let config = PcsConfig::default();
+    // Use the proof's own PCS config — `prove()` uses production_pcs_config
+    // by default (blowup=16, 19 queries, 20-bit PoW), not PcsConfig::default(),
+    // so blindly using default here makes Merkle witness sizes mismatch
+    // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
+    let config = pcs_config;
     let verifier_channel = &mut Blake2sChannel::default();
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
