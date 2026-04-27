@@ -13,9 +13,10 @@
 //! forwarded to the network layer (future).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
@@ -214,10 +215,29 @@ pub struct VosNode {
     /// at thread spawn time) freezes A's view of the world before
     /// B exists, breaking cross-agent invoke order-independent.
     invoke_routes: InvokeRoutes,
+    /// Set by [`VosNode::run_until_idle`] (or `collect`) when the
+    /// node decides it's done. Threads poll this at the top of
+    /// their main loop and exit cleanly. Replaces the per-agent
+    /// "exit after N seconds idle" heuristic with explicit
+    /// node-driven lifecycle.
+    shutdown: Arc<AtomicBool>,
+    /// Last time anything happened on the node — outbox routing,
+    /// agent dispatch, worker dispatch, invoke handling. Updated
+    /// by both threads and the routing loop. Read by
+    /// [`run_until_idle`] to decide when to wind the node down.
+    ///
+    /// [`run_until_idle`]: VosNode::run_until_idle
+    last_activity: ActivityClock,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
+
+/// Shared "last activity" instant, bumped on every dispatch. The
+/// node uses it as a global idle signal that — unlike outbox-only
+/// monitoring — also accounts for invoke traffic, which doesn't
+/// flow through the outbox.
+type ActivityClock = Arc<Mutex<Instant>>;
 
 impl VosNode {
     /// Create a node with the default prefix (0 = local/unscoped).
@@ -236,6 +256,8 @@ impl VosNode {
             outbox_tx,
             outbox_rx,
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -257,9 +279,11 @@ impl VosNode {
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
 
         let invoke_routes = self.invoke_routes.clone();
+        let shutdown = self.shutdown.clone();
+        let activity = self.last_activity.clone();
 
         let join = thread::spawn(move || {
-            agent_thread(id, config, rx, invoke_rx, outbox, invoke_routes)
+            agent_thread(id, config, rx, invoke_rx, outbox, invoke_routes, shutdown, activity)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -277,20 +301,75 @@ impl VosNode {
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
 
+        let shutdown = self.shutdown.clone();
+        let activity = self.last_activity.clone();
+
         let join = thread::spawn(move || {
-            worker_thread(id, config, rx, invoke_rx, outbox)
+            worker_thread(id, config, rx, invoke_rx, outbox, shutdown, activity)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
         id
     }
 
-    /// Route messages until all agents are idle or finished.
+    /// Route messages until the node has been globally idle for the
+    /// default duration (2 seconds). Shorthand for
+    /// `run_until_idle(Duration::from_secs(2))`.
     pub fn run(&mut self) {
+        self.run_until_idle(Duration::from_secs(2));
+    }
+
+    /// Route messages until traffic — both outbox routing AND
+    /// agent/worker dispatch — has been quiet for `threshold`,
+    /// then signal shutdown to all threads.
+    ///
+    /// Unlike the previous "agents auto-exit on idle" heuristic,
+    /// this is decided centrally: agents stay alive as long as the
+    /// node hasn't told them to stop. That keeps cross-agent
+    /// invoke peers reachable for the entire run, even when one
+    /// side has nothing on its inbox at the moment.
+    pub fn run_until_idle(&mut self, threshold: Duration) {
+        *self.last_activity.lock().unwrap() = Instant::now();
         loop {
-            match self.outbox_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(envelope) => self.route(envelope),
+            match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(envelope) => {
+                    self.route(envelope);
+                    *self.last_activity.lock().unwrap() = Instant::now();
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // If every agent has already exited (e.g.
+                    // they all errored at startup), there's no
+                    // point waiting out the threshold.
+                    let all_done = self.agents.iter().all(|h| {
+                        h.join.as_ref().map_or(true, |j| j.is_finished())
+                    });
+                    if all_done { break; }
+
+                    let idle = self.last_activity.lock().unwrap().elapsed();
+                    if idle >= threshold {
+                        self.shutdown.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Run forever, only stopping when [`shutdown`](Self::shutdown)
+    /// is called from another thread (e.g. a SIGTERM handler) or
+    /// every agent has exited on its own.
+    pub fn run_forever(&mut self) {
+        loop {
+            match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(envelope) => {
+                    self.route(envelope);
+                    *self.last_activity.lock().unwrap() = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let all_done = self.agents.iter().all(|h| {
                         h.join.as_ref().map_or(true, |j| j.is_finished())
                     });
@@ -299,6 +378,13 @@ impl VosNode {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    /// Trigger an explicit shutdown. Threads notice on their next
+    /// iteration (≤ 50 ms) and exit cleanly. Safe to call from a
+    /// signal handler or another thread.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     /// Route a single envelope to its destination.
@@ -318,8 +404,11 @@ impl VosNode {
         }
     }
 
-    /// Collect results from all agent threads.
+    /// Collect results from all agent threads. Forces shutdown if
+    /// it hasn't already been requested, so callers don't have to
+    /// remember the order.
     pub fn collect(mut self) -> Vec<AgentResult> {
+        self.shutdown.store(true, Ordering::Relaxed);
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
         // Drain the invoke routes too so threads' invoke_rx
@@ -347,11 +436,13 @@ fn agent_thread(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     invoke_routes: InvokeRoutes,
+    shutdown: Arc<AtomicBool>,
+    activity: ActivityClock,
 ) -> AgentResult {
     use std::collections::VecDeque;
-    use std::time::Duration;
 
     let mut runtime = VosRuntime::new();
+    let bump = || *activity.lock().unwrap() = Instant::now();
 
     // External invoke handler for ctx.ask targets that live on a
     // different thread (workers OR other agents). Looks up the
@@ -466,17 +557,15 @@ fn agent_thread(
         pending.push_back(Vec::new());
     }
 
-    let mut handled_any = false;
     let mut fatal_error: Option<String> = None;
-    // Idle-detection threshold. The agent stays alive long enough
-    // for peer agents to invoke it after a brief lull. 2 seconds is
-    // plenty for tests and short-running spaces; long-running ones
-    // stay busy or get explicit shutdown via the node dropping
-    // routes/invoke_routes.
-    let idle_threshold = Duration::from_secs(2);
-    let mut last_activity = std::time::Instant::now();
 
+    // Loop until the node tells us to stop (or our channels
+    // disconnect, which happens during collect()). No per-agent
+    // idle heuristic — the node is the source of truth for "are
+    // we done."
     loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+
         // Priority 1 — drain pending invoke requests. The caller's
         // PVM is suspended at the ecall waiting for a reply, so
         // these jump to the front of the queue.
@@ -484,9 +573,8 @@ fn agent_thread(
         loop {
             match invoke_rx.try_recv() {
                 Ok(req) => {
-                    handled_any = true;
                     serviced_invoke = true;
-                    last_activity = std::time::Instant::now();
+                    bump();
                     let outcome = handle_invoke_request(
                         &mut runtime, svc_id, &outbox, id, req,
                         strategy.as_mut(), recording_enabled,
@@ -506,10 +594,10 @@ fn agent_thread(
         }
 
         let msg = if let Some(m) = pending.pop_front() {
-            last_activity = std::time::Instant::now();
+            bump();
             m
         } else if runtime.has_work() || runtime.is_suspended(svc_id) {
-            last_activity = std::time::Instant::now();
+            bump();
             if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
                 strategy.as_mut(), recording_enabled) {
                 fatal_error = Some(format!("commit failed during residual work: {e}"));
@@ -517,26 +605,17 @@ fn agent_thread(
             }
             continue;
         } else {
-            // Short timeout on inbox so we keep checking invoke_rx
-            // promptly. Exit only when both channels have been
-            // quiet past the idle threshold (and we've handled at
-            // least one message), or when the inbox disconnects
-            // (the node is tearing down).
+            // Short blocking wait on inbox so we re-check the
+            // shutdown flag and the invoke channel promptly.
             match inbox.recv_timeout(Duration::from_millis(50)) {
                 Ok(env) => {
-                    last_activity = std::time::Instant::now();
+                    bump();
                     env.payload
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if handled_any && last_activity.elapsed() >= idle_threshold {
-                        break;
-                    }
-                    continue;
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
-        handled_any = true;
         if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
             strategy.as_mut(), recording_enabled) {
             fatal_error = Some(format!("commit failed: {e}"));
@@ -714,10 +793,13 @@ fn worker_thread(
     inbox: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
+    shutdown: Arc<AtomicBool>,
+    activity: ActivityClock,
 ) -> AgentResult {
     use crate::worker::WorkerPlugin;
     use std::collections::VecDeque;
-    use std::time::Duration;
+
+    let bump = || *activity.lock().unwrap() = Instant::now();
 
     let plugin = match unsafe { WorkerPlugin::load(&config.path) } {
         Ok(p) => p,
@@ -752,15 +834,16 @@ fn worker_thread(
     // Messages that arrived while we were waiting for a specific reply.
     // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
-    let mut handled_any = false;
 
     loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+
         // Process up to a few invoke requests per iteration to avoid
         // starving the regular inbox.
         for _ in 0..4 {
             match invoke_rx.try_recv() {
                 Ok(req) => {
-                    handled_any = true;
+                    bump();
                     let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
                     let _ = req.reply_tx.send(reply);
                     persist(strategy.as_mut(), &instance, id);
@@ -771,21 +854,15 @@ fn worker_thread(
 
         // Take next message: deferred first, then inbox
         let envelope = if let Some(e) = deferred.pop_front() {
+            bump();
             e
         } else {
-            match inbox.recv_timeout(Duration::from_millis(200)) {
-                Ok(e) => e,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Exit if we've handled at least one message and
-                    // there's nothing left. Otherwise keep waiting for
-                    // the first message.
-                    if handled_any { break; }
-                    continue;
-                }
+            match inbox.recv_timeout(Duration::from_millis(50)) {
+                Ok(e) => { bump(); e }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
-        handled_any = true;
 
         let reply = dispatch_and_poll(
             &mut instance, &envelope.payload,

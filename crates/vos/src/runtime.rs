@@ -486,6 +486,12 @@ impl<D: DataLayer> VosRuntime<D> {
         let next_id = &mut self.next_id;
 
         for (svc_id, mut items) in by_service {
+            // Drop any reply captured by a previous dispatch — only
+            // the most recent dispatch's reply is meaningful, and
+            // if this one produces no reply we don't want
+            // take_last_reply to surface stale bytes.
+            self.last_reply.remove(&svc_id);
+
             let info = match services.get(&svc_id) {
                 Some(i) if i.alive => i,
                 _ => continue,
