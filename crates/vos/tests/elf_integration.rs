@@ -656,6 +656,67 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 }
 
 #[test]
+fn cross_agent_invoke_returns_typed_reply() {
+    // #13 from the audit — exercises the data path of cross-agent
+    // invoke, not just the structural roundtrip. Registers the
+    // math actor (which has `add(a, b: u64) -> u64`), invokes it
+    // from outside the PVM via VosNode::invoke, decodes the rkyv-
+    // encoded reply, and asserts on the value.
+    use vos::node::{AgentConfig, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let math_path = format!(
+        "{}/../../examples/actors/math/target/riscv64em-javm/release/math.elf",
+        workspace,
+    );
+    let math_data = match std::fs::read(&math_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: math actor not built");
+            return;
+        }
+    };
+    let math_blob = grey_transpiler::link_elf(&math_data).expect("transpile");
+
+    // Spin up a node in a background thread so we can drive it
+    // synchronously from the test. The node's run_until_idle
+    // would normally wind it down on quiet, but here we want it
+    // alive while we issue invokes.
+    let mut node = VosNode::new();
+    let math_id = node.register(AgentConfig::new(math_blob));
+
+    // Build the invoke wire payload: TAG_DYNAMIC + rkyv-encoded
+    // Msg::new("add").with("a", 2).with("b", 3).
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let msg = Msg::new("add").with("a", 2u64).with("b", 3u64);
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+
+    let reply_bytes = node
+        .invoke(math_id, payload)
+        .expect("math.add invoke failed (timeout or disconnected)");
+
+    // Decode reply as Value and check the answer.
+    let value: vos::value::Value = vos::Decode::decode(&reply_bytes);
+    let result = value.as_u64().expect("reply not a u64");
+    assert_eq!(result, 5, "expected 2 + 3 = 5, got {result}");
+
+    // Wind the node down explicitly.
+    node.shutdown();
+    let results = node.collect();
+    for r in &results {
+        assert!(
+            r.is_ok(),
+            "agent {} failed: panics={} error={:?}",
+            r.id, r.panics, r.error,
+        );
+    }
+}
+
+#[test]
 fn crdt_cross_agent_invoke_records_reply_in_dag() {
     // Cross-agent invoke under CRDT recording must capture peer
     // replies in the caller's DAG, just as worker replies are

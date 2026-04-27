@@ -459,6 +459,41 @@ impl VosNode {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
+    /// Synchronously invoke a registered service from outside the
+    /// PVM — for tests, host-side bootstraps, and any code path
+    /// where you want to ask an agent or worker without first
+    /// spinning up another PVM agent to do it.
+    ///
+    /// Returns the raw rkyv-encoded reply bytes, or `None` if the
+    /// target isn't registered, the channel is disconnected, the
+    /// reply exceeds the producer cap, or the call times out.
+    /// Default timeout is 10 seconds; use
+    /// [`invoke_with_timeout`](Self::invoke_with_timeout) for
+    /// finer control.
+    pub fn invoke(&self, target: ServiceId, msg: Vec<u8>) -> Option<Vec<u8>> {
+        self.invoke_with_timeout(target, msg, Duration::from_secs(10))
+    }
+
+    /// Like [`invoke`](Self::invoke) but with an explicit timeout.
+    pub fn invoke_with_timeout(
+        &self,
+        target: ServiceId,
+        msg: Vec<u8>,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        let tx = {
+            let map = self.invoke_routes.lock().ok()?;
+            map.get(&target.0).cloned()?
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            msg,
+            reply_tx,
+            chain: Vec::new(),
+        }).ok()?;
+        reply_rx.recv_timeout(timeout).ok()
+    }
+
     /// Route a single envelope to its destination.
     fn route(&self, envelope: Envelope) {
         let target = envelope.to;
