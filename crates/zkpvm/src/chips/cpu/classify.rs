@@ -209,3 +209,19 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
         _ => step.reg_a,
     }
 }
+
+/// Phase 13c: extract the 20 category/sub-category flags (in the order
+/// matching ProgramMemoryChip's preprocessed columns) for a given opcode.
+/// Used by ProgramMemoryChip's preprocessed-trace fill to pin flag values
+/// to the canonical classify_opcode result.
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 20] {
+    let f = classify_opcode(op);
+    [
+        f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
+        f.is_bitwise as u8, f.is_shift as u8, f.is_compare as u8, f.is_move as u8,
+        f.is_32bit as u8, f.is_branch as u8, f.is_jump as u8, f.is_div_rem as u8,
+        f.is_load as u8, f.is_store as u8, f.is_exit as u8, f.is_neg_add as u8,
+        f.is_reverse_bytes as u8, f.is_zero_ext_16 as u8,
+        f.is_sign_ext_8 as u8, f.is_sign_ext_16 as u8,
+    ]
+}

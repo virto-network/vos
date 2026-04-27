@@ -193,3 +193,23 @@ fn forged_step_skip_len_rejected() {
         s.skip_len = 5; // honest = 1 (TwoReg op is 2 bytes; skip = 1)
     });
 }
+
+// ── Phase 13c: flag binding ────────────────────────────────────────────────
+// These tests cross-check that the prover can't alter the OPCODE → FLAGS
+// relation by lying about the opcode in a way the 13b tuple (which includes
+// flags) wouldn't catch on its own.  Concretely: forging the opcode to
+// another instruction whose decoded fields (regs, imm, skip_len) and flags
+// happen to all match would slip past 13b alone; 13c's flag binding closes
+// that residual.  Most of these tests reduce to the same "opcode mismatch"
+// path 13b already catches, but we keep them to document the surface.
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_opcode_to_different_category_rejected() {
+    // Trace: ReverseBytes (BitManip TwoReg).  Forge: claim Move (also
+    // TwoReg, also no immediate) — different category flags → rejected
+    // either via opcode mismatch (13b) or flag mismatch (13c).
+    forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
+        s.opcode = Opcode::MoveReg;
+    });
+}

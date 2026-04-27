@@ -41,6 +41,7 @@ mod reg_access;
 use classify::{classify_opcode, dest_reg, uses_immediate};
 use columns::{Column, PreprocessedColumn};
 pub(crate) use reg_access::step_reg_accesses;
+pub(crate) use classify::classify_opcode_for_program_memory;
 
 pub struct CpuChip;
 
@@ -1161,20 +1162,17 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 13b: program-memory consumer
+        // Phase 13b/c: program-memory consumer (pc + opcode + regs + imm + flags)
         //
-        // Per real CpuChip step, demand `(pc, opcode, skip_len, reg_a, reg_b,
-        // reg_d, imm)` from ProgramMemoryChip's preprocessed table.  This
-        // pins the prover-witnessed instruction tuple to the actual decoding
-        // of `code` at that PC — a malicious prover claiming a different
-        // opcode/imm/regs at any step now fails verification.
+        // Per real CpuChip step, demand the full instruction tuple +
+        // category-flag bag from ProgramMemoryChip's preprocessed table.
+        // Phase 13b binds (pc, opcode, skip_len, reg_a, reg_b, reg_d, imm);
+        // 13c extends it with 20 category/sub-category flag columns so the
+        // prover can't clear flags to skip per-op constraints.
         //
-        // Pair-parity note (CONSTRAINTS.md rule 1): we emit the consumer
-        // TWICE with identical multiplicity and tuple, paired together by
-        // finalize_logup_in_pairs.  ProgramMemoryChip doubles its
-        // multiplicity column to balance the doubled demand.  This keeps
-        // CpuChip's pair count even without disturbing the rest of the
-        // chip's emission structure.
+        // Pair-parity (CONSTRAINTS.md rule 1): two paired emissions with
+        // identical multiplicity and tuple.  ProgramMemoryChip doubles its
+        // multiplicity column.
         {
             let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
             let opcode = crate::trace::trace_eval!(trace_eval, Column::Opcode);
@@ -1182,12 +1180,29 @@ impl BuiltInComponent for CpuChip {
             let reg_a = crate::trace::trace_eval!(trace_eval, Column::RegA);
             let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
             let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
-            // CpuChip stores the immediate value in the existing imm-decoded
-            // form on RegValD only when ValDIsReg=0; for now ProgramMemory
-            // matches against the full 8-byte immediate witness column we
-            // need to add to CpuChip.  TEMPORARY in 13b: we materialise the
-            // imm tuple from existing columns; if a column doesn't exist we
-            // need to add it.
+            let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            // 13c flags — must match the order of ProgramMemoryChip's
+            // preprocessed columns and `classify_opcode_for_program_memory`.
+            let f_is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
+            let f_is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
+            let f_is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
+            let f_is_mul_upper = crate::trace::trace_eval!(trace_eval, Column::IsMulUpper);
+            let f_is_bitwise = crate::trace::trace_eval!(trace_eval, Column::IsBitwise);
+            let f_is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
+            let f_is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
+            let f_is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
+            let f_is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let f_is_branch = crate::trace::trace_eval!(trace_eval, Column::IsBranch);
+            let f_is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
+            let f_is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
+            let f_is_load = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
+            let f_is_store = crate::trace::trace_eval!(trace_eval, Column::IsStore);
+            let f_is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
+            let f_is_neg_add = crate::trace::trace_eval!(trace_eval, Column::IsNegAdd);
+            let f_is_reverse_bytes = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
+            let f_is_zero_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
+            let f_is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
+            let f_is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
 
             let mut tuple: Vec<E::F> = pc.to_vec();
             tuple.push(opcode[0].clone());
@@ -1195,15 +1210,29 @@ impl BuiltInComponent for CpuChip {
             tuple.push(reg_a[0].clone());
             tuple.push(reg_b[0].clone());
             tuple.push(reg_d[0].clone());
-            // imm: currently CpuChip doesn't expose a dedicated 8-byte imm
-            // column.  Phase 13b adds it; until then this emission would
-            // miss the imm field.  See the column add below.
-            let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             tuple.extend_from_slice(&imm);
+            tuple.push(f_is_add[0].clone());
+            tuple.push(f_is_sub[0].clone());
+            tuple.push(f_is_mul[0].clone());
+            tuple.push(f_is_mul_upper[0].clone());
+            tuple.push(f_is_bitwise[0].clone());
+            tuple.push(f_is_shift[0].clone());
+            tuple.push(f_is_compare[0].clone());
+            tuple.push(f_is_move[0].clone());
+            tuple.push(f_is_32bit[0].clone());
+            tuple.push(f_is_branch[0].clone());
+            tuple.push(f_is_jump[0].clone());
+            tuple.push(f_is_div_rem[0].clone());
+            tuple.push(f_is_load[0].clone());
+            tuple.push(f_is_store[0].clone());
+            tuple.push(f_is_exit[0].clone());
+            tuple.push(f_is_neg_add[0].clone());
+            tuple.push(f_is_reverse_bytes[0].clone());
+            tuple.push(f_is_zero_ext_16[0].clone());
+            tuple.push(f_is_sign_ext_8[0].clone());
+            tuple.push(f_is_sign_ext_16[0].clone());
 
-            // Two paired consumer emissions with the same is_real
-            // multiplicity and same tuple.  ProgramMemoryChip provides
-            // 2·count_at_pc on the producer side.
+            // Paired emissions; ProgramMemoryChip's mult = 2·count_at_pc.
             eval.add_to_relation(RelationEntry::new(
                 prog_mem_lookup,
                 is_real.clone().into(),
@@ -2052,7 +2081,7 @@ impl BuiltInProverComponent for CpuChip {
             );
         }
 
-        // ── Phase 13b: ProgramMemory consumer (prover-side, 2 paired) ──
+        // ── Phase 13b/c: ProgramMemory consumer (prover-side, 2 paired, 38 limbs) ──
         {
             let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
             let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
@@ -2062,6 +2091,26 @@ impl BuiltInProverComponent for CpuChip {
             let reg_b = crate::trace::original_base_column!(component_trace, Column::RegB);
             let reg_d = crate::trace::original_base_column!(component_trace, Column::RegD);
             let imm_bytes = crate::trace::original_base_column!(component_trace, Column::ImmBytes);
+            let f_is_add = crate::trace::original_base_column!(component_trace, Column::IsAdd);
+            let f_is_sub = crate::trace::original_base_column!(component_trace, Column::IsSub);
+            let f_is_mul = crate::trace::original_base_column!(component_trace, Column::IsMul);
+            let f_is_mul_upper = crate::trace::original_base_column!(component_trace, Column::IsMulUpper);
+            let f_is_bitwise = crate::trace::original_base_column!(component_trace, Column::IsBitwise);
+            let f_is_shift = crate::trace::original_base_column!(component_trace, Column::IsShift);
+            let f_is_compare = crate::trace::original_base_column!(component_trace, Column::IsCompare);
+            let f_is_move = crate::trace::original_base_column!(component_trace, Column::IsMove);
+            let f_is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
+            let f_is_branch = crate::trace::original_base_column!(component_trace, Column::IsBranch);
+            let f_is_jump = crate::trace::original_base_column!(component_trace, Column::IsJump);
+            let f_is_div_rem = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
+            let f_is_load = crate::trace::original_base_column!(component_trace, Column::IsLoad);
+            let f_is_store = crate::trace::original_base_column!(component_trace, Column::IsStore);
+            let f_is_exit = crate::trace::original_base_column!(component_trace, Column::IsExit);
+            let f_is_neg_add = crate::trace::original_base_column!(component_trace, Column::IsNegAdd);
+            let f_is_reverse_bytes = crate::trace::original_base_column!(component_trace, Column::IsReverseBytes);
+            let f_is_zero_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsZeroExt16);
+            let f_is_sign_ext_8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
+            let f_is_sign_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
             let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
             let mut tuple: Vec<_> = pc.to_vec();
@@ -2071,38 +2120,44 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(reg_b[0].clone());
             tuple.push(reg_d[0].clone());
             tuple.extend_from_slice(&imm_bytes);
+            tuple.push(f_is_add[0].clone());
+            tuple.push(f_is_sub[0].clone());
+            tuple.push(f_is_mul[0].clone());
+            tuple.push(f_is_mul_upper[0].clone());
+            tuple.push(f_is_bitwise[0].clone());
+            tuple.push(f_is_shift[0].clone());
+            tuple.push(f_is_compare[0].clone());
+            tuple.push(f_is_move[0].clone());
+            tuple.push(f_is_32bit[0].clone());
+            tuple.push(f_is_branch[0].clone());
+            tuple.push(f_is_jump[0].clone());
+            tuple.push(f_is_div_rem[0].clone());
+            tuple.push(f_is_load[0].clone());
+            tuple.push(f_is_store[0].clone());
+            tuple.push(f_is_exit[0].clone());
+            tuple.push(f_is_neg_add[0].clone());
+            tuple.push(f_is_reverse_bytes[0].clone());
+            tuple.push(f_is_zero_ext_16[0].clone());
+            tuple.push(f_is_sign_ext_8[0].clone());
+            tuple.push(f_is_sign_ext_16[0].clone());
 
-            // is_real = 1 - is_padding.  Two paired emissions, identical
-            // multiplicity and tuple, balanced by ProgramMemoryChip's
-            // doubled producer multiplicity.
-            let is_pad_for_pm = is_pad_col[0].clone();
-            logup.add_to_relation_computed(
-                prog_mem,
-                [is_pad_for_pm.clone()],
-                |[p]| {
-                    let one_packed = stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
-                    (one_packed - p).into()
-                },
-                tuple.len(),
-                {
-                    let tuple_clone: Vec<_> = tuple.clone();
-                    move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
-                },
-            );
-            let is_pad_for_pm2 = is_pad_col[0].clone();
-            logup.add_to_relation_computed(
-                prog_mem,
-                [is_pad_for_pm2],
-                |[p]| {
-                    let one_packed = stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
-                    (one_packed - p).into()
-                },
-                tuple.len(),
-                {
-                    let tuple_clone: Vec<_> = tuple.clone();
-                    move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
-                },
-            );
+            // Two paired emissions, multiplicity = is_real = 1 - is_padding.
+            for _ in 0..2 {
+                let is_pad = is_pad_col[0].clone();
+                logup.add_to_relation_computed(
+                    prog_mem,
+                    [is_pad],
+                    |[p]| {
+                        let one_packed = stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
+                        (one_packed - p).into()
+                    },
+                    tuple.len(),
+                    {
+                        let tuple_clone: Vec<_> = tuple.clone();
+                        move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
+                    },
+                );
+            }
         }
 
         logup.finalize()

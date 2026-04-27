@@ -20,14 +20,25 @@ stwo_constraint_framework::relation!(
     REL_REG_MEMORY_LOOKUP_SIZE
 );
 
-// (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8])
+// (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],
+//  flags[N_FLAGS])  — N_FLAGS = 20 category + sub-category booleans.
 //
 // Authenticates instruction-fetch tuples: every CpuChip step emits this
 // tuple, and ProgramMemoryChip's preprocessed table holds the canonical
-// decoding at every basic-block-starting PC of `code`.  Phase 13a defines
-// the chip; Phase 13b wires up the CpuChip consumer.  Once consumers exist,
-// a prover can no longer claim arbitrary opcode/imm/regs at any PC.
-const REL_PROG_MEMORY_LOOKUP_SIZE: usize = PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE;
+// decoding at every basic-block-starting PC of `code`.  Phase 13a defined
+// the chip; 13b wired the (pc, opcode, skip_len, regs, imm) consumer; 13c
+// extends the tuple with the category/sub-category flags so a prover
+// can't clear flags to skip per-op constraints — flag values are now
+// pinned to the canonical classify_opcode(opcode) decoding.
+//
+// Flag layout in the tuple, in order (Phase 13c):
+//   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
+//   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
+//   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
+//   is_sign_ext_16
+pub const PROG_MEMORY_N_FLAGS: usize = 20;
+const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
+    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS;
 stwo_constraint_framework::relation!(
     ProgramMemoryLookupElements,
     REL_PROG_MEMORY_LOOKUP_SIZE

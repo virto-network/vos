@@ -96,6 +96,29 @@ pub enum PreprocessedColumn {
     /// padding).
     #[size = 8]
     Imm,
+    // ── Phase 13c: category / sub-category flags ──
+    // Each flag mirrors classify_opcode's output for the opcode at this PC.
+    // Order MUST match the consumer-side tuple in CpuChip.add_constraints.
+    #[size = 1] IsAdd,
+    #[size = 1] IsSub,
+    #[size = 1] IsMul,
+    #[size = 1] IsMulUpper,
+    #[size = 1] IsBitwise,
+    #[size = 1] IsShift,
+    #[size = 1] IsCompare,
+    #[size = 1] IsMove,
+    #[size = 1] Is32Bit,
+    #[size = 1] IsBranch,
+    #[size = 1] IsJump,
+    #[size = 1] IsDivRem,
+    #[size = 1] IsLoad,
+    #[size = 1] IsStore,
+    #[size = 1] IsExit,
+    #[size = 1] IsNegAdd,
+    #[size = 1] IsReverseBytes,
+    #[size = 1] IsZeroExt16,
+    #[size = 1] IsSignExt8,
+    #[size = 1] IsSignExt16,
 }
 
 impl BuiltInComponent for ProgramMemoryChip {
@@ -116,11 +139,30 @@ impl BuiltInComponent for ProgramMemoryChip {
         let reg_b = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegB);
         let reg_d = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegD);
         let imm = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Imm);
+        // Phase 13c flags (in the canonical order — must match CpuChip consumer).
+        let f_is_add = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsAdd);
+        let f_is_sub = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSub);
+        let f_is_mul = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMul);
+        let f_is_mul_upper = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMulUpper);
+        let f_is_bitwise = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsBitwise);
+        let f_is_shift = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsShift);
+        let f_is_compare = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsCompare);
+        let f_is_move = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMove);
+        let f_is_32bit = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Is32Bit);
+        let f_is_branch = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsBranch);
+        let f_is_jump = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsJump);
+        let f_is_div_rem = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsDivRem);
+        let f_is_load = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoad);
+        let f_is_store = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStore);
+        let f_is_exit = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsExit);
+        let f_is_neg_add = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsNegAdd);
+        let f_is_reverse_bytes = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsReverseBytes);
+        let f_is_zero_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsZeroExt16);
+        let f_is_sign_ext_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt8);
+        let f_is_sign_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt16);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8]) — 18 limbs.
-        // Sourced from preprocessed columns so the program identity binds
-        // through the preprocessed Merkle commitment.
+        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 20 flags) — 38 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -128,8 +170,28 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm);
+        tuple.push(f_is_add[0].clone());
+        tuple.push(f_is_sub[0].clone());
+        tuple.push(f_is_mul[0].clone());
+        tuple.push(f_is_mul_upper[0].clone());
+        tuple.push(f_is_bitwise[0].clone());
+        tuple.push(f_is_shift[0].clone());
+        tuple.push(f_is_compare[0].clone());
+        tuple.push(f_is_move[0].clone());
+        tuple.push(f_is_32bit[0].clone());
+        tuple.push(f_is_branch[0].clone());
+        tuple.push(f_is_jump[0].clone());
+        tuple.push(f_is_div_rem[0].clone());
+        tuple.push(f_is_load[0].clone());
+        tuple.push(f_is_store[0].clone());
+        tuple.push(f_is_exit[0].clone());
+        tuple.push(f_is_neg_add[0].clone());
+        tuple.push(f_is_reverse_bytes[0].clone());
+        tuple.push(f_is_zero_ext_16[0].clone());
+        tuple.push(f_is_sign_ext_8[0].clone());
+        tuple.push(f_is_sign_ext_16[0].clone());
 
-        // Producer side: negative multiplicity, like the other table chips.
+        // Producer: negative multiplicity.
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
             (-mult[0].clone()).into(),
@@ -161,17 +223,31 @@ impl BuiltInProverComponent for ProgramMemoryChip {
             let bbs = (row < side_note.code.len())
                 && side_note.bitmask.get(row).copied().unwrap_or(0) == 1;
             if bbs {
-                let (opcode, skip_len, ra, rb, rd, imm) = decode_at(
-                    &side_note.code, &side_note.bitmask, row,
-                );
-                trace.fill_columns(row, opcode, PreprocessedColumn::Opcode);
-                trace.fill_columns(row, skip_len, PreprocessedColumn::SkipLen);
-                trace.fill_columns(row, ra, PreprocessedColumn::RegA);
-                trace.fill_columns(row, rb, PreprocessedColumn::RegB);
-                trace.fill_columns(row, rd, PreprocessedColumn::RegD);
-                trace.fill_columns(row, imm, PreprocessedColumn::Imm);
+                let d = decode_at(&side_note.code, &side_note.bitmask, row);
+                trace.fill_columns(row, d.opcode, PreprocessedColumn::Opcode);
+                trace.fill_columns(row, d.skip_len, PreprocessedColumn::SkipLen);
+                trace.fill_columns(row, d.ra, PreprocessedColumn::RegA);
+                trace.fill_columns(row, d.rb, PreprocessedColumn::RegB);
+                trace.fill_columns(row, d.rd, PreprocessedColumn::RegD);
+                trace.fill_columns(row, d.imm, PreprocessedColumn::Imm);
+                // Phase 13c: per-flag fill, in the same order as the lookup tuple.
+                let flag_cols = [
+                    PreprocessedColumn::IsAdd, PreprocessedColumn::IsSub,
+                    PreprocessedColumn::IsMul, PreprocessedColumn::IsMulUpper,
+                    PreprocessedColumn::IsBitwise, PreprocessedColumn::IsShift,
+                    PreprocessedColumn::IsCompare, PreprocessedColumn::IsMove,
+                    PreprocessedColumn::Is32Bit, PreprocessedColumn::IsBranch,
+                    PreprocessedColumn::IsJump, PreprocessedColumn::IsDivRem,
+                    PreprocessedColumn::IsLoad, PreprocessedColumn::IsStore,
+                    PreprocessedColumn::IsExit, PreprocessedColumn::IsNegAdd,
+                    PreprocessedColumn::IsReverseBytes, PreprocessedColumn::IsZeroExt16,
+                    PreprocessedColumn::IsSignExt8, PreprocessedColumn::IsSignExt16,
+                ];
+                for (i, col) in flag_cols.iter().enumerate() {
+                    trace.fill_columns(row, d.flags[i], *col);
+                }
             }
-            // Non-BBS / padding rows: opcode/skip_len/regs/imm stay at 0.
+            // Non-BBS / padding rows: opcode/skip_len/regs/imm/flags stay at 0.
         }
 
         trace.finalize_bit_reversed()
@@ -215,9 +291,29 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let reg_b = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegB);
         let reg_d = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegD);
         let imm = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Imm);
+        let f_is_add = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsAdd);
+        let f_is_sub = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSub);
+        let f_is_mul = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMul);
+        let f_is_mul_upper = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMulUpper);
+        let f_is_bitwise = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsBitwise);
+        let f_is_shift = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsShift);
+        let f_is_compare = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsCompare);
+        let f_is_move = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMove);
+        let f_is_32bit = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Is32Bit);
+        let f_is_branch = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsBranch);
+        let f_is_jump = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsJump);
+        let f_is_div_rem = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsDivRem);
+        let f_is_load = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoad);
+        let f_is_store = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStore);
+        let f_is_exit = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsExit);
+        let f_is_neg_add = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsNegAdd);
+        let f_is_reverse_bytes = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsReverseBytes);
+        let f_is_zero_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsZeroExt16);
+        let f_is_sign_ext_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt8);
+        let f_is_sign_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt16);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build tuple from preprocessed columns.
+        // Build the 38-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -225,6 +321,26 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm);
+        tuple.push(f_is_add[0].clone());
+        tuple.push(f_is_sub[0].clone());
+        tuple.push(f_is_mul[0].clone());
+        tuple.push(f_is_mul_upper[0].clone());
+        tuple.push(f_is_bitwise[0].clone());
+        tuple.push(f_is_shift[0].clone());
+        tuple.push(f_is_compare[0].clone());
+        tuple.push(f_is_move[0].clone());
+        tuple.push(f_is_32bit[0].clone());
+        tuple.push(f_is_branch[0].clone());
+        tuple.push(f_is_jump[0].clone());
+        tuple.push(f_is_div_rem[0].clone());
+        tuple.push(f_is_load[0].clone());
+        tuple.push(f_is_store[0].clone());
+        tuple.push(f_is_exit[0].clone());
+        tuple.push(f_is_neg_add[0].clone());
+        tuple.push(f_is_reverse_bytes[0].clone());
+        tuple.push(f_is_zero_ext_16[0].clone());
+        tuple.push(f_is_sign_ext_8[0].clone());
+        tuple.push(f_is_sign_ext_16[0].clone());
 
         // Producer (negative multiplicity).
         logup.add_to_relation_with(
@@ -245,12 +361,25 @@ fn chip_log_size(code_len: usize) -> u32 {
     crate::trace::utils::ceil_log2_at_least_lanes(code_len.max(1))
 }
 
-/// Decode the instruction at `pc` (which must be a basic-block start) into
-/// (opcode, skip_len, ra, rb, rd, imm).  Mirrors the tracer's per-step
-/// decoding so the preprocessed table tuple matches CpuChip's per-step
-/// columns 1:1.  Used only at preprocessed-trace generation, hence prover-only.
+/// Decoded instruction tuple at one PC.  Phase 13c adds the 20-flag bag.
 #[cfg(feature = "prover")]
-fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> (u8, u8, u8, u8, u8, u64) {
+struct Decoded {
+    opcode: u8,
+    skip_len: u8,
+    ra: u8,
+    rb: u8,
+    rd: u8,
+    imm: u64,
+    flags: [u8; 20],
+}
+
+/// Decode the instruction at `pc` (which must be a basic-block start) into
+/// the canonical tuple consumed by CpuChip.  Mirrors the tracer's per-step
+/// decoding plus classify_opcode's flag derivation, so the preprocessed
+/// table 1:1 reproduces what CpuChip's main columns hold for the matching
+/// step.  Used only at preprocessed-trace generation, hence prover-only.
+#[cfg(feature = "prover")]
+fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     use javm::args;
     use javm::instruction::Opcode;
 
@@ -261,5 +390,14 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> (u8, u8, u8, u8, u8, u64
     let decoded_args = args::decode_args(code, pc, skip_len as usize, category);
     let (ra, rb, rd) = crate::core::tracing::decode_reg_indices(opcode, &decoded_args);
     let imm = crate::core::tracing::decode_immediate(&decoded_args);
-    (opcode_byte, skip_len as u8, ra as u8, rb as u8, rd as u8, imm)
+    let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
+    Decoded {
+        opcode: opcode_byte,
+        skip_len: skip_len as u8,
+        ra: ra as u8,
+        rb: rb as u8,
+        rd: rd as u8,
+        imm,
+        flags: f,
+    }
 }
