@@ -5,13 +5,13 @@ can use to explore VOS, the actor runtime at the core of Kunekt.
 
 ```
 examples/
-├── Agent.toml     # manifest: one agent + a list of actors
+├── space.toml     # space manifest: agents (with optional child actors) + workers
 ├── justfile       # build and run recipes
 ├── agents/        # orchestrators (services that drive actors)
 │   ├── scheduler/   — invokes children each round, re-runs on yield
 │   ├── router/      — stateless message forwarder
 │   └── nushell/     — stub for a nu-style scripting agent
-└── actors/        # guest actors driven by an agent
+└── actors/        # guest actors hosted by an agent
     ├── greeter/     — one-shot "hello" actor
     ├── counter/     — counts ticks in persistent state
     ├── fizzbuzz/    — cooperative loop with yield
@@ -58,10 +58,11 @@ re-invokes any that yielded so cooperative loops can make progress.
 ### Execution flow
 
 ```
-vosx Agent.toml
+vosx start space.toml
   └─ load manifest, transpile ELFs to PVM blobs
-  └─ register scheduler service + actor blobs
-  └─ kick-start the scheduler
+  └─ register workers, then each [[agent]]'s child actors,
+     then the agent itself, on the multi-threaded VosNode
+  └─ kick-start every registered service
      │
      ▼
   scheduler (refine, PC=0)
@@ -96,7 +97,7 @@ already in hand. No snapshots, no replay — just a nested PVM invocation.
 ## Running
 
 ```sh
-# build everything and run the scheduler with all example actors
+# build everything and start the example space
 just run
 
 # list actors and their messages without running
@@ -104,7 +105,14 @@ just list
 
 # just build, don't run
 just build
+
+# run a single actor without a manifest
+cargo run -p vos --bin vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.elf
 ```
+
+The `space.toml` manifest is the structural unit: one `vosx start` =
+one space. See `space.toml` itself for the full schema (agents,
+nested actors, workers, `provides` roles, optional `[node]` block).
 
 You'll need [`just`](https://github.com/casey/just) and a recent nightly Rust
 toolchain. The example crates compile to RISC-V via a custom `riscv64em-javm`

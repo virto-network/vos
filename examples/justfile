@@ -10,7 +10,7 @@ build:
     cd actors/pipeline && cargo build --release
 
 run: build
-    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- Agent.toml
+    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- start space.toml --no-persist
 
 list: build
-    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- --list Agent.toml
+    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- list space.toml

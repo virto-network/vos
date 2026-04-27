@@ -79,7 +79,7 @@ enum Command {
         consistency: ConsistencyArg,
     },
     /// Start the space defined by a manifest. With no path, looks
-    /// for `Kunekt.toml` in the current directory.
+    /// for `space.toml` in the current directory.
     Start {
         manifest: Option<PathBuf>,
         /// Override the data directory (default: `data`). Per-actor
@@ -674,7 +674,7 @@ fn resolve_entry_path(
 }
 
 fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
-    let path = path.unwrap_or_else(|| "Kunekt.toml".into());
+    let path = path.unwrap_or_else(|| "space.toml".into());
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| die(&format!("reading {}: {e}", path.display())));
     let manifest: Manifest = toml::from_str(&content)

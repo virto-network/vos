@@ -52,9 +52,9 @@ test-one name: build-workers
 
 # ── Run ─────────────────────────────────────────────────────────────
 
-# Run vosx with the example manifest
+# Run vosx with the example space manifest
 run-manifest: build build-pvm
-    cargo run --bin vosx -- examples/Agent.toml
+    cargo run --bin vosx -- start examples/space.toml --no-persist
 
 # Run a single PVM actor
 run-actor name="greeter": build-pvm
@@ -71,7 +71,7 @@ run-workers: build-workers
         --worker target/debug/libproxy_worker.so
 
 # List metadata of actors in a manifest
-list manifest="examples/Agent.toml": build-pvm
+list manifest="examples/space.toml": build-pvm
     cargo run --bin vosx -- list {{manifest}}
 
 # ── Maintenance ─────────────────────────────────────────────────────
