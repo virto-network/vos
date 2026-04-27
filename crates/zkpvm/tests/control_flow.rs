@@ -111,6 +111,96 @@ fn prove_fallthrough() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+// Negative test (Phase 12h): Fallthrough is classified with no special control-
+// flow flags (is_branch=is_jump=is_exit=0), so the sequential-PC constraint
+// (next_pc = pc + 1 + skip_len) must fire on it.  If the constraint is missing
+// or mis-gated, a forged next_pc would produce a "valid" proof.
+#[test]
+#[should_panic(expected = "ConstraintsNotSatisfied")]
+fn fallthrough_forged_next_pc_rejected() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 5;
+    regs[1] = 7;
+
+    let code = vec![
+        Opcode::Fallthrough as u8,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 1, 0, 0, 1];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+
+    // Forge: claim Fallthrough advances to pc=2 instead of pc=1.
+    assert_eq!(steps[0].opcode, Opcode::Fallthrough);
+    steps[0].next_pc = 2;
+
+    // Honest proving must fail: the AIR's sequential-PC constraint catches the
+    // mismatch between (pc + 1 + skip_len) and the forged next_pc.
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_unlikely() {
+    // `Unlikely` is the basic-block-end hint counterpart of Fallthrough; the
+    // AIR treats both as plain sequential terminators (no control-flow flag).
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 5;
+    regs[1] = 7;
+
+    let code = vec![
+        Opcode::Unlikely as u8,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 1, 0, 0, 1];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, javm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].opcode, Opcode::Unlikely);
+    assert_eq!(steps[0].next_pc, 1);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "ConstraintsNotSatisfied")]
+fn unlikely_forged_next_pc_rejected() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 5;
+    regs[1] = 7;
+
+    let code = vec![
+        Opcode::Unlikely as u8,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 1, 0, 0, 1];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+
+    assert_eq!(steps[0].opcode, Opcode::Unlikely);
+    steps[0].next_pc = 2;
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 // ── Branch taken ──
 
 #[test]

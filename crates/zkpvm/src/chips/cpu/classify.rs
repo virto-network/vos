@@ -158,7 +158,11 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Jumps (unconditional, non-sequential target)
         Opcode::Jump | Opcode::LoadImmJump
             => { f.is_jump = true; }
-        // Fallthrough/Unlikely: sequential terminators, no special control flow constraint
+        // Fallthrough/Unlikely: pure sequential terminators (basic-block hints
+        // with no semantic effect).  All flags stay 0 so the default
+        // sequential-PC identity (next_pc = pc + 1 + skip_len) constrains them
+        // — see fallthrough_forged_next_pc_rejected and
+        // unlikely_forged_next_pc_rejected in tests/control_flow.rs.
         Opcode::Fallthrough | Opcode::Unlikely => {}
         // JumpInd/LoadImmJumpInd: dynamic jumps (target prover-trusted, exclude from sequential PC)
         Opcode::JumpInd | Opcode::LoadImmJumpInd => { f.is_exit = true; }
