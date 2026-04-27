@@ -371,9 +371,12 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
 
     let mut node = VosNode::new();
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    // Note: `provides` lists are surfaced in the boot log but not
-    // yet wired into runtime role lookup. That comes alongside the
-    // registry / `@role` resolver in the networking pass.
+    // role → list of ServiceIds providing it. Init values prefixed
+    // with '@' resolve through this map (e.g. peer = "@registry").
+    // Multiple providers of the same role yield an ambiguity error;
+    // dynamic role lookup at runtime is a future feature alongside
+    // the registry actor.
+    let mut provides_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
 
     // ── Workers ─────────────────────────────────────────────────────
     for w in &manifest.worker {
@@ -383,7 +386,7 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
         } else {
             let mut args = Args::new();
             for (k, v) in &w.init {
-                args = args.with(k, toml_to_value(v, &name_ids));
+                args = args.with(k, toml_to_value(v, &name_ids, &provides_map));
             }
             WorkerConfig::with_args(path, &args)
         };
@@ -394,8 +397,8 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
         let role_tag = format_provides(&w.provides);
         eprintln!("vosx: worker '{}' as {id}{role_tag}", w.name);
         name_ids.insert(w.name.clone(), id.0);
-        if !w.provides.is_empty() {
-            // (provides recorded via boot log; runtime use deferred)
+        for role in &w.provides {
+            provides_map.entry(role.clone()).or_default().push(id.0);
         }
     }
 
@@ -414,7 +417,7 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
             if let Some(d) = &data_dir {
                 cfg = cfg.persist(d);
             }
-            cfg = apply_init(cfg, &child.init, &elf_data, &name_ids);
+            cfg = apply_init(cfg, &child.init, &elf_data, &name_ids, &provides_map);
 
             let id = node.register(cfg);
             let role_tag = format_provides(&child.provides);
@@ -423,8 +426,8 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
                 child.name, a.name, a.consistency,
             );
             name_ids.insert(child.name.clone(), id.0);
-            if !child.provides.is_empty() {
-                // (provides recorded via boot log; runtime use deferred)
+            for role in &child.provides {
+                provides_map.entry(role.clone()).or_default().push(id.0);
             }
         }
 
@@ -437,7 +440,7 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
         if let Some(d) = &data_dir {
             cfg = cfg.persist(d);
         }
-        cfg = apply_init(cfg, &a.init, &elf_data, &name_ids);
+        cfg = apply_init(cfg, &a.init, &elf_data, &name_ids, &provides_map);
 
         let id = node.register(cfg);
         let role_tag = format_provides(&a.provides);
@@ -446,8 +449,8 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
             a.name, a.consistency,
         );
         name_ids.insert(a.name.clone(), id.0);
-        if !a.provides.is_empty() {
-            // (provides recorded via boot log; runtime use deferred)
+        for role in &a.provides {
+            provides_map.entry(role.clone()).or_default().push(id.0);
         }
     }
 
@@ -482,6 +485,7 @@ fn apply_init(
     init: &BTreeMap<String, toml::Value>,
     elf_data: &[u8],
     name_ids: &BTreeMap<String, u32>,
+    provides_map: &BTreeMap<String, Vec<u32>>,
 ) -> vos::node::AgentConfig {
     if init.is_empty() {
         return cfg;
@@ -494,7 +498,7 @@ fn apply_init(
             .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
             .map(|f| f.ty.as_str())
             .unwrap_or("String");
-        args = args.with(key, toml_to_init_value(val, ty, name_ids));
+        args = args.with(key, toml_to_init_value(val, ty, name_ids, provides_map));
     }
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     cfg = cfg.with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded.to_vec())]);
@@ -677,10 +681,49 @@ fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
     let path = path.unwrap_or_else(|| "space.toml".into());
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| die(&format!("reading {}: {e}", path.display())));
-    let manifest: Manifest = toml::from_str(&content)
+    let mut manifest: Manifest = toml::from_str(&content)
         .unwrap_or_else(|e| die(&format!("parsing {}: {e}", path.display())));
+
+    // Optional `<basename>.local.toml` overlay. Designed to live
+    // gitignored next to the shared manifest: different operators
+    // can set `[node]` (libp2p identity, listen addrs, data_dir)
+    // independently while the rest of the space stays shared.
+    let overlay_path = local_overlay_path(&path);
+    if overlay_path.exists() {
+        let overlay_content = std::fs::read_to_string(&overlay_path)
+            .unwrap_or_else(|e| die(&format!("reading {}: {e}", overlay_path.display())));
+        let overlay: LocalOverlay = toml::from_str(&overlay_content)
+            .unwrap_or_else(|e| die(&format!("parsing {}: {e}", overlay_path.display())));
+        if let Some(node) = overlay.node {
+            manifest.node = node;
+        }
+        eprintln!("vosx: merged overlay from {}", overlay_path.display());
+    }
+
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     (manifest, dir)
+}
+
+/// Derive the local-overlay file path: insert `.local` before the
+/// extension. `space.toml` → `space.local.toml`. Anything that
+/// doesn't have a `.toml` extension (shouldn't happen in practice)
+/// falls back to appending `.local.toml`.
+fn local_overlay_path(manifest: &Path) -> PathBuf {
+    let stem = manifest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("space");
+    let dir = manifest.parent().unwrap_or(Path::new("."));
+    dir.join(format!("{stem}.local.toml"))
+}
+
+/// Subset of the manifest schema that's allowed in the overlay
+/// file. Today only `[node]` — more fields can be added if /
+/// when operators have a real reason to override per-instance.
+#[derive(Deserialize, Default)]
+struct LocalOverlay {
+    #[serde(default)]
+    node: Option<NodeMeta>,
 }
 
 fn is_manifest(path: &Path) -> bool {
@@ -729,6 +772,41 @@ fn parse_cli_value(s: &str) -> vos::value::Value {
     Value::Str(s.into())
 }
 
+/// Resolve a string reference to a `ServiceId` u32. Two forms:
+///   `name`     → look up in `name_ids` (declared actor/worker name)
+///   `@role`    → look up in `provides_map` (must be unambiguous)
+///
+/// Forward references and ambiguous role lookups die with a clear
+/// message — we resolve in declaration order so the first usage of
+/// a peer must come after its `[[agent]]` / `[[worker]]` block.
+fn resolve_string_to_id(
+    s: &str,
+    name_ids: &BTreeMap<String, u32>,
+    provides_map: &BTreeMap<String, Vec<u32>>,
+) -> u32 {
+    if let Some(role) = s.strip_prefix('@') {
+        match provides_map.get(role) {
+            None => die(&format!(
+                "no actor or worker provides role '{role}' (referenced by '@{role}')",
+            )),
+            Some(ids) if ids.is_empty() => die(&format!(
+                "no actor or worker provides role '{role}'",
+            )),
+            Some(ids) if ids.len() > 1 => die(&format!(
+                "role '{role}' is provided by {} entries; cannot resolve '@{role}' unambiguously",
+                ids.len(),
+            )),
+            Some(ids) => ids[0],
+        }
+    } else {
+        name_ids.get(s).copied().unwrap_or_else(|| {
+            die(&format!(
+                "init value '{s}' is not a declared actor or worker (forward reference? use '@role' for role lookup)",
+            ))
+        })
+    }
+}
+
 /// Convert a TOML value to a typed `InitValue`, resolving string
 /// references against the running map of declared peers.
 ///
@@ -737,33 +815,31 @@ fn parse_cli_value(s: &str) -> vos::value::Value {
 /// - bool → `bool`
 /// - string → `String`, OR a `u32` ServiceId when the string
 ///   matches a declared actor/worker name and the expected type is
-///   `u32`
-/// - array → `Vec<u32>`, accepting integers or name-strings
+///   `u32`. Strings prefixed with `@` resolve via the `provides`
+///   role map.
+/// - array → `Vec<u32>`, accepting integers, name-strings, or
+///   `@role`-prefixed role lookups.
 fn toml_to_init_value(
     val: &toml::Value,
     expected_ty: &str,
     name_ids: &BTreeMap<String, u32>,
+    provides_map: &BTreeMap<String, Vec<u32>>,
 ) -> InitValue {
     let ty = expected_ty.replace(' ', "");
-    let resolve_name = |s: &str| -> u32 {
-        name_ids.get(s).copied().unwrap_or_else(|| {
-            die(&format!(
-                "init value '{s}' is not a declared actor or worker (forward reference?)",
-            ))
-        })
-    };
     match (val, ty.as_str()) {
         (toml::Value::Integer(n), "u32") => InitValue::U32(*n as u32),
         (toml::Value::Integer(n), "u64") => InitValue::U64(*n as u64),
         (toml::Value::Integer(n), "i32") => InitValue::I32(*n as i32),
         (toml::Value::Boolean(b), "bool") => InitValue::Bool(*b),
         (toml::Value::String(s), "String") => InitValue::Str(s.clone()),
-        (toml::Value::String(s), "u32") => InitValue::U32(resolve_name(s)),
+        (toml::Value::String(s), "u32") => {
+            InitValue::U32(resolve_string_to_id(s, name_ids, provides_map))
+        }
         (toml::Value::Array(arr), "Vec<u32>") => InitValue::ListU32(
             arr.iter()
                 .map(|v| match v {
                     toml::Value::Integer(n) => *n as u32,
-                    toml::Value::String(s) => resolve_name(s),
+                    toml::Value::String(s) => resolve_string_to_id(s, name_ids, provides_map),
                     other => die(&format!(
                         "Vec<u32> array element must be integer or actor/worker name, got {other:?}",
                     )),
@@ -776,8 +852,13 @@ fn toml_to_init_value(
 
 /// Convert a TOML value into a `vos::value::Value` for worker init
 /// args (which are untyped — we infer from the TOML shape, with
-/// strings resolving to ServiceIds when they match a declared name).
-fn toml_to_value(val: &toml::Value, name_ids: &BTreeMap<String, u32>) -> vos::value::Value {
+/// strings resolving to ServiceIds when they match a declared name
+/// or `@role` reference).
+fn toml_to_value(
+    val: &toml::Value,
+    name_ids: &BTreeMap<String, u32>,
+    provides_map: &BTreeMap<String, Vec<u32>>,
+) -> vos::value::Value {
     use vos::value::Value;
     match val {
         toml::Value::Integer(n) => {
@@ -789,7 +870,9 @@ fn toml_to_value(val: &toml::Value, name_ids: &BTreeMap<String, u32>) -> vos::va
         }
         toml::Value::Boolean(b) => Value::Bool(*b),
         toml::Value::String(s) => {
-            if let Some(&id) = name_ids.get(s) {
+            if let Some(role) = s.strip_prefix('@') {
+                Value::U32(resolve_string_to_id(&format!("@{role}"), name_ids, provides_map))
+            } else if let Some(&id) = name_ids.get(s) {
                 Value::U32(id)
             } else {
                 Value::Str(s.clone())
