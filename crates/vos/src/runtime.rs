@@ -255,6 +255,13 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     ///   returns the next logged output instead of running the
     ///   child.
     effect_mode: crate::effect_log::EffectMode,
+    /// Per-service reply bytes captured from the most recent
+    /// dispatch's [`RefinePayload::reply`] field. The host pulls
+    /// these out via [`take_last_reply`] to satisfy synchronous
+    /// invoke requests from peer agents.
+    ///
+    /// [`take_last_reply`]: VosRuntime::take_last_reply
+    last_reply: HashMap<u32, Vec<u8>>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -287,7 +294,15 @@ impl<D: DataLayer> VosRuntime<D> {
             code_cache: javm::CodeCache::new(),
             external_invoke: None,
             effect_mode: crate::effect_log::EffectMode::Inactive,
+            last_reply: HashMap::new(),
         }
+    }
+
+    /// Take and return the most recent dispatch's reply bytes for
+    /// `svc_id`, if any. Used by the host (`agent_thread`) to
+    /// answer synchronous invoke requests routed to this agent.
+    pub fn take_last_reply(&mut self, svc_id: ServiceId) -> Option<Vec<u8>> {
+        self.last_reply.remove(&svc_id.0)
     }
 
     pub fn gas_config(&self) -> &GasConfig {
@@ -554,6 +569,12 @@ impl<D: DataLayer> VosRuntime<D> {
                         if let Some(payload) = RefinePayload::decode(&payload_bytes) {
                             let cn = payload.continue_next;
                             let state = payload.state;
+                            // Capture the reply bytes for the host's
+                            // synchronous-invoke path. take_last_reply
+                            // pulls them out after run_blocking.
+                            if !payload.reply.is_empty() {
+                                self.last_reply.insert(svc_id, payload.reply.clone());
+                            }
                             journal.absorb_effects(payload.effects, svc_id);
                             (cn, state)
                         } else {

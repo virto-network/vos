@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use tracing::{error, info, warn};
@@ -208,11 +208,16 @@ pub struct VosNode {
     outbox_tx: mpsc::Sender<Envelope>,
     outbox_rx: mpsc::Receiver<Envelope>,
     /// Map from ServiceId → synchronous invoke channel. Both
-    /// workers and (cross-agent capable) PVM agents register here.
-    /// Used by an agent's `external_invoke` callback to route
-    /// `ctx.ask` calls whose target lives on a different thread.
-    invoke_routes: HashMap<u32, mpsc::Sender<InvokeRequest>>,
+    /// workers and PVM agents register here. Wrapped in an
+    /// `Arc<Mutex<...>>` so threads spawned earlier can resolve
+    /// peers registered later — the alternative (cloning the map
+    /// at thread spawn time) freezes A's view of the world before
+    /// B exists, breaking cross-agent invoke order-independent.
+    invoke_routes: InvokeRoutes,
 }
+
+/// Shared invoke-route table. Cheap to clone and pass to threads.
+type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 
 impl VosNode {
     /// Create a node with the default prefix (0 = local/unscoped).
@@ -230,7 +235,7 @@ impl VosNode {
             agents: Vec::new(),
             outbox_tx,
             outbox_rx,
-            invoke_routes: HashMap::new(),
+            invoke_routes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -245,16 +250,16 @@ impl VosNode {
     pub fn register(&mut self, config: AgentConfig) -> ServiceId {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
+        let (invoke_tx, invoke_rx) = mpsc::channel();
         let outbox = self.outbox_tx.clone();
 
-        // Route this service ID to this agent's inbox
-        self.routes.insert(id.0, tx.clone());
+        self.routes.insert(id.0, tx);
+        self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
 
-        // Clone worker invoke channels so the PVM agent can call workers
         let invoke_routes = self.invoke_routes.clone();
 
         let join = thread::spawn(move || {
-            agent_thread(id, config, rx, outbox, invoke_routes)
+            agent_thread(id, config, rx, invoke_rx, outbox, invoke_routes)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -270,7 +275,7 @@ impl VosNode {
         let outbox = self.outbox_tx.clone();
 
         self.routes.insert(id.0, tx);
-        self.invoke_routes.insert(id.0, invoke_tx);
+        self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
 
         let join = thread::spawn(move || {
             worker_thread(id, config, rx, invoke_rx, outbox)
@@ -317,7 +322,10 @@ impl VosNode {
     pub fn collect(mut self) -> Vec<AgentResult> {
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
-        drop(self.invoke_routes); // drop invoke channels so worker threads can detect disconnect
+        // Drain the invoke routes too so threads' invoke_rx
+        // disconnects when the node is winding down.
+        self.invoke_routes.lock().unwrap().clear();
+        drop(self.invoke_routes); // drop our reference so threads' Arc count drops
         self.agents.iter_mut()
             .filter_map(|h| h.join.take().and_then(|j| j.join().ok()))
             .collect()
@@ -336,28 +344,32 @@ fn agent_thread(
     id: ServiceId,
     config: AgentConfig,
     inbox: mpsc::Receiver<Envelope>,
+    invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
-    invoke_routes: HashMap<u32, mpsc::Sender<InvokeRequest>>,
+    invoke_routes: InvokeRoutes,
 ) -> AgentResult {
     use std::collections::VecDeque;
     use std::time::Duration;
 
     let mut runtime = VosRuntime::new();
 
-    // Set up external invoke handler for PVM → worker calls.
-    // When a PVM actor calls ctx.ask() on a worker ServiceId, this
-    // handler dispatches synchronously via the invoke channel.
-    if !invoke_routes.is_empty() {
-        runtime.set_external_invoke(Box::new(move |target, msg| {
-            let tx = invoke_routes.get(&target.0)?;
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(InvokeRequest {
-                msg: msg.to_vec(),
-                reply_tx,
-            }).ok()?;
-            reply_rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
-        }));
-    }
+    // External invoke handler for ctx.ask targets that live on a
+    // different thread (workers OR other agents). Looks up the
+    // target's invoke channel in the shared route table and blocks
+    // on the reply.
+    let invoke_routes_for_ext = invoke_routes.clone();
+    runtime.set_external_invoke(Box::new(move |target, msg| {
+        let tx = {
+            let map = invoke_routes_for_ext.lock().ok()?;
+            map.get(&target.0).cloned()?
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            msg: msg.to_vec(),
+            reply_tx,
+        }).ok()?;
+        reply_rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+    }));
 
     let consistency = config.consistency;
     let recording_enabled = consistency == Consistency::Crdt;
@@ -456,14 +468,48 @@ fn agent_thread(
 
     let mut handled_any = false;
     let mut fatal_error: Option<String> = None;
+    // Idle-detection threshold. The agent stays alive long enough
+    // for peer agents to invoke it after a brief lull. 2 seconds is
+    // plenty for tests and short-running spaces; long-running ones
+    // stay busy or get explicit shutdown via the node dropping
+    // routes/invoke_routes.
+    let idle_threshold = Duration::from_secs(2);
+    let mut last_activity = std::time::Instant::now();
 
     loop {
-        // Prefer the local queue, otherwise wait on the inbox.
+        // Priority 1 — drain pending invoke requests. The caller's
+        // PVM is suspended at the ecall waiting for a reply, so
+        // these jump to the front of the queue.
+        let mut serviced_invoke = false;
+        loop {
+            match invoke_rx.try_recv() {
+                Ok(req) => {
+                    handled_any = true;
+                    serviced_invoke = true;
+                    last_activity = std::time::Instant::now();
+                    let outcome = handle_invoke_request(
+                        &mut runtime, svc_id, &outbox, id, req,
+                        strategy.as_mut(), recording_enabled,
+                    );
+                    if let Err(e) = outcome {
+                        fatal_error = Some(format!("commit failed during invoke: {e}"));
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        if fatal_error.is_some() { break; }
+        if serviced_invoke {
+            continue;
+        }
+
         let msg = if let Some(m) = pending.pop_front() {
+            last_activity = std::time::Instant::now();
             m
         } else if runtime.has_work() || runtime.is_suspended(svc_id) {
-            // Residual work (self-messages, suspended continuation)
-            // — drive the runtime and loop, no new external event.
+            last_activity = std::time::Instant::now();
             if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
                 strategy.as_mut(), recording_enabled) {
                 fatal_error = Some(format!("commit failed during residual work: {e}"));
@@ -471,10 +517,20 @@ fn agent_thread(
             }
             continue;
         } else {
-            match inbox.recv_timeout(Duration::from_millis(200)) {
-                Ok(env) => env.payload,
+            // Short timeout on inbox so we keep checking invoke_rx
+            // promptly. Exit only when both channels have been
+            // quiet past the idle threshold (and we've handled at
+            // least one message), or when the inbox disconnects
+            // (the node is tearing down).
+            match inbox.recv_timeout(Duration::from_millis(50)) {
+                Ok(env) => {
+                    last_activity = std::time::Instant::now();
+                    env.payload
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if handled_any { break; }
+                    if handled_any && last_activity.elapsed() >= idle_threshold {
+                        break;
+                    }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -492,6 +548,64 @@ fn agent_thread(
         error!(%id, "{err}");
     }
     AgentResult { id, panics: runtime.panics, error: fatal_error }
+}
+
+/// Handle a synchronous invoke request from a peer: dispatch the
+/// message through this agent's runtime, capture the reply bytes
+/// (rkyv-encoded `Value`), and send them back through the caller's
+/// reply channel. The CALLER's `handle_invoke` wraps the reply in
+/// the invoke wire frame (`[STATUS_DONE][state_len=0][reply]`) —
+/// same convention workers use, so this path is symmetric with
+/// `worker_thread`.
+///
+/// Recording is honored: a CRDT-mode agent records the dispatch
+/// just like any other external message, since from its own
+/// perspective the invoke IS its external event for that tick.
+fn handle_invoke_request(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+    outbox: &mpsc::Sender<Envelope>,
+    from_id: ServiceId,
+    req: InvokeRequest,
+    strategy: &mut dyn crate::commit::CommitStrategy,
+    recording_enabled: bool,
+) -> Result<(), crate::commit::CommitError> {
+    if recording_enabled {
+        runtime.begin_recording(req.msg.clone());
+    }
+    runtime.send_to(svc_id, req.msg);
+    runtime.run_blocking();
+
+    // Route any external transfers the dispatch produced.
+    let external = runtime.drain_external_transfers(svc_id);
+    for (target, memo) in external {
+        let _ = outbox.send(Envelope {
+            from: from_id,
+            to: target,
+            payload: memo,
+        });
+    }
+
+    // Send the raw reply (or empty Vec if the handler had no
+    // reply, e.g. a `start() -> ()` returning Value::Unit). The
+    // caller's external_invoke unwraps this Option<Vec<u8>> and
+    // packs it into the wire frame.
+    let reply_payload = runtime.take_last_reply(svc_id).unwrap_or_default();
+    let _ = req.reply_tx.send(reply_payload);
+
+    // Persist whatever state changed (same path as a regular dispatch).
+    let state = runtime
+        .storage
+        .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
+        .map(|v| v.to_vec())
+        .unwrap_or_default();
+    if recording_enabled {
+        let log = runtime.finish_recording().expect("recording was started");
+        strategy.commit_with_log(&state, &log)?;
+    } else if !state.is_empty() {
+        strategy.commit(&state)?;
+    }
+    Ok(())
 }
 
 /// Run one dispatch cycle: optionally begin recording, deliver the

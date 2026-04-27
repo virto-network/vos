@@ -656,6 +656,78 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 }
 
 #[test]
+fn cross_agent_invoke_routes_through_node() {
+    // Two PVM agents on the same VosNode: scheduler (parent) and
+    // greeter (child). Scheduler's `init.children = [greeter_id]`,
+    // so when it runs it dispatches `start` to greeter via the
+    // INVOKE hostcall. With cross-agent invoke routing wired up,
+    // greeter's reply makes it back to the scheduler and both
+    // agents complete cleanly.
+    use vos::node::{AgentConfig, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let scheduler_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let greeter_path = format!(
+        "{}/../../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        workspace,
+    );
+    let scheduler_data = match std::fs::read(&scheduler_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let greeter_data = match std::fs::read(&greeter_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: greeter actor not built");
+            return;
+        }
+    };
+
+    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile sched");
+    let greeter_blob = grey_transpiler::link_elf(&greeter_data).expect("transpile greeter");
+
+    let mut node = VosNode::new();
+
+    // Register greeter first so we know its ServiceId before
+    // registering the scheduler that references it.
+    let greeter_id = node.register(AgentConfig::new(greeter_blob));
+
+    // Scheduler's init args point at greeter as a child.
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![greeter_id.0]),
+    );
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
+        .unwrap()
+        .to_vec();
+    let scheduler_id = node.register(
+        AgentConfig::new(scheduler_blob)
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded)]),
+    );
+
+    node.run();
+    let results = node.collect();
+
+    // Both agents should complete without host errors or PVM panics.
+    assert_eq!(results.len(), 2, "expected 2 agent threads");
+    for r in &results {
+        assert!(
+            r.is_ok(),
+            "agent {} failed: panics={} error={:?}",
+            r.id, r.panics, r.error,
+        );
+    }
+
+    let _ = scheduler_id; // unused suppression
+}
+
+#[test]
 fn recording_cap_truncates_oversized_invoke_output() {
     // SOUND-1 from the audit: when an invoke output exceeds the
     // session's per-reply cap, the host must replace it with a
