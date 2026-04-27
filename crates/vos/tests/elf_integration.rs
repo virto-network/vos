@@ -615,6 +615,89 @@ fn alloc_bogus_reply() -> Vec<u8> {
 }
 
 #[test]
+fn recording_cap_truncates_oversized_invoke_output() {
+    // SOUND-1 from the audit: when an invoke output exceeds the
+    // session's per-reply cap, the host must replace it with a
+    // single STATUS_PANICKED byte both in the caller's buffer and
+    // in the recorded log. Otherwise a runaway worker can poison
+    // consensus DAG nodes with arbitrarily large payloads.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let echo_so = {
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
+        std::path::PathBuf::from(p)
+    };
+    if !echo_so.exists() {
+        eprintln!("SKIP: echo-worker not built");
+        return;
+    }
+
+    let blob = transpile_actor(&agent_data);
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    let worker_child_id = vos::abi::service::ServiceId(99);
+    let invoke_count = std::sync::Arc::new(AtomicU32::new(0));
+    let count_clone = invoke_count.clone();
+
+    let plugin: &'static _ = Box::leak(Box::new(
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+    ));
+    let instance = std::sync::Mutex::new(plugin.create());
+
+    rt.set_external_invoke(Box::new(move |target, msg| {
+        if target != worker_child_id { return None; }
+        count_clone.fetch_add(1, Ordering::Relaxed);
+        let mut inst = instance.lock().unwrap();
+        match inst.dispatch_raw(msg) {
+            Ok(reply) => Some(reply),
+            Err(_) => Some(Vec::new()),
+        }
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    // Recording with an absurdly small cap (1 byte) — every invoke
+    // wire frame is at least 1 status byte plus state_len, so any
+    // real reply will overshoot.
+    rt.begin_recording_with_cap(b"cap-test".to_vec(), 1);
+    rt.send_to(agent_id, Vec::new());
+    rt.run_blocking();
+    let log = rt.finish_recording().expect("recording");
+
+    let invokes = invoke_count.load(Ordering::Relaxed);
+    assert!(invokes > 0, "scheduler should have invoked at least once");
+    assert_eq!(
+        log.reply_count() as u32, invokes,
+        "every top-level invoke is logged",
+    );
+    for (i, reply) in log.replies.iter().enumerate() {
+        assert_eq!(
+            reply.as_slice(),
+            &[vos::STATUS_PANICKED],
+            "reply #{i} should be the cap-truncated STATUS_PANICKED marker, got {reply:?}",
+        );
+    }
+}
+
+#[test]
 fn crdt_agent_populates_dag_and_state_on_dispatch() {
     // End-to-end: register a PVM agent with Crdt consistency + a
     // data-dir, kick a dispatch, and verify the agent's redb file

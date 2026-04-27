@@ -890,6 +890,15 @@ fn handle_refine_hostcall(
 ///
 /// Nested invokes (depth >= 2) belong to a child's refine and
 /// are irrelevant to the caller's session.
+///
+/// **Cap enforcement.** When recording, the session carries a
+/// per-reply byte cap (16 KiB by default). Outputs larger than the
+/// cap are replaced — both in the log and in the caller's buffer —
+/// with a single STATUS_PANICKED byte. The caller's PVM observes
+/// `InvokeError::Panicked`; replay reproduces the same observation
+/// bit-for-bit. The intent is to keep DAG nodes bounded so a
+/// runaway worker can't poison consensus replicas with multi-MB
+/// payloads.
 fn record_and_write_invoke(
     caller: &mut InvocationKernel,
     output_ptr: u32,
@@ -897,8 +906,16 @@ fn record_and_write_invoke(
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
+    use crate::actors::run::STATUS_PANICKED;
+
     if depth == 1 {
         if let crate::effect_log::EffectMode::Recording(s) = mode {
+            if output.len() > s.cap() {
+                let truncated = alloc::vec![STATUS_PANICKED];
+                s.record(truncated.clone());
+                kwrite(caller, output_ptr, &truncated);
+                return truncated.len() as u64;
+            }
             s.record(output.to_vec());
         }
     }
