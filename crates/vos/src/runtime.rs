@@ -360,12 +360,16 @@ impl<D: DataLayer> VosRuntime<D> {
         }
     }
 
-    /// Whether a recording session is active.
+    /// Whether a recording session is active. Mainly for tests and
+    /// host-side diagnostics.
+    #[doc(hidden)]
     pub fn is_recording(&self) -> bool {
         self.effect_mode.is_recording()
     }
 
-    /// Whether replay is active.
+    /// Whether replay is active. Mainly for tests and host-side
+    /// diagnostics.
+    #[doc(hidden)]
     pub fn is_replaying(&self) -> bool {
         self.effect_mode.is_replaying()
     }

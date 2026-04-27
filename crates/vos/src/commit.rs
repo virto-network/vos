@@ -14,21 +14,58 @@
 use std::path::Path;
 
 /// Error type for commit operations.
+///
+/// `Config` covers misuse of the API (e.g., `Crdt` consistency
+/// requested without a `data_dir`). `Backend` wraps any underlying
+/// I/O error (typically redb) so `?` can be used without a
+/// stringification dance at every call site.
 #[derive(Debug)]
 pub enum CommitError {
-    /// Backend-specific error (typically redb I/O).
-    Backend(String),
+    /// Configuration error — caller supplied incompatible options.
+    Config(String),
+    /// Backend I/O failure. The inner error is preserved for the
+    /// caller to inspect via [`std::error::Error::source`].
+    Backend(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl core::fmt::Display for CommitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Backend(s) => f.write_str(s),
+            Self::Config(s) => write!(f, "configuration error: {s}"),
+            Self::Backend(e) => write!(f, "backend error: {e}"),
         }
     }
 }
 
-impl std::error::Error for CommitError {}
+impl std::error::Error for CommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(_) => None,
+            Self::Backend(e) => Some(&**e),
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+mod from_redb {
+    use super::CommitError;
+
+    impl From<redb::DatabaseError> for CommitError {
+        fn from(e: redb::DatabaseError) -> Self { Self::Backend(Box::new(e)) }
+    }
+    impl From<redb::TableError> for CommitError {
+        fn from(e: redb::TableError) -> Self { Self::Backend(Box::new(e)) }
+    }
+    impl From<redb::StorageError> for CommitError {
+        fn from(e: redb::StorageError) -> Self { Self::Backend(Box::new(e)) }
+    }
+    impl From<redb::TransactionError> for CommitError {
+        fn from(e: redb::TransactionError) -> Self { Self::Backend(Box::new(e)) }
+    }
+    impl From<redb::CommitError> for CommitError {
+        fn from(e: redb::CommitError) -> Self { Self::Backend(Box::new(e)) }
+    }
+}
 
 /// Persistence/replication strategy for an actor's serialized state.
 ///
@@ -89,7 +126,7 @@ impl CommitStrategy for NoCommit {
 // ── redb-backed local strategy ──────────────────────────────────────
 
 #[cfg(feature = "storage")]
-pub use local::{LocalCommit, STATE_TABLE};
+pub use local::{LocalCommit, STATE_KEY, STATE_TABLE};
 
 #[cfg(feature = "storage")]
 pub use crdt::{Blake2b, CrdtCommit, DAG_TABLE, ROOTS_KEY};
@@ -103,7 +140,9 @@ mod local {
         redb::TableDefinition::new("state");
 
     /// Row key within [`STATE_TABLE`] for the actor's state blob.
-    const STATE_KEY: &str = "actor";
+    /// Shared with [`crdt::CrdtCommit`] so both strategies write to
+    /// the same row when they share a database file.
+    pub const STATE_KEY: &str = "actor";
 
     /// Persists state to a redb database, skipping writes when the
     /// serialized bytes are unchanged from the last commit.
@@ -115,9 +154,8 @@ mod local {
     impl LocalCommit {
         /// Open (or create) the redb database at `path`.
         pub fn open(path: &Path) -> Result<Self, CommitError> {
-            redb::Database::create(path)
-                .map(|db| Self { db, last: Vec::new() })
-                .map_err(|e| CommitError::Backend(e.to_string()))
+            let db = redb::Database::create(path)?;
+            Ok(Self { db, last: Vec::new() })
         }
 
         /// Borrow the underlying redb handle. Used when a higher-
@@ -141,20 +179,12 @@ mod local {
             if state == self.last {
                 return Ok(());
             }
-            let txn = self
-                .db
-                .begin_write()
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            let txn = self.db.begin_write()?;
             {
-                let mut table = txn
-                    .open_table(STATE_TABLE)
-                    .map_err(|e| CommitError::Backend(e.to_string()))?;
-                table
-                    .insert(STATE_KEY, state)
-                    .map_err(|e| CommitError::Backend(e.to_string()))?;
+                let mut table = txn.open_table(STATE_TABLE)?;
+                table.insert(STATE_KEY, state)?;
             }
-            txn.commit()
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            txn.commit()?;
             self.last = state.to_vec();
             Ok(())
         }
@@ -241,8 +271,7 @@ mod crdt {
         /// Open (or create) the redb database at `path` and load the
         /// Merkle-Clock roots from its `state` table.
         pub fn open(path: &std::path::Path) -> Result<Self, CommitError> {
-            let db = redb::Database::create(path)
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            let db = redb::Database::create(path)?;
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
             Ok(Self { db, clock, last_state })
@@ -293,14 +322,11 @@ mod crdt {
             let mut stack: Vec<Cid<Blake2b>> =
                 self.clock.roots().iter().cloned().collect();
 
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            let txn = self.db.begin_read()?;
             let table = match txn.open_table(DAG_TABLE) {
                 Ok(t) => t,
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(e) => return Err(CommitError::Backend(e.to_string())),
+                Err(e) => return Err(e.into()),
             };
 
             while let Some(cid) = stack.pop() {
@@ -308,12 +334,19 @@ mod crdt {
                     continue;
                 }
                 let val = table
-                    .get(cid.as_ref())
-                    .map_err(|e| CommitError::Backend(e.to_string()))?
-                    .ok_or_else(|| CommitError::Backend("missing DAG node".into()))?;
+                    .get(cid.as_ref())?
+                    .ok_or_else(|| {
+                        CommitError::Config(alloc::format!(
+                            "DAG node {cid:?} reachable from roots is missing from the dag table",
+                        ))
+                    })?;
                 let bytes = val.value();
                 let node: DagNode<Blake2b, EffectLog> = DagNode::from_bytes(bytes)
-                    .ok_or_else(|| CommitError::Backend("decode DagNode".into()))?;
+                    .ok_or_else(|| {
+                        CommitError::Config(alloc::format!(
+                            "DAG node {cid:?} could not be decoded — db corruption",
+                        ))
+                    })?;
                 for child in &node.children {
                     if !nodes.contains_key(child) {
                         stack.push(child.clone());
@@ -360,32 +393,18 @@ mod crdt {
                 None => encode_roots(self.clock.roots()),
             };
 
-            let txn = self
-                .db
-                .begin_write()
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            let txn = self.db.begin_write()?;
             {
-                let mut state_table = txn
-                    .open_table(STATE_TABLE)
-                    .map_err(|e| CommitError::Backend(e.to_string()))?;
-                state_table
-                    .insert(STATE_KEY_INNER, state)
-                    .map_err(|e| CommitError::Backend(e.to_string()))?;
-                state_table
-                    .insert(ROOTS_KEY, roots_bytes.as_slice())
-                    .map_err(|e| CommitError::Backend(e.to_string()))?;
+                let mut state_table = txn.open_table(STATE_TABLE)?;
+                state_table.insert(STATE_KEY, state)?;
+                state_table.insert(ROOTS_KEY, roots_bytes.as_slice())?;
 
                 if let Some((cid, bytes)) = &new_cid_and_bytes {
-                    let mut dag_table = txn
-                        .open_table(DAG_TABLE)
-                        .map_err(|e| CommitError::Backend(e.to_string()))?;
-                    dag_table
-                        .insert(cid.as_ref(), bytes.as_slice())
-                        .map_err(|e| CommitError::Backend(e.to_string()))?;
+                    let mut dag_table = txn.open_table(DAG_TABLE)?;
+                    dag_table.insert(cid.as_ref(), bytes.as_slice())?;
                 }
             }
-            txn.commit()
-                .map_err(|e| CommitError::Backend(e.to_string()))?;
+            txn.commit()?;
 
             // Update in-memory clock to reflect the newly committed
             // roots. For a log-less commit the roots are unchanged.
@@ -400,15 +419,10 @@ mod crdt {
 
     // ── helpers ─────────────────────────────────────────────────────
 
-    /// `STATE_TABLE` row key for the actor's state blob, duplicated
-    /// here because it's defined in the sibling `local` module.
-    /// Keeping it in sync is trivial — there is only one row key.
-    const STATE_KEY_INNER: &str = "actor";
-
     fn load_state(db: &redb::Database) -> Option<Vec<u8>> {
         let txn = db.begin_read().ok()?;
         let table = txn.open_table(STATE_TABLE).ok()?;
-        let val = table.get(STATE_KEY_INNER).ok().flatten()?;
+        let val = table.get(STATE_KEY).ok().flatten()?;
         Some(val.value().to_vec())
     }
 

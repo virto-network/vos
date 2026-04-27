@@ -33,7 +33,7 @@ pub const DEFAULT_REPLY_CAP: usize = 16 * 1024;
 /// Stored inside a CRDT actor's DAG node together with the incoming
 /// message bytes. Used both for recording (append replies as they
 /// arrive) and replay (pop replies in order).
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectLog {
     /// The incoming dispatch message — rkyv-encoded bytes exactly
     /// as the host would hand them to the actor's dispatch entry.
@@ -147,12 +147,16 @@ impl Default for EffectMode {
 }
 
 impl EffectMode {
-    /// `true` when actively recording.
+    /// `true` when actively recording. Mainly for tests and host
+    /// diagnostics; user code generally shouldn't need to peek.
+    #[doc(hidden)]
     pub fn is_recording(&self) -> bool {
         matches!(self, EffectMode::Recording(_))
     }
 
-    /// `true` when actively replaying.
+    /// `true` when actively replaying. Mainly for tests and host
+    /// diagnostics.
+    #[doc(hidden)]
     pub fn is_replaying(&self) -> bool {
         matches!(self, EffectMode::Replaying(_))
     }

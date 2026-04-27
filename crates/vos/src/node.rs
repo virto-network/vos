@@ -557,7 +557,7 @@ fn build_agent_strategy(
             Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
             Consistency::Local => {
                 let path = config.db_path(id).ok_or_else(|| {
-                    crate::commit::CommitError::Backend(
+                    crate::commit::CommitError::Config(
                         "Local consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
@@ -565,7 +565,7 @@ fn build_agent_strategy(
             }
             Consistency::Crdt => {
                 let path = config.db_path(id).ok_or_else(|| {
-                    crate::commit::CommitError::Backend(
+                    crate::commit::CommitError::Config(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
@@ -578,7 +578,7 @@ fn build_agent_strategy(
         let _ = (config, id);
         match config.consistency {
             Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
-            other => Err(crate::commit::CommitError::Backend(format!(
+            other => Err(crate::commit::CommitError::Config(format!(
                 "consistency={other:?} requires the `storage` feature"
             ))),
         }
