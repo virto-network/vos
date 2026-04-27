@@ -558,18 +558,24 @@ impl<D: DataLayer> VosRuntime<D> {
                             (cn, Vec::new())
                         };
 
+                    // Persist the actor's serialized state on every
+                    // dispatch — not just when yielding. A one-shot
+                    // handler that mutates `self` and returns must
+                    // still have its mutation reach the storage row
+                    // (and therefore the commit strategy) so CRDT /
+                    // Local persistence sees the actual end-of-tick
+                    // state instead of stale bytes from the previous
+                    // dispatch. Empty state means nothing changed.
+                    if !actor_state.is_empty() {
+                        journal.writes.push((
+                            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                            actor_state,
+                        ));
+                    }
+
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
                         save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
-                        // JAM-compatible: persist actor state so a
-                        // cold-start guest can restore via READ(STATE_KEY)
-                        // on a host that doesn't support flat_mem overlay.
-                        if !actor_state.is_empty() {
-                            journal.writes.push((
-                                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                                actor_state,
-                            ));
-                        }
                         // Spill any self-directed transfers from the
                         // payload's effects as pending transfers for next
                         // tick. On a JAM host, accumulate would replay

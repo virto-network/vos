@@ -682,14 +682,14 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     let db = redb::Database::open(&db_path).expect("open db");
     let txn = db.begin_read().unwrap();
 
-    // State table: must hold the roots key at minimum. The actor
-    // state row may be empty for stateless refine-only agents (the
-    // scheduler doesn't yield a continuation when its children
-    // list is empty), but the roots entry always exists once a
-    // commit has fired.
+    // State table: must hold the roots key AND the actor-state row.
+    // After SOUND-3 the runtime always journals serialized actor
+    // state on every dispatch — not just on yield — so even a
+    // refine-only one-shot agent leaves a non-empty state blob.
     let state_table = txn
         .open_table(redb::TableDefinition::<&str, &[u8]>::new("state"))
         .expect("state table exists");
+
     let roots_bytes = state_table
         .get("crdt_roots")
         .unwrap()
@@ -699,6 +699,17 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     assert!(roots_bytes.len() >= 8, "roots must encode at least count");
     let roots_count = u64::from_le_bytes(roots_bytes[..8].try_into().unwrap());
     assert!(roots_count >= 1, "expected at least one root CID");
+
+    let actor_bytes = state_table
+        .get("actor")
+        .unwrap()
+        .expect("actor state row persisted")
+        .value()
+        .to_vec();
+    assert!(
+        !actor_bytes.is_empty(),
+        "actor state should be persisted on every dispatch (SOUND-3 fix)",
+    );
 
     // DAG table: at least one node was appended.
     let dag_table = txn
