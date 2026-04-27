@@ -50,16 +50,19 @@ version = "0.1.0"
 name = "scheduler"
 path = "agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
 consistency = "ephemeral"
-init = { children = [] }
+# Cross-agent invoke is wired through the node — the scheduler can
+# ctx.ask() each of its children. Names in `init.children` resolve
+# to the corresponding actor's ServiceId at startup.
+init = { children = ["greeter", "counter", "fizzbuzz"] }
 
-# Child actors. Each one gets its own ServiceId and inherits the
-# agent's consistency. Reference them by name from the agent's own
-# init args:
-#   init = { children = ["ledger", "audit"] }
-# actors = [
-#   { name = "ledger", path = "...", init = { opening_balance = 100 } },
-#   { name = "audit",  path = "...", init = { peer = "ledger" } },
-# ]
+# Child actors. Each one gets its own ServiceId on the node and
+# inherits the parent agent's consistency. They're independent PVM
+# services; the parent invokes them via the cross-agent path.
+actors = [
+  { name = "greeter",  path = "actors/greeter/target/riscv64em-javm/release/greeter.elf" },
+  { name = "counter",  path = "actors/counter/target/riscv64em-javm/release/counter.elf" },
+  { name = "fizzbuzz", path = "actors/fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf" },
+]
 
 # ── Workers ──────────────────────────────────────────────────────
 #
