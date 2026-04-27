@@ -118,3 +118,22 @@ pub fn forge_two_reg_result(
     steps[0].regs_after[rd as usize] = forged;
     prove_and_verify(steps, &code, &bitmask);
 }
+
+/// Phase 13b negative-test helper: trace a TwoReg program, mutate one of
+/// `steps[0]`'s instruction-tuple columns (opcode/imm/reg_a/reg_b/reg_d/
+/// skip_len), then prove + verify.  The ProgramMemory consumer demands a
+/// tuple matching the canonical decoding of `code` at the step's PC, so
+/// any mismatch should make verification fail.  Caller wraps in
+/// `#[should_panic(expected = "ConstraintsNotSatisfied")]`.
+pub fn forge_step_field<F>(op: Opcode, rd: u8, ra: u8, input: u64, mutate: F)
+where
+    F: FnOnce(&mut PvmStep),
+{
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[ra as usize] = input;
+    let (code, bitmask) = two_reg_program(op, rd, ra);
+    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    assert_eq!(steps[0].opcode, op);
+    mutate(&mut steps[0]);
+    prove_and_verify(steps, &code, &bitmask);
+}

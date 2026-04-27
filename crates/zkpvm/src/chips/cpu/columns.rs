@@ -342,6 +342,13 @@ pub enum Column {
     /// AND-lookup it pins the byte decomposition `src = 16·hi_nib + lo_nib`.
     #[size = 1]
     SignExtSrcHiNib,
+    // ── Phase 13b: immediate witness column ─────────────────────────────
+    /// Decoded immediate value (`step.imm`) as 8 little-endian bytes.
+    /// Pinned to the canonical decoding of `code` at this PC by the
+    /// ProgramMemory consumer lookup (see add_constraints near
+    /// finalize_logup_in_pairs).
+    #[size = 8]
+    ImmBytes,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

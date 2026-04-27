@@ -24,7 +24,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -59,6 +59,7 @@ impl BuiltInComponent for CpuChip {
         PowerOfTwoLookupElements,
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
+        ProgramMemoryLookupElements,
     );
 
 
@@ -74,9 +75,10 @@ impl BuiltInComponent for CpuChip {
             PowerOfTwoLookupElements,
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
+            ProgramMemoryLookupElements,
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup) = lookup_elements;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1158,6 +1160,62 @@ impl BuiltInComponent for CpuChip {
             ));
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 13b: program-memory consumer
+        //
+        // Per real CpuChip step, demand `(pc, opcode, skip_len, reg_a, reg_b,
+        // reg_d, imm)` from ProgramMemoryChip's preprocessed table.  This
+        // pins the prover-witnessed instruction tuple to the actual decoding
+        // of `code` at that PC — a malicious prover claiming a different
+        // opcode/imm/regs at any step now fails verification.
+        //
+        // Pair-parity note (CONSTRAINTS.md rule 1): we emit the consumer
+        // TWICE with identical multiplicity and tuple, paired together by
+        // finalize_logup_in_pairs.  ProgramMemoryChip doubles its
+        // multiplicity column to balance the doubled demand.  This keeps
+        // CpuChip's pair count even without disturbing the rest of the
+        // chip's emission structure.
+        {
+            let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            let opcode = crate::trace::trace_eval!(trace_eval, Column::Opcode);
+            let skip_len = crate::trace::trace_eval!(trace_eval, Column::SkipLen);
+            let reg_a = crate::trace::trace_eval!(trace_eval, Column::RegA);
+            let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
+            let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
+            // CpuChip stores the immediate value in the existing imm-decoded
+            // form on RegValD only when ValDIsReg=0; for now ProgramMemory
+            // matches against the full 8-byte immediate witness column we
+            // need to add to CpuChip.  TEMPORARY in 13b: we materialise the
+            // imm tuple from existing columns; if a column doesn't exist we
+            // need to add it.
+
+            let mut tuple: Vec<E::F> = pc.to_vec();
+            tuple.push(opcode[0].clone());
+            tuple.push(skip_len[0].clone());
+            tuple.push(reg_a[0].clone());
+            tuple.push(reg_b[0].clone());
+            tuple.push(reg_d[0].clone());
+            // imm: currently CpuChip doesn't expose a dedicated 8-byte imm
+            // column.  Phase 13b adds it; until then this emission would
+            // miss the imm field.  See the column add below.
+            let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            tuple.extend_from_slice(&imm);
+
+            // Two paired consumer emissions with the same is_real
+            // multiplicity and same tuple.  ProgramMemoryChip provides
+            // 2·count_at_pc on the producer side.
+            eval.add_to_relation(RelationEntry::new(
+                prog_mem_lookup,
+                is_real.clone().into(),
+                &tuple,
+            ));
+            eval.add_to_relation(RelationEntry::new(
+                prog_mem_lookup,
+                is_real.clone().into(),
+                &tuple,
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -1180,6 +1238,12 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns_bytes(row, &step.next_pc.to_le_bytes(), Column::NextPc);
             trace.fill_columns(row, step.opcode as u8, Column::Opcode);
             trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
+            // Phase 13b: 8-byte immediate witness for the ProgramMemory lookup.
+            trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);
+            // Phase 13b: charge ProgramMemoryChip for this step's instruction
+            // fetch.  Two consumer emissions per step (paired) → producer
+            // multiplicity = 2 · count_at_pc.
+            *side_note.program_memory_counts.entry(step.pc).or_insert(0) += 2;
             // PC carry for sequential next_pc = pc + 1 + skip_len
             {
                 let pc_bytes = step.pc.to_le_bytes();
@@ -1984,6 +2048,59 @@ impl BuiltInProverComponent for CpuChip {
                 |i| {
                     let lo = val_d_1.at(i) - hi_3b.at(i) * sixteen;
                     vec![lo, fifteen_p, lo]
+                },
+            );
+        }
+
+        // ── Phase 13b: ProgramMemory consumer (prover-side, 2 paired) ──
+        {
+            let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
+            let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
+            let opcode = crate::trace::original_base_column!(component_trace, Column::Opcode);
+            let skip_len = crate::trace::original_base_column!(component_trace, Column::SkipLen);
+            let reg_a = crate::trace::original_base_column!(component_trace, Column::RegA);
+            let reg_b = crate::trace::original_base_column!(component_trace, Column::RegB);
+            let reg_d = crate::trace::original_base_column!(component_trace, Column::RegD);
+            let imm_bytes = crate::trace::original_base_column!(component_trace, Column::ImmBytes);
+            let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+
+            let mut tuple: Vec<_> = pc.to_vec();
+            tuple.push(opcode[0].clone());
+            tuple.push(skip_len[0].clone());
+            tuple.push(reg_a[0].clone());
+            tuple.push(reg_b[0].clone());
+            tuple.push(reg_d[0].clone());
+            tuple.extend_from_slice(&imm_bytes);
+
+            // is_real = 1 - is_padding.  Two paired emissions, identical
+            // multiplicity and tuple, balanced by ProgramMemoryChip's
+            // doubled producer multiplicity.
+            let is_pad_for_pm = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                prog_mem,
+                [is_pad_for_pm.clone()],
+                |[p]| {
+                    let one_packed = stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
+                    (one_packed - p).into()
+                },
+                tuple.len(),
+                {
+                    let tuple_clone: Vec<_> = tuple.clone();
+                    move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
+                },
+            );
+            let is_pad_for_pm2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                prog_mem,
+                [is_pad_for_pm2],
+                |[p]| {
+                    let one_packed = stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
+                    (one_packed - p).into()
+                },
+                tuple.len(),
+                {
+                    let tuple_clone: Vec<_> = tuple.clone();
+                    move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
                 },
             );
         }

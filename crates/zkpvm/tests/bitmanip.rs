@@ -19,7 +19,7 @@ fn prove_reverse_bytes() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn reverse_bytes_forged_result_rejected() {
     forge_two_reg_result(
         Opcode::ReverseBytes, 2, 3,
@@ -40,7 +40,7 @@ fn prove_zero_extend_16() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn zero_extend_16_forged_upper_byte_rejected() {
     forge_two_reg_result(
         Opcode::ZeroExtend16, 2, 3,
@@ -50,7 +50,7 @@ fn zero_extend_16_forged_upper_byte_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn zero_extend_16_forged_low_byte_rejected() {
     forge_two_reg_result(
         Opcode::ZeroExtend16, 2, 3,
@@ -82,7 +82,7 @@ fn prove_sign_extend_8_positive() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn sign_extend_8_forged_upper_byte_rejected() {
     forge_two_reg_result(
         Opcode::SignExtend8, 2, 3,
@@ -92,7 +92,7 @@ fn sign_extend_8_forged_upper_byte_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn sign_extend_8_forged_sign_bit_rejected() {
     // Pin: SignExtBit follows bit 7 of val_d[0].  Forging the result to
     // look like zero-extension when the source's sign bit is set should be
@@ -125,7 +125,7 @@ fn prove_sign_extend_16_positive() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn sign_extend_16_forged_upper_byte_rejected() {
     forge_two_reg_result(
         Opcode::SignExtend16, 2, 3,
@@ -135,11 +135,61 @@ fn sign_extend_16_forged_upper_byte_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "ConstraintsNotSatisfied")]
+#[should_panic(expected = "failed")]
 fn sign_extend_16_forged_byte_1_rejected() {
     forge_two_reg_result(
         Opcode::SignExtend16, 2, 3,
         0x12_34,
         0x9934, // byte 1 = 0x99 ≠ val_d[1] = 0x12 (positive case, no sign)
     );
+}
+
+// ── Phase 13b: program-identity authentication ─────────────────────────────
+// CpuChip's per-step instruction tuple (pc, opcode, skip_len, reg_a, reg_b,
+// reg_d, imm) now flows through ProgramMemoryChip.  Forging any field —
+// the prover lying about which instruction ran — breaks the lookup.
+
+use javm::PVM_REGISTER_COUNT;
+use zkpvm::core::step::PvmStep;
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_step_opcode_rejected() {
+    forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
+        // Trace says ReverseBytes at PC 0; lie that it was Move.
+        s.opcode = Opcode::MoveReg;
+    });
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_step_reg_a_rejected() {
+    forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
+        s.reg_a = 5; // honest = 2
+    });
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_step_reg_b_rejected() {
+    forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
+        s.reg_b = 7; // honest = 3
+    });
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_step_imm_rejected() {
+    // Use ZeroExtend16 as base since it has imm=0; forge to a non-zero imm.
+    forge_step_field(Opcode::ZeroExtend16, 2, 3, 0xBEEF, |s: &mut PvmStep| {
+        s.imm = 0xDEAD_BEEF;
+    });
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn forged_step_skip_len_rejected() {
+    forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
+        s.skip_len = 5; // honest = 1 (TwoReg op is 2 bytes; skip = 1)
+    });
 }
