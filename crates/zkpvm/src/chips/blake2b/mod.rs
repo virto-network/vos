@@ -9,6 +9,7 @@
 //! Each G-row emits 64 nibble-AND lookups (4 ANDs × 8 bytes × 2 nibbles) to
 //! the BitwiseLookupChip, constraining the AND witnesses used in XOR derivations.
 
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;

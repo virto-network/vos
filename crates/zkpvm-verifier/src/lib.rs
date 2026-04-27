@@ -21,7 +21,7 @@ use stwo::{
         air::Component,
         channel::{Blake2sChannel, Channel},
         fields::qm31::SecureField,
-        pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
+        pcs::{CommitmentSchemeVerifier, TreeVec},
         vcs::blake2_merkle::Blake2sMerkleChannel,
         verifier::VerificationError,
     },

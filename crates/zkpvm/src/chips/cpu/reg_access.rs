@@ -6,6 +6,7 @@
 //! they emit, otherwise the logup balance breaks.  Centralising the
 //! derivation here keeps them in sync.
 
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use super::classify::uses_immediate;
 use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;

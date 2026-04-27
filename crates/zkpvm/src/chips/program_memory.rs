@@ -24,6 +24,7 @@
 //!     non-zero pc, so consumer demand at those rows yields zero matches.
 //!     Padding rows past `code.len()` similarly hold zero.
 
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
@@ -33,7 +34,7 @@ use stwo::{
         ColumnVec,
     },
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
+        backend::simd::SimdBackend,
         poly::{circle::CircleEvaluation, BitReversedOrder},
     },
 };

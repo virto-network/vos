@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

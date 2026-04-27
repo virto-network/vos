@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use num_traits::Zero;
 use stwo::core::fields::m31::BaseField;

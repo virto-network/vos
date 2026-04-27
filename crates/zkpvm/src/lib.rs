@@ -1,4 +1,10 @@
 #![cfg_attr(not(feature = "prover"), no_std)]
+// In verifier-only builds (--no-default-features), prover-only modules are
+// gated out, so many helper fns / structs / consts in always-compiled
+// modules become dead from the compiler's perspective.  Silence those
+// lints crate-wide when prover is off; on the default build the lints
+// remain active and catch genuine dead code.
+#![cfg_attr(not(feature = "prover"), allow(dead_code, unused_imports))]
 
 extern crate alloc;
 

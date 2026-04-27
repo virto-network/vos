@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use alloc::collections::BTreeMap;
 use num_traits::One;
