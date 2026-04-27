@@ -615,6 +615,47 @@ fn alloc_bogus_reply() -> Vec<u8> {
 }
 
 #[test]
+fn crdt_consistency_without_data_dir_fails_loud() {
+    // SOUND-2/4 + ARCH-3 from the audit: a Crdt-requested agent that
+    // can't open its DAG file used to silently downgrade to NoCommit.
+    // Now build_agent_strategy returns Err and agent_thread surfaces
+    // it via AgentResult.error so the host can refuse to run.
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+
+    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let mut node = VosNode::new();
+    let _id = node.register(
+        AgentConfig::new(blob).with_consistency(Consistency::Crdt),
+        // intentionally NOT calling .persist(...) — Crdt without
+        // data_dir is a configuration error
+    );
+    node.run();
+    let results = node.collect();
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert!(r.error.is_some(), "expected fatal error, got result: panics={}, error={:?}", r.panics, r.error);
+    let err = r.error.as_ref().unwrap();
+    assert!(
+        err.contains("Crdt") && err.contains("data_dir"),
+        "error should call out the missing data_dir, got: {err}",
+    );
+}
+
+#[test]
 fn recording_cap_truncates_oversized_invoke_output() {
     // SOUND-1 from the audit: when an invoke output exceeds the
     // session's per-reply cap, the host must replace it with a
@@ -752,7 +793,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     node.run();
     let results = node.collect();
     for r in &results {
-        assert_eq!(r.panics, 0, "agent {} panicked", r.id);
+        assert!(r.is_ok(), "agent {} failed: panics={} error={:?}", r.id, r.panics, r.error);
     }
 
     // Verify the redb file exists at the expected path.
@@ -844,7 +885,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     node2.run();
     let results2 = node2.collect();
     for r in &results2 {
-        assert_eq!(r.panics, 0, "agent {} panicked on restart", r.id);
+        assert!(r.is_ok(), "agent {} failed on restart: panics={} error={:?}", r.id, r.panics, r.error);
     }
 
     let dag_count_after_second = {

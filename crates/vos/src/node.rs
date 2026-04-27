@@ -34,9 +34,22 @@ struct AgentHandle {
 }
 
 /// Result returned when an agent thread completes.
+///
+/// `panics` counts PVM-side panics during refine. `error` is set
+/// when the host itself failed unrecoverably — strategy build,
+/// replay rebuild divergence, commit failure — and we tore the
+/// agent down rather than continuing with corrupt state.
 pub struct AgentResult {
     pub id: ServiceId,
     pub panics: u32,
+    pub error: Option<String>,
+}
+
+impl AgentResult {
+    /// Did the agent finish cleanly (no PVM panics, no host errors)?
+    pub fn is_ok(&self) -> bool {
+        self.panics == 0 && self.error.is_none()
+    }
 }
 
 /// Replication / persistence semantics selected per agent.
@@ -345,7 +358,14 @@ fn agent_thread(
     let consistency = config.consistency;
     let recording_enabled = consistency == Consistency::Crdt;
     let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        build_agent_strategy(&config, id);
+        match build_agent_strategy(&config, id) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = format!("strategy build failed: {e}");
+                eprintln!("agent {id}: {err}");
+                return AgentResult { id, panics: 0, error: Some(err) };
+            }
+        };
 
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
@@ -364,7 +384,7 @@ fn agent_thread(
         match strategy.replay_logs() {
             Ok(logs) if !logs.is_empty() => {
                 eprintln!("agent {id}: rebuilding state from {} DAG nodes", logs.len());
-                for log in logs {
+                for (i, log) in logs.into_iter().enumerate() {
                     let msg = log.msg.clone();
                     runtime.begin_replay(log);
                     runtime.send_to(svc_id, msg);
@@ -373,14 +393,21 @@ fn agent_thread(
                     // replay — those had their original effects at
                     // record time; we are not re-issuing them.
                     let _ = runtime.drain_external_transfers(svc_id);
-                    if let Some(replay) = runtime.finish_replay() {
-                        if !replay.is_complete() {
-                            eprintln!(
-                                "agent {id}: replay incomplete (pos={}, exhausted={}) — \
-                                 handler may be non-deterministic",
-                                replay.position(), replay.was_exhausted(),
-                            );
-                        }
+                    let replay = runtime.finish_replay()
+                        .expect("replay was active");
+                    if !replay.is_complete() {
+                        let err = format!(
+                            "replay diverged at log #{i} (pos={}, exhausted={}); \
+                             handler is non-deterministic",
+                            replay.position(),
+                            replay.was_exhausted(),
+                        );
+                        eprintln!("agent {id}: {err}");
+                        return AgentResult {
+                            id,
+                            panics: runtime.panics,
+                            error: Some(err),
+                        };
                     }
                 }
                 // Materialize the state into the strategy so
@@ -391,11 +418,27 @@ fn agent_thread(
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
                 if !state.is_empty() {
-                    let _ = strategy.commit(&state);
+                    if let Err(e) = strategy.commit(&state) {
+                        let err = format!("post-replay commit failed: {e}");
+                        eprintln!("agent {id}: {err}");
+                        return AgentResult {
+                            id,
+                            panics: runtime.panics,
+                            error: Some(err),
+                        };
+                    }
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("agent {id}: replay_logs failed: {e}"),
+            Err(e) => {
+                let err = format!("replay_logs failed: {e}");
+                eprintln!("agent {id}: {err}");
+                return AgentResult {
+                    id,
+                    panics: runtime.panics,
+                    error: Some(err),
+                };
+            }
         }
     }
 
@@ -408,6 +451,7 @@ fn agent_thread(
     }
 
     let mut handled_any = false;
+    let mut fatal_error: Option<String> = None;
 
     loop {
         // Prefer the local queue, otherwise wait on the inbox.
@@ -416,8 +460,11 @@ fn agent_thread(
         } else if runtime.has_work() || runtime.is_suspended(svc_id) {
             // Residual work (self-messages, suspended continuation)
             // — drive the runtime and loop, no new external event.
-            dispatch_once(&mut runtime, svc_id, &outbox, id, None,
-                strategy.as_mut(), recording_enabled);
+            if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
+                strategy.as_mut(), recording_enabled) {
+                fatal_error = Some(format!("commit failed during residual work: {e}"));
+                break;
+            }
             continue;
         } else {
             match inbox.recv_timeout(Duration::from_millis(200)) {
@@ -430,16 +477,26 @@ fn agent_thread(
             }
         };
         handled_any = true;
-        dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
-            strategy.as_mut(), recording_enabled);
+        if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
+            strategy.as_mut(), recording_enabled) {
+            fatal_error = Some(format!("commit failed: {e}"));
+            break;
+        }
     }
 
-    AgentResult { id, panics: runtime.panics }
+    if let Some(err) = &fatal_error {
+        eprintln!("agent {id}: {err}");
+    }
+    AgentResult { id, panics: runtime.panics, error: fatal_error }
 }
 
 /// Run one dispatch cycle: optionally begin recording, deliver the
 /// message (or just drive residual work), route external transfers,
 /// then commit the resulting state via the strategy.
+///
+/// Returns `Err` only on host-side commit failures — those are
+/// terminal for the agent. Routing failures and transient runtime
+/// issues are not surfaced here.
 fn dispatch_once(
     runtime: &mut VosRuntime,
     svc_id: ServiceId,
@@ -448,7 +505,7 @@ fn dispatch_once(
     msg: Option<Vec<u8>>,
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
-) {
+) -> Result<(), crate::commit::CommitError> {
     let recorded = msg.is_some() && recording_enabled;
     if recorded {
         runtime.begin_recording(msg.as_ref().unwrap().clone());
@@ -474,50 +531,57 @@ fn dispatch_once(
         .unwrap_or_default();
 
     if recorded {
-        let log = runtime.finish_recording().unwrap_or_default();
-        if let Err(e) = strategy.commit_with_log(&state, &log) {
-            eprintln!("agent {svc_id}: CRDT commit failed: {e}");
-        }
+        let log = runtime.finish_recording().expect("recording was started");
+        strategy.commit_with_log(&state, &log)?;
     } else if !state.is_empty() {
-        if let Err(e) = strategy.commit(&state) {
-            eprintln!("agent {svc_id}: commit failed: {e}");
-        }
+        strategy.commit(&state)?;
     }
+    Ok(())
 }
 
 /// Select the agent's commit strategy from its config.
+///
+/// Returns `Err` when a non-`Ephemeral` strategy was requested but
+/// the underlying redb open failed, or when storage was requested
+/// without a `data_dir`. We deliberately do not silently downgrade
+/// to `NoCommit` — a CRDT actor that can't open its DAG file
+/// shouldn't pretend to be replicated.
 fn build_agent_strategy(
     config: &AgentConfig,
     id: ServiceId,
-) -> Box<dyn crate::commit::CommitStrategy> {
+) -> Result<Box<dyn crate::commit::CommitStrategy>, crate::commit::CommitError> {
     #[cfg(feature = "storage")]
     {
+        let _ = id;
         match config.consistency {
-            Consistency::Ephemeral => Box::new(crate::commit::NoCommit),
+            Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
             Consistency::Local => {
-                if let Some(path) = config.db_path(id) {
-                    match crate::commit::LocalCommit::open(&path) {
-                        Ok(lc) => return Box::new(lc),
-                        Err(e) => eprintln!("agent {id}: failed to open Local storage: {e}"),
-                    }
-                }
-                Box::new(crate::commit::NoCommit)
+                let path = config.db_path(id).ok_or_else(|| {
+                    crate::commit::CommitError::Backend(
+                        "Local consistency requires data_dir on AgentConfig".into(),
+                    )
+                })?;
+                Ok(Box::new(crate::commit::LocalCommit::open(&path)?))
             }
             Consistency::Crdt => {
-                if let Some(path) = config.db_path(id) {
-                    match crate::commit::CrdtCommit::open(&path) {
-                        Ok(cc) => return Box::new(cc),
-                        Err(e) => eprintln!("agent {id}: failed to open CRDT storage: {e}"),
-                    }
-                }
-                Box::new(crate::commit::NoCommit)
+                let path = config.db_path(id).ok_or_else(|| {
+                    crate::commit::CommitError::Backend(
+                        "Crdt consistency requires data_dir on AgentConfig".into(),
+                    )
+                })?;
+                Ok(Box::new(crate::commit::CrdtCommit::open(&path)?))
             }
         }
     }
     #[cfg(not(feature = "storage"))]
     {
         let _ = (config, id);
-        Box::new(crate::commit::NoCommit)
+        match config.consistency {
+            Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
+            other => Err(crate::commit::CommitError::Backend(format!(
+                "consistency={other:?} requires the `storage` feature"
+            ))),
+        }
     }
 }
 
@@ -540,8 +604,9 @@ fn worker_thread(
     let plugin = match unsafe { WorkerPlugin::load(&config.path) } {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("worker {id}: failed to load: {e}");
-            return AgentResult { id, panics: 1 };
+            let err = format!("failed to load worker plugin: {e}");
+            eprintln!("worker {id}: {err}");
+            return AgentResult { id, panics: 1, error: Some(err) };
         }
     };
 
@@ -618,7 +683,7 @@ fn worker_thread(
         persist(strategy.as_mut(), &instance, id);
     }
 
-    AgentResult { id, panics: 0 }
+    AgentResult { id, panics: 0, error: None }
 }
 
 /// Dispatch a message to a worker instance and poll to completion.

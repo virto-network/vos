@@ -207,7 +207,18 @@ fn cmd_node(
         programs.len(), workers.len());
     node.run();
 
-    let panics: u32 = node.collect().iter().map(|r| r.panics).sum();
+    let results = node.collect();
+    let panics: u32 = results.iter().map(|r| r.panics).sum();
+    let mut host_errors = 0usize;
+    for r in &results {
+        if let Some(err) = &r.error {
+            eprintln!("vosx: agent {} failed: {err}", r.id);
+            host_errors += 1;
+        }
+    }
+    if host_errors > 0 {
+        std::process::exit(2);
+    }
     exit_with_status(panics);
 }
 
