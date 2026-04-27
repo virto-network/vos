@@ -214,6 +214,34 @@ struct InvokeRequest {
 /// realistic compositions.
 const MAX_CROSS_AGENT_DEPTH: usize = 32;
 
+/// Maximum size, in bytes, of a single reply sent through an
+/// `InvokeRequest`'s `reply_tx`. Distinct from the per-call
+/// recording cap (`DEFAULT_REPLY_CAP`, 16 KiB) which bounds DAG
+/// log size. The producer cap is much larger — it's a guardrail
+/// against runaway memory pressure when an agent or worker
+/// produces a multi-megabyte reply, not a consensus-history
+/// concern. Replies exceeding this are dropped at the producer
+/// side and surface as `InvokeError::NotFound` at the caller.
+const MAX_PRODUCER_REPLY: usize = 1024 * 1024;
+
+/// Send `reply` through `reply_tx` if it's within the producer
+/// cap; otherwise log and drop the channel so the caller gets a
+/// disconnect-shaped failure. Pulled out to share between
+/// `handle_invoke_request` and `worker_thread`.
+fn send_reply_capped(reply_tx: mpsc::Sender<Vec<u8>>, reply: Vec<u8>, svc_id: ServiceId) {
+    if reply.len() > MAX_PRODUCER_REPLY {
+        warn!(
+            %svc_id,
+            size = reply.len(),
+            cap = MAX_PRODUCER_REPLY,
+            "reply exceeds producer-side cap; dropping channel",
+        );
+        drop(reply_tx);
+    } else {
+        let _ = reply_tx.send(reply);
+    }
+}
+
 /// Result of the pre-forward safety check on a synchronous invoke.
 #[derive(Debug, PartialEq, Eq)]
 enum InvokeForwardCheck {
@@ -764,9 +792,10 @@ fn handle_invoke_request(
     // Send the raw reply (or empty Vec if the handler had no
     // reply, e.g. a `start() -> ()` returning Value::Unit). The
     // caller's external_invoke unwraps this Option<Vec<u8>> and
-    // packs it into the wire frame.
+    // packs it into the wire frame. Cap enforced producer-side
+    // — see send_reply_capped.
     let reply_payload = runtime.take_last_reply(svc_id).unwrap_or_default();
-    let _ = req.reply_tx.send(reply_payload);
+    send_reply_capped(req.reply_tx, reply_payload, svc_id);
 
     // Persist whatever state changed (same path as a regular dispatch).
     let state = runtime
@@ -941,7 +970,7 @@ fn worker_thread(
                 Ok(req) => {
                     bump();
                     let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
-                    let _ = req.reply_tx.send(reply);
+                    send_reply_capped(req.reply_tx, reply, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,
@@ -1221,6 +1250,25 @@ mod tests {
         // A→B→C, fresh target D — allowed.
         let chain = [1u32, 2u32, 3u32];
         assert_eq!(check_invoke_forward(&chain, 4), InvokeForwardCheck::Allowed);
+    }
+
+    #[test]
+    fn send_reply_capped_passes_normal_payload() {
+        let (tx, rx) = mpsc::channel();
+        send_reply_capped(tx, vec![0u8; 100], ServiceId(1));
+        let received = rx.recv().expect("received");
+        assert_eq!(received.len(), 100);
+    }
+
+    #[test]
+    fn send_reply_capped_drops_oversized_payload() {
+        let (tx, rx) = mpsc::channel();
+        // One byte over the cap.
+        send_reply_capped(tx, vec![0u8; MAX_PRODUCER_REPLY + 1], ServiceId(1));
+        // Sender dropped without sending → recv yields Err(Disconnected).
+        // External_invoke maps that to None, surfacing as
+        // InvokeError::NotFound at the caller's PVM.
+        assert!(rx.recv().is_err(), "tx should have been dropped without a send");
     }
 
     #[test]
