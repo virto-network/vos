@@ -20,8 +20,14 @@ stwo_constraint_framework::relation!(
     REL_REG_MEMORY_LOOKUP_SIZE
 );
 
-// (pc, opcode, skip_len)
-const REL_PROG_MEMORY_LOOKUP_SIZE: usize = PC_SIZE + 2;
+// (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8])
+//
+// Authenticates instruction-fetch tuples: every CpuChip step emits this
+// tuple, and ProgramMemoryChip's preprocessed table holds the canonical
+// decoding at every basic-block-starting PC of `code`.  Phase 13a defines
+// the chip; Phase 13b wires up the CpuChip consumer.  Once consumers exist,
+// a prover can no longer claim arbitrary opcode/imm/regs at any PC.
+const REL_PROG_MEMORY_LOOKUP_SIZE: usize = PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE;
 stwo_constraint_framework::relation!(
     ProgramMemoryLookupElements,
     REL_PROG_MEMORY_LOOKUP_SIZE

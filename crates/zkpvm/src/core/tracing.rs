@@ -285,7 +285,7 @@ fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: 
 }
 
 /// Compute skip(i) — distance to next instruction minus 1.
-fn compute_skip(bitmask: &[u8], i: usize) -> u32 {
+pub(crate) fn compute_skip(bitmask: &[u8], i: usize) -> u32 {
     for j in 0..25u32 {
         let idx = i + 1 + j as usize;
         let bit = if idx < bitmask.len() { bitmask[idx] } else { 1 };
@@ -297,7 +297,7 @@ fn compute_skip(bitmask: &[u8], i: usize) -> u32 {
 }
 
 /// Extract immediate value from decoded args (0 if none).
-fn decode_immediate(decoded_args: &args::Args) -> u64 {
+pub(crate) fn decode_immediate(decoded_args: &args::Args) -> u64 {
     match decoded_args {
         args::Args::Imm { imm } => *imm,
         args::Args::RegImm { imm, .. } => *imm,
@@ -510,7 +510,7 @@ fn decode_mem_access(
 }
 
 /// Decode register indices from decoded instruction arguments.
-fn decode_reg_indices(_opcode: Opcode, decoded_args: &args::Args) -> (usize, usize, usize) {
+pub(crate) fn decode_reg_indices(_opcode: Opcode, decoded_args: &args::Args) -> (usize, usize, usize) {
     match decoded_args {
         args::Args::ThreeReg { ra, rb, rd } => (*ra, *rb, *rd),
         args::Args::TwoReg { rd, ra } => (*rd, *ra, 0),

@@ -35,6 +35,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::ProgramBoundaryChip,
+    &chips::ProgramMemoryChip, // 13a — producer-only until CpuChip consumer in 13b
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
@@ -49,6 +50,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::ProgramBoundaryChip,
+    &chips::ProgramMemoryChip,
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,

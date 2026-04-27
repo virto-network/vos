@@ -34,6 +34,11 @@ pub struct SideNote {
     /// (ECALL tests, actor entry points with non-zero regs) override via
     /// with_initial_regs or direct assignment.
     pub initial_regs: [u64; NUM_REGS],
+    /// Phase 13a: per-PC count of CpuChip steps that fetched the instruction
+    /// at that PC.  Populated in Phase 13b once CpuChip emits the
+    /// ProgramMemory consumer; in Phase 13a the chip exists with zero
+    /// multiplicity everywhere (its claimed_sum is 0).
+    pub program_memory_counts: HashMap<u32, u32>,
 }
 
 impl SideNote {
@@ -50,6 +55,7 @@ impl SideNote {
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
+            program_memory_counts: HashMap::new(),
         }
     }
 
