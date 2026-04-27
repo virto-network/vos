@@ -207,10 +207,11 @@ pub struct VosNode {
     /// Outbound channel — agent threads send cross-service transfers here.
     outbox_tx: mpsc::Sender<Envelope>,
     outbox_rx: mpsc::Receiver<Envelope>,
-    /// Map from worker ServiceId → synchronous invoke channel.
-    /// Used by PVM agents' external_invoke handlers to dispatch
-    /// directly to workers.
-    worker_invoke: HashMap<u32, mpsc::Sender<InvokeRequest>>,
+    /// Map from ServiceId → synchronous invoke channel. Both
+    /// workers and (cross-agent capable) PVM agents register here.
+    /// Used by an agent's `external_invoke` callback to route
+    /// `ctx.ask` calls whose target lives on a different thread.
+    invoke_routes: HashMap<u32, mpsc::Sender<InvokeRequest>>,
 }
 
 impl VosNode {
@@ -229,7 +230,7 @@ impl VosNode {
             agents: Vec::new(),
             outbox_tx,
             outbox_rx,
-            worker_invoke: HashMap::new(),
+            invoke_routes: HashMap::new(),
         }
     }
 
@@ -250,10 +251,10 @@ impl VosNode {
         self.routes.insert(id.0, tx.clone());
 
         // Clone worker invoke channels so the PVM agent can call workers
-        let worker_invoke = self.worker_invoke.clone();
+        let invoke_routes = self.invoke_routes.clone();
 
         let join = thread::spawn(move || {
-            agent_thread(id, config, rx, outbox, worker_invoke)
+            agent_thread(id, config, rx, outbox, invoke_routes)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -269,7 +270,7 @@ impl VosNode {
         let outbox = self.outbox_tx.clone();
 
         self.routes.insert(id.0, tx);
-        self.worker_invoke.insert(id.0, invoke_tx);
+        self.invoke_routes.insert(id.0, invoke_tx);
 
         let join = thread::spawn(move || {
             worker_thread(id, config, rx, invoke_rx, outbox)
@@ -316,7 +317,7 @@ impl VosNode {
     pub fn collect(mut self) -> Vec<AgentResult> {
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
-        drop(self.worker_invoke); // drop invoke channels so worker threads can detect disconnect
+        drop(self.invoke_routes); // drop invoke channels so worker threads can detect disconnect
         self.agents.iter_mut()
             .filter_map(|h| h.join.take().and_then(|j| j.join().ok()))
             .collect()
@@ -336,7 +337,7 @@ fn agent_thread(
     config: AgentConfig,
     inbox: mpsc::Receiver<Envelope>,
     outbox: mpsc::Sender<Envelope>,
-    worker_invoke: HashMap<u32, mpsc::Sender<InvokeRequest>>,
+    invoke_routes: HashMap<u32, mpsc::Sender<InvokeRequest>>,
 ) -> AgentResult {
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -346,9 +347,9 @@ fn agent_thread(
     // Set up external invoke handler for PVM → worker calls.
     // When a PVM actor calls ctx.ask() on a worker ServiceId, this
     // handler dispatches synchronously via the invoke channel.
-    if !worker_invoke.is_empty() {
+    if !invoke_routes.is_empty() {
         runtime.set_external_invoke(Box::new(move |target, msg| {
-            let tx = worker_invoke.get(&target.0)?;
+            let tx = invoke_routes.get(&target.0)?;
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
                 msg: msg.to_vec(),
