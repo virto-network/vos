@@ -173,3 +173,75 @@ fn shlo_r64_positive_smoke() {
 fn shlo_r64_forged_result_rejected() {
     forge_three_reg_result(Opcode::ShloR64, 2, 0, 1, 1024, 3, /*forged*/ 256);
 }
+
+// ── DivRem ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn div_u64_positive_smoke() {
+    // 100 / 7 = 14 (unsigned).
+    prove_three_reg(Opcode::DivU64, 2, 0, 1, 100, 7, 14);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn div_u64_forged_result_rejected() {
+    // Honest: 100 / 7 = 14.  Forge: claim 100 / 7 = 13.
+    forge_three_reg_result(Opcode::DivU64, 2, 0, 1, 100, 7, /*forged*/ 13);
+}
+
+#[test]
+fn rem_u64_positive_smoke() {
+    // 100 % 7 = 2 (unsigned).
+    prove_three_reg(Opcode::RemU64, 2, 0, 1, 100, 7, 2);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rem_u64_forged_result_rejected() {
+    forge_three_reg_result(Opcode::RemU64, 2, 0, 1, 100, 7, /*forged*/ 1);
+}
+
+// Note: DivS64 with a negative dividend (e.g. -100 / 7 = -14) currently
+// fails proving with ConstraintsNotSatisfied even though the interpreter
+// produces the correct quotient (0xFFFF_FFFF_FFFF_FFF2).  The AIR's
+// signed-divrem constraint chain has a corner not exercised by existing
+// positive tests in tests/phase2_alu.rs.  Filed as 15-divs-debug.
+//
+// Negative DivS64 testing therefore deferred until the positive case
+// proves cleanly.
+
+#[test]
+#[should_panic(expected = "failed")]
+fn div_s64_forged_unsigned_quotient_rejected() {
+    // 100 / 7 = 14 (positive case works).  Forge to 13.
+    forge_three_reg_result(Opcode::DivS64, 2, 0, 1, 100, 7, /*forged*/ 13);
+}
+
+// ── MulUpper (UU only — SS/SU still prover-trusted; see task 12c) ─────────
+
+#[test]
+fn mul_upper_uu_top_bits_smoke() {
+    // 2^63 * 2 = 2^64; top 64 bits = 1, low 64 bits = 0.
+    prove_three_reg(
+        Opcode::MulUpperUU, 2, 0, 1,
+        1u64 << 63, 2,
+        1,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn mul_upper_uu_forged_result_rejected() {
+    forge_three_reg_result(
+        Opcode::MulUpperUU, 2, 0, 1,
+        1u64 << 63, 2,
+        /*forged*/ 0, // honest = 1
+    );
+}
+
+// Note: tests with both 32-bit-fitting unsigned operands (e.g.
+// 0xFFFFFFFF * 0xFFFFFFFF) currently fail proving with
+// ConstraintsNotSatisfied — the schoolbook constraint chain seems to
+// have an issue at certain carry-propagation patterns.  Added to the
+// AIR-tightening backlog; smaller smoke tests above + the negative
+// test still exercise the constraint meaningfully.
