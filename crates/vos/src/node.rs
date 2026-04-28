@@ -401,6 +401,46 @@ impl crate::network::SyncProvider for NodeSyncProvider {
     }
 }
 
+/// Replay every log in the strategy's DAG against `runtime`'s
+/// state for `svc_id`. Used by both cold-start recovery and
+/// mid-flight soft restarts after the sync ticker merges new
+/// nodes. Caller is responsible for clearing prior state when
+/// rebuilding from scratch — this function only feeds messages
+/// through `begin_replay` and lets the actor produce state.
+fn replay_dag_into_runtime(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+    strategy: &dyn crate::commit::CommitStrategy,
+) -> Result<(), String> {
+    let logs = strategy
+        .replay_logs()
+        .map_err(|e| format!("replay_logs failed: {e}"))?;
+    if logs.is_empty() {
+        return Ok(());
+    }
+    for (i, log) in logs.into_iter().enumerate() {
+        let msg = log.msg.clone();
+        runtime.begin_replay(log);
+        runtime.send_to(svc_id, msg);
+        runtime.run_blocking();
+        // External transfers emitted during replay had their
+        // original effects at record time; we don't re-issue them.
+        let _ = runtime.drain_external_transfers(svc_id);
+        let replay = runtime
+            .finish_replay()
+            .expect("replay was active");
+        if !replay.is_complete() {
+            return Err(format!(
+                "replay diverged at log #{i} (pos={}, exhausted={}); \
+                 handler is non-deterministic",
+                replay.position(),
+                replay.was_exhausted(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// How often the per-replica sync ticker fires. Short enough that
 /// integration tests can observe convergence in a few hundred ms,
 /// long enough that idle clusters don't flood the wire.
@@ -1155,35 +1195,21 @@ fn agent_thread(
             .write(svc_id, crate::lifecycle::STATE_KEY_BYTES, &state_bytes);
         info!(%id, bytes = state_bytes.len(), "agent: restored state");
     } else if recording_enabled {
+        // Cold-start replay: pull every log out of the DAG and
+        // feed it through `begin_replay` / `finish_replay`. Same
+        // helper we use for mid-flight soft restarts.
         match strategy.replay_logs() {
             Ok(logs) if !logs.is_empty() => {
                 info!(%id, dag_nodes = logs.len(), "agent: rebuilding state from DAG");
-                for (i, log) in logs.into_iter().enumerate() {
-                    let msg = log.msg.clone();
-                    runtime.begin_replay(log);
-                    runtime.send_to(svc_id, msg);
-                    runtime.run_blocking();
-                    // Drop any external transfers emitted during
-                    // replay — those had their original effects at
-                    // record time; we are not re-issuing them.
-                    let _ = runtime.drain_external_transfers(svc_id);
-                    let replay = runtime.finish_replay()
-                        .expect("replay was active");
-                    if !replay.is_complete() {
-                        let err = format!(
-                            "replay diverged at log #{i} (pos={}, exhausted={}); \
-                             handler is non-deterministic",
-                            replay.position(),
-                            replay.was_exhausted(),
-                        );
-                        error!(%id, "{err}");
-                        return AgentResult {
-                            id,
-                            panics: runtime.panics,
-                            error: Some(err),
-                        };
-                    }
+                if let Err(err) = replay_dag_into_runtime(&mut runtime, svc_id, strategy.as_ref()) {
+                    error!(%id, "{err}");
+                    return AgentResult {
+                        id,
+                        panics: runtime.panics,
+                        error: Some(err),
+                    };
                 }
+                let _ = logs;
                 // Materialize the state into the strategy so
                 // subsequent cold starts hit the fast path.
                 let state = runtime
