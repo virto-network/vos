@@ -18,6 +18,17 @@
 //!   `chain` field from [`crate::node`] for cross-node cycle and
 //!   depth detection.
 //!
+//! Cycle 3 frames (CRDT replication):
+//!
+//! - [`Frame::FetchHeads`] / [`Frame::Heads`] — "what are your
+//!   merkle-clock roots for this replication group?" Carries a
+//!   32-byte `replication_id` (typically `blake2b(blob || name)`)
+//!   so peers don't need a shared ServiceId.
+//! - [`Frame::FetchNode`] / [`Frame::NodeReply`] — point-fetch a
+//!   single DAG node by CID. The reply slot carries
+//!   `Some(node_bytes)` when the peer has the node, `None`
+//!   otherwise.
+//!
 //! The encoding is deliberately hand-rolled (no serde / rkyv): the
 //! schema is small, framing the wire format ourselves makes
 //! versioning explicit, and we sidestep pulling another serializer
@@ -28,6 +39,26 @@ const TAG_TELL: u8 = 0x01;
 const TAG_INVOKE_REQ: u8 = 0x02;
 const TAG_INVOKE_REPLY: u8 = 0x03;
 const TAG_ACK: u8 = 0x04;
+const TAG_FETCH_HEADS: u8 = 0x20;
+const TAG_HEADS: u8 = 0x21;
+const TAG_FETCH_NODE: u8 = 0x22;
+const TAG_NODE_REPLY: u8 = 0x23;
+
+/// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
+/// `vos`). A wider hasher would require a wire-format bump.
+pub const CID_BYTES: usize = 32;
+
+/// Replication group identifier — 32 bytes. Same shape as a CID
+/// but carries a different meaning: a stable namespace shared by
+/// every replica of a logical actor (typically
+/// `blake2b(blob || actor_name)`).
+pub const REPLICATION_ID_BYTES: usize = 32;
+
+/// Cap on the number of roots a peer can claim in a single
+/// `Heads` reply. Roots in a healthy CRDT graph are tiny in
+/// number; this stops a malicious peer from forcing a large
+/// alloc. Realistic actor traffic stays in single digits.
+const MAX_HEADS: usize = 256;
 
 /// Hard cap on a single encoded frame. Matches the producer-side
 /// reply cap in `node.rs` so an oversized payload is rejected at
@@ -56,6 +87,25 @@ pub enum Frame {
         msg: Vec<u8>,
     },
     InvokeReply { payload: Vec<u8> },
+    /// "What are your merkle-clock roots for this replication
+    /// group?" Sent as a request; reply rides back as
+    /// [`Frame::Heads`].
+    FetchHeads { replication_id: [u8; REPLICATION_ID_BYTES] },
+    /// Reply to [`Frame::FetchHeads`].
+    Heads {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        roots: Vec<[u8; CID_BYTES]>,
+    },
+    /// Point-fetch a single DAG node. Sent as a request; reply
+    /// rides back as [`Frame::NodeReply`].
+    FetchNode {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        cid: [u8; CID_BYTES],
+    },
+    /// Reply to [`Frame::FetchNode`]. `None` means the peer
+    /// doesn't have the node — typically a transient state
+    /// during sync, not an error.
+    NodeReply { node: Option<Vec<u8>> },
     /// Empty acknowledgement — used as the response slot for
     /// fire-and-forget `Tell` so the request_response behaviour
     /// has something to deliver.
@@ -93,6 +143,36 @@ impl Frame {
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
             }
+            Frame::FetchHeads { replication_id } => {
+                out.push(TAG_FETCH_HEADS);
+                out.extend_from_slice(replication_id);
+            }
+            Frame::Heads { replication_id, roots } => {
+                out.push(TAG_HEADS);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&(roots.len() as u32).to_le_bytes());
+                for cid in roots {
+                    out.extend_from_slice(cid);
+                }
+            }
+            Frame::FetchNode { replication_id, cid } => {
+                out.push(TAG_FETCH_NODE);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(cid);
+            }
+            Frame::NodeReply { node } => {
+                out.push(TAG_NODE_REPLY);
+                match node {
+                    Some(bytes) => {
+                        out.push(1);
+                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                    None => {
+                        out.push(0);
+                    }
+                }
+            }
             Frame::Ack => {
                 out.push(TAG_ACK);
             }
@@ -129,6 +209,34 @@ impl Frame {
             TAG_INVOKE_REPLY => Frame::InvokeReply {
                 payload: r.bytes_with_len_prefix()?,
             },
+            TAG_FETCH_HEADS => Frame::FetchHeads {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+            },
+            TAG_HEADS => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let count = r.u32()? as usize;
+                if count > MAX_HEADS {
+                    return Err(FrameError::HeadsTooMany(count));
+                }
+                let mut roots = Vec::with_capacity(count);
+                for _ in 0..count {
+                    roots.push(r.fixed::<CID_BYTES>()?);
+                }
+                Frame::Heads { replication_id, roots }
+            }
+            TAG_FETCH_NODE => Frame::FetchNode {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+                cid: r.fixed::<CID_BYTES>()?,
+            },
+            TAG_NODE_REPLY => {
+                let present = r.u8()?;
+                let node = match present {
+                    0 => None,
+                    1 => Some(r.bytes_with_len_prefix()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::NodeReply { node }
+            }
             TAG_ACK => Frame::Ack,
             other => return Err(FrameError::UnknownTag(other)),
         };
@@ -146,6 +254,8 @@ pub enum FrameError {
     ChainTooLong(usize),
     PayloadTooLarge(usize),
     TrailingBytes(usize),
+    HeadsTooMany(usize),
+    BadOption(u8),
 }
 
 impl core::fmt::Display for FrameError {
@@ -160,6 +270,10 @@ impl core::fmt::Display for FrameError {
                 write!(f, "payload length {n} exceeds cap {MAX_FRAME_BYTES}")
             }
             FrameError::TrailingBytes(n) => write!(f, "{n} trailing bytes after frame"),
+            FrameError::HeadsTooMany(n) => {
+                write!(f, "heads count {n} exceeds cap {MAX_HEADS}")
+            }
+            FrameError::BadOption(b) => write!(f, "invalid Option discriminant {b}"),
         }
     }
 }
@@ -206,6 +320,12 @@ impl<'a> Reader<'a> {
             return Err(FrameError::PayloadTooLarge(len));
         }
         Ok(self.take(len)?.to_vec())
+    }
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], FrameError> {
+        let s = self.take(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(s);
+        Ok(out)
     }
 }
 
@@ -267,6 +387,68 @@ mod tests {
     #[test]
     fn ack_roundtrip() {
         roundtrip(Frame::Ack);
+    }
+
+    #[test]
+    fn fetch_heads_roundtrip() {
+        roundtrip(Frame::FetchHeads {
+            replication_id: [0u8; REPLICATION_ID_BYTES],
+        });
+        let mut id = [0u8; REPLICATION_ID_BYTES];
+        for (i, b) in id.iter_mut().enumerate() { *b = i as u8; }
+        roundtrip(Frame::FetchHeads { replication_id: id });
+    }
+
+    #[test]
+    fn heads_roundtrip() {
+        roundtrip(Frame::Heads {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            roots: vec![],
+        });
+        roundtrip(Frame::Heads {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            roots: vec![[0xBB; CID_BYTES], [0xCC; CID_BYTES]],
+        });
+    }
+
+    #[test]
+    fn fetch_node_roundtrip() {
+        roundtrip(Frame::FetchNode {
+            replication_id: [0x01; REPLICATION_ID_BYTES],
+            cid: [0x02; CID_BYTES],
+        });
+    }
+
+    #[test]
+    fn node_reply_roundtrip() {
+        roundtrip(Frame::NodeReply { node: None });
+        roundtrip(Frame::NodeReply {
+            node: Some(b"opaque dag node bytes".to_vec()),
+        });
+    }
+
+    #[test]
+    fn heads_count_capped() {
+        let mut bad = Vec::new();
+        bad.push(TAG_HEADS);
+        bad.extend_from_slice(&[0u8; REPLICATION_ID_BYTES]);
+        // claim 10_000 heads
+        bad.extend_from_slice(&(10_000u32).to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::HeadsTooMany(10_000))
+        ));
+    }
+
+    #[test]
+    fn node_reply_bad_option_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_NODE_REPLY);
+        bad.push(2); // not 0 or 1
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::BadOption(2))
+        ));
     }
 
     #[test]
