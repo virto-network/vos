@@ -560,6 +560,8 @@ fn sync_loop(
 ) {
     let mut confirmed: HashSet<libp2p::PeerId> = HashSet::new();
     let mut tick: u64 = 0;
+    let mut subscribed = false;
+    let (hint_tx, hint_rx) = mpsc::channel::<libp2p::PeerId>();
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(SYNC_INTERVAL);
         if shutdown.load(Ordering::Relaxed) {
@@ -568,23 +570,47 @@ fn sync_loop(
         let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else {
             continue;
         };
+        // First time we see the network attached, subscribe to
+        // the gossipsub topic and register our hint channel so
+        // peer head announcements wake us up.
+        if !subscribed {
+            net.subscribe_rep(rep_id);
+            net.register_hint_sender(rep_id, hint_tx.clone());
+            subscribed = true;
+        }
         let local = net.peer_id();
         let connected: HashSet<libp2p::PeerId> =
             net.connected_peers().into_iter().filter(|p| p != &local).collect();
         // Drop peers that disconnected since our last tick.
         confirmed.retain(|p| connected.contains(p));
 
+        // Drain pending gossipsub hints — peers that just
+        // published heads. Each hint triggers an immediate
+        // (single-peer) sync, bypassing the periodic poll.
+        let mut hinted: Vec<libp2p::PeerId> = Vec::new();
+        while let Ok(peer) = hint_rx.try_recv() {
+            if peer != local && connected.contains(&peer) && !hinted.contains(&peer) {
+                hinted.push(peer);
+            }
+        }
+
         // Reprobe sweep: every Nth tick (or whenever we have no
         // confirmed members yet) hit every connected peer to
-        // find new group hosts. Otherwise stick to the cache.
+        // find new group hosts. Otherwise stick to the cache
+        // plus any hinted peers from the gossipsub side.
         let reprobe = tick % SYNC_REPROBE_EVERY == 0 || confirmed.is_empty();
         tick = tick.wrapping_add(1);
 
-        let targets: Vec<libp2p::PeerId> = if reprobe {
+        let mut targets: Vec<libp2p::PeerId> = if reprobe {
             connected.iter().copied().collect()
         } else {
             confirmed.iter().copied().collect()
         };
+        for h in &hinted {
+            if !targets.contains(h) {
+                targets.push(*h);
+            }
+        }
 
         let mut any_inserted = false;
         for peer in targets {
@@ -1270,7 +1296,7 @@ fn agent_thread(
     let invoke_routes_for_ext = invoke_routes.clone();
     let chain_for_ext = current_chain.clone();
     #[cfg(feature = "network")]
-    let shared_network_for_ext = shared_network;
+    let shared_network_for_ext = shared_network.clone();
     let local_prefix = id.node_prefix();
     runtime.set_external_invoke(Box::new(move |target, msg| {
         let chain_snapshot = chain_for_ext.lock().ok()?.clone();
@@ -1346,6 +1372,9 @@ fn agent_thread(
 
     let consistency = config.consistency;
     let recording_enabled = consistency == Consistency::Crdt;
+    // Capture rep_id up front — config is consumed below.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    let agent_rep_id: Option<[u8; 32]> = config.replication_id;
     let mut strategy: Box<dyn crate::commit::CommitStrategy> =
         match build_agent_strategy(&config, id) {
             Ok(s) => s,
@@ -1460,6 +1489,10 @@ fn agent_thread(
                         fatal_error = Some(format!("commit failed during invoke: {e}"));
                         break;
                     }
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    publish_heads_if_replicated(
+                        &shared_network, agent_rep_id, strategy.as_ref(),
+                    );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
@@ -1507,6 +1540,10 @@ fn agent_thread(
                 fatal_error = Some(format!("commit failed during residual work: {e}"));
                 break;
             }
+            #[cfg(all(feature = "network", feature = "storage"))]
+            publish_heads_if_replicated(
+                &shared_network, agent_rep_id, strategy.as_ref(),
+            );
             continue;
         } else {
             // Short blocking wait on inbox so we re-check the
@@ -1526,12 +1563,35 @@ fn agent_thread(
             fatal_error = Some(format!("commit failed: {e}"));
             break;
         }
+        #[cfg(all(feature = "network", feature = "storage"))]
+        publish_heads_if_replicated(
+            &shared_network, agent_rep_id, strategy.as_ref(),
+        );
     }
 
     if let Some(err) = &fatal_error {
         error!(%id, "{err}");
     }
     AgentResult { id, panics: runtime.panics, error: fatal_error }
+}
+
+/// Publish the strategy's current roots on the gossipsub topic
+/// for `rep_id` if the agent is replicated and a network is
+/// attached. Cheap when not replicated (early return); the
+/// strategy's `roots()` is also a no-op for non-CRDT types.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn publish_heads_if_replicated(
+    shared_network: &SharedNetwork,
+    rep_id: Option<[u8; 32]>,
+    strategy: &dyn crate::commit::CommitStrategy,
+) {
+    let Some(rep_id) = rep_id else { return; };
+    let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else { return; };
+    let roots = strategy.roots();
+    if roots.is_empty() {
+        return;
+    }
+    net.publish_heads(rep_id, roots);
 }
 
 /// Handle a synchronous invoke request from a peer: dispatch the

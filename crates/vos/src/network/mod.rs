@@ -41,6 +41,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use libp2p::futures::StreamExt;
+use libp2p::gossipsub;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId, Swarm};
@@ -56,6 +57,14 @@ struct VosBehaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     req_resp: request_response::Behaviour<VosCodec>,
+    /// Push-based head announcements per replication group.
+    /// Each replica subscribes to `vos/sync/{rep_id_hex}` and
+    /// publishes the encoded `Frame::Heads` after every commit.
+    /// Subscribers schedule an immediate
+    /// [`sync_with_peer`](crate::node::sync_with_peer)-style
+    /// fetch against the publisher rather than waiting for the
+    /// next 250ms tick.
+    gossip: gossipsub::Behaviour,
 }
 
 /// One-way envelope received from a remote peer. Pushed to the
@@ -170,6 +179,25 @@ enum NetworkCmd {
         replication_id: [u8; 32],
         cid: [u8; 32],
         reply: std_mpsc::Sender<Option<Vec<u8>>>,
+    },
+    /// Subscribe the local node to the gossipsub topic for a
+    /// replication group. Idempotent — re-subscribing is a no-op.
+    SubscribeRep { replication_id: [u8; 32] },
+    /// Publish a head announcement for a replication group on
+    /// its gossipsub topic. Subscribers schedule an immediate
+    /// fetch from the publisher rather than waiting for the
+    /// next sync tick.
+    PublishHeads {
+        replication_id: [u8; 32],
+        roots: Vec<[u8; 32]>,
+    },
+    /// Register a sender that the swarm thread pushes hint
+    /// `(peer)` pairs into when it receives a head announcement
+    /// for this replication group. The matching sync_loop drains
+    /// the receiver and triggers an immediate fetch.
+    RegisterHintSender {
+        replication_id: [u8; 32],
+        sender: std_mpsc::Sender<PeerId>,
     },
     Shutdown,
 }
@@ -288,6 +316,38 @@ impl Network {
             reply: tx,
         });
         rx
+    }
+
+    /// Subscribe the local node to a replication group's
+    /// gossipsub topic. Idempotent — call once per local
+    /// replica when registered.
+    pub fn subscribe_rep(&self, replication_id: [u8; 32]) {
+        let _ = self.cmd_tx.send(NetworkCmd::SubscribeRep { replication_id });
+    }
+
+    /// Publish a head announcement for a replication group.
+    /// Called by the agent thread after every commit so peers
+    /// can pull the new state without waiting for the next 250ms
+    /// sync tick.
+    pub fn publish_heads(&self, replication_id: [u8; 32], roots: Vec<[u8; 32]>) {
+        let _ = self.cmd_tx.send(NetworkCmd::PublishHeads { replication_id, roots });
+    }
+
+    /// Register a sender that receives hint `(peer)` whenever a
+    /// gossipsub head announcement arrives for this replication
+    /// group. The matching sync_loop drains the receiver and
+    /// triggers an immediate fetch — that's how cycle 8 turns
+    /// the previously-poll-only sync into a near-zero-latency
+    /// push.
+    pub fn register_hint_sender(
+        &self,
+        replication_id: [u8; 32],
+        sender: std_mpsc::Sender<PeerId>,
+    ) {
+        let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
+            replication_id,
+            sender,
+        });
     }
 
     /// Synchronously invoke a service on a remote peer. Returns a
@@ -458,6 +518,12 @@ async fn network_main(
     let (response_tx, mut response_rx) =
         async_mpsc::unbounded_channel::<(request_response::ResponseChannel<Frame>, Frame)>();
 
+    // Per-replication-group hint senders. The agent's sync_loop
+    // registers itself once on startup; gossipsub head announcements
+    // route through here to the matching sync_loop, which then
+    // performs an immediate fetch from the publisher.
+    let mut hint_senders: HashMap<[u8; 32], std_mpsc::Sender<PeerId>> = HashMap::new();
+
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -468,6 +534,7 @@ async fn network_main(
                     &invoke_dispatcher,
                     &sync_provider,
                     &response_tx,
+                    &hint_senders,
                 );
             }
             cmd = cmd_rx.recv() => {
@@ -519,6 +586,43 @@ async fn network_main(
                         outbound_replies.insert(req_id, OutboundReply::Node(reply));
                         debug!(%target_peer, "network: sent FetchNode");
                     }
+                    Some(NetworkCmd::SubscribeRep { replication_id }) => {
+                        let topic = gossip_topic(&replication_id);
+                        match swarm.behaviour_mut().gossip.subscribe(&topic) {
+                            Ok(true) => debug!(
+                                topic = %topic,
+                                "network: subscribed to replication topic",
+                            ),
+                            Ok(false) => {} // already subscribed
+                            Err(e) => warn!(
+                                topic = %topic,
+                                error = %e,
+                                "network: subscribe failed",
+                            ),
+                        }
+                    }
+                    Some(NetworkCmd::PublishHeads { replication_id, roots }) => {
+                        let topic = gossip_topic(&replication_id);
+                        let frame = Frame::Heads { replication_id, roots };
+                        let bytes = frame.encode();
+                        match swarm.behaviour_mut().gossip.publish(topic.clone(), bytes) {
+                            Ok(_) => {}
+                            // NoPeersSubscribedToTopic is the common
+                            // case at startup before the topic mesh
+                            // forms — not a real error, the next sync
+                            // tick still drives convergence via the
+                            // request_response fallback.
+                            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                            Err(e) => debug!(
+                                topic = %topic,
+                                error = ?e,
+                                "network: publish heads (transient)",
+                            ),
+                        }
+                    }
+                    Some(NetworkCmd::RegisterHintSender { replication_id, sender }) => {
+                        hint_senders.insert(replication_id, sender);
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
@@ -564,11 +668,31 @@ fn build_swarm(
                 std::iter::once((PROTOCOL, ProtocolSupport::Full)),
                 request_response::Config::default(),
             );
+            // Gossipsub: one mesh per replication group. We sign
+            // messages with the local keypair so peers can attest
+            // who published a head announcement; that lets
+            // `handle_gossipsub_event` route the resulting hint
+            // back to the right peer for the BFS fetch.
+            let gossip_cfg = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .build()
+                .map_err::<Box<dyn std::error::Error + Send + Sync>, _>(|e| {
+                    format!("gossipsub config: {e}").into()
+                })?;
+            let gossip = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossip_cfg,
+            )
+            .map_err::<Box<dyn std::error::Error + Send + Sync>, _>(|e| {
+                format!("gossipsub: {e}").into()
+            })?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(VosBehaviour {
                 mdns,
                 ping,
                 identify,
                 req_resp,
+                gossip,
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -587,6 +711,7 @@ fn handle_swarm_event(
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
+    hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -636,6 +761,9 @@ fn handle_swarm_event(
                 swarm, rr_event, local_prefix, prefix_map, inbox,
                 outbound_replies, invoke_dispatcher, sync_provider, response_tx,
             );
+        }
+        SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {
+            handle_gossipsub_event(g_event, hint_senders);
         }
         _ => {}
     }
@@ -764,6 +892,46 @@ fn handle_req_resp(
             warn!(%peer, error = %error, "network: inbound request failed");
         }
         Event::ResponseSent { .. } => {}
+    }
+}
+
+/// Gossipsub topic name for a replication group.
+fn gossip_topic(rep_id: &[u8; 32]) -> gossipsub::IdentTopic {
+    let mut hex = String::with_capacity(64);
+    for b in rep_id {
+        use core::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    gossipsub::IdentTopic::new(format!("vos/sync/{hex}"))
+}
+
+fn handle_gossipsub_event(
+    event: gossipsub::Event,
+    hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
+) {
+    match event {
+        gossipsub::Event::Message { propagation_source, message, .. } => {
+            // Decode the published frame; expect Heads with a
+            // replication_id matching the topic. We use rep_id
+            // from the frame as the routing key (the topic's hex
+            // is derivable but the frame's bytes are
+            // authoritative).
+            let frame = match Frame::decode(&message.data) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(error = %e, "gossipsub: bad frame, dropping");
+                    return;
+                }
+            };
+            if let Frame::Heads { replication_id, .. } = frame {
+                if let Some(sender) = hint_senders.get(&replication_id) {
+                    let _ = sender.send(propagation_source);
+                }
+            } else {
+                warn!(?frame, "gossipsub: unexpected frame on sync topic");
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1207,6 +1375,66 @@ mod tests {
         let _ = node_a.collect();
         let _ = node_b.collect();
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Network-level test: gossipsub head announcements route a
+    /// `Frame::Heads` published by A to a hint sender registered
+    /// by B, with the publisher's PeerId surfaced as the hint
+    /// payload. Proves the cycle-8 push path independently of
+    /// the cycle-3 request_response fallback.
+    #[test]
+    fn gossipsub_head_announcement_hints_subscribers() {
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: 0xA0A0,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: 0xB0B0,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        let rep_id = [0x77u8; 32];
+        let (hint_tx, hint_rx) = std_mpsc::channel::<PeerId>();
+        net_b.register_hint_sender(rep_id, hint_tx);
+
+        // Both sides subscribe — gossipsub needs a mesh of at
+        // least one subscriber per side before publish actually
+        // delivers anything.
+        net_a.subscribe_rep(rep_id);
+        net_b.subscribe_rep(rep_id);
+
+        // Wait for the gossipsub heartbeat (1s) to form the
+        // mesh, then publish from A. Retry the publish until B
+        // sees the hint or the deadline expires.
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got: Option<PeerId> = None;
+        while std::time::Instant::now() < until {
+            net_a.publish_heads(rep_id, vec![[0xCDu8; 32]]);
+            if let Ok(peer) = hint_rx.recv_timeout(Duration::from_millis(500)) {
+                got = Some(peer);
+                break;
+            }
+        }
+        let publisher = got.expect("hint should arrive within deadline");
+        assert_eq!(publisher, net_a.peer_id(), "hint should carry A's PeerId");
+
+        net_a.join();
+        net_b.join();
     }
 
     /// Network-level test: A asks B for the heads of a replication

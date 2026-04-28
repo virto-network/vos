@@ -126,6 +126,16 @@ pub trait CommitStrategy: Send {
     fn reload(&mut self) -> Result<(), CommitError> {
         Ok(())
     }
+
+    /// Current root CIDs as raw 32-byte arrays — the wire shape
+    /// `Frame::Heads` carries. Used by the agent thread after
+    /// every commit to publish a head announcement on the
+    /// gossipsub topic for this replication group.
+    ///
+    /// Non-replicating strategies return an empty vec.
+    fn roots(&self) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
 }
 
 /// No-op strategy — state lives only in memory and is lost on exit.
@@ -574,6 +584,10 @@ mod crdt {
             self.clock = load_clock(&self.db).unwrap_or_default();
             self.last_state = load_state(&self.db).unwrap_or_default();
             Ok(())
+        }
+
+        fn roots(&self) -> Vec<[u8; 32]> {
+            self.root_bytes()
         }
 
         fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {
