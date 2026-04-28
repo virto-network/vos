@@ -109,6 +109,23 @@ pub trait CommitStrategy: Send {
     fn replay_logs(&self) -> Result<Vec<crate::effect_log::EffectLog>, CommitError> {
         Ok(Vec::new())
     }
+
+    /// Re-read the strategy's in-memory bookkeeping from disk so it
+    /// matches whatever has been written to the backing store —
+    /// typically because a parallel writer (e.g. the cycle-3 sync
+    /// ticker) merged remote DAG nodes while the agent thread was
+    /// idle. After this call:
+    ///
+    /// - [`replay_logs`](Self::replay_logs) reflects the merged DAG.
+    /// - The next [`commit`](Self::commit) will skip-on-unchanged
+    ///   against the materialized post-merge state, not the pre-
+    ///   merge cache.
+    ///
+    /// Default impl is a no-op for strategies that don't have any
+    /// mutable in-memory state (`NoCommit`, `LocalCommit`).
+    fn reload(&mut self) -> Result<(), CommitError> {
+        Ok(())
+    }
 }
 
 /// No-op strategy — state lives only in memory and is lost on exit.
@@ -502,6 +519,17 @@ mod crdt {
             self.write_atomic(state, Some(log))
         }
 
+        fn reload(&mut self) -> Result<(), CommitError> {
+            // Pick up roots and state the parallel sync ticker may
+            // have written to disk while we were idle. The clock
+            // reflects the merged head set; last_state goes back
+            // to whatever's persisted (which sync never overwrites
+            // — only the agent commits state).
+            self.clock = load_clock(&self.db).unwrap_or_default();
+            self.last_state = load_state(&self.db).unwrap_or_default();
+            Ok(())
+        }
+
         fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {
             // BFS from roots, collect all reachable nodes, then
             // topological sort so predecessors come before
@@ -779,6 +807,70 @@ mod tests {
             assert_eq!(replay[1], logs[1]);
             assert_eq!(replay[2], logs[2]);
         }
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_commit_reload_picks_up_external_writes() {
+        // Two `CrdtCommit` instances share the same `Arc<redb::Database>`.
+        // The "agent" half drives state forward; the "sync" half
+        // simulates a peer pulling a remote node by calling
+        // `insert_node` directly. After `reload`, the agent's view
+        // of `roots` includes the merged head, and `replay_logs`
+        // returns both the agent's own log and the simulated
+        // peer's log in causal order.
+        use crate::effect_log::EffectLog;
+        use std::collections::BTreeSet;
+
+        let path = temp_db_path("crdt_reload");
+        let arc = alloc::sync::Arc::new(redb::Database::create(&path).unwrap());
+
+        let mut agent = CrdtCommit::from_db_arc(arc.clone());
+        let mut sync = CrdtCommit::from_db_arc(arc.clone());
+
+        // Agent commits one log. After this, agent.clock has one root,
+        // sync's clock is still empty (won't see it without reload).
+        let log_a = EffectLog::for_msg(b"local".to_vec());
+        agent.commit_with_log(b"state-a", &log_a).unwrap();
+        assert_eq!(agent.root_bytes().len(), 1);
+        assert!(sync.root_bytes().is_empty(), "sync hasn't reloaded yet");
+
+        // sync.reload() picks up agent's persisted root.
+        sync.reload().unwrap();
+        assert_eq!(sync.root_bytes(), agent.root_bytes());
+
+        // Build a "remote" log node manually and feed it through
+        // sync.insert_node — mimics what the cycle-3 ticker does.
+        // It should be a sibling of the agent's existing root
+        // (no children → concurrent).
+        let log_b = EffectLog::for_msg(b"remote".to_vec());
+        let remote_node: merkle_crdt::DagNode<Blake2b, EffectLog> =
+            merkle_crdt::DagNode::new(log_b.clone(), BTreeSet::new());
+        let remote_cid = remote_node.cid();
+        let remote_bytes = remote_node.to_bytes();
+        let was_new = sync.insert_node(&remote_cid.0, &remote_bytes).unwrap();
+        assert!(was_new);
+        sync.compact_roots().unwrap();
+
+        // Now the disk has TWO roots (concurrent siblings). Agent
+        // hasn't reloaded yet; its clock still shows just the
+        // local root.
+        assert_eq!(agent.root_bytes().len(), 1);
+
+        // After reload, agent sees the merged set.
+        agent.reload().unwrap();
+        let mut roots = agent.root_bytes();
+        roots.sort();
+        assert_eq!(roots.len(), 2);
+
+        // replay_logs returns both effect logs.
+        let mut logs = agent.replay_logs().unwrap();
+        logs.sort_by(|a, b| a.msg.cmp(&b.msg));
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].msg, b"local");
+        assert_eq!(logs[1].msg, b"remote");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
