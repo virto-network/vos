@@ -58,13 +58,49 @@ build-crdt-counter:
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,
 # and asserts both replicas converge to count=2 (~1.4s
-# end-to-end). The integration test is the closest thing to a
-# multi-node demo until vosx manifest support for replication_id
-# lands (cycle 6) — at which point a real two-process
-# `vosx start` setup will work.
+# end-to-end).
 demo-crdt-sync: build-crdt-counter
     cargo test -p vos --features network --test elf_integration \
         crdt_counter_converges_across_nodes_live -- --nocapture
+
+# Two-process CRDT demo using real `vosx start` instances. Each
+# process owns its own data dir + libp2p identity; both run the
+# crdt-counter actor under the same replication_id (auto-derived
+# from blob+name). On startup each side fires `inc(tag=N)` with
+# N differing per host so the two EffectLogs hash to distinct
+# DAG nodes. Cycle-3 sync pulls each replica's node into the
+# other's redb; cycle-4 soft restart replays both logs; the
+# println in the actor reports `count=2` on each side once
+# convergence completes.
+demo-crdt-procs: build-crdt-counter build-crates
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf /tmp/vosx-a /tmp/vosx-b
+    mkdir -p /tmp/vosx-a /tmp/vosx-b
+    echo "→ starting host A (listens on :4811)..."
+    RUST_LOG=info ./target/debug/vosx start examples/space-crdt-a.toml \
+        --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811 \
+        > /tmp/vosx-a.log 2>&1 &
+    PID_A=$!
+    sleep 1
+    echo "→ starting host B (dials A)..."
+    RUST_LOG=info ./target/debug/vosx start examples/space-crdt-b.toml \
+        --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811 \
+        > /tmp/vosx-b.log 2>&1 &
+    PID_B=$!
+    sleep 6
+    echo ""
+    echo "── host A inc log ─────────────────────────────────────────"
+    grep "crdt-counter:" /tmp/vosx-a.log || echo "(no actor output)"
+    echo ""
+    echo "── host B inc log ─────────────────────────────────────────"
+    grep "crdt-counter:" /tmp/vosx-b.log || echo "(no actor output)"
+    echo ""
+    echo "→ shutting down..."
+    kill $PID_A $PID_B 2>/dev/null || true
+    wait $PID_A 2>/dev/null || true
+    wait $PID_B 2>/dev/null || true
+    echo "done. Full logs in /tmp/vosx-{a,b}.log"
 
 # ── Run ─────────────────────────────────────────────────────────────
 

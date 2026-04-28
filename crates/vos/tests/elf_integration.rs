@@ -1253,6 +1253,76 @@ fn crdt_counter_local_invoke_smoke() {
 
 #[test]
 #[cfg(feature = "network")]
+fn crdt_counter_init_payloads_dispatch() {
+    // Smoke test the on_start manifest path: register a CRDT
+    // counter with an init_payload that encodes inc(tag=7) and
+    // verify the count went up to 1 by the time we invoke get().
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_init_payload_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let inc_payload = {
+        let m = Msg::new("inc").with("tag", 7u32);
+        let encoded = m.encode();
+        let mut p = Vec::with_capacity(1 + encoded.len());
+        p.push(TAG_DYNAMIC);
+        p.extend_from_slice(&encoded);
+        p
+    };
+
+    let mut node = VosNode::new();
+    let id = node.register(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_init_payloads(vec![inc_payload]),
+    );
+
+    // Give the agent thread time to drain the init_payload.
+    let count = wait_for(
+        || {
+            let m = Msg::new("get");
+            let encoded = m.encode();
+            let mut p = Vec::with_capacity(1 + encoded.len());
+            p.push(TAG_DYNAMIC);
+            p.extend_from_slice(&encoded);
+            let bytes = node.invoke(id, p)?;
+            let v: vos::value::Value = vos::Decode::decode(&bytes);
+            match v.as_u64() {
+                Some(1) => Some(1u64),
+                _ => None,
+            }
+        },
+        std::time::Duration::from_secs(3),
+    );
+    assert_eq!(count, Some(1), "init_payload inc(tag=7) should drive count=1");
+
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "network")]
 fn crdt_counter_converges_across_nodes_live() {
     // Cycle 5 end-to-end: stand up two networked VosNodes with the
     // crdt-counter actor registered on both under the same

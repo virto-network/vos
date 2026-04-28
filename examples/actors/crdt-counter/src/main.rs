@@ -36,12 +36,13 @@ impl CrdtCounter {
         // `tag` is in the EffectLog so concurrent incs from different
         // replicas hash to different DAG-node CIDs. Not used in the
         // state transition.
-        let _ = tag;
         self.count += 1;
+        println!("crdt-counter: inc tag={tag} -> count={}", self.count);
     }
 
     #[msg]
     async fn get(&self) -> u64 {
+        println!("crdt-counter: get -> {}", self.count);
         self.count
     }
 }

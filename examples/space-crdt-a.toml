@@ -1,0 +1,26 @@
+# Cross-node CRDT demo, host A.
+#
+# Pair with `space-crdt-b.toml` running in another vosx process.
+# Each host kicks the local crdt-counter replica with a distinct
+# `tag` on startup so the two EffectLogs hash to different DAG
+# nodes (otherwise the merkle-DAG dedups byte-identical incs and
+# the replicas appear pre-converged at count=1).
+#
+# Run:
+#   vosx start examples/space-crdt-a.toml \
+#     --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811
+#
+# `replication_id` defaults to "auto" =
+# `blake2b(name || 0 || blob)` — both manifests reference the
+# same actor by the same name, so they auto-share a group.
+
+space = "crdt-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "counter"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+consistency = "crdt"
+on_start = [
+  { msg = "inc", args = { tag = 1 } },
+]

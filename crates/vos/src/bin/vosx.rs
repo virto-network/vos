@@ -478,6 +478,10 @@ fn cmd_start(
                 }
             }
             cfg = apply_init(cfg, &child.init, &elf_data, &name_ids, &provides_map);
+            if !child.on_start.is_empty() {
+                let payloads = encode_on_start(&child.name, &child.on_start, &elf_data, &name_ids, &provides_map);
+                cfg = cfg.with_init_payloads(payloads);
+            }
 
             let id = node.register(cfg);
             let role_tag = format_provides(&child.provides);
@@ -510,6 +514,10 @@ fn cmd_start(
             }
         }
         cfg = apply_init(cfg, &a.init, &elf_data, &name_ids, &provides_map);
+        if !a.on_start.is_empty() {
+            let payloads = encode_on_start(&a.name, &a.on_start, &elf_data, &name_ids, &provides_map);
+            cfg = cfg.with_init_payloads(payloads);
+        }
 
         let id = node.register(cfg);
         let role_tag = format_provides(&a.provides);
@@ -592,6 +600,80 @@ fn resolve_replication_id(name: &str, spec: Option<&str>, blob: &[u8]) -> Option
                 "'{name}': replication_id must be \"auto\", \"off\", or 64 hex chars; got {hex:?}",
             )),
         },
+    }
+}
+
+/// Encode the manifest's `on_start` entries as TAG_DYNAMIC +
+/// rkyv-encoded `Msg` payloads — the same wire shape
+/// `VosNode::invoke` and `ctx.tell` use. The agent thread
+/// receives these as initial inbox messages and dispatches them
+/// before reading from the inbox channel.
+///
+/// Argument types are looked up from the actor's `MessageMeta`
+/// so a TOML integer sent to a `u32` parameter lands as
+/// `Value::U32` (not the default `Value::U64`) — without that,
+/// the macro's `from_dynamic` fails to extract the field and
+/// dispatch silently skips.
+fn encode_on_start(
+    agent_name: &str,
+    entries: &[OnStartMsg],
+    elf_data: &[u8],
+    name_ids: &BTreeMap<String, u32>,
+    provides_map: &BTreeMap<String, Vec<u32>>,
+) -> Vec<Vec<u8>> {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let meta = vos::metadata::from_elf(elf_data);
+    let mut out = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut m = Msg::new(entry.msg.clone());
+        let handler_meta = meta
+            .as_ref()
+            .and_then(|am| am.messages.iter().find(|h| h.name.as_str() == entry.msg.as_str()));
+        for (k, v) in &entry.args {
+            // If the handler advertises a typed parameter, use it
+            // to coerce the TOML scalar into the right `Value`
+            // variant; otherwise fall back to the inference
+            // `toml_to_value` does.
+            let typed = handler_meta
+                .and_then(|h| h.fields.iter().find(|f| f.name.as_str() == k.as_str()))
+                .and_then(|f| typed_value(v, f.ty.as_str()));
+            let value = typed.unwrap_or_else(|| toml_to_value(v, name_ids, provides_map));
+            m = m.with(k.clone(), value);
+        }
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        eprintln!(
+            "vosx: on_start[{idx}] '{}' -> {}({})",
+            agent_name,
+            entry.msg,
+            entry.args.iter().map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>().join(", "),
+        );
+        out.push(payload);
+        // Suppress unused warning when on_start carries no args.
+        let _ = (name_ids, provides_map);
+    }
+    out
+}
+
+/// Coerce a TOML scalar to a typed `Value` matching the handler's
+/// declared parameter type. Returns `None` for unhandled
+/// combinations so the caller can fall back to inference.
+fn typed_value(val: &toml::Value, ty: &str) -> Option<vos::value::Value> {
+    use vos::value::Value;
+    match (val, ty.replace(' ', "").as_str()) {
+        (toml::Value::Integer(n), "u32") => Some(Value::U32(*n as u32)),
+        (toml::Value::Integer(n), "u64") => Some(Value::U64(*n as u64)),
+        (toml::Value::Integer(n), "i64") => Some(Value::I64(*n)),
+        (toml::Value::Integer(n), "i32") => Some(Value::I32(*n as i32)),
+        (toml::Value::Integer(n), "u16") => Some(Value::U16(*n as u16)),
+        (toml::Value::Integer(n), "u8") => Some(Value::U8(*n as u8)),
+        (toml::Value::Boolean(b), "bool") => Some(Value::Bool(*b)),
+        (toml::Value::String(s), "String") => Some(Value::Str(s.clone())),
+        _ => None,
     }
 }
 
@@ -745,6 +827,14 @@ struct AgentDef {
     ///   - "off" — no replication (DAG stays purely local)
     #[serde(default)]
     replication_id: Option<String>,
+    /// Messages to send to this agent immediately after startup.
+    /// Each entry is encoded as a TAG_DYNAMIC + rkyv(Msg) payload
+    /// and queued via `AgentConfig::init_payloads`. Useful for
+    /// kicking a CRDT actor with a per-process unique tag from
+    /// the local overlay so two replicas of the same manifest
+    /// produce different EffectLogs.
+    #[serde(default)]
+    on_start: Vec<OnStartMsg>,
     /// Child actors hosted by this agent. Each becomes its own
     /// registered service; the agent typically references them by
     /// name in its own `init` (e.g. `init = { children = [...] }`).
@@ -766,6 +856,19 @@ struct ActorDef {
     /// Same shape as [`AgentDef::replication_id`].
     #[serde(default)]
     replication_id: Option<String>,
+    /// Same shape as [`AgentDef::on_start`].
+    #[serde(default)]
+    on_start: Vec<OnStartMsg>,
+}
+
+#[derive(Deserialize, Clone)]
+struct OnStartMsg {
+    /// Handler name (the actor's `#[msg]` method).
+    msg: String,
+    /// Arguments to pack into the dynamic `Msg`. Keys must match
+    /// the handler's parameter names.
+    #[serde(default)]
+    args: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -902,6 +1005,34 @@ fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
         if let Some(node) = overlay.node {
             manifest.node = node;
         }
+        // Per-agent `on_start` overrides — by name. Useful for
+        // making two replicas of the same manifest fire distinct
+        // EffectLogs (e.g. `inc(tag = 1)` on host A,
+        // `inc(tag = 2)` on host B) without forking the manifest.
+        for ov in overlay.agent {
+            let mut applied = false;
+            for a in manifest.agent.iter_mut() {
+                if a.name == ov.name {
+                    a.on_start = ov.on_start;
+                    applied = true;
+                    break;
+                }
+                for child in a.actors.iter_mut() {
+                    if child.name == ov.name {
+                        child.on_start = ov.on_start.clone();
+                        applied = true;
+                        break;
+                    }
+                }
+                if applied { break; }
+            }
+            if !applied {
+                eprintln!(
+                    "vosx: overlay agent '{}' not found in base manifest; ignoring",
+                    ov.name,
+                );
+            }
+        }
         eprintln!("vosx: merged overlay from {}", overlay_path.display());
     }
 
@@ -923,12 +1054,25 @@ fn local_overlay_path(manifest: &Path) -> PathBuf {
 }
 
 /// Subset of the manifest schema that's allowed in the overlay
-/// file. Today only `[node]` — more fields can be added if /
-/// when operators have a real reason to override per-instance.
+/// file. `[node]` for libp2p identity / listen / data_dir, and
+/// `[[agent]]` entries for per-host on_start overrides keyed by
+/// agent name (the rest of the agent definition can't be
+/// overridden — only on_start, since that's the typical use
+/// case for "two operators run the same manifest with different
+/// kick-off messages").
 #[derive(Deserialize, Default)]
 struct LocalOverlay {
     #[serde(default)]
     node: Option<NodeMeta>,
+    #[serde(default)]
+    agent: Vec<LocalOverlayAgent>,
+}
+
+#[derive(Deserialize)]
+struct LocalOverlayAgent {
+    name: String,
+    #[serde(default)]
+    on_start: Vec<OnStartMsg>,
 }
 
 fn is_manifest(path: &Path) -> bool {

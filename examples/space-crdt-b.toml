@@ -1,0 +1,16 @@
+# Cross-node CRDT demo, host B. See space-crdt-a.toml for context.
+#
+# Run (after starting host A):
+#   vosx start examples/space-crdt-b.toml \
+#     --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811
+
+space = "crdt-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "counter"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+consistency = "crdt"
+on_start = [
+  { msg = "inc", args = { tag = 2 } },
+]
