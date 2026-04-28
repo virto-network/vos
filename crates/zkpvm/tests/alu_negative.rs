@@ -275,3 +275,55 @@ fn mul_upper_uu_full_64bit_squared() {
         0xFFFF_FFFF_FFFF_FFFE,
     );
 }
+
+// ── Move / LoadImm ───────────────────────────────────────────────────────
+//
+// MoveReg constraint: `is_move · (result[i] - val_d[i]) = 0` for all i.
+// LoadImm shares the same `is_move` flag — the AIR sees an immediate as
+// `val_d = imm` and binds result byte-wise.
+
+#[test]
+fn move_reg_positive_smoke() {
+    // φ[2] = φ[0] = 0xDEAD_BEEF (TwoReg: rd in low nibble, ra in high).
+    prove_two_reg(Opcode::MoveReg, 2, 0, 0xDEAD_BEEF, 0xDEAD_BEEF);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn move_reg_forged_result_rejected() {
+    forge_two_reg_result(
+        Opcode::MoveReg, 2, 0,
+        0xDEAD_BEEF, /*forged*/ 0xCAFE_BABE,
+    );
+}
+
+// LoadImm has its own encoding (opcode + reg_byte + 4-byte imm), so the
+// shared two_reg_program helper doesn't apply.  Inline a small helper
+// here that runs LoadImm with `imm=12345` then forges regs_after[ra].
+#[test]
+#[should_panic(expected = "failed")]
+fn load_imm_forged_result_rejected() {
+    use javm::PVM_REGISTER_COUNT;
+    use javm::interpreter::Interpreter;
+    use zkpvm::core::tracing::TracingPvm;
+
+    let regs = [0u64; PVM_REGISTER_COUNT];
+    let imm: u32 = 12345;
+    let imm_bytes = imm.to_le_bytes();
+    let mut code = vec![Opcode::LoadImm as u8, 2]; // ra=2
+    code.extend_from_slice(&imm_bytes);
+    code.push(Opcode::Trap as u8);
+    let mut bitmask = vec![1, 0, 0, 0, 0, 0];
+    bitmask.push(1);
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+    );
+    let mut tr = TracingPvm::new(pvm);
+    let _ = tr.run();
+    let mut steps = tr.into_trace();
+    assert_eq!(steps[0].regs_after[2], 12345);
+    steps[0].regs_after[2] = 99; // forge — `result = val_d = imm` should reject
+    prove_and_verify(steps, &code, &bitmask);
+}
