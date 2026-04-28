@@ -100,3 +100,28 @@ trace that the verifier must reject) leaves you with no proof the constraint
 fires.  See `tests/bitmanip.rs` for the pattern: build an honest trace,
 mutate one column, assert `prove + verify` panics with
 `ConstraintsNotSatisfied`.
+
+## 6. Regression checklist before committing a CpuChip constraint
+
+Before committing a new CpuChip constraint, run the FULL prover-side
+regression — not just the directly-related tests.  Two specific gotchas
+discovered the hard way:
+
+  - **Blake2b proofs.**  Any constraint conditioned on `is_exit`,
+    `is_load`, `is_store`, or other CpuChip flag column must be tested
+    against a trace containing the blake2b ECALL (`prove_blake2b_via_ecall`
+    or `prove_blake2b_precompile`).  `is_exit` in particular is shared by
+    Trap, Ecalli, Ecall, JumpInd, LoadImmJumpInd — a constraint requiring
+    "no successor real row when is_exit=1" is wrong for soft ECALLs that
+    hand back to host and resume.  Use a narrower per-opcode flag if
+    that's what you mean.
+  - **Hash-bench / fibonacci traces.**  These exercise tight loops with
+    many steps; constraint changes that interact with CpuChip's logup
+    pair structure should pass `prove_fibonacci_actor` (a few hundred
+    steps) before claiming the change is safe at scale.
+
+Minimum sweep: `cargo test -p zkpvm --test add64_e2e --test memory --test
+control_flow --test bitmanip --test alu_negative --test
+control_flow_negative --test memory_negative --test program_identity
+--test prove_vos_actor`.  ~6 minutes; catches all known regression
+classes.

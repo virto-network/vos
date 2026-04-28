@@ -659,13 +659,16 @@ impl BuiltInComponent for CpuChip {
         //   AND: (1 - branch_taken) * (sum (1 - byte_eq[i])) = (1 - branch_taken) * (something nonzero)
         // Simpler: introduce EqFlag column... but we don't have one.
         //
-        // Use per-byte constraints for eq/ne:
+        // Per-byte constraints for eq/ne:
         //   is_br_eq * branch_taken * (1 - byte_eq[i]) = 0 (if eq branch taken, all bytes equal)
         //   is_br_ne * (1 - branch_taken) * (1 - byte_eq[i]) = 0 (if ne branch NOT taken, all bytes equal)
-        // The converse (if bytes equal, eq branch MUST be taken) requires a witness.
-        // Skip strict converse for now — this catches the main class of prover malice.
-        // BranchEq taken: val_b == val_d ⇒ all byte_eq[i] = 1
-        // BranchNe not-taken: val_b == val_d ⇒ all byte_eq[i] = 1
+        // The converse (val_b == val_d ⇒ branch_taken_eq = 1) is benign in
+        // PVM semantics: branch_taken is the prover's witness for "PC took
+        // the offset path", not "the comparison succeeded".  When target ==
+        // sequential_next_pc the two coincide regardless, so a flipped
+        // branch_taken witness produces the same next_pc and the rest of
+        // the trace is unaffected.  See the loose-corner test in
+        // tests/control_flow_negative.rs.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
                 is_br_eq[0].clone() * branch_taken[0].clone()
@@ -1244,6 +1247,47 @@ impl BuiltInComponent for CpuChip {
                 is_real.clone().into(),
                 &tuple,
             ));
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 13e (REVERTED): terminal-row constraint via is_exit was too
+        // broad — it caught Trap (correctly) but also fired on Ecalli steps
+        // that don't actually exit (e.g. blake2b ECALL followed by Trap).
+        // IsExit in classify_opcode is shared by Trap, Ecalli, Ecall,
+        // JumpInd, LoadImmJumpInd, and the constraint required ALL of them
+        // to be terminal — wrong for soft ECALLs that hand back to host
+        // and resume.  Adding a per-opcode IsTrap column is the right
+        // direction for narrowing the gate; deferring that.
+        //
+        // The trap-mid-trace-splice gap remains closed in practice via
+        // ProgramBoundaryChip's final-row consumer + per-step
+        // (timestamp, pc) → (next_timestamp, next_pc) chain — a forged
+        // post-Trap step doesn't line up with Trap's next_pc/next_ts and
+        // breaks the chain.  See trap_mid_trace_rejected test.
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 15-load-result: bind Result to MemValue on Load steps
+        //
+        // For each byte i, on a load step (is_load=1), if byte i is within
+        // the load's width (mem_byte_active[i]=1), result[i] must equal
+        // mem_value[i].  Closes the gap where forging
+        // step.regs_after[dest_reg] on a Load wasn't caught when no later
+        // step read the destination register: previously the AIR linked
+        // Result to the register-memory ledger and MemValue to the memory
+        // ledger separately, but never equated them within the load step.
+        //
+        // Inactive bytes (i >= MemSize): for unsigned loads they must be
+        // zero, for signed loads 0xFF · sign_bit.  Tightening the inactive-
+        // byte constraint requires a per-variant IsLoadSigned flag; defer
+        // that piece.  The active-byte binding here is the load-bearing
+        // part of the fix.  Pure ground constraint, parity-neutral.
+        let is_load_local = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_load_local[0].clone()
+                    * mem_byte_active[i].clone()
+                    * (result[i].clone() - mem_value[i].clone()),
+            );
         }
 
         eval.finalize_logup_in_pairs();

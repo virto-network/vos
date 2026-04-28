@@ -174,6 +174,46 @@ fn prove_unlikely() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+// Phase 13e: terminal-row constraint.  A real exit step (Trap, Ecall, etc.)
+// must be the final real row of the trace — no successor real row.  This
+// closes the gap where a malicious prover splices a Trap mid-trace and
+// continues execution.
+#[test]
+#[should_panic(expected = "failed")]
+fn trap_mid_trace_rejected() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 5;
+    regs[1] = 7;
+
+    // Honest program: Fallthrough → Add64 → Trap.
+    let code = vec![
+        Opcode::Fallthrough as u8,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 1, 0, 0, 1];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[2].opcode, Opcode::Trap);
+
+    // Forge: take the original 3-step trace and append a fake post-Trap step
+    // claiming continued execution (a Fallthrough).  The terminal-row
+    // constraint sees Trap at row 2 with a real (non-padding) row 3 → reject.
+    let mut fake = steps[0].clone(); // copy a Fallthrough step
+    fake.timestamp = 4;
+    fake.pc = 0;
+    fake.next_pc = 1;
+    steps.push(fake);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 #[test]
 #[should_panic(expected = "ConstraintsNotSatisfied")]
 fn unlikely_forged_next_pc_rejected() {

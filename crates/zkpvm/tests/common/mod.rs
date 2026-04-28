@@ -137,3 +137,51 @@ where
     mutate(&mut steps[0]);
     prove_and_verify(steps, &code, &bitmask);
 }
+
+/// Encode a ThreeReg instruction at `code[0..3]`: opcode + reg_byte (rb in hi
+/// nibble, ra in lo nibble) + rd byte.  Used by ALU ops (Add64, Sub64, Mul64,
+/// And, Or, Xor, shift, compare).  Returns (code, bitmask) ending with Trap.
+pub fn three_reg_program(op: Opcode, rd: u8, ra: u8, rb: u8) -> (Vec<u8>, Vec<u8>) {
+    assert!(rd < 13 && ra < 13 && rb < 13, "reg out of range (PVM has 13 regs)");
+    let reg_byte = (rb << 4) | (ra & 0xF);
+    let code = vec![op as u8, reg_byte, rd, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    (code, bitmask)
+}
+
+/// Trace a ThreeReg program with given (input_a, input_b) in the source
+/// registers, then prove+verify.  Asserts the destination register holds
+/// `expected`.
+pub fn prove_three_reg(
+    op: Opcode, rd: u8, ra: u8, rb: u8,
+    input_a: u64, input_b: u64,
+    expected: u64,
+) {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[ra as usize] = input_a;
+    regs[rb as usize] = input_b;
+    let (code, bitmask) = three_reg_program(op, rd, ra, rb);
+    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    assert_eq!(steps[0].opcode, op);
+    assert_eq!(
+        steps[0].regs_after[rd as usize], expected,
+        "{op:?} φ[{rd}] = 0x{:x}, expected 0x{expected:x}", steps[0].regs_after[rd as usize]
+    );
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+/// Negative test for ThreeReg ops: trace, mutate `regs_after[rd]`, prove+verify.
+pub fn forge_three_reg_result(
+    op: Opcode, rd: u8, ra: u8, rb: u8,
+    input_a: u64, input_b: u64,
+    forged: u64,
+) {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[ra as usize] = input_a;
+    regs[rb as usize] = input_b;
+    let (code, bitmask) = three_reg_program(op, rd, ra, rb);
+    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    assert_eq!(steps[0].opcode, op);
+    steps[0].regs_after[rd as usize] = forged;
+    prove_and_verify(steps, &code, &bitmask);
+}

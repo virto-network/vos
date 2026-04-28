@@ -44,7 +44,11 @@ pub enum Column {
     /// Auxiliary carry/borrow (8 limbs). Used by add/sub.
     #[size = 8]
     Carry,
+    /// `mask_next_row` so the Phase 13e terminal-row constraint can read
+    /// the *next* row's IsPadding to assert that any real exit step
+    /// (Trap, Ecall, Trap-via-djump) has no successor real row.
     #[size = 1]
+    #[mask_next_row]
     IsPadding,
     #[size = 1]
     RegAWritten,
