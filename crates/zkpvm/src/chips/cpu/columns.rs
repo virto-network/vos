@@ -438,6 +438,47 @@ pub enum Column {
     /// finalize_logup_in_pairs).
     #[size = 8]
     ImmBytes,
+    /// Phase 16: 1 iff this step's opcode is one of DivS32 / DivS64 /
+    /// RemS32 / RemS64.  Drives the divrem schoolbook's high-byte
+    /// sign-correction (without it, signed divrem with any negative
+    /// operand fails proving — see DivCorrHi / DivCorrCarry).
+    #[size = 1]
+    IsDivS,
+    /// Phase 16: bit 7 of `div_quotient[7]` (sign of quotient on 64-bit
+    /// signed div/rem).  Prover-witnessed (mirrors SignBitB / SignBitD
+    /// — same trust model as Phase 12c MulUpper).  Used in the
+    /// DivCorrHi carry chain.
+    #[size = 1]
+    SignBitQ,
+    /// Phase 16: bit 7 of `div_remainder[7]` (sign of remainder on
+    /// 64-bit signed div/rem).  Prover-witnessed.  Used in the
+    /// DivCorrHi carry chain.
+    #[size = 1]
+    SignBitR,
+    /// Phase 16: high 8 bytes of the divrem schoolbook's unsigned
+    /// product `q_u·d_u + r_u`.  Replaces the old hard-coded "0" for
+    /// k≥8 in the schoolbook constraint.  For DivU rows: forced to 0,
+    /// so the schoolbook still demands `q·d + r = b` exactly.  For DivS
+    /// rows: bound by a carry chain to `sq·d_u + sd·q_u + sr − sa
+    /// (mod 2^64)`, the unsigned high produced by signed inputs in
+    /// two's complement.
+    #[size = 8]
+    DivCorrHi,
+    /// Phase 16: per-byte carry chain for the DivCorrHi sign-correction
+    /// equation.  Carry-out at byte 7 is the 64-bit overflow,
+    /// discarded (mirrors `% 2^64` at the boundary).
+    #[size = 8]
+    DivCorrCarry,
+    /// Phase 16: high byte of the divrem schoolbook carry per position;
+    /// pairs with DivMulCarry to represent a 16-bit value (mirrors
+    /// MulCarry / MulCarryHi from the mul schoolbook).  At busy middle
+    /// positions of `q · d` the per-byte sum can reach
+    /// 8·255² + 255 ≈ 520 000 → carry ≈ 2 030, which doesn't fit in a
+    /// single u8.  Pre-existing latent bug in the u8-only chain, hit
+    /// for the first time by DivS rows where both q and d have many
+    /// 0xFF bytes (e.g. -14 × -7 in two's complement).
+    #[size = 16]
+    DivMulCarryHi,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

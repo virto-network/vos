@@ -201,20 +201,72 @@ fn rem_u64_forged_result_rejected() {
     forge_three_reg_result(Opcode::RemU64, 2, 0, 1, 100, 7, /*forged*/ 1);
 }
 
-// Note: DivS64 with a negative dividend (e.g. -100 / 7 = -14) currently
-// fails proving with ConstraintsNotSatisfied even though the interpreter
-// produces the correct quotient (0xFFFF_FFFF_FFFF_FFF2).  The AIR's
-// signed-divrem constraint chain has a corner not exercised by existing
-// positive tests in tests/phase2_alu.rs.  Filed as 15-divs-debug.
-//
-// Negative DivS64 testing therefore deferred until the positive case
-// proves cleanly.
+// Phase 16: DivS64 with negative operands now proves cleanly thanks to
+// the divrem schoolbook's high-byte sign-correction (DivCorrHi /
+// DivCorrCarry).  Previously the AIR demanded `q·d + r ≡ b mod 2^128`
+// with high 64 bytes = 0, but for signed inputs the unsigned schoolbook
+// produces a non-zero high (e.g. -100/7=-14 → q_u·d_u = 7·2^64 − 98,
+// r_u = 2^64 − 2 → high = 7).  The new constraint binds the high to
+// `sq·d_u + sd·q_u + sr − sa  (mod 2^64)`, matching two's complement.
+
+#[test]
+fn div_s64_negative_dividend_smoke() {
+    // -100 / 7 = -14.  In u64: dividend = 2^64−100 = 0xFFFFFFFFFFFFFF9C,
+    // expected quotient = 2^64−14 = 0xFFFFFFFFFFFFFFF2.
+    prove_three_reg(
+        Opcode::DivS64, 2, 0, 1,
+        (-100i64) as u64, 7,
+        (-14i64) as u64,
+    );
+}
+
+#[test]
+fn div_s64_negative_divisor_smoke() {
+    // 100 / -7 = -14.
+    prove_three_reg(
+        Opcode::DivS64, 2, 0, 1,
+        100, (-7i64) as u64,
+        (-14i64) as u64,
+    );
+}
+
+#[test]
+fn div_s64_both_negative_smoke() {
+    // -100 / -7 = 14 (positive quotient with negative operands).
+    prove_three_reg(
+        Opcode::DivS64, 2, 0, 1,
+        (-100i64) as u64, (-7i64) as u64,
+        14,
+    );
+}
+
+#[test]
+fn rem_s64_negative_dividend_smoke() {
+    // -100 % 7 = -2 (round-toward-zero remainder takes dividend's sign).
+    prove_three_reg(
+        Opcode::RemS64, 2, 0, 1,
+        (-100i64) as u64, 7,
+        (-2i64) as u64,
+    );
+}
 
 #[test]
 #[should_panic(expected = "failed")]
 fn div_s64_forged_unsigned_quotient_rejected() {
     // 100 / 7 = 14 (positive case works).  Forge to 13.
     forge_three_reg_result(Opcode::DivS64, 2, 0, 1, 100, 7, /*forged*/ 13);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn div_s64_negative_forged_off_by_one_rejected() {
+    // -100 / 7 = -14, forge to -13 to confirm the new sign-correction
+    // chain still detects forgery on the negative path.
+    forge_three_reg_result(
+        Opcode::DivS64, 2, 0, 1,
+        (-100i64) as u64, 7,
+        /*forged*/ (-13i64) as u64,
+    );
 }
 
 // ── MulUpper (UU + SS + SU — Phase 12c bound all three) ──────────────────

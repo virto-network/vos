@@ -543,14 +543,36 @@ impl BuiltInComponent for CpuChip {
         let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
         let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
         let div_mul_carry = crate::trace::trace_eval!(trace_eval, Column::DivMulCarry);
+        let div_mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::DivMulCarryHi);
         let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
+        let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
+        let div_corr_hi = crate::trace::trace_eval!(trace_eval, Column::DivCorrHi);
 
         // Gate: only constrain when is_div_rem=1 and div_by_zero=0
         let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
+        // Phase 16: full 16-bit per-position carry, reconstructed as
+        // `low + 256·high`.  Mirrors the MulCarry / MulCarryHi pattern.
+        // u8-only (Phase 13-) was a latent bug — at busy middle positions
+        // q·d can carry up to ≈ 2 030, which doesn't fit in a byte.  Hit
+        // for the first time by DivS with both operands negative
+        // (q,d ≈ 0xFF…F2 / 0xFF…F9 in two's complement).
+        let div_full_carry = |k: usize| -> E::F {
+            div_mul_carry[k].clone() + div_mul_carry_hi[k].clone() * f256.clone()
+        };
 
-        // Schoolbook: quotient * divisor + remainder = dividend
-        // For 64-bit: 16 positions (q[0..8] * d[0..8] produces 16 output bytes)
-        // Output bytes: dividend[k] for k<8, should be 0 for k>=8 (no overflow)
+        // Schoolbook: quotient * divisor + remainder = dividend (mod 2^128)
+        // For 64-bit: 16 positions (q[0..8] * d[0..8] produces 16 output bytes).
+        //   Low 8 bytes (k<8):  expected = val_b[k]  (the dividend bytes).
+        //   High 8 bytes (k≥8): expected = DivCorrHi[k-8].  For DivU rows the
+        //     accompanying constraint forces DivCorrHi = 0 (so this matches
+        //     the original "expected high = 0" behaviour); for DivS rows
+        //     DivCorrHi is bound by a carry chain to the two's-complement
+        //     correction `sq·d_u + sd·q_u + sr − sa  (mod 2^64)`, which is
+        //     the unsigned-schoolbook high produced by signed inputs.
+        //
+        // Phase 16: this fixes #42 (DivS64 with negative dividend rejected).
+        // Without DivCorrHi, the high bytes of `(2^64 − |q|)·d + r` are
+        // non-zero in two's complement, but the AIR demanded zero.
         for k in 0..16usize {
             let mut partial_sum = E::F::zero();
             for i in 0..WORD_SIZE {
@@ -559,18 +581,84 @@ impl BuiltInComponent for CpuChip {
                     partial_sum += div_quotient[i].clone() * val_d[j].clone();
                 }
             }
-            // Add remainder to the low limbs
             if k < WORD_SIZE {
                 partial_sum += div_remainder[k].clone();
             }
-            let carry_in = if k == 0 { E::F::zero() } else { div_mul_carry[k - 1].clone() };
-            // Expected output: dividend byte (val_b[k]) for k<8, 0 for k>=8
-            let expected = if k < WORD_SIZE { val_b[k].clone() } else { E::F::zero() };
-            let c = expected + div_mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            let carry_in = if k == 0 { E::F::zero() } else { div_full_carry(k - 1) };
+            let expected = if k < WORD_SIZE {
+                val_b[k].clone()
+            } else {
+                div_corr_hi[k - WORD_SIZE].clone()
+            };
+            let c = expected + div_full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(div_active.clone() * is_64bit.clone() * c);
         }
 
-        // 32-bit divrem: same but only 8 positions
+        // DivCorrHi must be 0 on non-DivS rows (so the 64-bit schoolbook's
+        // high-byte `expected` collapses back to 0 for DivU).  Holds
+        // unconditionally — even on padding / non-divrem rows DivCorrHi is
+        // filled to 0 so the constraint is trivially satisfied.
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                (E::F::one() - is_div_s[0].clone()) * div_corr_hi[i].clone()
+            );
+        }
+
+        // Phase 16: DivS sign-correction carry chain.
+        //
+        //   high(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^64)
+        //
+        // where sa = SignBitB (dividend), sd = SignBitD (divisor),
+        //       sq = SignBitQ (quotient), sr = SignBitR (remainder).
+        //
+        // Encoded byte-wise as a non-negative addition (sr/sa are scalar
+        // sign bits contributing only at byte 0):
+        //
+        //   div_corr_hi[i] + div_corr_carry[i]·256 + (i==0 ? sa : 0)
+        //     = sq·val_d[i] + sd·div_quotient[i] + carry_in + (i==0 ? sr : 0)
+        //
+        // Carry-out at byte 7 is the 64-bit overflow, discarded.
+        // Gated on is_div_s · (1 − div_by_zero) · is_64bit; on DivU rows
+        // the constraint is dormant and DivCorrHi=0 is enforced separately.
+        // 32-bit DivS still hits the original "expected high = 0" via the
+        // 32-bit schoolbook below — negative DivS32 / RemS32 remains
+        // unbound and is left for a follow-up.
+        {
+            let div_corr_carry = crate::trace::trace_eval!(trace_eval, Column::DivCorrCarry);
+            let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
+            let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
+            // Reuse SignBitB / SignBitD already declared elsewhere in
+            // add_constraints (also referenced by Phase 12c MulUpper).
+            let sign_bit_b_div = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_bit_d_div = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+            let div_s_active = is_div_s[0].clone()
+                * (E::F::one() - div_by_zero[0].clone())
+                * is_64bit.clone();
+            for i in 0..WORD_SIZE {
+                let carry_in = if i == 0 {
+                    E::F::zero()
+                } else {
+                    div_corr_carry[i - 1].clone()
+                };
+                let extra_lhs = if i == 0 { sign_bit_b_div[0].clone() } else { E::F::zero() };
+                let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
+                eval.add_constraint(
+                    div_s_active.clone() * (
+                        div_corr_hi[i].clone()
+                            + div_corr_carry[i].clone() * f256.clone()
+                            + extra_lhs
+                            - sign_bit_q[0].clone() * val_d[i].clone()
+                            - sign_bit_d_div[0].clone() * div_quotient[i].clone()
+                            - carry_in
+                            - extra_rhs
+                    )
+                );
+            }
+        }
+
+        // 32-bit divrem: same but only 8 positions.  Use full 16-bit
+        // carry too (Phase 16) — although 32-bit per-position sums max
+        // out at 4·255² ≈ 260 100 → carry ≈ 1 020, still beyond u8.
         for k in 0..8usize {
             let mut partial_sum = E::F::zero();
             for i in 0..4usize {
@@ -582,9 +670,9 @@ impl BuiltInComponent for CpuChip {
             if k < 4 {
                 partial_sum += div_remainder[k].clone();
             }
-            let carry_in = if k == 0 { E::F::zero() } else { div_mul_carry[k - 1].clone() };
+            let carry_in = if k == 0 { E::F::zero() } else { div_full_carry(k - 1) };
             let expected = if k < 4 { val_b[k].clone() } else { E::F::zero() };
-            let c = expected + div_mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            let c = expected + div_full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(div_active.clone() * is_32bit[0].clone() * c);
         }
 
@@ -1320,6 +1408,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_mul_upper_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
             let f_is_mul_upper_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
             let f_is_mul_upper_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
+            let f_is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1358,6 +1447,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_mul_upper_uu[0].clone());
             tuple.push(f_is_mul_upper_su[0].clone());
             tuple.push(f_is_mul_upper_ss[0].clone());
+            tuple.push(f_is_div_s[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1870,6 +1960,7 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
             trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
             trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
+            trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
             trace.fill_columns(row, flags.is_bitwise, Column::IsBitwise);
             trace.fill_columns(row, flags.is_shift, Column::IsShift);
             trace.fill_columns(row, flags.is_compare, Column::IsCompare);
@@ -1992,7 +2083,12 @@ impl BuiltInProverComponent for CpuChip {
             let mut div_quotient = [0u8; WORD_SIZE];
             let mut div_remainder = [0u8; WORD_SIZE];
             let mut div_mul_carry = [0u8; 16];
+            let mut div_mul_carry_hi = [0u8; 16];
             let mut div_by_zero: u8 = 0;
+            let mut div_corr_hi = [0u8; WORD_SIZE];
+            let mut div_corr_carry = [0u8; WORD_SIZE];
+            let mut sign_bit_q: u8 = 0;
+            let mut sign_bit_r: u8 = 0;
             if flags.is_div_rem {
                 let dividend = val_b;
                 let divisor = val_d;
@@ -2001,15 +2097,53 @@ impl BuiltInProverComponent for CpuChip {
                     // For div-by-zero: result is special (u64::MAX for div, dividend for rem)
                     // quotient/remainder don't matter, constraint is bypassed
                 } else {
-                    let (q, r) = if flags.div_rem_op <= 1 {
-                        // Unsigned div (op 0) or signed div (op 1, prover-trusted for sign)
-                        (dividend / divisor, dividend % divisor)
+                    // Compute the canonical (q, r) the interpreter wrote.
+                    // For DivS / RemS we need *signed* round-toward-zero
+                    // division so the byte-level decomposition matches
+                    // two's complement (e.g. -100/7 → q = -14 →
+                    // q.to_le_bytes() = 0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF).
+                    // Phase 16: previously the trace used unsigned division
+                    // for DivS too — silently wrong on negatives, hidden
+                    // because no positive DivS test had a negative operand.
+                    let (q_bytes, r_bytes): ([u8; 8], [u8; 8]) = if flags.is_div_s {
+                        if flags.is_32bit {
+                            let b32 = dividend as i32;
+                            let d32 = divisor as i32;
+                            // i32 div / rem with the standard PVM
+                            // overflow guard (INT_MIN / -1 = INT_MIN, rem = 0).
+                            let (q32, r32) = if b32 == i32::MIN && d32 == -1 {
+                                (i32::MIN, 0i32)
+                            } else {
+                                (b32 / d32, b32 % d32)
+                            };
+                            // The 64-bit AIR reconstructs `q · d + r = b`
+                            // mod 2^128 only on Is64Bit rows; on 32-bit
+                            // rows the AIR's separate 8-position
+                            // schoolbook still expects high bytes = 0,
+                            // so feed the 32-bit byte pattern with high
+                            // 4 bytes zero (same as result column).
+                            let mut q = [0u8; 8];
+                            let mut r = [0u8; 8];
+                            q[..4].copy_from_slice(&(q32 as u32).to_le_bytes());
+                            r[..4].copy_from_slice(&(r32 as u32).to_le_bytes());
+                            (q, r)
+                        } else {
+                            let bs = dividend as i64;
+                            let ds = divisor as i64;
+                            let (qs, rs) = if bs == i64::MIN && ds == -1 {
+                                (i64::MIN, 0i64)
+                            } else {
+                                (bs / ds, bs % ds)
+                            };
+                            ((qs as u64).to_le_bytes(), (rs as u64).to_le_bytes())
+                        }
                     } else {
-                        // Unsigned rem (op 2) or signed rem (op 3)
-                        (dividend / divisor, dividend % divisor)
+                        // DivU / RemU: unsigned division.
+                        ((dividend / divisor).to_le_bytes(),
+                         (dividend % divisor).to_le_bytes())
                     };
-                    div_quotient = q.to_le_bytes();
-                    div_remainder = r.to_le_bytes();
+                    div_quotient = q_bytes;
+                    div_remainder = r_bytes;
 
                     // Carry chain for q * divisor + remainder = dividend (schoolbook)
                     let divisor_bytes = divisor.to_le_bytes();
@@ -2026,18 +2160,67 @@ impl BuiltInProverComponent for CpuChip {
                         accum[i] += div_remainder[i] as u32;
                     }
                     for k in 0..out_limbs.min(16).saturating_sub(1) {
-                        div_mul_carry[k] = (accum[k] >> 8) as u8;
-                        accum[k + 1] += accum[k] >> 8;
+                        let carry = accum[k] >> 8;
+                        div_mul_carry[k] = carry as u8;
+                        div_mul_carry_hi[k] = (carry >> 8) as u8;
+                        accum[k + 1] += carry;
                     }
                     if out_limbs > 0 && out_limbs <= 16 {
-                        div_mul_carry[out_limbs - 1] = (accum[out_limbs - 1] >> 8) as u8;
+                        let carry = accum[out_limbs - 1] >> 8;
+                        div_mul_carry[out_limbs - 1] = carry as u8;
+                        div_mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
+                    }
+
+                    // Phase 16: DivS sign-correction for the 64-bit
+                    // schoolbook's high bytes.  See the "DivS sign
+                    // correction" constraint block in add_constraints.
+                    //
+                    //   div_corr_hi[i] + carry_out·256 + (i==0 ? sa : 0)
+                    //     = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
+                    if flags.is_div_s && !flags.is_32bit {
+                        let sa = (val_b >> 63) & 1;
+                        let sd = (val_d >> 63) & 1;
+                        sign_bit_q = (div_quotient[7] >> 7) & 1;
+                        sign_bit_r = (div_remainder[7] >> 7) & 1;
+                        let term_d = if sign_bit_q == 1 { val_d } else { 0 };
+                        let term_q = if sd == 1 {
+                            u64::from_le_bytes(div_quotient)
+                        } else {
+                            0
+                        };
+                        let term_d_bytes = term_d.to_le_bytes();
+                        let term_q_bytes = term_q.to_le_bytes();
+                        let mut carry: i32 = 0;
+                        for i in 0..WORD_SIZE {
+                            let extra_lhs = if i == 0 { sa as i32 } else { 0 };
+                            let extra_rhs = if i == 0 { sign_bit_r as i32 } else { 0 };
+                            // s = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
+                            //     − (i==0 ? sa : 0)
+                            let s = term_d_bytes[i] as i32
+                                + term_q_bytes[i] as i32
+                                + carry
+                                + extra_rhs
+                                - extra_lhs;
+                            // Want: div_corr_hi[i] + carry_out·256 = s.
+                            // s ∈ [−1, 511 + carry_in]; with carry_in ≤ 2
+                            // and per-byte cap, take low byte and carry out.
+                            let s_mod = s.rem_euclid(256);
+                            div_corr_hi[i] = s_mod as u8;
+                            carry = (s - s_mod) / 256;
+                            div_corr_carry[i] = carry as u8;
+                        }
                     }
                 }
             }
             trace.fill_columns_bytes(row, &div_quotient, Column::DivQuotient);
             trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
             trace.fill_columns_bytes(row, &div_mul_carry, Column::DivMulCarry);
+            trace.fill_columns_bytes(row, &div_mul_carry_hi, Column::DivMulCarryHi);
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
+            trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
+            trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
+            trace.fill_columns(row, sign_bit_q, Column::SignBitQ);
+            trace.fill_columns(row, sign_bit_r, Column::SignBitR);
 
             // ── Memory access columns ──
             trace.fill_columns(row, flags.is_exit, Column::IsExit);
@@ -2547,6 +2730,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_mul_upper_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
             let f_is_mul_upper_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
             let f_is_mul_upper_ss = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSS);
+            let f_is_div_s = crate::trace::original_base_column!(component_trace, Column::IsDivS);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -2586,6 +2770,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_mul_upper_uu[0].clone());
             tuple.push(f_is_mul_upper_su[0].clone());
             tuple.push(f_is_mul_upper_ss[0].clone());
+            tuple.push(f_is_div_s[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

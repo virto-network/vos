@@ -82,6 +82,14 @@ pub(super) struct OpcodeFlags {
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,
     pub is_mul_upper_ss: bool,
+    /// Phase 16: signed div/rem variants (DivS32/DivS64/RemS32/RemS64).
+    /// Drives the sign-correction at the divrem schoolbook's high bytes:
+    ///   high(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^64)
+    /// where sa/sd/sq/sr are the dividend/divisor/quotient/remainder
+    /// sign bits.  Without this, signed divrem with any negative operand
+    /// fails proving — the schoolbook's high bytes aren't zero in
+    /// two's-complement.
+    pub is_div_s: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -175,12 +183,12 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // DivRem
         Opcode::DivU64 => { f.is_div_rem = true; f.div_rem_op = 0; }
         Opcode::DivU32 => { f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
-        Opcode::DivS64 => { f.is_div_rem = true; f.div_rem_op = 1; }
-        Opcode::DivS32 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_32bit = true; }
+        Opcode::DivS64 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_div_s = true; }
+        Opcode::DivS32 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_32bit = true; f.is_div_s = true; }
         Opcode::RemU64 => { f.is_div_rem = true; f.div_rem_op = 2; }
         Opcode::RemU32 => { f.is_div_rem = true; f.div_rem_op = 2; f.is_32bit = true; }
-        Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; }
-        Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; }
+        Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_div_s = true; }
+        Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; f.is_div_s = true; }
         // Loads
         Opcode::LoadU8 | Opcode::LoadI8 | Opcode::LoadU16 | Opcode::LoadI16
         | Opcode::LoadU32 | Opcode::LoadI32 | Opcode::LoadU64
@@ -240,12 +248,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c):
-/// extract the 26 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16):
+/// extract the 27 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 26] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 27] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -257,5 +265,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 26] {
         f.is_trap as u8, f.is_jump_ind as u8,
         f.is_load_imm_jump_ind as u8,
         f.is_mul_upper_uu as u8, f.is_mul_upper_su as u8, f.is_mul_upper_ss as u8,
+        f.is_div_s as u8,
     ]
 }
