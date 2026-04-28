@@ -50,6 +50,22 @@ test-pvm: build-workers
 test-one name: build-workers
     cargo test -p vos {{name}} -- --nocapture
 
+# Build just the crdt-counter actor (cycle-5 example)
+build-crdt-counter:
+    cd examples/actors/crdt-counter && cargo +nightly -Zjson-target-spec build --release
+
+# Live cross-node CRDT convergence demo. Spins up two networked
+# VosNodes in-process, registers the crdt-counter actor on both
+# under the same replication_id, drives one inc on each side,
+# and asserts both replicas converge to count=2 (~1.4s
+# end-to-end). The integration test is the closest thing to a
+# multi-node demo until vosx manifest support for replication_id
+# lands (cycle 6) — at which point a real two-process
+# `vosx start` setup will work.
+demo-crdt-sync: build-crdt-counter
+    cargo test -p vos --features network --test elf_integration \
+        crdt_counter_converges_across_nodes_live -- --nocapture
+
 # ── Run ─────────────────────────────────────────────────────────────
 
 # Run vosx with the example space manifest
