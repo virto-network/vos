@@ -90,9 +90,18 @@ pub enum Column {
     /// mul_high[0..8]: (val_b * val_d) = result + mul_high * 2^64
     #[size = 8]
     MulHigh,
-    /// Mul partial-product carry chain (16 limbs for schoolbook carries)
+    /// Mul partial-product carry chain (16 limbs, low bytes).  Each
+    /// schoolbook position can produce a carry up to ~16 bits at the
+    /// busiest middle positions (e.g. 0xFFFFFFFF * 0xFFFFFFFF), so the
+    /// carry is split across MulCarry (low byte) and MulCarryHi (high
+    /// byte) for a 16-bit value per position.  Constraint reconstructs
+    /// the full carry as `mul_carry[k] + 256 * mul_carry_hi[k]`.
     #[size = 16]
     MulCarry,
+    /// High byte of the schoolbook carry per position; pairs with MulCarry
+    /// to represent a 16-bit value.  See MulCarry doc.
+    #[size = 16]
+    MulCarryHi,
     /// 1 if this is MulUpper (result = high bits, mul_high = low bits)
     #[size = 1]
     IsMulUpper,

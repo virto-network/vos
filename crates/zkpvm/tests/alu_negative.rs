@@ -239,9 +239,39 @@ fn mul_upper_uu_forged_result_rejected() {
     );
 }
 
-// Note: tests with both 32-bit-fitting unsigned operands (e.g.
-// 0xFFFFFFFF * 0xFFFFFFFF) currently fail proving with
-// ConstraintsNotSatisfied — the schoolbook constraint chain seems to
-// have an issue at certain carry-propagation patterns.  Added to the
-// AIR-tightening backlog; smaller smoke tests above + the negative
-// test still exercise the constraint meaningfully.
+// Phase 15 finding (resolved): 0xFFFFFFFF² used to fail proving because
+// the schoolbook carry per position can exceed u8 (max ~0x3FB at busy
+// middle positions).  Trace fill was truncating to u8 → constraint
+// mismatch.  Fix: split the carry across MulCarry (low byte) +
+// MulCarryHi (high byte); AIR reconstructs the full 16-bit value.
+#[test]
+fn mul_upper_uu_low32_squared() {
+    // 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFF_FFFE_0000_0001 (low 64).
+    // Top 64 bits = 0.
+    prove_three_reg(
+        Opcode::MulUpperUU, 2, 0, 1,
+        0xFFFF_FFFF, 0xFFFF_FFFF,
+        0,
+    );
+}
+
+#[test]
+fn mul64_low32_squared() {
+    // Same operands, plain Mul64: result = low 64 bits.
+    prove_three_reg(
+        Opcode::Mul64, 2, 0, 1,
+        0xFFFF_FFFF, 0xFFFF_FFFF,
+        0xFFFF_FFFE_0000_0001,
+    );
+}
+
+#[test]
+fn mul_upper_uu_full_64bit_squared() {
+    // 0xFFFFFFFFFFFFFFFF² = 0xFFFFFFFFFFFFFFFE_0000000000000001 (128-bit).
+    // Top 64 bits = 0xFFFFFFFFFFFFFFFE.
+    prove_three_reg(
+        Opcode::MulUpperUU, 2, 0, 1,
+        0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_FFFF_FFFE,
+    );
+}

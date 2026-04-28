@@ -169,7 +169,15 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
         let is_mul_upper = crate::trace::trace_eval!(trace_eval, Column::IsMulUpper);
         let is_mul_low = E::F::one() - is_mul_upper[0].clone();
-        // 64-bit mul constraint (positions 0..15)
+        let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
+        // Helper: full 16-bit carry value at position k.
+        let full_carry = |k: usize| -> E::F {
+            mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
+        };
+        // 64-bit mul constraint (positions 0..15).  Carries can reach up to
+        // ~16 bits at busy middle positions (e.g. 0xFFFFFFFF² produces
+        // 0x3FB at position k=3), so the carry is reconstructed as
+        // mul_carry[k] + 256·mul_carry_hi[k].
         for k in 0..16usize {
             let mut partial_sum = E::F::zero();
             for i in 0..WORD_SIZE {
@@ -178,17 +186,18 @@ impl BuiltInComponent for CpuChip {
                     partial_sum += val_b[i].clone() * val_d[j].clone();
                 }
             }
-            let carry_in = if k == 0 { E::F::zero() } else { mul_carry[k - 1].clone() };
-            // Normal mul: output = result ++ mul_high
+            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let out_normal = if k < 8 { result[k].clone() } else { mul_high[k - 8].clone() };
-            // MulUpper: output = mul_high ++ result (swapped)
             let out_upper = if k < 8 { mul_high[k].clone() } else { result[k - 8].clone() };
-            let c_normal = out_normal + mul_carry[k].clone() * f256.clone() - partial_sum.clone() - carry_in.clone();
-            let c_upper = out_upper + mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
+            let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone() * c_normal);
             eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_upper[0].clone() * c_upper);
         }
-        // 32-bit mul constraint (positions 0..7, using low 4 limbs of inputs)
+        // 32-bit mul constraint (positions 0..7, using low 4 limbs).  The
+        // 32-bit case never produces carries > 8 bits (max partial = 4·0xFE01
+        // = 0x3F804 ≈ 18 bits, so carry ≤ 10 bits), but using the same
+        // 16-bit carry representation keeps the constraint shape uniform.
         for k in 0..8usize {
             let mut partial_sum = E::F::zero();
             for i in 0..4usize {
@@ -197,9 +206,9 @@ impl BuiltInComponent for CpuChip {
                     partial_sum += val_b[i].clone() * val_d[j].clone();
                 }
             }
-            let carry_in = if k == 0 { E::F::zero() } else { mul_carry[k - 1].clone() };
+            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let out_byte = if k < 4 { result[k].clone() } else { mul_high[k - 4].clone() };
-            let c = out_byte + mul_carry[k].clone() * f256.clone() - partial_sum - carry_in;
+            let c = out_byte + full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(is_mul[0].clone() * is_32bit[0].clone() * c);
         }
         // 32-bit mul: upper result limbs = 0
@@ -1407,6 +1416,7 @@ impl BuiltInProverComponent for CpuChip {
             // ── Mul auxiliary ──
             let mut mul_high = [0u8; WORD_SIZE];
             let mut mul_carry = [0u8; 16];
+            let mut mul_carry_hi = [0u8; 16];
             if flags.is_mul {
                 let full = (val_b as u128) * (val_d as u128);
                 if flags.is_32bit {
@@ -1430,16 +1440,25 @@ impl BuiltInProverComponent for CpuChip {
                         accum[i + j] += val_b_bytes[i] as u32 * val_d_bytes[j] as u32;
                     }
                 }
+                // Schoolbook carry per position is up to ~16 bits at busy
+                // middle positions (e.g. 0xFFFFFFFF² → carry 0x3FB at k=3).
+                // Split across mul_carry (low byte) and mul_carry_hi (high
+                // byte); the AIR reconstructs as mul_carry + 256·mul_carry_hi.
                 for k in 0..out_limbs.min(16).saturating_sub(1) {
-                    mul_carry[k] = (accum[k] >> 8) as u8;
-                    accum[k + 1] += accum[k] >> 8;
+                    let carry = accum[k] >> 8;
+                    mul_carry[k] = carry as u8;
+                    mul_carry_hi[k] = (carry >> 8) as u8;
+                    accum[k + 1] += carry;
                 }
                 if out_limbs <= 16 && out_limbs > 0 {
-                    mul_carry[out_limbs - 1] = (accum[out_limbs - 1] >> 8) as u8;
+                    let carry = accum[out_limbs - 1] >> 8;
+                    mul_carry[out_limbs - 1] = carry as u8;
+                    mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
                 }
             }
             trace.fill_columns_bytes(row, &mul_high, Column::MulHigh);
             trace.fill_columns_bytes(row, &mul_carry, Column::MulCarry);
+            trace.fill_columns_bytes(row, &mul_carry_hi, Column::MulCarryHi);
 
             // ── Bitwise auxiliary ──
             let mut and_result = [0u8; WORD_SIZE];
