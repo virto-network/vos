@@ -5,15 +5,6 @@ name = "crdt-counter"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["pvm"]
-# `vos` re-exports `#[cfg(feature = "pvm")]`-gated entry points
-# inside the `#[messages]` macro expansion. The cfg evaluates
-# against THIS crate, so we need to define the feature locally
-# (and turn it on by default) for the macro to actually emit
-# `_start` / `accumulate` and the println use-statement.
-pvm = []
-
 [dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
 

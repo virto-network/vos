@@ -565,31 +565,42 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             vos::metadata::encode::<4096>(&#enum_name::META);
     };
 
-    // PVM entry points — only when targeting PVM
+    // PVM entry points — emitted automatically when targeting
+    // riscv64. The cfg gate is intentionally target-based (not
+    // feature-based): every actor crate is built for one target,
+    // and the JAM-aligned PVM target is riscv64. Tying the entry
+    // emission to the architecture means actor crates don't have
+    // to declare a local `pvm` feature, which was a recurring
+    // footgun (omit it → 1 KiB stub binary with no `_start`).
+    //
+    // We assume that anyone targeting riscv64 also has the vos
+    // dep with the `service` (or `pvm`) feature on — there's no
+    // other sensible way to build a PVM actor — which makes the
+    // `vos::println` macro available below.
     let pvm_entries = quote! {
-        #[cfg(feature = "pvm")]
+        #[cfg(target_arch = "riscv64")]
         #[allow(unused_imports)]
         use vos::{print, println, eprint, eprintln};
 
         // PC=0 entry — JAM refine.
-        #[cfg(feature = "pvm")]
+        #[cfg(target_arch = "riscv64")]
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             vos::run_refine_entry::<#actor_name>();
         }
 
         // PC=5 entry — JAM accumulate.
-        #[cfg(feature = "pvm")]
+        #[cfg(target_arch = "riscv64")]
         #[unsafe(no_mangle)]
         pub extern "C" fn accumulate() {
             vos::run_accumulate_entry::<#actor_name>();
         }
 
-        #[cfg(feature = "pvm")]
+        #[cfg(target_arch = "riscv64")]
         #[used]
         static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
 
-        #[cfg(feature = "pvm")]
+        #[cfg(target_arch = "riscv64")]
         #[unsafe(link_section = ".vos_meta")]
         #[used]
         static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
