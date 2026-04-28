@@ -44,9 +44,11 @@ pub enum Column {
     /// Auxiliary carry/borrow (8 limbs). Used by add/sub.
     #[size = 8]
     Carry,
-    /// `mask_next_row` so the Phase 13e terminal-row constraint can read
-    /// the *next* row's IsPadding to assert that any real exit step
-    /// (Trap, Ecall, Trap-via-djump) has no successor real row.
+    /// `mask_next_row` so the Phase 13e-redux terminal-row constraint can
+    /// read the *next* row's IsPadding to assert that any real Trap step
+    /// has no successor real row.  (Original Phase 13e tried to gate this
+    /// on IsExit, which also covers Ecalli and JumpInd — too broad.  The
+    /// per-opcode IsTrap flag is the narrower gate that actually fits.)
     #[size = 1]
     #[mask_next_row]
     IsPadding,
@@ -347,6 +349,12 @@ pub enum Column {
     /// 1 iff this step is `SignExtend16`.
     #[size = 1]
     IsSignExt16,
+    /// Phase 13e-redux: 1 iff this step's opcode is `Trap`.  Distinct from
+    /// `IsExit` (which also covers Ecalli soft exits and JumpInd dynamic
+    /// dispatch).  Used by the terminal-row constraint that forbids any
+    /// successor real row after Trap.
+    #[size = 1]
+    IsTrap,
     /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
     /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
     #[size = 1]

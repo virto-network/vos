@@ -174,10 +174,57 @@ fn prove_unlikely() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Phase 13e: terminal-row constraint.  A real exit step (Trap, Ecall, etc.)
-// must be the final real row of the trace — no successor real row.  This
-// closes the gap where a malicious prover splices a Trap mid-trace and
-// continues execution.
+// Phase 13e-redux: Trap has a per-opcode `IsTrap` flag (distinct from
+// `IsExit`, which also covers Ecalli/JumpInd that legitimately have
+// successors).  The terminal-row constraint
+// `is_real · is_trap · (1 - is_padding_next) = 0` forbids any successor
+// real row after Trap.
+//
+// This test forges a "second Trap" after the real one with all continuity
+// fields (timestamp, pc, gas, regs) carefully consistent — even with the
+// ProgramExecution chain + ProgramMemory tuple all balanced, the IsTrap
+// terminal constraint catches the splice.  Before 13e-redux this test
+// passed (gap open); the flip to `#[should_panic]` was the closure of
+// the documented gap.
+#[test]
+#[should_panic(expected = "failed")]
+fn trap_followed_by_trap_clone_rejected_by_terminal_constraint() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 5;
+    regs[1] = 7;
+
+    let code = vec![
+        Opcode::Fallthrough as u8,
+        Opcode::Add64 as u8, 0x10, 2,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 1, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps.len(), 3);
+    let prev = steps[2].clone();
+    assert_eq!(prev.opcode, Opcode::Trap);
+
+    // Synthesize a "second Trap" step that consistently follows the first.
+    // Trap.next_pc is unconstrained (is_exit=true), so the prover can set
+    // it to any pc with a valid Trap (here: pc=4, the same Trap).
+    let mut fake = prev.clone();
+    fake.timestamp = prev.timestamp + 1;
+    fake.pc = prev.next_pc;
+    fake.regs_before = prev.regs_after;
+    fake.gas_after = prev.gas_after.saturating_sub(1);
+    fake.next_pc = fake.pc;
+    steps.push(fake);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 #[test]
 #[should_panic(expected = "failed")]
 fn trap_mid_trace_rejected() {

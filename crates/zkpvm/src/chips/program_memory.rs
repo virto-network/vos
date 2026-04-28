@@ -120,6 +120,9 @@ pub enum PreprocessedColumn {
     #[size = 1] IsZeroExt16,
     #[size = 1] IsSignExt8,
     #[size = 1] IsSignExt16,
+    /// Phase 13e-redux: per-opcode terminal flag.  True only at PCs whose
+    /// canonical decoding is `Opcode::Trap`.
+    #[size = 1] IsTrap,
 }
 
 impl BuiltInComponent for ProgramMemoryChip {
@@ -161,9 +164,10 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_zero_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsZeroExt16);
         let f_is_sign_ext_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt16);
+        let f_is_trap = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTrap);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 20 flags) — 38 limbs.
+        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 21 flags) — 39 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -191,6 +195,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_zero_ext_16[0].clone());
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
+        tuple.push(f_is_trap[0].clone());
 
         // Producer: negative multiplicity.
         eval.add_to_relation(RelationEntry::new(
@@ -243,6 +248,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsExit, PreprocessedColumn::IsNegAdd,
                     PreprocessedColumn::IsReverseBytes, PreprocessedColumn::IsZeroExt16,
                     PreprocessedColumn::IsSignExt8, PreprocessedColumn::IsSignExt16,
+                    PreprocessedColumn::IsTrap,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -312,9 +318,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_zero_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsZeroExt16);
         let f_is_sign_ext_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt16);
+        let f_is_trap = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTrap);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 38-limb tuple from preprocessed columns.
+        // Build the 39-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -342,6 +349,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_zero_ext_16[0].clone());
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
+        tuple.push(f_is_trap[0].clone());
 
         // Producer (negative multiplicity).
         logup.add_to_relation_with(
@@ -371,7 +379,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 20],
+    flags: [u8; 21],
 }
 
 /// Decode the instruction at `pc` (which must be a basic-block start) into

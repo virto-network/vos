@@ -1216,6 +1216,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_zero_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
             let f_is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
+            let f_is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
 
             let mut tuple: Vec<E::F> = pc.to_vec();
             tuple.push(opcode[0].clone());
@@ -1244,6 +1245,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_zero_ext_16[0].clone());
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
+            tuple.push(f_is_trap[0].clone());
 
             // Paired emissions; ProgramMemoryChip's mult = 2·count_at_pc.
             eval.add_to_relation(RelationEntry::new(
@@ -1259,20 +1261,32 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 13e (REVERTED): terminal-row constraint via is_exit was too
-        // broad — it caught Trap (correctly) but also fired on Ecalli steps
-        // that don't actually exit (e.g. blake2b ECALL followed by Trap).
-        // IsExit in classify_opcode is shared by Trap, Ecalli, Ecall,
-        // JumpInd, LoadImmJumpInd, and the constraint required ALL of them
-        // to be terminal — wrong for soft ECALLs that hand back to host
-        // and resume.  Adding a per-opcode IsTrap column is the right
-        // direction for narrowing the gate; deferring that.
+        // Phase 13e-redux: terminal-row constraint gated on per-opcode IsTrap
         //
-        // The trap-mid-trace-splice gap remains closed in practice via
-        // ProgramBoundaryChip's final-row consumer + per-step
-        // (timestamp, pc) → (next_timestamp, next_pc) chain — a forged
-        // post-Trap step doesn't line up with Trap's next_pc/next_ts and
-        // breaks the chain.  See trap_mid_trace_rejected test.
+        // Forbids a real successor row after Trap.  The first attempt (Phase
+        // 13e) gated on IsExit but that flag is shared with Ecalli (which
+        // legitimately has successors after blake2b hostcalls) and with
+        // JumpInd / LoadImmJumpInd (dynamic dispatch — also has successors).
+        // The narrower IsTrap flag fires only on Opcode::Trap.
+        //
+        // Reads the *next* row's IsPadding via `trace_eval_next_row!` (the
+        // IsPadding column is `#[mask_next_row]`).  When the current row is
+        // a real Trap, the next row's IsPadding must be 1.
+        {
+            let is_padding_next = crate::trace::trace_eval_next_row!(
+                trace_eval, Column::IsPadding
+            );
+            let is_trap_col = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
+            // Boolean witness.
+            eval.add_constraint(
+                is_trap_col[0].clone() * (E::F::one() - is_trap_col[0].clone())
+            );
+            // Terminal: real Trap forbids successor real row.
+            eval.add_constraint(
+                is_real.clone() * is_trap_col[0].clone()
+                    * (E::F::one() - is_padding_next[0].clone())
+            );
+        }
 
         // ════════════════════════════════════════════════════════════════════
         // Phase 15-load-result: bind Result to MemValue on Load steps
@@ -1601,6 +1615,7 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_zero_ext_16, Column::IsZeroExt16);
             trace.fill_columns(row, flags.is_sign_ext_8, Column::IsSignExt8);
             trace.fill_columns(row, flags.is_sign_ext_16, Column::IsSignExt16);
+            trace.fill_columns(row, flags.is_trap, Column::IsTrap);
             // Sign-extend witnesses (Phase 12b-2): high nibble + bit-7 of the
             // sign-source byte.  val_d[0] for SE8, val_d[1] for SE16.  Zero on
             // non-SE rows; the lookup multiplicities below are gated to match.
@@ -2175,6 +2190,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_zero_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsZeroExt16);
             let f_is_sign_ext_8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
+            let f_is_trap = crate::trace::original_base_column!(component_trace, Column::IsTrap);
             let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
             let mut tuple: Vec<_> = pc.to_vec();
@@ -2204,6 +2220,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_zero_ext_16[0].clone());
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
+            tuple.push(f_is_trap[0].clone());
 
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {

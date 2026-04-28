@@ -57,6 +57,12 @@ pub(super) struct OpcodeFlags {
     /// Phase 12b-2: BitManip sign-extend ops.
     pub is_sign_ext_8: bool,
     pub is_sign_ext_16: bool,
+    /// Phase 13e-redux: per-opcode terminal flag.  True only for Opcode::Trap.
+    /// Distinct from `is_exit`, which also covers Ecalli (soft exit, may
+    /// resume) and JumpInd / LoadImmJumpInd (dynamic dispatch).  Drives the
+    /// terminal-row constraint that forbids any successor real row after
+    /// Trap.
+    pub is_trap: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -180,7 +186,7 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Ecalli: host call (execution exits, no ALU constraint)
         Opcode::Ecalli | Opcode::Ecall => { f.is_exit = true; }
         // Trap: causes panic exit
-        Opcode::Trap => { f.is_exit = true; }
+        Opcode::Trap => { f.is_exit = true; f.is_trap = true; }
     }
     f
 }
@@ -210,11 +216,11 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c: extract the 20 category/sub-category flags (in the order
-/// matching ProgramMemoryChip's preprocessed columns) for a given opcode.
+/// Phase 13c (extended in 13e-redux): extract the 21 category/sub-category
+/// flags in the order matching ProgramMemoryChip's preprocessed columns.
 /// Used by ProgramMemoryChip's preprocessed-trace fill to pin flag values
 /// to the canonical classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 20] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 21] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -223,5 +229,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 20] {
         f.is_load as u8, f.is_store as u8, f.is_exit as u8, f.is_neg_add as u8,
         f.is_reverse_bytes as u8, f.is_zero_ext_16 as u8,
         f.is_sign_ext_8 as u8, f.is_sign_ext_16 as u8,
+        f.is_trap as u8,
     ]
 }
