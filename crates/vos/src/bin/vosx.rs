@@ -89,6 +89,15 @@ enum Command {
         /// Disable state persistence entirely (overrides --data-dir).
         #[arg(long)]
         no_persist: bool,
+        /// libp2p multiaddr to listen on. Combines with the
+        /// manifest's `[node].listen`. Inert when vosx was built
+        /// without the `network` feature. Example:
+        ///   --listen /ip4/0.0.0.0/tcp/4001
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
     },
     /// List actors in a manifest
     List {
@@ -110,10 +119,10 @@ fn main() {
         }
 
 
-        Some(Command::Start { manifest, data_dir, no_persist }) => {
+        Some(Command::Start { manifest, data_dir, no_persist, listen, connect }) => {
             let (m, dir) = manifest_from(manifest);
             let pers_dir = if no_persist { None } else { data_dir.as_deref() };
-            cmd_start(&m, &dir, pers_dir);
+            cmd_start(&m, &dir, pers_dir, &listen, &connect);
         }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
@@ -124,7 +133,7 @@ fn main() {
         }
         None => {
             let (m, dir) = manifest_from(cli.file);
-            cmd_start(&m, &dir, Some(Path::new("data")));
+            cmd_start(&m, &dir, Some(Path::new("data")), &[], &[]);
         }
     }
 }
@@ -323,7 +332,13 @@ fn resolve_entry_path_for_listing(
 /// name resolve to that peer's ServiceId. Forward references error
 /// out cleanly. Cross-agent actor refs require the target agent's
 /// children to be registered before the referring agent.
-fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
+fn cmd_start(
+    manifest: &Manifest,
+    dir: &Path,
+    data_dir_cli: Option<&Path>,
+    listen_cli: &[String],
+    connect_cli: &[String],
+) {
     use vos::node::{AgentConfig, VosNode, WorkerConfig};
     use vos::value::Args;
 
@@ -346,6 +361,26 @@ fn cmd_start(manifest: &Manifest, dir: &Path, data_dir_cli: Option<&Path>) {
     let data_dir = data_dir_cli
         .map(|p| p.to_path_buf())
         .or_else(|| manifest.node.data_dir.clone());
+
+    // ── Network startup ─────────────────────────────────────────────
+    //
+    // Combine CLI flags with manifest [node].listen. If anything to
+    // listen on or connect to is configured, start the libp2p
+    // network. Today this just establishes the pipe — peer
+    // connections are logged but no actor traffic flows yet.
+    #[cfg(feature = "network")]
+    let _network = start_network_if_needed(manifest, data_dir.as_deref(), listen_cli, connect_cli);
+    #[cfg(not(feature = "network"))]
+    {
+        if !listen_cli.is_empty() || !connect_cli.is_empty()
+            || !manifest.node.listen.is_empty()
+        {
+            eprintln!(
+                "vosx: warning: --listen / --connect / [node].listen ignored \
+                 (vosx was built without the `network` feature)",
+            );
+        }
+    }
 
     // Sanity: no two declarations share a name across agents,
     // child actors, and workers.
@@ -651,6 +686,58 @@ struct WorkerDef {
     provides: Vec<String>,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
+}
+
+#[cfg(feature = "network")]
+fn start_network_if_needed(
+    manifest: &Manifest,
+    data_dir: Option<&Path>,
+    listen_cli: &[String],
+    connect_cli: &[String],
+) -> Option<vos::network::Network> {
+    use std::str::FromStr;
+
+    let parse = |s: &str, kind: &str| -> Option<libp2p::Multiaddr> {
+        match libp2p::Multiaddr::from_str(s) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("vosx: ignoring invalid {kind} multiaddr '{s}': {e}");
+                None
+            }
+        }
+    };
+
+    let mut listen: Vec<libp2p::Multiaddr> = listen_cli
+        .iter()
+        .filter_map(|s| parse(s, "listen"))
+        .collect();
+    listen.extend(
+        manifest.node.listen.iter().filter_map(|s| parse(s, "listen")),
+    );
+    let connect: Vec<libp2p::Multiaddr> = connect_cli
+        .iter()
+        .filter_map(|s| parse(s, "connect"))
+        .collect();
+
+    if listen.is_empty() && connect.is_empty() {
+        return None;
+    }
+
+    let keypair = match vos::network::load_or_generate_identity(
+        manifest.node.identity.as_deref(),
+        data_dir,
+    ) {
+        Ok(kp) => kp,
+        Err(e) => die(&format!("identity: {e}")),
+    };
+    let peer_id = libp2p::PeerId::from(keypair.public());
+    eprintln!("vosx: node identity {peer_id}");
+
+    Some(vos::network::Network::start(vos::network::NetworkConfig {
+        keypair,
+        listen,
+        bootstrap: connect,
+    }))
 }
 
 /// Resolve the local file path for an entry that may use `path` (dev)

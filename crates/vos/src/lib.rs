@@ -105,6 +105,9 @@ pub mod node;
 #[cfg(feature = "std")]
 pub mod commit;
 
+#[cfg(feature = "network")]
+pub mod network;
+
 /// Re-export for use by generated print!/println! macros.
 #[cfg(feature = "pvm")]
 #[doc(hidden)]
