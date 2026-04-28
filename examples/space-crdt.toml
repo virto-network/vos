@@ -1,0 +1,36 @@
+# Cross-node CRDT replication demo manifest.
+#
+# Run two vosx processes pointing at this same file (with
+# different --data-dir and --listen/--connect flags) and the
+# crdt-counter actor will auto-replicate between them: a state
+# change on one side propagates via the cycle-3 sync ticker
+# and a cycle-4 mid-flight soft restart on the other.
+#
+#   # terminal A
+#   vosx start examples/space-crdt.toml \
+#     --data-dir /tmp/vosx-a \
+#     --listen /ip4/127.0.0.1/tcp/4811
+#
+#   # terminal B
+#   vosx start examples/space-crdt.toml \
+#     --data-dir /tmp/vosx-b \
+#     --connect /ip4/127.0.0.1/tcp/4811
+#
+# `replication_id` defaults to `auto`, which derives it from
+# `blake2b(name || 0x00 || blob)`. Both processes load the same
+# blob with the same name, so they automatically share the
+# replication group without any manual coordination.
+
+space = "crdt-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "counter"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+consistency = "crdt"
+# replication_id is "auto" by default — derived from the blob.
+# Set explicitly only if two replicas ship different blobs of
+# the "same" actor and need to share state anyway:
+#   replication_id = "<64 hex chars>"
+# Or opt out entirely:
+#   replication_id = "off"

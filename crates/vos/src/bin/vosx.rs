@@ -464,9 +464,18 @@ fn cmd_start(
             // Child actors inherit the agent's consistency by
             // default. Override would land as a per-actor field if
             // we ever need it; for now they're all the agent's tier.
-            let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
+            let mut cfg = AgentConfig::new(blob.clone()).with_consistency(a.consistency.into());
             if let Some(d) = &state_dir {
                 cfg = cfg.persist(d);
+            }
+            if a.consistency == ConsistencyDef::Crdt {
+                if let Some(rep_id) = resolve_replication_id(
+                    &child.name,
+                    child.replication_id.as_deref(),
+                    &blob,
+                ) {
+                    cfg = cfg.with_replication_id(rep_id);
+                }
             }
             cfg = apply_init(cfg, &child.init, &elf_data, &name_ids, &provides_map);
 
@@ -487,9 +496,18 @@ fn cmd_start(
         let elf_data = load_file(&path);
         let blob = load_blob(&path);
 
-        let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
+        let mut cfg = AgentConfig::new(blob.clone()).with_consistency(a.consistency.into());
         if let Some(d) = &state_dir {
             cfg = cfg.persist(d);
+        }
+        if a.consistency == ConsistencyDef::Crdt {
+            if let Some(rep_id) = resolve_replication_id(
+                &a.name,
+                a.replication_id.as_deref(),
+                &blob,
+            ) {
+                cfg = cfg.with_replication_id(rep_id);
+            }
         }
         cfg = apply_init(cfg, &a.init, &elf_data, &name_ids, &provides_map);
 
@@ -547,6 +565,56 @@ fn format_provides(provides: &[String]) -> String {
     } else {
         format!(" provides={provides:?}")
     }
+}
+
+/// Translate the manifest's `replication_id` value into the
+/// 32-byte handle [`AgentConfig::with_replication_id`] expects.
+///
+/// - `None` or `Some("auto")` — derive from
+///   `blake2b(name || 0 || blob)`. Two replicas of the same code
+///   under the same name auto-share a group, no manifest
+///   coordination needed.
+/// - `Some("off")` — explicitly opt out of replication; CRDT
+///   actor's DAG stays purely local.
+/// - `Some(hex)` — 64-char hex (`[0-9a-fA-F]{64}`) treated as an
+///   explicit 32-byte id. Useful for cross-cluster pinning where
+///   the auto-derived id won't match because operators ship
+///   different blobs of the "same" actor.
+///
+/// Anything else is a manifest error.
+fn resolve_replication_id(name: &str, spec: Option<&str>, blob: &[u8]) -> Option<[u8; 32]> {
+    match spec.map(str::trim) {
+        Some("off") => None,
+        None | Some("") | Some("auto") => Some(auto_replication_id(name, blob)),
+        Some(hex) => match decode_hex_32(hex) {
+            Some(arr) => Some(arr),
+            None => die(&format!(
+                "'{name}': replication_id must be \"auto\", \"off\", or 64 hex chars; got {hex:?}",
+            )),
+        },
+    }
+}
+
+fn auto_replication_id(name: &str, blob: &[u8]) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(name.as_bytes());
+    h.update(&[0u8]);
+    h.update(blob);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim_start_matches("0x");
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn apply_init(
@@ -669,6 +737,14 @@ struct AgentDef {
     provides: Vec<String>,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
+    /// Replication group identifier. Only meaningful when
+    /// `consistency = "crdt"`. Three forms:
+    ///   - omitted / "auto" — derive from `blake2b(name || 0 || blob)`,
+    ///     so two replicas of the same code+name auto-share a group
+    ///   - 64-char hex string — explicit, for cross-cluster pinning
+    ///   - "off" — no replication (DAG stays purely local)
+    #[serde(default)]
+    replication_id: Option<String>,
     /// Child actors hosted by this agent. Each becomes its own
     /// registered service; the agent typically references them by
     /// name in its own `init` (e.g. `init = { children = [...] }`).
@@ -687,9 +763,12 @@ struct ActorDef {
     provides: Vec<String>,
     #[serde(default)]
     init: BTreeMap<String, toml::Value>,
+    /// Same shape as [`AgentDef::replication_id`].
+    #[serde(default)]
+    replication_id: Option<String>,
 }
 
-#[derive(Deserialize, Default, Clone, Copy, Debug)]
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ConsistencyDef {
     #[default]
