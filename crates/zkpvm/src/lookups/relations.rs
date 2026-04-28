@@ -37,8 +37,12 @@ stwo_constraint_framework::relation!(
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
 //   is_sign_ext_16, is_trap
 pub const PROG_MEMORY_N_FLAGS: usize = 21;
+// Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
+//   + 21 flags + branch_target_canon[4] = 43 limbs.  The branch_target
+//   suffix was added in Phase 15-branch-target-fix so the prog_mem
+//   lookup pins the canonical static-jump / static-branch destination.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
-    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS;
+    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE;
 stwo_constraint_framework::relation!(
     ProgramMemoryLookupElements,
     REL_PROG_MEMORY_LOOKUP_SIZE

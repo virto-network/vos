@@ -312,7 +312,7 @@ pub(crate) fn decode_immediate(decoded_args: &args::Args) -> u64 {
 }
 
 /// Extract branch/jump target address from decoded args (0 if none).
-fn decode_branch_target(decoded_args: &args::Args) -> u32 {
+pub(crate) fn decode_branch_target(decoded_args: &args::Args) -> u32 {
     match decoded_args {
         args::Args::Offset { offset } => *offset as u32,
         args::Args::RegImmOffset { offset, .. } => *offset as u32,

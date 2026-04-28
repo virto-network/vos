@@ -123,6 +123,14 @@ pub enum PreprocessedColumn {
     /// Phase 13e-redux: per-opcode terminal flag.  True only at PCs whose
     /// canonical decoding is `Opcode::Trap`.
     #[size = 1] IsTrap,
+    /// Phase 15-branch-target-fix: canonical absolute target for static
+    /// jumps/branches at this PC, as 4 little-endian bytes.  Computed
+    /// from bytecode as `pc + sign_extend(signed_offset)`.  For ops
+    /// whose target isn't determined by bytecode (JumpInd / LoadImmJumpInd
+    /// — runtime-dependent on regs) and for non-branch/jump ops, this
+    /// is 0.  Bound to CpuChip's BranchTarget column via the prog_mem
+    /// tuple lookup, so a prover can't forge a static-jump destination.
+    #[size = 4] BranchTargetCanon,
 }
 
 impl BuiltInComponent for ProgramMemoryChip {
@@ -165,9 +173,13 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_sign_ext_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt16);
         let f_is_trap = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTrap);
+        let branch_target_canon = crate::trace::preprocessed_trace_eval!(
+            trace_eval, PreprocessedColumn::BranchTargetCanon
+        );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 21 flags) — 39 limbs.
+        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 21 flags,
+        //         branch_target_canon[4]) — 42 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -196,6 +208,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
         tuple.push(f_is_trap[0].clone());
+        tuple.extend_from_slice(&branch_target_canon);
 
         // Producer: negative multiplicity.
         eval.add_to_relation(RelationEntry::new(
@@ -236,6 +249,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                 trace.fill_columns(row, d.rb, PreprocessedColumn::RegB);
                 trace.fill_columns(row, d.rd, PreprocessedColumn::RegD);
                 trace.fill_columns(row, d.imm, PreprocessedColumn::Imm);
+                trace.fill_columns_bytes(
+                    row, &d.branch_target_canon.to_le_bytes(),
+                    PreprocessedColumn::BranchTargetCanon,
+                );
                 // Phase 13c: per-flag fill, in the same order as the lookup tuple.
                 let flag_cols = [
                     PreprocessedColumn::IsAdd, PreprocessedColumn::IsSub,
@@ -319,9 +336,12 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_sign_ext_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt16);
         let f_is_trap = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTrap);
+        let branch_target_canon = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::BranchTargetCanon
+        );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 39-limb tuple from preprocessed columns.
+        // Build the 42-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -350,6 +370,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
         tuple.push(f_is_trap[0].clone());
+        tuple.extend_from_slice(&branch_target_canon);
 
         // Producer (negative multiplicity).
         logup.add_to_relation_with(
@@ -370,7 +391,9 @@ fn chip_log_size(code_len: usize) -> u32 {
     crate::trace::utils::ceil_log2_at_least_lanes(code_len.max(1))
 }
 
-/// Decoded instruction tuple at one PC.  Phase 13c adds the 20-flag bag.
+/// Decoded instruction tuple at one PC.  Phase 13c adds the 20-flag bag,
+/// 13e-redux extends it to 21 flags with IsTrap, 15-branch-target-fix
+/// adds the canonical absolute branch target.
 #[cfg(feature = "prover")]
 struct Decoded {
     opcode: u8,
@@ -380,6 +403,7 @@ struct Decoded {
     rd: u8,
     imm: u64,
     flags: [u8; 21],
+    branch_target_canon: u32,
 }
 
 /// Decode the instruction at `pc` (which must be a basic-block start) into
@@ -399,6 +423,7 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let decoded_args = args::decode_args(code, pc, skip_len as usize, category);
     let (ra, rb, rd) = crate::core::tracing::decode_reg_indices(opcode, &decoded_args);
     let imm = crate::core::tracing::decode_immediate(&decoded_args);
+    let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
     let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
     Decoded {
         opcode: opcode_byte,
@@ -408,5 +433,6 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
         rd: rd as u8,
         imm,
         flags: f,
+        branch_target_canon,
     }
 }

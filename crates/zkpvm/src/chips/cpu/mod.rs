@@ -1217,6 +1217,9 @@ impl BuiltInComponent for CpuChip {
             let f_is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
             let f_is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
+            let branch_target_for_lookup = crate::trace::trace_eval!(
+                trace_eval, Column::BranchTarget
+            );
 
             let mut tuple: Vec<E::F> = pc.to_vec();
             tuple.push(opcode[0].clone());
@@ -1246,6 +1249,13 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
             tuple.push(f_is_trap[0].clone());
+            // Phase 15-branch-target-fix: bind BranchTarget to its canonical
+            // (pc + sign_extend(offset)) for static jumps/branches.  For
+            // JumpInd/LoadImmJumpInd and non-branch ops, the canonical is 0;
+            // the tracer also writes 0 to BranchTarget for those (see
+            // decode_branch_target's default arm), so the lookup balances
+            // without gating.
+            tuple.extend_from_slice(&branch_target_for_lookup);
 
             // Paired emissions; ProgramMemoryChip's mult = 2·count_at_pc.
             eval.add_to_relation(RelationEntry::new(
@@ -2191,6 +2201,9 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_sign_ext_8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
             let f_is_trap = crate::trace::original_base_column!(component_trace, Column::IsTrap);
+            let branch_target_for_lookup = crate::trace::original_base_column!(
+                component_trace, Column::BranchTarget
+            );
             let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
             let mut tuple: Vec<_> = pc.to_vec();
@@ -2221,6 +2234,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
             tuple.push(f_is_trap[0].clone());
+            tuple.extend_from_slice(&branch_target_for_lookup);
 
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {

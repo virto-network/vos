@@ -174,6 +174,57 @@ fn prove_unlikely() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+// Phase 15-branch-target-fix: ProgramMemoryChip now publishes the
+// canonical absolute branch target as a preprocessed `BranchTargetCanon`
+// column (= `pc + sign_extend(signed_offset)` for static jumps/branches,
+// 0 for JumpInd/LoadImmJumpInd and non-branch ops).  CpuChip emits its
+// `BranchTarget` column into the prog_mem tuple, so the existing
+// per-step lookup pins it to the canonical decoding.
+//
+// This test forges a Jump's branch_target/next_pc/successor.pc to
+// dispatch to a *different* valid BB start.  Pre-fix this passed (gap
+// open); post-fix the prog_mem lookup mismatches the canonical and
+// rejects.
+#[test]
+#[should_panic(expected = "failed")]
+fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0;
+    regs[1] = 0;
+
+    // Jump (opcode 40) at pc=0 with offset=4 → honest target=4.
+    // sequential_next_pc = pc + 1 + skip = 0 + 1 + 2 = 3.
+    // pc=3 has Trap (would-be fallthrough, dead under static jump).
+    // pc=4 has Trap (honest jump target).
+    // Both are valid BB starts; both decode to opcode=Trap.
+    let code = vec![
+        Opcode::Jump as u8, // pc=0
+        4, 0,                // pc=1-2: signed_offset = 4 (2 bytes LE)
+        Opcode::Trap as u8, // pc=3: would-be-fallthrough Trap (BB start)
+        Opcode::Trap as u8, // pc=4: honest jump target (BB start)
+    ];
+    let bitmask = vec![1, 0, 0, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps.len(), 2); // Jump → Trap@4
+    assert_eq!(steps[0].opcode, Opcode::Jump);
+    assert_eq!(steps[0].next_pc, 4);
+    assert_eq!(steps[1].pc, 4);
+
+    // Forge: dispatch to pc=3 instead of pc=4.  Both Traps in the program.
+    steps[0].branch_target = 3;
+    steps[0].next_pc = 3;
+    steps[1].pc = 3;
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 // Phase 13e-redux: Trap has a per-opcode `IsTrap` flag (distinct from
 // `IsExit`, which also covers Ecalli/JumpInd that legitimately have
 // successors).  The terminal-row constraint
