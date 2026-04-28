@@ -24,7 +24,7 @@ storage = ["dep:redb", "dep:merkle-crdt"]
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
 # single-node runs (workers, no_std actors) don't need it.
-network = ["std", "dep:libp2p", "dep:tokio"]
+network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
@@ -45,8 +45,9 @@ ureq = { version = "2", optional = true, default-features = false, features = ["
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
 merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
-libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify"], optional = true }
+libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
+async-trait = { version = "0.1", optional = true }
 
 [[bin]]
 name = "vosx"

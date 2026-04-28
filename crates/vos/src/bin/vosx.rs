@@ -750,12 +750,24 @@ fn start_network_if_needed(
         Err(e) => die(&format!("identity: {e}")),
     };
     let peer_id = libp2p::PeerId::from(keypair.public());
-    eprintln!("vosx: node identity {peer_id}");
+    let local_prefix = vos::network::derive_node_prefix(&peer_id);
+    eprintln!(
+        "vosx: node identity {peer_id} (prefix {:#06x})",
+        local_prefix,
+    );
 
+    // Slice 2 wires the libp2p layer up to the request-response
+    // pipe. The Network <-> VosNode bridge (forwarding inbound
+    // Tells into the local routing table, and forwarding non-local
+    // outbox envelopes over the network) lands in the next slice;
+    // for now `inbox` is None and inbound Tells are dropped with a
+    // warn log.
     Some(vos::network::Network::start(vos::network::NetworkConfig {
         keypair,
+        local_prefix,
         listen,
         bootstrap: connect,
+        inbox: None,
     }))
 }
 
