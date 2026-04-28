@@ -1200,3 +1200,266 @@ fn runtime_multiple_services_same_blob() {
 
     assert_ne!(id1, id2);
 }
+
+#[test]
+fn crdt_counter_local_invoke_smoke() {
+    // Sanity check: drive the crdt-counter actor in a single
+    // VosNode (no replication) and verify inc/get round-trip
+    // through invoke. Pre-flight for the cross-node test below.
+    use vos::node::{AgentConfig, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&data).expect("transpile");
+    let mut node = VosNode::new();
+    let id = node.register(AgentConfig::new(blob));
+
+    let inc = |tag: u32| {
+        let m = Msg::new("inc").with("tag", tag);
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+    let get = || {
+        let m = Msg::new("get");
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+
+    let _ = node.invoke(id, inc(1)).expect("inc returns");
+    let _ = node.invoke(id, inc(2)).expect("inc returns");
+    let get_reply = node.invoke(id, get()).expect("get returns");
+    assert!(!get_reply.is_empty(), "get() should reply with encoded u64");
+    let v: vos::value::Value = vos::Decode::decode(&get_reply);
+    assert_eq!(v.as_u64(), Some(2));
+
+    node.shutdown();
+    let _ = node.collect();
+}
+
+#[test]
+#[cfg(feature = "network")]
+fn crdt_counter_converges_across_nodes_live() {
+    // Cycle 5 end-to-end: stand up two networked VosNodes with the
+    // crdt-counter actor registered on both under the same
+    // replication_id. Drive each side once with `inc()`, wait for
+    // the per-replica sync ticker to gossip + the agent's mid-
+    // flight soft restart to refresh state, then invoke `get()`
+    // on each side and assert both report the converged total.
+    //
+    // Path under test:
+    //
+    //   1. local invoke writes a DAG node + state to A's redb
+    //   2. sync ticker on B fetches A's heads (FetchHeads/FetchNode)
+    //   3. ticker calls `insert_node` + `compact_roots` on B's
+    //      redb and pings the agent's sync_rx channel
+    //   4. agent_thread runs `soft_restart_crdt`: reload clock
+    //      from disk, wipe runtime state, replay every log in the
+    //      merged DAG, commit the rebuilt state
+    //   5. invoke `get()` reads the rebuilt count
+    //
+    // Replication of the same actor across nodes is the headline
+    // feature kunekt's CRDT machinery is for; this is the first
+    // test that drives it through a real PVM actor end-to-end.
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    // Each node needs its own data dir + libp2p identity. Make a
+    // shared replication_id so both nodes' counter replicas land
+    // in the same group.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!("vos_crdt_e2e_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        // Use the same derivation our manifest path will use later
+        // — `auto_replication_id`-equivalent — so this test mirrors
+        // production behaviour rather than relying on an arbitrary
+        // sentinel.
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"crdt-counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // ── Networks ────────────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+    });
+
+    // ── Nodes + actors ─────────────────────────────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let counter_a = node_a.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let counter_b = node_b.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+    );
+    node_b.attach_network(net_b);
+
+    // Wait for the Hello handshake before driving anything so the
+    // first inc() doesn't get its sync attempt swallowed.
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            if net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .expect("Hello completes");
+
+    // ── Drive each replica once ────────────────────────────────
+    // Use distinct tags so each replica's EffectLog hashes to a
+    // different CID; otherwise the merkle-DAG dedups identical
+    // events and the two replicas appear pre-converged at the
+    // single-node level.
+    let inc_with_tag = |tag: u32| -> Vec<u8> {
+        let m = Msg::new("inc").with("tag", tag);
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+    let _ = node_a.invoke(counter_a, inc_with_tag(1)).expect("inc on A");
+    let _ = node_b.invoke(counter_b, inc_with_tag(2)).expect("inc on B");
+
+    // ── Wait for convergence ───────────────────────────────────
+    // Both replicas should observe count=2 once the sync ticker
+    // (250ms) plus the agent's soft restart have completed in
+    // both directions.
+    let get_payload = || {
+        let m = Msg::new("get");
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+    let read_count = |node: &VosNode, target: ServiceId| -> Option<u64> {
+        let bytes = node.invoke(target, get_payload())?;
+        let v: vos::value::Value = vos::Decode::decode(&bytes);
+        v.as_u64()
+    };
+
+    // Each replica has applied its OWN inc; cross-node sync is
+    // what brings them to count=2.
+    assert_eq!(read_count(&node_a, counter_a), Some(1));
+    assert_eq!(read_count(&node_b, counter_b), Some(1));
+
+    let count_a = wait_for(
+        || match read_count(&node_a, counter_a) {
+            Some(2) => Some(2),
+            _ => None,
+        },
+        std::time::Duration::from_secs(8),
+    );
+    let count_b = wait_for(
+        || match read_count(&node_b, counter_b) {
+            Some(2) => Some(2),
+            _ => None,
+        },
+        std::time::Duration::from_secs(8),
+    );
+    assert_eq!(count_a, Some(2), "A did not converge to count=2 within deadline");
+    assert_eq!(count_b, Some(2), "B did not converge to count=2 within deadline");
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
+#[cfg(feature = "network")]
+fn wait_for<T>(
+    mut probe: impl FnMut() -> Option<T>,
+    deadline: std::time::Duration,
+) -> Option<T> {
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        if let Some(v) = probe() {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

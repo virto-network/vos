@@ -901,6 +901,17 @@ impl VosNode {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
+    /// Clone of the attached network, if any. Lets external code
+    /// (tests, monitoring, host-side bootstraps) inspect peer
+    /// state — `peer_for_prefix`, `connected_peers`, etc. —
+    /// without taking the network out of the node's ownership.
+    /// Returns `None` until [`attach_network`](Self::attach_network)
+    /// has run.
+    #[cfg(feature = "network")]
+    pub fn network(&self) -> Option<Arc<crate::network::Network>> {
+        self.shared_network.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Clone of the shutdown signal. Set to `true` from any thread
     /// to wind the node down. Useful when the node has been moved
     /// into a [`run_forever`](Self::run_forever) thread.
