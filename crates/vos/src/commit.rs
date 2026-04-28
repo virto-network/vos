@@ -282,6 +282,17 @@ mod crdt {
         db: alloc::sync::Arc<redb::Database>,
         clock: MerkleClock<Blake2b>,
         last_state: Vec<u8>,
+        /// Serializes the agent's commits with the sync ticker's
+        /// inserts/compactions when multiple `CrdtCommit`s share
+        /// the same database. The lock is held only for the
+        /// duration of one write — both paths refresh `clock` /
+        /// `last_state` from disk inside the critical section so
+        /// the view they write against is always the latest.
+        ///
+        /// When a strategy isn't shared (regular `open` / single-
+        /// node Local-style use), the lock is a fresh per-instance
+        /// `Mutex` that's always uncontended.
+        commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
     }
 
     impl CrdtCommit {
@@ -289,9 +300,7 @@ mod crdt {
         /// Merkle-Clock roots from its `state` table.
         pub fn open(path: &std::path::Path) -> Result<Self, CommitError> {
             let db = alloc::sync::Arc::new(redb::Database::create(path)?);
-            let clock = load_clock(&db).unwrap_or_default();
-            let last_state = load_state(&db).unwrap_or_default();
-            Ok(Self { db, clock, last_state })
+            Ok(Self::with_state(db, alloc::sync::Arc::new(std::sync::Mutex::new(()))))
         }
 
         /// Build a `CrdtCommit` on a pre-opened, shared
@@ -300,10 +309,35 @@ mod crdt {
         /// `SyncProvider`) without double-opening — redb is
         /// exclusive on file open, so this is the only way to
         /// share access.
+        ///
+        /// The returned strategy gets a fresh per-instance commit
+        /// lock; use [`from_db_arc_locked`](Self::from_db_arc_locked)
+        /// when multiple `CrdtCommit`s over the same db need to
+        /// serialize their writes (agent thread + sync ticker).
         pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>) -> Self {
+            Self::with_state(db, alloc::sync::Arc::new(std::sync::Mutex::new(())))
+        }
+
+        /// Build a `CrdtCommit` sharing both an `Arc<Database>`
+        /// AND an `Arc<Mutex<()>>` with another instance — agent
+        /// thread + sync ticker both pointing at the same redb
+        /// file need this to serialize the agent's
+        /// `commit_with_log` against the ticker's
+        /// `insert_node` + `compact_roots`.
+        pub fn from_db_arc_locked(
+            db: alloc::sync::Arc<redb::Database>,
+            commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
+        ) -> Self {
+            Self::with_state(db, commit_lock)
+        }
+
+        fn with_state(
+            db: alloc::sync::Arc<redb::Database>,
+            commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
+        ) -> Self {
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
-            Self { db, clock, last_state }
+            Self { db, clock, last_state, commit_lock }
         }
 
         /// Borrow the underlying redb database.
@@ -369,6 +403,10 @@ mod crdt {
             if read_dag_node(&self.db, cid)?.is_some() {
                 return Ok(false);
             }
+            // Serialize with concurrent commit_with_log on the agent
+            // thread so we never split the (DAG node + ROOTS_KEY)
+            // pair across an agent write.
+            let _guard = self.commit_lock.lock().expect("commit_lock poisoned");
             let txn = self.db.begin_write()?;
             {
                 let mut table = txn.open_table(DAG_TABLE)?;
@@ -388,6 +426,14 @@ mod crdt {
             // We walk via direct redb access (rather than
             // RedbStore) to avoid double-opening the database.
             // Pure read transaction — safe to overlap with writes.
+            //
+            // Serialize with the agent's commit_with_log: union
+            // our in-memory candidates with the persisted root
+            // set so a concurrent agent commit's new root isn't
+            // dropped from ROOTS_KEY when we write back.
+            let _guard = self.commit_lock.lock().expect("commit_lock poisoned");
+            let persisted = load_clock(&self.db).unwrap_or_default();
+            self.clock.add_roots(persisted.roots().iter().cloned());
             let candidates = self.clock.roots().clone();
             if candidates.len() <= 1 {
                 return self.persist_roots();
@@ -594,6 +640,16 @@ mod crdt {
             if state == self.last_state.as_slice() {
                 return Ok(());
             }
+
+            // Hold the commit lock across "compute new DAG node
+            // referencing current roots" + "write {state, ROOTS_KEY,
+            // new node}" so a concurrent sync ticker can't insert
+            // a peer node and update ROOTS_KEY between the read of
+            // self.clock.roots() and our write back. Refresh the
+            // clock from disk under the lock so we see anything
+            // the ticker just merged in.
+            let _guard = self.commit_lock.lock().expect("commit_lock poisoned");
+            self.clock = load_clock(&self.db).unwrap_or_default();
 
             // Compute the new DAG node (if any) off-transaction so
             // the write txn is short.

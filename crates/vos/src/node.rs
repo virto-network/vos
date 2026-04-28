@@ -106,6 +106,14 @@ pub struct AgentConfig {
     #[cfg(feature = "storage")]
     #[doc(hidden)]
     pub pre_opened_db: Option<Arc<redb::Database>>,
+    /// Companion to `pre_opened_db`: the commit lock that
+    /// serializes the agent thread's `commit_with_log` against
+    /// the sync ticker's `insert_node` + `compact_roots`. Both
+    /// must hand it to their `CrdtCommit::from_db_arc_locked`
+    /// for the serialization to actually happen.
+    #[cfg(feature = "storage")]
+    #[doc(hidden)]
+    pub pre_opened_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl AgentConfig {
@@ -120,6 +128,8 @@ impl AgentConfig {
             replication_id: None,
             #[cfg(feature = "storage")]
             pre_opened_db: None,
+            #[cfg(feature = "storage")]
+            pre_opened_lock: None,
         }
     }
 
@@ -352,12 +362,26 @@ pub struct VosNode {
     /// [`attach_network`](Self::attach_network) runs.
     #[cfg(feature = "network")]
     pub(crate) shared_network: SharedNetwork,
-    /// Map: replication group → shared `redb::Database` of the
-    /// local replica. Populated by `register` whenever a CRDT
-    /// actor with a `replication_id` is added. Read by
-    /// [`NodeSyncProvider`] to answer inbound sync queries.
+    /// Map: replication group → local replica handle.
+    /// Populated by `register` whenever a CRDT actor with a
+    /// `replication_id` is added. Read by [`NodeSyncProvider`]
+    /// (db only) to answer inbound sync queries; the agent
+    /// thread and sync ticker share the `commit_lock` to
+    /// serialize their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
-    pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], Arc<redb::Database>>>>,
+    pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+}
+
+/// Shared handle for one CRDT replication group. The same
+/// `Arc<Database>` powers the agent's `CrdtCommit` and the
+/// sync layer's `SyncProvider`; the `commit_lock` serializes
+/// the agent's `commit_with_log` against the sync ticker's
+/// `insert_node` + `compact_roots`.
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Clone)]
+pub(crate) struct ReplicaSlot {
+    pub db: Arc<redb::Database>,
+    pub commit_lock: Arc<Mutex<()>>,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -383,21 +407,22 @@ struct LocalInvokeDispatcher {
 /// `SyncProvider` impl backed by the node's `crdt_replicas` map.
 /// Looks up the shared `Arc<Database>` for the replication group
 /// and reads roots / DAG nodes directly through the public
-/// `commit::read_roots` / `commit::read_dag_node` helpers.
+/// `commit::read_roots` / `commit::read_dag_node` helpers. Reads
+/// are pure redb read txns — they don't need the commit lock.
 #[cfg(all(feature = "network", feature = "storage"))]
 struct NodeSyncProvider {
-    replicas: Arc<Mutex<HashMap<[u8; 32], Arc<redb::Database>>>>,
+    replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
 impl crate::network::SyncProvider for NodeSyncProvider {
     fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
-        let db = self.replicas.lock().ok()?.get(replication_id).cloned()?;
-        crate::commit::read_roots(&db).ok()
+        let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        crate::commit::read_roots(&slot.db).ok()
     }
     fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
-        let db = self.replicas.lock().ok()?.get(replication_id).cloned()?;
-        crate::commit::read_dag_node(&db, cid).ok().flatten()
+        let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
     }
 }
 
@@ -529,7 +554,7 @@ enum SyncOutcome {
 fn sync_loop(
     rep_id: [u8; 32],
     shared_network: SharedNetwork,
-    db: Arc<redb::Database>,
+    slot: ReplicaSlot,
     shutdown: Arc<AtomicBool>,
     notifier: Option<mpsc::Sender<()>>,
 ) {
@@ -563,7 +588,7 @@ fn sync_loop(
 
         let mut any_inserted = false;
         for peer in targets {
-            match sync_with_peer(&net, peer, &rep_id, &db) {
+            match sync_with_peer(&net, peer, &rep_id, &slot) {
                 Ok(SyncOutcome::PeerHasGroup { inserted }) => {
                     confirmed.insert(peer);
                     if inserted {
@@ -604,7 +629,7 @@ fn sync_with_peer(
     net: &crate::network::Network,
     peer: libp2p::PeerId,
     rep_id: &[u8; 32],
-    db: &Arc<redb::Database>,
+    slot: &ReplicaSlot,
 ) -> Result<SyncOutcome, crate::commit::CommitError> {
     use crate::commit::CrdtCommit;
     use crate::effect_log::EffectLog;
@@ -619,7 +644,7 @@ fn sync_with_peer(
         return Ok(SyncOutcome::PeerEmpty);
     }
 
-    let mut cc = CrdtCommit::from_db_arc(db.clone());
+    let mut cc = CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone());
     let mut frontier: Vec<[u8; 32]> = heads.clone();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut inserted_any = false;
@@ -824,14 +849,18 @@ impl VosNode {
                 let path = config.db_path(id)?;
                 match redb::Database::create(&path) {
                     Ok(db) => {
-                        let arc = Arc::new(db);
+                        let slot = ReplicaSlot {
+                            db: Arc::new(db),
+                            commit_lock: Arc::new(Mutex::new(())),
+                        };
                         self.crdt_replicas
                             .lock()
                             .unwrap()
-                            .insert(rep_id, arc.clone());
-                        config.pre_opened_db = Some(arc.clone());
+                            .insert(rep_id, slot.clone());
+                        config.pre_opened_db = Some(slot.db.clone());
+                        config.pre_opened_lock = Some(slot.commit_lock.clone());
                         let (sync_tx, sync_rx) = mpsc::channel::<()>();
-                        self.spawn_sync_thread(rep_id, arc, Some(sync_tx));
+                        self.spawn_sync_thread(rep_id, slot, Some(sync_tx));
                         Some(sync_rx)
                     }
                     Err(e) => {
@@ -1012,14 +1041,17 @@ impl VosNode {
         &mut self,
         rep_id: [u8; 32],
         db_path: &std::path::Path,
-    ) -> Arc<redb::Database> {
-        let arc = Arc::new(redb::Database::create(db_path).expect("create db"));
+    ) -> ReplicaSlot {
+        let slot = ReplicaSlot {
+            db: Arc::new(redb::Database::create(db_path).expect("create db")),
+            commit_lock: Arc::new(Mutex::new(())),
+        };
         self.crdt_replicas
             .lock()
             .unwrap()
-            .insert(rep_id, arc.clone());
-        self.spawn_sync_thread(rep_id, arc.clone(), None);
-        arc
+            .insert(rep_id, slot.clone());
+        self.spawn_sync_thread(rep_id, slot.clone(), None);
+        slot
     }
 
     /// Spawn the per-replica sync ticker. Detached: exits via the
@@ -1031,12 +1063,12 @@ impl VosNode {
     fn spawn_sync_thread(
         &self,
         rep_id: [u8; 32],
-        db: Arc<redb::Database>,
+        slot: ReplicaSlot,
         notifier: Option<mpsc::Sender<()>>,
     ) {
         let shared_network = self.shared_network.clone();
         let shutdown = self.shutdown.clone();
-        thread::spawn(move || sync_loop(rep_id, shared_network, db, shutdown, notifier));
+        thread::spawn(move || sync_loop(rep_id, shared_network, slot, shutdown, notifier));
     }
 
     /// Install a synchronous-invoke responder under a fresh
@@ -1636,7 +1668,14 @@ fn build_agent_strategy(
             }
             Consistency::Crdt => {
                 if let Some(arc) = &config.pre_opened_db {
-                    return Ok(Box::new(crate::commit::CrdtCommit::from_db_arc(arc.clone())));
+                    let cc = match &config.pre_opened_lock {
+                        Some(lock) => crate::commit::CrdtCommit::from_db_arc_locked(
+                            arc.clone(),
+                            lock.clone(),
+                        ),
+                        None => crate::commit::CrdtCommit::from_db_arc(arc.clone()),
+                    };
+                    return Ok(Box::new(cc));
                 }
                 let path = config.db_path(id).ok_or_else(|| {
                     crate::commit::CommitError::Config(

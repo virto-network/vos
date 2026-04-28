@@ -1033,15 +1033,18 @@ mod tests {
         // Two VosNodes, each with a test replica + a sync ticker
         // (install_test_replica spawns one).
         let mut node_a = VosNode::with_prefix(prefix_a);
-        let arc_a = node_a.install_test_replica(rep_id, &path_a);
+        let slot_a = node_a.install_test_replica(rep_id, &path_a);
         let mut node_b = VosNode::with_prefix(prefix_b);
-        let _arc_b = node_b.install_test_replica(rep_id, &path_b);
+        let slot_b = node_b.install_test_replica(rep_id, &path_b);
 
         // Drive A: two CRDT commits.
         let log1 = EffectLog::for_msg(b"first".to_vec());
         let log2 = EffectLog::for_msg(b"second".to_vec());
         {
-            let mut cc_a = CrdtCommit::from_db_arc(arc_a.clone());
+            let mut cc_a = CrdtCommit::from_db_arc_locked(
+                slot_a.db.clone(),
+                slot_a.commit_lock.clone(),
+            );
             cc_a.commit_with_log(b"v1", &log1).unwrap();
             cc_a.commit_with_log(b"v2", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
@@ -1062,7 +1065,10 @@ mod tests {
                 // roots. The sync ticker writes through the same
                 // redb file, so a fresh CrdtCommit picks up the
                 // merged state.
-                let cc = CrdtCommit::from_db_arc(_arc_b.clone());
+                let cc = CrdtCommit::from_db_arc_locked(
+                    slot_b.db.clone(),
+                    slot_b.commit_lock.clone(),
+                );
                 if cc.root_bytes().is_empty() {
                     None
                 } else {
@@ -1080,7 +1086,10 @@ mod tests {
         assert_eq!(logs[1], log2);
 
         // Roots match too.
-        let cc_a = CrdtCommit::from_db_arc(arc_a);
+        let cc_a = CrdtCommit::from_db_arc_locked(
+            slot_a.db.clone(),
+            slot_a.commit_lock.clone(),
+        );
         assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
 
         let _ = node_a.collect();
@@ -1137,19 +1146,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir_b).unwrap();
         let db_path_b = dir_b.join("replica.redb");
-        let _arc_b = node_b.install_test_replica(rep_id, &db_path_b);
+        let _slot_b = node_b.install_test_replica(rep_id, &db_path_b);
 
-        // Drop _arc_b out of scope so CrdtCommit::from_db_arc gets
-        // *the same* Arc through the map (we keep one in the map).
-        // Drive a couple of CRDT commits through a second Arc clone.
-        let arc_b_for_writes = node_b
+        // Drive a couple of CRDT commits through a CrdtCommit
+        // built from the same shared slot the sync layer reads.
+        let slot_for_writes = node_b
             .crdt_replicas
             .lock()
             .unwrap()
             .get(&rep_id)
             .cloned()
             .unwrap();
-        let mut cc = CrdtCommit::from_db_arc(arc_b_for_writes);
+        let mut cc = CrdtCommit::from_db_arc_locked(
+            slot_for_writes.db,
+            slot_for_writes.commit_lock,
+        );
         cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec())).unwrap();
         cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
         let expected_root = cc.root_bytes()[0];
