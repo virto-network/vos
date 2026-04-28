@@ -8,16 +8,30 @@
 //! the `registry::Client` host helper):
 //!
 //! - `announce(name, owner_prefix, service_id, [roles])` —
-//!   register / replace an entry.
+//!   register / replace an entry. Bumps the entry's `last_seen`.
+//! - `heartbeat(name)` — keepalive ping; bumps `last_seen` for
+//!   an existing entry. No-op when the name isn't registered.
 //! - `remove(name)` — clean shutdown.
 //! - `lookup(name) -> Option<RegistryEntry>` — point query;
 //!   replies as rkyv-encoded bytes inside `Value::Bytes`, or
 //!   `Value::Unit` when the name isn't registered.
 //! - `list(prefix, after, limit) -> Page` — sorted scan of
 //!   names starting with `prefix`, exclusive cursor `after`,
-//!   capped at [`registry::MAX_PAGE_SIZE`].
+//!   capped at [`registry::MAX_PAGE_SIZE`]. Page includes the
+//!   registry's current `clock` so callers can age-filter the
+//!   returned entries.
 //! - `by_role(role, prefix, after, limit) -> Page` — same
 //!   pagination shape, filtered by role membership.
+//!
+//! ## Liveness model
+//!
+//! The registry never reads wall-clock time (PVM is deterministic
+//! and replays); instead it maintains a monotone `tick` counter
+//! that bumps on every `announce`/`heartbeat`. Each entry's
+//! `last_seen` records the tick at its most recent touch, and
+//! `Page::clock` snapshots the current tick. Callers compute
+//! freshness by `clock - last_seen` against an age threshold of
+//! their own choosing — see [`RegistryEntry::is_alive_within`].
 
 use vos::{actor, messages};
 
@@ -32,6 +46,10 @@ struct Registry {
     /// instructions (e.g. `slt` with `x0` as rs1) for the
     /// riscv64em-javm target — see `reference_pvm_build` notes.
     entries: Vec<(String, EntryStored)>,
+    /// Monotone tick counter — incremented on every `announce`
+    /// and `heartbeat`. Surfaced as `Page::clock` so callers
+    /// can age-filter entries.
+    tick: u64,
 }
 
 /// Stored shape — like [`registry::RegistryEntry`] but without
@@ -43,6 +61,8 @@ struct EntryStored {
     owner_prefix: u16,
     service_id: u16,
     roles: Vec<String>,
+    /// Tick at the most recent `announce` or `heartbeat`.
+    last_seen: u64,
 }
 
 #[messages]
@@ -50,6 +70,7 @@ impl Registry {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -65,10 +86,12 @@ impl Registry {
         service_id: u32,
         roles: Vec<String>,
     ) {
+        self.tick += 1;
         let stored = EntryStored {
             owner_prefix: owner_prefix as u16,
             service_id: service_id as u16,
             roles,
+            last_seen: self.tick,
         };
         // Sorted-insert: replace on equal key, otherwise insert
         // at the matching position. Linear in the entry count;
@@ -88,6 +111,22 @@ impl Registry {
         }
         if !found {
             self.entries.insert(idx, (name, stored));
+        }
+    }
+
+    /// Liveness ping. Bumps the entry's `last_seen` to the
+    /// current `tick`. No-op when the name isn't registered —
+    /// callers should `announce` first.
+    #[msg]
+    async fn heartbeat(&mut self, name: String) {
+        self.tick += 1;
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                self.entries[idx].1.last_seen = self.tick;
+                return;
+            }
+            idx += 1;
         }
     }
 
@@ -118,6 +157,7 @@ impl Registry {
                     owner_prefix: stored.owner_prefix,
                     service_id: stored.service_id,
                     roles: stored.roles.clone(),
+                    last_seen: stored.last_seen,
                 };
                 return encode_archived(&entry);
             }
@@ -131,7 +171,7 @@ impl Registry {
     /// is capped at [`MAX_PAGE_SIZE`].
     #[msg]
     async fn list(&self, prefix: String, after: String, limit: u32) -> Vec<u8> {
-        let page = collect_page(&self.entries, &prefix, &after, limit, &String::new());
+        let page = collect_page(&self.entries, &prefix, &after, limit, &String::new(), self.tick);
         encode_archived(&page)
     }
 
@@ -139,7 +179,7 @@ impl Registry {
     /// contains `role`.
     #[msg]
     async fn by_role(&self, role: String, prefix: String, after: String, limit: u32) -> Vec<u8> {
-        let page = collect_page(&self.entries, &prefix, &after, limit, &role);
+        let page = collect_page(&self.entries, &prefix, &after, limit, &role, self.tick);
         encode_archived(&page)
     }
 }
@@ -153,6 +193,7 @@ fn collect_page(
     after: &str,
     limit: u32,
     role_filter: &str,
+    clock: u64,
 ) -> Page {
     let mut limit = limit;
     if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -207,8 +248,9 @@ fn collect_page(
             owner_prefix: stored.owner_prefix,
             service_id: stored.service_id,
             roles: stored.roles.clone(),
+            last_seen: stored.last_seen,
         });
     }
 
-    Page { entries: out, next }
+    Page { entries: out, next, clock }
 }

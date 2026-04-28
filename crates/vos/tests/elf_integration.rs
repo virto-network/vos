@@ -1809,3 +1809,94 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     let _ = node_b.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_heartbeat_bumps_last_seen() {
+    // Cycle 9 phase 4 (slice 4a): a `heartbeat(name)` invoke
+    // bumps the entry's `last_seen` while leaving the rest of
+    // the row alone. Single-node setup — the wire shape and
+    // tick semantics are what's under test, not network-side
+    // convergence (the existing
+    // `registry_announce_lookup_and_list_converge_across_nodes`
+    // already exercises that).
+    use registry_client::{Client, PageRequest};
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_hb_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut node = VosNode::new();
+    let _ = node.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_replication_id(registry::replication_id("hb-test")),
+        ServiceId::REGISTRY,
+    );
+
+    let client = Client::local(&node);
+    client.announce("kunekt/alpha", 0, 11, &["worker".to_string()]).expect("announce alpha");
+    client.announce("kunekt/beta", 0, 22, &[]).expect("announce beta");
+
+    // Initial state: announce assigns last_seen in tick order.
+    let alpha_t0 = client.lookup("kunekt/alpha").unwrap().expect("alpha");
+    let beta_t0 = client.lookup("kunekt/beta").unwrap().expect("beta");
+    assert!(alpha_t0.last_seen < beta_t0.last_seen,
+        "later announce should have higher last_seen: alpha={} beta={}",
+        alpha_t0.last_seen, beta_t0.last_seen);
+
+    // Page snapshot exposes the registry's current tick.
+    let page0 = client.list(PageRequest::new().with_prefix("kunekt/")).unwrap();
+    assert!(page0.clock >= beta_t0.last_seen, "page clock {} < beta {}",
+        page0.clock, beta_t0.last_seen);
+
+    // Heartbeat alpha — last_seen should advance past beta's.
+    client.heartbeat("kunekt/alpha").expect("heartbeat alpha");
+    let alpha_t1 = client.lookup("kunekt/alpha").unwrap().expect("alpha post-hb");
+    assert!(alpha_t1.last_seen > beta_t0.last_seen,
+        "heartbeat should bump alpha's last_seen above beta's: alpha={} beta={}",
+        alpha_t1.last_seen, beta_t0.last_seen);
+    // Other fields untouched.
+    assert_eq!(alpha_t1.owner_prefix, alpha_t0.owner_prefix);
+    assert_eq!(alpha_t1.service_id, alpha_t0.service_id);
+    assert_eq!(alpha_t1.roles, alpha_t0.roles);
+    // Beta unchanged.
+    let beta_t1 = client.lookup("kunekt/beta").unwrap().expect("beta still here");
+    assert_eq!(beta_t1.last_seen, beta_t0.last_seen, "heartbeat should not touch siblings");
+
+    // Heartbeat for an unknown name is a silent no-op.
+    client.heartbeat("kunekt/ghost").expect("heartbeat ghost (no-op)");
+    assert!(client.lookup("kunekt/ghost").unwrap().is_none(),
+        "heartbeat should not create entries");
+
+    // is_alive_within helper: alpha is fresh against the latest
+    // page clock; beta has aged at least 2 ticks (alpha's announce,
+    // alpha's heartbeat).
+    let page1 = client.list(PageRequest::new().with_prefix("kunekt/")).unwrap();
+    assert!(alpha_t1.is_alive_within(page1.clock, 1), "alpha should be fresh");
+    assert!(!beta_t0.is_alive_within(page1.clock, 1),
+        "beta should age past max_age=1: clock={} beta.last_seen={}",
+        page1.clock, beta_t0.last_seen);
+
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}

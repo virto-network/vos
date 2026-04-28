@@ -62,6 +62,13 @@ pub struct RegistryEntry {
     /// Local id (low 16 bits) on the owner node.
     pub service_id: u16,
     pub roles: Vec<String>,
+    /// Logical-time tick at which the registry last observed this
+    /// entry — bumped on `announce` and on every `heartbeat`.
+    /// Compare against [`Page::clock`] (or another entry's
+    /// `last_seen`) to gauge freshness; the registry never
+    /// touches wall-clock time, so this is purely a CRDT-friendly
+    /// monotone counter — see [`is_alive_within`].
+    pub last_seen: u64,
 }
 
 impl RegistryEntry {
@@ -69,6 +76,14 @@ impl RegistryEntry {
     /// service_id)`. Inverse of `ServiceId::new(prefix, local)`.
     pub fn full_service_id(&self) -> u32 {
         ((self.owner_prefix as u32) << 16) | (self.service_id as u32)
+    }
+
+    /// Returns `true` when `clock - self.last_seen <= max_age`.
+    /// `clock` is typically a [`Page::clock`] snapshot. Saturating
+    /// math: if the entry's `last_seen` somehow exceeds `clock`,
+    /// treat it as alive.
+    pub fn is_alive_within(&self, clock: u64, max_age: u64) -> bool {
+        clock.saturating_sub(self.last_seen) <= max_age
     }
 }
 
@@ -125,6 +140,10 @@ pub struct Page {
     /// Cursor to pass as the next request's `after`. Empty string
     /// when this page exhausts the result set.
     pub next: String,
+    /// Registry's tick at the moment this page was assembled. Use
+    /// with [`RegistryEntry::is_alive_within`] to filter stale
+    /// entries client-side.
+    pub clock: u64,
 }
 
 impl Page {
@@ -132,6 +151,7 @@ impl Page {
         Self {
             entries: Vec::new(),
             next: String::new(),
+            clock: 0,
         }
     }
 

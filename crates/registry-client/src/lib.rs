@@ -63,6 +63,14 @@ impl<'a> Client<'a> {
         self.invoke(m).map(|_| ())
     }
 
+    /// Liveness ping. Bumps the entry's `last_seen` so the
+    /// registry's tick — and the entry's freshness — advances.
+    /// No-op when the name isn't registered.
+    pub fn heartbeat(&self, name: &str) -> Result<(), ClientError> {
+        self.invoke(Msg::new("heartbeat").with("name", name))
+            .map(|_| ())
+    }
+
     /// Remove a service entry. No-op if the name isn't registered.
     pub fn remove(&self, name: &str) -> Result<(), ClientError> {
         self.invoke(Msg::new("remove").with("name", name))
