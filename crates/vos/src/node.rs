@@ -441,6 +441,42 @@ fn replay_dag_into_runtime(
     Ok(())
 }
 
+/// Soft restart for a CRDT actor. Picks up whatever the sync
+/// ticker merged into our redb file, throws away the locally-
+/// derived runtime state, replays every log in the merged DAG,
+/// and commits the rebuilt state. Idempotent — calling it twice
+/// in a row produces the same final state.
+///
+/// Called from the agent thread between dispatches when the
+/// sync notifier fires, so blocking is fine. Returns `Err(msg)`
+/// only on host-side errors (corrupt strategy, non-deterministic
+/// handler) — caller logs and tears the agent down.
+#[cfg(feature = "storage")]
+fn soft_restart_crdt(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+    strategy: &mut dyn crate::commit::CommitStrategy,
+) -> Result<(), String> {
+    strategy
+        .reload()
+        .map_err(|e| format!("strategy.reload: {e}"))?;
+    runtime
+        .storage
+        .delete(svc_id, crate::lifecycle::STATE_KEY_BYTES);
+    replay_dag_into_runtime(runtime, svc_id, strategy)?;
+    let state = runtime
+        .storage
+        .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
+        .map(|v| v.to_vec())
+        .unwrap_or_default();
+    if !state.is_empty() {
+        strategy
+            .commit(&state)
+            .map_err(|e| format!("post-soft-restart commit: {e}"))?;
+    }
+    Ok(())
+}
+
 /// How often the per-replica sync ticker fires. Short enough that
 /// integration tests can observe convergence in a few hundred ms,
 /// long enough that idle clusters don't flood the wire.
@@ -458,13 +494,17 @@ const SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Runs detached — exits when `shutdown` is set or every clone
 /// of the relevant `Arc`s has been dropped (signalling the
-/// network/node/db they reference is gone).
+/// network/node/db they reference is gone). When `notifier` is
+/// `Some`, sends `()` after every cycle that brought in at
+/// least one new node so the agent thread can soft-restart and
+/// pick up the merged state.
 #[cfg(all(feature = "network", feature = "storage"))]
 fn sync_loop(
     rep_id: [u8; 32],
     shared_network: SharedNetwork,
     db: Arc<redb::Database>,
     shutdown: Arc<AtomicBool>,
+    notifier: Option<mpsc::Sender<()>>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(SYNC_INTERVAL);
@@ -474,27 +514,39 @@ fn sync_loop(
         let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else {
             continue;
         };
+        let mut any_inserted = false;
         for peer in net.connected_peers() {
             if peer == net.peer_id() {
                 continue;
             }
-            let _ = sync_with_peer(&net, peer, &rep_id, &db);
+            match sync_with_peer(&net, peer, &rep_id, &db) {
+                Ok(true) => any_inserted = true,
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "sync: per-peer cycle failed"),
+            }
+        }
+        if any_inserted {
+            if let Some(n) = &notifier {
+                let _ = n.send(());
+            }
         }
     }
 }
 
 /// One pull cycle against a single peer for one replication
-/// group. Returns Err only on host-side commit failures (which
-/// the caller logs and ignores); transient network failures
-/// surface as `None` payloads / channel disconnects, which we
-/// silently treat as "try again next tick".
+/// group. Returns `Ok(true)` if at least one new DAG node was
+/// inserted into the local store; `Ok(false)` if everything was
+/// already known. Returns `Err` only on host-side commit
+/// failures; transient network failures surface as `None`
+/// payloads / channel disconnects, which we silently treat as
+/// "try again next tick".
 #[cfg(all(feature = "network", feature = "storage"))]
 fn sync_with_peer(
     net: &crate::network::Network,
     peer: libp2p::PeerId,
     rep_id: &[u8; 32],
     db: &Arc<redb::Database>,
-) -> Result<(), crate::commit::CommitError> {
+) -> Result<bool, crate::commit::CommitError> {
     use crate::commit::CrdtCommit;
     use crate::effect_log::EffectLog;
     use merkle_crdt::DagNode;
@@ -502,10 +554,10 @@ fn sync_with_peer(
     let heads_rx = net.fetch_heads(peer, *rep_id);
     let heads = match heads_rx.recv_timeout(SYNC_FETCH_TIMEOUT) {
         Ok(v) => v,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(false),
     };
     if heads.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut cc = CrdtCommit::from_db_arc(db.clone());
@@ -543,7 +595,7 @@ fn sync_with_peer(
     if inserted_any {
         cc.compact_roots()?;
     }
-    Ok(())
+    Ok(inserted_any)
 }
 
 #[cfg(feature = "network")]
@@ -698,31 +750,41 @@ impl VosNode {
 
         // Pre-open the redb database for CRDT actors that declare
         // a replication group, so the same `Arc<Database>` powers
-        // both the agent's `CrdtCommit` and (later) the network's
+        // both the agent's `CrdtCommit` and the network's
         // `SyncProvider`. redb is exclusive on file open, so this
         // is the only way to share the file across threads.
+        //
+        // When the file opens cleanly we also create a one-shot-
+        // style notification channel: the per-replica sync ticker
+        // pings the Sender after a non-empty merge, the agent
+        // thread holds the Receiver and runs `soft_restart_crdt`
+        // between dispatches to refresh its in-memory state.
         #[cfg(all(feature = "network", feature = "storage"))]
-        if config.consistency == Consistency::Crdt {
-            if let Some(rep_id) = config.replication_id {
-                if let Some(path) = config.db_path(id) {
-                    match redb::Database::create(&path) {
-                        Ok(db) => {
-                            let arc = Arc::new(db);
-                            self.crdt_replicas
-                                .lock()
-                                .unwrap()
-                                .insert(rep_id, arc.clone());
-                            config.pre_opened_db = Some(arc.clone());
-                            self.spawn_sync_thread(rep_id, arc);
-                        }
-                        Err(e) => {
-                            error!(%id, error = %e, "register: failed to open CRDT db; \
-                                replication will be inactive");
-                        }
+        let sync_rx: Option<mpsc::Receiver<()>> = if config.consistency == Consistency::Crdt {
+            config.replication_id.and_then(|rep_id| {
+                let path = config.db_path(id)?;
+                match redb::Database::create(&path) {
+                    Ok(db) => {
+                        let arc = Arc::new(db);
+                        self.crdt_replicas
+                            .lock()
+                            .unwrap()
+                            .insert(rep_id, arc.clone());
+                        config.pre_opened_db = Some(arc.clone());
+                        let (sync_tx, sync_rx) = mpsc::channel::<()>();
+                        self.spawn_sync_thread(rep_id, arc, Some(sync_tx));
+                        Some(sync_rx)
+                    }
+                    Err(e) => {
+                        error!(%id, error = %e, "register: failed to open CRDT db; \
+                            replication will be inactive");
+                        None
                     }
                 }
-            }
-        }
+            })
+        } else {
+            None
+        };
 
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
@@ -734,6 +796,7 @@ impl VosNode {
             agent_thread(
                 id, config, rx, invoke_rx, outbox, invoke_routes, shutdown, activity,
                 #[cfg(feature = "network")] shared_network,
+                #[cfg(all(feature = "network", feature = "storage"))] sync_rx,
             )
         });
 
@@ -872,7 +935,8 @@ impl VosNode {
     /// Register a `(replication_id → redb path)` pair directly in
     /// the CRDT replica map and spin up the matching sync ticker.
     /// Used by tests that want to verify the sync layer without
-    /// spinning up a real PVM agent.
+    /// spinning up a real PVM agent. No notifier is wired because
+    /// no agent thread is consuming.
     #[cfg(all(test, feature = "network", feature = "storage"))]
     pub(crate) fn install_test_replica(
         &mut self,
@@ -884,18 +948,25 @@ impl VosNode {
             .lock()
             .unwrap()
             .insert(rep_id, arc.clone());
-        self.spawn_sync_thread(rep_id, arc.clone());
+        self.spawn_sync_thread(rep_id, arc.clone(), None);
         arc
     }
 
     /// Spawn the per-replica sync ticker. Detached: exits via the
     /// shared shutdown flag (set on `collect`/`shutdown`) or when
-    /// the network/db Arcs die.
+    /// the network/db Arcs die. `notifier` (when present) is
+    /// pinged after a non-empty merge so the agent thread can
+    /// run `soft_restart_crdt` to pick up the new state.
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn spawn_sync_thread(&self, rep_id: [u8; 32], db: Arc<redb::Database>) {
+    fn spawn_sync_thread(
+        &self,
+        rep_id: [u8; 32],
+        db: Arc<redb::Database>,
+        notifier: Option<mpsc::Sender<()>>,
+    ) {
         let shared_network = self.shared_network.clone();
         let shutdown = self.shutdown.clone();
-        thread::spawn(move || sync_loop(rep_id, shared_network, db, shutdown));
+        thread::spawn(move || sync_loop(rep_id, shared_network, db, shutdown, notifier));
     }
 
     /// Install a synchronous-invoke responder under a fresh
@@ -1068,6 +1139,8 @@ fn agent_thread(
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    sync_rx: Option<mpsc::Receiver<()>>,
 ) -> AgentResult {
     use std::collections::VecDeque;
 
@@ -1293,6 +1366,29 @@ fn agent_thread(
         if fatal_error.is_some() { break; }
         if serviced_invoke {
             continue;
+        }
+
+        // Cycle 4 — drain CRDT sync notifications. The per-replica
+        // ticker pings us after merging remote DAG nodes; we run
+        // a soft restart to reload the strategy and replay the
+        // merged log set so our in-memory state matches.
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Some(rx) = &sync_rx {
+            let mut got_signal = false;
+            while let Ok(()) = rx.try_recv() {
+                got_signal = true;
+            }
+            if got_signal {
+                bump();
+                info!(%id, "agent: CRDT sync merged new nodes; soft-restarting");
+                if let Err(err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {
+                    fatal_error = Some(format!("soft restart failed: {err}"));
+                    break;
+                }
+                // Restart the loop so we re-check invokes that
+                // may have arrived during the soft restart.
+                continue;
+            }
         }
 
         let msg = if let Some(m) = pending.pop_front() {
