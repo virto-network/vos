@@ -89,6 +89,13 @@ pub struct AgentConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Replication / persistence semantics for this agent.
     pub consistency: Consistency,
+    /// 32-byte handle that identifies the *replication group* this
+    /// agent belongs to. Replicas of the same logical actor on
+    /// different nodes share this id and use it to find each other
+    /// over the network. Only meaningful when `consistency ==
+    /// Crdt`. `None` means "this CRDT actor has no peers" — its
+    /// DAG stays purely local.
+    pub replication_id: Option<[u8; 32]>,
 }
 
 impl AgentConfig {
@@ -100,6 +107,7 @@ impl AgentConfig {
             storage: Vec::new(),
             data_dir: None,
             consistency: Consistency::Ephemeral,
+            replication_id: None,
         }
     }
 
@@ -124,6 +132,31 @@ impl AgentConfig {
     /// Enable persistence under the given data directory.
     pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Pin this agent into a named replication group. Replicas
+    /// across nodes that share the same id automatically discover
+    /// each other (over an attached `Network`) and converge their
+    /// merkle-DAGs.
+    pub fn with_replication_id(mut self, id: [u8; 32]) -> Self {
+        self.replication_id = Some(id);
+        self
+    }
+
+    /// Convenience: derive a replication id from the agent's blob
+    /// + a logical name. Replicas with identical (blob, name)
+    /// automatically share an id without manifest coordination.
+    pub fn auto_replication_id(mut self, name: &str) -> Self {
+        let mut h = blake2b_simd::Params::new()
+            .hash_length(32)
+            .to_state();
+        h.update(name.as_bytes());
+        h.update(&[0u8]); // delimiter so name||blob ≠ shifted variants
+        h.update(&self.blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        self.replication_id = Some(out);
         self
     }
 

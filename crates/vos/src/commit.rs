@@ -262,7 +262,7 @@ mod crdt {
     /// [`replay_logs`](CommitStrategy::replay_logs) to rebuild state
     /// via a runtime replay session.
     pub struct CrdtCommit {
-        db: redb::Database,
+        db: alloc::sync::Arc<redb::Database>,
         clock: MerkleClock<Blake2b>,
         last_state: Vec<u8>,
     }
@@ -271,7 +271,7 @@ mod crdt {
         /// Open (or create) the redb database at `path` and load the
         /// Merkle-Clock roots from its `state` table.
         pub fn open(path: &std::path::Path) -> Result<Self, CommitError> {
-            let db = redb::Database::create(path)?;
+            let db = alloc::sync::Arc::new(redb::Database::create(path)?);
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
             Ok(Self { db, clock, last_state })
@@ -282,10 +282,162 @@ mod crdt {
             &self.db
         }
 
+        /// Clone of the underlying redb database `Arc`. Lets the
+        /// network sync layer read DAG nodes off this commit
+        /// strategy concurrently with the agent thread writing
+        /// new ones — redb serializes writes internally and
+        /// supports concurrent readers.
+        pub fn db_arc(&self) -> alloc::sync::Arc<redb::Database> {
+            self.db.clone()
+        }
+
         /// Borrow the in-memory Merkle-Clock.
         pub fn clock(&self) -> &MerkleClock<Blake2b> {
             &self.clock
         }
+
+        /// Current root CIDs as raw 32-byte arrays — the wire
+        /// format `Frame::Heads` uses.
+        pub fn root_bytes(&self) -> Vec<[u8; 32]> {
+            self.clock
+                .roots()
+                .iter()
+                .map(|cid| cid.0)
+                .collect()
+        }
+
+        /// Read a single DAG node's serialized bytes from the
+        /// store. `Ok(None)` means the CID isn't in the local
+        /// DAG (typical during sync — peer has nodes we don't).
+        pub fn get_node_bytes(
+            &self,
+            cid: &[u8; 32],
+        ) -> Result<Option<Vec<u8>>, CommitError> {
+            read_dag_node(&self.db, cid)
+        }
+
+        /// Insert a DAG node received from a peer. Self-verifies
+        /// the CID, writes the node atomically, then adds the CID
+        /// to the in-memory clock as a candidate root. Caller
+        /// should run [`compact_roots`](Self::compact_roots)
+        /// after a batch of inserts to drop ancestor roots.
+        ///
+        /// Returns `Ok(true)` when the node was new, `Ok(false)`
+        /// when we already had it.
+        pub fn insert_node(
+            &mut self,
+            cid: &[u8; 32],
+            node_bytes: &[u8],
+        ) -> Result<bool, CommitError> {
+            let recomputed = Blake2b::hash(node_bytes);
+            if &recomputed != cid {
+                return Err(CommitError::Config(alloc::format!(
+                    "insert_node: CID mismatch (claimed {cid:02x?}, recomputed {recomputed:02x?})"
+                )));
+            }
+            // Quick existence check — avoids a write txn for
+            // duplicates (which is the common case during gossip).
+            if read_dag_node(&self.db, cid)?.is_some() {
+                return Ok(false);
+            }
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(DAG_TABLE)?;
+                table.insert(cid.as_slice(), node_bytes)?;
+            }
+            txn.commit()?;
+            self.clock.add_roots(core::iter::once(Cid::<Blake2b>(*cid)));
+            Ok(true)
+        }
+
+        /// Drop ancestor roots — after a batch of `insert_node`
+        /// calls, some roots may be subsumed by others. Walks the
+        /// DAG to find and remove subsumed roots, then persists
+        /// the new root set to the state table so the next
+        /// `restore` sees it.
+        pub fn compact_roots(&mut self) -> Result<(), CommitError> {
+            // We walk via direct redb access (rather than
+            // RedbStore) to avoid double-opening the database.
+            // Pure read transaction — safe to overlap with writes.
+            let candidates = self.clock.roots().clone();
+            if candidates.len() <= 1 {
+                return self.persist_roots();
+            }
+            let mut subsumed = BTreeSet::new();
+            let mut visited = BTreeSet::new();
+            let mut stack: Vec<Cid<Blake2b>> = candidates.iter().cloned().collect();
+
+            let txn = self.db.begin_read()?;
+            let table = match txn.open_table(DAG_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return self.persist_roots();
+                }
+                Err(e) => return Err(e.into()),
+            };
+            while let Some(cid) = stack.pop() {
+                if !visited.insert(cid.clone()) {
+                    continue;
+                }
+                let Some(val) = table.get(cid.as_ref())? else {
+                    continue;
+                };
+                let node: DagNode<Blake2b, EffectLog> =
+                    DagNode::from_bytes(val.value()).ok_or_else(|| {
+                        CommitError::Config(alloc::format!(
+                            "compact_roots: node {cid:?} could not be decoded",
+                        ))
+                    })?;
+                for child in &node.children {
+                    if candidates.contains(child) {
+                        subsumed.insert(child.clone());
+                    }
+                    if !visited.contains(child) {
+                        stack.push(child.clone());
+                    }
+                }
+            }
+            drop(table);
+            drop(txn);
+
+            let new_roots: BTreeSet<Cid<Blake2b>> =
+                candidates.difference(&subsumed).cloned().collect();
+            self.clock = MerkleClock::new();
+            self.clock.add_roots(new_roots);
+            self.persist_roots()
+        }
+
+        /// Materialize state from the (possibly newly-merged) DAG
+        /// by re-running the existing `replay_logs` machinery.
+        /// Convenience for sync flows that just inserted nodes
+        /// and want the strategy's notion of state to catch up.
+        pub fn refresh_last_state(&mut self, state: Vec<u8>) {
+            self.last_state = state;
+        }
+
+        fn persist_roots(&self) -> Result<(), CommitError> {
+            let bytes = encode_roots(self.clock.roots());
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(STATE_TABLE)?;
+                table.insert(ROOTS_KEY, bytes.as_slice())?;
+            }
+            txn.commit()?;
+            Ok(())
+        }
+    }
+
+    fn read_dag_node(
+        db: &redb::Database,
+        cid: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, CommitError> {
+        let txn = db.begin_read()?;
+        let table = match txn.open_table(DAG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(cid.as_slice())?.map(|v| v.value().to_vec()))
     }
 
     impl CommitStrategy for CrdtCommit {
@@ -592,6 +744,85 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_sync_accessors_replicate_dag() {
+        // Drive replica A with two dispatches, then have replica B
+        // pull A's DAG nodes via the new sync accessors and
+        // verify B converges (same roots, replay_logs returns the
+        // same logs in the same order).
+        use crate::effect_log::EffectLog;
+        use std::collections::BTreeSet;
+        use merkle_crdt::DagNode;
+
+        let path_a = temp_db_path("crdt_sync_a");
+        let path_b = temp_db_path("crdt_sync_b");
+
+        // ── Drive A ────────────────────────────────────────────────
+        let mut a = CrdtCommit::open(&path_a).unwrap();
+        let log1 = EffectLog::for_msg(b"first".to_vec());
+        let log2 = EffectLog::for_msg(b"second".to_vec());
+        a.commit_with_log(b"state-1", &log1).unwrap();
+        a.commit_with_log(b"state-2", &log2).unwrap();
+
+        let a_roots = a.root_bytes();
+        assert_eq!(a_roots.len(), 1, "linear chain → one head");
+
+        // ── Replica B: pull A's nodes via accessors ────────────────
+        let mut b = CrdtCommit::open(&path_b).unwrap();
+        assert!(b.restore().is_none());
+        assert!(b.root_bytes().is_empty());
+
+        // BFS from A's roots, fetch each node, insert into B.
+        let mut frontier: Vec<[u8; 32]> = a_roots.clone();
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        while let Some(cid) = frontier.pop() {
+            if !seen.insert(cid) {
+                continue;
+            }
+            let bytes = a
+                .get_node_bytes(&cid)
+                .unwrap()
+                .expect("A has the node");
+            let was_new = b.insert_node(&cid, &bytes).unwrap();
+            assert!(was_new);
+            // Children to walk next
+            let node: DagNode<Blake2b, EffectLog> =
+                DagNode::from_bytes(&bytes).unwrap();
+            for child in node.children {
+                frontier.push(child.0);
+            }
+        }
+        b.compact_roots().unwrap();
+
+        // Roots match; replay reproduces A's history.
+        let mut a_sorted = a.root_bytes();
+        a_sorted.sort();
+        let mut b_sorted = b.root_bytes();
+        b_sorted.sort();
+        assert_eq!(a_sorted, b_sorted);
+
+        let a_logs = a.replay_logs().unwrap();
+        let b_logs = b.replay_logs().unwrap();
+        assert_eq!(a_logs, b_logs);
+        assert_eq!(b_logs.len(), 2);
+
+        // Idempotent re-insert returns false.
+        let some_cid = a_roots[0];
+        let some_bytes = a.get_node_bytes(&some_cid).unwrap().unwrap();
+        let was_new = b.insert_node(&some_cid, &some_bytes).unwrap();
+        assert!(!was_new, "re-inserting an existing node is a no-op");
+
+        // Tampered bytes are rejected via CID self-verification.
+        let mut tampered = some_bytes.clone();
+        tampered[0] ^= 0xFF;
+        let bad_cid = some_cid; // claim the same CID for tampered bytes
+        let err = b.insert_node(&bad_cid, &tampered);
+        assert!(err.is_err(), "tampered node must fail CID check");
+
+        let _ = std::fs::remove_dir_all(path_a.parent().unwrap());
     }
 
     #[cfg(feature = "storage")]
