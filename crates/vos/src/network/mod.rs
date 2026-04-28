@@ -79,6 +79,22 @@ pub trait InvokeDispatcher: Send + Sync {
     fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8>;
 }
 
+/// Read-side of CRDT replication: looks up DAG state for a given
+/// replication group. The network thread calls these methods
+/// directly on its current_thread tokio runtime; implementations
+/// must return quickly (a redb read transaction is fine — micro-
+/// seconds typically, well below the cross-await budget).
+pub trait SyncProvider: Send + Sync {
+    /// Return the current root CIDs for a replication group, or
+    /// `None` if no replica of that group is registered locally.
+    fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>>;
+
+    /// Look up a single DAG node's serialized bytes inside a
+    /// replication group. `None` means the local replica doesn't
+    /// have the node yet (sync racing) or the group is unknown.
+    fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>>;
+}
+
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
 /// frames flow in. Cheap to clone — owned by both the swarm
 /// thread and any [`Network`] callers that want to look up a
@@ -103,6 +119,10 @@ pub struct Network {
     /// Read by the swarm thread on every inbound `InvokeRequest`
     /// to dispatch against the local node.
     invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    /// Set via [`set_sync_provider`](Self::set_sync_provider).
+    /// Read by the swarm thread on every inbound `FetchHeads` /
+    /// `FetchNode` to look up the local replica.
+    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -140,7 +160,25 @@ enum NetworkCmd {
         msg: Vec<u8>,
         reply: std_mpsc::Sender<Vec<u8>>,
     },
+    SendFetchHeads {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        reply: std_mpsc::Sender<Vec<[u8; 32]>>,
+    },
+    SendFetchNode {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        cid: [u8; 32],
+        reply: std_mpsc::Sender<Option<Vec<u8>>>,
+    },
     Shutdown,
+}
+
+/// Outbound request kinds tracked while we wait for the reply.
+enum OutboundReply {
+    Invoke(std_mpsc::Sender<Vec<u8>>),
+    Heads(std_mpsc::Sender<Vec<[u8; 32]>>),
+    Node(std_mpsc::Sender<Option<Vec<u8>>>),
 }
 
 impl Network {
@@ -152,12 +190,15 @@ impl Network {
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>> =
             Arc::new(Mutex::new(None));
+        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> =
+            Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
         let prefix_map_for_thread = prefix_map.clone();
         let listen_addrs_for_thread = listen_addrs.clone();
         let invoke_dispatcher_for_thread = invoke_dispatcher.clone();
+        let sync_provider_for_thread = sync_provider.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -176,6 +217,7 @@ impl Network {
                 listen_addrs_for_thread,
                 inbox_tx,
                 invoke_dispatcher_for_thread,
+                sync_provider_for_thread,
             ));
         });
 
@@ -187,6 +229,7 @@ impl Network {
             listen_addrs,
             inbox_rx: Mutex::new(Some(inbox_rx)),
             invoke_dispatcher,
+            sync_provider,
             join: Some(join),
         }
     }
@@ -198,6 +241,53 @@ impl Network {
         if let Ok(mut g) = self.invoke_dispatcher.lock() {
             *g = Some(dispatcher);
         }
+    }
+
+    /// Install the handler used to answer inbound `FetchHeads` /
+    /// `FetchNode` frames against the local CRDT replicas.
+    /// Without it, peers asking us for sync data get empty
+    /// replies.
+    pub fn set_sync_provider(&self, provider: Arc<dyn SyncProvider>) {
+        if let Ok(mut g) = self.sync_provider.lock() {
+            *g = Some(provider);
+        }
+    }
+
+    /// Ask a peer for the current root CIDs of a replication
+    /// group. The receiver yields the peer's roots vec; on
+    /// failure the Sender is dropped (caller's recv yields
+    /// `Disconnected`).
+    pub fn fetch_heads(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+    ) -> std_mpsc::Receiver<Vec<[u8; 32]>> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendFetchHeads {
+            target_peer,
+            replication_id,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Point-fetch a single DAG node from a peer. The receiver
+    /// yields `Some(bytes)` if the peer has the node, `None` if
+    /// it doesn't (typical during sync racing).
+    pub fn fetch_node(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        cid: [u8; 32],
+    ) -> std_mpsc::Receiver<Option<Vec<u8>>> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendFetchNode {
+            target_peer,
+            replication_id,
+            cid,
+            reply: tx,
+        });
+        rx
     }
 
     /// Synchronously invoke a service on a remote peer. Returns a
@@ -310,6 +400,7 @@ async fn network_main(
     listen_addrs: ListenAddrs,
     inbox_tx: std_mpsc::Sender<InboundTell>,
     invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -337,14 +428,16 @@ async fn network_main(
         }
     }
 
-    // Outbound InvokeRequest tracking. When the user calls
-    // `Network::send_invoke`, we stash the reply Sender keyed by
-    // libp2p's outbound RequestId. The matching `InvokeReply` (or
-    // an OutboundFailure event) clears the entry and forwards the
-    // payload to the caller.
-    let mut outbound_invokes: HashMap<
+    // Outbound request tracking. Every outbound request_response
+    // call stashes its reply Sender here keyed by libp2p's
+    // OutboundRequestId; the matching response (or an
+    // OutboundFailure) clears the entry and forwards the payload
+    // to the caller. One map for invoke + sync because each
+    // RequestId is unique across all outbound traffic on the
+    // behaviour.
+    let mut outbound_replies: HashMap<
         request_response::OutboundRequestId,
-        std_mpsc::Sender<Vec<u8>>,
+        OutboundReply,
     > = HashMap::new();
 
     // Inbound dispatch path: blocking tasks complete asynchronously
@@ -360,8 +453,9 @@ async fn network_main(
                 handle_swarm_event(
                     &mut swarm, event, local_prefix,
                     &prefix_map, &listen_addrs, &inbox_tx,
-                    &mut outbound_invokes,
+                    &mut outbound_replies,
                     &invoke_dispatcher,
+                    &sync_provider,
                     &response_tx,
                 );
             }
@@ -389,8 +483,30 @@ async fn network_main(
                             .behaviour_mut()
                             .req_resp
                             .send_request(&target_peer, frame);
-                        outbound_invokes.insert(req_id, reply);
+                        outbound_replies.insert(req_id, OutboundReply::Invoke(reply));
                         debug!(%target_peer, from, to, "network: sent InvokeRequest");
+                    }
+                    Some(NetworkCmd::SendFetchHeads {
+                        target_peer, replication_id, reply,
+                    }) => {
+                        let frame = Frame::FetchHeads { replication_id };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::Heads(reply));
+                        debug!(%target_peer, "network: sent FetchHeads");
+                    }
+                    Some(NetworkCmd::SendFetchNode {
+                        target_peer, replication_id, cid, reply,
+                    }) => {
+                        let frame = Frame::FetchNode { replication_id, cid };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::Node(reply));
+                        debug!(%target_peer, "network: sent FetchNode");
                     }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
@@ -456,8 +572,9 @@ fn handle_swarm_event(
     prefix_map: &PrefixMap,
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
-    outbound_invokes: &mut HashMap<request_response::OutboundRequestId, std_mpsc::Sender<Vec<u8>>>,
+    outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     match event {
@@ -506,7 +623,7 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(VosBehaviourEvent::ReqResp(rr_event)) => {
             handle_req_resp(
                 swarm, rr_event, local_prefix, prefix_map, inbox,
-                outbound_invokes, invoke_dispatcher, response_tx,
+                outbound_replies, invoke_dispatcher, sync_provider, response_tx,
             );
         }
         _ => {}
@@ -519,8 +636,9 @@ fn handle_req_resp(
     local_prefix: u16,
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
-    outbound_invokes: &mut HashMap<request_response::OutboundRequestId, std_mpsc::Sender<Vec<u8>>>,
+    outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -569,6 +687,29 @@ fn handle_req_resp(
                                 .send((channel, Frame::InvokeReply { payload }));
                         });
                     }
+                    Frame::FetchHeads { replication_id } => {
+                        // Sync reads are quick redb txns; serve them
+                        // inline rather than spawning a blocking task.
+                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
+                        let roots = provider
+                            .as_ref()
+                            .and_then(|p| p.roots(&replication_id))
+                            .unwrap_or_default();
+                        let _ = swarm.behaviour_mut().req_resp.send_response(
+                            channel,
+                            Frame::Heads { replication_id, roots },
+                        );
+                    }
+                    Frame::FetchNode { replication_id, cid } => {
+                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
+                        let node = provider
+                            .as_ref()
+                            .and_then(|p| p.get_node(&replication_id, &cid));
+                        let _ = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_response(channel, Frame::NodeReply { node });
+                    }
                     other => {
                         warn!(%peer, ?other, "network: unexpected frame in request slot");
                         let _ = swarm
@@ -578,30 +719,35 @@ fn handle_req_resp(
                     }
                 }
             }
-            Message::Response { response, request_id, .. } => match response {
-                Frame::Hello { node_prefix } => {
-                    record_prefix(prefix_map, node_prefix, peer);
-                }
-                Frame::Ack => {
-                    debug!(%peer, "network: Tell ack received");
-                }
-                Frame::InvokeReply { payload } => {
-                    if let Some(reply_tx) = outbound_invokes.remove(&request_id) {
-                        let _ = reply_tx.send(payload);
-                    } else {
-                        debug!(%peer, "network: InvokeReply for unknown request");
+            Message::Response { response, request_id, .. } => {
+                let pending = outbound_replies.remove(&request_id);
+                match (response, pending) {
+                    (Frame::Hello { node_prefix }, _) => {
+                        record_prefix(prefix_map, node_prefix, peer);
+                    }
+                    (Frame::Ack, _) => {
+                        debug!(%peer, "network: Tell ack received");
+                    }
+                    (Frame::InvokeReply { payload }, Some(OutboundReply::Invoke(tx))) => {
+                        let _ = tx.send(payload);
+                    }
+                    (Frame::Heads { roots, .. }, Some(OutboundReply::Heads(tx))) => {
+                        let _ = tx.send(roots);
+                    }
+                    (Frame::NodeReply { node }, Some(OutboundReply::Node(tx))) => {
+                        let _ = tx.send(node);
+                    }
+                    (other, _) => {
+                        warn!(%peer, ?other, "network: response shape mismatched pending request");
                     }
                 }
-                other => {
-                    warn!(%peer, ?other, "network: unexpected frame in response slot");
-                }
-            },
+            }
         },
         Event::OutboundFailure { peer, request_id, error, .. } => {
             warn!(%peer, error = %error, "network: outbound request failed");
             // Drop the reply Sender so the caller's recv yields
-            // Disconnected, which surfaces as InvokeError::NotFound.
-            let _ = outbound_invokes.remove(&request_id);
+            // Disconnected — surfaces as None / NotFound.
+            let _ = outbound_replies.remove(&request_id);
         }
         Event::InboundFailure { peer, error, .. } => {
             warn!(%peer, error = %error, "network: inbound request failed");
@@ -821,6 +967,110 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Network-level test: A asks B for the heads of a replication
+    /// group and then point-fetches a DAG node by CID. Verifies
+    /// the SyncProvider on B sees the requests and the responses
+    /// round-trip through the request_response wire.
+    #[test]
+    fn cross_node_sync_fetch_heads_and_node() {
+        struct StaticProvider {
+            rep_id: [u8; 32],
+            roots: Vec<[u8; 32]>,
+            nodes: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+        }
+
+        impl SyncProvider for StaticProvider {
+            fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+                if replication_id == &self.rep_id {
+                    Some(self.roots.clone())
+                } else {
+                    None
+                }
+            }
+            fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+                if replication_id != &self.rep_id {
+                    return None;
+                }
+                self.nodes.get(cid).cloned()
+            }
+        }
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: 0x0A0A,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: 0x0B0B,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        let rep_id = [0x42u8; 32];
+        let cid_present = [0xAAu8; 32];
+        let cid_missing = [0xCCu8; 32];
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(cid_present, b"node-bytes-here".to_vec());
+
+        net_b.set_sync_provider(Arc::new(StaticProvider {
+            rep_id,
+            roots: vec![cid_present],
+            nodes,
+        }));
+
+        wait_for(
+            || net_a.peer_for_prefix(net_b.local_prefix()),
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+        let peer_b = net_a.peer_for_prefix(net_b.local_prefix()).unwrap();
+
+        // FetchHeads
+        let heads_rx = net_a.fetch_heads(peer_b, rep_id);
+        let heads = heads_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchHeads reply");
+        assert_eq!(heads, vec![cid_present]);
+
+        // FetchHeads for an unknown rep_id returns empty.
+        let unknown_rep = [0u8; 32];
+        let empty_heads = net_a
+            .fetch_heads(peer_b, unknown_rep)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchHeads reply for unknown group");
+        assert!(empty_heads.is_empty());
+
+        // FetchNode for a known CID returns Some.
+        let node_rx = net_a.fetch_node(peer_b, rep_id, cid_present);
+        let node = node_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchNode reply");
+        assert_eq!(node, Some(b"node-bytes-here".to_vec()));
+
+        // FetchNode for an unknown CID returns None.
+        let missing = net_a
+            .fetch_node(peer_b, rep_id, cid_missing)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchNode reply for missing CID");
+        assert_eq!(missing, None);
+
+        net_a.join();
+        net_b.join();
     }
 
     /// Network-level test: outbound `send_invoke` on A dispatches
