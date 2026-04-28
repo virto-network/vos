@@ -22,8 +22,9 @@ use alloc::vec::Vec;
 
 pub const TAG_PUBLISH: u8 = 0x01;
 pub const TAG_RESOLVE: u8 = 0x02;
-pub const TAG_REGISTER_ADDR: u8 = 0x03;
-pub const TAG_RESOLVE_ADDR: u8 = 0x04;
+// 0x03 / 0x04 were `TAG_REGISTER_ADDR` / `TAG_RESOLVE_ADDR` for
+// the legacy in-vos address codec; removed in cycle 9 phase 3
+// when ctx.resolve switched to invoking the real registry actor.
 
 /// A package identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -128,90 +129,16 @@ impl RegistryResponse {
     }
 }
 
-// ── Address resolution ────────────────────────────────────────────────
-
-/// An address resolution request.
-#[derive(Debug, Clone)]
-pub enum AddrRequest {
-    /// Register a name → ServiceId mapping.
-    Register { name: String, service_id: u32 },
-    /// Resolve a name to its ServiceId.
-    Resolve { name: String },
-}
-
-/// An address resolution response.
-#[derive(Debug, Clone)]
-pub enum AddrResponse {
-    Found(u32),
-    NotFound,
-}
-
-impl AddrRequest {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            Self::Register { name, service_id } => {
-                out.push(TAG_REGISTER_ADDR);
-                push_str(&mut out, name);
-                out.extend_from_slice(&service_id.to_le_bytes());
-            }
-            Self::Resolve { name } => {
-                out.push(TAG_RESOLVE_ADDR);
-                push_str(&mut out, name);
-            }
-        }
-        out
-    }
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() { return None; }
-        let mut pos = 1;
-        match bytes[0] {
-            TAG_REGISTER_ADDR => {
-                let name = read_str(bytes, &mut pos)?;
-                if pos + 4 > bytes.len() { return None; }
-                let service_id = u32::from_le_bytes([
-                    bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
-                ]);
-                Some(Self::Register { name, service_id })
-            }
-            TAG_RESOLVE_ADDR => {
-                let name = read_str(bytes, &mut pos)?;
-                Some(Self::Resolve { name })
-            }
-            _ => None,
-        }
-    }
-}
-
-impl AddrResponse {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Found(id) => {
-                let mut out = Vec::with_capacity(5);
-                out.push(0x01);
-                out.extend_from_slice(&id.to_le_bytes());
-                out
-            }
-            Self::NotFound => vec![0x00],
-        }
-    }
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() { return None; }
-        match bytes[0] {
-            0x01 if bytes.len() >= 5 => {
-                let id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-                Some(Self::Found(id))
-            }
-            0x00 => Some(Self::NotFound),
-            _ => None,
-        }
-    }
-}
+// Address resolution moved to the `registry` crate's wire types
+// once the real CRDT-replicated registry actor landed (cycle 9).
+// `Context::lookup` / `Context::resolve` now invoke that actor's
+// `lookup` message directly. The bespoke `AddrRequest` /
+// `AddrResponse` codec that lived here was a placeholder and has
+// been removed.
 
 // --- Wire helpers ---
 
+#[allow(dead_code)]
 fn push_str(out: &mut Vec<u8>, s: &str) {
     let len = s.len() as u16;
     out.extend_from_slice(&len.to_le_bytes());
@@ -276,45 +203,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn addr_register_roundtrip() {
-        let req = AddrRequest::Register {
-            name: String::from("greeter"),
-            service_id: 0x00A3_0005,
-        };
-        let encoded = req.encode();
-        match AddrRequest::decode(&encoded).unwrap() {
-            AddrRequest::Register { name, service_id } => {
-                assert_eq!(name, "greeter");
-                assert_eq!(service_id, 0x00A3_0005);
-            }
-            _ => panic!("expected Register"),
-        }
-    }
-
-    #[test]
-    fn addr_resolve_roundtrip() {
-        let req = AddrRequest::Resolve { name: String::from("counter") };
-        let encoded = req.encode();
-        match AddrRequest::decode(&encoded).unwrap() {
-            AddrRequest::Resolve { name } => assert_eq!(name, "counter"),
-            _ => panic!("expected Resolve"),
-        }
-    }
-
-    #[test]
-    fn addr_response_roundtrip() {
-        let found = AddrResponse::Found(0x00A3_0005);
-        let enc = found.encode();
-        match AddrResponse::decode(&enc).unwrap() {
-            AddrResponse::Found(id) => assert_eq!(id, 0x00A3_0005),
-            _ => panic!("expected Found"),
-        }
-
-        let not_found = AddrResponse::NotFound;
-        let enc = not_found.encode();
-        assert!(matches!(AddrResponse::decode(&enc).unwrap(), AddrResponse::NotFound));
-    }
+    // The legacy `AddrRequest` / `AddrResponse` codec was
+    // removed when ctx.resolve switched to invoking the real
+    // registry actor (cycle 9 phase 3); its round-trip tests
+    // went with it. Round-trip tests for the actor's wire shape
+    // live in `crates/registry`.
 
     #[test]
     fn response_roundtrip() {

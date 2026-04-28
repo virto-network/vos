@@ -1536,6 +1536,112 @@ fn wait_for<T>(
 
 #[test]
 #[cfg(feature = "network")]
+fn ctx_resolve_returns_announced_service_id() {
+    // Cycle 9 phase 3: a PVM actor calls `ctx.resolve(name)` and
+    // gets back the ServiceId the registry was announced under.
+    // Single-node setup — the path under test is the actor's
+    // INVOKE hostcall to ServiceId::REGISTRY, decoding the rkyv
+    // RegistryEntry, and surfacing the full u32 to the caller.
+    use registry_client::Client;
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let registry_path = format!(
+        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter not built"); return; }
+    };
+    let registry_data = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile counter");
+    let registry_blob = grey_transpiler::link_elf(&registry_data).expect("transpile registry");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_resolve_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Single node, no network. Both the registry and the
+    // counter live as local replicas; `ctx.resolve` from the
+    // counter goes through the in-process invoke_routes to the
+    // registry replica.
+    let mut node = VosNode::new();
+
+    let _registry_id = node.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_replication_id(registry::replication_id("test")),
+        ServiceId::REGISTRY,
+    );
+
+    let counter_id = node.register(AgentConfig::new(counter_blob));
+
+    // Tell the registry that "kunekt/counter" lives at
+    // counter_id. owner_prefix=0 since the node has no prefix.
+    Client::local(&node)
+        .announce(
+            "kunekt/counter",
+            counter_id.node_prefix(),
+            counter_id.local_id(),
+            &["counter".to_string()],
+        )
+        .expect("announce");
+
+    // Poll the registry until it sees the entry — the announce
+    // returns immediately but the actor loop processes it on
+    // its next tick.
+    wait_for(
+        || Client::local(&node).lookup("kunekt/counter").ok().flatten(),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("registry sees announce");
+
+    // Drive `whois("kunekt/counter")` on the counter and check
+    // the reply.
+    let invoke = |actor: ServiceId, m: Msg| -> Vec<u8> {
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        node.invoke(actor, payload).expect("invoke")
+    };
+
+    let bytes = invoke(counter_id, Msg::new("whois").with("name", "kunekt/counter"));
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    let resolved = value.as_u32().expect("u32 reply");
+    assert_eq!(resolved, counter_id.0, "ctx.resolve should return the announced ServiceId");
+
+    // Lookup of a missing name returns 0 (the sentinel `whois`
+    // uses for "not found", separate from any valid ServiceId
+    // since the counter's id is non-zero).
+    let bytes = invoke(counter_id, Msg::new("whois").with("name", "kunekt/missing"));
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    let resolved = value.as_u32().expect("u32 reply");
+    assert_eq!(resolved, 0, "missing name should resolve to 0");
+
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "network")]
 fn registry_announce_lookup_and_list_converge_across_nodes() {
     // Cycle 9 phase 1: two networked VosNodes, each with a
     // registry replica at ServiceId::REGISTRY under the same

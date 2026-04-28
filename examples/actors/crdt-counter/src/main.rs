@@ -45,4 +45,23 @@ impl CrdtCounter {
         println!("crdt-counter: get -> {}", self.count);
         self.count
     }
+
+    /// Resolve `name` against the hyperspace registry via the
+    /// cycle-9 phase-3 `ctx.resolve` sugar. Returns the full
+    /// 32-bit ServiceId of the matching service, or 0 when the
+    /// name isn't registered. Lets integration tests verify the
+    /// runtime-lookup path through a real PVM actor.
+    #[msg]
+    async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
+        match ctx.resolve(&name) {
+            Some(id) => {
+                println!("crdt-counter: whois({name}) -> {}", id.0);
+                id.0
+            }
+            None => {
+                println!("crdt-counter: whois({name}) -> not found");
+                0
+            }
+        }
+    }
 }

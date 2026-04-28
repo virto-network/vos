@@ -1004,7 +1004,15 @@ fn handle_invoke(
 
     let code_hash = kread_hash(caller, hash_ptr);
 
-    let target_svc_id = if code_hash[4..].iter().all(|&b| b == 0) {
+    // The actor framework's `service_code_hash(svc_id)` packs the
+    // target ServiceId into the first 4 bytes of `code_hash` and
+    // leaves the remaining 28 bytes zero. A genuine content-addressed
+    // invoke fills the whole 32 bytes from a real blake2b hash —
+    // those land in `blob_by_hash` directly. Anything else with
+    // non-zero tail bytes is a malformed hash that we drop as
+    // NOT_FOUND.
+    let is_service_invoke = code_hash[4..].iter().all(|&b| b == 0);
+    let target_svc_id = if is_service_invoke {
         ServiceId(u32::from_le_bytes([
             code_hash[0],
             code_hash[1],
@@ -1017,7 +1025,12 @@ fn handle_invoke(
 
     let blob_idx = if let Some(&idx) = blob_by_hash.get(&code_hash) {
         idx
-    } else if target_svc_id.0 != 0 {
+    } else if is_service_invoke {
+        // Explicit ServiceId invoke — look up in the services map.
+        // ServiceId(0) (== `ServiceId::REGISTRY`) is a real,
+        // resolvable target now that the registry actor lives there;
+        // the previous `!= 0` guard predated the registry and would
+        // have always rejected `ctx.resolve(...)` calls.
         match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
             None => {
