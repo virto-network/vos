@@ -375,7 +375,7 @@ fn cmd_start(
     // network. Today this just establishes the pipe — peer
     // connections are logged but no actor traffic flows yet.
     #[cfg(feature = "network")]
-    let _network = start_network_if_needed(manifest, data_dir.as_deref(), listen_cli, connect_cli);
+    let network = start_network_if_needed(manifest, data_dir.as_deref(), listen_cli, connect_cli);
     #[cfg(not(feature = "network"))]
     {
         if !listen_cli.is_empty() || !connect_cli.is_empty()
@@ -410,6 +410,16 @@ fn cmd_start(
         }
     }
 
+    // Use the network's prefix (when present) so all locally-
+    // allocated ServiceIds carry the right high 16 bits. Without a
+    // network we use prefix 0 — matches the pre-networking
+    // single-process behaviour.
+    #[cfg(feature = "network")]
+    let mut node = match &network {
+        Some(net) => VosNode::with_prefix(net.local_prefix()),
+        None => VosNode::new(),
+    };
+    #[cfg(not(feature = "network"))]
     let mut node = VosNode::new();
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
     // role → list of ServiceIds providing it. Init values prefixed
@@ -495,15 +505,20 @@ fn cmd_start(
         }
     }
 
-    eprintln!("vosx: running space '{}'...\n", manifest.space);
-    // When networking is active the node should stay up so peers
-    // can reach it; the 2-second idle heuristic from run() is for
-    // single-node tests/demos. The network handle's drop will
-    // signal shutdown when this function returns.
+    // Hand the network off to the node, which spawns a bridge
+    // thread for inbound Tells and starts forwarding non-local
+    // routes over the wire. After this `network` is owned by
+    // `node` — both die together at collect time.
     #[cfg(feature = "network")]
-    let networked = _network.is_some();
+    let networked = network.is_some();
+    #[cfg(feature = "network")]
+    if let Some(net) = network {
+        node.attach_network(net);
+    }
     #[cfg(not(feature = "network"))]
     let networked = false;
+
+    eprintln!("vosx: running space '{}'...\n", manifest.space);
     if networked {
         eprintln!("vosx: networking on — running until shutdown (Ctrl-C)");
         node.run_forever();
@@ -756,18 +771,11 @@ fn start_network_if_needed(
         local_prefix,
     );
 
-    // Slice 2 wires the libp2p layer up to the request-response
-    // pipe. The Network <-> VosNode bridge (forwarding inbound
-    // Tells into the local routing table, and forwarding non-local
-    // outbox envelopes over the network) lands in the next slice;
-    // for now `inbox` is None and inbound Tells are dropped with a
-    // warn log.
     Some(vos::network::Network::start(vos::network::NetworkConfig {
         keypair,
         local_prefix,
         listen,
         bootstrap: connect,
-        inbox: None,
     }))
 }
 

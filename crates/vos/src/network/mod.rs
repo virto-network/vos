@@ -86,6 +86,7 @@ pub struct Network {
     cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
+    inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -105,10 +106,6 @@ pub struct NetworkConfig {
     /// Multiaddrs to dial at startup. Useful when not relying on
     /// mDNS / hyperspace discovery.
     pub bootstrap: Vec<Multiaddr>,
-    /// Where the network thread pushes inbound `Tell` envelopes.
-    /// The owner keeps the matching `Receiver` and consumes from
-    /// it. `None` drops inbound Tells with a warn log.
-    pub inbox: Option<std_mpsc::Sender<InboundTell>>,
 }
 
 enum NetworkCmd {
@@ -130,6 +127,7 @@ impl Network {
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
+        let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
         let prefix_map_for_thread = prefix_map.clone();
         let listen_addrs_for_thread = listen_addrs.clone();
@@ -149,6 +147,7 @@ impl Network {
                 cmd_rx,
                 prefix_map_for_thread,
                 listen_addrs_for_thread,
+                inbox_tx,
             ));
         });
 
@@ -158,8 +157,18 @@ impl Network {
             cmd_tx,
             prefix_map,
             listen_addrs,
+            inbox_rx: Mutex::new(Some(inbox_rx)),
             join: Some(join),
         }
+    }
+
+    /// Take ownership of the inbound-Tell receiver. The first call
+    /// returns `Some(rx)`; subsequent calls return `None`. The
+    /// caller is responsible for draining and dispatching frames
+    /// — typically into a [`VosNode`](crate::node::VosNode)'s
+    /// outbox via the bridge thread it sets up.
+    pub fn take_inbox(&self) -> Option<std_mpsc::Receiver<InboundTell>> {
+        self.inbox_rx.lock().ok()?.take()
     }
 
     /// Snapshot of multiaddrs the swarm has bound to. Empty until
@@ -233,6 +242,7 @@ async fn network_main(
     mut cmd_rx: async_mpsc::UnboundedReceiver<NetworkCmd>,
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
+    inbox_tx: std_mpsc::Sender<InboundTell>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -260,14 +270,12 @@ async fn network_main(
         }
     }
 
-    let inbox = config.inbox;
-
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
                 handle_swarm_event(
                     &mut swarm, event, local_prefix,
-                    &prefix_map, &listen_addrs, inbox.as_ref(),
+                    &prefix_map, &listen_addrs, &inbox_tx,
                 );
             }
             cmd = cmd_rx.recv() => {
@@ -339,7 +347,7 @@ fn handle_swarm_event(
     local_prefix: u16,
     prefix_map: &PrefixMap,
     listen_addrs: &ListenAddrs,
-    inbox: Option<&std_mpsc::Sender<InboundTell>>,
+    inbox: &std_mpsc::Sender<InboundTell>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -396,7 +404,7 @@ fn handle_req_resp(
     event: request_response::Event<Frame, Frame>,
     local_prefix: u16,
     prefix_map: &PrefixMap,
-    inbox: Option<&std_mpsc::Sender<InboundTell>>,
+    inbox: &std_mpsc::Sender<InboundTell>,
 ) {
     use request_response::{Event, Message};
 
@@ -409,12 +417,8 @@ fn handle_req_resp(
                         Frame::Hello { node_prefix: local_prefix }
                     }
                     Frame::Tell { from, to, payload } => {
-                        if let Some(tx) = inbox {
-                            if tx.send(InboundTell { from, to, payload }).is_err() {
-                                warn!(%peer, "network: local inbox closed; dropping inbound Tell");
-                            }
-                        } else {
-                            warn!(%peer, "network: no inbox configured; dropping inbound Tell");
+                        if inbox.send(InboundTell { from, to, payload }).is_err() {
+                            warn!(%peer, "network: local inbox closed; dropping inbound Tell");
                         }
                         Frame::Ack
                     }
@@ -596,16 +600,13 @@ mod tests {
 
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
-        let (inbox_a_tx, inbox_a_rx) = std_mpsc::channel();
-        let (inbox_b_tx, inbox_b_rx) = std_mpsc::channel();
-
         let net_a = Network::start(NetworkConfig {
             keypair: kp_a,
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
-            inbox: Some(inbox_a_tx),
         });
+        let inbox_a_rx = net_a.take_inbox().expect("first take");
 
         // Wait until A reports a bound address — without this, B
         // has nothing to dial.
@@ -619,8 +620,8 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
-            inbox: Some(inbox_b_tx),
         });
+        let inbox_b_rx = net_b.take_inbox().expect("first take");
 
         // Wait until both prefix maps populate (Hello handshake done).
         let ok = wait_for(
@@ -675,6 +676,106 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// End-to-end test: VosNode A pushes an envelope addressed to a
+    /// service on node B. Path under test:
+    ///
+    /// ```text
+    /// A.outbox -> A.route() -> A.network.send_tell()
+    ///                       -> [libp2p /vos/0.1.0]
+    ///                       -> B.swarm -> inbox -> bridge thread
+    ///                       -> B.outbox -> B.route() -> inspector
+    /// ```
+    #[test]
+    fn cross_node_tell_delivers_to_remote_inspector() {
+        use crate::abi::service::ServiceId;
+        use crate::node::{Envelope, VosNode};
+        use std::sync::atomic::Ordering;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        assert_ne!(prefix_a, prefix_b, "test needs distinct prefixes");
+
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a should bind");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        // Wait for the Hello round trip before attaching, so we can
+        // still use the &Network handles for the prefix probe.
+        wait_for(
+            || {
+                if net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some()
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .expect("Hello should complete");
+
+        // Attach networks to fresh nodes. Node B owns the inspector;
+        // node A's inspector is unused (we only test A → B here).
+        let mut node_a = VosNode::with_prefix(prefix_a);
+        node_a.attach_network(net_a);
+        let outbox_a = node_a.outbox_sender();
+        let shutdown_a = node_a.shutdown_handle();
+
+        let mut node_b = VosNode::with_prefix(prefix_b);
+        let (inspector_id, inspector_rx) = node_b.install_inspector();
+        node_b.attach_network(net_b);
+        let shutdown_b = node_b.shutdown_handle();
+
+        let join_a = std::thread::spawn(move || node_a.run_forever());
+        let join_b = std::thread::spawn(move || node_b.run_forever());
+
+        // From outside the agent system, inject an envelope addressed
+        // to the inspector on B. A's routing loop sees a non-local
+        // prefix and forwards over the network.
+        let payload = b"cross-node hello".to_vec();
+        outbox_a
+            .send(Envelope {
+                from: ServiceId::new(prefix_a, 0xFFFF),
+                to: inspector_id,
+                payload: payload.clone(),
+            })
+            .expect("outbox_a accepts envelope");
+
+        let received = inspector_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("inspector on B should receive forwarded envelope");
+        assert_eq!(received.from.0, ServiceId::new(prefix_a, 0xFFFF).0);
+        assert_eq!(received.to, inspector_id);
+        assert_eq!(received.payload, payload);
+
+        // Stop both nodes (run_forever exits on shutdown flag).
+        shutdown_a.store(true, Ordering::Relaxed);
+        shutdown_b.store(true, Ordering::Relaxed);
+        let _ = join_a.join();
+        let _ = join_b.join();
     }
 
     #[test]

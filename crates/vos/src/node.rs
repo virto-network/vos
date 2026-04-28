@@ -300,6 +300,14 @@ pub struct VosNode {
     ///
     /// [`run_until_idle`]: VosNode::run_until_idle
     last_activity: ActivityClock,
+    /// Optional libp2p network handle. When attached via
+    /// [`attach_network`](Self::attach_network), [`route`](Self::route)
+    /// forwards envelopes whose target prefix isn't local over the
+    /// wire instead of dropping them. A bridge thread is spawned to
+    /// pump the network's inbound `Tell` queue back into this
+    /// node's outbox.
+    #[cfg(feature = "network")]
+    network: Option<crate::network::Network>,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -330,7 +338,58 @@ impl VosNode {
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
+            #[cfg(feature = "network")]
+            network: None,
         }
+    }
+
+    /// Attach a libp2p [`Network`](crate::network::Network) so the
+    /// node can route to and from peers.
+    ///
+    /// After this call:
+    /// - [`route`](Self::route) forwards any envelope whose target
+    ///   `node_prefix` doesn't match this node over the wire (via
+    ///   the network's `peer_for_prefix` lookup).
+    /// - A bridge thread reads inbound `Tell` frames from the
+    ///   network and feeds them back into this node's outbox, so
+    ///   they're routed by the same path local-only traffic uses.
+    ///
+    /// The bridge thread exits cleanly when either the network's
+    /// inbox closes (because the [`Network`](crate::network::Network)
+    /// is dropping) or the outbox closes (because the node is
+    /// being collected).
+    #[cfg(feature = "network")]
+    pub fn attach_network(&mut self, network: crate::network::Network) {
+        let inbox_rx = match network.take_inbox() {
+            Some(rx) => rx,
+            None => {
+                warn!("network already had its inbox taken; bridge will not run");
+                self.network = Some(network);
+                return;
+            }
+        };
+
+        let outbox_tx = self.outbox_tx.clone();
+        let activity = self.last_activity.clone();
+        let shutdown = self.shutdown.clone();
+        thread::spawn(move || {
+            for tell in inbox_rx {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                *activity.lock().unwrap() = Instant::now();
+                let env = Envelope {
+                    from: ServiceId(tell.from),
+                    to: ServiceId(tell.to),
+                    payload: tell.payload,
+                };
+                if outbox_tx.send(env).is_err() {
+                    break;
+                }
+            }
+        });
+
+        self.network = Some(network);
     }
 
     /// Allocate the next service ID on this node.
@@ -459,6 +518,37 @@ impl VosNode {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
+    /// Clone of the shutdown signal. Set to `true` from any thread
+    /// to wind the node down. Useful when the node has been moved
+    /// into a [`run_forever`](Self::run_forever) thread.
+    pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    /// Clone of the outbox sender. Pushing an [`Envelope`] here
+    /// runs it through [`route`](Self::route) — the same path
+    /// agent threads use for outgoing transfers — so addresses
+    /// targeting other nodes get forwarded over the network when
+    /// one is attached. Intended for host-side bootstraps and
+    /// tests that need to inject traffic from outside the agent
+    /// system.
+    pub fn outbox_sender(&self) -> mpsc::Sender<Envelope> {
+        self.outbox_tx.clone()
+    }
+
+    /// Install a "ghost" route under a fresh ServiceId: every
+    /// envelope routed to that ID is delivered to the returned
+    /// channel instead of an agent. Used by integration tests to
+    /// observe what crosses the routing layer; not part of the
+    /// production API.
+    #[cfg(test)]
+    pub(crate) fn install_inspector(&mut self) -> (ServiceId, mpsc::Receiver<Envelope>) {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        self.routes.insert(id.0, tx);
+        (id, rx)
+    }
+
     /// Synchronously invoke a registered service from outside the
     /// PVM — for tests, host-side bootstraps, and any code path
     /// where you want to ask an agent or worker without first
@@ -505,10 +595,30 @@ impl VosNode {
             } else {
                 warn!(%target, "node: no route for target, dropping");
             }
-        } else {
-            // Future: forward to network layer
-            warn!(%target, "node: no network layer, dropping remote target");
+            return;
         }
+
+        // Remote delivery via the network (if attached). The
+        // target's high 16 bits select the peer; if we haven't
+        // seen that prefix yet (no Hello received), the envelope
+        // is dropped with a warn — kunekt has no store-and-forward
+        // semantics today.
+        #[cfg(feature = "network")]
+        if let Some(net) = &self.network {
+            let prefix = target.node_prefix();
+            if let Some(peer) = net.peer_for_prefix(prefix) {
+                net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+                return;
+            }
+            warn!(
+                %target,
+                prefix = format!("{prefix:#06x}"),
+                "node: no peer known for prefix; dropping remote envelope",
+            );
+            return;
+        }
+
+        warn!(%target, "node: no network layer, dropping remote target");
     }
 
     /// Collect results from all agent threads. Forces shutdown if
