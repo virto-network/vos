@@ -78,6 +78,7 @@ impl TracingPvm {
         // Decode register indices and immediate from args
         let (reg_a, reg_b, reg_d) = decode_reg_indices(opcode, &decoded_args);
         let imm = decode_immediate(&decoded_args);
+        let imm_y = decode_imm_y(&decoded_args);
         let branch_target = decode_branch_target(&decoded_args);
 
         // Default next_pc for sequential execution
@@ -118,6 +119,7 @@ impl TracingPvm {
             reg_b,
             reg_d,
             imm,
+            imm_y,
             branch_target,
             branch_taken,
             mem_read,
@@ -312,6 +314,20 @@ pub(crate) fn decode_immediate(decoded_args: &args::Args) -> u64 {
 }
 
 /// Extract branch/jump target address from decoded args (0 if none).
+/// Phase 13d-loadimmjumpind: extract the second immediate (`imm_y`) for
+/// opcodes that have one (TwoImm, RegTwoImm, TwoRegTwoImm).  Default 0
+/// for everything else.  LoadImmJumpInd uses this as the jump-offset
+/// (added to regs[rb] for djump dispatch); the existing `imm` holds
+/// the load-value `imm_x`.
+pub(crate) fn decode_imm_y(decoded_args: &args::Args) -> u64 {
+    match decoded_args {
+        args::Args::TwoImm { imm_y, .. } => *imm_y,
+        args::Args::RegTwoImm { imm_y, .. } => *imm_y,
+        args::Args::TwoRegTwoImm { imm_y, .. } => *imm_y,
+        _ => 0,
+    }
+}
+
 pub(crate) fn decode_branch_target(decoded_args: &args::Args) -> u32 {
     match decoded_args {
         args::Args::Offset { offset } => *offset as u32,

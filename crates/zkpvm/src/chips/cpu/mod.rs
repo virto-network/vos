@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -62,6 +62,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
+        JumpTableLookupElements,
     );
 
 
@@ -78,9 +79,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
+            JumpTableLookupElements,
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, jump_table_lookup) = lookup_elements;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1217,6 +1219,9 @@ impl BuiltInComponent for CpuChip {
             let f_is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
             let f_is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
+            let f_is_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
+            let f_is_load_imm_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
             );
@@ -1249,6 +1254,12 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
             tuple.push(f_is_trap[0].clone());
+            tuple.push(f_is_jump_ind[0].clone());
+            tuple.push(f_is_load_imm_jump_ind[0].clone());
+            // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
+            // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
+            // immediate.  Tracer writes 0 to imm_y for those, so balanced.
+            tuple.extend_from_slice(&imm_y_for_lookup);
             // Phase 15-branch-target-fix: bind BranchTarget to its canonical
             // (pc + sign_extend(offset)) for static jumps/branches.  For
             // JumpInd/LoadImmJumpInd and non-branch ops, the canonical is 0;
@@ -1296,6 +1307,126 @@ impl BuiltInComponent for CpuChip {
                 is_real.clone() * is_trap_col[0].clone()
                     * (E::F::one() - is_padding_next[0].clone())
             );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 13d: JumpInd target binding via JumpTableChip
+        //
+        // (1) Carry-chain constraint: pin JumpIndAddr to (val_b + imm) low 32 bits.
+        //   For each byte i in 0..4:
+        //     is_jump_ind · (jump_ind_addr[i] + carry[i]·256
+        //                    - val_b[i] - imm_bytes[i] - carry_in[i]) = 0
+        //   carry_in[0] = 0; carry_in[i>0] = carry[i-1]; carry[3] is the
+        //   32-bit overflow, discarded.
+        //
+        // (2) JumpTableChip lookup: emit (jump_ind_addr[4], next_pc[4]) per
+        //   JumpInd row, paired (2 emissions, ProgramMemoryChip-style mult
+        //   doubling).  Multiplicity = is_jump_ind (degree 1).
+        //
+        // The producer side (JumpTableChip) commits via preprocessed Addr +
+        // Target columns to `(2*(idx+1), jump_table[idx])` per program-
+        // defined entry, so the lookup balances iff next_pc =
+        // jump_table[(val_b+imm)/2 - 1] — exactly the runtime djump.
+        {
+            let is_jump_ind_col = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
+            let jump_ind_addr = crate::trace::trace_eval!(trace_eval, Column::JumpIndAddr);
+            let jump_ind_carry = crate::trace::trace_eval!(trace_eval, Column::JumpIndCarry);
+            let imm_bytes_col = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            let next_pc_col = crate::trace::trace_eval!(trace_eval, Column::NextPc);
+            // Boolean witness.
+            eval.add_constraint(
+                is_jump_ind_col[0].clone()
+                    * (E::F::one() - is_jump_ind_col[0].clone())
+            );
+            for i in 0..4 {
+                let carry_in: E::F = if i == 0 {
+                    E::F::zero()
+                } else {
+                    jump_ind_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_jump_ind_col[0].clone() * (
+                        jump_ind_addr[i].clone()
+                            + jump_ind_carry[i].clone() * f256.clone()
+                            - val_b[i].clone()
+                            - imm_bytes_col[i].clone()
+                            - carry_in
+                    )
+                );
+            }
+            // Paired JumpTable consumer (mult = is_jump_ind on each emission;
+            // ProgramMemory-style pair doubling so the per-pair degree stays
+            // bounded).  Tuple = (jump_ind_addr[4], next_pc[4]) — pinned to
+            // ((val_b+imm) low 32 bits, runtime-jumped target) for JumpInd.
+            let mut jt_tuple: Vec<E::F> = jump_ind_addr.to_vec();
+            jt_tuple.extend_from_slice(&next_pc);
+            eval.add_to_relation(RelationEntry::new(
+                jump_table_lookup,
+                is_jump_ind_col[0].clone().into(),
+                &jt_tuple,
+            ));
+            eval.add_to_relation(RelationEntry::new(
+                jump_table_lookup,
+                is_jump_ind_col[0].clone().into(),
+                &jt_tuple,
+            ));
+            let _ = next_pc_col; // reuse outer next_pc
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 13d-loadimmjumpind: LoadImmJumpInd target binding via JumpTable
+        //
+        // Same chip lookup as JumpInd, but with a different addr formula.
+        // At runtime: addr = (regs[rb] + imm_y) mod 2^32, then djump.
+        // val_d = regs[rb] for TwoRegTwoImm (default arm in trace fill),
+        // imm_y is the new ImmYBytes column (bound to canonical via
+        // prog_mem tuple).
+        //
+        // Carry chain: pin LoadImmJumpIndAddr to (val_d + imm_y) low 32.
+        // Lookup: (LoadImmJumpIndAddr, NextPc) ∈ jump_table.
+        //
+        // Note: the load-side `regs[ra] = imm_x` is NOT yet bound — that's
+        // a separate concern that needs the existing `is_move` family
+        // extended.  Filed as a follow-up.
+        {
+            let is_lij_col = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let lij_addr = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndAddr);
+            let lij_carry = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndCarry);
+            let imm_y_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
+            // Boolean witness.
+            eval.add_constraint(
+                is_lij_col[0].clone() * (E::F::one() - is_lij_col[0].clone())
+            );
+            // Carry chain: lij_addr = val_d + imm_y_bytes (low 32 bits).
+            for i in 0..4 {
+                let carry_in: E::F = if i == 0 {
+                    E::F::zero()
+                } else {
+                    lij_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_lij_col[0].clone() * (
+                        lij_addr[i].clone()
+                            + lij_carry[i].clone() * f256.clone()
+                            - val_d[i].clone()
+                            - imm_y_bytes[i].clone()
+                            - carry_in
+                    )
+                );
+            }
+            // Paired JumpTable consumer.
+            let mut lij_tuple: Vec<E::F> = lij_addr.to_vec();
+            lij_tuple.extend_from_slice(&next_pc);
+            eval.add_to_relation(RelationEntry::new(
+                jump_table_lookup,
+                is_lij_col[0].clone().into(),
+                &lij_tuple,
+            ));
+            eval.add_to_relation(RelationEntry::new(
+                jump_table_lookup,
+                is_lij_col[0].clone().into(),
+                &lij_tuple,
+            ));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1626,6 +1757,70 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_sign_ext_8, Column::IsSignExt8);
             trace.fill_columns(row, flags.is_sign_ext_16, Column::IsSignExt16);
             trace.fill_columns(row, flags.is_trap, Column::IsTrap);
+            trace.fill_columns(row, flags.is_jump_ind, Column::IsJumpInd);
+            trace.fill_columns(row, flags.is_load_imm_jump_ind, Column::IsLoadImmJumpInd);
+            // Phase 13d-loadimmjumpind: ImmYBytes always carries low 4 bytes
+            // of step.imm_y so the prog_mem lookup balances on every row
+            // (canonical = 0 for non-LoadImmJumpInd ops).
+            trace.fill_columns_bytes(
+                row, &(step.imm_y as u32).to_le_bytes(), Column::ImmYBytes
+            );
+            // Phase 13d: per-byte add-with-carry chain for JumpIndAddr =
+            // (val_b + step.imm) mod 2^32.  The constraint is gated by
+            // IsJumpInd, so on non-JumpInd rows the columns are left at
+            // zero (default fill).  The runtime addr feeds JumpTableChip's
+            // multiplicity counter via side_note.jump_table_counts.
+            if flags.is_jump_ind {
+                let val_b_lo = (val_b as u32).to_le_bytes();
+                let imm_lo = (step.imm as u32).to_le_bytes();
+                let mut carry_in: u16 = 0;
+                let mut addr_bytes = [0u8; 4];
+                let mut carry_bytes = [0u8; 4];
+                for i in 0..4 {
+                    let s = val_b_lo[i] as u16 + imm_lo[i] as u16 + carry_in;
+                    addr_bytes[i] = s as u8;
+                    carry_in = s >> 8;
+                    carry_bytes[i] = carry_in as u8;
+                }
+                trace.fill_columns_bytes(row, &addr_bytes, Column::JumpIndAddr);
+                trace.fill_columns_bytes(row, &carry_bytes, Column::JumpIndCarry);
+
+                // Count this dispatch in side_note.jump_table_counts so
+                // JumpTableChip's producer multiplicity matches.  Index =
+                // addr/2 - 1 (mirrors the runtime djump indexing).
+                let addr = u32::from_le_bytes(addr_bytes);
+                if addr >= 2 && addr.is_multiple_of(2) {
+                    let idx = (addr / 2 - 1) as usize;
+                    if let Some(counts) = side_note.jump_table_counts.get_mut(idx) {
+                        *counts += 1;
+                    }
+                }
+            }
+            // Phase 13d-loadimmjumpind: LoadImmJumpInd carry chain for
+            // LoadImmJumpIndAddr = (val_d + imm_y) mod 2^32.
+            if flags.is_load_imm_jump_ind {
+                let val_d_lo = (val_d as u32).to_le_bytes();
+                let imm_y_lo = (step.imm_y as u32).to_le_bytes();
+                let mut carry_in: u16 = 0;
+                let mut addr_bytes = [0u8; 4];
+                let mut carry_bytes = [0u8; 4];
+                for i in 0..4 {
+                    let s = val_d_lo[i] as u16 + imm_y_lo[i] as u16 + carry_in;
+                    addr_bytes[i] = s as u8;
+                    carry_in = s >> 8;
+                    carry_bytes[i] = carry_in as u8;
+                }
+                trace.fill_columns_bytes(row, &addr_bytes, Column::LoadImmJumpIndAddr);
+                trace.fill_columns_bytes(row, &carry_bytes, Column::LoadImmJumpIndCarry);
+
+                let addr = u32::from_le_bytes(addr_bytes);
+                if addr >= 2 && addr.is_multiple_of(2) {
+                    let idx = (addr / 2 - 1) as usize;
+                    if let Some(counts) = side_note.jump_table_counts.get_mut(idx) {
+                        *counts += 1;
+                    }
+                }
+            }
             // Sign-extend witnesses (Phase 12b-2): high nibble + bit-7 of the
             // sign-source byte.  val_d[0] for SE8, val_d[1] for SE16.  Zero on
             // non-SE rows; the lookup multiplicities below are gated to match.
@@ -2201,6 +2396,9 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_sign_ext_8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
             let f_is_sign_ext_16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
             let f_is_trap = crate::trace::original_base_column!(component_trace, Column::IsTrap);
+            let f_is_jump_ind = crate::trace::original_base_column!(component_trace, Column::IsJumpInd);
+            let f_is_load_imm_jump_ind = crate::trace::original_base_column!(component_trace, Column::IsLoadImmJumpInd);
+            let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
             );
@@ -2234,6 +2432,9 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_sign_ext_8[0].clone());
             tuple.push(f_is_sign_ext_16[0].clone());
             tuple.push(f_is_trap[0].clone());
+            tuple.push(f_is_jump_ind[0].clone());
+            tuple.push(f_is_load_imm_jump_ind[0].clone());
+            tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
@@ -2251,6 +2452,46 @@ impl BuiltInProverComponent for CpuChip {
                         let tuple_clone: Vec<_> = tuple.clone();
                         move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
                     },
+                );
+            }
+        }
+
+        // ── Phase 13d: JumpTable consumer (prover-side, 2 paired, 8 limbs) ──
+        {
+            let jt: &JumpTableLookupElements = lookup_elements.as_ref();
+            let is_jump_ind_col = crate::trace::original_base_column!(component_trace, Column::IsJumpInd);
+            let jump_ind_addr = crate::trace::original_base_column!(component_trace, Column::JumpIndAddr);
+            let next_pc_col = crate::trace::original_base_column!(component_trace, Column::NextPc);
+
+            let mut tuple: Vec<_> = jump_ind_addr.to_vec();
+            tuple.extend_from_slice(&next_pc_col);
+
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    jt,
+                    [is_jump_ind_col[0].clone()],
+                    |[m]| m.into(),
+                    &tuple,
+                );
+            }
+        }
+
+        // ── Phase 13d-loadimmjumpind: JumpTable consumer for LoadImmJumpInd ──
+        {
+            let jt: &JumpTableLookupElements = lookup_elements.as_ref();
+            let is_lij_col = crate::trace::original_base_column!(component_trace, Column::IsLoadImmJumpInd);
+            let lij_addr = crate::trace::original_base_column!(component_trace, Column::LoadImmJumpIndAddr);
+            let next_pc_col = crate::trace::original_base_column!(component_trace, Column::NextPc);
+
+            let mut tuple: Vec<_> = lij_addr.to_vec();
+            tuple.extend_from_slice(&next_pc_col);
+
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    jt,
+                    [is_lij_col[0].clone()],
+                    |[m]| m.into(),
+                    &tuple,
                 );
             }
         }

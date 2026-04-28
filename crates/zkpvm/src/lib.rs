@@ -44,6 +44,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RegisterMemoryBoundaryChip,
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip, // 13a — producer-only until CpuChip consumer in 13b
+    &chips::JumpTableChip,     // 13d — producer of jump_table[] lookups
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
@@ -59,6 +60,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RegisterMemoryBoundaryChip,
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip,
+    &chips::JumpTableChip,
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,

@@ -123,6 +123,16 @@ pub enum PreprocessedColumn {
     /// Phase 13e-redux: per-opcode terminal flag.  True only at PCs whose
     /// canonical decoding is `Opcode::Trap`.
     #[size = 1] IsTrap,
+    /// Phase 13d: per-opcode flag for `Opcode::JumpInd`.
+    #[size = 1] IsJumpInd,
+    /// Phase 13d-loadimmjumpind: per-opcode flag for
+    /// `Opcode::LoadImmJumpInd`.
+    #[size = 1] IsLoadImmJumpInd,
+    /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
+    /// LoadImmJumpInd (the jump offset).  0 for ops without a second
+    /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
+    /// tuple lookup.
+    #[size = 4] ImmYCanon,
     /// Phase 15-branch-target-fix: canonical absolute target for static
     /// jumps/branches at this PC, as 4 little-endian bytes.  Computed
     /// from bytecode as `pc + sign_extend(signed_offset)`.  For ops
@@ -173,13 +183,16 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_sign_ext_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsSignExt16);
         let f_is_trap = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTrap);
+        let f_is_jump_ind = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsJumpInd);
+        let f_is_load_imm_jump_ind = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadImmJumpInd);
+        let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 21 flags,
-        //         branch_target_canon[4]) — 42 limbs.
+        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 23 flags,
+        //         imm_y_canon[4], branch_target_canon[4]) — 48 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -208,6 +221,9 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
         tuple.push(f_is_trap[0].clone());
+        tuple.push(f_is_jump_ind[0].clone());
+        tuple.push(f_is_load_imm_jump_ind[0].clone());
+        tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
         // Producer: negative multiplicity.
@@ -253,6 +269,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     row, &d.branch_target_canon.to_le_bytes(),
                     PreprocessedColumn::BranchTargetCanon,
                 );
+                trace.fill_columns_bytes(
+                    row, &d.imm_y_canon.to_le_bytes(),
+                    PreprocessedColumn::ImmYCanon,
+                );
                 // Phase 13c: per-flag fill, in the same order as the lookup tuple.
                 let flag_cols = [
                     PreprocessedColumn::IsAdd, PreprocessedColumn::IsSub,
@@ -265,7 +285,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsExit, PreprocessedColumn::IsNegAdd,
                     PreprocessedColumn::IsReverseBytes, PreprocessedColumn::IsZeroExt16,
                     PreprocessedColumn::IsSignExt8, PreprocessedColumn::IsSignExt16,
-                    PreprocessedColumn::IsTrap,
+                    PreprocessedColumn::IsTrap, PreprocessedColumn::IsJumpInd,
+                    PreprocessedColumn::IsLoadImmJumpInd,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -336,12 +357,15 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_sign_ext_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt8);
         let f_is_sign_ext_16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsSignExt16);
         let f_is_trap = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTrap);
+        let f_is_jump_ind = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsJumpInd);
+        let f_is_load_imm_jump_ind = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadImmJumpInd);
+        let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 42-limb tuple from preprocessed columns.
+        // Build the 48-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -370,6 +394,9 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_sign_ext_8[0].clone());
         tuple.push(f_is_sign_ext_16[0].clone());
         tuple.push(f_is_trap[0].clone());
+        tuple.push(f_is_jump_ind[0].clone());
+        tuple.push(f_is_load_imm_jump_ind[0].clone());
+        tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
         // Producer (negative multiplicity).
@@ -402,8 +429,9 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 21],
+    flags: [u8; 23],
     branch_target_canon: u32,
+    imm_y_canon: u32,
 }
 
 /// Decode the instruction at `pc` (which must be a basic-block start) into
@@ -423,6 +451,7 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let decoded_args = args::decode_args(code, pc, skip_len as usize, category);
     let (ra, rb, rd) = crate::core::tracing::decode_reg_indices(opcode, &decoded_args);
     let imm = crate::core::tracing::decode_immediate(&decoded_args);
+    let imm_y = crate::core::tracing::decode_imm_y(&decoded_args);
     let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
     let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
     Decoded {
@@ -434,5 +463,6 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
         imm,
         flags: f,
         branch_target_canon,
+        imm_y_canon: imm_y as u32,
     }
 }

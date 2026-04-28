@@ -148,7 +148,7 @@ fn prove_fibonacci_actor() {
         steps,
         code_blob.code.to_vec(),
         code_blob.bitmask.to_vec(),
-    );
+    ).with_jump_table(code_blob.jump_table.to_vec());
     let proof = prove(&mut side_note).expect("proving failed");
     eprintln!("Proof generated: {} claimed sums", proof.claimed_sums.len());
 
@@ -201,7 +201,7 @@ fn profile_fibonacci_actor() {
         steps,
         code_blob.code.to_vec(),
         code_blob.bitmask.to_vec(),
-    );
+    ).with_jump_table(code_blob.jump_table.to_vec());
 
     eprintln!("\n=== Prove Pipeline Profile ===");
     let (proof, _profile) = prove_profiled(&mut side_note).expect("proving failed");
@@ -269,7 +269,7 @@ fn profile_actor(name: &str, gas: u64) {
 
     let mut side_note = zkpvm::SideNote::new(
         steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    );
+    ).with_jump_table(code_blob.jump_table.to_vec());
 
     eprintln!("\nProve (96-bit security):");
     let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
@@ -327,7 +327,7 @@ fn profile_hash_bench() {
 
     let mut side_note = zkpvm::SideNote::new(
         steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    ).with_memory(flat_mem);
+    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof = prove(&mut side_note).expect("proving failed");
@@ -371,7 +371,7 @@ fn profile_hash_variant(name: &str) {
 
     let mut side_note = zkpvm::SideNote::new(
         steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    ).with_memory(flat_mem);
+    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
 
     let mut counts = std::collections::HashMap::new();
     for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
@@ -426,7 +426,7 @@ fn debug_blake2s_prefix() {
     for &n in &test_sizes {
         let n = n.min(steps.len());
         let trunc: Vec<_> = steps.iter().take(n).cloned().collect();
-        let mut sn = zkpvm::SideNote::new(trunc, code_blob.code.to_vec(), code_blob.bitmask.to_vec()).with_memory(flat_mem.clone());
+        let mut sn = zkpvm::SideNote::new(trunc, code_blob.code.to_vec(), code_blob.bitmask.to_vec()).with_memory(flat_mem.clone()).with_jump_table(code_blob.jump_table.to_vec());
         let ok = zkpvm::prove_with_config(&mut sn, config).is_ok();
         eprintln!("  {n:>5} steps: {}", if ok {"OK"} else {"FAIL"});
         if !ok { break; }
@@ -435,7 +435,7 @@ fn debug_blake2s_prefix() {
     eprintln!("Trying full trace ({} steps):", steps.len());
     let mut sn = zkpvm::SideNote::new(
         steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec()
-    ).with_memory(flat_mem);
+    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
     match zkpvm::prove_with_config(&mut sn, config) {
         Ok(proof) => {
             verify(proof, &sn).expect("verify");
@@ -465,7 +465,7 @@ fn prove_diverse() {
     eprintln!("Diverse: {} steps", steps.len());
     let mut side_note = zkpvm::SideNote::new(
         steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec()
-    ).with_memory(flat_mem);
+    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
     let t = std::time::Instant::now();
     match prove(&mut side_note) {
         Ok(p) => {
@@ -537,7 +537,7 @@ fn prove_segmented_hash_bench() {
     let seg1_steps: Vec<_> = all_steps[..split].to_vec();
     let mut seg1_sn = zkpvm::SideNote::new(
         seg1_steps, code.clone(), bitmask.clone()
-    ).with_memory(flat_mem.clone());
+    ).with_memory(flat_mem.clone()).with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof1 = prove(&mut seg1_sn).expect("segment 1 proving failed");
@@ -561,7 +561,7 @@ fn prove_segmented_hash_bench() {
     let seg2_steps: Vec<_> = all_steps[split..].to_vec();
     let mut seg2_sn = zkpvm::SideNote::new(
         seg2_steps, code.clone(), bitmask.clone()
-    ).with_memory(seg2_mem);
+    ).with_memory(seg2_mem).with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof2 = prove(&mut seg2_sn).expect("segment 2 proving failed");

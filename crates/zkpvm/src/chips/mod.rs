@@ -1,6 +1,7 @@
 pub mod blake2b;
 pub mod bitwise_lookup;
 pub mod cpu;
+pub mod jump_table;
 pub mod memory;
 pub mod memory_boundary;
 pub mod power_of_two;
@@ -13,6 +14,7 @@ pub mod register_memory_boundary;
 pub use blake2b::{Blake2bChip, Blake2bCall, blake2b_compress};
 pub use bitwise_lookup::BitwiseLookupChip;
 pub use cpu::CpuChip;
+pub use jump_table::JumpTableChip;
 pub use memory::MemoryChip;
 pub use memory_boundary::MemoryBoundaryChip;
 pub use power_of_two::PowerOfTwoChip;

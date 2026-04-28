@@ -63,6 +63,17 @@ pub(super) struct OpcodeFlags {
     /// terminal-row constraint that forbids any successor real row after
     /// Trap.
     pub is_trap: bool,
+    /// Phase 13d: per-opcode flag for `Opcode::JumpInd`.  Drives the
+    /// runtime-target binding via JumpTableChip — `addr = (regs[reg_a]
+    /// + imm) mod 2^32`, then `next_pc = jump_table[addr/2 - 1]` (the
+    /// chip's preprocessed lookup).
+    pub is_jump_ind: bool,
+    /// Phase 13d-loadimmjumpind: per-opcode flag for
+    /// `Opcode::LoadImmJumpInd`.  Same JumpTableChip lookup as JumpInd
+    /// but with `addr = (regs[rb] + imm_y) mod 2^32` (val_d + imm_y_low4
+    /// in the AIR).  Bound via a separate carry chain into
+    /// LoadImmJumpIndAddr.
+    pub is_load_imm_jump_ind: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -181,8 +192,11 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // — see fallthrough_forged_next_pc_rejected and
         // unlikely_forged_next_pc_rejected in tests/control_flow.rs.
         Opcode::Fallthrough | Opcode::Unlikely => {}
-        // JumpInd/LoadImmJumpInd: dynamic jumps (target prover-trusted, exclude from sequential PC)
-        Opcode::JumpInd | Opcode::LoadImmJumpInd => { f.is_exit = true; }
+        // JumpInd / LoadImmJumpInd: dynamic dispatch.  Both pinned via
+        // JumpTableChip lookups; JumpInd uses (val_b+imm), LoadImmJumpInd
+        // uses (val_d+imm_y) for the addr computation.
+        Opcode::JumpInd => { f.is_exit = true; f.is_jump_ind = true; }
+        Opcode::LoadImmJumpInd => { f.is_exit = true; f.is_load_imm_jump_ind = true; }
         // Ecalli: host call (execution exits, no ALU constraint)
         Opcode::Ecalli | Opcode::Ecall => { f.is_exit = true; }
         // Trap: causes panic exit
@@ -216,11 +230,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux): extract the 21 category/sub-category
-/// flags in the order matching ProgramMemoryChip's preprocessed columns.
-/// Used by ProgramMemoryChip's preprocessed-trace fill to pin flag values
-/// to the canonical classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 21] {
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind): extract
+/// the 23 category/sub-category flags in the order matching
+/// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
+/// preprocessed-trace fill to pin flag values to the canonical
+/// classify_opcode result.
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 23] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -229,6 +244,7 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 21] {
         f.is_load as u8, f.is_store as u8, f.is_exit as u8, f.is_neg_add as u8,
         f.is_reverse_bytes as u8, f.is_zero_ext_16 as u8,
         f.is_sign_ext_8 as u8, f.is_sign_ext_16 as u8,
-        f.is_trap as u8,
+        f.is_trap as u8, f.is_jump_ind as u8,
+        f.is_load_imm_jump_ind as u8,
     ]
 }

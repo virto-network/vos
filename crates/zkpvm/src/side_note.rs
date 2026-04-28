@@ -39,6 +39,19 @@ pub struct SideNote {
     /// ProgramMemory consumer; in Phase 13a the chip exists with zero
     /// multiplicity everywhere (its claimed_sum is 0).
     pub program_memory_counts: HashMap<u32, u32>,
+    /// Phase 13d: program's jump_table — the set of valid dynamic-dispatch
+    /// targets used by JumpInd / LoadImmJumpInd.  Empty for programs that
+    /// don't use indirect jumps (most negative tests).  JumpTableChip
+    /// commits to it via its preprocessed Addr/Target columns; CpuChip's
+    /// JumpInd consumer demands `(addr=val_b+imm, target=next_pc)`
+    /// against that table, balancing dispatch-by-runtime-index.
+    pub jump_table: Vec<u32>,
+    /// Phase 13d: per-jump-table-index count of JumpInd dispatches.  Indexed
+    /// by `addr/2 - 1` where `addr = (regs[reg_a] + imm) mod 2^32`; entry N
+    /// = number of times the program dispatched through `jump_table[N]`.
+    /// Set by CpuChip's trace fill from the JumpInd steps; consumed by
+    /// JumpTableChip's main-trace fill as Multiplicity.
+    pub jump_table_counts: Vec<u32>,
 }
 
 impl SideNote {
@@ -56,7 +69,19 @@ impl SideNote {
             blake2b_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
             program_memory_counts: HashMap::new(),
+            jump_table: Vec::new(),
+            jump_table_counts: Vec::new(),
         }
+    }
+
+    /// Builder-style setter: attach a program's jump_table to this side note.
+    /// Used by tests and prove paths to seed JumpTableChip's preprocessed
+    /// table.  No-op for programs that don't use JumpInd / LoadImmJumpInd
+    /// (the chip then has zero-multiplicity rows).
+    pub fn with_jump_table(mut self, jump_table: Vec<u32>) -> Self {
+        self.jump_table_counts = vec![0u32; jump_table.len()];
+        self.jump_table = jump_table;
+        self
     }
 
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {

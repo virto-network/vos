@@ -174,6 +174,145 @@ fn prove_unlikely() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+// Phase 13d: JumpInd's `next_pc = jump_table[(regs[reg_a] + imm)/2 - 1]`
+// is now bound by JumpTableChip — a preprocessed table committing to the
+// program's jump_table[].  CpuChip's per-step JumpInd consumer demands
+// `(addr = val_b + imm, target = next_pc)` against that table.  An
+// attacker dispatching to a valid-but-wrong table entry (different addr
+// from val_b+imm) breaks the lookup.
+//
+// LoadImmJumpInd is *not* covered yet — separate gap, filed as a
+// tripwire below.  Its target uses regs[rb] + imm_y where imm_y is
+// the SECOND immediate; the current trace stores step.imm = imm_x
+// (the load value) and there's no column for imm_y, so binding
+// requires either a new LoadImmJumpIndOffset column or piping imm_y
+// through PvmStep.
+// Phase 13d-loadimmjumpind: LoadImmJumpInd's `next_pc =
+// jump_table[(regs[rb]+imm_y)/2 - 1]` is now bound by JumpTableChip via
+// the same lookup as JumpInd, but with a separate carry chain pinning
+// LoadImmJumpIndAddr = (val_d + imm_y) low 32 bits.
+//
+// Note: only the JUMP target is bound; the LOAD side
+// (`regs[ra] = imm_x`) is still prover-trusted.  Filed as a follow-up.
+#[test]
+fn load_imm_jump_ind_positive_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 2; // honest target = jump_table[(2+0)/2 - 1] = jump_table[0] = 3
+
+    let code = vec![
+        Opcode::LoadImmJumpInd as u8, 0x01, 0,
+        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].opcode, Opcode::LoadImmJumpInd);
+    assert_eq!(steps[0].next_pc, 3);
+
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
+        .with_jump_table(vec![3u32, 5u32]);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn load_imm_jump_ind_forged_target_rejected() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 2; // honest target pc=3
+
+    let code = vec![
+        Opcode::LoadImmJumpInd as u8, 0x01, 0,
+        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps[0].next_pc, 3);
+
+    // Forge: dispatch to jump_table[1] = pc=5 instead of jump_table[0] = pc=3.
+    steps[0].next_pc = 5;
+    steps[1].pc = 5;
+
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
+        .with_jump_table(vec![3u32, 5u32]);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn jump_ind_positive_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 2; // jump_table[0] index → target pc=3.
+
+    let code = vec![
+        Opcode::JumpInd as u8, 0, 0,
+        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].opcode, Opcode::JumpInd);
+    assert_eq!(steps[0].next_pc, 3);
+
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
+        .with_jump_table(vec![3u32, 5u32]);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn jump_ind_forged_target_rejected() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 2; // honest target pc=3.
+
+    let code = vec![
+        Opcode::JumpInd as u8, 0, 0,
+        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps[0].next_pc, 3);
+
+    // Forge: dispatch to jump_table[1] = pc=5 instead of jump_table[0]=3.
+    // val_b + imm = 2 + 0 = 2 (canonical addr for jump_table[0]).  The
+    // JumpTableChip lookup demands (addr=2, target=jump_table[0]=3); we
+    // claim (addr=2, target=5) — no matching producer → reject.
+    steps[0].next_pc = 5;
+    steps[1].pc = 5;
+
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
+        .with_jump_table(vec![3u32, 5u32]);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
 // Phase 15-branch-target-fix: ProgramMemoryChip now publishes the
 // canonical absolute branch target as a preprocessed `BranchTargetCanon`
 // column (= `pc + sign_extend(signed_offset)` for static jumps/branches,

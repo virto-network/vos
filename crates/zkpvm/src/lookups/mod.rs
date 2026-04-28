@@ -15,9 +15,10 @@ pub use self::{
     range_check::Range256LookupElements,
     relations::{
         BitwiseAndLookupElements, Blake2bCallLookupElements,
-        Blake2bStateLookupElements, MemoryAccessLookupElements,
-        PowerOfTwoLookupElements, ProgramExecutionLookupElements,
-        ProgramMemoryLookupElements, RegisterMemoryLookupElements,
+        Blake2bStateLookupElements, JumpTableLookupElements,
+        MemoryAccessLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, ProgramMemoryLookupElements,
+        RegisterMemoryLookupElements,
     },
 };
 
@@ -26,6 +27,7 @@ macros::register_relation! {
         ProgramExecutionLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
+        JumpTableLookupElements,
         Range256LookupElements,
         MemoryAccessLookupElements,
         BitwiseAndLookupElements,
@@ -87,10 +89,10 @@ impl<T: RegisteredLookupBound> ComponentLookupElements for T {
     }
 }
 
-#[impl_for_tuples(8)]
+#[impl_for_tuples(9)]
 impl private::Sealed for T {}
 
-#[impl_for_tuples(8)]
+#[impl_for_tuples(9)]
 #[allow(clippy::unused_unit)]
 impl ComponentLookupElements for T {
     fn dummy() -> Self {

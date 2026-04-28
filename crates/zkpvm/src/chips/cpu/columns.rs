@@ -355,6 +355,44 @@ pub enum Column {
     /// successor real row after Trap.
     #[size = 1]
     IsTrap,
+    /// Phase 13d: 1 iff this step's opcode is `JumpInd`.  Drives the
+    /// JumpTableChip lookup `(addr=val_b+imm, target=next_pc)` plus the
+    /// matching 4-byte add-with-carry chain that pins JumpIndAddr to
+    /// `(val_b + imm) mod 2^32`.
+    #[size = 1]
+    IsJumpInd,
+    /// Phase 13d: virtual jump address (low 32 bits of `val_b + imm`),
+    /// 4 little-endian bytes.  Pinned by the carry-chain constraint on
+    /// JumpInd rows; emitted as the first half of the JumpTableChip
+    /// lookup tuple.
+    #[size = 4]
+    JumpIndAddr,
+    /// Phase 13d: per-byte add-with-carry chain for `JumpIndAddr =
+    /// val_b + imm_bytes` (low 32 bits).  Bytes 0..3.  Carry-out at byte
+    /// 3 is the 32-bit overflow, discarded (mirrors `% 2^32` at runtime).
+    #[size = 4]
+    JumpIndCarry,
+    /// Phase 13d-loadimmjumpind: 1 iff this step's opcode is
+    /// `LoadImmJumpInd`.  Drives the JumpTable lookup
+    /// `(LoadImmJumpIndAddr, NextPc)` and the matching carry-chain
+    /// `LoadImmJumpIndAddr = val_d + ImmYBytes` (low 32 bits).
+    #[size = 1]
+    IsLoadImmJumpInd,
+    /// Phase 13d-loadimmjumpind: 4 little-endian bytes of `step.imm_y`
+    /// (the second immediate, used for LoadImmJumpInd's jump offset).
+    /// Bound to canonical bytecode decoding via the prog_mem tuple.
+    #[size = 4]
+    ImmYBytes,
+    /// Phase 13d-loadimmjumpind: virtual jump address for LoadImmJumpInd
+    /// (low 32 bits of `val_d + imm_y`), 4 little-endian bytes.  Pinned
+    /// by the LoadImmJumpIndCarry chain; first half of the JumpTable
+    /// lookup tuple for LoadImmJumpInd rows.
+    #[size = 4]
+    LoadImmJumpIndAddr,
+    /// Phase 13d-loadimmjumpind: per-byte carry chain for
+    /// `LoadImmJumpIndAddr = val_d + ImmYBytes` (low 32 bits).
+    #[size = 4]
+    LoadImmJumpIndCarry,
     /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
     /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
     #[size = 1]
