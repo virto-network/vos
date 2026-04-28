@@ -488,9 +488,36 @@ const SYNC_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(all(feature = "network", feature = "storage"))]
 const SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Background ticker for one replication group. Polls every
-/// connected peer for their heads, BFS-fetches unknown DAG
-/// nodes, inserts them locally, and compacts the root set.
+/// Every Nth sync tick we re-probe all connected peers (not
+/// just known group members) so newly-joined replicas of an
+/// existing group get discovered. Picked to be a small
+/// multiple of the tick interval — at 250ms × 8, that's a 2s
+/// upper bound on discovering a new peer for a group we
+/// already track.
+#[cfg(all(feature = "network", feature = "storage"))]
+const SYNC_REPROBE_EVERY: u64 = 8;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Debug)]
+enum SyncOutcome {
+    /// Peer has the replication group. `inserted` is true iff
+    /// at least one DAG node was new locally.
+    PeerHasGroup { inserted: bool },
+    /// Peer answered with empty heads — they don't (currently)
+    /// host this group. Treated as a soft signal: the membership
+    /// cache demotes them, but a full re-probe sweep
+    /// (`SYNC_REPROBE_EVERY` ticks later) gives them another shot.
+    PeerEmpty,
+}
+
+/// Background ticker for one replication group. Tracks which
+/// connected peers have actually answered with non-empty heads
+/// for this group and only fans the BFS pull out to those —
+/// otherwise an N-peer / M-group cluster eats N×M FetchHeads
+/// frames per tick. Every [`SYNC_REPROBE_EVERY`] ticks the
+/// loop also probes peers it doesn't yet have membership info
+/// for, picking up replicas that joined the group after the
+/// initial discovery sweep.
 ///
 /// Runs detached — exits when `shutdown` is set or every clone
 /// of the relevant `Arc`s has been dropped (signalling the
@@ -506,6 +533,8 @@ fn sync_loop(
     shutdown: Arc<AtomicBool>,
     notifier: Option<mpsc::Sender<()>>,
 ) {
+    let mut confirmed: HashSet<libp2p::PeerId> = HashSet::new();
+    let mut tick: u64 = 0;
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(SYNC_INTERVAL);
         if shutdown.load(Ordering::Relaxed) {
@@ -514,14 +543,39 @@ fn sync_loop(
         let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else {
             continue;
         };
+        let local = net.peer_id();
+        let connected: HashSet<libp2p::PeerId> =
+            net.connected_peers().into_iter().filter(|p| p != &local).collect();
+        // Drop peers that disconnected since our last tick.
+        confirmed.retain(|p| connected.contains(p));
+
+        // Reprobe sweep: every Nth tick (or whenever we have no
+        // confirmed members yet) hit every connected peer to
+        // find new group hosts. Otherwise stick to the cache.
+        let reprobe = tick % SYNC_REPROBE_EVERY == 0 || confirmed.is_empty();
+        tick = tick.wrapping_add(1);
+
+        let targets: Vec<libp2p::PeerId> = if reprobe {
+            connected.iter().copied().collect()
+        } else {
+            confirmed.iter().copied().collect()
+        };
+
         let mut any_inserted = false;
-        for peer in net.connected_peers() {
-            if peer == net.peer_id() {
-                continue;
-            }
+        for peer in targets {
             match sync_with_peer(&net, peer, &rep_id, &db) {
-                Ok(true) => any_inserted = true,
-                Ok(false) => {}
+                Ok(SyncOutcome::PeerHasGroup { inserted }) => {
+                    confirmed.insert(peer);
+                    if inserted {
+                        any_inserted = true;
+                    }
+                }
+                Ok(SyncOutcome::PeerEmpty) => {
+                    // Demote — they're either out of the group
+                    // or briefly empty during their own cold
+                    // start. The next reprobe rediscovers them.
+                    confirmed.remove(&peer);
+                }
                 Err(e) => warn!(error = %e, "sync: per-peer cycle failed"),
             }
         }
@@ -534,19 +588,24 @@ fn sync_loop(
 }
 
 /// One pull cycle against a single peer for one replication
-/// group. Returns `Ok(true)` if at least one new DAG node was
-/// inserted into the local store; `Ok(false)` if everything was
-/// already known. Returns `Err` only on host-side commit
-/// failures; transient network failures surface as `None`
-/// payloads / channel disconnects, which we silently treat as
-/// "try again next tick".
+/// group. Returns:
+///   - `PeerHasGroup { inserted }` when the peer answered with
+///     non-empty heads (regardless of whether anything new was
+///     pulled in)
+///   - `PeerEmpty` when the peer reports no heads — interpreted
+///     as "this peer doesn't host the group right now"
+///
+/// Errors only on host-side commit failures; transient network
+/// failures surface as a timeout / disconnect, which we silently
+/// treat as `PeerEmpty` for the membership cache (the next
+/// reprobe sweep retries).
 #[cfg(all(feature = "network", feature = "storage"))]
 fn sync_with_peer(
     net: &crate::network::Network,
     peer: libp2p::PeerId,
     rep_id: &[u8; 32],
     db: &Arc<redb::Database>,
-) -> Result<bool, crate::commit::CommitError> {
+) -> Result<SyncOutcome, crate::commit::CommitError> {
     use crate::commit::CrdtCommit;
     use crate::effect_log::EffectLog;
     use merkle_crdt::DagNode;
@@ -554,10 +613,10 @@ fn sync_with_peer(
     let heads_rx = net.fetch_heads(peer, *rep_id);
     let heads = match heads_rx.recv_timeout(SYNC_FETCH_TIMEOUT) {
         Ok(v) => v,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(SyncOutcome::PeerEmpty),
     };
     if heads.is_empty() {
-        return Ok(false);
+        return Ok(SyncOutcome::PeerEmpty);
     }
 
     let mut cc = CrdtCommit::from_db_arc(db.clone());
@@ -595,7 +654,7 @@ fn sync_with_peer(
     if inserted_any {
         cc.compact_roots()?;
     }
-    Ok(inserted_any)
+    Ok(SyncOutcome::PeerHasGroup { inserted: inserted_any })
 }
 
 #[cfg(feature = "network")]
