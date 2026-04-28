@@ -7,15 +7,14 @@ license.workspace = true
 
 [features]
 default = ["std"]
-# Host-side helpers that drive the registry from a `VosNode`.
 # Off when actor crates depend on this for the wire types only
-# — they live in no_std + alloc and don't need the helpers.
-std = ["dep:vos", "dep:tracing"]
+# — they live in no_std + alloc. Today this only flips
+# blake2b_simd's std feature; future host-only sugar (if any)
+# would gate behind it too. The host-side `Client` lives in
+# the separate `registry-client` crate to avoid a vos→registry→vos
+# build cycle.
+std = ["blake2b_simd/std"]
 
 [dependencies]
 rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 blake2b_simd = { version = "1", default-features = false }
-
-# Host-side only.
-vos = { path = "../vos", optional = true, default-features = false, features = ["std"] }
-tracing = { version = "0.1", optional = true }

@@ -429,6 +429,50 @@ fn cmd_start(
     // the registry actor.
     let mut provides_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
 
+    // ── Hyperspace registry (phase-2 auto-spawn) ────────────────────
+    //
+    // When `hyperspace = "..."` is declared, vosx spins up a CRDT
+    // replica of the registry actor at the well-known
+    // `ServiceId::REGISTRY`, derives the replication group from
+    // `blake2b("vos-registry/v1" || hyperspace_name)`, and queues
+    // up announcements for every declared agent so the local
+    // replica (and via cycles 1–8, every replica in the
+    // hyperspace) sees them. `registry_blob` points at the actor
+    // ELF; future cycles will embed it.
+    let registry_active = if let Some(hyperspace_name) = &manifest.hyperspace {
+        let blob_path = match &manifest.registry_blob {
+            Some(p) => dir.join(p),
+            None => die(&format!(
+                "manifest declares hyperspace='{hyperspace_name}' but no \
+                 `registry_blob` path; phase-2 vosx needs the registry \
+                 actor's elf until embedding lands",
+            )),
+        };
+        let elf_data = load_file(&blob_path);
+        let blob = load_blob(&blob_path);
+        let rep_id = registry::replication_id(hyperspace_name);
+        let mut cfg = vos::node::AgentConfig::new(blob)
+            .with_consistency(vos::node::Consistency::Crdt)
+            .with_replication_id(rep_id);
+        if let Some(d) = &state_dir {
+            cfg = cfg.persist(d);
+        }
+        let id = node.register_at_id(cfg, vos::abi::service::ServiceId::REGISTRY);
+        eprintln!(
+            "vosx: hyperspace='{hyperspace_name}' registry as {id} (rep_id={})",
+            hex32(&rep_id),
+        );
+        let _ = elf_data;
+        true
+    } else {
+        false
+    };
+
+    // Collected at registration; flushed as `announce` invokes
+    // after attach_network so the local registry sees every
+    // locally-declared agent (and replicates them outward).
+    let mut announces: Vec<AnnouncePlan> = Vec::new();
+
     // ── Workers ─────────────────────────────────────────────────────
     for w in &manifest.worker {
         let path = resolve_entry_path(&w.name, &w.path, &w.service, dir);
@@ -493,6 +537,14 @@ fn cmd_start(
             for role in &child.provides {
                 provides_map.entry(role.clone()).or_default().push(id.0);
             }
+            if registry_active {
+                announces.push(AnnouncePlan {
+                    name: format!("{}/{}", a.name, child.name),
+                    owner_prefix: id.node_prefix(),
+                    service_id: id.local_id(),
+                    roles: child.provides.clone(),
+                });
+            }
         }
 
         // 2. Agent itself.
@@ -529,6 +581,14 @@ fn cmd_start(
         for role in &a.provides {
             provides_map.entry(role.clone()).or_default().push(id.0);
         }
+        if registry_active {
+            announces.push(AnnouncePlan {
+                name: a.name.clone(),
+                owner_prefix: id.node_prefix(),
+                service_id: id.local_id(),
+                roles: a.provides.clone(),
+            });
+        }
     }
 
     // Hand the network off to the node, which spawns a bridge
@@ -543,6 +603,14 @@ fn cmd_start(
     }
     #[cfg(not(feature = "network"))]
     let networked = false;
+
+    // Flush registry announces. Each invoke goes through
+    // invoke_routes locally (the registry replica lives on this
+    // node at ServiceId::REGISTRY), no network hop needed; the
+    // CRDT layer handles outward replication.
+    if registry_active && !announces.is_empty() {
+        flush_registry_announces(&node, &announces);
+    }
 
     eprintln!("vosx: running space '{}'...\n", manifest.space);
     if networked {
@@ -565,6 +633,57 @@ fn cmd_start(
         std::process::exit(2);
     }
     exit_with_status(panics);
+}
+
+/// Pending registry announce: vosx sends these to the local
+/// `ServiceId::REGISTRY` after `attach_network`. One per
+/// declared agent / child actor when `hyperspace` is set.
+struct AnnouncePlan {
+    name: String,
+    owner_prefix: u16,
+    service_id: u16,
+    roles: Vec<String>,
+}
+
+/// Send an `announce(...)` invoke for every plan to the local
+/// registry. Inlines the wire encoding rather than depending on
+/// `registry::Client` to avoid a vos→registry→vos build cycle.
+fn flush_registry_announces(node: &vos::node::VosNode, plans: &[AnnouncePlan]) {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    for plan in plans {
+        let m = Msg::new("announce")
+            .with("name", plan.name.clone())
+            .with("owner_prefix", plan.owner_prefix as u32)
+            .with("service_id", plan.service_id as u32)
+            .with("roles", plan.roles.clone());
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        let reply = node.invoke_with_timeout(
+            vos::abi::service::ServiceId::REGISTRY,
+            payload,
+            std::time::Duration::from_secs(2),
+        );
+        if reply.is_none() {
+            eprintln!(
+                "vosx: warning: registry announce for '{}' returned no reply",
+                plan.name,
+            );
+        } else {
+            eprintln!("vosx: registered '{}' in registry", plan.name);
+        }
+    }
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use core::fmt::Write;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
 }
 
 fn format_provides(provides: &[String]) -> String {
@@ -764,11 +883,20 @@ struct Manifest {
     #[serde(default)]
     #[allow(dead_code)]
     version: Option<String>,
-    /// Optional hyperspace to inherit registry / peers from.
-    /// Reserved for the networking layer — parsed and reported
-    /// today but inert until libp2p lands.
+    /// Optional hyperspace this space joins. When set, vosx
+    /// auto-spawns a registry replica at `ServiceId::REGISTRY`
+    /// using `registry_blob` as the actor binary, and registers
+    /// every declared agent in it on startup. The replication
+    /// group is `blake2b("vos-registry/v1" || hyperspace_name)`
+    /// — every node in the same hyperspace converges.
     #[serde(default)]
     hyperspace: Option<String>,
+    /// Path to the registry actor's `.elf`. Required when
+    /// `hyperspace` is set. Resolved relative to the manifest
+    /// directory. Future: vosx will embed the actor itself and
+    /// this field becomes a release-pinned override.
+    #[serde(default)]
+    registry_blob: Option<PathBuf>,
     #[serde(default)]
     agent: Vec<AgentDef>,
     #[serde(default)]

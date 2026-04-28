@@ -1543,7 +1543,7 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     // both replicas converge to a 2-entry directory. Lookup,
     // by_role, and paginated list all return consistent answers
     // from either side.
-    use registry::{Client, PageRequest};
+    use registry_client::{Client, PageRequest};
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};

@@ -6,8 +6,14 @@
 //! same `Frame::InvokeRequest` / `Frame::InvokeReply` pair, so
 //! a [`Client`] backed by a `VosNode` works whether the registry
 //! it talks to lives locally or across the wire.
+//!
+//! Lives in a separate crate from `registry` so `vos` can depend
+//! on `registry` (for the no_std wire types and the
+//! `replication_id` derivation) without forming a cycle. Vosx
+//! itself inlines the announce-encoding for the same reason.
 
-use crate::{Page, PageRequest, RegistryEntry, decode_archived};
+pub use registry::{Page, PageRequest, RegistryEntry, MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE};
+use registry::decode_archived;
 
 use vos::abi::service::ServiceId;
 use vos::node::VosNode;
@@ -22,11 +28,11 @@ pub struct Client<'a> {
 
 impl<'a> Client<'a> {
     /// Bind to the local node's own registry replica at the
-    /// well-known [`SERVICE_ID_RAW`](crate::SERVICE_ID_RAW).
+    /// well-known [`registry::SERVICE_ID_RAW`].
     pub fn local(node: &'a VosNode) -> Self {
         Self {
             node,
-            target: ServiceId(crate::SERVICE_ID_RAW),
+            target: ServiceId(registry::SERVICE_ID_RAW),
         }
     }
 
@@ -89,7 +95,7 @@ impl<'a> Client<'a> {
                 .with("role", role)
                 .with("prefix", request.prefix.clone())
                 .with("after", request.after.clone())
-                .with("limit", request.limit.min(crate::MAX_PAGE_SIZE)),
+                .with("limit", request.limit.min(registry::MAX_PAGE_SIZE)),
         )?;
         decode_page(&bytes)
     }
@@ -100,7 +106,7 @@ impl<'a> Client<'a> {
             Msg::new("list")
                 .with("prefix", request.prefix.clone())
                 .with("after", request.after.clone())
-                .with("limit", request.limit.min(crate::MAX_PAGE_SIZE)),
+                .with("limit", request.limit.min(registry::MAX_PAGE_SIZE)),
         )?;
         decode_page(&bytes)
     }

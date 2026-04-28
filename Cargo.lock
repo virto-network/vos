@@ -2956,7 +2956,13 @@ version = "0.1.0"
 dependencies = [
  "blake2b_simd",
  "rkyv",
- "tracing",
+]
+
+[[package]]
+name = "registry-client"
+version = "0.1.0"
+dependencies = [
+ "registry",
  "vos",
 ]
 
@@ -3790,6 +3796,7 @@ dependencies = [
  "pollster",
  "redb",
  "registry",
+ "registry-client",
  "rkyv",
  "serde",
  "tokio",

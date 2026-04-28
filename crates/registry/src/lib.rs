@@ -199,10 +199,5 @@ where
     rkyv::deserialize::<T, rkyv::rancor::Error>(archived).ok()
 }
 
-// ── Host-side client ────────────────────────────────────────────────
-
-#[cfg(feature = "std")]
-mod client;
-
-#[cfg(feature = "std")]
-pub use client::Client;
+// Host-side client lives in the separate `registry-client`
+// crate to avoid a vos → registry → vos build cycle.
