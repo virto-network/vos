@@ -217,7 +217,7 @@ fn div_s64_forged_unsigned_quotient_rejected() {
     forge_three_reg_result(Opcode::DivS64, 2, 0, 1, 100, 7, /*forged*/ 13);
 }
 
-// ── MulUpper (UU only — SS/SU still prover-trusted; see task 12c) ─────────
+// ── MulUpper (UU + SS + SU — Phase 12c bound all three) ──────────────────
 
 #[test]
 fn mul_upper_uu_top_bits_smoke() {
@@ -273,6 +273,34 @@ fn mul_upper_uu_full_64bit_squared() {
         Opcode::MulUpperUU, 2, 0, 1,
         0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
         0xFFFF_FFFF_FFFF_FFFE,
+    );
+}
+
+// Phase 12c probe: MulUpperSS / MulUpperSU were marked deferred because
+// the AIR's existing constraint binds `result = mul_high` (high 64 bits
+// of UNSIGNED product), correct only for UU.  For SS/SU the high bits
+// of the SIGNED product differ by sign corrections that the AIR didn't
+// model.  These tests pin the gap.  Flip to passing positive smokes
+// when the signed-schoolbook follow-up lands.
+#[test]
+fn mul_upper_ss_negative_squared_smoke() {
+    // (-1) × (-1) signed = 1.  As u64: 0xFFFF...FFFF² = 0xFFFF...FFFE_…1.
+    // High 64 of SIGNED product = 0.
+    prove_three_reg(
+        Opcode::MulUpperSS, 2, 0, 1,
+        0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
+        0,
+    );
+}
+
+#[test]
+fn mul_upper_su_negative_unsigned_smoke() {
+    // (-2) signed × 3 unsigned = -6 (signed 128-bit).
+    // High 64 of SIGNED = 0xFFFFFFFFFFFFFFFF (sign-ext from -1).
+    prove_three_reg(
+        Opcode::MulUpperSU, 2, 0, 1,
+        0xFFFF_FFFF_FFFF_FFFE, 3,
+        0xFFFF_FFFF_FFFF_FFFF,
     );
 }
 

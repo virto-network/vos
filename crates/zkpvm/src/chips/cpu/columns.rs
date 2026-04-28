@@ -393,6 +393,36 @@ pub enum Column {
     /// `LoadImmJumpIndAddr = val_d + ImmYBytes` (low 32 bits).
     #[size = 4]
     LoadImmJumpIndCarry,
+    /// Phase 12c: signedness sub-flags for MulUpper.  Exactly one of the
+    /// three is 1 when IsMulUpper=1.  Drive the per-variant result
+    /// binding (UU = unsigned high directly, SU/SS subtract sign
+    /// corrections from the unsigned high).
+    #[size = 1]
+    IsMulUpperUU,
+    #[size = 1]
+    IsMulUpperSU,
+    #[size = 1]
+    IsMulUpperSS,
+    /// Phase 12c: unsigned product high 64 bits (positions 8..15 of the
+    /// schoolbook).  Holds the schoolbook output for `is_mul_upper`
+    /// rows, decoupling the schoolbook constraint from the per-variant
+    /// result binding.
+    #[size = 8]
+    UnsignedProductHi,
+    /// Phase 12c: sign-correction term `sa·val_d` (low 64 bits).
+    /// Filled to `sa·val_d` for SU/SS rows; 0 for UU.
+    #[size = 8]
+    MulCorrTermA,
+    /// Phase 12c: sign-correction term `sb·val_b` (low 64 bits).
+    /// Filled to `sb·val_b` for SS rows; 0 for UU/SU.
+    #[size = 8]
+    MulCorrTermB,
+    /// Phase 12c: per-byte carry chain for the result-binding subtraction
+    /// `result + MulCorrTermA + MulCorrTermB ≡ UnsignedProductHi (mod 2^64)`
+    /// on `is_mul_upper` rows.  Carry-out at byte 7 is the 64-bit
+    /// overflow, discarded.
+    #[size = 8]
+    MulCorrCarry,
     /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
     /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
     #[size = 1]

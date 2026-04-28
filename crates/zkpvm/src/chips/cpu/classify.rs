@@ -74,6 +74,14 @@ pub(super) struct OpcodeFlags {
     /// in the AIR).  Bound via a separate carry chain into
     /// LoadImmJumpIndAddr.
     pub is_load_imm_jump_ind: bool,
+    /// Phase 12c: split `is_mul_upper` into the three signedness variants
+    /// so the AIR can apply the correct sign correction to the result.
+    /// `is_mul_upper_uu` ⇒ result = unsigned-product high 64.
+    /// `is_mul_upper_su` ⇒ result = signed-unsigned high = unsigned high − sa·val_d.
+    /// `is_mul_upper_ss` ⇒ result = signed-signed   high = unsigned high − sa·val_d − sb·val_b.
+    pub is_mul_upper_uu: bool,
+    pub is_mul_upper_su: bool,
+    pub is_mul_upper_ss: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -88,7 +96,9 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::Mul64 | Opcode::MulImm64 => { f.is_mul = true; }
         Opcode::Mul32 | Opcode::MulImm32 => { f.is_mul = true; f.is_32bit = true; }
         // MulUpper: result = high 64 bits of 128-bit product
-        Opcode::MulUpperUU | Opcode::MulUpperSS | Opcode::MulUpperSU => { f.is_mul = true; f.is_mul_upper = true; }
+        Opcode::MulUpperUU => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_uu = true; }
+        Opcode::MulUpperSS => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_ss = true; }
+        Opcode::MulUpperSU => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_su = true; }
         Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.is_and = true; }
         Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.is_or = true; }
         Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.is_xor = true; }
@@ -230,12 +240,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind): extract
-/// the 23 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c):
+/// extract the 26 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 23] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 26] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -246,5 +256,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 23] {
         f.is_sign_ext_8 as u8, f.is_sign_ext_16 as u8,
         f.is_trap as u8, f.is_jump_ind as u8,
         f.is_load_imm_jump_ind as u8,
+        f.is_mul_upper_uu as u8, f.is_mul_upper_su as u8, f.is_mul_upper_ss as u8,
     ]
 }

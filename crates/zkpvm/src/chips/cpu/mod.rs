@@ -172,6 +172,7 @@ impl BuiltInComponent for CpuChip {
         let is_mul_upper = crate::trace::trace_eval!(trace_eval, Column::IsMulUpper);
         let is_mul_low = E::F::one() - is_mul_upper[0].clone();
         let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
+        let unsigned_product_hi = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
         // Helper: full 16-bit carry value at position k.
         let full_carry = |k: usize| -> E::F {
             mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
@@ -180,6 +181,13 @@ impl BuiltInComponent for CpuChip {
         // ~16 bits at busy middle positions (e.g. 0xFFFFFFFF² produces
         // 0x3FB at position k=3), so the carry is reconstructed as
         // mul_carry[k] + 256·mul_carry_hi[k].
+        //
+        // Phase 12c: the schoolbook output for `is_mul_upper` (positions
+        // 8..15) now lands in `unsigned_product_hi[k-8]` instead of
+        // `result[k-8]`.  This decouples the schoolbook from per-variant
+        // result binding: UU/SU/SS all share the same unsigned-product
+        // computation, but `result` is derived differently per variant
+        // (UU = unsigned_product_hi; SU/SS subtract a sign correction).
         for k in 0..16usize {
             let mut partial_sum = E::F::zero();
             for i in 0..WORD_SIZE {
@@ -190,7 +198,7 @@ impl BuiltInComponent for CpuChip {
             }
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let out_normal = if k < 8 { result[k].clone() } else { mul_high[k - 8].clone() };
-            let out_upper = if k < 8 { mul_high[k].clone() } else { result[k - 8].clone() };
+            let out_upper = if k < 8 { mul_high[k].clone() } else { unsigned_product_hi[k - 8].clone() };
             let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
             let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone() * c_normal);
@@ -216,6 +224,94 @@ impl BuiltInComponent for CpuChip {
         // 32-bit mul: upper result limbs = 0
         for i in 4..WORD_SIZE {
             eval.add_constraint(is_mul[0].clone() * is_32bit[0].clone() * result[i].clone());
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 12c: MulUpper SS / SU sign-correction
+        //
+        //   high(a_s × b_s) ≡ high(a_u × b_u) − sa·b_u − sb·a_u  (mod 2^64)
+        //
+        // For UU: result = unsigned_product_hi (no correction).
+        // For SU: result = unsigned_product_hi − sa·val_d.
+        // For SS: result = unsigned_product_hi − sa·val_d − sb·val_b.
+        //
+        // Materialised via two sign-correction term columns (TermA = sa·val_d
+        // for SU/SS, 0 for UU; TermB = sb·val_b for SS, 0 elsewhere) and a
+        // 64-bit add-with-carry chain encoding
+        //   result + TermA + TermB ≡ unsigned_product_hi  (mod 2^64).
+        // For UU rows TermA = TermB = 0, so the chain collapses to
+        // `result = unsigned_product_hi` (which replaces the old direct
+        // schoolbook-into-result constraint for is_mul_upper).
+        {
+            let term_a = crate::trace::trace_eval!(trace_eval, Column::MulCorrTermA);
+            let term_b = crate::trace::trace_eval!(trace_eval, Column::MulCorrTermB);
+            let corr_carry = crate::trace::trace_eval!(trace_eval, Column::MulCorrCarry);
+            let mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
+            let mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
+            let mu_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
+            let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+
+            // Boolean witnesses.
+            for f in [&mu_uu, &mu_su, &mu_ss] {
+                eval.add_constraint(f[0].clone() * (E::F::one() - f[0].clone()));
+            }
+            // Variant flags partition is_mul_upper:
+            //   is_mul_upper = is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss.
+            eval.add_constraint(
+                is_mul_upper[0].clone()
+                    - mu_uu[0].clone() - mu_su[0].clone() - mu_ss[0].clone()
+            );
+
+            // Term definitions (degree 3 each — flag · sign_bit · operand byte).
+            //
+            // TermA[i]:
+            //   UU: 0
+            //   SU/SS: sa · val_d[i]   where sa = sign_bit_b
+            // TermB[i]:
+            //   UU/SU: 0
+            //   SS: sb · val_b[i]      where sb = sign_bit_d
+            //
+            // Encoded as paired constraints per byte: one forces the
+            // active variant's correct value; the other forces 0 on
+            // the inactive variants.
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    (mu_su[0].clone() + mu_ss[0].clone())
+                        * (term_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone())
+                );
+                eval.add_constraint(mu_uu[0].clone() * term_a[i].clone());
+                eval.add_constraint(
+                    mu_ss[0].clone()
+                        * (term_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone())
+                );
+                eval.add_constraint((mu_uu[0].clone() + mu_su[0].clone()) * term_b[i].clone());
+            }
+
+            // Result-binding sum with byte-level carry chain.
+            // Convention (matches the existing add/sub chain shape):
+            //   unsigned_hi[i] + carry_out[i]·256 = result[i] + TermA[i] + TermB[i] + carry_in[i]
+            // gated on is_mul_upper.  For UU: TermA=TermB=0 → unsigned_hi
+            // = result everywhere.  For SU/SS: unsigned_hi = result + corr
+            // (mod 2^64); the carry-out at byte 7 is the 64-bit overflow,
+            // discarded.
+            for i in 0..WORD_SIZE {
+                let carry_in: E::F = if i == 0 {
+                    E::F::zero()
+                } else {
+                    corr_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_mul_upper[0].clone() * (
+                        unsigned_product_hi[i].clone()
+                            + corr_carry[i].clone() * f256.clone()
+                            - result[i].clone()
+                            - term_a[i].clone()
+                            - term_b[i].clone()
+                            - carry_in
+                    )
+                );
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1221,6 +1317,9 @@ impl BuiltInComponent for CpuChip {
             let f_is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
             let f_is_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
             let f_is_load_imm_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let f_is_mul_upper_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
+            let f_is_mul_upper_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
+            let f_is_mul_upper_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1256,6 +1355,9 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_trap[0].clone());
             tuple.push(f_is_jump_ind[0].clone());
             tuple.push(f_is_load_imm_jump_ind[0].clone());
+            tuple.push(f_is_mul_upper_uu[0].clone());
+            tuple.push(f_is_mul_upper_su[0].clone());
+            tuple.push(f_is_mul_upper_ss[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1572,6 +1674,10 @@ impl BuiltInProverComponent for CpuChip {
             let mut mul_high = [0u8; WORD_SIZE];
             let mut mul_carry = [0u8; 16];
             let mut mul_carry_hi = [0u8; 16];
+            let mut unsigned_product_hi_bytes = [0u8; WORD_SIZE];
+            let mut mul_corr_term_a = [0u8; WORD_SIZE];
+            let mut mul_corr_term_b = [0u8; WORD_SIZE];
+            let mut mul_corr_carry = [0u8; WORD_SIZE];
             if flags.is_mul {
                 let full = (val_b as u128) * (val_d as u128);
                 if flags.is_32bit {
@@ -1580,9 +1686,16 @@ impl BuiltInProverComponent for CpuChip {
                     let high_bytes = high32.to_le_bytes();
                     mul_high[..4].copy_from_slice(&high_bytes);
                 } else if flags.is_mul_upper {
-                    // MulUpper: result holds high bits, mul_high holds LOW bits
+                    // MulUpper: mul_high holds positions 0..7 (low 64 of
+                    // unsigned product); positions 8..15 (unsigned high)
+                    // land in UnsignedProductHi.  result holds the
+                    // signedness-adjusted high (for UU: same as unsigned;
+                    // for SU/SS: unsigned − sign correction, computed by
+                    // the interpreter and reflected in step.regs_after).
                     let low = full as u64;
                     mul_high = low.to_le_bytes();
+                    let high = (full >> 64) as u64;
+                    unsigned_product_hi_bytes = high.to_le_bytes();
                 } else {
                     let high = (full >> 64) as u64;
                     mul_high = high.to_le_bytes();
@@ -1610,10 +1723,40 @@ impl BuiltInProverComponent for CpuChip {
                     mul_carry[out_limbs - 1] = carry as u8;
                     mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
                 }
+
+                // Phase 12c: sign-correction columns for MulUpper SS / SU.
+                // TermA = sa·val_d (SU/SS); TermB = sb·val_b (SS only).
+                // Carry chain: result + TermA + TermB ≡ unsigned_high (mod 2^64).
+                if flags.is_mul_upper && !flags.is_32bit {
+                    let sa = (val_b >> 63) & 1;
+                    let sb = (val_d >> 63) & 1;
+                    let term_a_full = if flags.is_mul_upper_su || flags.is_mul_upper_ss {
+                        if sa == 1 { val_d } else { 0 }
+                    } else { 0 };
+                    let term_b_full = if flags.is_mul_upper_ss {
+                        if sb == 1 { val_b } else { 0 }
+                    } else { 0 };
+                    mul_corr_term_a = term_a_full.to_le_bytes();
+                    mul_corr_term_b = term_b_full.to_le_bytes();
+                    let result_bytes_le = step.regs_after[dest_reg(step)].to_le_bytes();
+                    let mut carry_in: u16 = 0;
+                    for i in 0..WORD_SIZE {
+                        let s = result_bytes_le[i] as u16
+                            + mul_corr_term_a[i] as u16
+                            + mul_corr_term_b[i] as u16
+                            + carry_in;
+                        carry_in = s >> 8;
+                        mul_corr_carry[i] = carry_in as u8;
+                    }
+                }
             }
             trace.fill_columns_bytes(row, &mul_high, Column::MulHigh);
             trace.fill_columns_bytes(row, &mul_carry, Column::MulCarry);
             trace.fill_columns_bytes(row, &mul_carry_hi, Column::MulCarryHi);
+            trace.fill_columns_bytes(row, &unsigned_product_hi_bytes, Column::UnsignedProductHi);
+            trace.fill_columns_bytes(row, &mul_corr_term_a, Column::MulCorrTermA);
+            trace.fill_columns_bytes(row, &mul_corr_term_b, Column::MulCorrTermB);
+            trace.fill_columns_bytes(row, &mul_corr_carry, Column::MulCorrCarry);
 
             // ── Bitwise auxiliary ──
             let mut and_result = [0u8; WORD_SIZE];
@@ -1724,6 +1867,9 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_sub, Column::IsSub);
             trace.fill_columns(row, flags.is_mul, Column::IsMul);
             trace.fill_columns(row, flags.is_mul_upper, Column::IsMulUpper);
+            trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
+            trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
+            trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
             trace.fill_columns(row, flags.is_bitwise, Column::IsBitwise);
             trace.fill_columns(row, flags.is_shift, Column::IsShift);
             trace.fill_columns(row, flags.is_compare, Column::IsCompare);
@@ -2398,6 +2544,9 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_trap = crate::trace::original_base_column!(component_trace, Column::IsTrap);
             let f_is_jump_ind = crate::trace::original_base_column!(component_trace, Column::IsJumpInd);
             let f_is_load_imm_jump_ind = crate::trace::original_base_column!(component_trace, Column::IsLoadImmJumpInd);
+            let f_is_mul_upper_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
+            let f_is_mul_upper_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
+            let f_is_mul_upper_ss = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSS);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -2434,6 +2583,9 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_trap[0].clone());
             tuple.push(f_is_jump_ind[0].clone());
             tuple.push(f_is_load_imm_jump_ind[0].clone());
+            tuple.push(f_is_mul_upper_uu[0].clone());
+            tuple.push(f_is_mul_upper_su[0].clone());
+            tuple.push(f_is_mul_upper_ss[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

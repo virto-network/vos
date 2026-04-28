@@ -31,12 +31,13 @@ stwo_constraint_framework::relation!(
 // can't clear flags to skip per-op constraints — flag values are now
 // pinned to the canonical classify_opcode(opcode) decoding.
 //
-// Flag layout in the tuple, in order (Phase 13c, 13e-redux, 13d, 13d-loadimmjumpind):
+// Flag layout in the tuple, in order (Phase 13c → 12c):
 //   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
 //   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
-//   is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind
-pub const PROG_MEMORY_N_FLAGS: usize = 23;
+//   is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind,
+//   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss
+pub const PROG_MEMORY_N_FLAGS: usize = 26;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
 //   + 23 flags + imm_y_canon[4] + branch_target_canon[4] = 48 limbs.
 //   imm_y_canon added in 13d-loadimmjumpind for LoadImmJumpInd's

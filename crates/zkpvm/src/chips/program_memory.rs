@@ -128,6 +128,12 @@ pub enum PreprocessedColumn {
     /// Phase 13d-loadimmjumpind: per-opcode flag for
     /// `Opcode::LoadImmJumpInd`.
     #[size = 1] IsLoadImmJumpInd,
+    /// Phase 12c: per-variant flags for MulUpper.  Exactly one of these
+    /// is 1 when IsMulUpper=1; drive the result-binding for the SS/SU
+    /// sign-correction.
+    #[size = 1] IsMulUpperUU,
+    #[size = 1] IsMulUpperSU,
+    #[size = 1] IsMulUpperSS,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -185,14 +191,17 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_trap = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTrap);
         let f_is_jump_ind = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsJumpInd);
         let f_is_load_imm_jump_ind = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadImmJumpInd);
+        let f_is_mul_upper_uu = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMulUpperUU);
+        let f_is_mul_upper_su = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMulUpperSU);
+        let f_is_mul_upper_ss = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMulUpperSS);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 23 flags,
-        //         imm_y_canon[4], branch_target_canon[4]) — 48 limbs.
+        // Tuple: (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8], 26 flags,
+        //         imm_y_canon[4], branch_target_canon[4]) — 51 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -223,6 +232,9 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_trap[0].clone());
         tuple.push(f_is_jump_ind[0].clone());
         tuple.push(f_is_load_imm_jump_ind[0].clone());
+        tuple.push(f_is_mul_upper_uu[0].clone());
+        tuple.push(f_is_mul_upper_su[0].clone());
+        tuple.push(f_is_mul_upper_ss[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -287,6 +299,9 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsSignExt8, PreprocessedColumn::IsSignExt16,
                     PreprocessedColumn::IsTrap, PreprocessedColumn::IsJumpInd,
                     PreprocessedColumn::IsLoadImmJumpInd,
+                    PreprocessedColumn::IsMulUpperUU,
+                    PreprocessedColumn::IsMulUpperSU,
+                    PreprocessedColumn::IsMulUpperSS,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -359,13 +374,16 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_trap = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTrap);
         let f_is_jump_ind = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsJumpInd);
         let f_is_load_imm_jump_ind = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadImmJumpInd);
+        let f_is_mul_upper_uu = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMulUpperUU);
+        let f_is_mul_upper_su = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMulUpperSU);
+        let f_is_mul_upper_ss = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMulUpperSS);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 48-limb tuple from preprocessed columns.
+        // Build the 51-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -396,6 +414,9 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_trap[0].clone());
         tuple.push(f_is_jump_ind[0].clone());
         tuple.push(f_is_load_imm_jump_ind[0].clone());
+        tuple.push(f_is_mul_upper_uu[0].clone());
+        tuple.push(f_is_mul_upper_su[0].clone());
+        tuple.push(f_is_mul_upper_ss[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -429,7 +450,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 23],
+    flags: [u8; 26],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }
