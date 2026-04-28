@@ -25,6 +25,10 @@
 
 #![cfg(feature = "network")]
 
+mod wire;
+
+pub use wire::{Frame, FrameError, MAX_FRAME_BYTES};
+
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
