@@ -969,6 +969,116 @@ mod tests {
         }
     }
 
+    /// Slice 3b end-to-end: VosNode B has a CRDT replica registered
+    /// in `crdt_replicas` (via the test helper) with some DAG
+    /// nodes pre-populated; VosNode A asks via the network and
+    /// reads them back through `NodeSyncProvider`.
+    #[test]
+    fn cross_node_sync_via_vosnode_replicas() {
+        use crate::commit::{CommitStrategy, CrdtCommit};
+        use crate::effect_log::EffectLog;
+        use crate::node::VosNode;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        // Build node B with a pre-populated replica, attach net_b.
+        let mut node_b = VosNode::with_prefix(prefix_b);
+        let rep_id = [0x99u8; 32];
+        let dir_b = std::env::temp_dir().join(format!(
+            "vos_sync_b_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let db_path_b = dir_b.join("replica.redb");
+        let _arc_b = node_b.install_test_replica(rep_id, &db_path_b);
+
+        // Drop _arc_b out of scope so CrdtCommit::from_db_arc gets
+        // *the same* Arc through the map (we keep one in the map).
+        // Drive a couple of CRDT commits through a second Arc clone.
+        let arc_b_for_writes = node_b
+            .crdt_replicas
+            .lock()
+            .unwrap()
+            .get(&rep_id)
+            .cloned()
+            .unwrap();
+        let mut cc = CrdtCommit::from_db_arc(arc_b_for_writes);
+        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec())).unwrap();
+        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
+        let expected_root = cc.root_bytes()[0];
+        let expected_node_bytes = cc.get_node_bytes(&expected_root).unwrap().unwrap();
+        drop(cc);
+
+        node_b.attach_network(net_b);
+
+        // VosNode A — empty, just attached.
+        let mut node_a = VosNode::with_prefix(prefix_a);
+        node_a.attach_network(net_a);
+
+        // From outside, reach into A's network (we can't because
+        // attach_network moved it). Use the shared_network handle
+        // VosNode keeps.
+        let net_a_arc = node_a
+            .shared_network
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("net_a attached");
+
+        wait_for(
+            || net_a_arc.peer_for_prefix(prefix_b),
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+        let peer_b = net_a_arc.peer_for_prefix(prefix_b).unwrap();
+
+        // Ask B for heads of the replication group.
+        let heads = net_a_arc
+            .fetch_heads(peer_b, rep_id)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchHeads reply");
+        assert_eq!(heads, vec![expected_root]);
+
+        // Point-fetch the root node.
+        let node = net_a_arc
+            .fetch_node(peer_b, rep_id, expected_root)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchNode reply");
+        assert_eq!(node.as_deref(), Some(expected_node_bytes.as_slice()));
+
+        let _ = node_a.collect();
+        let _ = node_b.collect();
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
     /// Network-level test: A asks B for the heads of a replication
     /// group and then point-fetches a DAG node by CID. Verifies
     /// the SyncProvider on B sees the requests and the responses

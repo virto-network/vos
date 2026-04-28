@@ -129,7 +129,7 @@ impl CommitStrategy for NoCommit {
 pub use local::{LocalCommit, STATE_KEY, STATE_TABLE};
 
 #[cfg(feature = "storage")]
-pub use crdt::{Blake2b, CrdtCommit, DAG_TABLE, ROOTS_KEY};
+pub use crdt::{Blake2b, CrdtCommit, DAG_TABLE, ROOTS_KEY, read_dag_node, read_roots};
 
 #[cfg(feature = "storage")]
 mod local {
@@ -275,6 +275,18 @@ mod crdt {
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
             Ok(Self { db, clock, last_state })
+        }
+
+        /// Build a `CrdtCommit` on a pre-opened, shared
+        /// `Arc<redb::Database>`. Used when the host wants the
+        /// same database exposed to a parallel reader (e.g. a
+        /// `SyncProvider`) without double-opening — redb is
+        /// exclusive on file open, so this is the only way to
+        /// share access.
+        pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>) -> Self {
+            let clock = load_clock(&db).unwrap_or_default();
+            let last_state = load_state(&db).unwrap_or_default();
+            Self { db, clock, last_state }
         }
 
         /// Borrow the underlying redb database.
@@ -427,7 +439,11 @@ mod crdt {
         }
     }
 
-    fn read_dag_node(
+    /// Read a single DAG node's serialized bytes by CID from a
+    /// shared redb database. Public so a `SyncProvider` (or any
+    /// other reader) can serve fetches without holding a
+    /// `CrdtCommit` mutex.
+    pub fn read_dag_node(
         db: &redb::Database,
         cid: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, CommitError> {
@@ -438,6 +454,27 @@ mod crdt {
             Err(e) => return Err(e.into()),
         };
         Ok(table.get(cid.as_slice())?.map(|v| v.value().to_vec()))
+    }
+
+    /// Read the persisted root CIDs as raw 32-byte arrays. Returns
+    /// the most recent committed roots — slightly stale relative
+    /// to the in-memory `MerkleClock`, but correct enough for
+    /// sync (which doesn't race with in-flight commits anyway).
+    pub fn read_roots(db: &redb::Database) -> Result<Vec<[u8; 32]>, CommitError> {
+        let txn = db.begin_read()?;
+        let table = match txn.open_table(STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let bytes = match table.get(ROOTS_KEY)? {
+            Some(val) => val.value().to_vec(),
+            None => return Ok(Vec::new()),
+        };
+        let Some(roots) = decode_roots(&bytes) else {
+            return Ok(Vec::new());
+        };
+        Ok(roots.into_iter().map(|cid| cid.0).collect())
     }
 
     impl CommitStrategy for CrdtCommit {

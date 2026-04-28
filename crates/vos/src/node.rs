@@ -96,6 +96,16 @@ pub struct AgentConfig {
     /// Crdt`. `None` means "this CRDT actor has no peers" — its
     /// DAG stays purely local.
     pub replication_id: Option<[u8; 32]>,
+    /// Pre-opened, shared `redb::Database` for the agent's
+    /// `CrdtCommit`. When `register` plans to wire this actor
+    /// into the network's `SyncProvider`, it opens the file
+    /// here, hands the same `Arc` to the agent's commit
+    /// strategy *and* to the sync layer — redb is exclusive on
+    /// file open, so this is the only way to share. `None`
+    /// means the agent thread opens the file itself.
+    #[cfg(feature = "storage")]
+    #[doc(hidden)]
+    pub pre_opened_db: Option<Arc<redb::Database>>,
 }
 
 impl AgentConfig {
@@ -108,6 +118,8 @@ impl AgentConfig {
             data_dir: None,
             consistency: Consistency::Ephemeral,
             replication_id: None,
+            #[cfg(feature = "storage")]
+            pre_opened_db: None,
         }
     }
 
@@ -339,7 +351,13 @@ pub struct VosNode {
     /// registration. `None` inside the `Mutex` until
     /// [`attach_network`](Self::attach_network) runs.
     #[cfg(feature = "network")]
-    shared_network: SharedNetwork,
+    pub(crate) shared_network: SharedNetwork,
+    /// Map: replication group → shared `redb::Database` of the
+    /// local replica. Populated by `register` whenever a CRDT
+    /// actor with a `replication_id` is added. Read by
+    /// [`NodeSyncProvider`] to answer inbound sync queries.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], Arc<redb::Database>>>>,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -360,6 +378,27 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 #[cfg(feature = "network")]
 struct LocalInvokeDispatcher {
     invoke_routes: InvokeRoutes,
+}
+
+/// `SyncProvider` impl backed by the node's `crdt_replicas` map.
+/// Looks up the shared `Arc<Database>` for the replication group
+/// and reads roots / DAG nodes directly through the public
+/// `commit::read_roots` / `commit::read_dag_node` helpers.
+#[cfg(all(feature = "network", feature = "storage"))]
+struct NodeSyncProvider {
+    replicas: Arc<Mutex<HashMap<[u8; 32], Arc<redb::Database>>>>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl crate::network::SyncProvider for NodeSyncProvider {
+    fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let db = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        crate::commit::read_roots(&db).ok()
+    }
+    fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+        let db = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        crate::commit::read_dag_node(&db, cid).ok().flatten()
+    }
 }
 
 #[cfg(feature = "network")]
@@ -421,6 +460,8 @@ impl VosNode {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "network")]
             shared_network: Arc::new(Mutex::new(None)),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -449,6 +490,17 @@ impl VosNode {
             invoke_routes: self.invoke_routes.clone(),
         });
         network.set_invoke_dispatcher(dispatcher);
+
+        // Same story for the sync provider — answers inbound
+        // FetchHeads/FetchNode against the local CRDT replicas
+        // already opened by `register`.
+        #[cfg(feature = "storage")]
+        {
+            let sync_provider = Arc::new(NodeSyncProvider {
+                replicas: self.crdt_replicas.clone(),
+            });
+            network.set_sync_provider(sync_provider);
+        }
 
         let inbox_rx = match network.take_inbox() {
             Some(rx) => rx,
@@ -490,7 +542,7 @@ impl VosNode {
 
     /// Register an agent and return its service ID.
     /// The agent starts immediately on a new thread.
-    pub fn register(&mut self, config: AgentConfig) -> ServiceId {
+    pub fn register(&mut self, mut config: AgentConfig) -> ServiceId {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
@@ -498,6 +550,33 @@ impl VosNode {
 
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
+
+        // Pre-open the redb database for CRDT actors that declare
+        // a replication group, so the same `Arc<Database>` powers
+        // both the agent's `CrdtCommit` and (later) the network's
+        // `SyncProvider`. redb is exclusive on file open, so this
+        // is the only way to share the file across threads.
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if config.consistency == Consistency::Crdt {
+            if let Some(rep_id) = config.replication_id {
+                if let Some(path) = config.db_path(id) {
+                    match redb::Database::create(&path) {
+                        Ok(db) => {
+                            let arc = Arc::new(db);
+                            self.crdt_replicas
+                                .lock()
+                                .unwrap()
+                                .insert(rep_id, arc.clone());
+                            config.pre_opened_db = Some(arc);
+                        }
+                        Err(e) => {
+                            error!(%id, error = %e, "register: failed to open CRDT db; \
+                                replication will be inactive");
+                        }
+                    }
+                }
+            }
+        }
 
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
@@ -642,6 +721,20 @@ impl VosNode {
         let (tx, rx) = mpsc::channel();
         self.routes.insert(id.0, tx);
         (id, rx)
+    }
+
+    /// Register a `(replication_id → redb path)` pair directly in
+    /// the CRDT replica map. Used by tests that want to verify
+    /// the sync layer without spinning up a real PVM agent.
+    #[cfg(all(test, feature = "network", feature = "storage"))]
+    pub(crate) fn install_test_replica(
+        &mut self,
+        rep_id: [u8; 32],
+        db_path: &std::path::Path,
+    ) -> Arc<redb::Database> {
+        let arc = Arc::new(redb::Database::create(db_path).expect("create db"));
+        self.crdt_replicas.lock().unwrap().insert(rep_id, arc.clone());
+        arc
     }
 
     /// Install a synchronous-invoke responder under a fresh
@@ -1229,6 +1322,9 @@ fn build_agent_strategy(
                 Ok(Box::new(crate::commit::LocalCommit::open(&path)?))
             }
             Consistency::Crdt => {
+                if let Some(arc) = &config.pre_opened_db {
+                    return Ok(Box::new(crate::commit::CrdtCommit::from_db_arc(arc.clone())));
+                }
                 let path = config.db_path(id).ok_or_else(|| {
                     crate::commit::CommitError::Config(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
