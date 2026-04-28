@@ -387,6 +387,45 @@ pub(crate) struct ReplicaSlot {
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 
+/// Thread-safe handle for invoking local services. Returned by
+/// [`VosNode::invoke_handle`] so background tasks can keep
+/// calling into the node while [`VosNode::run_forever`] holds
+/// the main thread.
+///
+/// Local-only — cross-node invokes need the attached network,
+/// which lives on `VosNode` proper. Drop this handle when the
+/// background task is done; the node's lifetime is unaffected.
+pub struct InvokeHandle {
+    invoke_routes: InvokeRoutes,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl InvokeHandle {
+    /// Synchronously invoke `target`. Returns `None` when the
+    /// target isn't a local service or the call times out.
+    pub fn invoke_with_timeout(
+        &self,
+        target: ServiceId,
+        msg: Vec<u8>,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        let tx = {
+            let map = self.invoke_routes.lock().ok()?;
+            map.get(&target.0).cloned()
+        };
+        let tx = tx?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest { msg, reply_tx, chain: Vec::new() }).ok()?;
+        reply_rx.recv_timeout(timeout).ok()
+    }
+
+    /// `true` once the owning [`VosNode`] has been told to shut
+    /// down. Background loops poll this so they exit cleanly.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+}
+
 /// Shared pointer to the (optional) attached libp2p network. Agent
 /// threads grab a clone at spawn time and check it on every
 /// `external_invoke` so a `Network` attached *after* registration
@@ -1046,6 +1085,22 @@ impl VosNode {
     /// into a [`run_forever`](Self::run_forever) thread.
     pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
         self.shutdown.clone()
+    }
+
+    /// Returns a thread-safe handle that can synchronously invoke
+    /// any **local** service registered on this node. Background
+    /// tasks (e.g. vosx's auto-heartbeat) take this handle before
+    /// [`run_forever`](Self::run_forever) blocks the main thread,
+    /// then keep calling into the node from a side thread.
+    ///
+    /// Cross-node invokes aren't supported through this handle —
+    /// it doesn't carry the network reference. Use [`invoke`](Self::invoke)
+    /// from the owning thread for that.
+    pub fn invoke_handle(&self) -> InvokeHandle {
+        InvokeHandle {
+            invoke_routes: self.invoke_routes.clone(),
+            shutdown: self.shutdown.clone(),
+        }
     }
 
     /// Clone of the outbox sender. Pushing an [`Envelope`] here

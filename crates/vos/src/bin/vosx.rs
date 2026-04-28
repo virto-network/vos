@@ -612,12 +612,44 @@ fn cmd_start(
         flush_registry_announces(&node, &announces);
     }
 
+    // Auto-heartbeat: periodic `heartbeat(name)` invokes for
+    // every announced service so the registry's `last_seen`
+    // stays current. Only fires when (a) we have a registry,
+    // (b) something to ping, (c) we're in long-lived mode, and
+    // (d) the operator hasn't disabled it via interval=0. The
+    // thread runs alongside `run_forever`, polling its own
+    // `InvokeHandle`, and stops when the node signals shutdown.
+    let heartbeat_thread = if registry_active && !announces.is_empty() && networked {
+        let interval_secs = manifest.heartbeat_interval_secs.unwrap_or(30);
+        if interval_secs == 0 {
+            None
+        } else {
+            let names: Vec<String> = announces.iter().map(|a| a.name.clone()).collect();
+            let handle = node.invoke_handle();
+            let interval = std::time::Duration::from_secs(interval_secs);
+            eprintln!(
+                "vosx: auto-heartbeat every {}s for {} service(s)",
+                interval_secs,
+                names.len(),
+            );
+            Some(std::thread::spawn(move || heartbeat_loop(handle, names, interval)))
+        }
+    } else {
+        None
+    };
+
     eprintln!("vosx: running space '{}'...\n", manifest.space);
     if networked {
         eprintln!("vosx: networking on — running until shutdown (Ctrl-C)");
         node.run_forever();
     } else {
         node.run();
+    }
+
+    if let Some(h) = heartbeat_thread {
+        // run_forever / run already flipped the shutdown flag.
+        // Join so the thread doesn't outlive us.
+        let _ = h.join();
     }
 
     let results = node.collect();
@@ -643,6 +675,48 @@ struct AnnouncePlan {
     owner_prefix: u16,
     service_id: u16,
     roles: Vec<String>,
+}
+
+/// Background heartbeat loop. Each tick walks `names` and fires
+/// a `heartbeat(name)` invoke at `ServiceId::REGISTRY` through
+/// `handle`. Exits when the owning node flips its shutdown
+/// flag. Replies are ignored — `heartbeat` doesn't return
+/// anything meaningful, and the next tick recovers from any
+/// transient miss.
+fn heartbeat_loop(
+    handle: vos::node::InvokeHandle,
+    names: Vec<String>,
+    interval: std::time::Duration,
+) {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    // Sleep up front so we don't double-announce immediately
+    // after the initial flush.
+    let tick = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        // Sleep in small slices so shutdown is observed
+        // promptly without blocking the join at exit.
+        while waited < interval {
+            if handle.is_shutting_down() { return; }
+            std::thread::sleep(tick);
+            waited += tick;
+        }
+        waited = std::time::Duration::ZERO;
+        for name in &names {
+            if handle.is_shutting_down() { return; }
+            let m = Msg::new("heartbeat").with("name", name.as_str());
+            let encoded = m.encode();
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            let _ = handle.invoke_with_timeout(
+                vos::abi::service::ServiceId::REGISTRY,
+                payload,
+                std::time::Duration::from_secs(2),
+            );
+        }
+    }
 }
 
 /// Send an `announce(...)` invoke for every plan to the local
@@ -897,6 +971,13 @@ struct Manifest {
     /// this field becomes a release-pinned override.
     #[serde(default)]
     registry_blob: Option<PathBuf>,
+    /// How often vosx pings each auto-announced service via
+    /// `heartbeat(name)` so the registry's `last_seen` stays
+    /// current. `None` (the default) → 30s. Set to 0 to disable
+    /// auto-heartbeat. Only fires when `hyperspace` is set and
+    /// the node runs in long-lived (`run_forever`) mode.
+    #[serde(default)]
+    heartbeat_interval_secs: Option<u64>,
     #[serde(default)]
     agent: Vec<AgentDef>,
     #[serde(default)]

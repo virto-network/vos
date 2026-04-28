@@ -1900,3 +1900,107 @@ fn registry_heartbeat_bumps_last_seen() {
     let _ = node.collect();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
+    // Cycle 9 phase 4 (slice 4b): vosx's auto-heartbeat lives
+    // on a side thread that calls into the node via
+    // `VosNode::invoke_handle`. This test exercises that
+    // primitive directly — register, announce, then drive
+    // heartbeats from a worker thread and observe last_seen
+    // climb.
+    use registry_client::Client;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_hb2_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut node = VosNode::new();
+    let _ = node.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_replication_id(registry::replication_id("hb2-test")),
+        ServiceId::REGISTRY,
+    );
+
+    let client = Client::local(&node);
+    client.announce("kunekt/svc", 0, 7, &[]).expect("announce");
+    let initial = client.lookup("kunekt/svc").unwrap().expect("svc");
+
+    // Spin up a side thread that fires heartbeats every 50ms
+    // until told to stop. Mirrors what vosx does in production
+    // via `heartbeat_loop`.
+    let handle = node.invoke_handle();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let beats = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let beats_clone = beats.clone();
+
+    let thread = std::thread::spawn(move || {
+        let m = Msg::new("heartbeat").with("name", "kunekt/svc");
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        while !stop_clone.load(Ordering::Relaxed) && !handle.is_shutting_down() {
+            let _ = handle.invoke_with_timeout(
+                ServiceId::REGISTRY,
+                payload.clone(),
+                Duration::from_secs(2),
+            );
+            beats_clone.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    // Wait until we observe the entry's last_seen rise above its
+    // initial value at least 3 times — confirms repeated beats
+    // round-trip through invoke_routes from the other thread.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_observed = initial.last_seen;
+    let mut bumps = 0u32;
+    while Instant::now() < deadline && bumps < 3 {
+        std::thread::sleep(Duration::from_millis(75));
+        if let Some(entry) = client.lookup("kunekt/svc").ok().flatten() {
+            if entry.last_seen > last_observed {
+                last_observed = entry.last_seen;
+                bumps += 1;
+            }
+        }
+    }
+    assert!(bumps >= 3, "expected ≥3 last_seen bumps, got {bumps}");
+
+    // Tell the thread to wind down via the node's shutdown
+    // flag — same path vosx uses when run_forever returns.
+    node.shutdown();
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    assert!(beats.load(Ordering::Relaxed) > 0);
+
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
