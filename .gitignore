@@ -1,2 +1,7 @@
 target/
 .wt_*
+
+# vosx generated state
+data/
+node.key
+*.local.toml
