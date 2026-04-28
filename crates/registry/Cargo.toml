@@ -1,0 +1,21 @@
+[package]
+name = "registry"
+description = "Hyperspace service registry — shared wire types + host-side client for a CRDT-replicated name → ServiceId directory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+# Host-side helpers that drive the registry from a `VosNode`.
+# Off when actor crates depend on this for the wire types only
+# — they live in no_std + alloc and don't need the helpers.
+std = ["dep:vos", "dep:tracing"]
+
+[dependencies]
+rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
+blake2b_simd = { version = "1", default-features = false }
+
+# Host-side only.
+vos = { path = "../vos", optional = true, default-features = false, features = ["std"] }
+tracing = { version = "0.1", optional = true }

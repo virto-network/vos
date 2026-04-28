@@ -54,6 +54,11 @@ test-one name: build-workers
 build-crdt-counter:
     cd examples/actors/crdt-counter && cargo +nightly -Zjson-target-spec build --release
 
+# Build the hyperspace registry actor (cycle-9, first-class — lives
+# under actors/ rather than examples/)
+build-registry:
+    cd actors/registry && cargo +nightly -Zjson-target-spec build --release
+
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,

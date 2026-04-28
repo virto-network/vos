@@ -53,3 +53,6 @@ async-trait = { version = "0.1", optional = true }
 name = "vosx"
 path = "src/bin/vosx.rs"
 required-features = ["std"]
+
+[dev-dependencies]
+registry = { path = "../registry" }

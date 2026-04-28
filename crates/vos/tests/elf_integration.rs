@@ -1533,3 +1533,173 @@ fn wait_for<T>(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_announce_lookup_and_list_converge_across_nodes() {
+    // Cycle 9 phase 1: two networked VosNodes, each with a
+    // registry replica at ServiceId::REGISTRY under the same
+    // hyperspace replication_id. Each side announces a service;
+    // both replicas converge to a 2-entry directory. Lookup,
+    // by_role, and paginated list all return consistent answers
+    // from either side.
+    use registry::{Client, PageRequest};
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir().join(format!("vos_reg_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id = registry::replication_id("kunekt-test");
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    // Build node A with the registry at ServiceId::REGISTRY.
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let registry_a = node_a.register_at_id(
+        AgentConfig::new(blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    assert_eq!(registry_a, ServiceId::REGISTRY);
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let registry_b = node_b.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    assert_eq!(registry_b, ServiceId::REGISTRY);
+    node_b.attach_network(net_b);
+
+    // Wait for Hello so subsequent announcements have a peer to
+    // gossip to.
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(|| {
+        if net_a_arc.peer_for_prefix(prefix_b).is_some()
+            && net_b_arc.peer_for_prefix(prefix_a).is_some()
+        { Some(()) } else { None }
+    }, Duration::from_secs(10)).expect("Hello completes");
+
+    // ── Drive announces from each replica ──────────────────────
+    let alice_roles = vec!["worker".to_string()];
+    let bob_roles = vec!["worker".to_string(), "leader".to_string()];
+
+    Client::local(&node_a)
+        .announce("kunekt/alice", prefix_a, 100, &alice_roles)
+        .expect("announce alice on A");
+    Client::local(&node_b)
+        .announce("kunekt/bob", prefix_b, 200, &bob_roles)
+        .expect("announce bob on B");
+
+    // ── Wait for both replicas to converge on both entries ────
+    let see_both = |node: &VosNode| -> bool {
+        let client = Client::local(node);
+        let alice = client.lookup("kunekt/alice").ok().flatten();
+        let bob = client.lookup("kunekt/bob").ok().flatten();
+        alice.is_some() && bob.is_some()
+    };
+
+    wait_for(|| if see_both(&node_a) { Some(()) } else { None },
+        Duration::from_secs(8)).expect("A converges");
+    wait_for(|| if see_both(&node_b) { Some(()) } else { None },
+        Duration::from_secs(8)).expect("B converges");
+
+    // ── Inspect via the host client on each side ──────────────
+    for (label, node, expected_a_prefix, expected_b_prefix) in
+        [("A", &node_a, prefix_a, prefix_b), ("B", &node_b, prefix_a, prefix_b)]
+    {
+        let client = Client::local(node);
+        let alice = client.lookup("kunekt/alice").unwrap()
+            .unwrap_or_else(|| panic!("{label}: alice missing"));
+        assert_eq!(alice.name, "kunekt/alice");
+        assert_eq!(alice.owner_prefix, expected_a_prefix);
+        assert_eq!(alice.service_id, 100);
+        assert_eq!(alice.roles, alice_roles);
+
+        let bob = client.lookup("kunekt/bob").unwrap()
+            .unwrap_or_else(|| panic!("{label}: bob missing"));
+        assert_eq!(bob.owner_prefix, expected_b_prefix);
+        assert_eq!(bob.service_id, 200);
+        assert_eq!(bob.roles, bob_roles);
+
+        // Listing under the prefix returns both, sorted.
+        let all = client.list_all("kunekt/").unwrap();
+        let names: Vec<_> = all.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["kunekt/alice", "kunekt/bob"], "{label}: list");
+
+        // by_role narrows correctly.
+        let workers = client.by_role("worker", PageRequest::new()).unwrap();
+        let worker_names: Vec<_> = workers.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(worker_names, vec!["kunekt/alice", "kunekt/bob"], "{label}: workers");
+
+        let leaders = client.by_role("leader", PageRequest::new()).unwrap();
+        let leader_names: Vec<_> = leaders.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(leader_names, vec!["kunekt/bob"], "{label}: leaders");
+
+        // Lookup of a missing name returns None.
+        assert!(client.lookup("kunekt/nobody").unwrap().is_none(), "{label}: missing");
+    }
+
+    // ── Pagination: limit=1 walks both entries in 2 pages ─────
+    {
+        let client = Client::local(&node_a);
+        let p1 = client.list(PageRequest::new().with_prefix("kunekt/").with_limit(1)).unwrap();
+        assert_eq!(p1.entries.len(), 1);
+        assert_eq!(p1.entries[0].name, "kunekt/alice");
+        assert!(p1.has_more());
+        let p2 = client.list(
+            PageRequest::new().with_prefix("kunekt/").with_after(p1.next).with_limit(1),
+        ).unwrap();
+        assert_eq!(p2.entries.len(), 1);
+        assert_eq!(p2.entries[0].name, "kunekt/bob");
+        assert!(!p2.has_more());
+    }
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}

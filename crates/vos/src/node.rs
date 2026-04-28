@@ -847,10 +847,25 @@ impl VosNode {
         ServiceId::new(self.node_prefix, local)
     }
 
+    /// Register an agent at an explicit `ServiceId` instead of
+    /// auto-allocating one. Used for well-known slots like the
+    /// hyperspace registry which always lives at
+    /// [`ServiceId::REGISTRY`] (== `ServiceId(0)`) so any agent
+    /// can address it by a stable id without a name lookup.
+    ///
+    /// Caller is responsible for not double-registering.
+    pub fn register_at_id(&mut self, config: AgentConfig, id: ServiceId) -> ServiceId {
+        self.register_inner(config, id)
+    }
+
     /// Register an agent and return its service ID.
     /// The agent starts immediately on a new thread.
-    pub fn register(&mut self, mut config: AgentConfig) -> ServiceId {
+    pub fn register(&mut self, config: AgentConfig) -> ServiceId {
         let id = self.alloc_id();
+        self.register_inner(config, id)
+    }
+
+    fn register_inner(&mut self, mut config: AgentConfig, id: ServiceId) -> ServiceId {
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
         let outbox = self.outbox_tx.clone();

@@ -1243,13 +1243,17 @@ fn result_ok_type(ty: &syn::Type) -> Option<syn::Type> {
 fn type_to_accessor(ty: &syn::Type) -> proc_macro2::TokenStream {
     let ty_str = quote!(#ty).to_string().replace(' ', "");
     match ty_str.as_str() {
+        "u8" => quote! { get_u8 },
+        "u16" => quote! { get_u16 },
         "u32" => quote! { get_u32 },
         "u64" => quote! { get_u64 },
         "i32" => quote! { get_i32 },
+        "i64" => quote! { get_i64 },
         "bool" => quote! { get_bool },
         "String" => quote! { get_str },
         "Vec<u8>" => quote! { get_bytes },
         "Vec<u32>" => quote! { get_list_u32 },
+        "Vec<String>" => quote! { get_list_str },
         _ => {
             let msg = format!("unsupported constructor param type for init args: {ty_str}");
             quote! { compile_error!(#msg) }
