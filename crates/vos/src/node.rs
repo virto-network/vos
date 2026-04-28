@@ -12,7 +12,7 @@
 //! matches this node, the message is delivered locally. Otherwise it's
 //! forwarded to the network layer (future).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -401,6 +401,111 @@ impl crate::network::SyncProvider for NodeSyncProvider {
     }
 }
 
+/// How often the per-replica sync ticker fires. Short enough that
+/// integration tests can observe convergence in a few hundred ms,
+/// long enough that idle clusters don't flood the wire.
+#[cfg(all(feature = "network", feature = "storage"))]
+const SYNC_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Per-fetch deadline. Peers that disappear mid-handshake still
+/// only steal this long from the ticker.
+#[cfg(all(feature = "network", feature = "storage"))]
+const SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Background ticker for one replication group. Polls every
+/// connected peer for their heads, BFS-fetches unknown DAG
+/// nodes, inserts them locally, and compacts the root set.
+///
+/// Runs detached — exits when `shutdown` is set or every clone
+/// of the relevant `Arc`s has been dropped (signalling the
+/// network/node/db they reference is gone).
+#[cfg(all(feature = "network", feature = "storage"))]
+fn sync_loop(
+    rep_id: [u8; 32],
+    shared_network: SharedNetwork,
+    db: Arc<redb::Database>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(SYNC_INTERVAL);
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else {
+            continue;
+        };
+        for peer in net.connected_peers() {
+            if peer == net.peer_id() {
+                continue;
+            }
+            let _ = sync_with_peer(&net, peer, &rep_id, &db);
+        }
+    }
+}
+
+/// One pull cycle against a single peer for one replication
+/// group. Returns Err only on host-side commit failures (which
+/// the caller logs and ignores); transient network failures
+/// surface as `None` payloads / channel disconnects, which we
+/// silently treat as "try again next tick".
+#[cfg(all(feature = "network", feature = "storage"))]
+fn sync_with_peer(
+    net: &crate::network::Network,
+    peer: libp2p::PeerId,
+    rep_id: &[u8; 32],
+    db: &Arc<redb::Database>,
+) -> Result<(), crate::commit::CommitError> {
+    use crate::commit::CrdtCommit;
+    use crate::effect_log::EffectLog;
+    use merkle_crdt::DagNode;
+
+    let heads_rx = net.fetch_heads(peer, *rep_id);
+    let heads = match heads_rx.recv_timeout(SYNC_FETCH_TIMEOUT) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if heads.is_empty() {
+        return Ok(());
+    }
+
+    let mut cc = CrdtCommit::from_db_arc(db.clone());
+    let mut frontier: Vec<[u8; 32]> = heads.clone();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut inserted_any = false;
+
+    while let Some(cid) = frontier.pop() {
+        if !seen.insert(cid) {
+            continue;
+        }
+        if cc.get_node_bytes(&cid)?.is_some() {
+            continue;
+        }
+        let node_rx = net.fetch_node(peer, *rep_id, cid);
+        let Ok(Some(node_bytes)) = node_rx.recv_timeout(SYNC_FETCH_TIMEOUT) else {
+            continue;
+        };
+        match cc.insert_node(&cid, &node_bytes) {
+            Ok(true) => inserted_any = true,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "sync: node from peer rejected");
+                continue;
+            }
+        }
+        // Walk children so the BFS keeps going.
+        if let Some(node) = DagNode::<crate::commit::Blake2b, EffectLog>::from_bytes(&node_bytes) {
+            for child in node.children {
+                frontier.push(child.0);
+            }
+        }
+    }
+
+    if inserted_any {
+        cc.compact_roots()?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "network")]
 impl crate::network::InvokeDispatcher for LocalInvokeDispatcher {
     fn dispatch(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
@@ -567,7 +672,8 @@ impl VosNode {
                                 .lock()
                                 .unwrap()
                                 .insert(rep_id, arc.clone());
-                            config.pre_opened_db = Some(arc);
+                            config.pre_opened_db = Some(arc.clone());
+                            self.spawn_sync_thread(rep_id, arc);
                         }
                         Err(e) => {
                             error!(%id, error = %e, "register: failed to open CRDT db; \
@@ -724,8 +830,9 @@ impl VosNode {
     }
 
     /// Register a `(replication_id → redb path)` pair directly in
-    /// the CRDT replica map. Used by tests that want to verify
-    /// the sync layer without spinning up a real PVM agent.
+    /// the CRDT replica map and spin up the matching sync ticker.
+    /// Used by tests that want to verify the sync layer without
+    /// spinning up a real PVM agent.
     #[cfg(all(test, feature = "network", feature = "storage"))]
     pub(crate) fn install_test_replica(
         &mut self,
@@ -733,8 +840,22 @@ impl VosNode {
         db_path: &std::path::Path,
     ) -> Arc<redb::Database> {
         let arc = Arc::new(redb::Database::create(db_path).expect("create db"));
-        self.crdt_replicas.lock().unwrap().insert(rep_id, arc.clone());
+        self.crdt_replicas
+            .lock()
+            .unwrap()
+            .insert(rep_id, arc.clone());
+        self.spawn_sync_thread(rep_id, arc.clone());
         arc
+    }
+
+    /// Spawn the per-replica sync ticker. Detached: exits via the
+    /// shared shutdown flag (set on `collect`/`shutdown`) or when
+    /// the network/db Arcs die.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn spawn_sync_thread(&self, rep_id: [u8; 32], db: Arc<redb::Database>) {
+        let shared_network = self.shared_network.clone();
+        let shutdown = self.shutdown.clone();
+        thread::spawn(move || sync_loop(rep_id, shared_network, db, shutdown));
     }
 
     /// Install a synchronous-invoke responder under a fresh

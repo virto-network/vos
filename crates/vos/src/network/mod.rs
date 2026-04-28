@@ -354,6 +354,17 @@ impl Network {
         self.prefix_map.lock().ok()?.get(&prefix).copied()
     }
 
+    /// Snapshot of all peers that have completed the Hello
+    /// handshake. Used by the sync ticker to fan out fetches
+    /// across every reachable replica, since cycle 3 doesn't
+    /// yet maintain a per-replication-group peer index.
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.prefix_map
+            .lock()
+            .map(|g| g.values().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Dial a peer at the given multiaddr.
     pub fn connect(&self, addr: Multiaddr) {
         let _ = self.cmd_tx.send(NetworkCmd::Connect(addr));
@@ -967,6 +978,114 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Cycle 3 convergence: replica A is driven by two commits,
+    /// replica B (empty) automatically pulls A's DAG via the
+    /// background sync ticker. After a brief settle period,
+    /// re-open B's redb and verify `replay_logs` reproduces A's
+    /// history bit-for-bit.
+    #[test]
+    fn crdt_replicas_converge_via_sync_ticker() {
+        use crate::commit::{CommitStrategy, CrdtCommit};
+        use crate::effect_log::EffectLog;
+        use crate::node::VosNode;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        let rep_id = [0xCDu8; 32];
+        let dir = std::env::temp_dir().join(format!(
+            "vos_sync_conv_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_a = dir.join("a.redb");
+        let path_b = dir.join("b.redb");
+
+        // Two VosNodes, each with a test replica + a sync ticker
+        // (install_test_replica spawns one).
+        let mut node_a = VosNode::with_prefix(prefix_a);
+        let arc_a = node_a.install_test_replica(rep_id, &path_a);
+        let mut node_b = VosNode::with_prefix(prefix_b);
+        let _arc_b = node_b.install_test_replica(rep_id, &path_b);
+
+        // Drive A: two CRDT commits.
+        let log1 = EffectLog::for_msg(b"first".to_vec());
+        let log2 = EffectLog::for_msg(b"second".to_vec());
+        {
+            let mut cc_a = CrdtCommit::from_db_arc(arc_a.clone());
+            cc_a.commit_with_log(b"v1", &log1).unwrap();
+            cc_a.commit_with_log(b"v2", &log2).unwrap();
+            assert_eq!(cc_a.root_bytes().len(), 1);
+        }
+
+        // Attach the networks. This is when the sync ticker can
+        // actually do anything — until shared_network is Some it
+        // just sleeps.
+        node_a.attach_network(net_a);
+        node_b.attach_network(net_b);
+
+        // Wait for the Hello round trip + a few sync ticks. The
+        // ticker fires every 250ms, so 2 seconds gives 6+ rounds —
+        // plenty to cover a 2-node BFS of 2 DAG nodes.
+        let convergence = wait_for(
+            || {
+                // Open a *fresh* CrdtCommit on B and check its
+                // roots. The sync ticker writes through the same
+                // redb file, so a fresh CrdtCommit picks up the
+                // merged state.
+                let cc = CrdtCommit::from_db_arc(_arc_b.clone());
+                if cc.root_bytes().is_empty() {
+                    None
+                } else {
+                    Some(cc)
+                }
+            },
+            Duration::from_secs(5),
+        );
+        let cc_b = convergence.expect("B should converge to A's heads");
+
+        // Replay logs match A's history.
+        let logs = cc_b.replay_logs().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0], log1);
+        assert_eq!(logs[1], log2);
+
+        // Roots match too.
+        let cc_a = CrdtCommit::from_db_arc(arc_a);
+        assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
+
+        let _ = node_a.collect();
+        let _ = node_b.collect();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Slice 3b end-to-end: VosNode B has a CRDT replica registered
