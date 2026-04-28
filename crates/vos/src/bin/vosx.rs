@@ -121,8 +121,7 @@ fn main() {
 
         Some(Command::Start { manifest, data_dir, no_persist, listen, connect }) => {
             let (m, dir) = manifest_from(manifest);
-            let pers_dir = if no_persist { None } else { data_dir.as_deref() };
-            cmd_start(&m, &dir, pers_dir, &listen, &connect);
+            cmd_start(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect);
         }
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
@@ -133,7 +132,7 @@ fn main() {
         }
         None => {
             let (m, dir) = manifest_from(cli.file);
-            cmd_start(&m, &dir, Some(Path::new("data")), &[], &[]);
+            cmd_start(&m, &dir, Some(Path::new("data")), false, &[], &[]);
         }
     }
 }
@@ -336,6 +335,7 @@ fn cmd_start(
     manifest: &Manifest,
     dir: &Path,
     data_dir_cli: Option<&Path>,
+    no_persist: bool,
     listen_cli: &[String],
     connect_cli: &[String],
 ) {
@@ -355,12 +355,18 @@ fn cmd_start(
         );
     }
 
-    // CLI --data-dir wins; otherwise fall back to the manifest's
-    // [node].data_dir; otherwise no persistence directory at all
-    // (Local/Crdt actors will fail loudly via build_agent_strategy).
+    // Where this node lives on disk: CLI --data-dir wins; otherwise
+    // fall back to the manifest's [node].data_dir. Used for the
+    // libp2p identity regardless of --no-persist; --no-persist only
+    // disables *actor state* persistence below.
     let data_dir = data_dir_cli
         .map(|p| p.to_path_buf())
         .or_else(|| manifest.node.data_dir.clone());
+
+    // Actor state persistence honours --no-persist. Network identity
+    // does not — peers that get a fresh PeerId on every restart are
+    // useless for any kind of stable addressing.
+    let state_dir = if no_persist { None } else { data_dir.clone() };
 
     // ── Network startup ─────────────────────────────────────────────
     //
@@ -425,7 +431,7 @@ fn cmd_start(
             }
             WorkerConfig::with_args(path, &args)
         };
-        if let Some(d) = &data_dir {
+        if let Some(d) = &state_dir {
             cfg = cfg.persist(d);
         }
         let id = node.register_worker(cfg);
@@ -449,7 +455,7 @@ fn cmd_start(
             // default. Override would land as a per-actor field if
             // we ever need it; for now they're all the agent's tier.
             let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
-            if let Some(d) = &data_dir {
+            if let Some(d) = &state_dir {
                 cfg = cfg.persist(d);
             }
             cfg = apply_init(cfg, &child.init, &elf_data, &name_ids, &provides_map);
@@ -472,7 +478,7 @@ fn cmd_start(
         let blob = load_blob(&path);
 
         let mut cfg = AgentConfig::new(blob).with_consistency(a.consistency.into());
-        if let Some(d) = &data_dir {
+        if let Some(d) = &state_dir {
             cfg = cfg.persist(d);
         }
         cfg = apply_init(cfg, &a.init, &elf_data, &name_ids, &provides_map);
@@ -490,7 +496,20 @@ fn cmd_start(
     }
 
     eprintln!("vosx: running space '{}'...\n", manifest.space);
-    node.run();
+    // When networking is active the node should stay up so peers
+    // can reach it; the 2-second idle heuristic from run() is for
+    // single-node tests/demos. The network handle's drop will
+    // signal shutdown when this function returns.
+    #[cfg(feature = "network")]
+    let networked = _network.is_some();
+    #[cfg(not(feature = "network"))]
+    let networked = false;
+    if networked {
+        eprintln!("vosx: networking on — running until shutdown (Ctrl-C)");
+        node.run_forever();
+    } else {
+        node.run();
+    }
 
     let results = node.collect();
     let panics: u32 = results.iter().map(|r| r.panics).sum();
