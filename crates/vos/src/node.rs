@@ -300,18 +300,66 @@ pub struct VosNode {
     ///
     /// [`run_until_idle`]: VosNode::run_until_idle
     last_activity: ActivityClock,
-    /// Optional libp2p network handle. When attached via
-    /// [`attach_network`](Self::attach_network), [`route`](Self::route)
-    /// forwards envelopes whose target prefix isn't local over the
-    /// wire instead of dropping them. A bridge thread is spawned to
-    /// pump the network's inbound `Tell` queue back into this
-    /// node's outbox.
+    /// Optional libp2p network handle. Shared with all agent
+    /// threads so cross-node `external_invoke` works regardless of
+    /// whether the network was attached before or after agent
+    /// registration. `None` inside the `Mutex` until
+    /// [`attach_network`](Self::attach_network) runs.
     #[cfg(feature = "network")]
-    network: Option<crate::network::Network>,
+    shared_network: SharedNetwork,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
+
+/// Shared pointer to the (optional) attached libp2p network. Agent
+/// threads grab a clone at spawn time and check it on every
+/// `external_invoke` so a `Network` attached *after* registration
+/// still gets used. `None` until [`VosNode::attach_network`] is
+/// called.
+#[cfg(feature = "network")]
+type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
+
+/// `InvokeDispatcher` impl that routes inbound cross-node invokes
+/// into this node's local invoke-route table. The network thread
+/// runs `dispatch` on a `tokio::task::spawn_blocking`, so blocking
+/// on the std `mpsc` reply channel here is fine.
+#[cfg(feature = "network")]
+struct LocalInvokeDispatcher {
+    invoke_routes: InvokeRoutes,
+}
+
+#[cfg(feature = "network")]
+impl crate::network::InvokeDispatcher for LocalInvokeDispatcher {
+    fn dispatch(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
+        // The chain arrived already including the original caller's
+        // ID (the remote peer's agent). The receiver's own
+        // external_invoke prepends *this* agent's ID when dispatching
+        // further hops, so we don't need to touch the chain here.
+        let tx = self
+            .invoke_routes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&to).cloned());
+        let Some(tx) = tx else {
+            return Vec::new();
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(InvokeRequest {
+                msg,
+                reply_tx,
+                chain,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_default()
+    }
+}
 
 /// Shared "last activity" instant, bumped on every dispatch. The
 /// node uses it as a global idle signal that — unlike outbox-only
@@ -339,7 +387,7 @@ impl VosNode {
             shutdown: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "network")]
-            network: None,
+            shared_network: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -360,11 +408,20 @@ impl VosNode {
     /// being collected).
     #[cfg(feature = "network")]
     pub fn attach_network(&mut self, network: crate::network::Network) {
+        // Install the dispatcher first so any inbound InvokeRequest
+        // that arrives between now and the bridge starting gets
+        // resolved against this node's invoke_routes rather than
+        // the empty-reply default.
+        let dispatcher = Arc::new(LocalInvokeDispatcher {
+            invoke_routes: self.invoke_routes.clone(),
+        });
+        network.set_invoke_dispatcher(dispatcher);
+
         let inbox_rx = match network.take_inbox() {
             Some(rx) => rx,
             None => {
                 warn!("network already had its inbox taken; bridge will not run");
-                self.network = Some(network);
+                *self.shared_network.lock().unwrap() = Some(Arc::new(network));
                 return;
             }
         };
@@ -389,7 +446,7 @@ impl VosNode {
             }
         });
 
-        self.network = Some(network);
+        *self.shared_network.lock().unwrap() = Some(Arc::new(network));
     }
 
     /// Allocate the next service ID on this node.
@@ -412,9 +469,14 @@ impl VosNode {
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
         let activity = self.last_activity.clone();
+        #[cfg(feature = "network")]
+        let shared_network = self.shared_network.clone();
 
         let join = thread::spawn(move || {
-            agent_thread(id, config, rx, invoke_rx, outbox, invoke_routes, shutdown, activity)
+            agent_thread(
+                id, config, rx, invoke_rx, outbox, invoke_routes, shutdown, activity,
+                #[cfg(feature = "network")] shared_network,
+            )
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -549,6 +611,27 @@ impl VosNode {
         (id, rx)
     }
 
+    /// Install a synchronous-invoke responder under a fresh
+    /// ServiceId. The handler runs on a helper thread; each
+    /// inbound `InvokeRequest` is fed its `msg` bytes and the
+    /// returned `Vec<u8>` is sent back as the reply.
+    #[cfg(test)]
+    pub(crate) fn install_invoke_responder<F>(&mut self, mut handler: F) -> ServiceId
+    where
+        F: FnMut(Vec<u8>) -> Vec<u8> + Send + 'static,
+    {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        self.invoke_routes.lock().unwrap().insert(id.0, tx);
+        thread::spawn(move || {
+            for req in rx {
+                let reply = handler(req.msg);
+                let _ = req.reply_tx.send(reply);
+            }
+        });
+        id
+    }
+
     /// Synchronously invoke a registered service from outside the
     /// PVM — for tests, host-side bootstraps, and any code path
     /// where you want to ask an agent or worker without first
@@ -565,23 +648,62 @@ impl VosNode {
     }
 
     /// Like [`invoke`](Self::invoke) but with an explicit timeout.
+    ///
+    /// Lookup order:
+    ///
+    /// 1. Local invoke route (any agent or worker on this node).
+    /// 2. Cross-node via the attached network: when the target's
+    ///    `node_prefix` doesn't match this node and a peer with
+    ///    that prefix has completed the Hello handshake, the
+    ///    invoke is forwarded over libp2p.
+    ///
+    /// Returns `None` if neither path resolves the target, or if
+    /// the call times out / the channel disconnects.
     pub fn invoke_with_timeout(
         &self,
         target: ServiceId,
         msg: Vec<u8>,
         timeout: Duration,
     ) -> Option<Vec<u8>> {
-        let tx = {
+        // 1. Local
+        let local_tx = {
             let map = self.invoke_routes.lock().ok()?;
-            map.get(&target.0).cloned()?
+            map.get(&target.0).cloned()
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(InvokeRequest {
-            msg,
-            reply_tx,
-            chain: Vec::new(),
-        }).ok()?;
-        reply_rx.recv_timeout(timeout).ok()
+        if let Some(tx) = local_tx {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(InvokeRequest {
+                msg,
+                reply_tx,
+                chain: Vec::new(),
+            })
+            .ok()?;
+            return reply_rx.recv_timeout(timeout).ok();
+        }
+
+        // 2. Cross-node fallback.
+        #[cfg(feature = "network")]
+        {
+            if !target.is_on_node(self.node_prefix) && !target.is_local() {
+                let net = self.shared_network.lock().ok().and_then(|g| g.clone());
+                if let Some(net) = net {
+                    if let Some(peer) = net.peer_for_prefix(target.node_prefix()) {
+                        // `from = 0` because this is host-side; it
+                        // never participates in chain detection.
+                        let reply_rx = net.send_invoke(
+                            peer,
+                            ServiceId::REGISTRY.0,
+                            target.0,
+                            Vec::new(),
+                            msg,
+                        );
+                        return reply_rx.recv_timeout(timeout).ok();
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Route a single envelope to its destination.
@@ -604,18 +726,21 @@ impl VosNode {
         // is dropped with a warn — kunekt has no store-and-forward
         // semantics today.
         #[cfg(feature = "network")]
-        if let Some(net) = &self.network {
-            let prefix = target.node_prefix();
-            if let Some(peer) = net.peer_for_prefix(prefix) {
-                net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+        {
+            let net = self.shared_network.lock().ok().and_then(|g| g.clone());
+            if let Some(net) = net {
+                let prefix = target.node_prefix();
+                if let Some(peer) = net.peer_for_prefix(prefix) {
+                    net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+                    return;
+                }
+                warn!(
+                    %target,
+                    prefix = format!("{prefix:#06x}"),
+                    "node: no peer known for prefix; dropping remote envelope",
+                );
                 return;
             }
-            warn!(
-                %target,
-                prefix = format!("{prefix:#06x}"),
-                "node: no peer known for prefix; dropping remote envelope",
-            );
-            return;
         }
 
         warn!(%target, "node: no network layer, dropping remote target");
@@ -655,6 +780,7 @@ fn agent_thread(
     invoke_routes: InvokeRoutes,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
+    #[cfg(feature = "network")] shared_network: SharedNetwork,
 ) -> AgentResult {
     use std::collections::VecDeque;
 
@@ -681,6 +807,9 @@ fn agent_thread(
     //   - Depth: cap at MAX_CROSS_AGENT_DEPTH hops. Same abort.
     let invoke_routes_for_ext = invoke_routes.clone();
     let chain_for_ext = current_chain.clone();
+    #[cfg(feature = "network")]
+    let shared_network_for_ext = shared_network;
+    let local_prefix = id.node_prefix();
     runtime.set_external_invoke(Box::new(move |target, msg| {
         let chain_snapshot = chain_for_ext.lock().ok()?.clone();
 
@@ -704,17 +833,53 @@ fn agent_thread(
             }
         }
 
-        let tx = {
+        // 1. Local invoke route — same node, agent or worker.
+        let local_tx = {
             let map = invoke_routes_for_ext.lock().ok()?;
-            map.get(&target.0).cloned()?
+            map.get(&target.0).cloned()
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(InvokeRequest {
-            msg: msg.to_vec(),
-            reply_tx,
-            chain: chain_snapshot,
-        }).ok()?;
-        reply_rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+        if let Some(tx) = local_tx {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(InvokeRequest {
+                msg: msg.to_vec(),
+                reply_tx,
+                chain: chain_snapshot,
+            })
+            .ok()?;
+            return reply_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .ok();
+        }
+
+        // 2. Cross-node invoke — target on a different node and we
+        //    have a `Network` attached. Reuses the chain so the
+        //    far side detects cycles that span multiple hosts.
+        #[cfg(feature = "network")]
+        {
+            if !target.is_on_node(local_prefix) && !target.is_local() {
+                let net = shared_network_for_ext
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone());
+                if let Some(net) = net {
+                    let prefix = target.node_prefix();
+                    if let Some(peer) = net.peer_for_prefix(prefix) {
+                        let reply_rx = net.send_invoke(
+                            peer,
+                            id.0,
+                            target.0,
+                            chain_snapshot,
+                            msg.to_vec(),
+                        );
+                        return reply_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .ok();
+                    }
+                }
+            }
+        }
+
+        None
     }));
 
     let consistency = config.consistency;

@@ -59,12 +59,24 @@ struct VosBehaviour {
 }
 
 /// One-way envelope received from a remote peer. Pushed to the
-/// `inbox` channel supplied via [`NetworkConfig`].
+/// channel handed back by [`Network::take_inbox`].
 #[derive(Debug, Clone)]
 pub struct InboundTell {
     pub from: u32,
     pub to: u32,
     pub payload: Vec<u8>,
+}
+
+/// Handler invoked by the network thread when a remote peer sends
+/// us a `Frame::InvokeRequest`. The implementation typically
+/// dispatches against the local invoke-route table and blocks on
+/// the agent's reply (the network calls `dispatch` from a
+/// `tokio::task::spawn_blocking`, so blocking is safe). Returning
+/// an empty `Vec` is interpreted as "no reply" / "target not
+/// found" and surfaces to the original caller as an empty
+/// `InvokeReply`.
+pub trait InvokeDispatcher: Send + Sync {
+    fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8>;
 }
 
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
@@ -87,6 +99,10 @@ pub struct Network {
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
+    /// Set via [`set_invoke_dispatcher`](Self::set_invoke_dispatcher).
+    /// Read by the swarm thread on every inbound `InvokeRequest`
+    /// to dispatch against the local node.
+    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -116,6 +132,14 @@ enum NetworkCmd {
         to: u32,
         payload: Vec<u8>,
     },
+    SendInvoke {
+        target_peer: PeerId,
+        from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+        reply: std_mpsc::Sender<Vec<u8>>,
+    },
     Shutdown,
 }
 
@@ -126,11 +150,14 @@ impl Network {
         let local_prefix = config.local_prefix;
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
+        let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>> =
+            Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
         let prefix_map_for_thread = prefix_map.clone();
         let listen_addrs_for_thread = listen_addrs.clone();
+        let invoke_dispatcher_for_thread = invoke_dispatcher.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -148,6 +175,7 @@ impl Network {
                 prefix_map_for_thread,
                 listen_addrs_for_thread,
                 inbox_tx,
+                invoke_dispatcher_for_thread,
             ));
         });
 
@@ -158,8 +186,46 @@ impl Network {
             prefix_map,
             listen_addrs,
             inbox_rx: Mutex::new(Some(inbox_rx)),
+            invoke_dispatcher,
             join: Some(join),
         }
+    }
+
+    /// Install the handler used to dispatch inbound `InvokeRequest`
+    /// frames into the local node. Without it, remote invokes
+    /// receive an empty `InvokeReply`.
+    pub fn set_invoke_dispatcher(&self, dispatcher: Arc<dyn InvokeDispatcher>) {
+        if let Ok(mut g) = self.invoke_dispatcher.lock() {
+            *g = Some(dispatcher);
+        }
+    }
+
+    /// Synchronously invoke a service on a remote peer. Returns a
+    /// receiver that yields the reply bytes (rkyv-encoded `Value`)
+    /// or, on failure, disconnects without sending — surfacing as
+    /// `InvokeError::NotFound` at the caller.
+    ///
+    /// `chain` carries the synchronous-invoke stack of caller IDs
+    /// for cycle / depth detection on the remote side; pass an
+    /// empty vec if calling from outside the agent system.
+    pub fn send_invoke(
+        &self,
+        target_peer: PeerId,
+        from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> std_mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendInvoke {
+            target_peer,
+            from,
+            to,
+            chain,
+            msg,
+            reply: tx,
+        });
+        rx
     }
 
     /// Take ownership of the inbound-Tell receiver. The first call
@@ -243,6 +309,7 @@ async fn network_main(
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_tx: std_mpsc::Sender<InboundTell>,
+    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -270,12 +337,32 @@ async fn network_main(
         }
     }
 
+    // Outbound InvokeRequest tracking. When the user calls
+    // `Network::send_invoke`, we stash the reply Sender keyed by
+    // libp2p's outbound RequestId. The matching `InvokeReply` (or
+    // an OutboundFailure event) clears the entry and forwards the
+    // payload to the caller.
+    let mut outbound_invokes: HashMap<
+        request_response::OutboundRequestId,
+        std_mpsc::Sender<Vec<u8>>,
+    > = HashMap::new();
+
+    // Inbound dispatch path: blocking tasks complete asynchronously
+    // and need to push (response_channel, frame) back to the swarm
+    // so it can call send_response. The select! arm below pulls
+    // from this channel.
+    let (response_tx, mut response_rx) =
+        async_mpsc::unbounded_channel::<(request_response::ResponseChannel<Frame>, Frame)>();
+
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
                 handle_swarm_event(
                     &mut swarm, event, local_prefix,
                     &prefix_map, &listen_addrs, &inbox_tx,
+                    &mut outbound_invokes,
+                    &invoke_dispatcher,
+                    &response_tx,
                 );
             }
             cmd = cmd_rx.recv() => {
@@ -294,10 +381,31 @@ async fn network_main(
                             .send_request(&target_peer, frame);
                         debug!(%target_peer, from, to, "network: sent Tell");
                     }
+                    Some(NetworkCmd::SendInvoke {
+                        target_peer, from, to, chain, msg, reply,
+                    }) => {
+                        let frame = Frame::InvokeRequest { from, to, chain, msg };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_invokes.insert(req_id, reply);
+                        debug!(%target_peer, from, to, "network: sent InvokeRequest");
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
                     }
+                }
+            }
+            Some((channel, frame)) = response_rx.recv() => {
+                if swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .send_response(channel, frame)
+                    .is_err()
+                {
+                    warn!("network: deferred response failed (channel closed)");
                 }
             }
         }
@@ -348,6 +456,9 @@ fn handle_swarm_event(
     prefix_map: &PrefixMap,
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
+    outbound_invokes: &mut HashMap<request_response::OutboundRequestId, std_mpsc::Sender<Vec<u8>>>,
+    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -393,7 +504,10 @@ fn handle_swarm_event(
             debug!(%peer_id, agent = %info.agent_version, "network: identify received");
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::ReqResp(rr_event)) => {
-            handle_req_resp(swarm, rr_event, local_prefix, prefix_map, inbox);
+            handle_req_resp(
+                swarm, rr_event, local_prefix, prefix_map, inbox,
+                outbound_invokes, invoke_dispatcher, response_tx,
+            );
         }
         _ => {}
     }
@@ -405,58 +519,89 @@ fn handle_req_resp(
     local_prefix: u16,
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
+    outbound_invokes: &mut HashMap<request_response::OutboundRequestId, std_mpsc::Sender<Vec<u8>>>,
+    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
+    response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
 
     match event {
         Event::Message { peer, message, .. } => match message {
             Message::Request { request, channel, .. } => {
-                let response = match request {
+                match request {
                     Frame::Hello { node_prefix } => {
                         record_prefix(prefix_map, node_prefix, peer);
-                        Frame::Hello { node_prefix: local_prefix }
+                        let _ = swarm.behaviour_mut().req_resp.send_response(
+                            channel,
+                            Frame::Hello { node_prefix: local_prefix },
+                        );
                     }
                     Frame::Tell { from, to, payload } => {
                         if inbox.send(InboundTell { from, to, payload }).is_err() {
                             warn!(%peer, "network: local inbox closed; dropping inbound Tell");
                         }
-                        Frame::Ack
+                        let _ = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_response(channel, Frame::Ack);
                     }
-                    Frame::InvokeRequest { .. } => {
-                        warn!(%peer, "network: cross-node InvokeRequest not yet implemented");
-                        Frame::InvokeReply { payload: Vec::new() }
+                    Frame::InvokeRequest { from, to, chain, msg } => {
+                        // Hand off to a blocking task: the dispatcher's
+                        // reply channel uses std::sync::mpsc, which would
+                        // park the runtime if awaited inline. The task
+                        // calls back with (channel, InvokeReply) which the
+                        // swarm select! arm forwards via send_response.
+                        let dispatcher = invoke_dispatcher.lock().ok().and_then(|g| g.clone());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let payload = match dispatcher {
+                                Some(d) => d.dispatch(from, to, chain, msg),
+                                None => {
+                                    warn!(
+                                        from, to,
+                                        "network: inbound InvokeRequest with no \
+                                         dispatcher installed; replying empty",
+                                    );
+                                    Vec::new()
+                                }
+                            };
+                            let _ = response_tx
+                                .send((channel, Frame::InvokeReply { payload }));
+                        });
                     }
                     other => {
                         warn!(%peer, ?other, "network: unexpected frame in request slot");
-                        Frame::Ack
+                        let _ = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_response(channel, Frame::Ack);
                     }
-                };
-                if swarm
-                    .behaviour_mut()
-                    .req_resp
-                    .send_response(channel, response)
-                    .is_err()
-                {
-                    warn!(%peer, "network: failed to send response (channel dropped)");
                 }
             }
-            Message::Response { response, .. } => match response {
+            Message::Response { response, request_id, .. } => match response {
                 Frame::Hello { node_prefix } => {
                     record_prefix(prefix_map, node_prefix, peer);
                 }
                 Frame::Ack => {
                     debug!(%peer, "network: Tell ack received");
                 }
-                Frame::InvokeReply { .. } => {
-                    debug!(%peer, "network: stray InvokeReply; cycle 2.5 will pair them");
+                Frame::InvokeReply { payload } => {
+                    if let Some(reply_tx) = outbound_invokes.remove(&request_id) {
+                        let _ = reply_tx.send(payload);
+                    } else {
+                        debug!(%peer, "network: InvokeReply for unknown request");
+                    }
                 }
                 other => {
                     warn!(%peer, ?other, "network: unexpected frame in response slot");
                 }
             },
         },
-        Event::OutboundFailure { peer, error, .. } => {
+        Event::OutboundFailure { peer, request_id, error, .. } => {
             warn!(%peer, error = %error, "network: outbound request failed");
+            // Drop the reply Sender so the caller's recv yields
+            // Disconnected, which surfaces as InvokeError::NotFound.
+            let _ = outbound_invokes.remove(&request_id);
         }
         Event::InboundFailure { peer, error, .. } => {
             warn!(%peer, error = %error, "network: inbound request failed");
@@ -676,6 +821,170 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Network-level test: outbound `send_invoke` on A dispatches
+    /// against an `InvokeDispatcher` installed on B, and the
+    /// reply flows back through the request_response response
+    /// slot to the original caller.
+    #[test]
+    fn cross_node_invoke_round_trips_reply() {
+        struct RecordingDispatcher {
+            seen: Arc<Mutex<Option<(u32, u32, Vec<u32>, Vec<u8>)>>>,
+            reply: Vec<u8>,
+        }
+
+        impl InvokeDispatcher for RecordingDispatcher {
+            fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
+                *self.seen.lock().unwrap() =
+                    Some((from, to, chain.clone(), msg));
+                self.reply.clone()
+            }
+        }
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = 0xAAAA;
+        let prefix_b = 0xBBBB;
+
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        // Install dispatcher on B before any invoke can race in.
+        let seen = Arc::new(Mutex::new(None));
+        net_b.set_invoke_dispatcher(Arc::new(RecordingDispatcher {
+            seen: seen.clone(),
+            reply: b"the answer".to_vec(),
+        }));
+
+        wait_for(
+            || net_a.peer_for_prefix(prefix_b),
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+
+        let target_peer = net_a.peer_for_prefix(prefix_b).unwrap();
+        let reply_rx = net_a.send_invoke(
+            target_peer,
+            0x00010002, // from
+            0xBBBB0007, // to (B's local id 7)
+            vec![0x00010002], // chain
+            b"please reply".to_vec(),
+        );
+
+        let payload = reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invoke reply");
+        assert_eq!(payload, b"the answer");
+
+        let seen = seen.lock().unwrap().clone().expect("dispatcher saw the call");
+        assert_eq!(seen.0, 0x00010002);
+        assert_eq!(seen.1, 0xBBBB0007);
+        assert_eq!(seen.2, vec![0x00010002]);
+        assert_eq!(seen.3, b"please reply");
+
+        net_a.join();
+        net_b.join();
+    }
+
+    /// Full path: `VosNode::invoke` on A finds no local route,
+    /// falls through to the network, hits B's `LocalInvokeDispatcher`
+    /// (installed by `attach_network`), which dispatches against
+    /// B's invoke_routes table where a test responder lives.
+    #[test]
+    fn vosnode_invoke_falls_through_to_remote_node() {
+        use crate::node::VosNode;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        wait_for(
+            || {
+                if net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some()
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+
+        // Build node B with a responder, then attach the network so
+        // the LocalInvokeDispatcher sees the responder's route.
+        let mut node_b = VosNode::with_prefix(prefix_b);
+        let responder_id = node_b.install_invoke_responder(|msg| {
+            // Echo with a marker so we can assert on the reply.
+            let mut out = b"ack:".to_vec();
+            out.extend_from_slice(&msg);
+            out
+        });
+        node_b.attach_network(net_b);
+
+        // Node A only needs the network — no local services.
+        let mut node_a = VosNode::with_prefix(prefix_a);
+        node_a.attach_network(net_a);
+
+        // Cross-node invoke from outside the agent system.
+        let reply = node_a
+            .invoke_with_timeout(responder_id, b"ping".to_vec(), Duration::from_secs(5))
+            .expect("cross-node invoke should resolve");
+        assert_eq!(reply, b"ack:ping");
+
+        // Sanity check: invoking a target with no local route AND no
+        // remote owner returns None instead of hanging.
+        let unknown = crate::abi::service::ServiceId::new(0xDEAD, 1);
+        let nothing = node_a.invoke_with_timeout(unknown, b"".to_vec(), Duration::from_millis(500));
+        assert!(nothing.is_none());
+
+        // collect drops both nodes; their networks shut down with them.
+        let _ = node_a.collect();
+        let _ = node_b.collect();
     }
 
     /// End-to-end test: VosNode A pushes an envelope addressed to a
