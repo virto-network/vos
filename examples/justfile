@@ -8,9 +8,10 @@ build:
     cd actors/animation && cargo build --release
     cd actors/math && cargo build --release
     cd actors/pipeline && cargo build --release
+    cd actors/crdt-counter && cargo build --release
 
 run: build
-    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- start space.toml --no-persist
+    cargo run --manifest-path ../Cargo.toml -p vosx -- start space.toml --no-persist
 
 list: build
-    cargo run --manifest-path ../crates/vos/Cargo.toml --bin vosx -- list space.toml
+    cargo run --manifest-path ../Cargo.toml -p vosx -- list space.toml

@@ -6,6 +6,8 @@
 use vos::lifecycle::InvokeResult;
 use vos::value::Msg;
 use vos::{actor, messages, lifecycle, Decode};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct Router {
@@ -48,3 +50,5 @@ impl Router {
         }
     }
 }
+
+vos::pvm_main!(Router);

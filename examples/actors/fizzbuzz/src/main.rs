@@ -4,6 +4,8 @@
 //! and a yield loop. Each invocation prints the next fizzbuzz value.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct FizzBuzz {
@@ -33,3 +35,5 @@ impl FizzBuzz {
         }
     }
 }
+
+vos::pvm_main!(FizzBuzz);

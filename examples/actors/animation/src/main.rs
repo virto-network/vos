@@ -11,6 +11,8 @@
 //! the framebuffer/timing lives in the Display service.
 
 use vos::{actor, messages, value::Msg};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 const DISPLAY_ID: u32 = 6;
 const WIDTH: usize = 16;
@@ -94,3 +96,5 @@ impl Animation {
         }
     }
 }
+
+vos::pvm_main!(Animation);

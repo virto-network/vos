@@ -7,6 +7,8 @@
 //! The `read` handler returns the current framebuffer contents.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 const WIDTH: u32 = 16;
 const HEIGHT: u32 = 8;
@@ -53,3 +55,5 @@ impl Display {
         self.framebuffer.clone()
     }
 }
+
+vos::pvm_main!(Display);

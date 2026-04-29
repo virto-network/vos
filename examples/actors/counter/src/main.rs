@@ -5,6 +5,8 @@
 //! The agent re-invokes to drive subsequent iterations.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct Counter {
@@ -26,3 +28,5 @@ impl Counter {
         }
     }
 }
+
+vos::pvm_main!(Counter);

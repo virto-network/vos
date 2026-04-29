@@ -13,6 +13,8 @@
 //! types as replies, and a loop that terminates with a result.
 
 use vos::{actor, messages, value::Msg};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 const MATH_ID: u32 = 8;
 const THRESHOLD: u64 = 1000;
@@ -70,3 +72,5 @@ impl Pipeline {
         }
     }
 }
+
+vos::pvm_main!(Pipeline);

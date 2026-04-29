@@ -6,6 +6,8 @@
 //! the same `Start` message to drive the next iteration.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 /// Simple hash: XOR-fold with rotation.
 fn simple_hash(input: &[u8; 32]) -> [u8; 32] {
@@ -46,3 +48,5 @@ impl Hasher {
         }
     }
 }
+
+vos::pvm_main!(Hasher);

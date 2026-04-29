@@ -4,6 +4,8 @@
 //! `Value` and sent back as replies to `ask()` callers.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct Math;
@@ -26,3 +28,5 @@ impl Math {
         a * b
     }
 }
+
+vos::pvm_main!(Math);

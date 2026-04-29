@@ -564,16 +564,23 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // PVM service path reads init args from storage. Worker/WASM
         // builds receive args via __vos_create_with_args; bare create()
         // is an error there.
+        //
+        // The cfg gate is target-based, not feature-based: every PVM
+        // actor crate is built for `riscv64`, the service feature is
+        // enabled on `vos` (not on the user crate). A previous version
+        // checked `cfg(feature = "service")` against the *user* crate
+        // — which never has that feature — and `__vos_create` always
+        // hit the panic branch.
         quote! {
             fn __vos_create() -> Self {
-                #[cfg(feature = "service")]
+                #[cfg(target_arch = "riscv64")]
                 {
                     let args: vos::value::Args = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
                         .expect("actor init args not found in storage");
                     #( #extractions )*
                     return Self::new(#( #names ),*);
                 }
-                #[cfg(not(feature = "service"))]
+                #[cfg(not(target_arch = "riscv64"))]
                 panic!(
                     "actor has constructor parameters — workers and WASM \
                      must be created with init args (see vos_worker_create / \

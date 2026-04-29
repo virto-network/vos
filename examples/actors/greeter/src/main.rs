@@ -4,6 +4,8 @@
 //! that executes once and completes.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct Greeter {
@@ -21,3 +23,5 @@ impl Greeter {
         println!("greeter: Hello n={}", self.n);
     }
 }
+
+vos::pvm_main!(Greeter);

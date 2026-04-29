@@ -11,6 +11,8 @@
 use vos::lifecycle::InvokeResult;
 use vos::value::Msg;
 use vos::{actor, messages, lifecycle};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 /// No artificial cap — the runtime's per-tick iteration limit + gas
 /// budget provide the safety ceiling. Across ticks, continuations
@@ -115,3 +117,5 @@ impl Agent {
         }
     }
 }
+
+vos::pvm_main!(Agent);

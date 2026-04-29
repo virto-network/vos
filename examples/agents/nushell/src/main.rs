@@ -3,6 +3,8 @@
 //! Actors appear as pipeable commands in nu scripts. Not yet implemented.
 
 use vos::{actor, messages};
+#[allow(unused_imports)]
+use vos::{print, println, eprint, eprintln};
 
 #[actor]
 struct Nushell {
@@ -21,3 +23,5 @@ impl Nushell {
         println!("nushell: not yet implemented");
     }
 }
+
+vos::pvm_main!(Nushell);

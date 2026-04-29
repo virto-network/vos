@@ -108,10 +108,6 @@ pub mod hostcalls {
 macro_rules! pvm_main {
     ($actor:ty) => {
         #[cfg(target_arch = "riscv64")]
-        #[allow(unused_imports)]
-        use $crate::{print, println, eprint, eprintln};
-
-        #[cfg(target_arch = "riscv64")]
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             $crate::run_refine_entry::<$actor>();
