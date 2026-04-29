@@ -31,19 +31,20 @@ stwo_constraint_framework::relation!(
 // can't clear flags to skip per-op constraints — flag values are now
 // pinned to the canonical classify_opcode(opcode) decoding.
 //
-// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23):
+// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24):
 //   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
 //   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
 //   is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind,
 //   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss, is_div_s,
 //   is_load_i8, is_load_i16, is_load_i32,
-//   is_mem_size_1, is_mem_size_2, is_mem_size_4, is_mem_size_8
-pub const PROG_MEMORY_N_FLAGS: usize = 34;
+//   is_mem_size_1, is_mem_size_2, is_mem_size_4, is_mem_size_8,
+//   is_store_direct
+pub const PROG_MEMORY_N_FLAGS: usize = 35;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 34 flags + imm_y_canon[4] + branch_target_canon[4] = 59 limbs.
-//   is_mem_size_{1,2,4,8} added in Phase 23 to pin MemSize to the
-//   opcode-canonical access width.
+//   + 35 flags + imm_y_canon[4] + branch_target_canon[4] = 60 limbs.
+//   is_store_direct added in Phase 24 to drive the MemValue ↔ val_b
+//   binding on direct-addressing stores (StoreU8/16/32/64).
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(

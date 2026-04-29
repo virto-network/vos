@@ -109,6 +109,14 @@ pub(super) struct OpcodeFlags {
     pub is_mem_size_2: bool,
     pub is_mem_size_4: bool,
     pub is_mem_size_8: bool,
+    /// Phase 24: 1 iff this opcode is `StoreU8 / StoreU16 / StoreU32 /
+    /// StoreU64` (OneRegOneImm category — *direct* store, not Ind or
+    /// Imm).  For these the trace fill's default arm puts `regs[ra]`
+    /// (the source value) into `val_b`, so MemValue's active bytes
+    /// can be pinned to `val_b`'s bytes by a single constraint.
+    /// StoreInd* / StoreImm* / StoreImmInd* leave the source value in
+    /// a different place and need their own bindings (deferred).
+    pub is_store_direct: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -223,14 +231,24 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; }
         Opcode::LoadI32 | Opcode::LoadIndI32
             => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; }
-        // Stores
-        Opcode::StoreU8 | Opcode::StoreIndU8 | Opcode::StoreImmU8 | Opcode::StoreImmIndU8
+        // Stores — split by addressing mode (Phase 24 needs is_store_direct
+        // set only on the OneRegOneImm-category direct stores; Ind / Imm
+        // / ImmInd handle their source values differently).
+        Opcode::StoreU8
+            => { f.is_store = true; f.is_mem_size_1 = true; f.is_store_direct = true; }
+        Opcode::StoreU16
+            => { f.is_store = true; f.is_mem_size_2 = true; f.is_store_direct = true; }
+        Opcode::StoreU32
+            => { f.is_store = true; f.is_mem_size_4 = true; f.is_store_direct = true; }
+        Opcode::StoreU64
+            => { f.is_store = true; f.is_mem_size_8 = true; f.is_store_direct = true; }
+        Opcode::StoreIndU8 | Opcode::StoreImmU8 | Opcode::StoreImmIndU8
             => { f.is_store = true; f.is_mem_size_1 = true; }
-        Opcode::StoreU16 | Opcode::StoreIndU16 | Opcode::StoreImmU16 | Opcode::StoreImmIndU16
+        Opcode::StoreIndU16 | Opcode::StoreImmU16 | Opcode::StoreImmIndU16
             => { f.is_store = true; f.is_mem_size_2 = true; }
-        Opcode::StoreU32 | Opcode::StoreIndU32 | Opcode::StoreImmU32 | Opcode::StoreImmIndU32
+        Opcode::StoreIndU32 | Opcode::StoreImmU32 | Opcode::StoreImmIndU32
             => { f.is_store = true; f.is_mem_size_4 = true; }
-        Opcode::StoreU64 | Opcode::StoreIndU64 | Opcode::StoreImmU64 | Opcode::StoreImmIndU64
+        Opcode::StoreIndU64 | Opcode::StoreImmU64 | Opcode::StoreImmIndU64
             => { f.is_store = true; f.is_mem_size_8 = true; }
         // Jumps (unconditional, non-sequential target)
         Opcode::Jump | Opcode::LoadImmJump
@@ -279,12 +297,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23):
-/// extract the 34 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24):
+/// extract the 35 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 34] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 35] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -300,5 +318,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 34] {
         f.is_load_i8 as u8, f.is_load_i16 as u8, f.is_load_i32 as u8,
         f.is_mem_size_1 as u8, f.is_mem_size_2 as u8,
         f.is_mem_size_4 as u8, f.is_mem_size_8 as u8,
+        f.is_store_direct as u8,
     ]
 }

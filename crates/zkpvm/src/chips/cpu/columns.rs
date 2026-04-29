@@ -608,6 +608,14 @@ pub enum Column {
     #[size = 1] IsMemSize2,
     #[size = 1] IsMemSize4,
     #[size = 1] IsMemSize8,
+    /// Phase 24: 1 iff this opcode is `StoreU8 / StoreU16 / StoreU32 /
+    /// StoreU64` (the OneRegOneImm-category direct stores).  For these
+    /// the trace fill puts `regs[ra]` into `val_b` (default arm in the
+    /// source-operand match), so MemValue's active bytes can be pinned
+    /// to val_b's bytes by a single byte-wise constraint.  Pinned to
+    /// the canonical opcode decoding by ProgramMemoryChip.
+    #[size = 1]
+    IsStoreDirect,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
