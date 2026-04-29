@@ -1542,7 +1542,7 @@ fn ctx_resolve_returns_announced_service_id() {
     // Single-node setup — the path under test is the actor's
     // INVOKE hostcall to ServiceId::REGISTRY, decoding the rkyv
     // RegistryEntry, and surfacing the full u32 to the caller.
-    use registry::{decode_archived, RegistryClient, RegistryEntry};
+    use registry::RegistryClient;
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
@@ -1606,13 +1606,10 @@ fn ctx_resolve_returns_announced_service_id() {
 
     // Poll the registry until it sees the entry — the announce
     // returns immediately but the actor loop processes it on
-    // its next tick. `lookup` returns rkyv-encoded bytes
-    // (empty for "not registered"); we decode into RegistryEntry.
+    // its next tick. The macro-generated `lookup` returns
+    // `Result<Option<RegistryEntry>, ClientError>` directly.
     wait_for(
-        || {
-            let bytes = registry_client().lookup("kunekt/counter".to_string()).ok()?;
-            if bytes.is_empty() { None } else { decode_archived::<RegistryEntry>(&bytes) }
-        },
+        || registry_client().lookup("kunekt/counter".to_string()).ok().flatten(),
         std::time::Duration::from_secs(3),
     )
     .expect("registry sees announce");
@@ -1654,22 +1651,11 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     // both replicas converge to a 2-entry directory. Lookup,
     // by_role, and paginated list all return consistent answers
     // from either side.
-    use registry::{decode_archived, Page, RegistryClient, RegistryEntry};
+    use registry::RegistryClient;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
     use vos::node::{AgentConfig, Consistency, VosNode};
-
-    // Tiny helpers to keep the test readable now that the
-    // generated `RegistryClient` returns wire-shaped replies
-    // (raw bytes for `lookup`/`list`/`by_role`). Slice 3 will
-    // teach the macro to do this decoding for us.
-    fn decode_lookup(bytes: &[u8]) -> Option<RegistryEntry> {
-        if bytes.is_empty() { None } else { decode_archived::<RegistryEntry>(bytes) }
-    }
-    fn decode_page(bytes: &[u8]) -> Page {
-        decode_archived::<Page>(bytes).unwrap_or_else(Page::empty)
-    }
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let actor_path = format!(
@@ -1764,11 +1750,8 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     // ── Wait for both replicas to converge on both entries ────
     let see_both = |node: &VosNode| -> bool {
         let client = RegistryClient::at(node, ServiceId::REGISTRY);
-        let alice = client.lookup("kunekt/alice".to_string()).ok()
-            .and_then(|b| decode_lookup(&b));
-        let bob = client.lookup("kunekt/bob".to_string()).ok()
-            .and_then(|b| decode_lookup(&b));
-        alice.is_some() && bob.is_some()
+        client.lookup("kunekt/alice".to_string()).ok().flatten().is_some()
+        && client.lookup("kunekt/bob".to_string()).ok().flatten().is_some()
     };
 
     wait_for(|| if see_both(&node_a) { Some(()) } else { None },
@@ -1781,55 +1764,48 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
         [("A", &node_a, prefix_a, prefix_b), ("B", &node_b, prefix_a, prefix_b)]
     {
         let client = RegistryClient::at(node, ServiceId::REGISTRY);
-        let alice = decode_lookup(&client.lookup("kunekt/alice".to_string()).unwrap())
+        let alice = client.lookup("kunekt/alice".to_string()).unwrap()
             .unwrap_or_else(|| panic!("{label}: alice missing"));
         assert_eq!(alice.name, "kunekt/alice");
         assert_eq!(alice.owner_prefix, expected_a_prefix);
         assert_eq!(alice.service_id, 100);
         assert_eq!(alice.roles, alice_roles);
 
-        let bob = decode_lookup(&client.lookup("kunekt/bob".to_string()).unwrap())
+        let bob = client.lookup("kunekt/bob".to_string()).unwrap()
             .unwrap_or_else(|| panic!("{label}: bob missing"));
         assert_eq!(bob.owner_prefix, expected_b_prefix);
         assert_eq!(bob.service_id, 200);
         assert_eq!(bob.roles, bob_roles);
 
         // Listing under the prefix returns both, sorted.
-        let bytes = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
-        let page = decode_page(&bytes);
+        let page = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
         let names: Vec<_> = page.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["kunekt/alice", "kunekt/bob"], "{label}: list");
 
         // by_role narrows correctly.
-        let bytes = client
+        let workers = client
             .by_role("worker".to_string(), String::new(), String::new(), 64).unwrap();
-        let workers = decode_page(&bytes);
         let worker_names: Vec<_> = workers.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(worker_names, vec!["kunekt/alice", "kunekt/bob"], "{label}: workers");
 
-        let bytes = client
+        let leaders = client
             .by_role("leader".to_string(), String::new(), String::new(), 64).unwrap();
-        let leaders = decode_page(&bytes);
         let leader_names: Vec<_> = leaders.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(leader_names, vec!["kunekt/bob"], "{label}: leaders");
 
-        // Lookup of a missing name returns empty bytes.
-        let missing = client.lookup("kunekt/nobody".to_string()).unwrap();
-        assert!(missing.is_empty(), "{label}: missing");
+        // Lookup of a missing name returns None.
+        assert!(client.lookup("kunekt/nobody".to_string()).unwrap().is_none(),
+            "{label}: missing");
     }
 
     // ── Pagination: limit=1 walks both entries in 2 pages ─────
     {
         let client = RegistryClient::at(&node_a, ServiceId::REGISTRY);
-        let p1 = decode_page(
-            &client.list("kunekt/".to_string(), String::new(), 1).unwrap()
-        );
+        let p1 = client.list("kunekt/".to_string(), String::new(), 1).unwrap();
         assert_eq!(p1.entries.len(), 1);
         assert_eq!(p1.entries[0].name, "kunekt/alice");
         assert!(p1.has_more());
-        let p2 = decode_page(
-            &client.list("kunekt/".to_string(), p1.next.clone(), 1).unwrap()
-        );
+        let p2 = client.list("kunekt/".to_string(), p1.next.clone(), 1).unwrap();
         assert_eq!(p2.entries.len(), 1);
         assert_eq!(p2.entries[0].name, "kunekt/bob");
         assert!(!p2.has_more());
@@ -1850,7 +1826,7 @@ fn registry_heartbeat_bumps_last_seen() {
     // convergence (the existing
     // `registry_announce_lookup_and_list_converge_across_nodes`
     // already exercises that).
-    use registry::{decode_archived, Page, RegistryClient, RegistryEntry};
+    use registry::RegistryClient;
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -1883,14 +1859,7 @@ fn registry_heartbeat_bumps_last_seen() {
     );
 
     let client = RegistryClient::at(&node, ServiceId::REGISTRY);
-    let lookup = |name: &str| -> Option<RegistryEntry> {
-        let bytes = client.lookup(name.to_string()).expect("invoke");
-        if bytes.is_empty() { None } else { decode_archived::<RegistryEntry>(&bytes) }
-    };
-    let list_page = |prefix: &str| -> Page {
-        let bytes = client.list(prefix.to_string(), String::new(), 64).expect("invoke");
-        decode_archived::<Page>(&bytes).unwrap_or_else(Page::empty)
-    };
+    let lookup = |name: &str| client.lookup(name.to_string()).expect("invoke");
 
     client.announce("kunekt/alpha".to_string(), 0, 11, vec!["worker".to_string()])
         .expect("announce alpha");
@@ -1905,7 +1874,7 @@ fn registry_heartbeat_bumps_last_seen() {
         alpha_t0.last_seen, beta_t0.last_seen);
 
     // Page snapshot exposes the registry's current tick.
-    let page0 = list_page("kunekt/");
+    let page0 = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
     assert!(page0.clock >= beta_t0.last_seen, "page clock {} < beta {}",
         page0.clock, beta_t0.last_seen);
 
@@ -1929,7 +1898,7 @@ fn registry_heartbeat_bumps_last_seen() {
         "heartbeat should not create entries");
 
     // is_alive_within helper.
-    let page1 = list_page("kunekt/");
+    let page1 = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
     assert!(alpha_t1.is_alive_within(page1.clock, 1), "alpha should be fresh");
     assert!(!beta_t0.is_alive_within(page1.clock, 1),
         "beta should age past max_age=1: clock={} beta.last_seen={}",
@@ -1949,7 +1918,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
     // primitive directly — register, announce, then drive
     // heartbeats from a worker thread and observe last_seen
     // climb.
-    use registry::{decode_archived, RegistryClient, RegistryEntry};
+    use registry::RegistryClient;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1987,10 +1956,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
     );
 
     let client = RegistryClient::at(&node, ServiceId::REGISTRY);
-    let lookup_entry = || -> Option<RegistryEntry> {
-        let bytes = client.lookup("kunekt/svc".to_string()).ok()?;
-        if bytes.is_empty() { None } else { decode_archived::<RegistryEntry>(&bytes) }
-    };
+    let lookup_entry = || client.lookup("kunekt/svc".to_string()).ok().flatten();
     client.announce("kunekt/svc".to_string(), 0, 7, vec![]).expect("announce");
     let initial = lookup_entry().expect("svc");
 

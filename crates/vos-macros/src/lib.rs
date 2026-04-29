@@ -305,13 +305,79 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Enum variant
         enum_variants.push(quote! { #struct_name(#struct_name) });
 
+        // Detect `Option<T>` in the handler's return type (after
+        // unwrapping `Result<T, E>` if applicable). When present,
+        // we serialize replies via rkyv into `Value::Bytes` —
+        // empty for `None`, populated for `Some(v)`. The
+        // generated client at the other end recognises this
+        // shape and turns it back into `Option<T>`.
+        let raw_ret = match &method.sig.output {
+            ReturnType::Default => None,
+            ReturnType::Type(_, ty) => Some(ty.as_ref().clone()),
+        };
+        let success_after_result = match &raw_ret {
+            None => None,
+            Some(t) => match result_ok_type(t) {
+                Some(inner) => Some(inner),
+                None => Some(t.clone()),
+            },
+        };
+        let option_inner = success_after_result.as_ref().and_then(option_inner_type);
+
+        // Reply-encoding step: how to convert the handler's
+        // returned value into the `Value` we hand to
+        // `ctx.__set_reply`. Three shapes, in order:
+        //
+        // 1. `Option<T>` — match Some/None, rkyv-encode T into
+        //    `Value::Bytes` (empty for None).
+        // 2. Primitives / strings / `Vec<u8|u32|String>` — these
+        //    all impl `Into<Value>` already, so `reply.into()`.
+        // 3. Anything else — assume a user rkyv-able struct and
+        //    encode into `Value::Bytes`.
+        let reply_to_value = if option_inner.is_some() {
+            quote! {
+                {
+                    let __reply = reply;
+                    match __reply {
+                        None => vos::value::Value::Bytes(alloc::vec::Vec::new()),
+                        Some(v) => {
+                            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&v)
+                                .expect("rkyv encode")
+                                .to_vec();
+                            vos::value::Value::Bytes(bytes)
+                        }
+                    }
+                }
+            }
+        } else {
+            let ty_str = success_after_result.as_ref()
+                .map(|t| quote!(#t).to_string().replace(' ', ""))
+                .unwrap_or_else(|| "()".to_string());
+            const PRIMITIVES: &[&str] = &[
+                "()", "bool", "u8", "u16", "u32", "u64", "i32", "i64",
+                "String", "Vec<u8>", "Vec<u32>", "Vec<String>",
+            ];
+            if PRIMITIVES.contains(&ty_str.as_str()) {
+                quote! { reply.into() }
+            } else {
+                quote! {
+                    {
+                        let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&reply)
+                            .expect("rkyv encode")
+                            .to_vec();
+                        vos::value::Value::Bytes(bytes)
+                    }
+                }
+            }
+        };
+
         // Deliver arm — different code for infallible vs fallible handlers
         let deliver_arm = if returns_result {
             quote! {
                 #enum_name::#struct_name(msg) => {
                     match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
                         Ok(reply) => {
-                            ctx.__set_reply(reply.into());
+                            ctx.__set_reply(#reply_to_value);
                             false
                         }
                         Err(e) => vos::Actor::on_error(actor, &e),
@@ -322,7 +388,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 #enum_name::#struct_name(msg) => {
                     let reply = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
-                    ctx.__set_reply(reply.into());
+                    ctx.__set_reply(#reply_to_value);
                     false
                 }
             }
@@ -1381,6 +1447,22 @@ fn parse_actor_attrs(attr: TokenStream) -> proc_macro2::TokenStream {
     }
 }
 
+/// If `ty` is `Option<T>`, return the inner `T`. Otherwise `None`.
+fn option_inner_type(ty: &syn::Type) -> Option<syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
 /// If `ty` is `Result<T>` or `Result<T, E>`, return the `T`.
 fn result_ok_type(ty: &syn::Type) -> Option<syn::Type> {
     let syn::Type::Path(p) = ty else { return None };
@@ -1424,6 +1506,31 @@ fn client_decode_body(
     let Some(ty) = success_ty else {
         return quote! { Ok(()) };
     };
+
+    // `Option<T>`: the actor encodes `None` as
+    // `Value::Bytes(empty)` (or `Value::Unit`) and `Some(v)` as
+    // `Value::Bytes(rkyv-encoded v)`. Mirror that on decode.
+    if let Some(inner) = option_inner_type(ty) {
+        return quote! {
+            match #value_ident {
+                vos::value::Value::Unit => Ok(None),
+                vos::value::Value::Bytes(b) if b.is_empty() => Ok(None),
+                vos::value::Value::Bytes(b) => {
+                    let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
+                    av.extend_from_slice(&b);
+                    let archived = unsafe {
+                        vos::rkyv::access_unchecked::<<#inner as vos::rkyv::Archive>::Archived>(&av)
+                    };
+                    vos::rkyv::deserialize::<#inner, vos::rkyv::rancor::Error>(archived)
+                        .map(Some)
+                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                }
+                other => Err(vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", other))),
+            }
+        };
+    }
+
     let ty_str = ty.to_token_stream().to_string().replace(' ', "");
     match ty_str.as_str() {
         "()" => quote! { Ok(()) },

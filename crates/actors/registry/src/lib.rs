@@ -281,44 +281,45 @@ impl Registry {
         0
     }
 
-    /// Returns rkyv-encoded `RegistryEntry` bytes when the name
-    /// is registered; returns an empty `Vec<u8>` (decoded host-
-    /// side as `Ok(None)`) when it isn't.
+    /// Look up a single name. The macro encodes `None` as an
+    /// empty `Value::Bytes` and `Some(entry)` as
+    /// rkyv-encoded bytes; the generated `RegistryClient::lookup`
+    /// reverses that to give callers an `Option<RegistryEntry>`
+    /// directly.
     #[msg]
-    async fn lookup(&self, name: String) -> Vec<u8> {
+    async fn lookup(&self, name: String) -> Option<RegistryEntry> {
         let mut idx = 0usize;
         while idx < self.entries.len() {
             if self.entries[idx].0 == name {
                 let stored = &self.entries[idx].1;
-                let entry = RegistryEntry {
+                return Some(RegistryEntry {
                     name,
                     owner_prefix: stored.owner_prefix,
                     service_id: stored.service_id,
                     roles: stored.roles.clone(),
                     last_seen: stored.last_seen,
-                };
-                return encode_archived(&entry);
+                });
             }
             idx += 1;
         }
-        Vec::new()
+        None
     }
 
     /// Paginated scan. `prefix` filters by leading-slash path,
     /// `after` is an exclusive cursor (empty = start), `limit`
-    /// is capped at `MAX_PAGE_SIZE`.
+    /// is capped at `MAX_PAGE_SIZE`. The macro recognises the
+    /// custom rkyv-able `Page` and emits a typed
+    /// `RegistryClient::list -> Page` on the host side.
     #[msg]
-    async fn list(&self, prefix: String, after: String, limit: u32) -> Vec<u8> {
-        let page = collect_page(&self.entries, &prefix, &after, limit, &String::new(), self.tick);
-        encode_archived(&page)
+    async fn list(&self, prefix: String, after: String, limit: u32) -> Page {
+        collect_page(&self.entries, &prefix, &after, limit, &String::new(), self.tick)
     }
 
     /// Same shape as `list`, but only entries whose `roles`
     /// contains `role`.
     #[msg]
-    async fn by_role(&self, role: String, prefix: String, after: String, limit: u32) -> Vec<u8> {
-        let page = collect_page(&self.entries, &prefix, &after, limit, &role, self.tick);
-        encode_archived(&page)
+    async fn by_role(&self, role: String, prefix: String, after: String, limit: u32) -> Page {
+        collect_page(&self.entries, &prefix, &after, limit, &role, self.tick)
     }
 }
 
