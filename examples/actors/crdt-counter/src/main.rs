@@ -20,8 +20,10 @@
 
 use vos::{actor, messages};
 
+vos::pvm_main!(CrdtCounter);
+
 #[actor]
-struct CrdtCounter {
+pub struct CrdtCounter {
     count: u64,
 }
 
@@ -46,20 +48,18 @@ impl CrdtCounter {
         self.count
     }
 
-    /// Resolve `name` by invoking the registry actor at
-    /// `ServiceId::REGISTRY` directly: it's a regular vos
-    /// service with a `resolve(name) -> u32` message, and
-    /// `ctx.ask` is how any actor talks to any other.
-    /// Returns the matching ServiceId, or 0 when unregistered.
-    /// Will be sugared to `RegistryActorClient::at(ctx).resolve(name).await`
-    /// once `#[messages]` learns to emit per-actor client traits.
+    /// Resolve `name` against the hyperspace registry via the
+    /// macro-generated `RegistryActorClient`. The actor-side
+    /// client wraps `ctx.ask(REGISTRY, "resolve", ...).await`
+    /// in a typed method.
     #[msg]
     async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
         use vos::abi::service::ServiceId;
-        let msg = vos::value::Msg::new("resolve").with("name", name.clone());
-        match ctx.ask(ServiceId::REGISTRY, &msg).await {
-            Ok(value) => {
-                let id = value.as_u32().unwrap_or(0);
+        use registry::RegistryActorClient;
+        match RegistryActorClient::at(ctx, ServiceId::REGISTRY)
+            .resolve(name.clone()).await
+        {
+            Ok(id) => {
                 if id == 0 {
                     println!("crdt-counter: whois({name}) -> not found");
                 } else {
@@ -68,7 +68,7 @@ impl CrdtCounter {
                 id
             }
             Err(e) => {
-                println!("crdt-counter: whois({name}) -> error {e:?}");
+                println!("crdt-counter: whois({name}) -> error {e}");
                 0
             }
         }

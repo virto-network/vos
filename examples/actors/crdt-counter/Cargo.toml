@@ -7,6 +7,11 @@ edition = "2024"
 
 [dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
+# Registry actor's lib portion: types + the macro-generated
+# `RegistryActorClient` (used by `whois` below). No `host`
+# feature — that would pull `VosNode` and host-side blake2b
+# into a riscv64 build, which doesn't make sense.
+registry = { path = "../../../crates/actors/registry" }
 
 [profile.release]
 opt-level = "s"

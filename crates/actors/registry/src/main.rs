@@ -1,13 +1,10 @@
-//! Bin entry. The actor framework's `_start` / `accumulate` PVM
-//! symbols come from the `#[messages]` expansion in `lib.rs`
-//! (gated on `target_arch = "riscv64"`); when the bin links the
-//! lib for the riscv64 target, those symbols propagate. On host
-//! targets there's nothing to run and `fn main` is just here to
-//! satisfy cargo.
+//! Bin entry. `vos::pvm_main!` emits `_start` / `accumulate`
+//! and the `.vos_meta` static for the riscv64 build. The bin
+//! is only meaningful on riscv64 (the PVM target enforced by
+//! `rust-toolchain.toml`), so we mark it `#![no_main]` and
+//! rely on `_start` as the entry point.
 
 #![no_std]
+#![no_main]
 
-#[allow(unused_imports)]
-use registry::Registry;
-
-fn main() {}
+vos::pvm_main!(registry::Registry);

@@ -590,7 +590,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Preamble — always emitted
+    // Preamble — always emitted. Worker/WASM entry blocks below
+    // reference `_VOS_META_ENCODED` to embed the actor's metadata
+    // into their respective `.vos_meta`-shaped exports. The PVM
+    // entries (now in `vos::pvm_main!`) compute their own meta.
     let preamble = quote! {
         extern crate alloc;
 
@@ -605,52 +608,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             vos::metadata::encode::<4096>(&#enum_name::META);
     };
 
-    // PVM entry points — emitted automatically when targeting
-    // riscv64. The cfg gate is intentionally target-based (not
-    // feature-based): every actor crate is built for one target,
-    // and the JAM-aligned PVM target is riscv64. Tying the entry
-    // emission to the architecture means actor crates don't have
-    // to declare a local `pvm` feature, which was a recurring
-    // footgun (omit it → 1 KiB stub binary with no `_start`).
-    //
-    // We assume that anyone targeting riscv64 also has the vos
-    // dep with the `service` (or `pvm`) feature on — there's no
-    // other sensible way to build a PVM actor — which makes the
-    // `vos::println` macro available below.
-    let pvm_entries = quote! {
-        #[cfg(target_arch = "riscv64")]
-        #[allow(unused_imports)]
-        use vos::{print, println, eprint, eprintln};
-
-        // PC=0 entry — JAM refine.
-        #[cfg(target_arch = "riscv64")]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn _start() {
-            vos::run_refine_entry::<#actor_name>();
-        }
-
-        // PC=5 entry — JAM accumulate.
-        #[cfg(target_arch = "riscv64")]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn accumulate() {
-            vos::run_accumulate_entry::<#actor_name>();
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        #[used]
-        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
-
-        #[cfg(target_arch = "riscv64")]
-        #[unsafe(link_section = ".vos_meta")]
-        #[used]
-        static _VOS_META: [u8; _VOS_META_ENCODED.1] = {
-            let (src, len) = _VOS_META_ENCODED;
-            let mut out = [0u8; _VOS_META_ENCODED.1];
-            let mut i = 0;
-            while i < len { out[i] = src[i]; i += 1; }
-            out
-        };
-    };
+    // PVM entry points used to land here, gated on
+    // `target_arch = "riscv64"`. They moved to the
+    // `vos::pvm_main!` decl-macro: lib.rs of an actor crate
+    // can now define `#[actor]` + `#[messages]` (so consumers
+    // can import its types and the generated `Client`/
+    // `ActorClient`) without duplicating `_start` /
+    // `accumulate` symbols when another actor crate links
+    // against it. The bin's `main.rs` invokes
+    // `vos::pvm_main!(crate::Foo)` once to materialize the
+    // entries + meta static.
+    let pvm_entries = quote! {};
 
     // Worker entry points — native .so plugins (poll-based async ABI).
     //
@@ -1284,6 +1252,74 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Actor-side client emission ──────────────────────────────
+    //
+    // Same shape as the host client, but for use from inside
+    // another actor's handler. Holds `&mut Context<A>` and the
+    // target ServiceId. Methods are async; they call
+    // `ctx.ask_raw(target, payload).await`, get back a `Value`,
+    // and decode against the handler's declared return type.
+    //
+    // No feature gate — the actor framework that's needed is
+    // always available when `vos` is in the dep graph (which is
+    // a hard requirement for `#[messages]`).
+    let actor_client_struct_name = format_ident!("{}ActorClient", actor_name);
+    let actor_client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
+        let method_ident = &m.wire_name;
+        let wire_name = m.wire_name.to_string();
+        let arg_decls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, t)| {
+            quote! { #n: #t }
+        }).collect();
+        let with_calls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, _)| {
+            let n_str = n.to_string();
+            quote! { .with(#n_str, #n) }
+        }).collect();
+        let return_ty: proc_macro2::TokenStream = match &m.success_ty {
+            None => quote! { () },
+            Some(t) => quote! { #t },
+        };
+        let value_ident = format_ident!("__value");
+        let decode = client_decode_body(&m.success_ty, &value_ident);
+        quote! {
+            pub async fn #method_ident(
+                &mut self,
+                #( #arg_decls ),*
+            ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                use vos::Encode;
+                let __msg = vos::value::Msg::new(#wire_name)
+                    #( #with_calls )*;
+                let __encoded = __msg.encode();
+                let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                __payload.push(vos::value::TAG_DYNAMIC);
+                __payload.extend_from_slice(&__encoded);
+                let __reply_value = self.ctx.ask_raw(self.target, &__payload).await
+                    .map_err(|_| vos::actors::client::ClientError::Unreachable)?;
+                let #value_ident: vos::value::Value = __reply_value;
+                #decode
+            }
+        }
+    }).collect();
+
+    let actor_client_emission = quote! {
+        pub struct #actor_client_struct_name<'a, __A: vos::Actor> {
+            ctx: &'a mut vos::Context<__A>,
+            target: vos::abi::service::ServiceId,
+        }
+
+        impl<'a, __A: vos::Actor> #actor_client_struct_name<'a, __A> {
+            /// Bind to an explicit `ServiceId` from inside another
+            /// actor's handler.
+            pub fn at(
+                ctx: &'a mut vos::Context<__A>,
+                target: vos::abi::service::ServiceId,
+            ) -> Self {
+                Self { ctx, target }
+            }
+
+            #( #actor_client_methods_emit )*
+        }
+    };
+
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
@@ -1294,6 +1330,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #worker_entries
         #wasm_entries
         #client_emission
+        #actor_client_emission
     };
 
     expanded.into()

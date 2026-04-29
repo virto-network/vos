@@ -90,6 +90,65 @@ pub mod hostcalls {
     pub use crate::abi::pvm::hostcalls::*;
 }
 
+/// Materialize the PVM entry points (`_start`, `accumulate`)
+/// and the `.vos_meta` static for an actor type.
+///
+/// `#[messages]` no longer emits these itself — putting them in
+/// the lib would cause duplicate-symbol link errors when one
+/// actor crate depends on another's lib. Instead, the bin's
+/// `main.rs` invokes this macro once:
+///
+/// ```ignore
+/// vos::pvm_main!(crate::Foo);
+/// ```
+///
+/// All emitted items are gated on `cfg(target_arch = "riscv64")`,
+/// so a host build of the same `main.rs` is just `fn main() {}`.
+#[macro_export]
+macro_rules! pvm_main {
+    ($actor:ty) => {
+        #[cfg(target_arch = "riscv64")]
+        #[allow(unused_imports)]
+        use $crate::{print, println, eprint, eprintln};
+
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() {
+            $crate::run_refine_entry::<$actor>();
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn accumulate() {
+            $crate::run_accumulate_entry::<$actor>();
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        #[used]
+        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
+
+        // Meta encoding lives here so the `.vos_meta` static
+        // sits in the bin's translation unit — same reason as
+        // `_start`. The const is recomputed from the actor's
+        // `Message::META` rather than referenced from the lib.
+        #[cfg(target_arch = "riscv64")]
+        const __VOS_PVM_MAIN_META: ([u8; 4096], usize) = $crate::metadata::encode::<4096>(
+            &<<$actor as $crate::Actor>::Message>::META
+        );
+
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(link_section = ".vos_meta")]
+        #[used]
+        static _VOS_META: [u8; __VOS_PVM_MAIN_META.1] = {
+            let (src, len) = __VOS_PVM_MAIN_META;
+            let mut out = [0u8; __VOS_PVM_MAIN_META.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
+    };
+}
+
 // --- Runtime infrastructure (host-only) ---
 
 #[cfg(feature = "std")]

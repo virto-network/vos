@@ -6,6 +6,7 @@ version = 4
 name = "crdt-counter"
 version = "0.1.0"
 dependencies = [
+ "registry",
  "vos",
 ]
 
@@ -80,6 +81,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a063ea72381527c2a0561da9c80000ef822bdd7c3241b1cc1b12100e3df081ee"
 dependencies = [
  "ptr_meta",
+]
+
+[[package]]
+name = "registry"
+version = "0.1.0"
+dependencies = [
+ "vos",
 ]
 
 [[package]]
