@@ -1621,6 +1621,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_mem_size_4 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
             let f_is_mem_size_8 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
             let f_is_store_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+            let f_is_load_direct = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1668,6 +1669,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_mem_size_4[0].clone());
             tuple.push(f_is_mem_size_8[0].clone());
             tuple.push(f_is_store_direct[0].clone());
+            tuple.push(f_is_load_direct[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1890,6 +1892,40 @@ impl BuiltInComponent for CpuChip {
                     is_store_direct_local[0].clone()
                         * mem_byte_active[i].clone()
                         * (mem_value[i].clone() - val_b[i].clone()),
+                );
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 25: bind MemAddr ↔ ImmBytes[0..4] on direct loads/stores
+        //
+        // For LoadU8/I8/U16/I16/U32/I32/U64 and StoreU8/16/32/64
+        // (the OneRegOneImm-category direct memory ops) the runtime
+        // address is just the immediate (`addr = imm` per
+        // javm/src/vm.rs's RegImm-arm impls).  The interpreter uses
+        // `let addr = imm as u32`, so MemAddr's 4 bytes are the low
+        // 4 bytes of the canonical immediate.  ImmBytes is already
+        // pinned to that immediate by Phase 13b's ProgramMemory
+        // tuple, so the binding is a 4-byte equality.
+        //
+        // Pre-Phase-25 MemAddr was prover-witnessed; combined with
+        // Phase 24's MemValue ↔ val_b binding, a malicious prover
+        // could store the right value at the wrong address (or
+        // load from the wrong address, returning a value that
+        // happens to be there).  Phase 25 closes the address half
+        // for direct ops; indirect addressing (`addr = regs[r] + imm`,
+        // covers LoadInd* / StoreInd* / StoreImmInd*) needs a
+        // separate carry-chain binding (deferred).
+        {
+            let is_load_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
+            let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+            let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            let direct_mem_active = is_load_direct_local[0].clone()
+                + is_store_direct_local[0].clone();
+            for i in 0..4 {
+                eval.add_constraint(
+                    direct_mem_active.clone()
+                        * (mem_addr[i].clone() - imm_bytes_local[i].clone())
                 );
             }
         }
@@ -2877,6 +2913,8 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_mem_size_8, Column::IsMemSize8);
             // Phase 24: direct-store flag (StoreU8/16/32/64 only).
             trace.fill_columns(row, flags.is_store_direct, Column::IsStoreDirect);
+            // Phase 25: direct-load flag (LoadU8/I8/U16/I16/U32/I32/U64).
+            trace.fill_columns(row, flags.is_load_direct, Column::IsLoadDirect);
             let load_sign_src: u8 = if flags.is_load_i8 {
                 result_bytes[0]
             } else if flags.is_load_i16 {
@@ -3407,6 +3445,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_mem_size_4 = crate::trace::original_base_column!(component_trace, Column::IsMemSize4);
             let f_is_mem_size_8 = crate::trace::original_base_column!(component_trace, Column::IsMemSize8);
             let f_is_store_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
+            let f_is_load_direct = crate::trace::original_base_column!(component_trace, Column::IsLoadDirect);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3455,6 +3494,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_mem_size_4[0].clone());
             tuple.push(f_is_mem_size_8[0].clone());
             tuple.push(f_is_store_direct[0].clone());
+            tuple.push(f_is_load_direct[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

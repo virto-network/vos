@@ -616,6 +616,14 @@ pub enum Column {
     /// the canonical opcode decoding by ProgramMemoryChip.
     #[size = 1]
     IsStoreDirect,
+    /// Phase 25: 1 iff this opcode is one of the *direct* loads
+    /// (`LoadU8 / LoadI8 / LoadU16 / LoadI16 / LoadU32 / LoadI32 /
+    /// LoadU64`, OneRegOneImm category).  For both direct loads and
+    /// direct stores `addr = imm`, so MemAddr's 4 bytes are pinned to
+    /// the low 4 bytes of ImmBytes (which is itself pinned to the
+    /// canonical opcode immediate by Phase 13b).
+    #[size = 1]
+    IsLoadDirect,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
