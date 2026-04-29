@@ -504,15 +504,24 @@ pub enum Column {
     /// High nibble of SignSrcD.  Same pattern as SignBHiNib.
     #[size = 1]
     SignDHiNib,
-    /// High nibble of `div_quotient[7]`.  Pins SignBitQ = bit 7 of
-    /// div_quotient[7].  On 32-bit DivS rows div_quotient[7] = 0 so
-    /// SignBitQ = 0 (the DivS sign-correction chain is gated on
-    /// is_64bit anyway, so this is fine).
+    /// High nibble of SignSrcQ (Phase 18 added the multiplex so this
+    /// works for 32-bit DivS too).  Pins SignBitQ = bit 7 of SignSrcQ.
     #[size = 1]
     SignQHiNib,
-    /// High nibble of `div_remainder[7]`.  Pins SignBitR similarly.
+    /// High nibble of SignSrcR.  Pins SignBitR similarly.
     #[size = 1]
     SignRHiNib,
+    /// Phase 18: multiplexed source byte for SignBitQ —
+    /// `div_quotient[7]` on 64-bit rows, `div_quotient[3]` on 32-bit
+    /// rows.  Required because the 32-bit DivS correction needs the
+    /// quotient's *32-bit* sign (bit 7 of byte 3); pinning to byte 7
+    /// alone (Phase 17) would force SignBitQ = 0 on 32-bit DivS rows
+    /// since the trace zeroes the high 4 bytes there.
+    #[size = 1]
+    SignSrcQ,
+    /// Phase 18: multiplexed source byte for SignBitR.
+    #[size = 1]
+    SignSrcR,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

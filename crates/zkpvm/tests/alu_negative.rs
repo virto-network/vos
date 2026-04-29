@@ -269,6 +269,71 @@ fn div_s64_negative_forged_off_by_one_rejected() {
     );
 }
 
+// ── DivS32 / RemS32 with negatives (Phase 18) ────────────────────────────
+//
+// The 32-bit divrem schoolbook now applies the same sign-correction as
+// Phase 16's 64-bit version (high 4 bytes ≡ sq·d_u + sd·q_u + sr − sa
+// mod 2^32).  32-bit signs derive from byte 3 of val_b / val_d /
+// div_quotient / div_remainder; Phase 18 added the SignSrcQ / SignSrcR
+// multiplex so SignBitQ / SignBitR track bit 7 of byte 3 on 32-bit
+// DivS rows (Phase 17 alone pinned them to byte 7, which is always
+// zero on 32-bit DivS).
+//
+// Coverage caveat — the AIR's pre-existing 32-bit ALU constraint
+// `result[4..8] = 0` (mod.rs:758, shared with all 32-bit ALU ops)
+// is incompatible with the interpreter's sign-extension of negative
+// 32-bit results to 64-bit (`q as i64 as u64` in javm/src/vm.rs).
+// Same gap as documented in the Add32 comment at the top of this
+// file.  Tests here are restricted to cases where the 32-bit *result*
+// is non-negative (no sign-extension), even though either operand
+// (and the schoolbook's high bytes) may be negative — which is
+// exactly the path Phase 18's chain corrects.  Negative-result
+// DivS32 / RemS32 needs a follow-up that loosens the result-
+// truncation constraint to permit sign-extension; deferred.
+
+#[test]
+fn div_s32_both_negative_smoke() {
+    // -100 / -7 = 14 (positive 32-bit result).  Both operands are
+    // negative → sd = 1, sa = 1, sr = 1, sq = 0; high_32(q_u·d_u + r_u)
+    // = 14, which the pre-Phase-18 AIR rejected (high bytes forced
+    // to 0).  Result column has high bytes = 0 (positive 14), so
+    // dodges the result-truncation gap.
+    prove_three_reg(
+        Opcode::DivS32, 2, 0, 1,
+        (-100i32) as u32 as u64,
+        (-7i32) as u32 as u64,
+        14,
+    );
+}
+
+#[test]
+fn rem_s32_positive_with_negative_divisor_smoke() {
+    // 100 % -7 = 2 (positive 32-bit remainder, sign-of-dividend rule).
+    // Quotient is -14 (sq = 1, sd = 1) so the schoolbook chain still
+    // exercises the 32-bit correction; *result* (= remainder = 2) has
+    // high bytes = 0, so the truncation gap is dodged.
+    prove_three_reg(
+        Opcode::RemS32, 2, 0, 1,
+        100,
+        (-7i32) as u32 as u64,
+        2,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn div_s32_both_negative_forged_off_by_one_rejected() {
+    // -100 / -7 = 14, forge to 13.  Confirms the 32-bit chain still
+    // rejects a bad quotient on a row whose negative-operand path
+    // goes through the new sign-correction.
+    forge_three_reg_result(
+        Opcode::DivS32, 2, 0, 1,
+        (-100i32) as u32 as u64,
+        (-7i32) as u32 as u64,
+        /*forged*/ 13,
+    );
+}
+
 // ── MulUpper (UU + SS + SU — Phase 12c bound all three) ──────────────────
 
 #[test]
