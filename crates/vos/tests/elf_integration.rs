@@ -2125,3 +2125,144 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     let _ = node_b.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_remove_replicates_across_nodes() {
+    // `remove(name)` is one of the registry's six messages and
+    // it tombstones state — the trickiest sync shape to get
+    // right because a peer that hasn't seen the announce yet
+    // could plausibly drop the remove on the floor and end up
+    // with a phantom entry. This test exercises the announce →
+    // converge → remove → converge cycle end-to-end so any
+    // ordering regression in the actor or the EffectLog replay
+    // surfaces here.
+    use registry::RegistryClient;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir()
+        .join(format!("vos_remove_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id = registry::replication_id("remove-test");
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.register_at_id(
+        AgentConfig::new(blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    // Wait for Hello so subsequent traffic has a peer to gossip to.
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(|| {
+        if net_a_arc.peer_for_prefix(prefix_b).is_some()
+            && net_b_arc.peer_for_prefix(prefix_a).is_some()
+        { Some(()) } else { None }
+    }, Duration::from_secs(10)).expect("Hello completes");
+
+    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
+    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
+
+    // ── Phase 1: A announces three; both converge ──────────────
+    for (name, id) in [("alpha", 1u32), ("beta", 2), ("gamma", 3)] {
+        client_a.announce(format!("kunekt/{name}"), prefix_a as u32, id, vec![])
+            .expect("announce");
+    }
+    let see_three = |client: &RegistryClient<'_>| -> bool {
+        ["alpha", "beta", "gamma"].iter().all(|name|
+            client.lookup(format!("kunekt/{name}")).ok().flatten().is_some())
+    };
+    wait_for(|| if see_three(&client_b) { Some(()) } else { None },
+        Duration::from_secs(10)).expect("B converges to all three");
+
+    // ── Phase 2: A removes beta; B's beta should disappear ────
+    client_a.remove("kunekt/beta".to_string()).expect("remove beta");
+    wait_for(
+        || {
+            let beta = client_b.lookup("kunekt/beta".to_string()).ok().flatten();
+            if beta.is_none() { Some(()) } else { None }
+        },
+        Duration::from_secs(10),
+    ).expect("B propagates the remove");
+
+    // Sibling entries unchanged — `remove` is targeted, not a wipe.
+    assert!(client_b.lookup("kunekt/alpha".to_string()).unwrap().is_some(),
+        "alpha must survive a sibling remove");
+    assert!(client_b.lookup("kunekt/gamma".to_string()).unwrap().is_some(),
+        "gamma must survive a sibling remove");
+
+    // ── Phase 3: B announces beta back, A picks it up ──────────
+    // Tests the inverse direction (A had the original announce
+    // and the remove; B drives the new lifecycle).
+    client_b.announce("kunekt/beta".to_string(), prefix_b as u32, 99, vec![])
+        .expect("re-announce beta on B");
+    wait_for(
+        || {
+            let entry = client_a.lookup("kunekt/beta".to_string()).ok().flatten()?;
+            if entry.owner_prefix == prefix_b && entry.service_id == 99 {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(10),
+    ).expect("A picks up B's re-announce");
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
