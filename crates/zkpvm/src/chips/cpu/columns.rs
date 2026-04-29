@@ -637,6 +637,18 @@ pub enum Column {
     /// carry_out ≤ 1).
     #[size = 4]
     MemAddrCarry,
+    /// Phase 27: 1 iff this opcode is `StoreImm[U][8/16/32/64]` or
+    /// `StoreImmInd[U][8/16/32/64]`.  Drives the per-byte
+    /// MemValue ↔ ImmYBytes binding (the value is `imm_y` for both
+    /// categories).
+    #[size = 1]
+    IsStoreImmAny,
+    /// Phase 27: 1 iff this opcode is `StoreImm[U][8/16/32/64]`
+    /// (TwoImm only).  Drives the direct-addr `MemAddr =
+    /// ImmBytes[0..4]` binding (mirrors Phase 25's pattern; the
+    /// indirect StoreImmInd path is covered by Phase 26 instead).
+    #[size = 1]
+    IsStoreImmDirect,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

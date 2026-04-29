@@ -171,6 +171,14 @@ pub enum PreprocessedColumn {
     /// [8/16/32/64], or StoreImmInd[U][8/16/32/64].  Drives the
     /// `MemAddr = (val_b + ImmBytes) mod 2^32` add-with-carry chain.
     #[size = 1] IsMemIndirect,
+    /// Phase 27: 1 at PCs whose canonical decoding is
+    /// StoreImm[U][8/16/32/64] or StoreImmInd[U][8/16/32/64].
+    /// Drives the MemValue ↔ ImmYBytes binding.
+    #[size = 1] IsStoreImmAny,
+    /// Phase 27: 1 at PCs whose canonical decoding is
+    /// StoreImm[U][8/16/32/64] (direct, TwoImm only).  Drives the
+    /// direct-addr binding (MemAddr = ImmBytes[0..4]).
+    #[size = 1] IsStoreImmDirect,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -242,6 +250,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_store_direct = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStoreDirect);
         let f_is_load_direct = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadDirect);
         let f_is_mem_indirect = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemIndirect);
+        let f_is_store_imm_any = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStoreImmAny);
+        let f_is_store_imm_direct = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStoreImmDirect);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -294,6 +304,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_store_direct[0].clone());
         tuple.push(f_is_load_direct[0].clone());
         tuple.push(f_is_mem_indirect[0].clone());
+        tuple.push(f_is_store_imm_any[0].clone());
+        tuple.push(f_is_store_imm_direct[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -372,6 +384,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsStoreDirect,
                     PreprocessedColumn::IsLoadDirect,
                     PreprocessedColumn::IsMemIndirect,
+                    PreprocessedColumn::IsStoreImmAny,
+                    PreprocessedColumn::IsStoreImmDirect,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -458,6 +472,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_store_direct = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStoreDirect);
         let f_is_load_direct = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadDirect);
         let f_is_mem_indirect = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemIndirect);
+        let f_is_store_imm_any = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStoreImmAny);
+        let f_is_store_imm_direct = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStoreImmDirect);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -509,6 +525,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_store_direct[0].clone());
         tuple.push(f_is_load_direct[0].clone());
         tuple.push(f_is_mem_indirect[0].clone());
+        tuple.push(f_is_store_imm_any[0].clone());
+        tuple.push(f_is_store_imm_direct[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -542,7 +560,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 37],
+    flags: [u8; 39],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }

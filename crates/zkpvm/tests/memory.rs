@@ -155,6 +155,52 @@ fn prove_multiple_stores_same_addr() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+// ── Phase 27: StoreImm direct + StoreImmInd value/address binding ────────
+
+#[test]
+fn prove_store_imm_u8_then_load() {
+    // StoreImmU8 (TwoImm direct): mem[imm_x=0x1000] = imm_y=0x42.
+    // Then read back via LoadIndU8.  Phase 27 binds:
+    //   - MemAddr = ImmBytes[0..4] (= imm_x), via the widened
+    //     `IsLoadDirect+IsStoreDirect+IsStoreImmDirect` gate.
+    //   - MemValue = ImmYBytes (= imm_y) on active bytes.
+    //
+    // TwoImm encoding: [opcode, lx_byte, imm_x_bytes(lx), imm_y_bytes(ly)]
+    //   lx = 4 (4-byte address), ly is implied by skip_len.
+    //
+    // For our 6-byte payload after opcode (lx_byte + 4 + 1):
+    //   skip_len = 6.
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = 0x1000; // base for the load
+
+    let memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreImmU8 as u8,            // 30
+        4,                                    // lx_byte: imm_x is 4 bytes
+        0x00, 0x10, 0x00, 0x00,              // imm_x = 0x1000 LE
+        0x42,                                 // imm_y = 0x42
+        Opcode::LoadIndU8 as u8, 0x12, 0, 0, 0, 0,
+        Opcode::Trap as u8,
+    ];
+    // Bitmask: instruction 0 is 7 bytes (opcode + 6 payload),
+    //          instruction 1 is 6 bytes (opcode + 5 payload),
+    //          instruction 2 is 1 byte.
+    let bitmask = vec![
+        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0,
+        1,
+    ];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run(), javm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+
+    assert_eq!(steps[1].regs_after[2], 0x42);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 #[test]
 fn prove_store_load_with_alu() {
     // ALU + memory mixed: compute a value, store it, load it back

@@ -1623,6 +1623,8 @@ impl BuiltInComponent for CpuChip {
             let f_is_store_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
             let f_is_load_direct = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
             let f_is_mem_indirect = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
+            let f_is_store_imm_any = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
+            let f_is_store_imm_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1672,6 +1674,8 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_store_direct[0].clone());
             tuple.push(f_is_load_direct[0].clone());
             tuple.push(f_is_mem_indirect[0].clone());
+            tuple.push(f_is_store_imm_any[0].clone());
+            tuple.push(f_is_store_imm_direct[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1921,13 +1925,50 @@ impl BuiltInComponent for CpuChip {
         {
             let is_load_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
             let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+            // Phase 27 widens this to also cover StoreImm direct
+            // (TwoImm with `addr = imm_x`).  step.imm = imm_x for
+            // TwoImm, so ImmBytes already pins the address bytes.
+            let is_store_imm_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             let direct_mem_active = is_load_direct_local[0].clone()
-                + is_store_direct_local[0].clone();
+                + is_store_direct_local[0].clone()
+                + is_store_imm_direct_local[0].clone();
             for i in 0..4 {
                 eval.add_constraint(
                     direct_mem_active.clone()
                         * (mem_addr[i].clone() - imm_bytes_local[i].clone())
+                );
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 27: bind MemValue ↔ ImmYBytes on StoreImm / StoreImmInd
+        //
+        // For all 8 immediate-source store opcodes (StoreImm[U] and
+        // StoreImmInd[U] of width 1/2/4/8) the value written to
+        // memory is `imm_y`.  ImmYBytes already carries the low 4
+        // bytes of step.imm_y on every row (filled in Phase
+        // 13d-loadimmjumpind's trace fill, pinned in
+        // ProgramMemoryChip via ImmYCanon).  Per-byte equality on
+        // active bytes:
+        //   IsStoreImmAny · mem_byte_active[i] · (mem_value[i] −
+        //                                          imm_y_bytes[i]) = 0
+        // for `i ∈ 0..4`.
+        //
+        // Out of scope (deferred): MemSize=8 stores' imm_y high 4
+        // bytes — would need an ImmYBytesHi[4] column pinned in
+        // prog_mem analogous to ImmYCanon.  StoreImmU64 and
+        // StoreImmIndU64 with imm_y > 2^32 are therefore still
+        // partially prover-trusted (high 4 bytes of value
+        // unbound).  The low 4 bytes of MemValue ARE bound.
+        {
+            let is_store_imm_any_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
+            let imm_y_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
+            for i in 0..4 {
+                eval.add_constraint(
+                    is_store_imm_any_local[0].clone()
+                        * mem_byte_active[i].clone()
+                        * (mem_value[i].clone() - imm_y_bytes_local[i].clone())
                 );
             }
         }
@@ -2971,6 +3012,9 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_load_direct, Column::IsLoadDirect);
             // Phase 26: indirect-mem flag + MemAddr add-with-carry chain.
             trace.fill_columns(row, flags.is_mem_indirect, Column::IsMemIndirect);
+            // Phase 27: StoreImm / StoreImmInd flags.
+            trace.fill_columns(row, flags.is_store_imm_any, Column::IsStoreImmAny);
+            trace.fill_columns(row, flags.is_store_imm_direct, Column::IsStoreImmDirect);
             let mut mem_addr_carry = [0u8; 4];
             if flags.is_mem_indirect {
                 let val_b_bytes_le = val_b.to_le_bytes();
@@ -3515,6 +3559,8 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_store_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
             let f_is_load_direct = crate::trace::original_base_column!(component_trace, Column::IsLoadDirect);
             let f_is_mem_indirect = crate::trace::original_base_column!(component_trace, Column::IsMemIndirect);
+            let f_is_store_imm_any = crate::trace::original_base_column!(component_trace, Column::IsStoreImmAny);
+            let f_is_store_imm_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreImmDirect);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3565,6 +3611,8 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_store_direct[0].clone());
             tuple.push(f_is_load_direct[0].clone());
             tuple.push(f_is_mem_indirect[0].clone());
+            tuple.push(f_is_store_imm_any[0].clone());
+            tuple.push(f_is_store_imm_direct[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
