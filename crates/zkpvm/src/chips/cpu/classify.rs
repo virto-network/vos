@@ -99,6 +99,16 @@ pub(super) struct OpcodeFlags {
     pub is_load_i8: bool,
     pub is_load_i16: bool,
     pub is_load_i32: bool,
+    /// Phase 23: per-size memory-access flags covering both load and
+    /// store variants.  Pin `MemSize = 1·is_mem_size_1 + 2·is_mem_size_2
+    /// + 4·is_mem_size_4 + 8·is_mem_size_8`, so the prover can't pick a
+    /// MemSize inconsistent with the opcode (closes the gap left at the
+    /// end of Phase 22).  Exactly one is set per memory-op row, all
+    /// zero on non-memory rows.
+    pub is_mem_size_1: bool,
+    pub is_mem_size_2: bool,
+    pub is_mem_size_4: bool,
+    pub is_mem_size_8: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -198,22 +208,30 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::RemU32 => { f.is_div_rem = true; f.div_rem_op = 2; f.is_32bit = true; }
         Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_div_s = true; }
         Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; f.is_div_s = true; }
-        // Loads
-        Opcode::LoadU8 | Opcode::LoadU16 | Opcode::LoadU32 | Opcode::LoadU64
-        | Opcode::LoadIndU8 | Opcode::LoadIndU16 | Opcode::LoadIndU32 | Opcode::LoadIndU64
-            => { f.is_load = true; }
+        // Loads — `is_mem_size_*` covers both load and store; set per width.
+        Opcode::LoadU8 | Opcode::LoadIndU8
+            => { f.is_load = true; f.is_mem_size_1 = true; }
+        Opcode::LoadU16 | Opcode::LoadIndU16
+            => { f.is_load = true; f.is_mem_size_2 = true; }
+        Opcode::LoadU32 | Opcode::LoadIndU32
+            => { f.is_load = true; f.is_mem_size_4 = true; }
+        Opcode::LoadU64 | Opcode::LoadIndU64
+            => { f.is_load = true; f.is_mem_size_8 = true; }
         Opcode::LoadI8 | Opcode::LoadIndI8
-            => { f.is_load = true; f.is_load_i8 = true; }
+            => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; }
         Opcode::LoadI16 | Opcode::LoadIndI16
-            => { f.is_load = true; f.is_load_i16 = true; }
+            => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; }
         Opcode::LoadI32 | Opcode::LoadIndI32
-            => { f.is_load = true; f.is_load_i32 = true; }
+            => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; }
         // Stores
-        Opcode::StoreU8 | Opcode::StoreU16 | Opcode::StoreU32 | Opcode::StoreU64
-        | Opcode::StoreIndU8 | Opcode::StoreIndU16 | Opcode::StoreIndU32 | Opcode::StoreIndU64
-        | Opcode::StoreImmU8 | Opcode::StoreImmU16 | Opcode::StoreImmU32 | Opcode::StoreImmU64
-        | Opcode::StoreImmIndU8 | Opcode::StoreImmIndU16 | Opcode::StoreImmIndU32 | Opcode::StoreImmIndU64
-            => { f.is_store = true; }
+        Opcode::StoreU8 | Opcode::StoreIndU8 | Opcode::StoreImmU8 | Opcode::StoreImmIndU8
+            => { f.is_store = true; f.is_mem_size_1 = true; }
+        Opcode::StoreU16 | Opcode::StoreIndU16 | Opcode::StoreImmU16 | Opcode::StoreImmIndU16
+            => { f.is_store = true; f.is_mem_size_2 = true; }
+        Opcode::StoreU32 | Opcode::StoreIndU32 | Opcode::StoreImmU32 | Opcode::StoreImmIndU32
+            => { f.is_store = true; f.is_mem_size_4 = true; }
+        Opcode::StoreU64 | Opcode::StoreIndU64 | Opcode::StoreImmU64 | Opcode::StoreImmIndU64
+            => { f.is_store = true; f.is_mem_size_8 = true; }
         // Jumps (unconditional, non-sequential target)
         Opcode::Jump | Opcode::LoadImmJump
             => { f.is_jump = true; }
@@ -261,12 +279,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20):
-/// extract the 30 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23):
+/// extract the 34 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 30] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 34] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -280,5 +298,7 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 30] {
         f.is_mul_upper_uu as u8, f.is_mul_upper_su as u8, f.is_mul_upper_ss as u8,
         f.is_div_s as u8,
         f.is_load_i8 as u8, f.is_load_i16 as u8, f.is_load_i32 as u8,
+        f.is_mem_size_1 as u8, f.is_mem_size_2 as u8,
+        f.is_mem_size_4 as u8, f.is_mem_size_8 as u8,
     ]
 }

@@ -598,6 +598,16 @@ pub enum Column {
     /// carry_in ≤ 511 with carry_in ≤ 1).  Boolean-constrained.
     #[size = 8]
     DivCmpCarry,
+    // ── Phase 23: per-size memory-access flags ────────────────────────────
+    // Pin `MemSize = 1·IsMemSize1 + 2·IsMemSize2 + 4·IsMemSize4 +
+    // 8·IsMemSize8` so the prover can't pick a MemSize inconsistent with
+    // the opcode (Phase 22's prefix-1 + sum bound MemByteActive's shape
+    // to MemSize, but left MemSize itself prover-witnessed).  Flags are
+    // pinned to the canonical opcode decoding by ProgramMemoryChip.
+    #[size = 1] IsMemSize1,
+    #[size = 1] IsMemSize2,
+    #[size = 1] IsMemSize4,
+    #[size = 1] IsMemSize8,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

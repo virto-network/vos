@@ -1206,9 +1206,25 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_real.clone() * (mem_size[0].clone() - active_sum)
             );
-            // (Valid-size constraint deferred — degree-6 polynomial
-            // exceeds CpuChip's bound; would need an alternative
-            // formulation, e.g. per-size flags pinned by ProgramMemory.)
+            // Phase 23: pin MemSize to opcode-canonical width via
+            // per-size flags pinned by ProgramMemoryChip.  Closes the
+            // gap deferred at the end of Phase 22 (the degree-6 valid-
+            // size polynomial was too high; using flag-based formulation
+            // brings the degree down to 1).  Each flag IsMemSize*  is
+            // bound to the canonical opcode decoding via the
+            // ProgramMemory tuple, and exactly one is set on a memory-
+            // op row (load OR store), all zero on non-memory rows.
+            let f_is_mem_size_1_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
+            let f_is_mem_size_2_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
+            let f_is_mem_size_4_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
+            let f_is_mem_size_8_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
+            let canonical_size = f_is_mem_size_1_l[0].clone()
+                + f_is_mem_size_2_l[0].clone() * E::F::from(BaseField::from(2u32))
+                + f_is_mem_size_4_l[0].clone() * E::F::from(BaseField::from(4u32))
+                + f_is_mem_size_8_l[0].clone() * E::F::from(BaseField::from(8u32));
+            eval.add_constraint(
+                is_real.clone() * (mem_size[0].clone() - canonical_size)
+            );
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1600,6 +1616,10 @@ impl BuiltInComponent for CpuChip {
             let f_is_load_i8 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
             let f_is_load_i16 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
             let f_is_load_i32 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
+            let f_is_mem_size_1 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
+            let f_is_mem_size_2 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
+            let f_is_mem_size_4 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
+            let f_is_mem_size_8 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1642,6 +1662,10 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_load_i8[0].clone());
             tuple.push(f_is_load_i16[0].clone());
             tuple.push(f_is_load_i32[0].clone());
+            tuple.push(f_is_mem_size_1[0].clone());
+            tuple.push(f_is_mem_size_2[0].clone());
+            tuple.push(f_is_mem_size_4[0].clone());
+            tuple.push(f_is_mem_size_8[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -2816,6 +2840,11 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_load_i8, Column::IsLoadI8);
             trace.fill_columns(row, flags.is_load_i16, Column::IsLoadI16);
             trace.fill_columns(row, flags.is_load_i32, Column::IsLoadI32);
+            // Phase 23: per-size flags (cover both load and store variants).
+            trace.fill_columns(row, flags.is_mem_size_1, Column::IsMemSize1);
+            trace.fill_columns(row, flags.is_mem_size_2, Column::IsMemSize2);
+            trace.fill_columns(row, flags.is_mem_size_4, Column::IsMemSize4);
+            trace.fill_columns(row, flags.is_mem_size_8, Column::IsMemSize8);
             let load_sign_src: u8 = if flags.is_load_i8 {
                 result_bytes[0]
             } else if flags.is_load_i16 {
@@ -3341,6 +3370,10 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_load_i8 = crate::trace::original_base_column!(component_trace, Column::IsLoadI8);
             let f_is_load_i16 = crate::trace::original_base_column!(component_trace, Column::IsLoadI16);
             let f_is_load_i32 = crate::trace::original_base_column!(component_trace, Column::IsLoadI32);
+            let f_is_mem_size_1 = crate::trace::original_base_column!(component_trace, Column::IsMemSize1);
+            let f_is_mem_size_2 = crate::trace::original_base_column!(component_trace, Column::IsMemSize2);
+            let f_is_mem_size_4 = crate::trace::original_base_column!(component_trace, Column::IsMemSize4);
+            let f_is_mem_size_8 = crate::trace::original_base_column!(component_trace, Column::IsMemSize8);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3384,6 +3417,10 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_load_i8[0].clone());
             tuple.push(f_is_load_i16[0].clone());
             tuple.push(f_is_load_i32[0].clone());
+            tuple.push(f_is_mem_size_1[0].clone());
+            tuple.push(f_is_mem_size_2[0].clone());
+            tuple.push(f_is_mem_size_4[0].clone());
+            tuple.push(f_is_mem_size_8[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

@@ -147,6 +147,16 @@ pub enum PreprocessedColumn {
     /// Phase 20: 1 at PCs whose canonical decoding is `LoadI32` /
     /// `LoadIndI32`.
     #[size = 1] IsLoadI32,
+    /// Phase 23: per-size memory-access flags.  Drive the
+    /// `MemSize = 1·sz1 + 2·sz2 + 4·sz4 + 8·sz8` constraint, pinning
+    /// MemSize to the opcode-canonical value (closes the gap left by
+    /// Phase 22's prefix-1 binding).  Cover both load and store
+    /// variants — exactly one is set on a memory-op row, all zero
+    /// otherwise.
+    #[size = 1] IsMemSize1,
+    #[size = 1] IsMemSize2,
+    #[size = 1] IsMemSize4,
+    #[size = 1] IsMemSize8,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -211,6 +221,10 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_load_i8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadI8);
         let f_is_load_i16 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadI16);
         let f_is_load_i32 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadI32);
+        let f_is_mem_size_1 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemSize1);
+        let f_is_mem_size_2 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemSize2);
+        let f_is_mem_size_4 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemSize4);
+        let f_is_mem_size_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemSize8);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -256,6 +270,10 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_load_i8[0].clone());
         tuple.push(f_is_load_i16[0].clone());
         tuple.push(f_is_load_i32[0].clone());
+        tuple.push(f_is_mem_size_1[0].clone());
+        tuple.push(f_is_mem_size_2[0].clone());
+        tuple.push(f_is_mem_size_4[0].clone());
+        tuple.push(f_is_mem_size_8[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -327,6 +345,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsLoadI8,
                     PreprocessedColumn::IsLoadI16,
                     PreprocessedColumn::IsLoadI32,
+                    PreprocessedColumn::IsMemSize1,
+                    PreprocessedColumn::IsMemSize2,
+                    PreprocessedColumn::IsMemSize4,
+                    PreprocessedColumn::IsMemSize8,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -406,6 +428,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_load_i8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadI8);
         let f_is_load_i16 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadI16);
         let f_is_load_i32 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadI32);
+        let f_is_mem_size_1 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemSize1);
+        let f_is_mem_size_2 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemSize2);
+        let f_is_mem_size_4 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemSize4);
+        let f_is_mem_size_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemSize8);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -450,6 +476,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_load_i8[0].clone());
         tuple.push(f_is_load_i16[0].clone());
         tuple.push(f_is_load_i32[0].clone());
+        tuple.push(f_is_mem_size_1[0].clone());
+        tuple.push(f_is_mem_size_2[0].clone());
+        tuple.push(f_is_mem_size_4[0].clone());
+        tuple.push(f_is_mem_size_8[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -483,7 +513,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 30],
+    flags: [u8; 34],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }
