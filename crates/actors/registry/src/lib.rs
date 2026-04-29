@@ -33,9 +33,10 @@
 //! freshness by `clock - last_seen` against an age threshold of
 //! their own choosing — see [`RegistryEntry::is_alive_within`].
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
 extern crate alloc;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -166,17 +167,20 @@ where
 // types and `Client`) without colliding on `_start` at link
 // time.
 
-// ── Host helpers (std-only) ────────────────────────────────────────
+// ── Host helpers (`host` feature) ──────────────────────────────────
 //
 // `replication_id` and `Client` are host concerns: deriving the CRDT
 // group, invoking the actor over the local node's invoke routes.
-// Gated on the `std` feature so the riscv64 actor build doesn't pull
-// blake2b_simd or `vos::node::*`.
+// Gated on the `host` feature — driver-side code, not std-side.
+// The riscv64 actor build leaves `host` off and pulls neither
+// blake2b_simd nor `vos::node::*`. Once blake2b becomes a host
+// ecall, `replication_id` will route through that and this dep
+// drops out.
 
 /// Derive the 32-byte CRDT replication-id for a hyperspace's
 /// registry. Every node in the same hyperspace ends up in the same
 /// CRDT group.
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 pub fn replication_id(hyperspace: &str) -> [u8; 32] {
     let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
     h.update(b"vos-registry/v1");
@@ -190,13 +194,13 @@ pub fn replication_id(hyperspace: &str) -> [u8; 32] {
 /// Typed host wrapper over `VosNode::invoke` for the registry's
 /// six messages. Ordinary actor — uses the regular invoke plumbing,
 /// no special infra.
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 pub struct Client<'a> {
     node: &'a vos::node::VosNode,
     target: vos::abi::service::ServiceId,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 impl<'a> Client<'a> {
     /// Bind to the local node's own registry replica at the
     /// well-known [`SERVICE_ID_RAW`].
@@ -294,7 +298,7 @@ impl<'a> Client<'a> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 fn decode_page(bytes: &[u8]) -> Result<Page, ClientError> {
     let value: vos::value::Value = vos::Decode::decode(bytes);
     let payload = match value {
@@ -308,7 +312,7 @@ fn decode_page(bytes: &[u8]) -> Result<Page, ClientError> {
     decode_archived::<Page>(&payload).ok_or(ClientError::Decode)
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 #[derive(Debug)]
 pub enum ClientError {
     Unreachable,
@@ -316,7 +320,7 @@ pub enum ClientError {
     UnexpectedReply(String),
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "host")]
 impl core::fmt::Display for ClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -327,5 +331,5 @@ impl core::fmt::Display for ClientError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ClientError {}
+#[cfg(feature = "host")]
+impl core::error::Error for ClientError {}

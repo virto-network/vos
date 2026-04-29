@@ -5,7 +5,7 @@
 //! the lib so other crates can depend on them without pulling in
 //! these entry symbols.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
 use vos::{actor, messages};
 
