@@ -414,6 +414,18 @@ impl Network {
         self.prefix_map.lock().ok()?.get(&prefix).copied()
     }
 
+    /// Snapshot of every peer + its `node_prefix`, in no
+    /// particular order. Same population as
+    /// [`connected_peers`](Self::connected_peers); useful for
+    /// operator UIs (`vosx status`) that want both halves
+    /// without rebuilding the map peer-by-peer.
+    pub fn peers_with_prefixes(&self) -> Vec<(u16, PeerId)> {
+        self.prefix_map
+            .lock()
+            .map(|g| g.iter().map(|(p, id)| (*p, *id)).collect())
+            .unwrap_or_default()
+    }
+
     /// Snapshot of all peers that have completed the Hello
     /// handshake. Used by the sync ticker to fan out fetches
     /// across every reachable replica, since cycle 3 doesn't

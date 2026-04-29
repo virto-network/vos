@@ -116,6 +116,18 @@ enum Command {
     List {
         manifest: Option<PathBuf>,
     },
+    /// Snapshot of a hyperspace: local identity, connected
+    /// peers, and the registry's contents. Joins the manifest's
+    /// hyperspace as a transient peer (same model as `invoke`).
+    Status {
+        manifest: Option<PathBuf>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        /// Seconds to wait for registry sync before printing.
+        #[arg(long, default_value_t = 3)]
+        sync_timeout: u64,
+    },
     /// Resolve a service name (or accept a `0x…` ServiceId) and
     /// invoke a typed message on it. Joins the manifest's
     /// hyperspace as a transient peer, looks the name up via
@@ -161,6 +173,10 @@ fn main() {
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             commands::list::run(&m, &dir);
+        }
+        Some(Command::Status { manifest, connect, sync_timeout }) => {
+            let (m, dir) = manifest_from(manifest);
+            commands::status::run(&m, &dir, &connect, sync_timeout);
         }
         Some(Command::Invoke { target, msg, arg, manifest, connect, sync_timeout }) => {
             let (m, dir) = manifest_from(manifest);
