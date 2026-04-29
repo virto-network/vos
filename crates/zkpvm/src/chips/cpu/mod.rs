@@ -1646,6 +1646,147 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 17: pin SignBitB / SignBitD / SignBitQ / SignBitR to bit 7
+        // of their respective source bytes via nibble-AND lookups.  Closes
+        // the soundness gap shared with Phase 12c — until now those four
+        // sign bits were prover-witnessed with no in-circuit tie to the
+        // actual byte's bit 7, so a malicious prover could lie on rows
+        // where the AIR uses them (signed compare/branch, MulUpper SS/SU,
+        // DivS sign-correction).
+        //
+        // For each (sign_bit, source_byte, hi_nib) triple we emit:
+        //   (hi_nib, 8, 8·sign_bit) — pins sign_bit = bit 3 of hi_nib.
+        //   (source − 16·hi_nib, 0xF, source − 16·hi_nib) — range-checks
+        //     the low nibble (forces it ∈ [0, 15] AND lo&0xF = lo, which
+        //     pins the decomposition source = 16·hi_nib + lo).
+        // Together: sign_bit = bit 7 of source.
+        //
+        // Source bytes:
+        //   SignBitB → SignSrcB = (1−Is32Bit)·val_b[7] + Is32Bit·val_b[3]
+        //   SignBitD → SignSrcD = (1−Is32Bit)·val_d[7] + Is32Bit·val_d[3]
+        //   SignBitQ → div_quotient[7]  (DivS chain is is_64bit-only)
+        //   SignBitR → div_remainder[7]
+        //
+        // Multiplicity = is_real on every row (8 emissions × is_real).
+        // Tuple shape stays degree-1, so we hit the BitwiseLookupChip with
+        // 8 emissions per real row; bitwise_and_counts is charged
+        // accordingly.  Even-emission block, placed last → no pair-shape
+        // reshuffle (CONSTRAINTS.md rule 2).
+        //
+        // Ground constraint: pin SignSrcB / SignSrcD to the canonical
+        // multiplexed value.
+        {
+            let is_32bit_local = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let sign_src_b = crate::trace::trace_eval!(trace_eval, Column::SignSrcB);
+            let sign_src_d = crate::trace::trace_eval!(trace_eval, Column::SignSrcD);
+            let one_minus_32 = E::F::one() - is_32bit_local[0].clone();
+            eval.add_constraint(
+                is_real.clone() * (
+                    sign_src_b[0].clone()
+                        - one_minus_32.clone() * val_b[7].clone()
+                        - is_32bit_local[0].clone() * val_b[3].clone()
+                )
+            );
+            eval.add_constraint(
+                is_real.clone() * (
+                    sign_src_d[0].clone()
+                        - one_minus_32 * val_d[7].clone()
+                        - is_32bit_local[0].clone() * val_d[3].clone()
+                )
+            );
+        }
+
+        // Sign-bit nibble lookups (last lookup block before finalize).
+        {
+            let sign_src_b = crate::trace::trace_eval!(trace_eval, Column::SignSrcB);
+            let sign_src_d = crate::trace::trace_eval!(trace_eval, Column::SignSrcD);
+            let sign_b_hi = crate::trace::trace_eval!(trace_eval, Column::SignBHiNib);
+            let sign_d_hi = crate::trace::trace_eval!(trace_eval, Column::SignDHiNib);
+            let sign_q_hi = crate::trace::trace_eval!(trace_eval, Column::SignQHiNib);
+            let sign_r_hi = crate::trace::trace_eval!(trace_eval, Column::SignRHiNib);
+            let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+            let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
+            let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
+            let div_quotient_local = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
+            let div_remainder_local = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
+            let eight_p17: E::F = E::F::from(BaseField::from(8));
+            let sixteen_p17: E::F = E::F::from(BaseField::from(16));
+            let fifteen_p17: E::F = E::F::from(BaseField::from(15));
+
+            // SignBitB: (hi_b, 8, 8·bit_b), (src_b − 16·hi_b, 0xF, same).
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    sign_b_hi[0].clone(),
+                    eight_p17.clone(),
+                    sign_bit_b[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_b = sign_src_b[0].clone() - sign_b_hi[0].clone() * sixteen_p17.clone();
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_b.clone(), fifteen_p17.clone(), lo_b],
+            ));
+
+            // SignBitD.
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    sign_d_hi[0].clone(),
+                    eight_p17.clone(),
+                    sign_bit_d[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_d = sign_src_d[0].clone() - sign_d_hi[0].clone() * sixteen_p17.clone();
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_d.clone(), fifteen_p17.clone(), lo_d],
+            ));
+
+            // SignBitQ — source is div_quotient[7] directly (no Is32Bit
+            // multiplex; 32-bit DivS leaves div_quotient[7] = 0 so this
+            // pins SignBitQ = 0 on 32-bit, and the DivS chain is gated on
+            // is_64bit so the value is irrelevant elsewhere).
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    sign_q_hi[0].clone(),
+                    eight_p17.clone(),
+                    sign_bit_q[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_q = div_quotient_local[7].clone() - sign_q_hi[0].clone() * sixteen_p17.clone();
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_q.clone(), fifteen_p17.clone(), lo_q],
+            ));
+
+            // SignBitR — source is div_remainder[7].
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    sign_r_hi[0].clone(),
+                    eight_p17.clone(),
+                    sign_bit_r[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_r = div_remainder_local[7].clone() - sign_r_hi[0].clone() * sixteen_p17;
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_r.clone(), fifteen_p17, lo_r],
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -1893,10 +2034,22 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, cmp_lt_flag, Column::CmpLtFlag);
             let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
             trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);
-            let sign_bit_b: u8 = if flags.is_32bit { ((val_b >> 31) & 1) as u8 } else { ((val_b >> 63) & 1) as u8 };
-            let sign_bit_d: u8 = if flags.is_32bit { ((val_d >> 31) & 1) as u8 } else { ((val_d >> 63) & 1) as u8 };
+            // Phase 17: SignBitB/D are now pinned to bit 7 of the
+            // multiplexed source byte (val_b[7] in 64-bit, val_b[3] in
+            // 32-bit) via nibble-AND lookups at the end of add_constraints.
+            // Compute the source byte explicitly and derive the sign +
+            // hi-nibble + lo-nibble from it; bit-31-of-u64 and bit-63-of-u64
+            // give the same answer when val_b[4..8] are constrained to 0
+            // on 32-bit, but going through the byte makes it obvious that
+            // the AIR pin and trace fill use the same source.
+            let sign_src_b: u8 = if flags.is_32bit { val_b_bytes[3] } else { val_b_bytes[7] };
+            let sign_src_d: u8 = if flags.is_32bit { val_d_bytes[3] } else { val_d_bytes[7] };
+            let sign_bit_b: u8 = (sign_src_b >> 7) & 1;
+            let sign_bit_d: u8 = (sign_src_d >> 7) & 1;
             trace.fill_columns(row, sign_bit_b, Column::SignBitB);
             trace.fill_columns(row, sign_bit_d, Column::SignBitD);
+            trace.fill_columns(row, sign_src_b, Column::SignSrcB);
+            trace.fill_columns(row, sign_src_d, Column::SignSrcD);
             // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
             let cmp_lt_s_flag: u8 = if sign_bit_b != sign_bit_d {
                 sign_bit_b // b is negative (sign=1) → b < d
@@ -2087,8 +2240,6 @@ impl BuiltInProverComponent for CpuChip {
             let mut div_by_zero: u8 = 0;
             let mut div_corr_hi = [0u8; WORD_SIZE];
             let mut div_corr_carry = [0u8; WORD_SIZE];
-            let mut sign_bit_q: u8 = 0;
-            let mut sign_bit_r: u8 = 0;
             if flags.is_div_rem {
                 let dividend = val_b;
                 let divisor = val_d;
@@ -2180,9 +2331,7 @@ impl BuiltInProverComponent for CpuChip {
                     if flags.is_div_s && !flags.is_32bit {
                         let sa = (val_b >> 63) & 1;
                         let sd = (val_d >> 63) & 1;
-                        sign_bit_q = (div_quotient[7] >> 7) & 1;
-                        sign_bit_r = (div_remainder[7] >> 7) & 1;
-                        let term_d = if sign_bit_q == 1 { val_d } else { 0 };
+                        let term_d = if (div_quotient[7] >> 7) & 1 == 1 { val_d } else { 0 };
                         let term_q = if sd == 1 {
                             u64::from_le_bytes(div_quotient)
                         } else {
@@ -2190,10 +2339,11 @@ impl BuiltInProverComponent for CpuChip {
                         };
                         let term_d_bytes = term_d.to_le_bytes();
                         let term_q_bytes = term_q.to_le_bytes();
+                        let sr_bit = (div_remainder[7] >> 7) & 1;
                         let mut carry: i32 = 0;
                         for i in 0..WORD_SIZE {
                             let extra_lhs = if i == 0 { sa as i32 } else { 0 };
-                            let extra_rhs = if i == 0 { sign_bit_r as i32 } else { 0 };
+                            let extra_rhs = if i == 0 { sr_bit as i32 } else { 0 };
                             // s = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
                             //     − (i==0 ? sa : 0)
                             let s = term_d_bytes[i] as i32
@@ -2219,8 +2369,37 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
             trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
             trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
+            // Phase 17: SignBitQ / SignBitR are now pinned to bit 7 of
+            // div_quotient[7] / div_remainder[7] (which are 0 on
+            // non-divrem rows, so SignBitQ / SignBitR fall to 0 there
+            // — consistent with the nibble lookups).
+            let sign_bit_q: u8 = (div_quotient[7] >> 7) & 1;
+            let sign_bit_r: u8 = (div_remainder[7] >> 7) & 1;
             trace.fill_columns(row, sign_bit_q, Column::SignBitQ);
             trace.fill_columns(row, sign_bit_r, Column::SignBitR);
+
+            // Phase 17: hi nibbles + BitwiseLookupChip charges for the
+            // 8 sign-bit pinning lookups emitted on every real row.
+            let hi_b = sign_src_b >> 4;
+            let lo_b = sign_src_b & 0xF;
+            let hi_d = sign_src_d >> 4;
+            let lo_d = sign_src_d & 0xF;
+            let hi_q = div_quotient[7] >> 4;
+            let lo_q = div_quotient[7] & 0xF;
+            let hi_r = div_remainder[7] >> 4;
+            let lo_r = div_remainder[7] & 0xF;
+            trace.fill_columns(row, hi_b, Column::SignBHiNib);
+            trace.fill_columns(row, hi_d, Column::SignDHiNib);
+            trace.fill_columns(row, hi_q, Column::SignQHiNib);
+            trace.fill_columns(row, hi_r, Column::SignRHiNib);
+            *side_note.bitwise_and_counts.entry((hi_b, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((lo_b, 0xF)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((hi_d, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((lo_d, 0xF)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((hi_q, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((lo_q, 0xF)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((hi_r, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((lo_r, 0xF)).or_insert(0) += 1;
 
             // ── Memory access columns ──
             trace.fill_columns(row, flags.is_exit, Column::IsExit);
@@ -2831,6 +3010,130 @@ impl BuiltInProverComponent for CpuChip {
                     &tuple,
                 );
             }
+        }
+
+        // ── Phase 17: sign-bit nibble lookups (8 emissions) ──
+        // Mirrors the verifier-side block placed just before
+        // finalize_logup_in_pairs.  Same tuple shape, same multiplicity
+        // (is_real per row), same emission order.
+        {
+            let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+            let sign_src_b = crate::trace::original_base_column!(component_trace, Column::SignSrcB);
+            let sign_src_d = crate::trace::original_base_column!(component_trace, Column::SignSrcD);
+            let sign_b_hi = crate::trace::original_base_column!(component_trace, Column::SignBHiNib);
+            let sign_d_hi = crate::trace::original_base_column!(component_trace, Column::SignDHiNib);
+            let sign_q_hi = crate::trace::original_base_column!(component_trace, Column::SignQHiNib);
+            let sign_r_hi = crate::trace::original_base_column!(component_trace, Column::SignRHiNib);
+            let sign_bit_b = crate::trace::original_base_column!(component_trace, Column::SignBitB);
+            let sign_bit_d = crate::trace::original_base_column!(component_trace, Column::SignBitD);
+            let sign_bit_q = crate::trace::original_base_column!(component_trace, Column::SignBitQ);
+            let sign_bit_r = crate::trace::original_base_column!(component_trace, Column::SignBitR);
+            let div_quot = crate::trace::original_base_column!(component_trace, Column::DivQuotient);
+            let div_rem = crate::trace::original_base_column!(component_trace, Column::DivRemainder);
+
+            let one_p = PackedBaseField::broadcast(BaseField::from(1));
+            let eight_p = PackedBaseField::broadcast(BaseField::from(8));
+            let fifteen_p = PackedBaseField::broadcast(BaseField::from(15));
+            let sixteen_p = PackedBaseField::broadcast(BaseField::from(16));
+
+            // Emit (hi, 8, 8·bit) and (src - 16·hi, 0xF, same) for each
+            // sign bit, in the same order as the verifier-side block:
+            // B → D → Q → R, hi-pin first then lo-range each.
+            let hi_b = sign_b_hi[0].clone();
+            let bit_b = sign_bit_b[0].clone();
+            let pad_b1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_b1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_b.at(i), eight_p, bit_b.at(i) * eight_p],
+            );
+            let src_b = sign_src_b[0].clone();
+            let hi_b2 = sign_b_hi[0].clone();
+            let pad_b2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_b2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_b.at(i) - hi_b2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+
+            let hi_d = sign_d_hi[0].clone();
+            let bit_d = sign_bit_d[0].clone();
+            let pad_d1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_d1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_d.at(i), eight_p, bit_d.at(i) * eight_p],
+            );
+            let src_d = sign_src_d[0].clone();
+            let hi_d2 = sign_d_hi[0].clone();
+            let pad_d2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_d2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_d.at(i) - hi_d2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+
+            let hi_q = sign_q_hi[0].clone();
+            let bit_q = sign_bit_q[0].clone();
+            let pad_q1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_q1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_q.at(i), eight_p, bit_q.at(i) * eight_p],
+            );
+            let src_q = div_quot[7].clone();
+            let hi_q2 = sign_q_hi[0].clone();
+            let pad_q2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_q2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_q.at(i) - hi_q2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+
+            let hi_r = sign_r_hi[0].clone();
+            let bit_r = sign_bit_r[0].clone();
+            let pad_r1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_r1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_r.at(i), eight_p, bit_r.at(i) * eight_p],
+            );
+            let src_r = div_rem[7].clone();
+            let hi_r2 = sign_r_hi[0].clone();
+            let pad_r2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_r2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_r.at(i) - hi_r2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
         }
 
         logup.finalize()

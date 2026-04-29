@@ -479,6 +479,40 @@ pub enum Column {
     /// 0xFF bytes (e.g. -14 × -7 in two's complement).
     #[size = 16]
     DivMulCarryHi,
+    // ── Phase 17: sign-bit pinning ────────────────────────────────────────
+    // Closes the SignBitB / SignBitD / SignBitQ / SignBitR soundness gap
+    // shared with Phase 12c.  Each sign bit is now constrained to equal
+    // bit 7 of its source byte via a pair of nibble-AND lookups
+    // (mirrors the SignExtBit pattern from Phase 12b-2):
+    //   1) (HiNib, 8, 8·SignBit) — pins SignBit = bit 3 of HiNib.
+    //   2) (Src − 16·HiNib, 0xF, same) — range-checks the low nibble,
+    //      pinning the byte decomposition Src = 16·HiNib + LoNib.
+    /// Multiplexed source byte for SignBitB: `val_b[7]` on 64-bit rows,
+    /// `val_b[3]` on 32-bit rows.  Held as a column so the lookup tuple
+    /// stays degree-1 (an inline `(1-Is32Bit)·val_b[7] + Is32Bit·val_b[3]`
+    /// would be degree 2 and exceed the per-tuple bound).
+    #[size = 1]
+    SignSrcB,
+    /// Multiplexed source byte for SignBitD: `val_d[7]` on 64-bit rows,
+    /// `val_d[3]` on 32-bit rows.
+    #[size = 1]
+    SignSrcD,
+    /// High nibble of SignSrcB.  Tied to SignBitB by the (HiNib, 8,
+    /// 8·SignBitB) lookup; tied to SignSrcB by the low-nibble lookup.
+    #[size = 1]
+    SignBHiNib,
+    /// High nibble of SignSrcD.  Same pattern as SignBHiNib.
+    #[size = 1]
+    SignDHiNib,
+    /// High nibble of `div_quotient[7]`.  Pins SignBitQ = bit 7 of
+    /// div_quotient[7].  On 32-bit DivS rows div_quotient[7] = 0 so
+    /// SignBitQ = 0 (the DivS sign-correction chain is gated on
+    /// is_64bit anyway, so this is fine).
+    #[size = 1]
+    SignQHiNib,
+    /// High nibble of `div_remainder[7]`.  Pins SignBitR similarly.
+    #[size = 1]
+    SignRHiNib,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
