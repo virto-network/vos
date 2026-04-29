@@ -8,7 +8,7 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use super::classify::uses_immediate;
+use super::classify::{classify_opcode, uses_immediate};
 use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
 
 /// Phase 9d: register-access descriptor for a single PVM step.  Used by both
@@ -21,6 +21,12 @@ pub(crate) struct StepRegAccesses {
     pub val_b_read: Option<(u8, u64)>,
     /// (reg_idx, value) if ValD came from a register read at this step.
     pub val_d_read: Option<(u8, u64)>,
+    /// Phase 28: (reg_idx, value) if the step reads `regs[ra]` for a
+    /// purpose not already captured by `val_b_read`.  Currently set
+    /// only on `StoreInd[U][8/16/32/64]` rows — there val_b holds the
+    /// *base* `regs[rb]`, while the value to be written is `regs[ra]`,
+    /// neither of which lands in a column without this read.
+    pub val_a_read: Option<(u8, u64)>,
     /// (reg_idx, value) if the step wrote a register.
     pub result_write: Option<(u8, u64)>,
     /// Phase 9e: ECALL-specific register reads.  Blake2b hostcall reads φ[7],
@@ -61,6 +67,14 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
         _ if uses_immediate(step.opcode) => None,
         _ => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
     };
+    // Phase 28: StoreInd source-value read.  TwoRegOneImm's val_b
+    // already covers reg_b (the base); val_a_read picks up reg_a
+    // (the source value) for StoreInd[U][8/16/32/64].
+    let val_a_read = if classify_opcode(step.opcode).is_store_ind {
+        Some((step.reg_a as u8, step.regs_before[step.reg_a]))
+    } else {
+        None
+    };
     let result_write = step.reg_write.map(|idx| (idx as u8, step.regs_after[idx]));
     // Phase 9e: blake2b ECALL reads φ[7], φ[10], φ[11], φ[12] at this step's ts.
     let is_blake_ecall = matches!(step.opcode,
@@ -76,5 +90,5 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     } else {
         Vec::new()
     };
-    StepRegAccesses { val_b_read, val_d_read, result_write, ecall_reads }
+    StepRegAccesses { val_b_read, val_d_read, val_a_read, result_write, ecall_reads }
 }

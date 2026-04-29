@@ -162,6 +162,14 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             if let Some((reg_idx, val)) = acc.val_d_read {
                 entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
             }
+            // Phase 28: StoreInd source-value read (regs[reg_a]).
+            // Pushed TWICE because CpuChip emits the producer paired
+            // (CONSTRAINTS.md rule 1) — both rows contribute
+            // multiplicity 1, summing to 2 per StoreInd consumer pair.
+            if let Some((reg_idx, val)) = acc.val_a_read {
+                entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+                entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+            }
             if let Some((reg_idx, val)) = acc.result_write {
                 entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: true });
             }

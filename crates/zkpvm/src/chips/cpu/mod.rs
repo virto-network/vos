@@ -1331,6 +1331,30 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
+            // Phase 28: RegValA producer for StoreInd source value.
+            // Emitted as a paired duplicate (mirrors the prog_mem
+            // pattern from Phase 13b/13c) so pair-parity stays even;
+            // RegisterMemoryChip pushes the val_a_read entry twice
+            // to match.  Tuple uses RegA directly as the index
+            // (reg_a is already a column on every row, decoded from
+            // the opcode by Phase 13b's ProgramMemory binding).
+            let reg_val_a = crate::trace::trace_eval!(trace_eval, Column::RegValA);
+            let reg_a_col = crate::trace::trace_eval!(trace_eval, Column::RegA);
+            let is_store_ind_col = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
+            let mut tuple_a: Vec<E::F> = vec![reg_a_col[0].clone()];
+            for b in &reg_val_a { tuple_a.push(b.clone()); }
+            for ts in &timestamp { tuple_a.push(ts.clone()); }
+            eval.add_to_relation(RelationEntry::new(
+                reg_lookup,
+                is_store_ind_col[0].clone().into(),
+                &tuple_a,
+            ));
+            eval.add_to_relation(RelationEntry::new(
+                reg_lookup,
+                is_store_ind_col[0].clone().into(),
+                &tuple_a,
+            ));
+
             // Phase 9g: IsTruncated is 1 iff Is32Bit AND (IsAdd + IsSub +
             // IsMul + IsDivRem).  Validity constraint ties it to the op flags
             // so a prover can't flip it independently.
@@ -1625,6 +1649,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_mem_indirect = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
             let f_is_store_imm_any = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
             let f_is_store_imm_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
+            let f_is_store_ind = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1676,6 +1701,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_mem_indirect[0].clone());
             tuple.push(f_is_store_imm_any[0].clone());
             tuple.push(f_is_store_imm_direct[0].clone());
+            tuple.push(f_is_store_ind[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1898,6 +1924,31 @@ impl BuiltInComponent for CpuChip {
                     is_store_direct_local[0].clone()
                         * mem_byte_active[i].clone()
                         * (mem_value[i].clone() - val_b[i].clone()),
+                );
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 28: bind MemValue ↔ RegValA on indirect register-source stores
+        //
+        // For StoreInd[U][8/16/32/64] (TwoRegOneImm), val_b holds
+        // the *base* register `regs[rb]` — not the value being
+        // stored.  The value is `regs[ra]`, which lands in the new
+        // RegValA column (filled in trace fill on StoreInd rows;
+        // bound to the actual register snapshot via the paired
+        // register-memory ledger producer in the Phase 9 block).
+        //
+        // Per-byte equality on active bytes:
+        //   IsStoreInd · mem_byte_active[i] · (mem_value[i] −
+        //                                      reg_val_a[i]) = 0
+        {
+            let is_store_ind_p28 = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
+            let reg_val_a_p28 = crate::trace::trace_eval!(trace_eval, Column::RegValA);
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_store_ind_p28[0].clone()
+                        * mem_byte_active[i].clone()
+                        * (mem_value[i].clone() - reg_val_a_p28[i].clone()),
                 );
             }
         }
@@ -3015,6 +3066,14 @@ impl BuiltInProverComponent for CpuChip {
             // Phase 27: StoreImm / StoreImmInd flags.
             trace.fill_columns(row, flags.is_store_imm_any, Column::IsStoreImmAny);
             trace.fill_columns(row, flags.is_store_imm_direct, Column::IsStoreImmDirect);
+            // Phase 28: StoreInd flag + RegValA (regs_before[reg_a]).
+            trace.fill_columns(row, flags.is_store_ind, Column::IsStoreInd);
+            let reg_val_a_u64 = if flags.is_store_ind {
+                step.regs_before[step.reg_a]
+            } else {
+                0
+            };
+            trace.fill_columns(row, reg_val_a_u64, Column::RegValA);
             let mut mem_addr_carry = [0u8; 4];
             if flags.is_mem_indirect {
                 let val_b_bytes_le = val_b.to_le_bytes();
@@ -3387,6 +3446,23 @@ impl BuiltInProverComponent for CpuChip {
                 &tuple,
             );
         }
+        // Phase 28: RegValA producer (paired emission for parity).
+        {
+            let reg_val_a_cols = crate::trace::original_base_column!(component_trace, Column::RegValA);
+            let reg_a_cols = crate::trace::original_base_column!(component_trace, Column::RegA);
+            let is_store_ind_col = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
+            let mut tuple: Vec<_> = vec![reg_a_cols[0].clone()];
+            tuple.extend_from_slice(&reg_val_a_cols);
+            tuple.extend_from_slice(&timestamp);
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    reg_lookup,
+                    [is_store_ind_col[0].clone()],
+                    |[active]| active.into(),
+                    &tuple,
+                );
+            }
+        }
         {
             let mut tuple: Vec<_> = vec![result_reg_idx[0].clone()];
             tuple.extend_from_slice(&result_cols);
@@ -3561,6 +3637,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_mem_indirect = crate::trace::original_base_column!(component_trace, Column::IsMemIndirect);
             let f_is_store_imm_any = crate::trace::original_base_column!(component_trace, Column::IsStoreImmAny);
             let f_is_store_imm_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreImmDirect);
+            let f_is_store_ind = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3613,6 +3690,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_mem_indirect[0].clone());
             tuple.push(f_is_store_imm_any[0].clone());
             tuple.push(f_is_store_imm_direct[0].clone());
+            tuple.push(f_is_store_ind[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

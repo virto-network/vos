@@ -649,6 +649,23 @@ pub enum Column {
     /// indirect StoreImmInd path is covered by Phase 26 instead).
     #[size = 1]
     IsStoreImmDirect,
+    /// Phase 28: 1 iff this opcode is `StoreInd[U][8/16/32/64]`
+    /// (TwoRegOneImm — *register-source* indirect store).  For
+    /// these the value written to memory is `regs[ra]`, which val_b
+    /// doesn't carry on TwoRegOneImm rows (val_b holds regs[rb]
+    /// = the base).  Drives the `MemValue = RegValA` per-byte
+    /// binding plus the producer emission to the register-memory
+    /// ledger.
+    #[size = 1]
+    IsStoreInd,
+    /// Phase 28: raw u64 of `regs_before[reg_a]` whenever
+    /// IsStoreInd=1, zero otherwise.  Producer multiplicity
+    /// uses IsStoreInd directly (no separate `ValAIsReg` column —
+    /// the flag is the indicator).  Tuple shape mirrors the
+    /// existing RegValB / RegValD producers: `(reg_a, reg_val_a,
+    /// timestamp) ∈ reg_lookup` with multiplicity IsStoreInd.
+    #[size = 8]
+    RegValA,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
