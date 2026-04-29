@@ -48,17 +48,8 @@ merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
-# `registry` is no-std + alloc by default; we want only the wire
-# types and `replication_id` here, not the host `Client` (whose
-# std feature would make registry depend on vos and introduce a
-# cycle). vosx inlines the announce-encoding instead.
-registry = { path = "../registry", default-features = false }
 
 [[bin]]
 name = "vosx"
 path = "src/bin/vosx.rs"
 required-features = ["std"]
-
-[dev-dependencies]
-registry = { path = "../registry" }
-registry-client = { path = "../registry-client" }

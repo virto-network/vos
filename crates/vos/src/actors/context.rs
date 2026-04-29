@@ -181,7 +181,7 @@ impl<A: Actor> Context<A> {
     /// owner_prefix, service_id, roles). Use [`resolve`](Self::resolve)
     /// if you only need the `ServiceId`.
     #[cfg(feature = "pvm")]
-    pub fn lookup(&mut self, name: &str) -> Option<registry::RegistryEntry> {
+    pub fn lookup(&mut self, name: &str) -> Option<crate::registry::RegistryEntry> {
         let msg = super::value::Msg::new("lookup")
             .with("name", alloc::string::String::from(name));
         let encoded = super::codec::Encode::encode(&msg);
@@ -197,7 +197,7 @@ impl<A: Actor> Context<A> {
         if bytes.is_empty() {
             return None;
         }
-        registry::decode_archived::<registry::RegistryEntry>(bytes)
+        crate::registry::decode_archived::<crate::registry::RegistryEntry>(bytes)
     }
 
     /// Resolve a service name to its full `ServiceId`. Convenience

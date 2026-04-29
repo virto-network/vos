@@ -35,7 +35,7 @@
 
 use vos::{actor, messages};
 
-use registry::{Page, RegistryEntry, encode_archived, MAX_PAGE_SIZE};
+use vos::registry::{Page, RegistryEntry, encode_archived, MAX_PAGE_SIZE};
 
 #[actor]
 struct Registry {

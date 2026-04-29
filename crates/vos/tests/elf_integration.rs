@@ -1542,7 +1542,7 @@ fn ctx_resolve_returns_announced_service_id() {
     // Single-node setup — the path under test is the actor's
     // INVOKE hostcall to ServiceId::REGISTRY, decoding the rkyv
     // RegistryEntry, and surfacing the full u32 to the caller.
-    use registry_client::Client;
+    use vos::registry::Client;
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
@@ -1586,7 +1586,7 @@ fn ctx_resolve_returns_announced_service_id() {
         AgentConfig::new(registry_blob)
             .with_consistency(Consistency::Crdt)
             .persist(&dir)
-            .with_replication_id(registry::replication_id("test")),
+            .with_replication_id(vos::registry::replication_id("test")),
         ServiceId::REGISTRY,
     );
 
@@ -1649,7 +1649,7 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     // both replicas converge to a 2-entry directory. Lookup,
     // by_role, and paginated list all return consistent answers
     // from either side.
-    use registry_client::{Client, PageRequest};
+    use vos::registry::{Client, PageRequest};
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -1674,7 +1674,7 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
 
-    let rep_id = registry::replication_id("kunekt-test");
+    let rep_id = vos::registry::replication_id("kunekt-test");
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
@@ -1820,7 +1820,7 @@ fn registry_heartbeat_bumps_last_seen() {
     // convergence (the existing
     // `registry_announce_lookup_and_list_converge_across_nodes`
     // already exercises that).
-    use registry_client::{Client, PageRequest};
+    use vos::registry::{Client, PageRequest};
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -1848,7 +1848,7 @@ fn registry_heartbeat_bumps_last_seen() {
         AgentConfig::new(blob)
             .with_consistency(Consistency::Crdt)
             .persist(&dir)
-            .with_replication_id(registry::replication_id("hb-test")),
+            .with_replication_id(vos::registry::replication_id("hb-test")),
         ServiceId::REGISTRY,
     );
 
@@ -1910,7 +1910,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
     // primitive directly — register, announce, then drive
     // heartbeats from a worker thread and observe last_seen
     // climb.
-    use registry_client::Client;
+    use vos::registry::Client;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1943,7 +1943,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
         AgentConfig::new(blob)
             .with_consistency(Consistency::Crdt)
             .persist(&dir)
-            .with_replication_id(registry::replication_id("hb2-test")),
+            .with_replication_id(vos::registry::replication_id("hb2-test")),
         ServiceId::REGISTRY,
     );
 
