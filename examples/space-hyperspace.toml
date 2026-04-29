@@ -13,7 +13,7 @@ version = "0.1.0"
 hyperspace = "kunekt-test"
 # vosx loads this elf for the registry actor. Resolved relative
 # to the manifest directory. Future cycles will embed the actor.
-registry_blob = "../actors/registry/target/riscv64em-javm/release/registry-actor.elf"
+registry_blob = "../crates/actors/registry/target/riscv64em-javm/release/registry-actor.elf"
 
 [[agent]]
 name = "counter"

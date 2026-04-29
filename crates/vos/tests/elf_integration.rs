@@ -1554,7 +1554,7 @@ fn ctx_resolve_returns_announced_service_id() {
         workspace,
     );
     let registry_path = format!(
-        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1657,7 +1657,7 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let actor_path = format!(
-        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
         workspace,
     );
     let elf = match std::fs::read(&actor_path) {
@@ -1826,7 +1826,7 @@ fn registry_heartbeat_bumps_last_seen() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let actor_path = format!(
-        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
         workspace,
     );
     let elf = match std::fs::read(&actor_path) {
@@ -1921,7 +1921,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let actor_path = format!(
-        "{}/../../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
         workspace,
     );
     let elf = match std::fs::read(&actor_path) {

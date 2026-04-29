@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "registry-actor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+registry = { path = "../../registry", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
