@@ -2254,6 +2254,188 @@ fn crdt_counter_restart_replays_state_from_disk() {
 
 #[test]
 #[cfg(feature = "network")]
+fn crdt_counter_offline_node_catches_up_after_restart() {
+    // Cross-node restart: A and B start in sync, both at
+    // count=1. A shuts down. While A is offline, B drives
+    // additional `inc()` calls. A restarts against the same
+    // data_dir (and same libp2p identity), reconnects to B,
+    // and must catch up to B's higher count.
+    //
+    // This test spans two of kunekt's load-bearing claims:
+    //
+    //  1. Restart determinism: A's on-disk state survives the
+    //     process boundary (probed in
+    //     `crdt_counter_restart_replays_state_from_disk`,
+    //     reused here cross-node).
+    //  2. Sync recovery: A doesn't have to "re-do" the work
+    //     it missed; the EffectLogs B accumulated propagate
+    //     over libp2p once A reconnects.
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir()
+        .join(format!("vos_crdt_offline_restart_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // A and B keep the same libp2p identity across restart so
+    // peers can re-find them at the same prefix. We persist the
+    // keys explicitly for that reason.
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    // Helper: invoke a Msg on a node, return the rkyv reply.
+    let dyn_payload = |m: Msg| -> Vec<u8> {
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+    let read_count = |node: &VosNode, target: ServiceId| -> Option<u64> {
+        let bytes = node.invoke(target, dyn_payload(Msg::new("get")))?;
+        let v: vos::value::Value = vos::Decode::decode(&bytes);
+        v.as_u64()
+    };
+
+    // ── Phase 1: bring A and B up, converge to count=2 ─────────
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a.clone(), local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b.clone(), local_prefix: prefix_b,
+        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+    });
+    // Snapshot B's bound address now so A's restart can dial
+    // it directly — without that, A2 would only discover B
+    // via mDNS, which makes the test flaky in CI sandboxes.
+    let b_listen = wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(5),
+    ).expect("net_b binds");
+    let b_dial = b_listen.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let counter_a = node_a.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let counter_b = node_b.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(|| {
+        if net_a_arc.peer_for_prefix(prefix_b).is_some()
+            && net_b_arc.peer_for_prefix(prefix_a).is_some()
+        { Some(()) } else { None }
+    }, std::time::Duration::from_secs(10)).expect("Hello completes");
+
+    let _ = node_a.invoke(counter_a, dyn_payload(Msg::new("inc").with("tag", 1u32))).expect("inc A");
+    let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc").with("tag", 2u32))).expect("inc B");
+
+    wait_for(|| if read_count(&node_a, counter_a) == Some(2) { Some(()) } else { None },
+        std::time::Duration::from_secs(8)).expect("A converges to 2");
+    wait_for(|| if read_count(&node_b, counter_b) == Some(2) { Some(()) } else { None },
+        std::time::Duration::from_secs(8)).expect("B converges to 2");
+
+    // ── Phase 2: A goes offline, B drives more incs ────────────
+    let _ = node_a.collect();
+    drop(net_a_arc); // release the test's reference so collect actually drops the redb arc
+
+    // While A is offline, give B a few more incs.
+    for tag in 3u32..=5 {
+        let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc").with("tag", tag)))
+            .expect("inc on B while A offline");
+    }
+    wait_for(|| if read_count(&node_b, counter_b) == Some(5) { Some(()) } else { None },
+        std::time::Duration::from_secs(2)).expect("B reaches 5 alone");
+
+    // ── Phase 3: A comes back, must catch up to 5 ──────────────
+    let net_a2 = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen], bootstrap: vec![b_dial],
+    });
+
+    let mut node_a2 = VosNode::with_prefix(prefix_a);
+    let counter_a2 = node_a2.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+    );
+    assert_eq!(counter_a2, counter_a, "restarted A must reuse the same ServiceId");
+    node_a2.attach_network(net_a2);
+
+    let net_a2_arc = node_a2.network().expect("net_a2");
+    wait_for(|| {
+        if net_a2_arc.peer_for_prefix(prefix_b).is_some()
+            && net_b_arc.peer_for_prefix(prefix_a).is_some()
+        { Some(()) } else { None }
+    }, std::time::Duration::from_secs(10)).expect("A re-Hellos B");
+
+    // Catch-up window: A's CRDT layer should pull B's three
+    // missed incs and replay; final count is 5.
+    wait_for(
+        || if read_count(&node_a2, counter_a2) == Some(5) { Some(()) } else { None },
+        std::time::Duration::from_secs(15),
+    ).expect("A catches up to 5 after restart");
+    assert_eq!(read_count(&node_b, counter_b), Some(5));
+
+    let _ = node_a2.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
+#[test]
+#[cfg(feature = "network")]
 fn registry_remove_replicates_across_nodes() {
     // `remove(name)` is one of the registry's six messages and
     // it tombstones state — the trickiest sync shape to get
