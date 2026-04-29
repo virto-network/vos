@@ -106,6 +106,13 @@ impl BuiltInComponent for CpuChip {
         let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
         let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
         let result = crate::trace::trace_eval!(trace_eval, Column::Result);
+        // Phase 19: high bytes of `result` on 32-bit ALU rows now equal
+        // 0xFF · SignBitResult (sign-extension), matching the
+        // interpreter's `q as i64 as u64`.  SignBitResult is pinned by
+        // a nibble-AND lookup at the end of add_constraints to bit 7
+        // of result[3].
+        let sign_bit_result_p19 = crate::trace::trace_eval!(trace_eval, Column::SignBitResult);
+        let f_ff_p19: E::F = E::F::from(BaseField::from(255));
         let carry = crate::trace::trace_eval!(trace_eval, Column::Carry);
         let mul_high = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
         let mul_carry = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
@@ -139,8 +146,14 @@ impl BuiltInComponent for CpuChip {
                 eval.add_constraint(is_add[0].clone() * is_64bit.clone() * c);
             }
         }
+        // Phase 19: `result[4..8] = 0xFF · SignBitResult` on 32-bit
+        // Add rows (was: `= 0`).  Matches the interpreter's
+        // `sign_extend_32` of the low-32 sum.
         for i in 4..WORD_SIZE {
-            eval.add_constraint(is_add[0].clone() * is_32bit[0].clone() * result[i].clone());
+            eval.add_constraint(
+                is_add[0].clone() * is_32bit[0].clone()
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+            );
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -161,7 +174,10 @@ impl BuiltInComponent for CpuChip {
             }
         }
         for i in 4..WORD_SIZE {
-            eval.add_constraint(is_sub[0].clone() * is_32bit[0].clone() * result[i].clone());
+            eval.add_constraint(
+                is_sub[0].clone() * is_32bit[0].clone()
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+            );
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -223,7 +239,10 @@ impl BuiltInComponent for CpuChip {
         }
         // 32-bit mul: upper result limbs = 0
         for i in 4..WORD_SIZE {
-            eval.add_constraint(is_mul[0].clone() * is_32bit[0].clone() * result[i].clone());
+            eval.add_constraint(
+                is_mul[0].clone() * is_32bit[0].clone()
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+            );
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -755,7 +774,10 @@ impl BuiltInComponent for CpuChip {
 
         // 32-bit: upper result limbs = 0
         for i in 4..WORD_SIZE {
-            eval.add_constraint(is_div_rem[0].clone() * is_32bit[0].clone() * result[i].clone());
+            eval.add_constraint(
+                is_div_rem[0].clone() * is_32bit[0].clone()
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+            );
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1852,11 +1874,35 @@ impl BuiltInComponent for CpuChip {
                     sign_bit_r[0].clone() * eight_p17.clone(),
                 ],
             ));
-            let lo_r = sign_src_r[0].clone() - sign_r_hi[0].clone() * sixteen_p17;
+            let lo_r = sign_src_r[0].clone() - sign_r_hi[0].clone() * sixteen_p17.clone();
             eval.add_to_relation(RelationEntry::new(
                 bitwise_and_lookup,
                 is_real.clone().into(),
-                &[lo_r.clone(), fifteen_p17, lo_r],
+                &[lo_r.clone(), fifteen_p17.clone(), lo_r],
+            ));
+
+            // Phase 19: SignBitResult — pin to bit 7 of result[3].  No
+            // Is32Bit multiplex needed: on 64-bit rows the result-
+            // sign-extension constraint we'll add below is gated on
+            // is_32bit and won't fire, so SignBitResult's value is
+            // unused.  Keeping the same shape as the other 4 sign-bit
+            // pins keeps the lookup-pair structure uniform.
+            let sign_bit_result = crate::trace::trace_eval!(trace_eval, Column::SignBitResult);
+            let result_hi = crate::trace::trace_eval!(trace_eval, Column::ResultHiNib);
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    result_hi[0].clone(),
+                    eight_p17.clone(),
+                    sign_bit_result[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_res = result[3].clone() - result_hi[0].clone() * sixteen_p17;
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_res.clone(), fifteen_p17, lo_res],
             ));
         }
 
@@ -2340,17 +2386,15 @@ impl BuiltInProverComponent for CpuChip {
                             } else {
                                 (b32 / d32, b32 % d32)
                             };
-                            // The 64-bit AIR reconstructs `q · d + r = b`
-                            // mod 2^128 only on Is64Bit rows; on 32-bit
-                            // rows the AIR's separate 8-position
-                            // schoolbook still expects high bytes = 0,
-                            // so feed the 32-bit byte pattern with high
-                            // 4 bytes zero (same as result column).
-                            let mut q = [0u8; 8];
-                            let mut r = [0u8; 8];
-                            q[..4].copy_from_slice(&(q32 as u32).to_le_bytes());
-                            r[..4].copy_from_slice(&(r32 as u32).to_le_bytes());
-                            (q, r)
+                            // Phase 19: sign-extend div_quotient / div_remainder
+                            // to match the result column (which is the
+                            // interpreter's `q as i64 as u64`).  The 32-bit
+                            // schoolbook + Phase 18 sign-correction chain
+                            // only reference [0..4]; the result-quotient
+                            // binding requires [4..8] to track sign-
+                            // extension too.
+                            ((q32 as i64 as u64).to_le_bytes(),
+                             (r32 as i64 as u64).to_le_bytes())
                         } else {
                             let bs = dividend as i64;
                             let ds = divisor as i64;
@@ -2516,6 +2560,17 @@ impl BuiltInProverComponent for CpuChip {
             *side_note.bitwise_and_counts.entry((lo_q, 0xF)).or_insert(0) += 1;
             *side_note.bitwise_and_counts.entry((hi_r, 8)).or_insert(0) += 1;
             *side_note.bitwise_and_counts.entry((lo_r, 0xF)).or_insert(0) += 1;
+
+            // Phase 19: SignBitResult / ResultHiNib pinning.  On
+            // padding rows result_bytes = 0 so SignBitResult = 0
+            // (consistent with the lookup).
+            let sign_bit_result = (result_bytes[3] >> 7) & 1;
+            let hi_res = result_bytes[3] >> 4;
+            let lo_res = result_bytes[3] & 0xF;
+            trace.fill_columns(row, sign_bit_result, Column::SignBitResult);
+            trace.fill_columns(row, hi_res, Column::ResultHiNib);
+            *side_note.bitwise_and_counts.entry((hi_res, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((lo_res, 0xF)).or_insert(0) += 1;
 
             // ── Memory access columns ──
             trace.fill_columns(row, flags.is_exit, Column::IsExit);
@@ -3247,6 +3302,34 @@ impl BuiltInProverComponent for CpuChip {
                 3,
                 |i| {
                     let lo = src_r.at(i) - hi_r2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+
+            // Phase 19: SignBitResult — pin to bit 7 of result[3].
+            let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
+            let sign_bit_result_col = crate::trace::original_base_column!(component_trace, Column::SignBitResult);
+            let result_hi_col = crate::trace::original_base_column!(component_trace, Column::ResultHiNib);
+            let hi_res = result_hi_col[0].clone();
+            let bit_res = sign_bit_result_col[0].clone();
+            let pad_res1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_res1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_res.at(i), eight_p, bit_res.at(i) * eight_p],
+            );
+            let src_res = result_cols[3].clone();
+            let hi_res2 = result_hi_col[0].clone();
+            let pad_res2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_res2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_res.at(i) - hi_res2.at(i) * sixteen_p;
                     vec![lo, fifteen_p, lo]
                 },
             );

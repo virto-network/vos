@@ -522,6 +522,25 @@ pub enum Column {
     /// Phase 18: multiplexed source byte for SignBitR.
     #[size = 1]
     SignSrcR,
+    // ── Phase 19: 32-bit ALU result sign-extension ────────────────────────
+    // The PVM interpreter sign-extends every 32-bit ALU result to 64-bit
+    // (`q as i64 as u64` in javm/src/vm.rs).  Until Phase 19 the AIR
+    // forced `result[4..8] = 0` for every 32-bit ALU op, which only
+    // worked when bit 31 of the result happened to be 0.  Phase 19
+    // pins SignBitResult = bit 7 of `result[3]` via the same nibble-
+    // AND pattern as the other sign bits, then replaces the
+    // truncation constraint with `result[i] = 0xFF · SignBitResult`
+    // for `i ∈ 4..8` on 32-bit ALU rows.
+    /// Bit 7 of `result[3]`.  Pinned via the (HiNib, 8, 8·SignBitResult)
+    /// lookup; equals 0 on rows where result[3] < 0x80, equals 1 on
+    /// 32-bit ALU rows whose signed result is negative.  On non-real
+    /// rows (padding) result[3] = 0 so SignBitResult = 0.
+    #[size = 1]
+    SignBitResult,
+    /// High nibble of `result[3]`, paired with the (lo, 0xF, lo)
+    /// range-check lookup so `result[3] = 16·HiNib + LoNib` is pinned.
+    #[size = 1]
+    ResultHiNib,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

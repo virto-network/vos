@@ -40,6 +40,81 @@ fn add64_off_by_one_rejected() {
 // tests/phase2_alu.rs::prove_add32 already covers the positive path with
 // inputs that don't trigger sign extension; defer Add32 negative-test
 // coverage to a focused future pass.
+//
+// Phase 19 update: 32-bit ALU result high bytes now bind to
+// `0xFF · SignBitResult` (sign-extension) instead of the previous
+// hard-coded zero, matching the interpreter's `q as i64 as u64`.  See
+// the negative-result smokes below.
+
+#[test]
+fn add32_negative_result_smoke() {
+    // 0x7FFFFFFF + 1 = 0x80000000 in i32 → -2147483648 sign-extended
+    // to u64 = 0xFFFFFFFF80000000.  Pre-Phase-19 AIR rejected this
+    // (result[4..8] forced to 0).
+    prove_three_reg(
+        Opcode::Add32, 2, 0, 1,
+        0x7FFF_FFFF, 1,
+        0xFFFF_FFFF_8000_0000,
+    );
+}
+
+#[test]
+fn sub32_negative_result_smoke() {
+    // 5 - 10 = -5 in i32 → 0xFFFFFFFB sign-extended = 0xFFFFFFFFFFFFFFFB.
+    prove_three_reg(
+        Opcode::Sub32, 2, 0, 1,
+        5, 10,
+        (-5i64) as u64,
+    );
+}
+
+#[test]
+fn mul32_negative_result_smoke() {
+    // (-2) * 3 = -6 in i32 → 0xFFFFFFFA sign-extended.
+    prove_three_reg(
+        Opcode::Mul32, 2, 0, 1,
+        (-2i32) as u32 as u64,
+        3,
+        (-6i64) as u64,
+    );
+}
+
+#[test]
+fn div_s32_negative_dividend_smoke() {
+    // -100 / 7 = -14 in i32 → sign-extended 0xFFFFFFFFFFFFFFF2.
+    // Phase 18 added the 32-bit DivS chain; Phase 19 fixed the result
+    // sign-extension so this now proves end-to-end.
+    prove_three_reg(
+        Opcode::DivS32, 2, 0, 1,
+        (-100i32) as u32 as u64,
+        7,
+        (-14i64) as u64,
+    );
+}
+
+#[test]
+fn rem_s32_negative_dividend_smoke() {
+    // -100 % 7 = -2 in i32 → sign-extended 0xFFFFFFFFFFFFFFFE.
+    prove_three_reg(
+        Opcode::RemS32, 2, 0, 1,
+        (-100i32) as u32 as u64,
+        7,
+        (-2i64) as u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn add32_negative_result_forged_high_byte_rejected() {
+    // Honest result for 0x7FFFFFFF + 1 sign-extended = 0xFFFFFFFF80000000.
+    // Forge to drop one of the high 0xFF bytes (mask off bit 56) — should
+    // be caught by the new sign-extension constraint at result[7].
+    forge_three_reg_result(
+        Opcode::Add32, 2, 0, 1,
+        0x7FFF_FFFF, 1,
+        /*forged*/ 0x00FF_FFFF_8000_0000,
+    );
+}
 
 // ── Sub ───────────────────────────────────────────────────────────────────
 
