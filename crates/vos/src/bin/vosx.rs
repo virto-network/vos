@@ -103,19 +103,12 @@ enum Command {
     List {
         manifest: Option<PathBuf>,
     },
-    /// Inspect or interact with the hyperspace registry. The CLI
-    /// runs a transient ephemeral replica, syncs from peers, and
-    /// answers queries locally — no running vosx required as
-    /// long as a peer carrying the registry state is reachable
-    /// (mDNS or `--connect`).
-    Registry {
-        #[command(subcommand)]
-        action: RegistryAction,
-    },
     /// Resolve a service name (or accept a `0x…` ServiceId) and
-    /// invoke a typed message on it. Same transient-replica
-    /// model as `registry list` — useful for poking running
-    /// services from outside their host process.
+    /// invoke a typed message on it. The CLI joins the
+    /// manifest's hyperspace as a transient peer, looks the
+    /// name up via the registry actor like any other service,
+    /// then forwards the call. Use this to drive any actor —
+    /// the registry included (`vosx invoke registry list`).
     Invoke {
         /// Service name (looked up in registry) or a literal
         /// `0xHEX` ServiceId.
@@ -133,39 +126,6 @@ enum Command {
         connect: Vec<String>,
         /// Seconds to wait for registry sync before resolving
         /// the target name. Ignored when target is `0x…`.
-        #[arg(long, default_value_t = 3)]
-        sync_timeout: u64,
-    },
-}
-
-#[derive(Subcommand)]
-enum RegistryAction {
-    /// List entries (optionally restricted to a slash-prefix).
-    List {
-        /// Restrict to names starting with this string.
-        #[arg(long, value_name = "PREFIX")]
-        prefix: Option<String>,
-        manifest: Option<PathBuf>,
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-        #[arg(long, default_value_t = 3)]
-        sync_timeout: u64,
-    },
-    /// Resolve a single name.
-    Lookup {
-        name: String,
-        manifest: Option<PathBuf>,
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-        #[arg(long, default_value_t = 3)]
-        sync_timeout: u64,
-    },
-    /// List entries that advertise the given role.
-    ByRole {
-        role: String,
-        manifest: Option<PathBuf>,
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
         #[arg(long, default_value_t = 3)]
         sync_timeout: u64,
     },
@@ -192,9 +152,6 @@ fn main() {
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             cmd_list(&m, &dir);
-        }
-        Some(Command::Registry { action }) => {
-            cmd_registry(action);
         }
         Some(Command::Invoke { target, msg, arg, manifest, connect, sync_timeout }) => {
             let (m, dir) = manifest_from(manifest);
@@ -750,124 +707,40 @@ struct AnnouncePlan {
     roles: Vec<String>,
 }
 
-// ── `vosx registry` / `vosx invoke` (transient query node) ─────────
+// ── `vosx invoke` (transient query node) ───────────────────────────
 //
-// Both commands work the same way: spin up an ephemeral, non-
-// persisting VosNode that joins the manifest's hyperspace, wait
-// briefly for CRDT sync to populate the local registry replica
-// from peers, then run the action and exit. No data dir, no
-// long-lived state — the node is gone after the command returns.
+// Spin up an ephemeral, non-persisting VosNode that joins the
+// manifest's hyperspace, wait briefly for CRDT sync to populate
+// the local registry replica from peers, resolve the target
+// name, fire the invoke, and exit. No data dir, no long-lived
+// state — the node is gone after the command returns.
 //
-// Wire encoding for `lookup`/`list`/`by_role` is inlined here
-// rather than pulled from `registry-client`, since vos's binary
-// can't depend on `registry-client` without a cycle (the
-// client crate already depends on `vos`). The encoding is
-// deliberately tiny — a few `Msg::with(...)` calls.
+// Name resolution uses the registry actor like any other caller
+// would: invoke `lookup(name)` at `ServiceId::REGISTRY`, decode
+// the rkyv-encoded `RegistryEntry` reply. The wire encoding is
+// inlined here rather than pulled from `registry-client`,
+// because vos's binary can't depend on the client crate
+// (`registry-client` already depends on `vos`).
 
+/// Invoke the well-known registry actor's `lookup(name)` and
+/// decode the rkyv-encoded `RegistryEntry` reply. Used both by
+/// `vosx invoke <NAME>` for name resolution and by
+/// `with_query_node` to detect when CRDT sync has populated the
+/// local replica.
 #[cfg(feature = "network")]
-fn cmd_registry(action: RegistryAction) {
-    match action {
-        RegistryAction::List { prefix, manifest, connect, sync_timeout } => {
-            let (m, dir) = manifest_from(manifest);
-            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
-                let prefix_str = prefix.clone().unwrap_or_default();
-                let mut entries: Vec<registry::RegistryEntry> = Vec::new();
-                let mut clock: u64;
-                let mut after = String::new();
-                loop {
-                    let page = match registry_list_page(node, &prefix_str, &after) {
-                        Some(p) => p,
-                        None => die("registry list: invoke failed"),
-                    };
-                    clock = page.clock;
-                    let next = page.next.clone();
-                    entries.extend(page.entries);
-                    if next.is_empty() { break; }
-                    after = next;
-                }
-                if entries.is_empty() {
-                    println!("(no entries)");
-                    return;
-                }
-                println!("clock: {clock}");
-                for e in entries {
-                    let id = vos::abi::service::ServiceId(e.full_service_id());
-                    let age = clock.saturating_sub(e.last_seen);
-                    let roles = if e.roles.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {:?}", e.roles)
-                    };
-                    println!("  {} → {id} (last_seen={}, age={}){roles}",
-                        e.name, e.last_seen, age);
-                }
-            });
-        }
-        RegistryAction::Lookup { name, manifest, connect, sync_timeout } => {
-            let (m, dir) = manifest_from(manifest);
-            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
-                match registry_lookup(node, &name) {
-                    Some(e) => {
-                        let id = vos::abi::service::ServiceId(e.full_service_id());
-                        println!("{} → {id}", e.name);
-                        println!("  last_seen: {}", e.last_seen);
-                        if !e.roles.is_empty() {
-                            println!("  roles: {:?}", e.roles);
-                        }
-                    }
-                    None => {
-                        eprintln!("'{name}' not found");
-                        std::process::exit(1);
-                    }
-                }
-            });
-        }
-        RegistryAction::ByRole { role, manifest, connect, sync_timeout } => {
-            let (m, dir) = manifest_from(manifest);
-            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
-                let mut entries: Vec<registry::RegistryEntry> = Vec::new();
-                let mut after = String::new();
-                loop {
-                    let page = match registry_by_role_page(node, &role, &after) {
-                        Some(p) => p,
-                        None => die("by_role: invoke failed"),
-                    };
-                    let next = page.next.clone();
-                    entries.extend(page.entries);
-                    if next.is_empty() { break; }
-                    after = next;
-                }
-                if entries.is_empty() {
-                    println!("(no entries with role '{role}')");
-                    return;
-                }
-                for e in entries {
-                    let id = vos::abi::service::ServiceId(e.full_service_id());
-                    println!("  {} → {id}", e.name);
-                }
-            });
-        }
-    }
-}
-
-#[cfg(feature = "network")]
-fn registry_invoke_dyn(node: &vos::node::VosNode, msg: vos::value::Msg) -> Option<Vec<u8>> {
+fn registry_lookup(node: &vos::node::VosNode, name: &str) -> Option<registry::RegistryEntry> {
     use vos::value::TAG_DYNAMIC;
     use vos::Encode;
-    let encoded = msg.encode();
+    let m = vos::value::Msg::new("lookup").with("name", name);
+    let encoded = m.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    node.invoke_with_timeout(
+    let bytes = node.invoke_with_timeout(
         vos::abi::service::ServiceId::REGISTRY,
         payload,
         std::time::Duration::from_secs(5),
-    )
-}
-
-#[cfg(feature = "network")]
-fn registry_lookup(node: &vos::node::VosNode, name: &str) -> Option<registry::RegistryEntry> {
-    let bytes = registry_invoke_dyn(node, vos::value::Msg::new("lookup").with("name", name))?;
+    )?;
     let value: vos::value::Value = vos::Decode::decode(&bytes);
     match value {
         vos::value::Value::Bytes(b) if !b.is_empty() => {
@@ -875,45 +748,6 @@ fn registry_lookup(node: &vos::node::VosNode, name: &str) -> Option<registry::Re
         }
         _ => None,
     }
-}
-
-#[cfg(feature = "network")]
-fn registry_list_page(node: &vos::node::VosNode, prefix: &str, after: &str)
-    -> Option<registry::Page>
-{
-    let m = vos::value::Msg::new("list")
-        .with("prefix", prefix)
-        .with("after", after)
-        .with("limit", registry::DEFAULT_PAGE_SIZE);
-    decode_page_reply(registry_invoke_dyn(node, m)?)
-}
-
-#[cfg(feature = "network")]
-fn registry_by_role_page(node: &vos::node::VosNode, role: &str, after: &str)
-    -> Option<registry::Page>
-{
-    let m = vos::value::Msg::new("by_role")
-        .with("role", role)
-        .with("prefix", "")
-        .with("after", after)
-        .with("limit", registry::DEFAULT_PAGE_SIZE);
-    decode_page_reply(registry_invoke_dyn(node, m)?)
-}
-
-#[cfg(feature = "network")]
-fn decode_page_reply(bytes: Vec<u8>) -> Option<registry::Page> {
-    let value: vos::value::Value = vos::Decode::decode(&bytes);
-    match value {
-        vos::value::Value::Bytes(b) if !b.is_empty() => {
-            registry::decode_archived::<registry::Page>(&b)
-        }
-        _ => Some(registry::Page::empty()),
-    }
-}
-
-#[cfg(not(feature = "network"))]
-fn cmd_registry(_action: RegistryAction) {
-    die("`vosx registry` requires the `network` feature");
 }
 
 #[cfg(feature = "network")]
@@ -1108,15 +942,22 @@ fn with_query_node(
     // intervals (~250ms each). We early-exit only when the
     // registry actually has entries — `has_peers` alone fires
     // before any state has flowed.
-    let _ = net_arc; // keep the network alive for the full wait
+    // Sync warmup: wait for at least one peer to appear, then
+    // give the CRDT layer a fixed window to pull the registry
+    // DAG. Hello-handshake is fast (tens of ms); fetching and
+    // applying logs takes a couple of sync intervals (250ms
+    // each). Whole budget is `sync_timeout_secs`.
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(sync_timeout_secs);
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let has_entries = registry_list_page(&node, "", "")
-            .map(|p| !p.entries.is_empty())
-            .unwrap_or(false);
-        if has_entries { break; }
+    while std::time::Instant::now() < deadline && net_arc.connected_peers().is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Allow time for CRDT replay after the first peer appears,
+    // bounded by the remaining budget.
+    let post_peer_window = std::time::Duration::from_millis(750);
+    let drain_until = (std::time::Instant::now() + post_peer_window).min(deadline);
+    while std::time::Instant::now() < drain_until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     f(&node);
