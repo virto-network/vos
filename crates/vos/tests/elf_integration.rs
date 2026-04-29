@@ -1995,3 +1995,133 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
     let _ = node.collect();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
+    // Sync protocol cold-start: node A is the only replica, it
+    // has accumulated three announces, then node B joins fresh
+    // (no on-disk state) and dials A. The CRDT sync_loop on B
+    // should walk A's heads via FetchHeads/FetchNode, populate
+    // its DAG, and replay on the local replica — no further
+    // writes from anyone needed.
+    use registry::RegistryClient;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir()
+        .join(format!("vos_cold_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id = registry::replication_id("cold-bootstrap-test");
+
+    // ── Phase 1: only A exists, accumulates state ──────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.register_at_id(
+        AgentConfig::new(blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
+    client_a.announce("kunekt/alpha".to_string(), prefix_a as u32, 1, vec![])
+        .expect("announce alpha");
+    client_a.announce("kunekt/beta".to_string(), prefix_a as u32, 2, vec![])
+        .expect("announce beta");
+    client_a.announce("kunekt/gamma".to_string(), prefix_a as u32, 3,
+        vec!["worker".to_string()]).expect("announce gamma");
+
+    // Confirm A has all three before bringing B up.
+    let initial = client_a.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    assert_eq!(initial.entries.len(), 3,
+        "A should hold three entries before B joins");
+
+    // ── Phase 2: B joins fresh, dials A ────────────────────────
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    // ── Phase 3: B catches up via the sync protocol ────────────
+    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
+    wait_for(
+        || {
+            let alpha = client_b.lookup("kunekt/alpha".to_string()).ok().flatten();
+            let beta = client_b.lookup("kunekt/beta".to_string()).ok().flatten();
+            let gamma = client_b.lookup("kunekt/gamma".to_string()).ok().flatten();
+            if alpha.is_some() && beta.is_some() && gamma.is_some() {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(15),
+    ).expect("B converges to A's three entries within deadline");
+
+    // Confirm gamma's role list survived the round-trip — checks
+    // that the EffectLog payload was replicated faithfully, not
+    // just the entry count.
+    let gamma = client_b.lookup("kunekt/gamma".to_string())
+        .unwrap().expect("gamma");
+    assert_eq!(gamma.roles, vec!["worker".to_string()]);
+
+    // Both replicas now report the same clock — a side effect of
+    // every announce flowing through both DAGs. They may differ
+    // by 1 if a heartbeat raced; treat ≥ A's tick as sync-caught-up.
+    let page_a = client_a.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    let page_b = client_b.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    assert!(page_b.clock >= page_a.clock - 1,
+        "B's clock {} < A's clock {} — sync did not deliver tail events",
+        page_b.clock, page_a.clock);
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
