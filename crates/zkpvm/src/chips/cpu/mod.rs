@@ -1622,6 +1622,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_mem_size_8 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
             let f_is_store_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
             let f_is_load_direct = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
+            let f_is_mem_indirect = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1670,6 +1671,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_mem_size_8[0].clone());
             tuple.push(f_is_store_direct[0].clone());
             tuple.push(f_is_load_direct[0].clone());
+            tuple.push(f_is_mem_indirect[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1926,6 +1928,58 @@ impl BuiltInComponent for CpuChip {
                 eval.add_constraint(
                     direct_mem_active.clone()
                         * (mem_addr[i].clone() - imm_bytes_local[i].clone())
+                );
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 26: bind MemAddr ↔ (val_b + ImmBytes) mod 2^32 on indirect ops
+        //
+        // For LoadInd[U/I][8/16/32/64], StoreInd[U][8/16/32/64], and
+        // StoreImmInd[U][8/16/32/64] the runtime address is
+        // `regs[base] + imm` (where base = rb for the TwoRegOneImm
+        // pair, ra for OneRegTwoImm).  In every case the trace fill
+        // puts the base register's value into val_b — TwoRegOneImm's
+        // arm gives `val_b = regs[reg_b]`, OneRegTwoImm falls
+        // through to the default arm `val_b = regs[reg_a]` and
+        // reg_a is decoded as the base for OneRegTwoImm — so a
+        // single uniform formula works:
+        //
+        //   MemAddr = (val_b + ImmBytes) mod 2^32
+        //
+        // Encoded as a 4-byte add-with-carry chain, mirroring the
+        // existing JumpIndAddr / LoadImmJumpIndAddr patterns.
+        // Carry-out at byte 3 is the 32-bit overflow, discarded.
+        // Per-byte carry boolean (val_b[i] + ImmBytes[i] + carry_in
+        // ≤ 511 with carry_in ≤ 1, so carry_out ≤ 1).
+        {
+            let is_mem_indirect_local = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
+            let mem_addr_carry = crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
+            let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            // Boolean carry per byte (gated by is_real so range is
+            // forced even on non-indirect rows where the chain is
+            // dormant).
+            for i in 0..4 {
+                eval.add_constraint(
+                    is_real.clone() * mem_addr_carry[i].clone()
+                        * (E::F::one() - mem_addr_carry[i].clone())
+                );
+            }
+            // Add-with-carry chain (gated on is_mem_indirect).
+            for i in 0..4 {
+                let carry_in = if i == 0 {
+                    E::F::zero()
+                } else {
+                    mem_addr_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_mem_indirect_local[0].clone() * (
+                        mem_addr[i].clone()
+                            + mem_addr_carry[i].clone() * f256.clone()
+                            - val_b[i].clone()
+                            - imm_bytes_local[i].clone()
+                            - carry_in
+                    )
                 );
             }
         }
@@ -2915,6 +2969,20 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_store_direct, Column::IsStoreDirect);
             // Phase 25: direct-load flag (LoadU8/I8/U16/I16/U32/I32/U64).
             trace.fill_columns(row, flags.is_load_direct, Column::IsLoadDirect);
+            // Phase 26: indirect-mem flag + MemAddr add-with-carry chain.
+            trace.fill_columns(row, flags.is_mem_indirect, Column::IsMemIndirect);
+            let mut mem_addr_carry = [0u8; 4];
+            if flags.is_mem_indirect {
+                let val_b_bytes_le = val_b.to_le_bytes();
+                let imm_bytes_le = step.imm.to_le_bytes();
+                let mut c: u16 = 0;
+                for i in 0..4 {
+                    let s = val_b_bytes_le[i] as u16 + imm_bytes_le[i] as u16 + c;
+                    c = s >> 8;
+                    mem_addr_carry[i] = c as u8;
+                }
+            }
+            trace.fill_columns_bytes(row, &mem_addr_carry, Column::MemAddrCarry);
             let load_sign_src: u8 = if flags.is_load_i8 {
                 result_bytes[0]
             } else if flags.is_load_i16 {
@@ -3446,6 +3514,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_mem_size_8 = crate::trace::original_base_column!(component_trace, Column::IsMemSize8);
             let f_is_store_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
             let f_is_load_direct = crate::trace::original_base_column!(component_trace, Column::IsLoadDirect);
+            let f_is_mem_indirect = crate::trace::original_base_column!(component_trace, Column::IsMemIndirect);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3495,6 +3564,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_mem_size_8[0].clone());
             tuple.push(f_is_store_direct[0].clone());
             tuple.push(f_is_load_direct[0].clone());
+            tuple.push(f_is_mem_indirect[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

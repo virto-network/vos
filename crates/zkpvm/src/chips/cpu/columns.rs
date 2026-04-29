@@ -624,6 +624,19 @@ pub enum Column {
     /// canonical opcode immediate by Phase 13b).
     #[size = 1]
     IsLoadDirect,
+    /// Phase 26: 1 iff this opcode is one of the *indirect* memory
+    /// ops (LoadInd[U/I][8/16/32/64] / StoreInd[U][8/16/32/64] /
+    /// StoreImmInd[U][8/16/32/64]).  Drives the byte-wise add-with-
+    /// carry chain pinning `MemAddr = (val_b + ImmBytes) mod 2^32`.
+    #[size = 1]
+    IsMemIndirect,
+    /// Phase 26: per-byte carry chain for the MemAddr indirect-
+    /// addressing add `MemAddr = (val_b + ImmBytes) mod 2^32`.
+    /// Carry-out at byte 3 is the 32-bit overflow, discarded.
+    /// Boolean-constrained (val_b[i] + ImmBytes[i] + carry_in ≤ 511,
+    /// carry_out ≤ 1).
+    #[size = 4]
+    MemAddrCarry,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

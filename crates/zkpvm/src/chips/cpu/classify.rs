@@ -123,6 +123,15 @@ pub(super) struct OpcodeFlags {
     /// just the immediate (`addr = imm`); paired with IsStoreDirect
     /// drives the `MemAddr = ImmBytes[0..4]` binding.
     pub is_load_direct: bool,
+    /// Phase 26: 1 iff this opcode is one of the *indirect* memory
+    /// ops — LoadInd[U/I][8/16/32/64] (TwoRegOneImm), StoreInd[U/I]
+    /// [8/16/32/64] (TwoRegOneImm), or StoreImmInd[U][8/16/32/64]
+    /// (OneRegTwoImm).  For all three categories the trace fill
+    /// puts the base register's value into `val_b` (regs[rb] for
+    /// TwoRegOneImm, regs[ra] for OneRegTwoImm via the default
+    /// match arm).  Drives the byte-wise add-with-carry chain
+    /// pinning `MemAddr = (val_b + ImmBytes) mod 2^32`.
+    pub is_mem_indirect: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -229,31 +238,31 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::LoadU8
             => { f.is_load = true; f.is_mem_size_1 = true; f.is_load_direct = true; }
         Opcode::LoadIndU8
-            => { f.is_load = true; f.is_mem_size_1 = true; }
+            => { f.is_load = true; f.is_mem_size_1 = true; f.is_mem_indirect = true; }
         Opcode::LoadU16
             => { f.is_load = true; f.is_mem_size_2 = true; f.is_load_direct = true; }
         Opcode::LoadIndU16
-            => { f.is_load = true; f.is_mem_size_2 = true; }
+            => { f.is_load = true; f.is_mem_size_2 = true; f.is_mem_indirect = true; }
         Opcode::LoadU32
             => { f.is_load = true; f.is_mem_size_4 = true; f.is_load_direct = true; }
         Opcode::LoadIndU32
-            => { f.is_load = true; f.is_mem_size_4 = true; }
+            => { f.is_load = true; f.is_mem_size_4 = true; f.is_mem_indirect = true; }
         Opcode::LoadU64
             => { f.is_load = true; f.is_mem_size_8 = true; f.is_load_direct = true; }
         Opcode::LoadIndU64
-            => { f.is_load = true; f.is_mem_size_8 = true; }
+            => { f.is_load = true; f.is_mem_size_8 = true; f.is_mem_indirect = true; }
         Opcode::LoadI8
             => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; f.is_load_direct = true; }
         Opcode::LoadIndI8
-            => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; }
+            => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; f.is_mem_indirect = true; }
         Opcode::LoadI16
             => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; f.is_load_direct = true; }
         Opcode::LoadIndI16
-            => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; }
+            => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; f.is_mem_indirect = true; }
         Opcode::LoadI32
             => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; f.is_load_direct = true; }
         Opcode::LoadIndI32
-            => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; }
+            => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; f.is_mem_indirect = true; }
         // Stores — split by addressing mode (Phase 24 needs is_store_direct
         // set only on the OneRegOneImm-category direct stores; Ind / Imm
         // / ImmInd handle their source values differently).
@@ -265,13 +274,21 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             => { f.is_store = true; f.is_mem_size_4 = true; f.is_store_direct = true; }
         Opcode::StoreU64
             => { f.is_store = true; f.is_mem_size_8 = true; f.is_store_direct = true; }
-        Opcode::StoreIndU8 | Opcode::StoreImmU8 | Opcode::StoreImmIndU8
+        Opcode::StoreIndU8 | Opcode::StoreImmIndU8
+            => { f.is_store = true; f.is_mem_size_1 = true; f.is_mem_indirect = true; }
+        Opcode::StoreImmU8
             => { f.is_store = true; f.is_mem_size_1 = true; }
-        Opcode::StoreIndU16 | Opcode::StoreImmU16 | Opcode::StoreImmIndU16
+        Opcode::StoreIndU16 | Opcode::StoreImmIndU16
+            => { f.is_store = true; f.is_mem_size_2 = true; f.is_mem_indirect = true; }
+        Opcode::StoreImmU16
             => { f.is_store = true; f.is_mem_size_2 = true; }
-        Opcode::StoreIndU32 | Opcode::StoreImmU32 | Opcode::StoreImmIndU32
+        Opcode::StoreIndU32 | Opcode::StoreImmIndU32
+            => { f.is_store = true; f.is_mem_size_4 = true; f.is_mem_indirect = true; }
+        Opcode::StoreImmU32
             => { f.is_store = true; f.is_mem_size_4 = true; }
-        Opcode::StoreIndU64 | Opcode::StoreImmU64 | Opcode::StoreImmIndU64
+        Opcode::StoreIndU64 | Opcode::StoreImmIndU64
+            => { f.is_store = true; f.is_mem_size_8 = true; f.is_mem_indirect = true; }
+        Opcode::StoreImmU64
             => { f.is_store = true; f.is_mem_size_8 = true; }
         // Jumps (unconditional, non-sequential target)
         Opcode::Jump | Opcode::LoadImmJump
@@ -320,12 +337,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25):
-/// extract the 36 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26):
+/// extract the 37 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 36] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 37] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -343,5 +360,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 36] {
         f.is_mem_size_4 as u8, f.is_mem_size_8 as u8,
         f.is_store_direct as u8,
         f.is_load_direct as u8,
+        f.is_mem_indirect as u8,
     ]
 }

@@ -166,6 +166,11 @@ pub enum PreprocessedColumn {
     /// / LoadI32 / LoadU64).  Paired with IsStoreDirect drives the
     /// MemAddr ↔ ImmBytes[0..4] binding (the `addr = imm` pattern).
     #[size = 1] IsLoadDirect,
+    /// Phase 26: 1 at PCs whose canonical decoding is one of the
+    /// *indirect* memory ops — LoadInd[U/I][8/16/32/64], StoreInd[U]
+    /// [8/16/32/64], or StoreImmInd[U][8/16/32/64].  Drives the
+    /// `MemAddr = (val_b + ImmBytes) mod 2^32` add-with-carry chain.
+    #[size = 1] IsMemIndirect,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -236,6 +241,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_mem_size_8 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemSize8);
         let f_is_store_direct = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStoreDirect);
         let f_is_load_direct = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLoadDirect);
+        let f_is_mem_indirect = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMemIndirect);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -287,6 +293,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_mem_size_8[0].clone());
         tuple.push(f_is_store_direct[0].clone());
         tuple.push(f_is_load_direct[0].clone());
+        tuple.push(f_is_mem_indirect[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -364,6 +371,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsMemSize8,
                     PreprocessedColumn::IsStoreDirect,
                     PreprocessedColumn::IsLoadDirect,
+                    PreprocessedColumn::IsMemIndirect,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -449,6 +457,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_mem_size_8 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemSize8);
         let f_is_store_direct = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStoreDirect);
         let f_is_load_direct = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLoadDirect);
+        let f_is_mem_indirect = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsMemIndirect);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -499,6 +508,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_mem_size_8[0].clone());
         tuple.push(f_is_store_direct[0].clone());
         tuple.push(f_is_load_direct[0].clone());
+        tuple.push(f_is_mem_indirect[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -532,7 +542,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 36],
+    flags: [u8; 37],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }

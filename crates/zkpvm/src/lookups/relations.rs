@@ -31,7 +31,7 @@ stwo_constraint_framework::relation!(
 // can't clear flags to skip per-op constraints — flag values are now
 // pinned to the canonical classify_opcode(opcode) decoding.
 //
-// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24 → 25):
+// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24 → 25 → 26):
 //   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
 //   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
@@ -39,12 +39,12 @@ stwo_constraint_framework::relation!(
 //   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss, is_div_s,
 //   is_load_i8, is_load_i16, is_load_i32,
 //   is_mem_size_1, is_mem_size_2, is_mem_size_4, is_mem_size_8,
-//   is_store_direct, is_load_direct
-pub const PROG_MEMORY_N_FLAGS: usize = 36;
+//   is_store_direct, is_load_direct, is_mem_indirect
+pub const PROG_MEMORY_N_FLAGS: usize = 37;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 36 flags + imm_y_canon[4] + branch_target_canon[4] = 61 limbs.
-//   is_load_direct added in Phase 25 to drive the MemAddr ↔
-//   ImmBytes[0..4] binding on direct-addressing loads/stores.
+//   + 37 flags + imm_y_canon[4] + branch_target_canon[4] = 62 limbs.
+//   is_mem_indirect added in Phase 26 to drive the indirect-
+//   addressing `MemAddr = (val_b + ImmBytes) mod 2^32` carry chain.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(
