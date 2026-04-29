@@ -13,6 +13,7 @@
 //! - `ctx.sleep(n)` — commit state, sleep N ticks, halt
 
 mod actor;
+pub mod client;
 pub mod codec;
 pub mod init;
 pub mod lifecycle;

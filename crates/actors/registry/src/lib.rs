@@ -35,10 +35,9 @@
 
 #![no_std]
 
-extern crate alloc;
-use alloc::format;
-use alloc::string::String;
-use alloc::vec::Vec;
+// `extern crate alloc;` and `use alloc::{format, string::String,
+// vec::Vec};` are emitted by `#[messages]` further down — we
+// don't need to declare them here.
 
 // ── Wire types ─────────────────────────────────────────────────────
 //
@@ -159,23 +158,245 @@ where
 
 // ── Actor ──────────────────────────────────────────────────────────
 //
-// The `#[actor]` + `#[messages]` blocks live in `main.rs`, not
-// here. The `#[messages]` macro emits PVM entry symbols
-// (`_start`, `accumulate`) gated on `target_arch = "riscv64"`;
-// keeping that emission out of the lib means another actor
-// crate can take a regular path-dep on `registry` (for the
-// types and `Client`) without colliding on `_start` at link
-// time.
+// `#[messages]` lives here in the lib so that, when the consumer
+// enables `feature = "host"`, the macro emits the host
+// `RegistryClient` struct alongside the dispatch glue. Hosts
+// (vosx, tests) call `RegistryClient::at(&node, ...).announce(...)`
+// — typed, no manual `Msg` wrangling. The riscv64 PVM entry
+// emission also lives here and propagates from this rlib into
+// `main.rs`'s bin link.
+
+use vos::{actor, messages};
+
+#[actor]
+pub struct Registry {
+    /// Sorted `(name, entry)` pairs. Kept sorted on every
+    /// announce so prefix scans and pagination are simple linear
+    /// walks. We use `Vec` rather than `BTreeMap::range` because
+    /// LLVM's BTreeMap codegen produces PVM-unsupported
+    /// instructions (e.g. `slt` with `x0` as rs1) for the
+    /// riscv64em-javm target.
+    entries: Vec<(String, EntryStored)>,
+    /// Monotone tick counter — incremented on every `announce`
+    /// and `heartbeat`. Surfaced as `Page::clock` so callers can
+    /// age-filter entries.
+    tick: u64,
+}
+
+/// Stored shape — like `RegistryEntry` but without the
+/// redundant `name` field (the entry's tuple slot holds it).
+#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone)]
+#[rkyv(crate = vos::rkyv)]
+struct EntryStored {
+    owner_prefix: u16,
+    service_id: u16,
+    roles: Vec<String>,
+    last_seen: u64,
+}
+
+#[messages]
+impl Registry {
+    fn new() -> Self {
+        Self { entries: Vec::new(), tick: 0 }
+    }
+
+    /// Register or replace `name`. `service_id` and
+    /// `owner_prefix` arrive as u32 because the dynamic `Msg`
+    /// arg system treats integers as u32/u64; we truncate the
+    /// upper half here.
+    #[msg]
+    async fn announce(
+        &mut self,
+        name: String,
+        owner_prefix: u32,
+        service_id: u32,
+        roles: Vec<String>,
+    ) {
+        self.tick += 1;
+        let stored = EntryStored {
+            owner_prefix: owner_prefix as u16,
+            service_id: service_id as u16,
+            roles,
+            last_seen: self.tick,
+        };
+        let mut idx = 0usize;
+        let mut found = false;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                self.entries[idx].1 = stored.clone();
+                found = true;
+                break;
+            }
+            if self.entries[idx].0.as_str() > name.as_str() {
+                break;
+            }
+            idx += 1;
+        }
+        if !found {
+            self.entries.insert(idx, (name, stored));
+        }
+    }
+
+    /// Liveness ping. Bumps the entry's `last_seen` to the
+    /// current `tick`. No-op when the name isn't registered.
+    #[msg]
+    async fn heartbeat(&mut self, name: String) {
+        self.tick += 1;
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                self.entries[idx].1.last_seen = self.tick;
+                return;
+            }
+            idx += 1;
+        }
+    }
+
+    #[msg]
+    async fn remove(&mut self, name: String) {
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                self.entries.remove(idx);
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    /// Resolve a name to its full `ServiceId` u32. Returns 0
+    /// when the name isn't registered. Lighter than `lookup`
+    /// for hosts that only need the address — no rkyv schema
+    /// involved on the caller side.
+    #[msg]
+    async fn resolve(&self, name: String) -> u32 {
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                let stored = &self.entries[idx].1;
+                return ((stored.owner_prefix as u32) << 16) | (stored.service_id as u32);
+            }
+            idx += 1;
+        }
+        0
+    }
+
+    /// Returns rkyv-encoded `RegistryEntry` bytes when the name
+    /// is registered; returns an empty `Vec<u8>` (decoded host-
+    /// side as `Ok(None)`) when it isn't.
+    #[msg]
+    async fn lookup(&self, name: String) -> Vec<u8> {
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                let stored = &self.entries[idx].1;
+                let entry = RegistryEntry {
+                    name,
+                    owner_prefix: stored.owner_prefix,
+                    service_id: stored.service_id,
+                    roles: stored.roles.clone(),
+                    last_seen: stored.last_seen,
+                };
+                return encode_archived(&entry);
+            }
+            idx += 1;
+        }
+        Vec::new()
+    }
+
+    /// Paginated scan. `prefix` filters by leading-slash path,
+    /// `after` is an exclusive cursor (empty = start), `limit`
+    /// is capped at `MAX_PAGE_SIZE`.
+    #[msg]
+    async fn list(&self, prefix: String, after: String, limit: u32) -> Vec<u8> {
+        let page = collect_page(&self.entries, &prefix, &after, limit, &String::new(), self.tick);
+        encode_archived(&page)
+    }
+
+    /// Same shape as `list`, but only entries whose `roles`
+    /// contains `role`.
+    #[msg]
+    async fn by_role(&self, role: String, prefix: String, after: String, limit: u32) -> Vec<u8> {
+        let page = collect_page(&self.entries, &prefix, &after, limit, &role, self.tick);
+        encode_archived(&page)
+    }
+}
+
+/// Shared pagination machinery for `list` and `by_role`.
+fn collect_page(
+    entries: &[(String, EntryStored)],
+    prefix: &str,
+    after: &str,
+    limit: u32,
+    role_filter: &str,
+    clock: u64,
+) -> Page {
+    let mut limit = limit;
+    if limit == 0 || limit > MAX_PAGE_SIZE {
+        limit = MAX_PAGE_SIZE;
+    }
+    let limit = limit as usize;
+
+    let mut out = Vec::new();
+    let mut next = String::new();
+
+    let mut idx = 0usize;
+    while idx < entries.len() {
+        let (name, stored) = &entries[idx];
+        idx += 1;
+
+        if !after.is_empty() && name.as_str() <= after {
+            continue;
+        }
+        if !prefix.is_empty() && !name.starts_with(prefix) {
+            if !out.is_empty() && name.as_str() > prefix {
+                break;
+            }
+            continue;
+        }
+        if !role_filter.is_empty() {
+            let mut has = false;
+            let mut ri = 0usize;
+            while ri < stored.roles.len() {
+                if stored.roles[ri] == role_filter {
+                    has = true;
+                    break;
+                }
+                ri += 1;
+            }
+            if !has {
+                continue;
+            }
+        }
+
+        if out.len() >= limit {
+            if let Some(last) = out.last() {
+                let last: &RegistryEntry = last;
+                next = last.name.clone();
+            }
+            break;
+        }
+        out.push(RegistryEntry {
+            name: name.clone(),
+            owner_prefix: stored.owner_prefix,
+            service_id: stored.service_id,
+            roles: stored.roles.clone(),
+            last_seen: stored.last_seen,
+        });
+    }
+
+    Page { entries: out, next, clock }
+}
 
 // ── Host helpers (`host` feature) ──────────────────────────────────
 //
-// `replication_id` and `Client` are host concerns: deriving the CRDT
-// group, invoking the actor over the local node's invoke routes.
-// Gated on the `host` feature — driver-side code, not std-side.
-// The riscv64 actor build leaves `host` off and pulls neither
-// blake2b_simd nor `vos::node::*`. Once blake2b becomes a host
-// ecall, `replication_id` will route through that and this dep
-// drops out.
+// `replication_id` is host policy — deriving the CRDT group from
+// the hyperspace name. The typed `RegistryClient` is generated
+// by `#[messages]` above (also gated on `host`); see how vosx
+// and the integration tests use it.
+//
+// Once blake2b becomes a host ecall, `replication_id` routes
+// through that and this dep drops out.
 
 /// Derive the 32-byte CRDT replication-id for a hyperspace's
 /// registry. Every node in the same hyperspace ends up in the same
@@ -191,145 +412,7 @@ pub fn replication_id(hyperspace: &str) -> [u8; 32] {
     out
 }
 
-/// Typed host wrapper over `VosNode::invoke` for the registry's
-/// six messages. Ordinary actor — uses the regular invoke plumbing,
-/// no special infra.
-#[cfg(feature = "host")]
-pub struct Client<'a> {
-    node: &'a vos::node::VosNode,
-    target: vos::abi::service::ServiceId,
-}
-
-#[cfg(feature = "host")]
-impl<'a> Client<'a> {
-    /// Bind to the local node's own registry replica at the
-    /// well-known [`SERVICE_ID_RAW`].
-    pub fn local(node: &'a vos::node::VosNode) -> Self {
-        Self::at(node, vos::abi::service::ServiceId(SERVICE_ID_RAW))
-    }
-
-    /// Bind to a registry replica at an explicit `ServiceId`.
-    pub fn at(node: &'a vos::node::VosNode, target: vos::abi::service::ServiceId) -> Self {
-        Self { node, target }
-    }
-
-    pub fn announce(
-        &self,
-        name: &str,
-        owner_prefix: u16,
-        service_id: u16,
-        roles: &[String],
-    ) -> Result<(), ClientError> {
-        let m = vos::value::Msg::new("announce")
-            .with("name", name)
-            .with("owner_prefix", owner_prefix as u32)
-            .with("service_id", service_id as u32)
-            .with("roles", roles.to_vec());
-        self.invoke(m).map(|_| ())
-    }
-
-    pub fn heartbeat(&self, name: &str) -> Result<(), ClientError> {
-        self.invoke(vos::value::Msg::new("heartbeat").with("name", name))
-            .map(|_| ())
-    }
-
-    pub fn remove(&self, name: &str) -> Result<(), ClientError> {
-        self.invoke(vos::value::Msg::new("remove").with("name", name))
-            .map(|_| ())
-    }
-
-    pub fn lookup(&self, name: &str) -> Result<Option<RegistryEntry>, ClientError> {
-        let bytes = self.invoke(vos::value::Msg::new("lookup").with("name", name))?;
-        let value: vos::value::Value = vos::Decode::decode(&bytes);
-        let payload = match value {
-            vos::value::Value::Bytes(b) => b,
-            vos::value::Value::Unit => return Ok(None),
-            other => return Err(ClientError::UnexpectedReply(format!("{other:?}"))),
-        };
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        decode_archived::<RegistryEntry>(&payload)
-            .map(Some)
-            .ok_or(ClientError::Decode)
-    }
-
-    pub fn by_role(&self, role: &str, request: PageRequest) -> Result<Page, ClientError> {
-        let bytes = self.invoke(
-            vos::value::Msg::new("by_role")
-                .with("role", role)
-                .with("prefix", request.prefix.clone())
-                .with("after", request.after.clone())
-                .with("limit", request.limit.min(MAX_PAGE_SIZE)),
-        )?;
-        decode_page(&bytes)
-    }
-
-    pub fn list(&self, request: PageRequest) -> Result<Page, ClientError> {
-        let bytes = self.invoke(
-            vos::value::Msg::new("list")
-                .with("prefix", request.prefix.clone())
-                .with("after", request.after.clone())
-                .with("limit", request.limit.min(MAX_PAGE_SIZE)),
-        )?;
-        decode_page(&bytes)
-    }
-
-    pub fn list_all(&self, prefix: &str) -> Result<Vec<RegistryEntry>, ClientError> {
-        let mut out = Vec::new();
-        let mut after = String::new();
-        loop {
-            let req = PageRequest::new().with_prefix(prefix).with_after(after);
-            let page = self.list(req)?;
-            let next = page.next.clone();
-            out.extend(page.entries);
-            if next.is_empty() { break; }
-            after = next;
-        }
-        Ok(out)
-    }
-
-    fn invoke(&self, msg: vos::value::Msg) -> Result<Vec<u8>, ClientError> {
-        let encoded = vos::Encode::encode(&msg);
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(vos::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        self.node.invoke(self.target, payload).ok_or(ClientError::Unreachable)
-    }
-}
-
-#[cfg(feature = "host")]
-fn decode_page(bytes: &[u8]) -> Result<Page, ClientError> {
-    let value: vos::value::Value = vos::Decode::decode(bytes);
-    let payload = match value {
-        vos::value::Value::Bytes(b) => b,
-        vos::value::Value::Unit => return Ok(Page::empty()),
-        other => return Err(ClientError::UnexpectedReply(format!("{other:?}"))),
-    };
-    if payload.is_empty() {
-        return Ok(Page::empty());
-    }
-    decode_archived::<Page>(&payload).ok_or(ClientError::Decode)
-}
-
-#[cfg(feature = "host")]
-#[derive(Debug)]
-pub enum ClientError {
-    Unreachable,
-    Decode,
-    UnexpectedReply(String),
-}
-
-#[cfg(feature = "host")]
-impl core::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Unreachable => write!(f, "registry: target unreachable"),
-            Self::Decode => write!(f, "registry: failed to decode reply"),
-            Self::UnexpectedReply(s) => write!(f, "registry: unexpected reply: {s}"),
-        }
-    }
-}
-
-#[cfg(feature = "host")]
-impl core::error::Error for ClientError {}
+// `RegistryClient` (the typed host wrapper) is now generated by
+// `#[messages]` above — one method per `#[msg]`, all returning
+// `Result<HandlerReturnType, vos::actors::client::ClientError>`.
+// See the macro emission in `vos-macros`.

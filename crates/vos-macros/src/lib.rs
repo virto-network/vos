@@ -163,6 +163,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
+    // One entry per `#[msg]`: the data the host-Client emission
+    // (gated on `feature = "host"`) needs to generate a typed
+    // method per message — the wire name and the unwrapped
+    // success type.
+    let mut client_methods: Vec<ClientMethodInfo> = Vec::new();
     let mut has_start_handler = false;
     let mut start_returns_result = false;
 
@@ -372,6 +377,41 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         from_msg_arms.push(quote! {
             #msg_name_str => { #from_msg_body }
+        });
+
+        // Stash data for the host-Client emission below. The
+        // wire name is the original snake_case method ident; the
+        // success type unwraps `Result<T, E>` to `T` (clients
+        // surface the `Result` in their own `ClientError`-shaped
+        // return type).
+        let success_ty = match &method.sig.output {
+            ReturnType::Default => None,
+            ReturnType::Type(_, ty) => match result_ok_type(ty) {
+                Some(inner) => {
+                    if matches!(&inner, syn::Type::Tuple(t) if t.elems.is_empty()) {
+                        None
+                    } else {
+                        Some(inner)
+                    }
+                }
+                None => {
+                    if matches!(ty.as_ref(), syn::Type::Tuple(t) if t.elems.is_empty()) {
+                        None
+                    } else {
+                        Some(ty.as_ref().clone())
+                    }
+                }
+            },
+        };
+        let client_args: Vec<(syn::Ident, syn::Type)> = field_names
+            .iter()
+            .cloned()
+            .zip(field_types.iter().cloned())
+            .collect();
+        client_methods.push(ClientMethodInfo {
+            wire_name: method_name.clone(),
+            args: client_args,
+            success_ty,
         });
     }
 
@@ -1164,6 +1204,86 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Host client emission ────────────────────────────────────
+    //
+    // For consumers compiled with `feature = "host"`, generate a
+    // `{Actor}Client` struct + impl with one typed method per
+    // `#[msg]`. Each method calls `VosNode::invoke` on a target
+    // ServiceId (set at construction time), encodes args into a
+    // dynamic `Msg`, and decodes the reply based on the
+    // handler's declared return type.
+    //
+    // Caller crates that don't declare a `host` feature get
+    // nothing — the cfg evaluates false and the items disappear.
+    let client_struct_name = format_ident!("{}Client", actor_name);
+    let client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
+        let method_ident = &m.wire_name;
+        let wire_name = m.wire_name.to_string();
+        let arg_idents: Vec<&syn::Ident> = m.args.iter().map(|(n, _)| n).collect();
+        let arg_types: Vec<&syn::Type> = m.args.iter().map(|(_, t)| t).collect();
+        let arg_decls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, t)| {
+            quote! { #n: #t }
+        }).collect();
+        let with_calls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, _)| {
+            let n_str = n.to_string();
+            quote! { .with(#n_str, #n) }
+        }).collect();
+        let return_ty: proc_macro2::TokenStream = match &m.success_ty {
+            None => quote! { () },
+            Some(t) => quote! { #t },
+        };
+        let value_ident = format_ident!("__value");
+        let decode = client_decode_body(&m.success_ty, &value_ident);
+        let _ = (arg_idents, arg_types); // silence unused — used inline
+        quote! {
+            pub fn #method_ident(
+                &self,
+                #( #arg_decls ),*
+            ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                use vos::Encode;
+                let __msg = vos::value::Msg::new(#wire_name)
+                    #( #with_calls )*;
+                let __encoded = __msg.encode();
+                let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                __payload.push(vos::value::TAG_DYNAMIC);
+                __payload.extend_from_slice(&__encoded);
+                let __reply_bytes = self.node
+                    .invoke(self.target, __payload)
+                    .ok_or(vos::actors::client::ClientError::Unreachable)?;
+                // Unit-returning handlers reply with zero bytes;
+                // shape that as `Value::Unit` so the per-return-type
+                // decoder below doesn't panic in `Decode::decode`.
+                let #value_ident: vos::value::Value = if __reply_bytes.is_empty() {
+                    vos::value::Value::Unit
+                } else {
+                    vos::Decode::decode(&__reply_bytes)
+                };
+                #decode
+            }
+        }
+    }).collect();
+
+    let client_emission = quote! {
+        #[cfg(feature = "host")]
+        pub struct #client_struct_name<'a> {
+            node: &'a vos::node::VosNode,
+            target: vos::abi::service::ServiceId,
+        }
+
+        #[cfg(feature = "host")]
+        impl<'a> #client_struct_name<'a> {
+            /// Bind to an explicit `ServiceId`.
+            pub fn at(
+                node: &'a vos::node::VosNode,
+                target: vos::abi::service::ServiceId,
+            ) -> Self {
+                Self { node, target }
+            }
+
+            #( #client_methods_emit )*
+        }
+    };
+
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
@@ -1173,6 +1293,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #pvm_entries
         #worker_entries
         #wasm_entries
+        #client_emission
     };
 
     expanded.into()
@@ -1236,6 +1357,112 @@ fn result_ok_type(ty: &syn::Type) -> Option<syn::Type> {
     match args.args.first()? {
         syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
+    }
+}
+
+/// Per-message data captured from the `#[messages] impl` block,
+/// used by the host-side client emission. The dispatch path
+/// uses its own per-message data; this is purely for the
+/// generated `{Actor}Client` struct.
+struct ClientMethodInfo {
+    /// Wire name (snake_case ident from the original handler).
+    wire_name: syn::Ident,
+    /// Args excluding `self` and `Context<Self>`.
+    args: Vec<(syn::Ident, syn::Type)>,
+    /// Handler's success type — `T` if the handler returns `T`,
+    /// or the inner `T` if the handler returns `Result<T, E>`.
+    /// `None` means unit.
+    success_ty: Option<syn::Type>,
+}
+
+/// Emit the body of a generated client method's reply-decoding
+/// step. `value_ident` is the local that holds the
+/// already-decoded `vos::value::Value`. The body is an
+/// expression returning `Result<#success_ty, ClientError>`.
+fn client_decode_body(
+    success_ty: &Option<syn::Type>,
+    value_ident: &syn::Ident,
+) -> proc_macro2::TokenStream {
+    use quote::ToTokens;
+    let Some(ty) = success_ty else {
+        return quote! { Ok(()) };
+    };
+    let ty_str = ty.to_token_stream().to_string().replace(' ', "");
+    match ty_str.as_str() {
+        "()" => quote! { Ok(()) },
+        "bool" => quote! {
+            #value_ident.as_bool().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "u8" => quote! {
+            #value_ident.as_u8().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "u16" => quote! {
+            #value_ident.as_u16().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "u32" => quote! {
+            #value_ident.as_u32().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "u64" => quote! {
+            #value_ident.as_u64().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "i32" => quote! {
+            #value_ident.as_i32().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "i64" => quote! {
+            #value_ident.as_i64().ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "String" => quote! {
+            #value_ident.as_str().map(alloc::string::String::from).ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "Vec<u8>" => quote! {
+            match #value_ident {
+                vos::value::Value::Bytes(b) => Ok(b),
+                other => Err(vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", other))),
+            }
+        },
+        "Vec<u32>" => quote! {
+            #value_ident.as_list_u32().map(|s| s.to_vec()).ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        "Vec<String>" => quote! {
+            #value_ident.as_list_str().map(|s| s.to_vec()).ok_or_else(||
+                vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", #value_ident)))
+        },
+        // Anything else: assume rkyv-encoded inside Value::Bytes.
+        _ => quote! {
+            match #value_ident {
+                vos::value::Value::Bytes(b) => {
+                    let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
+                    av.extend_from_slice(&b);
+                    let archived = unsafe {
+                        vos::rkyv::access_unchecked::<<#ty as vos::rkyv::Archive>::Archived>(&av)
+                    };
+                    vos::rkyv::deserialize::<#ty, vos::rkyv::rancor::Error>(archived)
+                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                }
+                other => Err(vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", other))),
+            }
+        },
     }
 }
 
