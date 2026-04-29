@@ -103,6 +103,72 @@ enum Command {
     List {
         manifest: Option<PathBuf>,
     },
+    /// Inspect or interact with the hyperspace registry. The CLI
+    /// runs a transient ephemeral replica, syncs from peers, and
+    /// answers queries locally — no running vosx required as
+    /// long as a peer carrying the registry state is reachable
+    /// (mDNS or `--connect`).
+    Registry {
+        #[command(subcommand)]
+        action: RegistryAction,
+    },
+    /// Resolve a service name (or accept a `0x…` ServiceId) and
+    /// invoke a typed message on it. Same transient-replica
+    /// model as `registry list` — useful for poking running
+    /// services from outside their host process.
+    Invoke {
+        /// Service name (looked up in registry) or a literal
+        /// `0xHEX` ServiceId.
+        target: String,
+        /// Message name (e.g. `inc`, `get`, `lookup`).
+        msg: String,
+        /// Repeatable: `--arg key=value`. Auto-typed: integer
+        /// → u64, `true`/`false` → bool, everything else → str.
+        #[arg(long, value_name = "KEY=VALUE")]
+        arg: Vec<String>,
+        /// Manifest path. Defaults to `space.toml`.
+        manifest: Option<PathBuf>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        /// Seconds to wait for registry sync before resolving
+        /// the target name. Ignored when target is `0x…`.
+        #[arg(long, default_value_t = 3)]
+        sync_timeout: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryAction {
+    /// List entries (optionally restricted to a slash-prefix).
+    List {
+        /// Restrict to names starting with this string.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        manifest: Option<PathBuf>,
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        sync_timeout: u64,
+    },
+    /// Resolve a single name.
+    Lookup {
+        name: String,
+        manifest: Option<PathBuf>,
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        sync_timeout: u64,
+    },
+    /// List entries that advertise the given role.
+    ByRole {
+        role: String,
+        manifest: Option<PathBuf>,
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        sync_timeout: u64,
+    },
 }
 
 fn main() {
@@ -126,6 +192,13 @@ fn main() {
         Some(Command::List { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             cmd_list(&m, &dir);
+        }
+        Some(Command::Registry { action }) => {
+            cmd_registry(action);
+        }
+        Some(Command::Invoke { target, msg, arg, manifest, connect, sync_timeout }) => {
+            let (m, dir) = manifest_from(manifest);
+            cmd_invoke(&m, &dir, &target, &msg, &arg, &connect, sync_timeout);
         }
         None if cli.file.as_ref().is_some_and(|p| !is_manifest(p)) => {
             cmd_run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);
@@ -675,6 +748,382 @@ struct AnnouncePlan {
     owner_prefix: u16,
     service_id: u16,
     roles: Vec<String>,
+}
+
+// ── `vosx registry` / `vosx invoke` (transient query node) ─────────
+//
+// Both commands work the same way: spin up an ephemeral, non-
+// persisting VosNode that joins the manifest's hyperspace, wait
+// briefly for CRDT sync to populate the local registry replica
+// from peers, then run the action and exit. No data dir, no
+// long-lived state — the node is gone after the command returns.
+//
+// Wire encoding for `lookup`/`list`/`by_role` is inlined here
+// rather than pulled from `registry-client`, since vos's binary
+// can't depend on `registry-client` without a cycle (the
+// client crate already depends on `vos`). The encoding is
+// deliberately tiny — a few `Msg::with(...)` calls.
+
+#[cfg(feature = "network")]
+fn cmd_registry(action: RegistryAction) {
+    match action {
+        RegistryAction::List { prefix, manifest, connect, sync_timeout } => {
+            let (m, dir) = manifest_from(manifest);
+            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
+                let prefix_str = prefix.clone().unwrap_or_default();
+                let mut entries: Vec<registry::RegistryEntry> = Vec::new();
+                let mut clock: u64;
+                let mut after = String::new();
+                loop {
+                    let page = match registry_list_page(node, &prefix_str, &after) {
+                        Some(p) => p,
+                        None => die("registry list: invoke failed"),
+                    };
+                    clock = page.clock;
+                    let next = page.next.clone();
+                    entries.extend(page.entries);
+                    if next.is_empty() { break; }
+                    after = next;
+                }
+                if entries.is_empty() {
+                    println!("(no entries)");
+                    return;
+                }
+                println!("clock: {clock}");
+                for e in entries {
+                    let id = vos::abi::service::ServiceId(e.full_service_id());
+                    let age = clock.saturating_sub(e.last_seen);
+                    let roles = if e.roles.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {:?}", e.roles)
+                    };
+                    println!("  {} → {id} (last_seen={}, age={}){roles}",
+                        e.name, e.last_seen, age);
+                }
+            });
+        }
+        RegistryAction::Lookup { name, manifest, connect, sync_timeout } => {
+            let (m, dir) = manifest_from(manifest);
+            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
+                match registry_lookup(node, &name) {
+                    Some(e) => {
+                        let id = vos::abi::service::ServiceId(e.full_service_id());
+                        println!("{} → {id}", e.name);
+                        println!("  last_seen: {}", e.last_seen);
+                        if !e.roles.is_empty() {
+                            println!("  roles: {:?}", e.roles);
+                        }
+                    }
+                    None => {
+                        eprintln!("'{name}' not found");
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+        RegistryAction::ByRole { role, manifest, connect, sync_timeout } => {
+            let (m, dir) = manifest_from(manifest);
+            with_query_node(&m, &dir, &connect, sync_timeout, |node| {
+                let mut entries: Vec<registry::RegistryEntry> = Vec::new();
+                let mut after = String::new();
+                loop {
+                    let page = match registry_by_role_page(node, &role, &after) {
+                        Some(p) => p,
+                        None => die("by_role: invoke failed"),
+                    };
+                    let next = page.next.clone();
+                    entries.extend(page.entries);
+                    if next.is_empty() { break; }
+                    after = next;
+                }
+                if entries.is_empty() {
+                    println!("(no entries with role '{role}')");
+                    return;
+                }
+                for e in entries {
+                    let id = vos::abi::service::ServiceId(e.full_service_id());
+                    println!("  {} → {id}", e.name);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "network")]
+fn registry_invoke_dyn(node: &vos::node::VosNode, msg: vos::value::Msg) -> Option<Vec<u8>> {
+    use vos::value::TAG_DYNAMIC;
+    use vos::Encode;
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    node.invoke_with_timeout(
+        vos::abi::service::ServiceId::REGISTRY,
+        payload,
+        std::time::Duration::from_secs(5),
+    )
+}
+
+#[cfg(feature = "network")]
+fn registry_lookup(node: &vos::node::VosNode, name: &str) -> Option<registry::RegistryEntry> {
+    let bytes = registry_invoke_dyn(node, vos::value::Msg::new("lookup").with("name", name))?;
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    match value {
+        vos::value::Value::Bytes(b) if !b.is_empty() => {
+            registry::decode_archived::<registry::RegistryEntry>(&b)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "network")]
+fn registry_list_page(node: &vos::node::VosNode, prefix: &str, after: &str)
+    -> Option<registry::Page>
+{
+    let m = vos::value::Msg::new("list")
+        .with("prefix", prefix)
+        .with("after", after)
+        .with("limit", registry::DEFAULT_PAGE_SIZE);
+    decode_page_reply(registry_invoke_dyn(node, m)?)
+}
+
+#[cfg(feature = "network")]
+fn registry_by_role_page(node: &vos::node::VosNode, role: &str, after: &str)
+    -> Option<registry::Page>
+{
+    let m = vos::value::Msg::new("by_role")
+        .with("role", role)
+        .with("prefix", "")
+        .with("after", after)
+        .with("limit", registry::DEFAULT_PAGE_SIZE);
+    decode_page_reply(registry_invoke_dyn(node, m)?)
+}
+
+#[cfg(feature = "network")]
+fn decode_page_reply(bytes: Vec<u8>) -> Option<registry::Page> {
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    match value {
+        vos::value::Value::Bytes(b) if !b.is_empty() => {
+            registry::decode_archived::<registry::Page>(&b)
+        }
+        _ => Some(registry::Page::empty()),
+    }
+}
+
+#[cfg(not(feature = "network"))]
+fn cmd_registry(_action: RegistryAction) {
+    die("`vosx registry` requires the `network` feature");
+}
+
+#[cfg(feature = "network")]
+fn cmd_invoke(
+    manifest: &Manifest,
+    dir: &Path,
+    target_str: &str,
+    msg_name: &str,
+    args: &[String],
+    connect: &[String],
+    sync_timeout: u64,
+) {
+    use vos::abi::service::ServiceId;
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    // Argument parsing first so an obvious typo fails fast,
+    // before we waste time spinning up the network.
+    let mut msg = Msg::new(msg_name);
+    for a in args {
+        let (k, v) = a.split_once('=').unwrap_or_else(|| {
+            die(&format!("--arg '{a}' must be 'key=value'"));
+        });
+        msg = match parse_arg_value(v) {
+            ParsedArg::U32(n) => msg.with(k, n),
+            ParsedArg::U64(n) => msg.with(k, n),
+            ParsedArg::Bool(b) => msg.with(k, b),
+            ParsedArg::Str(s) => msg.with(k, s),
+        };
+    }
+
+    with_query_node(manifest, dir, connect, sync_timeout, |node| {
+        let target = if let Some(hex) = target_str.strip_prefix("0x") {
+            let raw = u32::from_str_radix(hex, 16)
+                .unwrap_or_else(|e| die(&format!("invalid 0x ServiceId '{target_str}': {e}")));
+            ServiceId(raw)
+        } else {
+            match registry_lookup(node, target_str) {
+                Some(e) => ServiceId(e.full_service_id()),
+                None => {
+                    eprintln!("'{target_str}' not registered");
+                    std::process::exit(1);
+                }
+            }
+        };
+        eprintln!("vosx: invoking {msg_name} on {target}");
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        let reply = match node.invoke_with_timeout(
+            target, payload, std::time::Duration::from_secs(10),
+        ) {
+            Some(r) => r,
+            None => {
+                eprintln!("invoke: no reply (target unreachable or timed out)");
+                std::process::exit(2);
+            }
+        };
+        // Unit-returning handlers reply with zero bytes — print
+        // a placeholder so the user sees the call completed.
+        if reply.is_empty() {
+            println!("()");
+        } else {
+            let value: vos::value::Value = vos::Decode::decode(&reply);
+            println!("{value:?}");
+        }
+    });
+}
+
+#[cfg(not(feature = "network"))]
+fn cmd_invoke(
+    _manifest: &Manifest,
+    _dir: &Path,
+    _target_str: &str,
+    _msg_name: &str,
+    _args: &[String],
+    _connect: &[String],
+    _sync_timeout: u64,
+) {
+    die("`vosx invoke` requires the `network` feature");
+}
+
+#[cfg(feature = "network")]
+enum ParsedArg { U32(u32), U64(u64), Bool(bool), Str(String) }
+
+/// Parse a `--arg key=value` value. Optional `type:` prefix
+/// pins the wire type (`u32:42`, `u64:42`, `bool:true`,
+/// `str:42`); without one we autotype: `true`/`false` → bool,
+/// integer → u64, anything else → string. Use a prefix when
+/// the actor's handler takes a narrower integer type — `u64`
+/// will silently no-op against a `u32` handler.
+#[cfg(feature = "network")]
+fn parse_arg_value(v: &str) -> ParsedArg {
+    if let Some((ty, rest)) = v.split_once(':') {
+        match ty {
+            "u32" => return ParsedArg::U32(rest.parse::<u32>()
+                .unwrap_or_else(|e| die(&format!("--arg u32:{rest}: {e}")))),
+            "u16" | "u8" => return ParsedArg::U32(rest.parse::<u32>()
+                .unwrap_or_else(|e| die(&format!("--arg {ty}:{rest}: {e}")))),
+            "u64" => return ParsedArg::U64(rest.parse::<u64>()
+                .unwrap_or_else(|e| die(&format!("--arg u64:{rest}: {e}")))),
+            "bool" => return ParsedArg::Bool(rest.parse::<bool>()
+                .unwrap_or_else(|e| die(&format!("--arg bool:{rest}: {e}")))),
+            "str" => return ParsedArg::Str(rest.to_string()),
+            _ => {} // unknown prefix → fall through to autotype
+        }
+    }
+    if v.eq_ignore_ascii_case("true") { return ParsedArg::Bool(true); }
+    if v.eq_ignore_ascii_case("false") { return ParsedArg::Bool(false); }
+    if let Ok(n) = v.parse::<u64>() { return ParsedArg::U64(n); }
+    ParsedArg::Str(v.to_string())
+}
+
+/// Spin up a transient ephemeral node that joins the manifest's
+/// hyperspace, wait briefly for sync, run `f` against it, then
+/// shut down. Used by `vosx registry` and `vosx invoke`.
+///
+/// `sync_timeout_secs` is the upper bound; we exit early once
+/// the registry has at least one entry (or any peer has
+/// completed Hello), whichever happens first.
+#[cfg(feature = "network")]
+fn with_query_node(
+    manifest: &Manifest,
+    dir: &Path,
+    connect: &[String],
+    sync_timeout_secs: u64,
+    f: impl FnOnce(&vos::node::VosNode),
+) {
+    let hyperspace = manifest.hyperspace.as_deref().unwrap_or_else(|| {
+        die("manifest does not declare a `hyperspace`; nothing to query");
+    });
+    let blob_path = manifest.registry_blob.as_ref().map(|p| dir.join(p))
+        .unwrap_or_else(|| die("manifest must set `registry_blob` for query commands"));
+    let blob = load_blob(&blob_path);
+    let rep_id = registry::replication_id(hyperspace);
+
+    // Always listen on a random loopback port — the CLI is a
+    // transient peer; a fixed port would clash with running
+    // instances. Bootstrap from --connect and from manifest.
+    use std::str::FromStr;
+    let listen: libp2p::Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+    let parse = |s: &str| -> Option<libp2p::Multiaddr> {
+        match libp2p::Multiaddr::from_str(s) {
+            Ok(a) => Some(a),
+            Err(e) => { eprintln!("vosx: ignoring bad multiaddr '{s}': {e}"); None }
+        }
+    };
+    let mut bootstrap: Vec<libp2p::Multiaddr> = connect.iter().filter_map(|s| parse(s)).collect();
+    bootstrap.extend(manifest.node.listen.iter().filter_map(|s| parse(s)));
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let local_prefix = vos::network::derive_node_prefix(
+        &libp2p::PeerId::from(keypair.public()),
+    );
+
+    let net = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair,
+        local_prefix,
+        listen: vec![listen],
+        bootstrap,
+    });
+
+    // CRDT replicas require a `data_dir` on disk for their redb;
+    // for the transient CLI we hand them a one-shot tempdir that
+    // we wipe on the way out. The sync-from-peers path doesn't
+    // care that the dir is fresh — it pulls the DAG nodes it
+    // needs over libp2p and commits them locally.
+    let temp_root = std::env::temp_dir().join(format!(
+        "vosx-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    if let Err(e) = std::fs::create_dir_all(&temp_root) {
+        die(&format!("creating tempdir {}: {e}", temp_root.display()));
+    }
+
+    let mut node = vos::node::VosNode::with_prefix(local_prefix);
+    let _ = node.register_at_id(
+        vos::node::AgentConfig::new(blob)
+            .with_consistency(vos::node::Consistency::Crdt)
+            .persist(&temp_root)
+            .with_replication_id(rep_id),
+        vos::abi::service::ServiceId::REGISTRY,
+    );
+    node.attach_network(net);
+    let net_arc = node.network().expect("network was just attached");
+
+    // Wait for sync. Hello-handshake is fast (tens of ms), but
+    // pulling the DAG and replaying takes a couple of sync
+    // intervals (~250ms each). We early-exit only when the
+    // registry actually has entries — `has_peers` alone fires
+    // before any state has flowed.
+    let _ = net_arc; // keep the network alive for the full wait
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(sync_timeout_secs);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let has_entries = registry_list_page(&node, "", "")
+            .map(|p| !p.entries.is_empty())
+            .unwrap_or(false);
+        if has_entries { break; }
+    }
+
+    f(&node);
+
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&temp_root);
 }
 
 /// Background heartbeat loop. Each tick walks `names` and fires
