@@ -571,6 +571,33 @@ pub enum Column {
     /// (lo, 0xF, lo) range check.
     #[size = 1]
     LoadSignHiNib,
+    // ── Phase 21: DivU quotient uniqueness (r < d) ─────────────────────────
+    // Closes the off-by-multiple gap on DivU.  The schoolbook
+    // `q·d + r = b` alone has multiple solutions (e.g. (q, r) and
+    // (q−1, r+d) both satisfy when r+d < 2^64); the standard fix is
+    // to additionally require `r < d`, which uniquely determines the
+    // pair under Euclidean division.
+    //
+    // Encoded byte-wise as the carry chain for `val_d − 1 − div_remainder`
+    // (equivalently `val_d + ~div_remainder` with carry_in[0] = 0):
+    //   DivCmpDiff[i] + DivCmpCarry[i]·256
+    //     = val_d[i] + (255 − div_remainder[i]) + carry_in
+    // The top carry `DivCmpCarry[7]` is 1 iff `val_d > div_remainder`,
+    // i.e.  `r < d`.  Forced to 1 on `is_div_rem · ¬div_by_zero ·
+    // ¬is_div_s` rows.  DivS uniqueness has its own sign-aware
+    // formulation; left for a follow-up.
+    /// Phase 21: byte-level diff for the val_d > div_remainder check.
+    /// Range-checked via BitwiseAnd `(diff, 0xFF, diff)` per row to
+    /// pin each byte to [0, 255] (without range check the prover can
+    /// pick field-level values that satisfy the chain in M31 but not
+    /// as integers).
+    #[size = 8]
+    DivCmpDiff,
+    /// Phase 21: per-byte carry chain for the val_d > div_remainder
+    /// check.  Range max = 1 (val_d[i] + 255 − div_remainder[i] +
+    /// carry_in ≤ 511 with carry_in ≤ 1).  Boolean-constrained.
+    #[size = 8]
+    DivCmpCarry,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

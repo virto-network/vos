@@ -781,6 +781,64 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Phase 21: DivU quotient-uniqueness (r < d)
+        //
+        // Without this, the schoolbook `q·d + r = b` alone is satisfied
+        // by (q, r), (q−1, r+d), (q−2, r+2d), …  A malicious prover
+        // could write `q' = q − 1`, `r' = r + d` and the AIR would
+        // accept — the wrong quotient ends up in the destination
+        // register.  Adding `r < d` (equivalently `val_d > div_remainder`)
+        // forces the unique Euclidean pair.
+        //
+        // Encoded as the carry chain for `val_d − 1 − div_remainder`
+        // (= `val_d + ~div_remainder` with carry_in[0] = 0).  The top
+        // carry is 1 iff `val_d > div_remainder`.  Range-check on
+        // DivCmpDiff bytes (via BitwiseAnd `(diff, 0xFF, diff)`) is
+        // emitted alongside the Phase 17/19/20 sign-bit nibble lookup
+        // block.  DivCmpCarry boolean-constrained on every real row.
+        //
+        // Gate: `is_div_rem · ¬div_by_zero · ¬is_div_s`.  DivS r<d
+        // uniqueness needs |r| < |d| with sign analysis; deferred.
+        {
+            let div_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
+            let div_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::DivCmpCarry);
+            // Boolean carry on every real row (so the range is forced
+            // even on non-divrem rows where DivCmpCarry is unused).
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone() * div_cmp_carry[i].clone()
+                        * (E::F::one() - div_cmp_carry[i].clone())
+                );
+            }
+            // Carry chain (gated on divrem-no-divzero-no-divs).
+            let div_u_active = is_div_rem[0].clone()
+                * (E::F::one() - div_by_zero[0].clone())
+                * (E::F::one() - is_div_s[0].clone());
+            let f_255_p21: E::F = E::F::from(BaseField::from(255));
+            for i in 0..WORD_SIZE {
+                let carry_in = if i == 0 {
+                    E::F::zero()
+                } else {
+                    div_cmp_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    div_u_active.clone() * (
+                        div_cmp_diff[i].clone()
+                            + div_cmp_carry[i].clone() * f256.clone()
+                            - val_d[i].clone()
+                            - f_255_p21.clone()
+                            + div_remainder[i].clone()
+                            - carry_in
+                    )
+                );
+            }
+            // Top carry must be 1 (val_d > div_remainder, i.e. r < d).
+            eval.add_constraint(
+                div_u_active * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // MOVE: result = val_d
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
@@ -1977,12 +2035,30 @@ impl BuiltInComponent for CpuChip {
                     load_sign_bit_pin[0].clone() * eight_p17.clone(),
                 ],
             ));
-            let lo_load = load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17;
+            let lo_load = load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17.clone();
             eval.add_to_relation(RelationEntry::new(
                 bitwise_and_lookup,
                 is_real.clone().into(),
-                &[lo_load.clone(), fifteen_p17, lo_load],
+                &[lo_load.clone(), fifteen_p17.clone(), lo_load],
             ));
+
+            let _ = sixteen_p17; // already consumed via lo_load
+        }
+
+        // Phase 21: range-check DivCmpDiff bytes via Range256 (the
+        // BitwiseLookupChip handles only nibbles, so byte-range needs
+        // the dedicated 256-entry table).  Placed at end before the
+        // sign-bit nibble lookups would otherwise have ended.  8
+        // emissions per real row, gated by is_real, even count.
+        {
+            let div_cmp_diff_p21 = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
+            for i in 0..WORD_SIZE {
+                eval.add_to_relation(RelationEntry::new(
+                    range256_lookup,
+                    is_real.clone().into(),
+                    &[div_cmp_diff_p21[i].clone()],
+                ));
+            }
         }
 
         eval.finalize_logup_in_pairs();
@@ -2601,6 +2677,36 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
             trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
             trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
+
+            // Phase 21: DivCmpDiff / DivCmpCarry chain — pins r < d
+            // on DivU rows.  Computed on every real row (carry chain
+            // for `val_d − 1 − div_remainder = val_d + ~div_remainder`);
+            // gating on `is_div_rem · ¬div_by_zero · ¬is_div_s` happens
+            // at the AIR level, so on non-DivU rows the chain is just
+            // unused but range/boolean constrained for parity.
+            let mut div_cmp_diff = [0u8; WORD_SIZE];
+            let mut div_cmp_carry = [0u8; WORD_SIZE];
+            {
+                let mut c: u16 = 0;
+                for i in 0..WORD_SIZE {
+                    let s = val_d_bytes[i] as u16
+                        + (255u16 - div_remainder[i] as u16)
+                        + c;
+                    div_cmp_diff[i] = (s & 0xFF) as u8;
+                    c = s >> 8;
+                    div_cmp_carry[i] = c as u8;
+                }
+            }
+            trace.fill_columns_bytes(row, &div_cmp_diff, Column::DivCmpDiff);
+            trace.fill_columns_bytes(row, &div_cmp_carry, Column::DivCmpCarry);
+            // 8 Range256 charges for the per-byte range-checks emitted
+            // on every real row.  Collected here, charged after the loop
+            // (mirrors the existing result/cmp_sub range_bytes pattern;
+            // can't call side_note.add_range256 inline because the loop
+            // already holds an immutable borrow of side_note.steps).
+            for &b in &div_cmp_diff {
+                range_bytes.push(b);
+            }
             // Phase 17 / 18: SignBitQ / SignBitR are pinned to bit 7
             // of the multiplexed source byte (div_quotient[7] in
             // 64-bit, div_quotient[3] in 32-bit; same for remainder).
@@ -3467,6 +3573,25 @@ impl BuiltInProverComponent for CpuChip {
                     vec![lo, fifteen_p, lo]
                 },
             );
+
+        }
+
+        // Phase 21: range-check DivCmpDiff bytes via Range256.
+        {
+            let range256_p21: &Range256LookupElements = lookup_elements.as_ref();
+            let is_pad_col_p21 = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+            let div_cmp_diff_cols = crate::trace::original_base_column!(component_trace, Column::DivCmpDiff);
+            for col in &div_cmp_diff_cols {
+                logup.add_to_relation_with(
+                    range256_p21,
+                    [is_pad_col_p21[0].clone()],
+                    |[pad]| {
+                        use stwo::prover::backend::simd::m31::PackedBaseField;
+                        (PackedBaseField::one() - pad).into()
+                    },
+                    &[col.clone()],
+                );
+            }
         }
 
         logup.finalize()

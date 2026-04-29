@@ -276,6 +276,26 @@ fn rem_u64_forged_result_rejected() {
     forge_three_reg_result(Opcode::RemU64, 2, 0, 1, 100, 7, /*forged*/ 1);
 }
 
+// ── Phase 21: DivU r < d uniqueness ──────────────────────────────────────
+//
+// Without `r < d`, the schoolbook `q · d + r = b` alone is satisfied
+// by (q − k, r + k·d) for any k where r + k·d < 2^64 — a malicious
+// prover could write the wrong quotient.  Phase 21 added a per-byte
+// carry chain forcing `val_d > div_remainder` on DivU rows.
+//
+// Coverage caveat — the `forge_three_reg_result` helper only mutates
+// `regs_after[rd]` (the result column = quotient on a div op).  A
+// direct "forge q' = q − 1, r' = r + d" attack needs to also rewrite
+// div_quotient and div_remainder in the trace, which the test
+// harness doesn't expose (no column-level mutator).  The existing
+// div_u64_forged_result_rejected (forge q to 13) already catches a
+// trivial off-by-one through the result-quotient binding.  The new
+// constraint additionally rules out the deeper attack where the
+// prover synchronises q / r to satisfy schoolbook-without-uniqueness;
+// indirect coverage: the regression sweep is green and the new
+// constraint fires on every honest DivU row (any DivU test would
+// fail proving if pinning broke).
+
 // Phase 16: DivS64 with negative operands now proves cleanly thanks to
 // the divrem schoolbook's high-byte sign-correction (DivCorrHi /
 // DivCorrCarry).  Previously the AIR demanded `q·d + r ≡ b mod 2^128`
