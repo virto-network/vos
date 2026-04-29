@@ -1,3 +1,61 @@
+//! # zkpvm — zero-knowledge prover and verifier for PVM bytecode
+//!
+//! A STARK proving system for the **PVM** instruction set used by
+//! the Polkadot Virtual Machine and the Kunekt actor runtime.
+//! Adapted from the Nexus zkVM (Stwo / Circle-STARK over M31),
+//! retargeted at PVM via the `javm` interpreter and ECALL host-call
+//! protocol.
+//!
+//! See the crate-level `README.md` for the full architecture
+//! overview and which opcodes are bound today; `STATUS.md` for
+//! soundness coverage; `PLAN.md` for the remaining phase plan.
+//!
+//! ## Quick start
+//!
+//! ```ignore
+//! use javm::{Interpreter, ExitReason};
+//! use zkpvm::{prove, verify, SideNote};
+//! use zkpvm::core::tracing::TracingPvm;
+//!
+//! let pvm = Interpreter::new(code, bitmask, args, regs, memory, gas, max_steps);
+//! let mut tracing = TracingPvm::new(pvm);
+//! assert_eq!(tracing.run(), ExitReason::Trap);
+//! let steps = tracing.into_trace();
+//!
+//! let mut side_note = SideNote::new(steps, code, bitmask);
+//! let proof = prove(&mut side_note).expect("proving failed");
+//! verify(proof, &side_note).expect("verification failed");
+//! ```
+//!
+//! ## Crate layout
+//!
+//! - [`chips`] — per-chip AIRs and trace generators.  `chips::cpu`
+//!   carries the bulk of the PVM-step constraints; the rest are
+//!   auxiliary lookup tables (memory, register-memory, bitwise,
+//!   power-of-two, range-256, jump-table, blake2b, program-memory,
+//!   program-execution, boundary chips for initial / final state).
+//! - [`core`] — PVM step / opcode / tracing types.  Mirrors
+//!   `javm`'s semantics so trace fill matches the interpreter
+//!   byte-for-byte.
+//! - [`framework`] / [`framework_access`] — Stwo integration glue
+//!   (component registration, claimed-sum collection, lookup
+//!   element propagation).
+//! - [`lookups`] — relation definitions for cross-chip lookups
+//!   (Range256, BitwiseAnd, MemoryAccess, RegisterMemory,
+//!   ProgramMemory, JumpTable, ProgramExecution, Blake2bState,
+//!   Blake2bCall).
+//! - [`trace`] — column-fill helpers + interaction-trace builder.
+//! - [`proof`] — public proof type (serializable).
+//! - `prove` / `verify` / `program_id` — top-level prover / verifier
+//!   API plus the public program-commitment hash.
+//!
+//! ## Features
+//!
+//! - `prover` (default) — trace generation, proof creation, blake3
+//!   commitments, rayon parallelism.  Pulls in heavy deps.
+//! - `--no-default-features` — verifier-only, `no_std` compatible,
+//!   minimal dep tree.
+
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
 // gated out, so many helper fns / structs / consts in always-compiled
