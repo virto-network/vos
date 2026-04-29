@@ -2253,6 +2253,104 @@ fn crdt_counter_restart_replays_state_from_disk() {
 }
 
 #[test]
+fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
+    // Robustness claim: a `panic!()` inside a `#[msg]` handler
+    // must surface to the invoke caller as a `Panicked` error
+    // and leave the agent thread alive so the next message
+    // gets dispatched normally. State must not be corrupted
+    // by the panicked handler — its mutations get rolled back.
+    //
+    // If a handler panic deadlocks the agent thread, every
+    // subsequent invoke times out and the actor is effectively
+    // dead. That'd be a fatal regression for any production
+    // use, so this is a load-bearing test.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_panic_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    let mut node = VosNode::new();
+    let id = node.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_replication_id(rep_id),
+    );
+
+    let counter = CrdtCounterClient::at(&node, id);
+
+    // Build up some state first so we can detect corruption
+    // post-panic.
+    counter.inc(1).expect("inc 1");
+    counter.inc(2).expect("inc 2");
+    assert_eq!(counter.get().expect("get pre-boom"), 2);
+
+    // Trigger the panic. The macro-generated client returns
+    // `ClientError::Unreachable` because `node.invoke` returns
+    // `None` when the actor's invoke pipeline reports a panic.
+    // We don't care about the exact error variant — we care
+    // that (a) the call returns *something* without hanging,
+    // and (b) the agent thread is still alive after.
+    let boom_result = counter.boom();
+    assert!(
+        boom_result.is_err(),
+        "boom() must surface the panic as an error, got Ok: {boom_result:?}",
+    );
+
+    // Now the real probe: agent thread should still be
+    // dispatching, state should be exactly 2 (the panic
+    // mutated nothing observable since `boom` only panics).
+    assert_eq!(
+        counter.get().expect("get post-boom must succeed"),
+        2,
+        "state should be unchanged after a handler panic",
+    );
+
+    // Subsequent writes must still land. This is the test
+    // that fails loudest if the agent thread died on the panic
+    // (the invoke would time out / return Unreachable).
+    counter.inc(3).expect("inc post-boom must succeed");
+    assert_eq!(counter.get().expect("get final"), 3);
+
+    // Hit boom a second time — exercises the recovery path
+    // twice in case the first survival was a fluke.
+    let _ = counter.boom();
+    counter.inc(4).expect("inc after second boom");
+    assert_eq!(counter.get().expect("get final-final"), 4);
+
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(feature = "network")]
 fn crdt_counter_offline_node_catches_up_after_restart() {
     // Cross-node restart: A and B start in sync, both at

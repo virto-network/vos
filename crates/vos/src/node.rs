@@ -1740,13 +1740,19 @@ fn handle_invoke_request(
         });
     }
 
-    // Send the raw reply (or empty Vec if the handler had no
-    // reply, e.g. a `start() -> ()` returning Value::Unit). The
-    // caller's external_invoke unwraps this Option<Vec<u8>> and
-    // packs it into the wire frame. Cap enforced producer-side
-    // — see send_reply_capped.
-    let reply_payload = runtime.take_last_reply(svc_id).unwrap_or_default();
-    send_reply_capped(req.reply_tx, reply_payload, svc_id);
+    // Send the raw reply, or signal a panic by dropping
+    // `reply_tx` so the caller's `recv_timeout` returns
+    // `Err(Disconnected)` (mapped to `None` at the boundary
+    // and surfaced as `ClientError::Unreachable` /
+    // `InvokeError::Panicked` upstream). The runtime
+    // distinguishes "handler ran to completion and returned
+    // `()`" from "handler panicked" by whether
+    // `take_last_reply` returns `Some(_)` (possibly empty,
+    // for unit replies) vs `None` (panic).
+    match runtime.take_last_reply(svc_id) {
+        Some(bytes) => send_reply_capped(req.reply_tx, bytes, svc_id),
+        None => drop(req.reply_tx),
+    }
 
     // Persist whatever state changed (same path as a regular dispatch).
     let state = runtime

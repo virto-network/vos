@@ -576,11 +576,16 @@ impl<D: DataLayer> VosRuntime<D> {
                             let cn = payload.continue_next;
                             let state = payload.state;
                             // Capture the reply bytes for the host's
-                            // synchronous-invoke path. take_last_reply
-                            // pulls them out after run_blocking.
-                            if !payload.reply.is_empty() {
-                                self.last_reply.insert(svc_id, payload.reply.clone());
-                            }
+                            // synchronous-invoke path. Always insert,
+                            // even for empty replies (Unit-returning
+                            // handlers): callers distinguish "handler
+                            // returned ()" from "handler panicked" by
+                            // looking at whether `take_last_reply`
+                            // returns `Some(_)` or `None`. A `None`
+                            // here would conflate the two and let
+                            // panics surface to the host as silent
+                            // success.
+                            self.last_reply.insert(svc_id, payload.reply.clone());
                             journal.absorb_effects(payload.effects, svc_id);
                             (cn, state)
                         } else {

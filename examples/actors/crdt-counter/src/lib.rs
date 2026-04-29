@@ -50,6 +50,16 @@ impl CrdtCounter {
         self.count
     }
 
+    /// Deliberate panic for failure-mode tests. The runtime
+    /// should surface this to the caller as
+    /// `InvokeError::Panicked`, leave the actor's state
+    /// intact, and continue dispatching subsequent messages
+    /// — the next `inc()` after a `boom()` must work.
+    #[msg]
+    async fn boom(&self) {
+        panic!("crdt-counter: boom — deliberate panic for test");
+    }
+
     /// Resolve `name` against the hyperspace registry via the
     /// macro-generated `RegistryActorClient`. The actor-side
     /// client wraps `ctx.ask(REGISTRY, "resolve", ...).await`
