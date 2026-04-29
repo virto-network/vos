@@ -2127,6 +2127,132 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
 }
 
 #[test]
+fn crdt_counter_restart_replays_state_from_disk() {
+    // Core determinism claim: a CRDT actor whose process dies
+    // mid-flight and then comes back against the same data_dir
+    // must replay its EffectLog and rebuild the same state.
+    // No networking — just one node, same redb file across two
+    // VosNode instances, asserting `get()` survives the restart.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    // Initialize tracing so any error! / warn! from the agent
+    // thread surfaces during debugging. No-op if already set
+    // (other tests in this file may have initialized it).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("vos=warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_restart_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Same replication_id derivation cmd_start uses, so this
+    // mirrors what a real `vosx start` would produce.
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // ── First boot: drive three inc() calls, observe count=3 ──
+    let counter_id;
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob.clone())
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        counter_id = id;
+
+        let counter = CrdtCounterClient::at(&node, id);
+        counter.inc(1).expect("inc 1");
+        counter.inc(2).expect("inc 2");
+        counter.inc(3).expect("inc 3");
+        assert_eq!(counter.get().expect("get pre-restart"), 3);
+
+        node.shutdown();
+        let _ = node.collect();
+    } // node + its agent thread fully torn down here.
+
+    // Sanity: the redb file should exist on disk after the
+    // first boot finishes. If it doesn't, persistence isn't
+    // happening and the rest of the test is meaningless.
+    let agents_dir = dir.join("agents");
+    let entries: Vec<_> = std::fs::read_dir(&agents_dir)
+        .expect("agents/ should exist after first boot")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "first boot should have persisted at least one redb under {}",
+        agents_dir.display(),
+    );
+    eprintln!("test: persisted files: {entries:?}");
+
+    // ── Second boot: same dir, fresh VosNode. Replay should
+    //    rebuild state from the on-disk DAG without any
+    //    further `inc()` from us.
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob)
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        // The actor must come back at the same ServiceId for
+        // its persisted DAG to be addressable from on-disk
+        // state. (Same prefix, deterministic local-id allocation.)
+        assert_eq!(id, counter_id, "restarted actor must reuse its ServiceId");
+
+        let counter = CrdtCounterClient::at(&node, id);
+        assert_eq!(
+            counter.get().expect("get post-restart"),
+            3,
+            "restart must replay the three logged incs",
+        );
+
+        // One more inc after restart — confirms the replayed
+        // state isn't a frozen snapshot, the actor really is
+        // alive and writable on the same DAG.
+        counter.inc(4).expect("inc post-restart");
+        assert_eq!(counter.get().expect("get final"), 4);
+
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(feature = "network")]
 fn registry_remove_replicates_across_nodes() {
     // `remove(name)` is one of the registry's six messages and

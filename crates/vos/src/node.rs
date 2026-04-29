@@ -370,6 +370,15 @@ pub struct VosNode {
     /// serialize their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
     pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// Join handles for the per-replica sync threads spawned
+    /// by [`spawn_sync_thread`]. We keep these so [`collect`]
+    /// can wait for the threads to exit before returning —
+    /// otherwise the threads outlive the node, hold open
+    /// `Arc<redb::Database>` references, and the next
+    /// `redb::Database::create` against the same file fails
+    /// with `Database already open. Cannot acquire lock`.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    sync_threads: Vec<thread::JoinHandle<()>>,
 }
 
 /// Shared handle for one CRDT replication group. The same
@@ -808,6 +817,8 @@ impl VosNode {
             shared_network: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            sync_threads: Vec::new(),
         }
     }
 
@@ -1157,14 +1168,15 @@ impl VosNode {
     /// run `soft_restart_crdt` to pick up the new state.
     #[cfg(all(feature = "network", feature = "storage"))]
     fn spawn_sync_thread(
-        &self,
+        &mut self,
         rep_id: [u8; 32],
         slot: ReplicaSlot,
         notifier: Option<mpsc::Sender<()>>,
     ) {
         let shared_network = self.shared_network.clone();
         let shutdown = self.shutdown.clone();
-        thread::spawn(move || sync_loop(rep_id, shared_network, slot, shutdown, notifier));
+        let join = thread::spawn(move || sync_loop(rep_id, shared_network, slot, shutdown, notifier));
+        self.sync_threads.push(join);
     }
 
     /// Install a synchronous-invoke responder under a fresh
@@ -1305,6 +1317,13 @@ impl VosNode {
     /// Collect results from all agent threads. Forces shutdown if
     /// it hasn't already been requested, so callers don't have to
     /// remember the order.
+    ///
+    /// Also joins the per-replica sync threads. Without this,
+    /// they outlive the node and keep `Arc<redb::Database>`
+    /// references live, blocking any subsequent
+    /// `redb::Database::create` against the same file with
+    /// "Database already open. Cannot acquire lock." Restart
+    /// scenarios depend on this join happening.
     pub fn collect(mut self) -> Vec<AgentResult> {
         self.shutdown.store(true, Ordering::Relaxed);
         drop(self.outbox_tx);
@@ -1313,9 +1332,30 @@ impl VosNode {
         // disconnects when the node is winding down.
         self.invoke_routes.lock().unwrap().clear();
         drop(self.invoke_routes); // drop our reference so threads' Arc count drops
-        self.agents.iter_mut()
+
+        // Drop the replica registry so the sync threads' last
+        // reference to each `Arc<redb::Database>` is the one
+        // they hold themselves — once they exit, the underlying
+        // file is unlocked.
+        #[cfg(all(feature = "network", feature = "storage"))]
+        {
+            self.crdt_replicas.lock().unwrap().clear();
+        }
+
+        let agent_results: Vec<AgentResult> = self
+            .agents
+            .iter_mut()
             .filter_map(|h| h.join.take().and_then(|j| j.join().ok()))
-            .collect()
+            .collect();
+
+        // Sync threads poll `shutdown` every SYNC_INTERVAL and
+        // exit on the next tick, so this is a bounded wait.
+        #[cfg(all(feature = "network", feature = "storage"))]
+        for h in self.sync_threads.drain(..) {
+            let _ = h.join();
+        }
+
+        agent_results
     }
 }
 
