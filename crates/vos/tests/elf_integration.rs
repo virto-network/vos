@@ -2402,6 +2402,111 @@ fn crdt_counter_survives_corrupted_persisted_state() {
 }
 
 #[test]
+fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
+    // Robustness probe: the PVM `INVOKE` hostcall's ABI passes
+    // only the *output pointer* (register 11) and no *output
+    // length*. The runtime side (`handle_invoke` →
+    // `record_and_write_invoke` → `kwrite`) writes the full
+    // reply bytes to the caller's PVM memory at that pointer
+    // regardless of how big the caller's actual buffer is.
+    // Guest-side `lifecycle::invoke_raw` allocates a fixed
+    // 4 KiB stack buffer (`BUF_SIZE = 4096`) for `output`. If
+    // an external responder returns more than 4091 bytes
+    // (4 KiB minus the 5-byte status+state_len header) the
+    // runtime overruns the caller's stack inside the PVM
+    // sandbox.
+    //
+    // The probe simulates a misbehaving external responder
+    // that returns 5 KiB. Whatever happens, two invariants
+    // must hold:
+    //
+    //  1. The host-side `VosRuntime` MUST NOT segfault, deadlock,
+    //     or otherwise affect the surrounding test process.
+    //  2. The agent that issued the bad invoke gets a deterministic,
+    //     observable outcome — either the caller is reported as
+    //     panicked (a guest-side bounds check fired during the
+    //     reply unpacking) or the runtime trapped the over-write
+    //     and surfaced a clean error. What MUST NOT happen is the
+    //     caller silently consuming corrupted bytes as a "valid"
+    //     reply and continuing to run.
+    //
+    // The cleanest fix is to extend the INVOKE hostcall ABI with
+    // an output-length argument (use `ecall6` and pass a 6th
+    // register, or pack length into the high bits of `output_ptr`)
+    // and have the runtime cap the kwrite at that length —
+    // returning STATUS_PANICKED when truncation would otherwise
+    // be needed. Until that ABI change lands, the test documents
+    // the current observable behaviour.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+    };
+    let blob = transpile_actor(&agent_data);
+
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    let oversized_target = vos::abi::service::ServiceId(99);
+    let invokes = std::sync::Arc::new(AtomicU32::new(0));
+    let invokes_clone = invokes.clone();
+
+    // External responder returns 5 KiB of zeros — well past the
+    // caller's 4 KiB invoke output buffer. The bytes themselves
+    // don't matter; what's interesting is the *length*.
+    rt.set_external_invoke(Box::new(move |target, _msg| {
+        if target != oversized_target { return None; }
+        invokes_clone.fetch_add(1, Ordering::Relaxed);
+        Some(vec![0u8; 5_000])
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![oversized_target.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(agent_id, Vec::new());
+    // The runtime must terminate (panicked agent or otherwise) —
+    // not hang.  `run_blocking` has its own iteration cap so a
+    // hang here would already trip the test timeout.
+    rt.run_blocking();
+
+    let n = invokes.load(Ordering::Relaxed);
+    assert!(n > 0, "external_invoke handler should have been called at least once");
+
+    // Current behaviour: the runtime writes 5005 bytes into the
+    // caller's 4096-byte stack buffer; the guest's bounds check
+    // on `output[5..n]` in `lifecycle::invoke_raw` fires and the
+    // agent is recorded as panicked. The kwrite is by then a
+    // fait accompli — anything past the buffer in PVM memory
+    // has been clobbered. Containment relies on Rust's
+    // panic-abort taking the agent down before the corrupted
+    // bytes are read.
+    //
+    // If a future fix lands (e.g. the INVOKE ABI gets an
+    // output_len register and the runtime caps the kwrite),
+    // this assertion should be updated to reflect the new
+    // observable shape — STATUS_PANICKED returned cleanly via
+    // InvokeResult without an actual PVM panic, for instance.
+    // Don't make the assertion conditional; a regression that
+    // silently drops the panic *and* lets the agent continue
+    // would mean the caller is consuming corrupted memory.
+    assert!(
+        rt.panics >= 1,
+        "expected at least one PVM panic from the oversized-reply \
+         unpacking, got rt.panics = {} — if the runtime now traps \
+         oversized writes at the kwrite site, update the assertion \
+         to reflect that path", rt.panics,
+    );
+}
+
+#[test]
 fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // Robustness claim: a `panic!()` inside a `#[msg]` handler
     // must surface to the invoke caller as a `Panicked` error
