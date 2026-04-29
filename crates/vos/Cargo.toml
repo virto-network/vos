@@ -49,11 +49,6 @@ libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
 
-[[bin]]
-name = "vosx"
-path = "src/bin/vosx.rs"
-required-features = ["std"]
-
 [dev-dependencies]
 # Tests need typed access to the registry actor — `host` pulls
 # in `Client` and `replication_id`. Cargo allows this dev-dep

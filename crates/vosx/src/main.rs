@@ -404,19 +404,7 @@ fn cmd_start(
     // listen on or connect to is configured, start the libp2p
     // network. Today this just establishes the pipe — peer
     // connections are logged but no actor traffic flows yet.
-    #[cfg(feature = "network")]
     let network = start_network_if_needed(manifest, data_dir.as_deref(), listen_cli, connect_cli);
-    #[cfg(not(feature = "network"))]
-    {
-        if !listen_cli.is_empty() || !connect_cli.is_empty()
-            || !manifest.node.listen.is_empty()
-        {
-            eprintln!(
-                "vosx: warning: --listen / --connect / [node].listen ignored \
-                 (vosx was built without the `network` feature)",
-            );
-        }
-    }
 
     // Sanity: no two declarations share a name across agents,
     // child actors, and workers.
@@ -444,13 +432,10 @@ fn cmd_start(
     // allocated ServiceIds carry the right high 16 bits. Without a
     // network we use prefix 0 — matches the pre-networking
     // single-process behaviour.
-    #[cfg(feature = "network")]
     let mut node = match &network {
         Some(net) => VosNode::with_prefix(net.local_prefix()),
         None => VosNode::new(),
     };
-    #[cfg(not(feature = "network"))]
-    let mut node = VosNode::new();
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
     // role → list of ServiceIds providing it. Init values prefixed
     // with '@' resolve through this map (e.g. peer = "@registry").
@@ -480,7 +465,7 @@ fn cmd_start(
         };
         let elf_data = load_file(&blob_path);
         let blob = load_blob(&blob_path);
-        let rep_id = registry_replication_id(hyperspace_name);
+        let rep_id = registry::replication_id(hyperspace_name);
         let mut cfg = vos::node::AgentConfig::new(blob)
             .with_consistency(vos::node::Consistency::Crdt)
             .with_replication_id(rep_id);
@@ -625,14 +610,10 @@ fn cmd_start(
     // thread for inbound Tells and starts forwarding non-local
     // routes over the wire. After this `network` is owned by
     // `node` — both die together at collect time.
-    #[cfg(feature = "network")]
     let networked = network.is_some();
-    #[cfg(feature = "network")]
     if let Some(net) = network {
         node.attach_network(net);
     }
-    #[cfg(not(feature = "network"))]
-    let networked = false;
 
     // Flush registry announces. Each invoke goes through
     // invoke_routes locally (the registry replica lives on this
@@ -717,7 +698,6 @@ struct AnnouncePlan {
 // No data dir, no long-lived state — the node is gone after the
 // command returns.
 
-#[cfg(feature = "network")]
 fn cmd_invoke(
     manifest: &Manifest,
     dir: &Path,
@@ -752,24 +732,13 @@ fn cmd_invoke(
                 .unwrap_or_else(|e| die(&format!("invalid 0x ServiceId '{target_str}': {e}")));
             ServiceId(raw)
         } else {
-            // Resolve via the registry actor's `resolve(name) ->
-            // u32` message. Returns 0 when the name isn't
-            // registered; we surface that as "not found" since
-            // the registry's own ID (also 0) is never a useful
-            // resolution target.
-            let resolve_msg = Msg::new("resolve").with("name", target_str);
-            let encoded = resolve_msg.encode();
-            let mut payload = Vec::with_capacity(1 + encoded.len());
-            payload.push(TAG_DYNAMIC);
-            payload.extend_from_slice(&encoded);
-            let reply = node.invoke_with_timeout(
-                ServiceId::REGISTRY,
-                payload,
-                std::time::Duration::from_secs(5),
-            ).unwrap_or_else(|| die(&format!("resolve '{target_str}': registry unreachable")));
-            let value: vos::value::Value = vos::Decode::decode(&reply);
-            let id = value.as_u32().unwrap_or_else(||
-                die(&format!("resolve '{target_str}': unexpected reply {value:?}")));
+            // Resolve via the macro-generated `RegistryClient`.
+            // Returns 0 when the name isn't registered; we surface
+            // that as "not found" since the registry's own ID
+            // (also 0) is never a useful resolution target.
+            let id = registry::RegistryClient::at(node, ServiceId::REGISTRY)
+                .resolve(target_str.to_string())
+                .unwrap_or_else(|e| die(&format!("resolve '{target_str}': {e}")));
             if id == 0 {
                 eprintln!("'{target_str}' not registered");
                 std::process::exit(1);
@@ -801,20 +770,6 @@ fn cmd_invoke(
     });
 }
 
-#[cfg(not(feature = "network"))]
-fn cmd_invoke(
-    _manifest: &Manifest,
-    _dir: &Path,
-    _target_str: &str,
-    _msg_name: &str,
-    _args: &[String],
-    _connect: &[String],
-    _sync_timeout: u64,
-) {
-    die("`vosx invoke` requires the `network` feature");
-}
-
-#[cfg(feature = "network")]
 enum ParsedArg { U32(u32), U64(u64), Bool(bool), Str(String) }
 
 /// Parse a `--arg key=value` value. Optional `type:` prefix
@@ -823,7 +778,7 @@ enum ParsedArg { U32(u32), U64(u64), Bool(bool), Str(String) }
 /// integer → u64, anything else → string. Use a prefix when
 /// the actor's handler takes a narrower integer type — `u64`
 /// will silently no-op against a `u32` handler.
-#[cfg(feature = "network")]
+
 fn parse_arg_value(v: &str) -> ParsedArg {
     if let Some((ty, rest)) = v.split_once(':') {
         match ty {
@@ -852,7 +807,7 @@ fn parse_arg_value(v: &str) -> ParsedArg {
 /// `sync_timeout_secs` is the upper bound; we exit early once
 /// the registry has at least one entry (or any peer has
 /// completed Hello), whichever happens first.
-#[cfg(feature = "network")]
+
 fn with_query_node(
     manifest: &Manifest,
     dir: &Path,
@@ -866,7 +821,7 @@ fn with_query_node(
     let blob_path = manifest.registry_blob.as_ref().map(|p| dir.join(p))
         .unwrap_or_else(|| die("manifest must set `registry_blob` for query commands"));
     let blob = load_blob(&blob_path);
-    let rep_id = registry_replication_id(hyperspace);
+    let rep_id = registry::replication_id(hyperspace);
 
     // Always listen on a random loopback port — the CLI is a
     // transient peer; a fixed port would clash with running
@@ -993,50 +948,25 @@ fn heartbeat_loop(
 }
 
 /// Send an `announce(...)` invoke for every plan to the local
-/// registry. Inlines the wire encoding: vosx doesn't depend on
-/// the `registry` crate (which would form a cargo cycle through
-/// `registry → vos`), so we build the `Msg` ourselves like any
-/// other caller would.
+/// registry via the macro-generated `RegistryClient`. The local
+/// replica fans out via the CRDT layer; on a single-host setup
+/// this is just a same-process invoke.
 fn flush_registry_announces(node: &vos::node::VosNode, plans: &[AnnouncePlan]) {
-    use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
+    let client = registry::RegistryClient::at(node, vos::abi::service::ServiceId::REGISTRY);
     for plan in plans {
-        let m = Msg::new("announce")
-            .with("name", plan.name.clone())
-            .with("owner_prefix", plan.owner_prefix as u32)
-            .with("service_id", plan.service_id as u32)
-            .with("roles", plan.roles.clone());
-        let encoded = m.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        let reply = node.invoke_with_timeout(
-            vos::abi::service::ServiceId::REGISTRY,
-            payload,
-            std::time::Duration::from_secs(2),
-        );
-        if reply.is_none() {
-            eprintln!("vosx: warning: registry announce for '{}' returned no reply", plan.name);
-        } else {
-            eprintln!("vosx: registered '{}' in registry", plan.name);
+        match client.announce(
+            plan.name.clone(),
+            plan.owner_prefix as u32,
+            plan.service_id as u32,
+            plan.roles.clone(),
+        ) {
+            Ok(()) => eprintln!("vosx: registered '{}' in registry", plan.name),
+            Err(e) => eprintln!(
+                "vosx: warning: registry announce for '{}' failed: {e}",
+                plan.name,
+            ),
         }
     }
-}
-
-/// Derive the 32-byte CRDT replication-id for a hyperspace's
-/// registry. Inlined in vosx (rather than imported from the
-/// `registry` crate) because vosx can't take a regular dep on
-/// `registry` without forming a `vos → registry → vos` cycle.
-/// Tests in `crates/vos/tests` import the same derivation from
-/// `registry` via dev-deps; the two functions must agree.
-fn registry_replication_id(hyperspace: &str) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-registry/v1");
-    h.update(&[0u8]);
-    h.update(hyperspace.as_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -1401,7 +1331,7 @@ struct WorkerDef {
     init: BTreeMap<String, toml::Value>,
 }
 
-#[cfg(feature = "network")]
+
 fn start_network_if_needed(
     manifest: &Manifest,
     data_dir: Option<&Path>,

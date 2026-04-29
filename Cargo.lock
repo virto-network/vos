@@ -3817,6 +3817,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vosx"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "clap",
+ "grey-transpiler",
+ "libp2p",
+ "registry",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vos",
+]
+
+[[package]]
 name = "w3f-pcs"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

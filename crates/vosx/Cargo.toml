@@ -1,0 +1,36 @@
+[package]
+name = "vosx"
+description = "vosx — host CLI for the VOS runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vos = { path = "../vos", features = ["std", "http", "storage", "network"] }
+# Direct dep for ELF → PVM blob conversion. vos uses it
+# transitively but doesn't re-export, so vosx pulls its own.
+grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler" }
+# Registry actor lib + the macro-generated host `RegistryClient`.
+# Used by `flush_registry_announces`, the auto-heartbeat thread,
+# and `cmd_invoke`'s name-resolution path. Now that vosx is a
+# separate crate the old `vos → registry → vos` cycle is gone:
+# `registry → vos` and `vosx → {vos, registry}` is acyclic.
+registry = { path = "../actors/registry", features = ["host"] }
+
+# CLI / serde
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Used only by the auto-derive replication-id helper for
+# CRDT actors that don't pin a group manually. The registry's
+# own group-id derivation lives behind `registry::replication_id`.
+blake2b_simd = "1"
+
+# libp2p multiaddr parsing for `--listen` / `--connect`. The
+# rest of the network plumbing is owned by `vos::network`.
+libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"] }
