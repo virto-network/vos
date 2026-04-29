@@ -42,7 +42,7 @@
 //! use case is "two operators run the same manifest with
 //! different kick-off messages".
 
-use crate::die;
+use crate::util::die;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
