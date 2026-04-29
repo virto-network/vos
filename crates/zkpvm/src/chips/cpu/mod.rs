@@ -1161,6 +1161,57 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Phase 22: pin MemByteActive to a prefix-1 pattern of length MemSize
+        //
+        // Until Phase 22 the AIR only used MemByteActive as the lookup
+        // multiplicity for byte-level memory accesses; its shape was
+        // prover-witnessed.  A malicious prover could set MemByteActive
+        // to a non-prefix pattern (e.g. [1,0,1,0,...]) or pick MemSize
+        // inconsistent with the active-byte count.  Phase 22 forces:
+        //   1. each MemByteActive[i] is boolean,
+        //   2. monotonic (active[i+1]=1 ⇒ active[i]=1) — prefix-1 shape,
+        //   3. MemSize equals the number of active bytes,
+        //   4. MemSize ∈ {0, 1, 2, 4, 8}  (the valid PVM access widths).
+        //
+        // Combined, these uniquely determine MemByteActive from MemSize.
+        // Out of scope: pinning MemSize itself to the opcode-canonical
+        // size (would need IsLoadU8/U16/U32/U64 + IsStoreU8/U16/U32/U64
+        // flags through ProgramMemoryChip).
+        {
+            let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
+            // Boolean per byte.  Gate by is_real so padding rows
+            // (MemByteActive = 0) trivially satisfy this without
+            // forcing extra zeros.
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone()
+                        * mem_byte_active[i].clone()
+                        * (E::F::one() - mem_byte_active[i].clone())
+                );
+            }
+            // Monotonicity: active[i+1] = 1 ⇒ active[i] = 1.  Encoded
+            // as `active[i+1] · (1 - active[i]) = 0`.
+            for i in 0..WORD_SIZE - 1 {
+                eval.add_constraint(
+                    is_real.clone()
+                        * mem_byte_active[i + 1].clone()
+                        * (E::F::one() - mem_byte_active[i].clone())
+                );
+            }
+            // MemSize equals the count of active bytes.
+            let mut active_sum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                active_sum += mem_byte_active[i].clone();
+            }
+            eval.add_constraint(
+                is_real.clone() * (mem_size[0].clone() - active_sum)
+            );
+            // (Valid-size constraint deferred — degree-6 polynomial
+            // exceeds CpuChip's bound; would need an alternative
+            // formulation, e.g. per-size flags pinned by ProgramMemory.)
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // Program execution lookup: step sequencing
         // ════════════════════════════════════════════════════════════════════
         {
