@@ -1204,11 +1204,12 @@ fn runtime_multiple_services_same_blob() {
 #[test]
 fn crdt_counter_local_invoke_smoke() {
     // Sanity check: drive the crdt-counter actor in a single
-    // VosNode (no replication) and verify inc/get round-trip
-    // through invoke. Pre-flight for the cross-node test below.
+    // VosNode (no replication) using the macro-generated typed
+    // `CrdtCounterClient`. inc returns (), get returns u64 —
+    // both come from the actor's `#[msg]` signatures, no manual
+    // `Msg::new(...)` plumbing needed.
+    use crdt_counter::CrdtCounterClient;
     use vos::node::{AgentConfig, VosNode};
-    use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -1223,29 +1224,10 @@ fn crdt_counter_local_invoke_smoke() {
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(blob));
 
-    let inc = |tag: u32| {
-        let m = Msg::new("inc").with("tag", tag);
-        let encoded = m.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        payload
-    };
-    let get = || {
-        let m = Msg::new("get");
-        let encoded = m.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        payload
-    };
-
-    let _ = node.invoke(id, inc(1)).expect("inc returns");
-    let _ = node.invoke(id, inc(2)).expect("inc returns");
-    let get_reply = node.invoke(id, get()).expect("get returns");
-    assert!(!get_reply.is_empty(), "get() should reply with encoded u64");
-    let v: vos::value::Value = vos::Decode::decode(&get_reply);
-    assert_eq!(v.as_u64(), Some(2));
+    let counter = CrdtCounterClient::at(&node, id);
+    counter.inc(1).expect("inc 1");
+    counter.inc(2).expect("inc 2");
+    assert_eq!(counter.get().expect("get"), 2);
 
     node.shutdown();
     let _ = node.collect();

@@ -677,6 +677,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crdt-counter"
+version = "0.1.0"
+dependencies = [
+ "registry",
+ "vos",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3779,6 +3787,7 @@ dependencies = [
  "async-trait",
  "blake2b_simd",
  "clap",
+ "crdt-counter",
  "dlmalloc",
  "grey-transpiler",
  "javm",

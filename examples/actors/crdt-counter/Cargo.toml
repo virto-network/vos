@@ -5,6 +5,21 @@ name = "crdt-counter"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# When set on a host consumer, `#[messages]` emits the typed
+# `CrdtCounterClient` (see registry/Cargo.toml for the same
+# convention). Off for the riscv64 actor build.
+default = []
+host = []
+
+[lib]
+name = "crdt_counter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crdt-counter"
+path = "src/main.rs"
+
 [dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
 # Registry actor's lib portion: types + the macro-generated

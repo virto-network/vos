@@ -60,3 +60,4 @@ required-features = ["std"]
 # cycle (registry → vos) because dev-deps don't participate in
 # the regular dep graph; only test/example builds activate it.
 registry = { path = "../actors/registry", features = ["host"] }
+crdt-counter = { path = "../../examples/actors/crdt-counter", features = ["host"] }
