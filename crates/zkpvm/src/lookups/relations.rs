@@ -31,17 +31,18 @@ stwo_constraint_framework::relation!(
 // can't clear flags to skip per-op constraints — flag values are now
 // pinned to the canonical classify_opcode(opcode) decoding.
 //
-// Flag layout in the tuple, in order (Phase 13c → 12c → 16):
+// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20):
 //   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
 //   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
 //   is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind,
-//   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss, is_div_s
-pub const PROG_MEMORY_N_FLAGS: usize = 27;
+//   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss, is_div_s,
+//   is_load_i8, is_load_i16, is_load_i32
+pub const PROG_MEMORY_N_FLAGS: usize = 30;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 27 flags + imm_y_canon[4] + branch_target_canon[4] = 52 limbs.
-//   is_div_s added in Phase 16 to drive the divrem schoolbook
-//   sign-correction.
+//   + 30 flags + imm_y_canon[4] + branch_target_canon[4] = 55 limbs.
+//   is_load_i8/16/32 added in Phase 20 to drive the inactive-byte
+//   sign-extension binding for signed loads.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(

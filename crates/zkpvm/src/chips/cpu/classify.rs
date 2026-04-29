@@ -90,6 +90,15 @@ pub(super) struct OpcodeFlags {
     /// fails proving — the schoolbook's high bytes aren't zero in
     /// two's-complement.
     pub is_div_s: bool,
+    /// Phase 20: per-size signed-load flags (covers direct + indirect
+    /// variants: LoadI8 / LoadIndI8 → is_load_i8, etc.).  Drive the
+    /// inactive-byte sign-extension binding for `result[i]` on
+    /// `i ≥ MemSize`.  Without this, a prover could write garbage in
+    /// the high bytes of a load result; the interpreter writes
+    /// `0xFF · sign_bit` for signed loads (and `0` for unsigned).
+    pub is_load_i8: bool,
+    pub is_load_i16: bool,
+    pub is_load_i32: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -190,11 +199,15 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_div_s = true; }
         Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; f.is_div_s = true; }
         // Loads
-        Opcode::LoadU8 | Opcode::LoadI8 | Opcode::LoadU16 | Opcode::LoadI16
-        | Opcode::LoadU32 | Opcode::LoadI32 | Opcode::LoadU64
-        | Opcode::LoadIndU8 | Opcode::LoadIndI8 | Opcode::LoadIndU16 | Opcode::LoadIndI16
-        | Opcode::LoadIndU32 | Opcode::LoadIndI32 | Opcode::LoadIndU64
+        Opcode::LoadU8 | Opcode::LoadU16 | Opcode::LoadU32 | Opcode::LoadU64
+        | Opcode::LoadIndU8 | Opcode::LoadIndU16 | Opcode::LoadIndU32 | Opcode::LoadIndU64
             => { f.is_load = true; }
+        Opcode::LoadI8 | Opcode::LoadIndI8
+            => { f.is_load = true; f.is_load_i8 = true; }
+        Opcode::LoadI16 | Opcode::LoadIndI16
+            => { f.is_load = true; f.is_load_i16 = true; }
+        Opcode::LoadI32 | Opcode::LoadIndI32
+            => { f.is_load = true; f.is_load_i32 = true; }
         // Stores
         Opcode::StoreU8 | Opcode::StoreU16 | Opcode::StoreU32 | Opcode::StoreU64
         | Opcode::StoreIndU8 | Opcode::StoreIndU16 | Opcode::StoreIndU32 | Opcode::StoreIndU64
@@ -248,12 +261,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16):
-/// extract the 27 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20):
+/// extract the 30 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 27] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 30] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -266,5 +279,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 27] {
         f.is_load_imm_jump_ind as u8,
         f.is_mul_upper_uu as u8, f.is_mul_upper_su as u8, f.is_mul_upper_ss as u8,
         f.is_div_s as u8,
+        f.is_load_i8 as u8, f.is_load_i16 as u8, f.is_load_i32 as u8,
     ]
 }

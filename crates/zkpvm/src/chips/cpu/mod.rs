@@ -1488,6 +1488,9 @@ impl BuiltInComponent for CpuChip {
             let f_is_mul_upper_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
             let f_is_mul_upper_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
             let f_is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
+            let f_is_load_i8 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
+            let f_is_load_i16 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
+            let f_is_load_i32 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -1527,6 +1530,9 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_mul_upper_su[0].clone());
             tuple.push(f_is_mul_upper_ss[0].clone());
             tuple.push(f_is_div_s[0].clone());
+            tuple.push(f_is_load_i8[0].clone());
+            tuple.push(f_is_load_i16[0].clone());
+            tuple.push(f_is_load_i32[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -1711,11 +1717,11 @@ impl BuiltInComponent for CpuChip {
         // Result to the register-memory ledger and MemValue to the memory
         // ledger separately, but never equated them within the load step.
         //
-        // Inactive bytes (i >= MemSize): for unsigned loads they must be
-        // zero, for signed loads 0xFF · sign_bit.  Tightening the inactive-
-        // byte constraint requires a per-variant IsLoadSigned flag; defer
-        // that piece.  The active-byte binding here is the load-bearing
-        // part of the fix.  Pure ground constraint, parity-neutral.
+        // Inactive bytes (i >= MemSize): unsigned loads must be 0,
+        // signed loads must be 0xFF · sign_bit_of_top_active_byte.
+        // Phase 20 closes this gap — see "Phase 20: signed-load
+        // inactive-byte sign-extension" block below for the
+        // pinning + per-byte equality constraint.
         let is_load_local = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
         for i in 0..WORD_SIZE {
             eval.add_constraint(
@@ -1723,6 +1729,59 @@ impl BuiltInComponent for CpuChip {
                     * mem_byte_active[i].clone()
                     * (result[i].clone() - mem_value[i].clone()),
             );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 20: signed-load inactive-byte sign-extension
+        //
+        // For load rows, every inactive byte (mem_byte_active[i] = 0)
+        // must equal 0xFF · LoadSignBit:
+        //   - Unsigned loads: IsLoadI8 = IsLoadI16 = IsLoadI32 = 0 →
+        //     LoadSignSrc = 0 → LoadSignBit = 0 → result[i] = 0.
+        //   - Signed loads: LoadSignSrc multiplexes the highest active
+        //     byte (result[0] for I8, result[1] for I16, result[3] for
+        //     I32); LoadSignBit pins to its bit 7 via a nibble-AND
+        //     lookup (block placed alongside Phase 17 sign-bit pins).
+        //     result[i] = 0xFF · LoadSignBit for all inactive bytes.
+        //
+        // This closes the gap where a prover could write garbage into
+        // the high bytes of a load result.  The interpreter writes 0
+        // (unsigned) / 0xFF (signed-extended) per the JAVM spec.
+        {
+            let f_is_load_i8 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
+            let f_is_load_i16 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
+            let f_is_load_i32 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
+            let load_sign_src = crate::trace::trace_eval!(trace_eval, Column::LoadSignSrc);
+            let load_sign_bit = crate::trace::trace_eval!(trace_eval, Column::LoadSignBit);
+
+            // Boolean witnesses + at-most-one-active.
+            for f in [&f_is_load_i8, &f_is_load_i16, &f_is_load_i32] {
+                eval.add_constraint(f[0].clone() * (E::F::one() - f[0].clone()));
+            }
+            // Mutex: sum ≤ 1.  Combined with each being boolean and
+            // gated to only fire on signed-load opcodes (via the
+            // ProgramMemory consumer pinning the canonical decoding),
+            // exactly one is 1 on a signed-load row.
+
+            // LoadSignSrc multiplex.
+            eval.add_constraint(
+                load_sign_src[0].clone()
+                    - f_is_load_i8[0].clone() * result[0].clone()
+                    - f_is_load_i16[0].clone() * result[1].clone()
+                    - f_is_load_i32[0].clone() * result[3].clone()
+            );
+
+            // Inactive-byte binding for all loads: result[i] = 0xFF · LoadSignBit
+            // when mem_byte_active[i] = 0.  Skip i=0 (always active for any
+            // non-zero MemSize, so mem_byte_active[0] = 1 ⇒ gate = 0).
+            let f_ff_p20: E::F = E::F::from(BaseField::from(255));
+            for i in 1..WORD_SIZE {
+                eval.add_constraint(
+                    is_load_local[0].clone()
+                        * (E::F::one() - mem_byte_active[i].clone())
+                        * (result[i].clone() - f_ff_p20.clone() * load_sign_bit[0].clone())
+                );
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1898,11 +1957,31 @@ impl BuiltInComponent for CpuChip {
                     sign_bit_result[0].clone() * eight_p17.clone(),
                 ],
             ));
-            let lo_res = result[3].clone() - result_hi[0].clone() * sixteen_p17;
+            let lo_res = result[3].clone() - result_hi[0].clone() * sixteen_p17.clone();
             eval.add_to_relation(RelationEntry::new(
                 bitwise_and_lookup,
                 is_real.clone().into(),
-                &[lo_res.clone(), fifteen_p17, lo_res],
+                &[lo_res.clone(), fifteen_p17.clone(), lo_res],
+            ));
+
+            // Phase 20: LoadSignBit — pin to bit 7 of LoadSignSrc.
+            let load_sign_bit_pin = crate::trace::trace_eval!(trace_eval, Column::LoadSignBit);
+            let load_sign_hi = crate::trace::trace_eval!(trace_eval, Column::LoadSignHiNib);
+            let load_sign_src_pin = crate::trace::trace_eval!(trace_eval, Column::LoadSignSrc);
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[
+                    load_sign_hi[0].clone(),
+                    eight_p17.clone(),
+                    load_sign_bit_pin[0].clone() * eight_p17.clone(),
+                ],
+            ));
+            let lo_load = load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17;
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_and_lookup,
+                is_real.clone().into(),
+                &[lo_load.clone(), fifteen_p17, lo_load],
             ));
         }
 
@@ -2576,6 +2655,27 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_exit, Column::IsExit);
             trace.fill_columns(row, flags.is_load, Column::IsLoad);
             trace.fill_columns(row, flags.is_store, Column::IsStore);
+            // Phase 20: signed-load flags + sign-bit pinning.
+            trace.fill_columns(row, flags.is_load_i8, Column::IsLoadI8);
+            trace.fill_columns(row, flags.is_load_i16, Column::IsLoadI16);
+            trace.fill_columns(row, flags.is_load_i32, Column::IsLoadI32);
+            let load_sign_src: u8 = if flags.is_load_i8 {
+                result_bytes[0]
+            } else if flags.is_load_i16 {
+                result_bytes[1]
+            } else if flags.is_load_i32 {
+                result_bytes[3]
+            } else {
+                0
+            };
+            let load_sign_bit: u8 = (load_sign_src >> 7) & 1;
+            let load_sign_hi: u8 = load_sign_src >> 4;
+            let load_sign_lo: u8 = load_sign_src & 0xF;
+            trace.fill_columns(row, load_sign_src, Column::LoadSignSrc);
+            trace.fill_columns(row, load_sign_bit, Column::LoadSignBit);
+            trace.fill_columns(row, load_sign_hi, Column::LoadSignHiNib);
+            *side_note.bitwise_and_counts.entry((load_sign_hi, 8)).or_insert(0) += 1;
+            *side_note.bitwise_and_counts.entry((load_sign_lo, 0xF)).or_insert(0) += 1;
             let mem = step.mem_read.as_ref().or(step.mem_write.as_ref());
             if let Some(m) = mem {
                 trace.fill_columns_bytes(row, &m.address.to_le_bytes(), Column::MemAddr);
@@ -3081,6 +3181,9 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_mul_upper_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
             let f_is_mul_upper_ss = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSS);
             let f_is_div_s = crate::trace::original_base_column!(component_trace, Column::IsDivS);
+            let f_is_load_i8 = crate::trace::original_base_column!(component_trace, Column::IsLoadI8);
+            let f_is_load_i16 = crate::trace::original_base_column!(component_trace, Column::IsLoadI16);
+            let f_is_load_i32 = crate::trace::original_base_column!(component_trace, Column::IsLoadI32);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -3121,6 +3224,9 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_mul_upper_su[0].clone());
             tuple.push(f_is_mul_upper_ss[0].clone());
             tuple.push(f_is_div_s[0].clone());
+            tuple.push(f_is_load_i8[0].clone());
+            tuple.push(f_is_load_i16[0].clone());
+            tuple.push(f_is_load_i32[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
@@ -3330,6 +3436,34 @@ impl BuiltInProverComponent for CpuChip {
                 3,
                 |i| {
                     let lo = src_res.at(i) - hi_res2.at(i) * sixteen_p;
+                    vec![lo, fifteen_p, lo]
+                },
+            );
+
+            // Phase 20: LoadSignBit — pin to bit 7 of LoadSignSrc.
+            let load_sign_src = crate::trace::original_base_column!(component_trace, Column::LoadSignSrc);
+            let load_sign_bit_col = crate::trace::original_base_column!(component_trace, Column::LoadSignBit);
+            let load_sign_hi_col = crate::trace::original_base_column!(component_trace, Column::LoadSignHiNib);
+            let hi_load = load_sign_hi_col[0].clone();
+            let bit_load = load_sign_bit_col[0].clone();
+            let pad_load1 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_load1],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| vec![hi_load.at(i), eight_p, bit_load.at(i) * eight_p],
+            );
+            let src_load = load_sign_src[0].clone();
+            let hi_load2 = load_sign_hi_col[0].clone();
+            let pad_load2 = is_pad_col[0].clone();
+            logup.add_to_relation_computed(
+                bitwise_and,
+                [pad_load2],
+                |[p]| (one_p - p).into(),
+                3,
+                |i| {
+                    let lo = src_load.at(i) - hi_load2.at(i) * sixteen_p;
                     vec![lo, fifteen_p, lo]
                 },
             );

@@ -541,6 +541,36 @@ pub enum Column {
     /// range-check lookup so `result[3] = 16·HiNib + LoNib` is pinned.
     #[size = 1]
     ResultHiNib,
+    // ── Phase 20: signed-load inactive-byte sign-extension ────────────────
+    // Closes the soundness gap on `result[i]` for `i ≥ MemSize` on load
+    // rows.  Until Phase 20 those bytes were unconstrained — the
+    // interpreter writes 0 (unsigned loads) or 0xFF (signed loads,
+    // sign-extended), but the AIR didn't enforce either.
+    /// Phase 20: 1 iff this row is `LoadI8` or `LoadIndI8`.
+    #[size = 1]
+    IsLoadI8,
+    /// Phase 20: 1 iff this row is `LoadI16` or `LoadIndI16`.
+    #[size = 1]
+    IsLoadI16,
+    /// Phase 20: 1 iff this row is `LoadI32` or `LoadIndI32`.
+    #[size = 1]
+    IsLoadI32,
+    /// Phase 20: multiplexed source byte for the signed-load sign:
+    /// `IsLoadI8·result[0] + IsLoadI16·result[1] + IsLoadI32·result[3]`.
+    /// Zero on rows that aren't signed loads, so LoadSignBit collapses
+    /// to 0 there too.
+    #[size = 1]
+    LoadSignSrc,
+    /// Phase 20: bit 7 of LoadSignSrc.  Pinned via the (HiNib, 8,
+    /// 8·LoadSignBit) nibble-AND lookup.  Drives the inactive-byte
+    /// sign-extension constraint
+    /// `is_load · (1 − mem_byte_active[i]) · (result[i] − 0xFF·LoadSignBit) = 0`.
+    #[size = 1]
+    LoadSignBit,
+    /// Phase 20: high nibble of LoadSignSrc.  Paired with the
+    /// (lo, 0xF, lo) range check.
+    #[size = 1]
+    LoadSignHiNib,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
