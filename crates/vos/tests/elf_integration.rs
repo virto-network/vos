@@ -2253,6 +2253,155 @@ fn crdt_counter_restart_replays_state_from_disk() {
 }
 
 #[test]
+#[ignore = "known bug — corrupted state is silently accepted as garbage; \
+    the actor's rkyv decode goes through `access_unchecked` which skips \
+    bounds + sanity validation. Fix needs `bytecheck` derives on every \
+    actor state type so `rkyv::access` (validating) can replace \
+    `access_unchecked` in `vos::actors::codec::Decode`. The test below \
+    documents the expected post-fix behaviour."]
+fn crdt_counter_survives_corrupted_persisted_state() {
+    // Robustness probe: simulate schema drift / disk
+    // corruption / hand-edited save by overwriting the
+    // actor's persisted state blob with garbage between two
+    // node boots. The actor's rkyv-decode on restart will
+    // fail. The runtime should:
+    //
+    //  1. Not silently surface garbage as "valid" state —
+    //     either the actor falls back to default state
+    //     (count==0) or refuses to dispatch entirely.
+    //  2. Not crash the agent thread permanently — the next
+    //     invoke must produce a usable error or a usable
+    //     reply, not a hang or segfault.
+    //
+    // Today the test FAILS because `codec::Decode` uses
+    // `rkyv::access_unchecked`: 7 bytes of garbage decode
+    // into a u64 of 72057589742960640, the actor reports it
+    // as the count, and writes through it on the next inc.
+    // Silent corruption is the worst kind of failure mode;
+    // marking ignored until the validating-decode fix lands.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_corrupt_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // Boot 1: drive a few inc() calls so the state row gets
+    // populated with valid rkyv-encoded bytes.
+    let counter_id;
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob.clone())
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        counter_id = id;
+        let counter = CrdtCounterClient::at(&node, id);
+        counter.inc(1).expect("inc 1");
+        counter.inc(2).expect("inc 2");
+        assert_eq!(counter.get().expect("get"), 2);
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    // Hand-corrupt the actor's persisted state. Open the same
+    // redb file, find the `state` table, replace the `actor`
+    // row with random bytes that won't deserialize.
+    {
+        let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
+        assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+        let db = redb::Database::create(&db_path).expect("open redb for corruption");
+        let table_def: redb::TableDefinition<'_, &str, &[u8]> =
+            redb::TableDefinition::new("state");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut table = txn.open_table(table_def).expect("open state table");
+            // Garbage that won't deserialize as the actor's
+            // state. rkyv's archive format is highly
+            // specific; a short pile of zeros tends to fail
+            // alignment / pointer checks.
+            table.insert("actor", &[0u8][..])
+                .expect("write garbage");
+        }
+        txn.commit().expect("commit corruption");
+    }
+
+    // Boot 2: same data_dir, fresh node. The actor's first
+    // dispatch will try to deserialize the garbage state.
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob)
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        assert_eq!(id, counter_id);
+
+        let counter = CrdtCounterClient::at(&node, id);
+
+        // The expected behaviour after the fix lands:
+        //   (a) get() returns Ok(0) — actor fell back to a
+        //       fresh instance because the on-disk blob
+        //       failed to validate; OR
+        //   (b) get() returns Err(_) — actor refused to
+        //       dispatch on a corrupt state.
+        // What MUST NOT happen: get() returns Ok(<garbage>),
+        // because then any caller silently consumes wrong
+        // state.
+        let get_result = counter.get();
+        match get_result {
+            Ok(0) => { /* fresh start, ideal */ }
+            Err(_) => { /* explicit failure, also fine */ }
+            Ok(other) => panic!(
+                "post-corruption get returned Ok({other}); \
+                 corrupted state must not surface as valid output \
+                 (expected Ok(0) for fresh-start fallback or Err(_) \
+                 for explicit refusal)",
+            ),
+        }
+
+        // Once we've handled the corruption, the agent thread
+        // must still respond to subsequent calls — even if
+        // they error.
+        let _ = counter.inc(99);
+        let _ = counter.get();
+
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // Robustness claim: a `panic!()` inside a `#[msg]` handler
     // must surface to the invoke caller as a `Panicked` error

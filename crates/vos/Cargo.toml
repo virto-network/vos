@@ -56,3 +56,6 @@ async-trait = { version = "0.1", optional = true }
 # the regular dep graph; only test/example builds activate it.
 registry = { path = "../actors/registry", features = ["host"] }
 crdt-counter = { path = "../../examples/actors/crdt-counter", features = ["host"] }
+# Used by a single robustness test that hand-corrupts the
+# actor's persisted state to simulate schema drift.
+redb = "2"
