@@ -53,3 +53,10 @@ async-trait = { version = "0.1", optional = true }
 name = "vosx"
 path = "src/bin/vosx.rs"
 required-features = ["std"]
+
+[dev-dependencies]
+# Tests need typed access to the registry actor. Cargo allows
+# this dev-dep cycle (registry → vos) because dev-deps don't
+# participate in the regular dep graph; only test/example
+# builds activate it.
+registry = { path = "../actors/registry", features = ["std"] }

@@ -1,12 +1,28 @@
 [workspace]
 
 [package]
-name = "registry-actor"
+name = "registry"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Default off so the riscv64 actor build stays no_std-clean.
+# Hosts (vosx, tests) opt in via `features = ["std"]` to get the
+# `Client` wrapper and `replication_id` derivation.
+default = []
+std = ["dep:blake2b_simd", "vos/std"]
+
+[lib]
+name = "registry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "registry-actor"
+path = "src/main.rs"
+
 [dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "s"

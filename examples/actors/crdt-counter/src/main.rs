@@ -46,20 +46,29 @@ impl CrdtCounter {
         self.count
     }
 
-    /// Resolve `name` against the hyperspace registry via the
-    /// cycle-9 phase-3 `ctx.resolve` sugar. Returns the full
-    /// 32-bit ServiceId of the matching service, or 0 when the
-    /// name isn't registered. Lets integration tests verify the
-    /// runtime-lookup path through a real PVM actor.
+    /// Resolve `name` by invoking the registry actor at
+    /// `ServiceId::REGISTRY` directly: it's a regular vos
+    /// service with a `resolve(name) -> u32` message, and
+    /// `ctx.ask` is how any actor talks to any other.
+    /// Returns the matching ServiceId, or 0 when unregistered.
+    /// Will be sugared to `RegistryActorClient::at(ctx).resolve(name).await`
+    /// once `#[messages]` learns to emit per-actor client traits.
     #[msg]
     async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
-        match ctx.resolve(&name) {
-            Some(id) => {
-                println!("crdt-counter: whois({name}) -> {}", id.0);
-                id.0
+        use vos::abi::service::ServiceId;
+        let msg = vos::value::Msg::new("resolve").with("name", name.clone());
+        match ctx.ask(ServiceId::REGISTRY, &msg).await {
+            Ok(value) => {
+                let id = value.as_u32().unwrap_or(0);
+                if id == 0 {
+                    println!("crdt-counter: whois({name}) -> not found");
+                } else {
+                    println!("crdt-counter: whois({name}) -> {id}");
+                }
+                id
             }
-            None => {
-                println!("crdt-counter: whois({name}) -> not found");
+            Err(e) => {
+                println!("crdt-counter: whois({name}) -> error {e:?}");
                 0
             }
         }

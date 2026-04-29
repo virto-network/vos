@@ -480,7 +480,7 @@ fn cmd_start(
         };
         let elf_data = load_file(&blob_path);
         let blob = load_blob(&blob_path);
-        let rep_id = vos::registry::replication_id(hyperspace_name);
+        let rep_id = registry_replication_id(hyperspace_name);
         let mut cfg = vos::node::AgentConfig::new(blob)
             .with_consistency(vos::node::Consistency::Crdt)
             .with_replication_id(rep_id);
@@ -712,7 +712,8 @@ struct AnnouncePlan {
 // Spin up an ephemeral, non-persisting VosNode that joins the
 // manifest's hyperspace, wait briefly for CRDT sync to populate
 // the local registry replica from peers, resolve the target
-// name via `vos::registry::Client`, fire the invoke, and exit.
+// name via the registry actor's `resolve` message, fire the
+// invoke, and exit.
 // No data dir, no long-lived state — the node is gone after the
 // command returns.
 
@@ -751,14 +752,29 @@ fn cmd_invoke(
                 .unwrap_or_else(|e| die(&format!("invalid 0x ServiceId '{target_str}': {e}")));
             ServiceId(raw)
         } else {
-            match vos::registry::Client::local(node).lookup(target_str) {
-                Ok(Some(e)) => ServiceId(e.full_service_id()),
-                Ok(None) => {
-                    eprintln!("'{target_str}' not registered");
-                    std::process::exit(1);
-                }
-                Err(e) => die(&format!("resolve '{target_str}': {e}")),
+            // Resolve via the registry actor's `resolve(name) ->
+            // u32` message. Returns 0 when the name isn't
+            // registered; we surface that as "not found" since
+            // the registry's own ID (also 0) is never a useful
+            // resolution target.
+            let resolve_msg = Msg::new("resolve").with("name", target_str);
+            let encoded = resolve_msg.encode();
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            let reply = node.invoke_with_timeout(
+                ServiceId::REGISTRY,
+                payload,
+                std::time::Duration::from_secs(5),
+            ).unwrap_or_else(|| die(&format!("resolve '{target_str}': registry unreachable")));
+            let value: vos::value::Value = vos::Decode::decode(&reply);
+            let id = value.as_u32().unwrap_or_else(||
+                die(&format!("resolve '{target_str}': unexpected reply {value:?}")));
+            if id == 0 {
+                eprintln!("'{target_str}' not registered");
+                std::process::exit(1);
             }
+            ServiceId(id)
         };
         eprintln!("vosx: invoking {msg_name} on {target}");
         let encoded = msg.encode();
@@ -850,7 +866,7 @@ fn with_query_node(
     let blob_path = manifest.registry_blob.as_ref().map(|p| dir.join(p))
         .unwrap_or_else(|| die("manifest must set `registry_blob` for query commands"));
     let blob = load_blob(&blob_path);
-    let rep_id = vos::registry::replication_id(hyperspace);
+    let rep_id = registry_replication_id(hyperspace);
 
     // Always listen on a random loopback port — the CLI is a
     // transient peer; a fixed port would clash with running
@@ -977,21 +993,50 @@ fn heartbeat_loop(
 }
 
 /// Send an `announce(...)` invoke for every plan to the local
-/// registry via [`vos::registry::Client`]. The local replica
-/// fans out via the CRDT layer.
+/// registry. Inlines the wire encoding: vosx doesn't depend on
+/// the `registry` crate (which would form a cargo cycle through
+/// `registry → vos`), so we build the `Msg` ourselves like any
+/// other caller would.
 fn flush_registry_announces(node: &vos::node::VosNode, plans: &[AnnouncePlan]) {
-    let client = vos::registry::Client::local(node);
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
     for plan in plans {
-        let res = client.announce(&plan.name, plan.owner_prefix, plan.service_id, &plan.roles);
-        if res.is_err() {
-            eprintln!(
-                "vosx: warning: registry announce for '{}' returned no reply",
-                plan.name,
-            );
+        let m = Msg::new("announce")
+            .with("name", plan.name.clone())
+            .with("owner_prefix", plan.owner_prefix as u32)
+            .with("service_id", plan.service_id as u32)
+            .with("roles", plan.roles.clone());
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        let reply = node.invoke_with_timeout(
+            vos::abi::service::ServiceId::REGISTRY,
+            payload,
+            std::time::Duration::from_secs(2),
+        );
+        if reply.is_none() {
+            eprintln!("vosx: warning: registry announce for '{}' returned no reply", plan.name);
         } else {
             eprintln!("vosx: registered '{}' in registry", plan.name);
         }
     }
+}
+
+/// Derive the 32-byte CRDT replication-id for a hyperspace's
+/// registry. Inlined in vosx (rather than imported from the
+/// `registry` crate) because vosx can't take a regular dep on
+/// `registry` without forming a `vos → registry → vos` cycle.
+/// Tests in `crates/vos/tests` import the same derivation from
+/// `registry` via dev-deps; the two functions must agree.
+fn registry_replication_id(hyperspace: &str) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"vos-registry/v1");
+    h.update(&[0u8]);
+    h.update(hyperspace.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

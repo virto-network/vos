@@ -162,59 +162,12 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    // --- Name resolution (via the hyperspace registry) ---
-    //
-    // The registry actor lives at `ServiceId::REGISTRY` on every
-    // node; cycles 1–8 keep its DAG converged across the
-    // hyperspace. These helpers wrap the wire shape from
-    // `crates/registry`: invoke `lookup(name)` on REGISTRY, get
-    // back rkyv-encoded `RegistryEntry` bytes inside
-    // `Value::Bytes`, decode, return.
-    //
-    // Empty bytes from the actor mean "not registered" — we
-    // surface that as `None`. Anything else (rkyv decode
-    // failure, bad reply shape, registry unreachable) also
-    // returns `None`; a future iteration could distinguish via
-    // a `Result<Option<RegistryEntry>, ResolveError>`.
-
-    /// Resolve a service name to its full `RegistryEntry` (name,
-    /// owner_prefix, service_id, roles). Use [`resolve`](Self::resolve)
-    /// if you only need the `ServiceId`.
-    #[cfg(feature = "pvm")]
-    pub fn lookup(&mut self, name: &str) -> Option<crate::registry::RegistryEntry> {
-        let msg = super::value::Msg::new("lookup")
-            .with("name", alloc::string::String::from(name));
-        let encoded = super::codec::Encode::encode(&msg);
-        let mut payload = alloc::vec::Vec::with_capacity(1 + encoded.len());
-        payload.push(super::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        let result = self.ask_raw(ServiceId::REGISTRY, &payload);
-        let value = match crate::actors::run::try_poll(async { result.await }) {
-            crate::actors::run::RunResult::Complete(Ok(v)) => v,
-            _ => return None,
-        };
-        let bytes = value.as_bytes()?;
-        if bytes.is_empty() {
-            return None;
-        }
-        crate::registry::decode_archived::<crate::registry::RegistryEntry>(bytes)
-    }
-
-    /// Resolve a service name to its full `ServiceId`. Convenience
-    /// over [`lookup`](Self::lookup) for the common case where the
-    /// caller only needs to address the service.
-    #[cfg(feature = "pvm")]
-    pub fn resolve(&mut self, name: &str) -> Option<ServiceId> {
-        self.lookup(name).map(|entry| ServiceId(entry.full_service_id()))
-    }
-
-    /// Send a dynamic message to a named service (resolve + tell).
-    #[cfg(feature = "pvm")]
-    pub fn tell_named(&mut self, name: &str, msg: &super::value::Msg) {
-        if let Some(target) = self.resolve(name) {
-            self.tell(target, msg);
-        }
-    }
+    // Name resolution belongs to the registry actor, not vos. To
+    // resolve from a PVM actor handler, depend on the `registry`
+    // crate and call `ctx.ask(ServiceId::REGISTRY, ...)`
+    // directly. A future macro-generated `RegistryActorClient`
+    // will wrap this; for now it stays explicit so vos doesn't
+    // know about any specific service.
 
     // --- Host I/O (worker mode) ---
 

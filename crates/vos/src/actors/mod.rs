@@ -52,5 +52,10 @@ pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */ }
 #[cfg(feature = "pvm")]
 mod guest_io;
 
-#[cfg(feature = "pvm")]
+// Guest-only #[panic_handler]. Include only when we're a no_std
+// guest build — when both `pvm` and `std` are enabled (which
+// happens to vos itself when an actor crate is dev-deped from
+// host code), std already provides `panic_impl` and a second one
+// here is a duplicate-lang-item error.
+#[cfg(all(feature = "pvm", not(feature = "std")))]
 mod guest_panic;

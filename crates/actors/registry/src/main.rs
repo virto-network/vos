@@ -1,41 +1,15 @@
-//! Hyperspace registry actor.
-//!
-//! Hosts a CRDT-replicated `name → RegistryEntry` directory. Every
-//! node in a hyperspace runs a replica at the well-known
-//! `ServiceId::REGISTRY`; cycles 1–8 converge them.
-//!
-//! Messages (matched by name in the manifest's `on_start` and by
-//! the `registry::Client` host helper):
-//!
-//! - `announce(name, owner_prefix, service_id, [roles])` —
-//!   register / replace an entry. Bumps the entry's `last_seen`.
-//! - `heartbeat(name)` — keepalive ping; bumps `last_seen` for
-//!   an existing entry. No-op when the name isn't registered.
-//! - `remove(name)` — clean shutdown.
-//! - `lookup(name) -> Option<RegistryEntry>` — point query;
-//!   replies as rkyv-encoded bytes inside `Value::Bytes`, or
-//!   `Value::Unit` when the name isn't registered.
-//! - `list(prefix, after, limit) -> Page` — sorted scan of
-//!   names starting with `prefix`, exclusive cursor `after`,
-//!   capped at [`registry::MAX_PAGE_SIZE`]. Page includes the
-//!   registry's current `clock` so callers can age-filter the
-//!   returned entries.
-//! - `by_role(role, prefix, after, limit) -> Page` — same
-//!   pagination shape, filtered by role membership.
-//!
-//! ## Liveness model
-//!
-//! The registry never reads wall-clock time (PVM is deterministic
-//! and replays); instead it maintains a monotone `tick` counter
-//! that bumps on every `announce`/`heartbeat`. Each entry's
-//! `last_seen` records the tick at its most recent touch, and
-//! `Page::clock` snapshots the current tick. Callers compute
-//! freshness by `clock - last_seen` against an age threshold of
-//! their own choosing — see [`RegistryEntry::is_alive_within`].
+//! Bin entry. The actor framework's `_start` / `accumulate` PVM
+//! symbols are emitted by `#[messages]` here so they only ever
+//! land in the bin's translation unit. Wire types (
+//! [`registry::RegistryEntry`], [`registry::Page`], etc.) live in
+//! the lib so other crates can depend on them without pulling in
+//! these entry symbols.
+
+#![cfg_attr(not(feature = "std"), no_std)]
 
 use vos::{actor, messages};
 
-use vos::registry::{Page, RegistryEntry, encode_archived, MAX_PAGE_SIZE};
+use registry::{encode_archived, Page, RegistryEntry, MAX_PAGE_SIZE};
 
 #[actor]
 struct Registry {
@@ -44,40 +18,35 @@ struct Registry {
     /// walks. We use `Vec` rather than `BTreeMap::range` because
     /// LLVM's BTreeMap codegen produces PVM-unsupported
     /// instructions (e.g. `slt` with `x0` as rs1) for the
-    /// riscv64em-javm target — see `reference_pvm_build` notes.
+    /// riscv64em-javm target.
     entries: Vec<(String, EntryStored)>,
     /// Monotone tick counter — incremented on every `announce`
-    /// and `heartbeat`. Surfaced as `Page::clock` so callers
-    /// can age-filter entries.
+    /// and `heartbeat`. Surfaced as `Page::clock` so callers can
+    /// age-filter entries.
     tick: u64,
 }
 
-/// Stored shape — like [`registry::RegistryEntry`] but without
-/// the redundant `name` field, since the entry's tuple slot
-/// holds it.
+/// Stored shape — like `RegistryEntry` but without the
+/// redundant `name` field (the entry's tuple slot holds it).
 #[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone)]
 #[rkyv(crate = vos::rkyv)]
 struct EntryStored {
     owner_prefix: u16,
     service_id: u16,
     roles: Vec<String>,
-    /// Tick at the most recent `announce` or `heartbeat`.
     last_seen: u64,
 }
 
 #[messages]
 impl Registry {
     fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            tick: 0,
-        }
+        Self { entries: Vec::new(), tick: 0 }
     }
 
     /// Register or replace `name`. `service_id` and
-    /// `owner_prefix` arrive as u32 from the wire because the
-    /// dynamic `Msg` arg system treats integers as u32/u64; we
-    /// truncate the upper half here.
+    /// `owner_prefix` arrive as u32 because the dynamic `Msg`
+    /// arg system treats integers as u32/u64; we truncate the
+    /// upper half here.
     #[msg]
     async fn announce(
         &mut self,
@@ -93,9 +62,6 @@ impl Registry {
             roles,
             last_seen: self.tick,
         };
-        // Sorted-insert: replace on equal key, otherwise insert
-        // at the matching position. Linear in the entry count;
-        // fine for phase-1 sizes.
         let mut idx = 0usize;
         let mut found = false;
         while idx < self.entries.len() {
@@ -115,8 +81,7 @@ impl Registry {
     }
 
     /// Liveness ping. Bumps the entry's `last_seen` to the
-    /// current `tick`. No-op when the name isn't registered —
-    /// callers should `announce` first.
+    /// current `tick`. No-op when the name isn't registered.
     #[msg]
     async fn heartbeat(&mut self, name: String) {
         self.tick += 1;
@@ -142,10 +107,26 @@ impl Registry {
         }
     }
 
+    /// Resolve a name to its full `ServiceId` u32. Returns 0
+    /// when the name isn't registered. Lighter than `lookup`
+    /// for hosts that only need the address — no rkyv schema
+    /// involved on the caller side.
+    #[msg]
+    async fn resolve(&self, name: String) -> u32 {
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if self.entries[idx].0 == name {
+                let stored = &self.entries[idx].1;
+                return ((stored.owner_prefix as u32) << 16) | (stored.service_id as u32);
+            }
+            idx += 1;
+        }
+        0
+    }
+
     /// Returns rkyv-encoded `RegistryEntry` bytes when the name
-    /// is registered; returns an empty `Vec<u8>` (which the
-    /// reply path encodes as `Value::Bytes(empty)`, decoded as
-    /// `Ok(None)` host-side) when it isn't.
+    /// is registered; returns an empty `Vec<u8>` (decoded host-
+    /// side as `Ok(None)`) when it isn't.
     #[msg]
     async fn lookup(&self, name: String) -> Vec<u8> {
         let mut idx = 0usize;
@@ -168,7 +149,7 @@ impl Registry {
 
     /// Paginated scan. `prefix` filters by leading-slash path,
     /// `after` is an exclusive cursor (empty = start), `limit`
-    /// is capped at [`MAX_PAGE_SIZE`].
+    /// is capped at `MAX_PAGE_SIZE`.
     #[msg]
     async fn list(&self, prefix: String, after: String, limit: u32) -> Vec<u8> {
         let page = collect_page(&self.entries, &prefix, &after, limit, &String::new(), self.tick);
@@ -185,8 +166,6 @@ impl Registry {
 }
 
 /// Shared pagination machinery for `list` and `by_role`.
-/// `role_filter` is empty for the unfiltered `list` case; non-
-/// empty for `by_role`. Linear scan over the sorted Vec.
 fn collect_page(
     entries: &[(String, EntryStored)],
     prefix: &str,
@@ -213,7 +192,6 @@ fn collect_page(
             continue;
         }
         if !prefix.is_empty() && !name.starts_with(prefix) {
-            // Past the prefix range (entries are sorted), stop.
             if !out.is_empty() && name.as_str() > prefix {
                 break;
             }
@@ -235,8 +213,6 @@ fn collect_page(
         }
 
         if out.len() >= limit {
-            // We've already filled the page; the previous entry
-            // is the cursor for the next call.
             if let Some(last) = out.last() {
                 let last: &RegistryEntry = last;
                 next = last.name.clone();
@@ -254,3 +230,5 @@ fn collect_page(
 
     Page { entries: out, next, clock }
 }
+
+fn main() {}

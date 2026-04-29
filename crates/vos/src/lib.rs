@@ -39,7 +39,6 @@ pub mod abi;
 
 pub mod actors;
 pub mod refine_payload;
-pub mod registry;
 
 pub mod effects;
 pub mod effect_log;
