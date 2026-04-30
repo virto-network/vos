@@ -3694,3 +3694,122 @@ fn registry_concurrent_announce_and_remove_converges() {
     let _ = node_b.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+#[test]
+fn raft_counter_single_node_replays_log_after_restart() {
+    // Phase-1 boundary for Raft: prove `RaftCommit`'s redb tables
+    // persist a log of `EffectLog`s and replay them on cold
+    // restart to produce identical state. No peers, no leader
+    // election — the strategy runs in `Role::SingleNode` so each
+    // commit appends + applies + persists state in one redb txn.
+    //
+    // Same crdt-counter actor, same shape as
+    // `crdt_counter_restart_replays_state_from_disk`, only the
+    // `Consistency` selection differs. A single test exercises:
+    //
+    //   - `restore` returning `None` on the first boot
+    //   - `commit_with_log` advancing `last_applied` per inc
+    //   - skip-on-unchanged: `get()` calls don't append entries
+    //   - cold restart: `replay_logs` rebuilds count from the log
+    //   - subsequent inc()s continue from the rebuilt state
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_raft_phase1_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let counter_id;
+    // ── Boot 1: drive 3 inc()s + a few read-only get()s. ──────
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob.clone())
+                .with_consistency(Consistency::Raft)
+                .persist(&dir),
+        );
+        counter_id = id;
+        let counter = CrdtCounterClient::at(&node, id);
+        counter.inc(1).expect("inc 1");
+        counter.inc(2).expect("inc 2");
+        counter.inc(3).expect("inc 3");
+        // Sanity reads — must NOT bloat the log.
+        for _ in 0..5 {
+            assert_eq!(counter.get().expect("get pre-restart"), 3);
+        }
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    // ── Probe: exactly 3 raft_log rows on disk, last_applied=3.
+    let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
+    assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+    {
+        use redb::ReadableTableMetadata;
+        let db = redb::Database::create(&db_path).expect("open redb");
+        let txn = db.begin_read().expect("read txn");
+        let log_table = txn.open_table(vos::raft::RAFT_LOG).expect("raft_log");
+        assert_eq!(
+            log_table.len().expect("len"),
+            3,
+            "exactly one raft_log entry per state-changing inc, \
+             pure get()s must not append",
+        );
+        let meta = vos::raft::RaftMeta::load(&db).expect("load meta");
+        assert_eq!(meta.last_applied, 3, "last_applied tracks log tail");
+        assert_eq!(meta.commit_index, 3, "commit_index tracks log tail");
+        assert_eq!(meta.current_term, 0, "no election yet → term stays 0");
+        assert_eq!(meta.voted_for, None, "phase 1 never casts a vote");
+    }
+
+    // ── Boot 2: same data_dir. Replay log → count must be 3.
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob)
+                .with_consistency(Consistency::Raft)
+                .persist(&dir),
+        );
+        assert_eq!(id, counter_id, "service id stable across restart");
+
+        let counter = CrdtCounterClient::at(&node, id);
+        assert_eq!(
+            counter.get().expect("get post-restart"),
+            3,
+            "log replay must produce identical state",
+        );
+        // One more inc: log appends a fourth entry post-restart.
+        counter.inc(4).expect("inc post-restart");
+        assert_eq!(counter.get().expect("get final"), 4);
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    // ── Final check: log grew to 4 across the restart. ──────
+    {
+        use redb::ReadableTableMetadata;
+        let db = redb::Database::create(&db_path).expect("reopen redb");
+        let txn = db.begin_read().expect("read txn");
+        let log_table = txn.open_table(vos::raft::RAFT_LOG).expect("raft_log");
+        assert_eq!(log_table.len().expect("len"), 4);
+        let meta = vos::raft::RaftMeta::load(&db).expect("load meta");
+        assert_eq!(meta.last_applied, 4);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
