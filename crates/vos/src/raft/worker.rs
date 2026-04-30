@@ -32,15 +32,23 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use redb::Database;
 use tracing::{debug, warn};
 
 use crate::network::{
-    RaftAppendResult, RaftEntry, RaftRpcHandler, RaftVoteResult,
+    Network, RaftAppendResult, RaftEntry, RaftRpcHandler, RaftVoteResult,
 };
 
 use super::log::{RaftLog, RaftMeta};
+
+/// Hard upper bound on how long a single outbound vote helper
+/// thread waits for a peer's reply before giving up. The election
+/// timeout will fire long before this — the cap exists only so a
+/// peer that drops a request without ever replying doesn't leak a
+/// helper thread for the lifetime of the worker.
+const VOTE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cluster role for a replication group. Phase 3.1 only ever
 /// stays in `Follower`; `Candidate` / `Leader` arrive in 3.2 / 3.3
@@ -59,21 +67,25 @@ pub enum Role {
 pub struct WorkerConfig {
     /// Local node's `node_prefix`.
     pub me: u16,
-    /// Static cluster membership. Empty in single-node mode.
+    /// Static cluster membership. Empty / single-element disables
+    /// elections (single-node mode stays in `Follower` forever
+    /// since there's no quorum to win).
     pub members: Vec<u16>,
-    /// Replication group id — passed back into outbound
-    /// `send_raft_*` calls. Phase 3.1 doesn't initiate any
-    /// outbound calls, but 3.2+ will.
+    /// Replication group id — used for outbound `send_raft_*`
+    /// calls and for matching inbound RPCs.
     pub replication_id: [u8; 32],
+    /// Randomized election-timeout window (low, high) in
+    /// milliseconds. The actual timeout for each Follower /
+    /// Candidate cycle is drawn uniformly from this range. Tests
+    /// shrink it to ~50ms; production defaults sit at 150-300ms.
+    pub election_timeout_ms: (u64, u64),
 }
 
 /// Inbound message processed by the worker loop.
 ///
-/// Some fields are unused in phase 3.1 — `prev_log_term` and
-/// `leader_commit` for `AppendEntries`, `from_prefix` /
-/// `last_log_index` / `last_log_term` for `RequestVote`. Phase 3.2
-/// (voting up-to-date check) and phase 4 (log consistency check)
-/// consume them.
+/// Some fields are unused in this phase — `prev_log_term` and
+/// `leader_commit` for `AppendEntries` — and consumed by phase 4
+/// (log consistency check + commit advance).
 #[allow(dead_code)]
 pub(crate) enum RaftMsg {
     /// Inbound `AppendEntries` from a peer. The reply channel
@@ -95,7 +107,30 @@ pub(crate) enum RaftMsg {
         last_log_term: u64,
         reply: std_mpsc::Sender<RaftVoteResult>,
     },
+    /// Drained by the worker after every outbound `send_raft_vote`
+    /// helper thread receives the peer's reply (or times out
+    /// trying). Carries the answer back into the worker so the
+    /// tally happens on the worker's single-threaded inbox.
+    VoteResponse {
+        from_prefix: u16,
+        term: u64,
+        vote_granted: bool,
+    },
+    /// Test/diagnostic: snapshot the worker's role + term.
+    QueryState {
+        reply: std_mpsc::Sender<WorkerSnapshot>,
+    },
     Shutdown,
+}
+
+/// Diagnostic snapshot of a worker's state. Returned by
+/// [`WorkerHandle::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerSnapshot {
+    pub role: Role,
+    pub current_term: u64,
+    pub voted_for: Option<u16>,
+    pub last_log_index: u64,
 }
 
 /// Owning handle to a running worker. Drop-or-`shutdown` cleans
@@ -106,13 +141,21 @@ pub struct RaftWorker {
 }
 
 impl RaftWorker {
-    /// Spawn a worker thread for one replication group.
-    pub fn spawn(db: Arc<Database>, cfg: WorkerConfig) -> Self {
+    /// Spawn a worker thread for one replication group. `network`
+    /// is `None` for unit tests and single-node mode (no outbound
+    /// RPCs); a `Some(_)` enables real elections by giving the
+    /// worker a way to call peers.
+    pub fn spawn(
+        db: Arc<Database>,
+        cfg: WorkerConfig,
+        network: Option<Arc<Network>>,
+    ) -> Self {
         let (tx, rx) = std_mpsc::channel();
+        let inbox_tx = tx.clone();
         let join = thread::Builder::new()
             .name(alloc::format!("raft-worker-{:04x}", cfg.me))
             .spawn(move || {
-                if let Err(e) = worker_loop(db, cfg, rx) {
+                if let Err(e) = worker_loop(db, cfg, network, rx, inbox_tx) {
                     warn!(error = ?e, "raft: worker exited with error");
                 }
             })
@@ -229,32 +272,66 @@ impl RaftRpcHandler for WorkerHandle {
     }
 }
 
-/// Worker state. Phase 3.1 carries the bare minimum for Follower
-/// behaviour — `last_log_index` and `last_log_term` are loaded
-/// from the on-disk log so future heartbeats see the right tail.
-/// `log` is unused at this phase (no log writes from a follower
-/// yet) but is loaded eagerly so phase 4's consistency check
-/// inherits the same struct shape.
+impl WorkerHandle {
+    /// Test / diagnostic — block briefly waiting for the worker
+    /// to send back a snapshot of its current state. Returns
+    /// `None` if the worker is shut down or busy beyond the
+    /// internal deadline.
+    pub fn snapshot(&self) -> Option<WorkerSnapshot> {
+        let (tx, rx) = std_mpsc::channel();
+        self.inbox.send(RaftMsg::QueryState { reply: tx }).ok()?;
+        rx.recv_timeout(Duration::from_millis(500)).ok()
+    }
+}
+
+/// Worker state. Owns the per-group state machine + the
+/// in-memory tally for an in-flight election.
 struct WorkerState {
     db: Arc<Database>,
     cfg: WorkerConfig,
+    network: Option<Arc<Network>>,
+    /// Sender clone of the worker's own inbox. Used by helper
+    /// threads spawned for outbound `RequestVote` to deliver
+    /// `VoteResponse` messages back into the single-threaded
+    /// state machine.
+    inbox_tx: std_mpsc::Sender<RaftMsg>,
     role: Role,
-    #[allow(dead_code)]
     log: RaftLog,
     meta: RaftMeta,
+    /// Next election timeout. `Instant::now() >= deadline` triggers
+    /// a Follower → Candidate transition. Followers refresh this
+    /// on every accepted heartbeat / granted vote; candidates
+    /// refresh it when starting an election; leaders push it far
+    /// into the future (phase 3.3 replaces this with a heartbeat
+    /// tick).
+    election_deadline: Instant,
+    /// Set of voters that have granted us a vote *in this term*.
+    /// Includes ourselves the moment we become Candidate.
+    votes_received: alloc::collections::BTreeSet<u16>,
 }
 
 impl WorkerState {
-    fn open(db: Arc<Database>, cfg: WorkerConfig) -> Result<Self, crate::commit::CommitError> {
+    fn open(
+        db: Arc<Database>,
+        cfg: WorkerConfig,
+        network: Option<Arc<Network>>,
+        inbox_tx: std_mpsc::Sender<RaftMsg>,
+    ) -> Result<Self, crate::commit::CommitError> {
         let log = RaftLog::open(db.clone())?;
         let meta = RaftMeta::load(&db)?;
-        Ok(Self {
+        let mut s = Self {
             db,
             cfg,
+            network,
+            inbox_tx,
             role: Role::Follower,
             log,
             meta,
-        })
+            election_deadline: Instant::now(),
+            votes_received: alloc::collections::BTreeSet::new(),
+        };
+        s.reset_election_timer();
+        Ok(s)
     }
 
     fn persist_meta(&self) -> Result<(), crate::commit::CommitError> {
@@ -263,22 +340,55 @@ impl WorkerState {
         txn.commit()?;
         Ok(())
     }
+
+    fn reset_election_timer(&mut self) {
+        let (lo, hi) = self.cfg.election_timeout_ms;
+        let span = (hi.saturating_sub(lo)).max(1);
+        // Crude per-call PRNG seeded from the system clock + the
+        // worker's prefix; good enough to scatter timeouts across
+        // peers so they don't all time out simultaneously.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let jitter = (nanos.wrapping_mul(0x9E3779B97F4A7C15)
+            ^ self.cfg.me as u64
+            ^ self.meta.current_term)
+            % span;
+        let timeout = Duration::from_millis(lo + jitter);
+        self.election_deadline = Instant::now() + timeout;
+    }
+
+    fn quorum(&self) -> usize {
+        // Majority of total members — the candidate counts itself,
+        // so for 3 members we need 2 votes (the candidate + one
+        // peer); for 5 members, 3 votes; etc. Single-member
+        // configurations would need 1 vote total which the
+        // candidate's self-vote already provides, so they'd
+        // immediately become Leader; phase 3.2 tests use ≥3.
+        self.cfg.members.len() / 2 + 1
+    }
 }
 
 fn worker_loop(
     db: Arc<Database>,
     cfg: WorkerConfig,
+    network: Option<Arc<Network>>,
     inbox: std_mpsc::Receiver<RaftMsg>,
+    inbox_tx: std_mpsc::Sender<RaftMsg>,
 ) -> Result<(), crate::commit::CommitError> {
-    let mut state = WorkerState::open(db, cfg)?;
+    let mut state = WorkerState::open(db, cfg, network, inbox_tx)?;
     debug!(me = state.cfg.me, "raft: worker started in Follower role");
-    while let Ok(msg) = inbox.recv() {
-        match msg {
-            RaftMsg::Shutdown => {
+
+    loop {
+        let now = Instant::now();
+        let timeout = state.election_deadline.saturating_duration_since(now);
+        match inbox.recv_timeout(timeout) {
+            Ok(RaftMsg::Shutdown) => {
                 debug!(me = state.cfg.me, "raft: worker shutting down");
                 break;
             }
-            RaftMsg::AppendEntries {
+            Ok(RaftMsg::AppendEntries {
                 from_prefix,
                 term,
                 prev_log_index,
@@ -286,7 +396,7 @@ fn worker_loop(
                 leader_commit: _,
                 entries,
                 reply,
-            } => {
+            }) => {
                 let resp = handle_append_entries(
                     &mut state,
                     from_prefix,
@@ -296,22 +406,50 @@ fn worker_loop(
                 )?;
                 let _ = reply.send(resp);
             }
-            RaftMsg::RequestVote {
-                from_prefix: _,
+            Ok(RaftMsg::RequestVote {
+                from_prefix,
                 term,
-                last_log_index: _,
-                last_log_term: _,
+                last_log_index,
+                last_log_term,
                 reply,
-            } => {
-                // Phase 3.1: voting not yet implemented. Reply
-                // refusal so the candidate sees a hard "no" and
-                // moves on; phase 3.2 plumbs the real predicate
-                // (up-to-date check + at-most-one-vote-per-term).
-                let _ = reply.send(RaftVoteResult {
-                    term: state.meta.current_term.max(term),
-                    vote_granted: false,
+            }) => {
+                let resp = handle_request_vote(
+                    &mut state,
+                    from_prefix,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                )?;
+                let _ = reply.send(resp);
+            }
+            Ok(RaftMsg::VoteResponse {
+                from_prefix,
+                term,
+                vote_granted,
+            }) => {
+                handle_vote_response(&mut state, from_prefix, term, vote_granted)?;
+            }
+            Ok(RaftMsg::QueryState { reply }) => {
+                let _ = reply.send(WorkerSnapshot {
+                    role: state.role,
+                    current_term: state.meta.current_term,
+                    voted_for: state.meta.voted_for,
+                    last_log_index: state.log.last_index(),
                 });
             }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if matches!(state.role, Role::Follower | Role::Candidate) {
+                    start_election(&mut state)?;
+                } else {
+                    // Leader: phase 3.2 doesn't run heartbeats yet,
+                    // so push the deadline out so we keep handling
+                    // inbound traffic without re-triggering elections.
+                    // Phase 3.3 replaces this with a real heartbeat
+                    // tick.
+                    state.election_deadline = Instant::now() + Duration::from_secs(60);
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
@@ -333,22 +471,23 @@ fn handle_append_entries(
         });
     }
 
-    // Adopt the leader's term if it advances ours, and clear our
-    // vote (we may grant a fresh one in this new term — phase 3.2
-    // uses this; phase 3.1 only relies on the persistence shape
-    // matching what later phases expect).
     let mut meta_changed = false;
     if term > state.meta.current_term {
         state.meta.current_term = term;
         state.meta.voted_for = None;
         meta_changed = true;
     }
+    // Any AppendEntries from a current-term leader is a
+    // legitimate signal to step down to Follower (whether we're
+    // already a Follower or a stale Candidate / Leader at a
+    // lower term). The role transition is the leader's
+    // authority asserting itself.
+    state.role = Role::Follower;
+    state.votes_received.clear();
+    state.reset_election_timer();
 
-    // Phase 3.1 only handles heartbeats (empty entries). A real
-    // AppendEntries with non-empty entries is rejected with
-    // success=false until phase 4 implements the consistency
-    // check + log append. The leader will retry with a smaller
-    // batch / earlier prev_log_index, eventually catching us up.
+    // Phase 3.2 still only handles heartbeats (empty entries).
+    // Real replication lands in phase 4.
     if entries_len > 0 {
         if meta_changed {
             state.persist_meta()?;
@@ -357,7 +496,7 @@ fn handle_append_entries(
             me = state.cfg.me,
             from_prefix,
             entries_len,
-            "raft: phase 3.1 worker rejects non-empty AppendEntries; \
+            "raft: phase 3.2 worker rejects non-empty AppendEntries; \
              leader replication lands in phase 4",
         );
         return Ok(RaftAppendResult {
@@ -367,8 +506,6 @@ fn handle_append_entries(
         });
     }
 
-    // Heartbeat path. The follower stays in `Follower` role.
-    state.role = Role::Follower;
     if meta_changed {
         state.persist_meta()?;
     }
@@ -376,12 +513,170 @@ fn handle_append_entries(
     Ok(RaftAppendResult {
         term: state.meta.current_term,
         success: true,
-        // For a heartbeat the leader's prev_log_index reflects
-        // what *it* last appended. We don't have that entry yet
-        // (phase 4 lands replication), so we report 0 — phase 4
-        // will refine this once the consistency check lands.
         match_index: prev_log_index,
     })
+}
+
+fn handle_request_vote(
+    state: &mut WorkerState,
+    from_prefix: u16,
+    term: u64,
+    last_log_index: u64,
+    last_log_term: u64,
+) -> Result<RaftVoteResult, crate::commit::CommitError> {
+    // Stale candidate term — refuse, advertise our higher term
+    // so they can step down.
+    if term < state.meta.current_term {
+        return Ok(RaftVoteResult {
+            term: state.meta.current_term,
+            vote_granted: false,
+        });
+    }
+
+    let mut meta_changed = false;
+    if term > state.meta.current_term {
+        state.meta.current_term = term;
+        state.meta.voted_for = None;
+        state.role = Role::Follower;
+        state.votes_received.clear();
+        meta_changed = true;
+    }
+
+    // Up-to-date check: candidate's log must be at least as new
+    // as ours. Either the last term is strictly higher, or the
+    // last term matches and the index is at least as high.
+    let our_last_term = state.log.last_term();
+    let our_last_index = state.log.last_index();
+    let candidate_up_to_date = (last_log_term > our_last_term)
+        || (last_log_term == our_last_term && last_log_index >= our_last_index);
+
+    let already_voted_otherwise = state
+        .meta
+        .voted_for
+        .is_some_and(|v| v != from_prefix);
+
+    let granted = !already_voted_otherwise && candidate_up_to_date;
+
+    if granted {
+        state.meta.voted_for = Some(from_prefix);
+        state.reset_election_timer();
+        meta_changed = true;
+    }
+
+    if meta_changed {
+        state.persist_meta()?;
+    }
+
+    Ok(RaftVoteResult {
+        term: state.meta.current_term,
+        vote_granted: granted,
+    })
+}
+
+fn handle_vote_response(
+    state: &mut WorkerState,
+    from_prefix: u16,
+    term: u64,
+    vote_granted: bool,
+) -> Result<(), crate::commit::CommitError> {
+    // Stale response (from a peer that's already moved on) —
+    // step down if the peer's term is higher.
+    if term > state.meta.current_term {
+        state.meta.current_term = term;
+        state.meta.voted_for = None;
+        state.role = Role::Follower;
+        state.votes_received.clear();
+        state.persist_meta()?;
+        state.reset_election_timer();
+        return Ok(());
+    }
+
+    // Only Candidates count votes, and only votes for the term
+    // they're campaigning in.
+    if state.role != Role::Candidate || term != state.meta.current_term {
+        return Ok(());
+    }
+
+    if vote_granted {
+        state.votes_received.insert(from_prefix);
+        if state.votes_received.len() >= state.quorum() {
+            debug!(
+                me = state.cfg.me,
+                term = state.meta.current_term,
+                votes = state.votes_received.len(),
+                quorum = state.quorum(),
+                "raft: elected leader",
+            );
+            state.role = Role::Leader;
+            state.votes_received.clear();
+            // Phase 3.3 replaces this with a heartbeat tick.
+            state.election_deadline = Instant::now() + Duration::from_secs(60);
+        }
+    }
+    Ok(())
+}
+
+fn start_election(state: &mut WorkerState) -> Result<(), crate::commit::CommitError> {
+    state.role = Role::Candidate;
+    state.meta.current_term += 1;
+    state.meta.voted_for = Some(state.cfg.me);
+    state.persist_meta()?;
+    state.votes_received.clear();
+    state.votes_received.insert(state.cfg.me);
+
+    let term = state.meta.current_term;
+    let me = state.cfg.me;
+    let rep_id = state.cfg.replication_id;
+    let last_log_index = state.log.last_index();
+    let last_log_term = state.log.last_term();
+
+    debug!(
+        me,
+        term,
+        members = state.cfg.members.len(),
+        "raft: starting election",
+    );
+
+    if let Some(network) = state.network.clone() {
+        for peer_prefix in state.cfg.members.iter().copied() {
+            if peer_prefix == me {
+                continue;
+            }
+            let Some(peer_id) = network.peer_for_prefix(peer_prefix) else {
+                // Peer unreachable right now — election will time
+                // out and retry.
+                continue;
+            };
+            let rx = network.send_raft_vote(
+                peer_id,
+                rep_id,
+                term,
+                me,
+                last_log_index,
+                last_log_term,
+            );
+            let inbox_tx = state.inbox_tx.clone();
+            thread::spawn(move || {
+                if let Ok(resp) = rx.recv_timeout(VOTE_RPC_TIMEOUT) {
+                    let _ = inbox_tx.send(RaftMsg::VoteResponse {
+                        from_prefix: peer_prefix,
+                        term: resp.term,
+                        vote_granted: resp.vote_granted,
+                    });
+                }
+            });
+        }
+    }
+
+    // Single-node mode degenerates to "self-vote is the quorum".
+    if state.votes_received.len() >= state.quorum() {
+        state.role = Role::Leader;
+        state.votes_received.clear();
+        state.election_deadline = Instant::now() + Duration::from_secs(60);
+    } else {
+        state.reset_election_timer();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -408,18 +703,21 @@ mod tests {
             me,
             members: vec![me, me ^ 0x1, me ^ 0x2],
             replication_id: [0xC0; 32],
+            // Long timeout so unit tests that exercise inbound
+            // RPCs aren't racing the election timer.
+            election_timeout_ms: (5_000, 10_000),
         }
     }
 
     #[test]
-    fn handler_request_vote_returns_refusal_in_phase_3_1() {
+    fn request_vote_grants_when_log_is_empty() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA));
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
         let h = worker.handler();
-        let resp = h.request_vote(&[0xC0; 32], 0xBBBB, 5, 10, 4);
-        assert!(!resp.vote_granted, "phase 3.1 always refuses");
-        // The reply mirrors the larger of (peer term, local term).
-        // Local is 0 at boot; peer asks at term 5 → reply term 5.
+        // Empty log on both sides + higher term + no prior vote
+        // → grant. Up-to-date check passes trivially.
+        let resp = h.request_vote(&[0xC0; 32], 0xBBBB, 5, 0, 0);
+        assert!(resp.vote_granted);
         assert_eq!(resp.term, 5);
         worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
@@ -428,7 +726,7 @@ mod tests {
     #[test]
     fn append_entries_heartbeat_advances_term_and_persists() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA));
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
         let h = worker.handler();
 
         // Heartbeat at term 5 from leader prefix 0xBBBB.
@@ -465,7 +763,7 @@ mod tests {
     #[test]
     fn append_entries_with_payload_is_refused_in_phase_3_1() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA));
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
         let h = worker.handler();
 
         let resp = h.append_entries(
@@ -494,11 +792,76 @@ mod tests {
     #[test]
     fn worker_shuts_down_cleanly() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA));
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
         // Drop sends shutdown + joins.
         drop(worker);
         // DB is still openable post-drop.
         let _ = RaftMeta::load(&db).unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn at_most_one_vote_per_term() {
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let h = worker.handler();
+        // First voter wins term 5.
+        let resp = h.request_vote(&[0xC0; 32], 0xBBBB, 5, 0, 0);
+        assert!(resp.vote_granted);
+        // Same candidate asking again at the same term — granted
+        // (idempotent re-grant).
+        let resp = h.request_vote(&[0xC0; 32], 0xBBBB, 5, 0, 0);
+        assert!(resp.vote_granted);
+        // Different candidate at the same term — refused.
+        let resp = h.request_vote(&[0xC0; 32], 0xCCCC, 5, 0, 0);
+        assert!(!resp.vote_granted);
+        // Different candidate at a higher term — granted (the
+        // higher term clears `voted_for`).
+        let resp = h.request_vote(&[0xC0; 32], 0xCCCC, 6, 0, 0);
+        assert!(resp.vote_granted);
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn solo_candidate_with_quorum_of_one_becomes_leader() {
+        // Single-member cluster: the candidate's self-vote is the
+        // quorum, so the very first election fires + wins.
+        let (db, dir) = temp_db();
+        let cfg = WorkerConfig {
+            me: 0xAAAA,
+            members: vec![0xAAAA],
+            replication_id: [0xC0; 32],
+            // Tiny timeout so the test doesn't have to wait long.
+            election_timeout_ms: (10, 30),
+        };
+        let worker = RaftWorker::spawn(db.clone(), cfg, None);
+        let h = worker.handler();
+        // Wait for the election to fire + complete.
+        let snap = wait_for_role(&h, Role::Leader, Duration::from_millis(500));
+        assert_eq!(snap.role, Role::Leader);
+        assert!(snap.current_term >= 1);
+        assert_eq!(snap.voted_for, Some(0xAAAA));
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn wait_for_role(h: &WorkerHandle, want: Role, deadline: Duration) -> WorkerSnapshot {
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            if let Some(snap) = h.snapshot() {
+                if snap.role == want {
+                    return snap;
+                }
+            }
+            if std::time::Instant::now() >= until {
+                let snap = h.snapshot().expect("worker still alive");
+                panic!(
+                    "worker did not reach {want:?} within {deadline:?}; \
+                     last snapshot: {snap:?}",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

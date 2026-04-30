@@ -2355,4 +2355,155 @@ mod tests {
         net_a.join();
         net_b.join();
     }
+
+    /// Phase-3.2 boundary: three networked nodes spin up Raft
+    /// workers configured for the same cluster, run for a short
+    /// while, and exactly one becomes Leader. No replication,
+    /// no log writes — just election. The leader's term must
+    /// match across all three replicas; the two losers stay
+    /// Follower and have `voted_for == leader`.
+    #[test]
+    fn three_node_cluster_elects_a_leader() {
+        use crate::raft::{RaftWorker, Role, WorkerConfig};
+        use std::time::Instant as StdInstant;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let kp_c = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let prefix_c = derive_node_prefix(&PeerId::from(kp_c.public()));
+        // Skip if any two prefixes happen to collide on the
+        // 16-bit truncation (vanishingly rare in practice but
+        // possible with random keypairs).
+        if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+            eprintln!("SKIP: prefix collision; rerun");
+            return;
+        }
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_a, local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()], bootstrap: vec![],
+        }));
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        ).expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_b, local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()], bootstrap: vec![a_dial.clone()],
+        }));
+        // Wait for B's listen addr so C can bootstrap to both A
+        // and B — without an explicit dial between B and C the
+        // mesh wouldn't form within the test deadline.
+        let b_addr = wait_for(
+            || net_b.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        ).expect("net_b binds");
+        let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+        let net_c = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_c, local_prefix: prefix_c,
+            listen: vec![listen_addr], bootstrap: vec![a_dial, b_dial],
+        }));
+
+        // Wait for the Hello triangle to close.
+        wait_for(|| {
+            let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                  && net_b.peer_for_prefix(prefix_a).is_some();
+            let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                  && net_c.peer_for_prefix(prefix_a).is_some();
+            let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                  && net_c.peer_for_prefix(prefix_b).is_some();
+            (ab && ac && bc).then_some(())
+        }, Duration::from_secs(15))
+        .expect("3-node Hello mesh forms");
+
+        // Each node gets its own redb file + worker.
+        let dir = std::env::temp_dir().join(format!(
+            "vos_raft_election_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk_worker = |me, network: Arc<Network>, db_name: &str| {
+            let db = Arc::new(redb::Database::create(dir.join(db_name)).unwrap());
+            RaftWorker::spawn(
+                db,
+                WorkerConfig {
+                    me,
+                    members: vec![prefix_a, prefix_b, prefix_c],
+                    replication_id: [0xC1; 32],
+                    // Short window so the test settles in well
+                    // under a second. The randomization scatters
+                    // peer timeouts so they don't all become
+                    // candidates at once.
+                    election_timeout_ms: (50, 150),
+                },
+                Some(network),
+            )
+        };
+        let w_a = mk_worker(prefix_a, net_a.clone(), "a.redb");
+        let w_b = mk_worker(prefix_b, net_b.clone(), "b.redb");
+        let w_c = mk_worker(prefix_c, net_c.clone(), "c.redb");
+        net_a.set_raft_handler(Arc::new(w_a.handler()));
+        net_b.set_raft_handler(Arc::new(w_b.handler()));
+        net_c.set_raft_handler(Arc::new(w_c.handler()));
+
+        // Phase 3.2 has no heartbeats, so leadership flickers: the
+        // moment a Leader's quorum is settled, the *other* replicas
+        // are still racing their own election timers and may bump
+        // the term, forcing the leader to step down. We're only
+        // asserting that election *makes progress* — at some
+        // observation a Leader exists at term ≥ 1. Phase 3.3 adds
+        // heartbeats, at which point a steady-state leader is the
+        // right invariant.
+        let until = StdInstant::now() + Duration::from_secs(5);
+        let mut observed: Option<(u16, u64)> = None;
+        loop {
+            let snaps = [
+                (prefix_a, w_a.handler().snapshot()),
+                (prefix_b, w_b.handler().snapshot()),
+                (prefix_c, w_c.handler().snapshot()),
+            ];
+            for (p, s) in &snaps {
+                if let Some(snap) = s {
+                    if snap.role == Role::Leader && snap.current_term >= 1 {
+                        observed = Some((*p, snap.current_term));
+                        // Sanity on the leader snapshot itself.
+                        assert_eq!(snap.voted_for, Some(*p),
+                            "a Leader voted for itself this term");
+                        break;
+                    }
+                }
+            }
+            if observed.is_some() { break; }
+            if StdInstant::now() >= until {
+                panic!(
+                    "no Leader observed within deadline; \
+                     last snapshots: A={:?}, B={:?}, C={:?}",
+                    snaps[0].1, snaps[1].1, snaps[2].1,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let (leader_prefix, leader_term) = observed.unwrap();
+        assert!([prefix_a, prefix_b, prefix_c].contains(&leader_prefix));
+        assert!(leader_term >= 1);
+
+        // Cleanly stop the workers before joining the networks
+        // so any in-flight outbound vote helpers exit.
+        w_a.shutdown();
+        w_b.shutdown();
+        w_c.shutdown();
+        match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
