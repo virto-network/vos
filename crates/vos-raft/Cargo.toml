@@ -7,23 +7,25 @@ license.workspace = true
 
 [features]
 default = ["std"]
-# `std` enables std-using helpers: `StdClock` (a per-`Delay`
-# thread-spawning timer that's robust under heavy `cargo test`
-# parallelism), `StdRng` (entropy from the system clock), and the
-# `Worker::spawn` helper that drives the async worker loop on a
-# dedicated thread with a tiny single-task executor. Without `std`
-# the same async types compile and can be driven by an
-# Embassy / async-std / custom executor.
-std = ["dep:futures-executor"]
+# `std` enables:
+#  - The `Worker` / `WorkerHandle` async loop (uses
+#    `futures-channel::mpsc` for the inbox, which requires std).
+#  - `StdClock` — per-`Delay` thread-spawning timer, robust under
+#    heavy `cargo test` parallelism.
+#  - `StdRng` — entropy from the system clock + pid.
+#  - The `Worker::spawn` helper that runs the worker future on a
+#    dedicated thread via `futures-executor`.
+#
+# Without `std`, only the pure data types compile (`Config`,
+# `LogEntry`, `Meta`, `Role`, `RPC` structs, `Storage` /
+# `Transport` traits, `MemStorage`). An embedded host implements
+# the worker driver itself against its async runtime.
+std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
 
 [dependencies]
-# Channels + `select!` + `FuturesUnordered`. `mpsc` needs std,
-# but the rest works on no_std + alloc — a future commit will
-# add a no_std-friendly channel abstraction so the worker can
-# run unchanged on Embassy.
-futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }
-futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
-futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await-macro", "std"] }
-# Std-only minimal executor used by `Worker::spawn` to drive the
-# worker future on a dedicated thread.
+# Channels + `select!` + `FuturesUnordered` — only used by the
+# std-feature worker. Optional so a true no_std build pulls in
+# nothing beyond core + alloc.
+futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
 futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
