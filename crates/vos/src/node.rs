@@ -121,6 +121,26 @@ pub struct AgentConfig {
     #[cfg(feature = "storage")]
     #[doc(hidden)]
     pub pre_opened_lock: Option<Arc<Mutex<()>>>,
+    /// Static cluster membership (list of `node_prefix`es) for
+    /// `Consistency::Raft`. Empty = single-node degenerate mode.
+    /// All cluster members must list the same set in the same
+    /// order.
+    pub members: Vec<u16>,
+    /// Pre-spawned Raft worker for `Consistency::Raft` multi-mode
+    /// replication. `register` spawns this when the right
+    /// conditions hold (multi-member + network attached + storage
+    /// feature on) and hands it to the agent thread, which builds
+    /// `RaftCommit::from_worker` with it. Caller code shouldn't
+    /// set this directly.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[doc(hidden)]
+    pub raft_worker: Option<crate::raft::RaftWorker>,
+    /// Apply-receiver paired with `raft_worker`. Drained by
+    /// `RaftCommit::commit_with_log` while waiting for an
+    /// in-flight propose to commit.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[doc(hidden)]
+    pub raft_apply_rx: Option<std::sync::mpsc::Receiver<u64>>,
 }
 
 impl AgentConfig {
@@ -137,7 +157,19 @@ impl AgentConfig {
             pre_opened_db: None,
             #[cfg(feature = "storage")]
             pre_opened_lock: None,
+            members: Vec::new(),
+            #[cfg(all(feature = "storage", feature = "network"))]
+            raft_worker: None,
+            #[cfg(all(feature = "storage", feature = "network"))]
+            raft_apply_rx: None,
         }
+    }
+
+    /// Set the static cluster membership for `Consistency::Raft`
+    /// — list of `node_prefix`es. Same list on every replica.
+    pub fn with_members(mut self, members: Vec<u16>) -> Self {
+        self.members = members;
+        self
     }
 
     /// Attach initial payloads dispatched on cold start.
@@ -968,6 +1000,66 @@ impl VosNode {
                     }
                 }
             })
+        } else if config.consistency == Consistency::Raft
+            && config.members.len() > 1
+        {
+            // Multi-mode Raft: spawn a worker, install it as the
+            // network's RaftRpcHandler, and bridge the worker's
+            // apply notifications into both (a) the agent's
+            // sync_rx (so the soft-restart path catches up state
+            // on followers) and (b) the strategy's apply_rx (so
+            // the leader's commit_with_log unblocks once its
+            // proposed entry commits).
+            let network = self.shared_network.lock().ok().and_then(|g| g.clone());
+            let rep_id = config.replication_id.unwrap_or([0u8; 32]);
+            match config.db_path(id).map(|p| (p, redb::Database::create(&config.db_path(id).unwrap()))) {
+                Some((_path, Ok(db))) => {
+                    let db = Arc::new(db);
+                    config.pre_opened_db = Some(db.clone());
+
+                    let worker_cfg = crate::raft::WorkerConfig {
+                        me: id.node_prefix(),
+                        members: config.members.clone(),
+                        replication_id: rep_id,
+                        election_timeout_ms: (150, 300),
+                        heartbeat_interval_ms: 50,
+                    };
+                    let (worker_tx, worker_rx) = mpsc::channel::<u64>();
+                    let worker = crate::raft::RaftWorker::spawn(
+                        db.clone(),
+                        worker_cfg,
+                        network.clone(),
+                        Some(worker_tx),
+                    );
+                    if let Some(net) = network.as_ref() {
+                        net.set_raft_handler(Arc::new(worker.handler()));
+                    }
+                    // Relay: each commit advance fans out to both
+                    // the strategy's apply_rx and the agent's
+                    // sync_rx. Lives until the worker drops its
+                    // sender (either side closing is fine).
+                    let (commit_tx, commit_rx) = mpsc::channel::<u64>();
+                    let (sync_tx, sync_rx) = mpsc::channel::<()>();
+                    thread::Builder::new()
+                        .name(format!("raft-relay-{:08x}", id.0))
+                        .spawn(move || {
+                            while let Ok(idx) = worker_rx.recv() {
+                                let _ = commit_tx.send(idx);
+                                let _ = sync_tx.send(());
+                            }
+                        })
+                        .expect("spawn raft relay");
+                    config.raft_worker = Some(worker);
+                    config.raft_apply_rx = Some(commit_rx);
+                    Some(sync_rx)
+                }
+                Some((path, Err(e))) => {
+                    error!(%id, path = %path.display(), error = %e,
+                        "register: failed to open Raft db; replication will be inactive");
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1376,7 +1468,7 @@ impl Default for VosNode {
 
 fn agent_thread(
     id: ServiceId,
-    config: AgentConfig,
+    mut config: AgentConfig,
     inbox: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
@@ -1499,15 +1591,49 @@ fn agent_thread(
     // Capture rep_id up front — config is consumed below.
     #[cfg(all(feature = "network", feature = "storage"))]
     let agent_rep_id: Option<[u8; 32]> = config.replication_id;
-    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        match build_agent_strategy(&config, id, id.node_prefix()) {
+    // Multi-mode Raft: register() pre-spawned the worker and
+    // handed it to us through the config; build the Multi-flavour
+    // strategy here while we still own `config` mutably.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    let raft_multi: Option<Box<dyn crate::commit::CommitStrategy>> =
+        if consistency == Consistency::Raft && config.raft_worker.is_some() {
+            let db = config.pre_opened_db.clone();
+            let worker = config.raft_worker.take();
+            let apply_rx = config.raft_apply_rx.take();
+            match (db, worker, apply_rx) {
+                (Some(db), Some(worker), Some(apply_rx)) => {
+                    let cfg = crate::raft::RaftConfig {
+                        me: id.node_prefix(),
+                        members: config.members.clone(),
+                        replication_id: agent_rep_id.unwrap_or([0u8; 32]),
+                        ..crate::raft::RaftConfig::default()
+                    };
+                    match crate::raft::RaftCommit::from_worker(db, cfg, worker, apply_rx) {
+                        Ok(s) => Some(Box::new(s) as Box<dyn crate::commit::CommitStrategy>),
+                        Err(e) => {
+                            error!(%id, error = %e, "raft multi: failed to construct strategy");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+    #[cfg(not(all(feature = "network", feature = "storage")))]
+    let raft_multi: Option<Box<dyn crate::commit::CommitStrategy>> = None;
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> = match raft_multi {
+        Some(s) => s,
+        None => match build_agent_strategy(&config, id, id.node_prefix()) {
             Ok(s) => s,
             Err(e) => {
                 let err = format!("strategy build failed: {e}");
                 error!(%id, "{err}");
                 return AgentResult { id, panics: 0, error: Some(err) };
             }
-        };
+        },
+    };
 
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
@@ -1876,20 +2002,20 @@ fn build_agent_strategy(
                 Ok(Box::new(crate::commit::CrdtCommit::open(&path)?))
             }
             Consistency::Raft => {
-                // Phase 1: single-node only. The cluster ID lives in
-                // `replication_id` if set (so phase 3's worker can
-                // self-discover peers via gossipsub) but isn't read
-                // here yet — phase 1 only needs `me` to seed
-                // `RaftConfig`, and that's the local node prefix.
+                // Single-node-only path: agent_thread handles the
+                // multi-mode case before reaching here (it owns
+                // the pre-spawned worker via `config.raft_worker`).
+                let cfg = crate::raft::RaftConfig {
+                    me: self_node_prefix,
+                    members: config.members.clone(),
+                    replication_id: config.replication_id.unwrap_or([0u8; 32]),
+                    ..crate::raft::RaftConfig::default()
+                };
                 let path = config.db_path(id).ok_or_else(|| {
                     crate::commit::CommitError::Config(
                         "Raft consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
-                let cfg = crate::raft::RaftConfig {
-                    me: self_node_prefix,
-                    ..crate::raft::RaftConfig::default()
-                };
                 Ok(Box::new(crate::raft::RaftCommit::open(&path, cfg)?))
             }
         }
