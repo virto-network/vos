@@ -107,6 +107,15 @@ commit.
   complementary shift identity uses modulus 32 (vs 64 for the
   64-bit variants); a `val_d[4..8] = 0` constraint pins
   ShiftAmount/ShiftAmountCompl ∈ [0, 31] uniquely `[36]`.
+- **RotR64ImmAlt / RotR32ImmAlt** — swapped-operand variants
+  where the immediate is the rotated value and `regs[rb]` is the
+  shift amount.  Trace fill swaps val_b ← imm and val_d ←
+  regs[rb] on these rows; reg_access also swaps val_b_read /
+  val_d_read.  A new `val_b ↔ ImmBytes` constraint (low 4 bytes
+  always; high 4 bytes match-or-zero gated on IsTruncated, same
+  shape as the val_b ↔ reg_val_b cross-constraint) pins the
+  swapped source.  All other rotate-r logic re-uses Phase 35/36
+  via the existing IsRotateR64 / IsRotateR32 flags `[40]`.
 
 ### Sign-bit pinning
 - `SignBitB / SignBitD / SignBitQ / SignBitR` — each pinned to
@@ -203,12 +212,9 @@ biggest exposure-to-fix-cost ratio.  See
   infrastructure would close both).
 
 ### Rotate
-- **RotR64ImmAlt / RotR32ImmAlt** — still prover-trusted.
-  Both have swapped operand semantics (immediate is the
-  rotated value, register is the shift amount), which clashes
-  with the AIR's val_b/val_d layout.  Would need a swapped
-  trace-fill code path plus a flag distinguishing the two
-  TwoRegOneImm variants.
+- (closed by Phase 40) **RotR64ImmAlt / RotR32ImmAlt** —
+  swapped-operand variants now bound via the same swapped
+  trace-fill + reg_access path described above.
 
 ### BitManip
 - **Sbrk** — host-call-like; needs precompile-style integration.

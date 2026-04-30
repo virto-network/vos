@@ -341,6 +341,43 @@ impl BuiltInComponent for CpuChip {
                         )
                 );
             }
+            // Phase 40: pin val_b ↔ ImmBytes on RotR64ImmAlt /
+            // RotR32ImmAlt rows.  These swap the operand convention
+            // (immediate is the rotated value, register is the shift
+            // amount), so val_b is no longer a register read — the
+            // standard val_b ↔ reg_val_b cross-constraint is
+            // inactive (val_b_is_reg=0).  Without this constraint
+            // val_b would be effectively unbound.
+            //
+            // Shape mirrors the val_b cross-constraint:
+            //   - low 4 bytes: val_b[i] = ImmBytes[i] always.
+            //   - high 4 bytes: match ImmBytes when not truncated;
+            //     zero when truncated (32-bit ImmAlt has IsTruncated
+            //     = is_32bit · is_mul = 1, which masks val_b high
+            //     bytes to 0 in trace fill, while ImmBytes carries
+            //     the sign-extended bytes from step.imm.to_le_bytes()).
+            let f_is_rotate_r_imm_alt_p40 = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let imm_bytes_p40 = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            let is_truncated_p40 = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
+            for i in 0..4 {
+                eval.add_constraint(
+                    f_is_rotate_r_imm_alt_p40[0].clone()
+                        * (val_b[i].clone() - imm_bytes_p40[i].clone())
+                );
+            }
+            for i in 4..WORD_SIZE {
+                eval.add_constraint(
+                    f_is_rotate_r_imm_alt_p40[0].clone()
+                        * (E::F::one() - is_truncated_p40[0].clone())
+                        * (val_b[i].clone() - imm_bytes_p40[i].clone())
+                );
+                eval.add_constraint(
+                    f_is_rotate_r_imm_alt_p40[0].clone()
+                        * is_truncated_p40[0].clone()
+                        * val_b[i].clone()
+                );
+            }
+
             // Phase 36 / 37: pin val_d high 4 bytes = 0 on ALL 32-bit
             // shift-constrained rows.  Combined with the PowerOfTwo
             // lookup (table covers shifts [0, 63]), this forces
@@ -2376,6 +2413,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_rotate_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let f_is_rotate_l32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
             let f_is_rotate_r32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+            let f_is_rotate_r_imm_alt = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2435,6 +2473,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_rotate_r64[0].clone());
             tuple.push(f_is_rotate_l32[0].clone());
             tuple.push(f_is_rotate_r32[0].clone());
+            tuple.push(f_is_rotate_r_imm_alt[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -3137,10 +3176,29 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, step.reg_b as u8, Column::RegB);
             trace.fill_columns(row, step.reg_d as u8, Column::RegD);
 
-            // Source operands
+            let flags = classify_opcode(step.opcode);
+
+            // Source operands.  Default convention (used by all but
+            // the Phase-40 swap):
+            //   ThreeReg     → (regs[ra], regs[rb])
+            //   TwoRegOneImm → (regs[rb], imm)
+            //   TwoReg       → (0, regs[rb])
+            //   OneRegImmOffset → (regs[ra], imm)  [imm-compare branches]
+            //   Other immediate-source ops → (0, imm)
+            //
+            // Phase 40: RotR64ImmAlt / RotR32ImmAlt swap the source
+            // convention — the immediate is the rotated value, the
+            // register is the shift amount.  In AIR terms: val_b ←
+            // imm, val_d ← regs[rb].
             let (mut val_b, mut val_d) = match step.opcode.category() {
                 javm::instruction::InstructionCategory::ThreeReg => {
                     (step.regs_before[step.reg_a], step.regs_before[step.reg_b])
+                }
+                javm::instruction::InstructionCategory::TwoRegOneImm
+                    if flags.is_rotate_r_imm_alt =>
+                {
+                    // Phase 40 swap.
+                    (step.imm, step.regs_before[step.reg_b])
                 }
                 javm::instruction::InstructionCategory::TwoRegOneImm => {
                     (step.regs_before[step.reg_b], step.imm)
@@ -3157,8 +3215,6 @@ impl BuiltInProverComponent for CpuChip {
                 }
                 _ => (step.regs_before[step.reg_a], step.regs_before[step.reg_b]),
             };
-
-            let flags = classify_opcode(step.opcode);
 
             // For left/right shifts and Phase-32/36 rotates: save shift
             // amount, then replace val_d with 2^shift_amount.
@@ -3481,6 +3537,7 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, flags.is_rotate_r64, Column::IsRotateR64);
             trace.fill_columns(row, flags.is_rotate_l32, Column::IsRotateL32);
             trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
+            trace.fill_columns(row, flags.is_rotate_r_imm_alt, Column::IsRotateRImmAlt);
             trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
             trace.fill_columns(row, saved_shift_quotient_compl, Column::ShiftQuotientCompl);
 
@@ -4657,6 +4714,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_rotate_r64 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
             let f_is_rotate_l32 = crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
             let f_is_rotate_r32 = crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
+            let f_is_rotate_r_imm_alt = crate::trace::original_base_column!(component_trace, Column::IsRotateRImmAlt);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -4717,6 +4775,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_rotate_r64[0].clone());
             tuple.push(f_is_rotate_l32[0].clone());
             tuple.push(f_is_rotate_r32[0].clone());
+            tuple.push(f_is_rotate_r_imm_alt[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

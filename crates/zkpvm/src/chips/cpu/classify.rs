@@ -204,6 +204,15 @@ pub(super) struct OpcodeFlags {
     /// 2^((32 − n) mod 32); result low 4 bytes = UnsignedProductLow
     /// + mul_high; high 4 bytes = sign-extension.
     pub is_rotate_r32: bool,
+    /// Phase 40: 1 iff this opcode is `RotR64ImmAlt` or
+    /// `RotR32ImmAlt` — the swapped-source variants where the
+    /// immediate is the rotated value and `regs[rb]` is the shift
+    /// amount (vs. RotR64Imm / RotR32Imm where the convention is
+    /// reversed).  Drives a swapped trace fill (val_b ← imm,
+    /// val_d ← regs[rb]) plus a `val_b = ImmBytes` constraint
+    /// pinning the new source.  Set alongside is_rotate_r64 /
+    /// is_rotate_r32 so the existing rotate-r constraints fire.
+    pub is_rotate_r_imm_alt: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -267,7 +276,16 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_r64 = true;
         }
-        Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
+        // Phase 40: RotR64ImmAlt — value = imm, shift = regs[rb].
+        // Set is_rotate_r64 so the existing rotate-r logic fires;
+        // is_rotate_r_imm_alt drives the swapped trace fill.
+        Opcode::RotR64ImmAlt => {
+            f.is_shift = true;
+            f.shift_op = 4;
+            f.is_mul = true;
+            f.is_rotate_r64 = true;
+            f.is_rotate_r_imm_alt = true;
+        }
         // Phase 36: RotR32 + RotR32Imm — value in val_b, shift in val_d.
         // Same shape as RotR64 but with modulus 32.  RotR32ImmAlt
         // deferred for the same operand-swap reason as RotR64ImmAlt.
@@ -278,7 +296,15 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_r32 = true;
         }
-        Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
+        // Phase 40: RotR32ImmAlt — same swap as RotR64ImmAlt but 32-bit.
+        Opcode::RotR32ImmAlt => {
+            f.is_shift = true;
+            f.shift_op = 4;
+            f.is_32bit = true;
+            f.is_mul = true;
+            f.is_rotate_r32 = true;
+            f.is_rotate_r_imm_alt = true;
+        }
         // Compare
         Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.is_set_lt_u = true; }
         Opcode::SetLtS | Opcode::SetLtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
@@ -469,12 +495,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35 + 36):
-/// extract the 47 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35 + 36 + 40):
+/// extract the 48 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 47] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -502,5 +528,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 47] {
         f.is_rotate_r64 as u8,
         f.is_rotate_l32 as u8,
         f.is_rotate_r32 as u8,
+        f.is_rotate_r_imm_alt as u8,
     ]
 }

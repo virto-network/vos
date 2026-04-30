@@ -143,12 +143,20 @@ Phase 36 added `val_d[4..8] = 0` on rotate-32 rows; Phase 37
 widens the gate to all `is_32bit · is_shift_c` rows so
 ShloL32/ShloR32/SharR32 (+ Imm/ImmAlt variants) are covered too.
 
-### Future — RotR64ImmAlt + RotR32ImmAlt
+### Phase 40 — RotR64ImmAlt + RotR32ImmAlt — DONE
 
-Both have swapped operand semantics (immediate is the rotated
-value, register is the shift amount).  Need a flag distinguishing
-the two TwoRegOneImm variants and a swapped-source trace-fill path
-(val_b ← imm, val_d ← regs[reg_b]).  Deferred.
+Closed via:
+- A new IsRotateRImmAlt flag (set alongside IsRotateR64 / IsRotateR32
+  so the existing rotate-r constraints fire normally).
+- A swapped trace-fill path (val_b ← imm, val_d ← regs[rb]) for
+  TwoRegOneImm rows where is_rotate_r_imm_alt = 1, plus matching
+  swap in reg_access (val_b_read = None, val_d_read = Some((rb, ...))).
+- A `val_b ↔ ImmBytes` algebraic constraint pinning val_b to the
+  canonical immediate.  Shape mirrors the val_b cross-constraint:
+  low 4 bytes always; high 4 bytes match-or-zero gated on
+  IsTruncated (32-bit ImmAlt has IsTruncated=1, which masks val_b
+  high bytes to 0 in trace fill while ImmBytes carries the
+  sign-extended bytes).
 
 ## BitManip remainder
 

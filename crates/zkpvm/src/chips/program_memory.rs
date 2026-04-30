@@ -223,6 +223,12 @@ pub enum PreprocessedColumn {
     /// = 2^((32 − n) mod 32), result low 4 bytes = sum of both
     /// halves.
     #[size = 1] IsRotateR32,
+    /// Phase 40: 1 at PCs whose canonical decoding is `RotR64ImmAlt`
+    /// or `RotR32ImmAlt`.  Drives the swapped-source trace fill
+    /// (val_b ← imm, val_d ← regs[rb]) plus a `val_b = ImmBytes`
+    /// constraint.  Set alongside IsRotateR64 / IsRotateR32 so the
+    /// existing rotate-r logic fires.
+    #[size = 1] IsRotateRImmAlt,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -304,6 +310,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_rotate_r64 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateR64);
         let f_is_rotate_l32 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateL32);
         let f_is_rotate_r32 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateR32);
+        let f_is_rotate_r_imm_alt = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateRImmAlt);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -366,6 +373,7 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_rotate_r64[0].clone());
         tuple.push(f_is_rotate_l32[0].clone());
         tuple.push(f_is_rotate_r32[0].clone());
+        tuple.push(f_is_rotate_r_imm_alt[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -454,6 +462,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsRotateR64,
                     PreprocessedColumn::IsRotateL32,
                     PreprocessedColumn::IsRotateR32,
+                    PreprocessedColumn::IsRotateRImmAlt,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -550,6 +559,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_rotate_r64 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateR64);
         let f_is_rotate_l32 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateL32);
         let f_is_rotate_r32 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateR32);
+        let f_is_rotate_r_imm_alt = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateRImmAlt);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -611,6 +621,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_rotate_r64[0].clone());
         tuple.push(f_is_rotate_l32[0].clone());
         tuple.push(f_is_rotate_r32[0].clone());
+        tuple.push(f_is_rotate_r_imm_alt[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -644,7 +655,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 47],
+    flags: [u8; 48],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }

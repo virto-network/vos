@@ -42,12 +42,14 @@ stwo_constraint_framework::relation!(
 //   is_store_direct, is_load_direct, is_mem_indirect,
 //   is_store_imm_any, is_store_imm_direct, is_store_ind, is_rotate_l64,
 //   is_count_set_bits, is_lzb, is_tzb, is_rotate_r64,
-//   is_rotate_l32, is_rotate_r32
-pub const PROG_MEMORY_N_FLAGS: usize = 47;
+//   is_rotate_l32, is_rotate_r32, is_rotate_r_imm_alt
+pub const PROG_MEMORY_N_FLAGS: usize = 48;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 47 flags + imm_y_canon[4] + branch_target_canon[4] = 72 limbs.
-//   is_rotate_l32 / is_rotate_r32 added in Phase 36 to drive the
-//   32-bit rotate bindings via the 32-bit mul-schoolbook re-route.
+//   + 48 flags + imm_y_canon[4] + branch_target_canon[4] = 73 limbs.
+//   is_rotate_r_imm_alt added in Phase 40 to drive the swapped-source
+//   trace fill (val_b ← imm, val_d ← regs[rb]) for RotR64ImmAlt /
+//   RotR32ImmAlt; the existing rotate-r constraints fire normally
+//   alongside is_rotate_r64 / is_rotate_r32.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(

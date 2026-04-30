@@ -888,6 +888,79 @@ fn prove_rotate_r32_full_word() {
     test_three_reg_op(Opcode::RotR32, a_lo as u64, 32, expected);
 }
 
+// ── Phase 40: RotR64ImmAlt / RotR32ImmAlt (swapped operand convention) ──
+
+#[test]
+fn prove_rotate_r64_imm_alt_smoke() {
+    // RotR64ImmAlt: regs[ra] = imm.rotate_right((regs[rb] % 64) as u32).
+    // The 4-byte encoded immediate is sign-extended to i64 before
+    // becoming step.imm.  Use a positive-i32 imm to keep the
+    // sign-extension a no-op and the math obvious.
+    let imm: i32 = 0x12345678;
+    let n: u64 = 16;
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = n;
+    let steps = run_two_reg_imm(Opcode::RotR64ImmAlt, 0, 1, imm as i64, regs);
+    let expected = (imm as i64 as u64).rotate_right(n as u32);
+    assert_eq!(steps[0].regs_after[0], expected,
+        "RotR64ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}", steps[0].regs_after[0], expected);
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![Opcode::RotR64ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_rotate_r32_imm_alt_smoke() {
+    // RotR32ImmAlt: regs[ra] = sign_extend_32(imm.rotate_right((regs[rb] % 32) as u32)).
+    // Use a positive-i32 imm so the sign-extension to i64 is a no-op.
+    let imm: i32 = 0x12345678;
+    let n: u64 = 4;
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = n;
+    let steps = run_two_reg_imm(Opcode::RotR32ImmAlt, 0, 1, imm as i64, regs);
+    let rotated = (imm as u32).rotate_right(n as u32);
+    let expected = ((rotated as i32) as i64) as u64;
+    assert_eq!(steps[0].regs_after[0], expected,
+        "RotR32ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}", steps[0].regs_after[0], expected);
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![Opcode::RotR32ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_rotate_r32_imm_alt_negative_imm() {
+    // RotR32ImmAlt with high-bit-set imm — exercises the imm
+    // sign-extension to i64 (val_b high 4 bytes = 0xFF, low 4 bytes
+    // = the actual rotated value).
+    let imm: i32 = -1; // 0xFFFFFFFF as u32
+    let n: u64 = 4;
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = n;
+    let steps = run_two_reg_imm(Opcode::RotR32ImmAlt, 0, 1, imm as i64, regs);
+    // 0xFFFFFFFF rotated by anything = 0xFFFFFFFF; sign-ext to u64 = u64::MAX.
+    assert_eq!(steps[0].regs_after[0], u64::MAX);
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![Opcode::RotR32ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_rotate_r64_imm_alt_zero_shift() {
+    // n=0 → identity (after the imm sign-extension to i64).
+    let imm: i32 = 0x12345678; // positive → no sign extension
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = 0;
+    let steps = run_two_reg_imm(Opcode::RotR64ImmAlt, 0, 1, imm as i64, regs);
+    assert_eq!(steps[0].regs_after[0], imm as i64 as u64);
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![Opcode::RotR64ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 #[test]
 fn prove_shlo_l64_negative_value() {
     // Exact values from blake2s step 242: left shift of a large (negative-looking) 64-bit value

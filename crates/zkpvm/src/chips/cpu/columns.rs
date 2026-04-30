@@ -863,6 +863,16 @@ pub enum Column {
     /// complementary shift identity and PowerOfTwo lookup.
     #[size = 1]
     IsRotateR32,
+    /// Phase 40: 1 iff this opcode is `RotR64ImmAlt` or
+    /// `RotR32ImmAlt`.  These are the swapped-source variants
+    /// where the immediate is the rotated value and `regs[rb]`
+    /// is the shift amount.  Drives the `val_b = ImmBytes`
+    /// constraint pinning val_b to the canonical immediate
+    /// (since val_b is no longer a register read for these rows
+    /// — the standard val_b ↔ reg_val_b cross-constraint is
+    /// inactive when val_b_is_reg=0).
+    #[size = 1]
+    IsRotateRImmAlt,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
