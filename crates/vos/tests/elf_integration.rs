@@ -2506,18 +2506,11 @@ fn crdt_counter_restart_replays_state_from_disk() {
 }
 
 #[test]
-#[ignore = "known bug — corrupted state is silently accepted as garbage; \
-    the actor's rkyv decode goes through `access_unchecked` which skips \
-    bounds + sanity validation. Fix needs `bytecheck` derives on every \
-    actor state type so `rkyv::access` (validating) can replace \
-    `access_unchecked` in `vos::actors::codec::Decode`. The test below \
-    documents the expected post-fix behaviour."]
 fn crdt_counter_survives_corrupted_persisted_state() {
     // Robustness probe: simulate schema drift / disk
     // corruption / hand-edited save by overwriting the
     // actor's persisted state blob with garbage between two
-    // node boots. The actor's rkyv-decode on restart will
-    // fail. The runtime should:
+    // node boots. The actor's rkyv-decode on restart must:
     //
     //  1. Not silently surface garbage as "valid" state —
     //     either the actor falls back to default state
@@ -2526,12 +2519,14 @@ fn crdt_counter_survives_corrupted_persisted_state() {
     //     invoke must produce a usable error or a usable
     //     reply, not a hang or segfault.
     //
-    // Today the test FAILS because `codec::Decode` uses
-    // `rkyv::access_unchecked`: 7 bytes of garbage decode
-    // into a u64 of 72057589742960640, the actor reports it
-    // as the count, and writes through it on the next inc.
-    // Silent corruption is the worst kind of failure mode;
-    // marking ignored until the validating-decode fix lands.
+    // Pre-fix behaviour was: `codec::Decode` used
+    // `rkyv::access_unchecked`, so 7 bytes of garbage
+    // decoded into a u64 of 72057589742960640 and the actor
+    // happily reported it as the count. Fixed by routing
+    // `lifecycle::load_or_create` through validating
+    // `Decode::try_decode` (rkyv `access` + bytecheck), so a
+    // corrupted blob falls back to `A::create()` and the
+    // actor reports a clean count==0.
     use crdt_counter::CrdtCounterClient;
     use vos::node::{AgentConfig, Consistency, VosNode};
 

@@ -62,10 +62,15 @@ pub enum DispatchResult {
 /// This is the first step of any actor lifecycle — both services and
 /// invoked actors use it. The caller provides state bytes from wherever
 /// they came (storage, input protocol, etc.).
+///
+/// Uses validating `try_decode` so a hand-corrupted, truncated, or
+/// schema-drifted persisted blob falls back to `A::create()` instead
+/// of decoding silently to garbage. The probe in
+/// `crdt_counter_survives_corrupted_persisted_state` exercises this.
 #[cfg(feature = "pvm")]
 pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
     match state {
-        Some(bytes) if !bytes.is_empty() => A::decode(bytes),
+        Some(bytes) if !bytes.is_empty() => A::try_decode(bytes).unwrap_or_else(A::create),
         _ => A::create(),
     }
 }

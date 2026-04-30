@@ -884,6 +884,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             /// Restore a worker instance from previously saved state.
             /// Caller takes ownership of the returned pointer.
+            ///
+            /// Uses validating `try_decode` so a corrupted persisted
+            /// blob falls back to a fresh instance instead of decoding
+            /// to garbage and (worse) panicking across the FFI boundary.
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_worker_load(
                 state_ptr: *const u8,
@@ -893,7 +897,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let bytes = unsafe {
                     core::slice::from_raw_parts(state_ptr, state_len)
                 };
-                let mut actor: #actor_name = vos::Decode::decode(bytes);
+                let mut actor: #actor_name = vos::Decode::try_decode(bytes)
+                    .unwrap_or_else(<#actor_name as vos::Actor>::create);
                 let mut ctx = vos::Context::<#actor_name>::new(
                     vos::actors::context::ServiceId(0),
                 );
@@ -1140,14 +1145,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             /// Restore an actor instance from previously saved state.
-            /// Returns the new state pointer.
+            /// Returns the new state pointer. Falls back to a fresh
+            /// instance on validation failure (mirrors PVM/worker
+            /// `load_or_create` so corruption doesn't surface as
+            /// silent garbage).
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_load(state_ptr: u32, state_len: u32) -> u32 {
                 use vos::Actor as _;
                 let bytes = unsafe {
                     core::slice::from_raw_parts(state_ptr as *const u8, state_len as usize)
                 };
-                let mut actor: #actor_name = vos::Decode::decode(bytes);
+                let mut actor: #actor_name = vos::Decode::try_decode(bytes)
+                    .unwrap_or_else(<#actor_name as vos::Actor>::create);
                 let mut ctx = vos::Context::<#actor_name>::new(
                     vos::actors::context::ServiceId(0),
                 );
