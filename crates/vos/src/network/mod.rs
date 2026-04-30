@@ -120,6 +120,13 @@ pub struct RaftVoteResult {
     pub vote_granted: bool,
 }
 
+/// Inbound result from an
+/// [`InstallSnapshot`](Frame::RaftInstallSnapshotReq) RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftInstallSnapshotResult {
+    pub term: u64,
+}
+
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncProvider`]'s
 /// shape: the swarm thread invokes the trait methods on its current-
 /// thread runtime, so implementations must be fast. Any redb writes
@@ -154,6 +161,24 @@ pub trait RaftRpcHandler: Send + Sync {
         last_log_index: u64,
         last_log_term: u64,
     ) -> RaftVoteResult;
+
+    /// Inbound `InstallSnapshot` from `from_prefix` (the leader).
+    /// Implementations replace the local actor state, advance
+    /// the snap pointer, and drop any log entries the snapshot
+    /// supersedes — atomically, before answering. The default
+    /// impl just refuses (advertises our current term) so older
+    /// handlers stay safely on the AppendEntries path.
+    fn install_snapshot(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        term: u64,
+        _last_included_index: u64,
+        _last_included_term: u64,
+        _snapshot: Vec<u8>,
+    ) -> RaftInstallSnapshotResult {
+        RaftInstallSnapshotResult { term }
+    }
 }
 
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
@@ -280,6 +305,17 @@ enum NetworkCmd {
         last_log_term: u64,
         reply: std_mpsc::Sender<RaftVoteResult>,
     },
+    /// Send a Raft `InstallSnapshot` RPC to a specific peer.
+    SendRaftInstallSnapshot {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+        reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
+    },
     Shutdown,
 }
 
@@ -290,6 +326,7 @@ enum OutboundReply {
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
     RaftAppend(std_mpsc::Sender<RaftAppendResult>),
     RaftVote(std_mpsc::Sender<RaftVoteResult>),
+    RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
 }
 
 impl Network {
@@ -428,6 +465,32 @@ impl Network {
             candidate_prefix,
             last_log_index,
             last_log_term,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a Raft `InstallSnapshot` RPC to a specific peer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raft_install_snapshot(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+    ) -> std_mpsc::Receiver<RaftInstallSnapshotResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftInstallSnapshot {
+            target_peer,
+            replication_id,
+            term,
+            leader_prefix,
+            last_included_index,
+            last_included_term,
+            snapshot,
             reply: tx,
         });
         rx
@@ -839,6 +902,35 @@ async fn network_main(
                         outbound_replies.insert(req_id, OutboundReply::RaftVote(reply));
                         debug!(%target_peer, term, "network: sent RaftVote");
                     }
+                    Some(NetworkCmd::SendRaftInstallSnapshot {
+                        target_peer,
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        last_included_index,
+                        last_included_term,
+                        snapshot,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftInstallSnapshotReq {
+                            replication_id,
+                            term,
+                            leader_prefix,
+                            last_included_index,
+                            last_included_term,
+                            snapshot,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(
+                            req_id,
+                            OutboundReply::RaftInstallSnapshot(reply),
+                        );
+                        debug!(%target_peer, term, last_included_index,
+                            "network: sent RaftInstallSnapshot");
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
@@ -1159,6 +1251,44 @@ fn handle_req_resp(
                             ));
                         });
                     }
+                    Frame::RaftInstallSnapshotReq {
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        last_included_index,
+                        last_included_term,
+                        snapshot,
+                    } => {
+                        // Install logic writes redb (state row +
+                        // raft_meta + raft_log truncate), so a
+                        // blocking task is the right shape.
+                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.install_snapshot(
+                                    &replication_id,
+                                    leader_prefix,
+                                    term,
+                                    last_included_index,
+                                    last_included_term,
+                                    snapshot,
+                                ),
+                                None => {
+                                    warn!(
+                                        leader_prefix,
+                                        "network: inbound RaftInstallSnapshotReq with no \
+                                         handler; replying with our term",
+                                    );
+                                    RaftInstallSnapshotResult { term }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftInstallSnapshotResp { term: resp.term },
+                            ));
+                        });
+                    }
                     other => {
                         warn!(%peer, ?other, "network: unexpected frame in request slot");
                         let _ = swarm
@@ -1201,6 +1331,12 @@ fn handle_req_resp(
                         Some(OutboundReply::RaftVote(tx)),
                     ) => {
                         let _ = tx.send(RaftVoteResult { term, vote_granted });
+                    }
+                    (
+                        Frame::RaftInstallSnapshotResp { term },
+                        Some(OutboundReply::RaftInstallSnapshot(tx)),
+                    ) => {
+                        let _ = tx.send(RaftInstallSnapshotResult { term });
                     }
                     (other, _) => {
                         warn!(%peer, ?other, "network: response shape mismatched pending request");

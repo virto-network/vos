@@ -43,14 +43,16 @@ const TAG_FETCH_HEADS: u8 = 0x20;
 const TAG_HEADS: u8 = 0x21;
 const TAG_FETCH_NODE: u8 = 0x22;
 const TAG_NODE_REPLY: u8 = 0x23;
-// Raft RPCs (phase 2). 0x30..=0x35 reserved for the basic
-// election + replication round; 0x36 reserved for follower-→-
-// leader propose forwarding (phase 5+); 0x37..=0x38 reserved
-// for snapshot install/response (phase 6+).
+// Raft RPCs. 0x30..=0x35 reserved for the basic election +
+// replication round; 0x36 reserved for follower→leader propose
+// forwarding (later phase); 0x37..=0x38 for snapshot install
+// (phase 7).
 const TAG_RAFT_APPEND_REQ: u8 = 0x30;
 const TAG_RAFT_APPEND_RESP: u8 = 0x31;
 const TAG_RAFT_VOTE_REQ: u8 = 0x32;
 const TAG_RAFT_VOTE_RESP: u8 = 0x33;
+const TAG_RAFT_INSTALL_REQ: u8 = 0x37;
+const TAG_RAFT_INSTALL_RESP: u8 = 0x38;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -154,6 +156,24 @@ pub enum Frame {
     },
     /// Reply to [`Frame::RaftVoteReq`].
     RaftVoteResp { term: u64, vote_granted: bool },
+    /// Raft `InstallSnapshot` RPC — the leader hands a far-behind
+    /// follower the actor state at `last_included_index`/term so
+    /// the follower doesn't need a log replay it can no longer
+    /// reconstruct (the entries have been compacted away).
+    /// Single-shot for now; chunked support is a later phase.
+    RaftInstallSnapshotReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        /// Opaque actor state at `last_included_index`. Bounded
+        /// by `MAX_FRAME_BYTES` (1 MB) like every other length-
+        /// prefixed payload.
+        snapshot: Vec<u8>,
+    },
+    /// Reply to [`Frame::RaftInstallSnapshotReq`].
+    RaftInstallSnapshotResp { term: u64 },
 }
 
 /// One log entry carried inside an [`Frame::RaftAppendReq`].
@@ -278,6 +298,27 @@ impl Frame {
                 out.extend_from_slice(&term.to_le_bytes());
                 out.push(if *vote_granted { 1 } else { 0 });
             }
+            Frame::RaftInstallSnapshotReq {
+                replication_id,
+                term,
+                leader_prefix,
+                last_included_index,
+                last_included_term,
+                snapshot,
+            } => {
+                out.push(TAG_RAFT_INSTALL_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&leader_prefix.to_le_bytes());
+                out.extend_from_slice(&last_included_index.to_le_bytes());
+                out.extend_from_slice(&last_included_term.to_le_bytes());
+                out.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
+                out.extend_from_slice(snapshot);
+            }
+            Frame::RaftInstallSnapshotResp { term } => {
+                out.push(TAG_RAFT_INSTALL_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+            }
         }
         out
     }
@@ -393,6 +434,23 @@ impl Frame {
                 };
                 Frame::RaftVoteResp { term, vote_granted }
             }
+            TAG_RAFT_INSTALL_REQ => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let term = r.u64()?;
+                let leader_prefix = r.u16()?;
+                let last_included_index = r.u64()?;
+                let last_included_term = r.u64()?;
+                let snapshot = r.bytes_with_len_prefix()?;
+                Frame::RaftInstallSnapshotReq {
+                    replication_id,
+                    term,
+                    leader_prefix,
+                    last_included_index,
+                    last_included_term,
+                    snapshot,
+                }
+            }
+            TAG_RAFT_INSTALL_RESP => Frame::RaftInstallSnapshotResp { term: r.u64()? },
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -762,6 +820,32 @@ mod tests {
             Frame::decode(&bad),
             Err(FrameError::BadOption(7))
         ));
+    }
+
+    #[test]
+    fn raft_install_snapshot_req_roundtrip() {
+        roundtrip(Frame::RaftInstallSnapshotReq {
+            replication_id: [0x22; REPLICATION_ID_BYTES],
+            term: 9,
+            leader_prefix: 0xAAAA,
+            last_included_index: 100,
+            last_included_term: 8,
+            snapshot: b"opaque actor state".to_vec(),
+        });
+        // Empty snapshot — degenerate but valid.
+        roundtrip(Frame::RaftInstallSnapshotReq {
+            replication_id: [0x22; REPLICATION_ID_BYTES],
+            term: 1,
+            leader_prefix: 0,
+            last_included_index: 0,
+            last_included_term: 0,
+            snapshot: vec![],
+        });
+    }
+
+    #[test]
+    fn raft_install_snapshot_resp_roundtrip() {
+        roundtrip(Frame::RaftInstallSnapshotResp { term: 9 });
     }
 
     #[test]

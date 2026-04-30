@@ -41,10 +41,28 @@ use tracing::{debug, warn};
 
 use crate::commit::CommitError;
 use crate::network::{
-    Network, RaftAppendResult, RaftEntry, RaftRpcHandler, RaftVoteResult,
+    Network, RaftAppendResult, RaftEntry, RaftInstallSnapshotResult, RaftRpcHandler,
+    RaftVoteResult,
 };
 
 use super::log::{RaftLog, RaftMeta};
+
+/// Read the actor's currently-persisted state row. Used by the
+/// leader when assembling an InstallSnapshot to a far-behind
+/// peer — the snapshot bytes are the post-apply actor state at
+/// (or above) the leader's snap pointer.
+fn read_state_bytes(db: &Database) -> Result<Vec<u8>, CommitError> {
+    let txn = db.begin_read()?;
+    let table = match txn.open_table(crate::commit::STATE_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(table
+        .get(crate::commit::STATE_KEY)?
+        .map(|v| v.value().to_vec())
+        .unwrap_or_default())
+}
 
 /// Hard upper bound on how long a single outbound vote helper
 /// thread waits for a peer's reply before giving up. The election
@@ -159,6 +177,28 @@ pub(crate) enum RaftMsg {
         term: u64,
         success: bool,
         match_index: u64,
+    },
+    /// Inbound `InstallSnapshot` from the leader. The reply
+    /// channel receives our current term once the snapshot has
+    /// been applied (or refused for a stale-term reason).
+    InstallSnapshot {
+        from_prefix: u16,
+        term: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+        reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
+    },
+    /// Drained by the worker after every outbound
+    /// `send_raft_install_snapshot` helper thread receives the
+    /// peer's reply. Used to step down on a higher term, and to
+    /// advance the leader's per-peer `next_index` past the snap
+    /// boundary so subsequent AppendEntries pick up where the
+    /// snapshot left off.
+    InstallSnapshotResponse {
+        from_prefix: u16,
+        term: u64,
+        last_included_index: u64,
     },
     /// Test/diagnostic: snapshot the worker's role + term.
     QueryState {
@@ -377,6 +417,33 @@ impl RaftRpcHandler for WorkerHandle {
             term,
             vote_granted: false,
         })
+    }
+
+    fn install_snapshot(
+        &self,
+        _replication_id: &[u8; 32],
+        from_prefix: u16,
+        term: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+    ) -> RaftInstallSnapshotResult {
+        let (tx, rx) = std_mpsc::channel();
+        if self
+            .inbox
+            .send(RaftMsg::InstallSnapshot {
+                from_prefix,
+                term,
+                last_included_index,
+                last_included_term,
+                snapshot,
+                reply: tx,
+            })
+            .is_err()
+        {
+            return RaftInstallSnapshotResult { term };
+        }
+        rx.recv().unwrap_or(RaftInstallSnapshotResult { term })
     }
 }
 
@@ -675,6 +742,36 @@ fn worker_loop(
                 let result = handle_propose(&mut state, payload);
                 let _ = reply.send(result);
             }
+            Ok(RaftMsg::InstallSnapshot {
+                from_prefix,
+                term,
+                last_included_index,
+                last_included_term,
+                snapshot,
+                reply,
+            }) => {
+                let resp = handle_install_snapshot(
+                    &mut state,
+                    from_prefix,
+                    term,
+                    last_included_index,
+                    last_included_term,
+                    snapshot,
+                )?;
+                let _ = reply.send(resp);
+            }
+            Ok(RaftMsg::InstallSnapshotResponse {
+                from_prefix,
+                term,
+                last_included_index,
+            }) => {
+                handle_install_snapshot_response(
+                    &mut state,
+                    from_prefix,
+                    term,
+                    last_included_index,
+                )?;
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => match state.role {
                 Role::Follower | Role::Candidate => start_election(&mut state)?,
                 Role::Leader => send_heartbeats(&mut state),
@@ -951,11 +1048,47 @@ fn send_heartbeats(state: &mut WorkerState) {
         None => return,
     };
 
+    let snap_idx = state.log.snap_last_index();
+    let snap_term = state.log.snap_last_term();
     for peer_prefix in state.cfg.members.iter().copied() {
         if peer_prefix == me {
             continue;
         }
         let next_idx = leader.next_index.get(&peer_prefix).copied().unwrap_or(1);
+
+        // If the peer is so far behind that we'd need entries
+        // we've already compacted, fall back to InstallSnapshot.
+        // The peer's `next_idx - 1` (its prev_log_index) lives
+        // inside our snap range — we can't serve the consistency
+        // check from log, so send the snapshot instead.
+        if next_idx <= snap_idx && snap_idx > 0 {
+            let Some(peer_id) = network.peer_for_prefix(peer_prefix) else {
+                continue;
+            };
+            let snapshot = match read_state_bytes(&state.db) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(me, peer = peer_prefix, error = ?e,
+                        "raft: failed to read state for snapshot install");
+                    continue;
+                }
+            };
+            let rx = network.send_raft_install_snapshot(
+                peer_id, rep_id, term, me, snap_idx, snap_term, snapshot,
+            );
+            let inbox_tx = state.inbox_tx.clone();
+            thread::spawn(move || {
+                if let Ok(resp) = rx.recv_timeout(VOTE_RPC_TIMEOUT) {
+                    let _ = inbox_tx.send(RaftMsg::InstallSnapshotResponse {
+                        from_prefix: peer_prefix,
+                        term: resp.term,
+                        last_included_index: snap_idx,
+                    });
+                }
+            });
+            continue;
+        }
+
         // prev_log_index/term identifies the entry just before
         // what we're about to send, so the follower's consistency
         // check has something to anchor on.
@@ -1151,6 +1284,123 @@ fn try_advance_commit_index(state: &mut WorkerState) -> Result<(), CommitError> 
     state.meta.last_applied = state.meta.last_applied.max(majority_floor);
     state.persist_meta()?;
     state.fire_apply_notification();
+    Ok(())
+}
+
+fn handle_install_snapshot(
+    state: &mut WorkerState,
+    _from_prefix: u16,
+    term: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    snapshot: Vec<u8>,
+) -> Result<RaftInstallSnapshotResult, CommitError> {
+    // Stale-leader check: if their term is below ours, refuse —
+    // advertise our higher term so they step down.
+    if term < state.meta.current_term {
+        return Ok(RaftInstallSnapshotResult {
+            term: state.meta.current_term,
+        });
+    }
+    if term > state.meta.current_term {
+        state.meta.current_term = term;
+        state.meta.voted_for = None;
+    }
+    state.set_role(Role::Follower);
+    state.votes_received.clear();
+    state.leader = None;
+    state.reset_election_timer();
+
+    // Idempotent retry: snapshot at an index we've already
+    // covered → just refresh meta + reply.
+    if last_included_index <= state.log.snap_last_index() {
+        state.persist_meta()?;
+        return Ok(RaftInstallSnapshotResult {
+            term: state.meta.current_term,
+        });
+    }
+
+    // Apply the snapshot atomically:
+    //   1. wipe `raft_log` (every entry is now ≤ snap pointer)
+    //   2. write `STATE_TABLE` / `STATE_KEY` to the snapshot bytes
+    //   3. advance `raft_meta` (term, snap pointer, commit_index,
+    //      last_applied)
+    let txn = state.db.begin_write()?;
+    {
+        use redb::ReadableTable;
+        let mut log_table = txn.open_table(super::log::RAFT_LOG)?;
+        // Drop every entry up to and including last_included_index.
+        // Anything past it is preserved (the leader will only send
+        // a snapshot covering entries we don't yet have, but the
+        // table might still hold entries beyond the snap if we
+        // were stale and the tail was speculative).
+        let to_drop: alloc::vec::Vec<u64> = log_table
+            .range(0u64..=last_included_index)?
+            .filter_map(|kv| kv.ok().map(|(k, _)| k.value()))
+            .collect();
+        for k in to_drop {
+            log_table.remove(k)?;
+        }
+    }
+    {
+        let mut state_table = txn.open_table(crate::commit::STATE_TABLE)?;
+        state_table.insert(crate::commit::STATE_KEY, snapshot.as_slice())?;
+    }
+    state.meta.snap_last_index = last_included_index;
+    state.meta.snap_last_term = last_included_term;
+    state.meta.commit_index = state.meta.commit_index.max(last_included_index);
+    state.meta.last_applied = state.meta.last_applied.max(last_included_index);
+    state.meta.write_in_txn(&txn)?;
+    txn.commit()?;
+
+    // Refresh log cache (last_index now equals the snap pointer
+    // since the table is empty).
+    state.log = super::log::RaftLog::open(state.db.clone())?;
+
+    // Tell the agent thread to soft-restart so its in-memory
+    // runtime picks up the new state row.
+    state.fire_apply_notification();
+
+    debug!(
+        me = state.cfg.me,
+        last_included_index,
+        last_included_term,
+        snapshot_bytes = snapshot.len(),
+        "raft: installed snapshot",
+    );
+
+    Ok(RaftInstallSnapshotResult {
+        term: state.meta.current_term,
+    })
+}
+
+fn handle_install_snapshot_response(
+    state: &mut WorkerState,
+    from_prefix: u16,
+    term: u64,
+    last_included_index: u64,
+) -> Result<(), CommitError> {
+    if term > state.meta.current_term {
+        state.meta.current_term = term;
+        state.meta.voted_for = None;
+        state.persist_meta()?;
+        step_down(state);
+        return Ok(());
+    }
+    if state.role != Role::Leader || term != state.meta.current_term {
+        return Ok(());
+    }
+    if let Some(leader) = state.leader.as_mut() {
+        // The follower acknowledged the install; advance the
+        // per-peer indices past the snap boundary so the next
+        // heartbeat tick sends AppendEntries from there.
+        let new_match = last_included_index;
+        let prev_match = leader.match_index.get(&from_prefix).copied().unwrap_or(0);
+        if new_match > prev_match {
+            leader.match_index.insert(from_prefix, new_match);
+        }
+        leader.next_index.insert(from_prefix, new_match + 1);
+    }
     Ok(())
 }
 
@@ -1543,6 +1793,89 @@ mod tests {
         let err = h.propose(b"x".to_vec()).unwrap_err();
         assert!(matches!(err, ProposeError::NotLeader));
         worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follower_applies_install_snapshot() {
+        // Phase 7: a follower receiving InstallSnapshot writes
+        // the state row, advances meta to the leader's snap
+        // pointer, drops every log entry up to and including
+        // last_included_index, and replies with the (possibly
+        // bumped) current term.
+        use crate::commit::{STATE_KEY, STATE_TABLE};
+        let (db, dir) = temp_db();
+        // Pre-populate some old log entries that the snapshot
+        // will supersede.
+        {
+            let mut log = RaftLog::open(db.clone()).unwrap();
+            for _ in 0..5 {
+                let txn = db.begin_write().unwrap();
+                log.append_in_txn(&txn, 1, b"old").unwrap();
+                txn.commit().unwrap();
+            }
+        }
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
+        let h = worker.handler();
+
+        let snapshot_bytes = b"actor-state-at-index-3".to_vec();
+        let resp = h.install_snapshot(
+            &[0xC0; 32],
+            0xBBBB,
+            7,    // term — bumps ours
+            3,    // last_included_index
+            2,    // last_included_term
+            snapshot_bytes.clone(),
+        );
+        assert_eq!(resp.term, 7);
+
+        worker.shutdown();
+
+        // STATE_TABLE row matches the snapshot bytes.
+        let txn = db.begin_read().unwrap();
+        let state_table = txn.open_table(STATE_TABLE).unwrap();
+        let state = state_table.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+        assert_eq!(state, snapshot_bytes);
+
+        // Meta advanced.
+        let meta = RaftMeta::load(&db).unwrap();
+        assert_eq!(meta.current_term, 7);
+        assert_eq!(meta.snap_last_index, 3);
+        assert_eq!(meta.snap_last_term, 2);
+        assert_eq!(meta.commit_index, 3);
+        assert_eq!(meta.last_applied, 3);
+
+        // Log entries up to 3 are gone; 4..=5 survive.
+        let log = RaftLog::open(db.clone()).unwrap();
+        assert_eq!(log.snap_last_index(), 3);
+        assert!(log.entries(1, 3).unwrap().is_empty());
+        let surviving = log.entries(4, 5).unwrap();
+        assert_eq!(surviving.len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_at_lower_index_is_no_op() {
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
+        let h = worker.handler();
+
+        // First install at index 5.
+        let _ = h.install_snapshot(
+            &[0xC0; 32], 0xBBBB, 1, 5, 1, b"v1".to_vec(),
+        );
+        // Retry at lower index — must NOT regress the snap pointer
+        // or overwrite the state row.
+        let _ = h.install_snapshot(
+            &[0xC0; 32], 0xBBBB, 1, 3, 1, b"v2".to_vec(),
+        );
+
+        worker.shutdown();
+        let meta = RaftMeta::load(&db).unwrap();
+        assert_eq!(meta.snap_last_index, 5,
+            "lower-index install must not regress the snap pointer");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
