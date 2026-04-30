@@ -180,11 +180,15 @@ LSB-direction `ValDPartialNZ`; LZ adds `ValDPartialNZMsb[8]`
 (MSB over low 4 bytes, for LZ32).  Default fallback 64/32 when
 val_d (or low 4) is zero.  `result[1..8] = 0`.
 
-### Phase 35 — Sbrk
+### Phase 41 — Sbrk — DONE
 
-Host-call-like: extends the heap.  Likely needs its own
-precompile chip mirroring Blake2b's pattern.  Skip until there's
-demand from a benchmark / actor.
+JAR v0.8.0 removed Sbrk from the ISA in favour of the grow_heap
+hostcall, so the interpreter panics on execution.  The earlier
+"needs precompile" framing was stale — Phase 41 just marks Sbrk
+as `is_exit + is_trap` so the Phase 13e-redux terminal-row
+constraint catches any attempted continuation, matching the
+panic-and-stop semantics.  1-line classify change + 2 tests
+(positive prove + terminal-forge reject).
 
 ## Cross-cutting
 

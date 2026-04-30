@@ -217,7 +217,12 @@ biggest exposure-to-fix-cost ratio.  See
   trace-fill + reg_access path described above.
 
 ### BitManip
-- **Sbrk** — host-call-like; needs precompile-style integration.
+- (closed by Phase 41) **Sbrk** — JAR v0.8.0 removed it from the
+  ISA in favour of the grow_heap hostcall, so the interpreter
+  panics on execution.  Phase 41 marks it `is_exit + is_trap`
+  so the Phase 13e-redux terminal-row constraint forbids any
+  successor real row, matching the panic-and-stop semantics.
+  No precompile needed.
 
 ### Smaller
 - (closed by Phase 39) **`is_write` discriminator** on the

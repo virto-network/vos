@@ -332,7 +332,13 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::LeadingZeroBits32 => { f.is_lzb = true; f.is_32bit = true; }
         Opcode::TrailingZeroBits64 => { f.is_tzb = true; }
         Opcode::TrailingZeroBits32 => { f.is_tzb = true; f.is_32bit = true; }
-        Opcode::Sbrk => {}
+        // Phase 41: Sbrk panics on execution (JAR v0.8.0 removed it
+        // from the ISA — replaced by the grow_heap hostcall).  Mark
+        // it terminal in the same way as Trap so the Phase 13e-redux
+        // no-successor-row constraint fires.  is_exit covers the
+        // execution-stops semantics; is_trap forbids any subsequent
+        // real row.
+        Opcode::Sbrk => { f.is_exit = true; f.is_trap = true; }
         // Branches (conditional) — classify by comparison type
         // For Le/Gt variants we'll flip the operand order / invert
         Opcode::BranchEq | Opcode::BranchEqImm

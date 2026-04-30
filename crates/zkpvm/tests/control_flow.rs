@@ -606,3 +606,53 @@ fn prove_loop_add() {
 
     prove_and_verify(steps, &code, &bitmask);
 }
+
+// ── Phase 41: Sbrk as terminal opcode ─────────────────────────────────────
+// Sbrk panics on execution (JAR v0.8.0 removed it from the ISA in favour of
+// the grow_heap hostcall).  Phase 41 marks Sbrk as is_exit + is_trap so the
+// terminal-row constraint forbids any successor real row, matching the
+// interpreter's panic-and-stop semantics.
+
+#[test]
+fn prove_sbrk_terminal() {
+    let regs = [0u64; PVM_REGISTER_COUNT];
+    let code = vec![Opcode::Sbrk as u8];
+    let bitmask = vec![1];
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, javm::ExitReason::Panic);
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].opcode, Opcode::Sbrk);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn sbrk_followed_by_clone_rejected_by_terminal_constraint() {
+    // Same shape as `trap_followed_by_trap_clone_rejected_by_terminal_constraint`
+    // but for Sbrk: synthesize a "second Sbrk" step after the real one with
+    // all continuity fields plausibly consistent.  The Phase 41 IsTrap flag
+    // (set on Sbrk) drives Phase 13e-redux's terminal-row constraint
+    // (`is_real · is_trap · (1 - is_padding_next) = 0`) → splice rejected.
+    let regs = [0u64; PVM_REGISTER_COUNT];
+    let code = vec![Opcode::Sbrk as u8];
+    let bitmask = vec![1];
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let mut steps = tracing.into_trace();
+    assert_eq!(steps.len(), 1);
+    let prev = steps[0].clone();
+    let mut clone = prev.clone();
+    clone.timestamp = prev.timestamp + 1;
+    steps.push(clone);
+    prove_and_verify(steps, &code, &bitmask);
+}
