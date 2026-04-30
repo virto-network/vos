@@ -666,6 +666,31 @@ pub enum Column {
     /// timestamp) ∈ reg_lookup` with multiplicity IsStoreInd.
     #[size = 8]
     RegValA,
+    // ── Phase 29: byte-wise val_d zero-check ──────────────────────────────
+    // Pre-Phase-29 ValDIsZero was one-direction-pinned only
+    // (`val_d_is_zero=1 ⇒ val_d=0`, gated on is_compare); the converse
+    // (`val_d=0 ⇒ val_d_is_zero=1`) was unenforced.  Same gap on
+    // div_by_zero — `div_by_zero=1 ⇒ schoolbook bypassed` but result
+    // unbound.  Phase 29 closes both via byte-wise inversion witnesses
+    // + cumulative OR.
+    /// Per-byte inverse witness.  When `val_d[i] ≠ 0`, ByteInv[i]
+    /// must equal `1/val_d[i]` (in the field) so that
+    /// `val_d[i] · ByteInv[i] = 1` (the byte indicator).  When
+    /// `val_d[i] = 0`, ByteInv[i] is unconstrained (the indicator
+    /// degenerates to 0).  Constrained by
+    ///   `val_d[i] · (val_d[i] · ByteInv[i] − 1) = 0`
+    /// which is satisfied iff val_d[i]=0 OR (ByteInv[i] is the inverse).
+    #[size = 8]
+    ValDByteInv,
+    /// Cumulative OR of byte-indicators.  Recurrence (degree 3):
+    ///   PartialNZ[0] = val_d[0] · ByteInv[0]
+    ///   PartialNZ[i] = PartialNZ[i-1] + ByteIndicator[i]
+    ///                  − PartialNZ[i-1] · ByteIndicator[i]
+    /// where `ByteIndicator[i] = val_d[i] · ByteInv[i] ∈ {0, 1}`.
+    /// `PartialNZ[7] = 1 ↔ val_d ≠ 0`.  ValDIsZero is then pinned
+    /// to `1 − PartialNZ[7]`.
+    #[size = 8]
+    ValDPartialNZ,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

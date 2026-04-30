@@ -839,6 +839,112 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Phase 29: byte-wise val_d zero-check + DivByZero result binding
+        //
+        // Closes two related soundness gaps with shared infrastructure:
+        //   (a) ValDIsZero ⇔ (val_d == 0) — both directions pinned, so
+        //       CmovIz / CmovNz fire as the interpreter does.  Pre-phase
+        //       only the `=1 ⇒ val_d=0` direction was constrained
+        //       (gated on is_compare).
+        //   (b) DivByZero result binding: on `is_div_rem · div_by_zero`
+        //       rows the schoolbook is bypassed; we now also bind
+        //       result = u64::MAX (div ops) or result = val_b (rem ops),
+        //       matching the interpreter's div-by-zero convention.
+        //
+        // Mechanism — byte-wise inversion witness + cumulative OR:
+        //   ByteIndicator[i] = val_d[i] · ByteInv[i]    (degree 2)
+        //   constrained by   val_d[i] · (ByteIndicator[i] − 1) = 0
+        //   which forces ByteIndicator[i] = 1 when val_d[i] ≠ 0
+        //   (because ByteInv[i] must equal 1/val_d[i]) and accepts
+        //   any ByteIndicator value when val_d[i] = 0 — but the
+        //   prover only gains by setting it to 0 there (the OR doesn't
+        //   short-circuit otherwise).  PartialNZ accumulates OR:
+        //     PartialNZ[0]   = ByteIndicator[0]
+        //     PartialNZ[i]   = PartialNZ[i-1] + ByteIndicator[i]
+        //                      − PartialNZ[i-1] · ByteIndicator[i]
+        //   PartialNZ[7] = 1 ↔ any byte non-zero ↔ val_d ≠ 0.
+        //   ValDIsZero = 1 − PartialNZ[7].
+        {
+            let val_d_byte_inv = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
+            let val_d_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
+            let val_d_is_zero_p29 = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
+            let div_by_zero_p29 = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
+
+            // Per-byte indicator constraint.  Forces the prover to
+            // set ByteInv[i] = 1/val_d[i] whenever val_d[i] ≠ 0
+            // (else `val_d[i] · ByteInv[i]` would be != 1, making
+            // `val_d[i] · (val_d[i]·ByteInv[i] − 1) ≠ 0`).
+            // For val_d[i] = 0 the constraint is trivially satisfied;
+            // the prover can pick any ByteInv[i].
+            for i in 0..WORD_SIZE {
+                let byte_indicator = val_d[i].clone() * val_d_byte_inv[i].clone();
+                eval.add_constraint(
+                    is_real.clone() * val_d[i].clone()
+                        * (byte_indicator - E::F::one())
+                );
+            }
+
+            // PartialNZ recurrence.  Each PartialNZ[i] is a column; the
+            // constraint pins it to the OR of (PartialNZ[i-1],
+            // ByteIndicator[i]).  Degree 3 (column · column · column).
+            // PartialNZ[0] = ByteIndicator[0].
+            eval.add_constraint(
+                is_real.clone()
+                    * (val_d_partial_nz[0].clone()
+                        - val_d[0].clone() * val_d_byte_inv[0].clone())
+            );
+            for i in 1..WORD_SIZE {
+                let byte_indicator = val_d[i].clone() * val_d_byte_inv[i].clone();
+                let or_expr = val_d_partial_nz[i - 1].clone()
+                    + byte_indicator.clone()
+                    - val_d_partial_nz[i - 1].clone() * byte_indicator;
+                eval.add_constraint(
+                    is_real.clone() * (val_d_partial_nz[i].clone() - or_expr)
+                );
+            }
+
+            // ValDIsZero = 1 − PartialNZ[7].
+            eval.add_constraint(
+                is_real.clone()
+                    * (val_d_is_zero_p29[0].clone()
+                        + val_d_partial_nz[WORD_SIZE - 1].clone()
+                        - E::F::one())
+            );
+
+            // DivByZero = is_div_rem · ValDIsZero.  On non-divrem rows
+            // DivByZero must be 0; on divrem rows it must equal
+            // ValDIsZero (which now correctly tracks val_d==0).
+            eval.add_constraint(
+                is_real.clone()
+                    * (div_by_zero_p29[0].clone()
+                        - is_div_rem[0].clone() * val_d_is_zero_p29[0].clone())
+            );
+
+            // DivByZero result binding.  On `is_div_rem · div_by_zero`
+            // rows the schoolbook is bypassed (div_active = 0); the
+            // interpreter writes u64::MAX for div and the dividend
+            // for rem.  Reuse the existing `gate_div` (op ∈ {0,1})
+            // and `gate_rem` (op ∈ {2,3}) expressions from the
+            // schoolbook block above.
+            let f_ff_p29: E::F = E::F::from(BaseField::from(255));
+            let drop2 = div_rem_op[0].clone() - E::F::from(BaseField::from(2u32));
+            let drop3 = div_rem_op[0].clone() - E::F::from(BaseField::from(3u32));
+            let gate_div_p29 = drop2.clone() * drop3;
+            let gate_rem_p29 = div_rem_op[0].clone() * (div_rem_op[0].clone() - E::F::one());
+            let dbz_active = is_div_rem[0].clone() * div_by_zero_p29[0].clone();
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    dbz_active.clone() * gate_div_p29.clone()
+                        * (result[i].clone() - f_ff_p29.clone())
+                );
+                eval.add_constraint(
+                    dbz_active.clone() * gate_rem_p29.clone()
+                        * (result[i].clone() - val_b[i].clone())
+                );
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // MOVE: result = val_d
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
@@ -2595,6 +2701,27 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, cmp_lt_flag, Column::CmpLtFlag);
             let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
             trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);
+
+            // Phase 29: byte-wise val_d zero-check infrastructure.
+            //   - ValDByteInv[i] = 1/val_d[i] in M31 when val_d[i] ≠ 0;
+            //     0 (or any value) when val_d[i] = 0.
+            //   - ValDPartialNZ[i] = OR(val_d[0..=i] != 0) as a 0/1 byte.
+            // The constraint forces ByteIndicator[i] = val_d[i]·ByteInv[i]
+            // to equal 1 whenever val_d[i] ≠ 0, so the cumulative OR
+            // accumulates correctly.
+            let mut val_d_byte_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
+            let mut val_d_partial_nz = [0u8; 8];
+            let mut running_nz: u8 = 0;
+            for i in 0..8 {
+                let b = val_d_bytes[i];
+                if b != 0 {
+                    val_d_byte_inv[i] = stwo::core::fields::m31::BaseField::from(b as u32).inverse();
+                    running_nz = 1;
+                }
+                val_d_partial_nz[i] = running_nz;
+            }
+            trace.fill_columns_base_field(row, &val_d_byte_inv, Column::ValDByteInv);
+            trace.fill_columns_bytes(row, &val_d_partial_nz, Column::ValDPartialNZ);
             // Phase 17: SignBitB/D are now pinned to bit 7 of the
             // multiplexed source byte (val_b[7] in 64-bit, val_b[3] in
             // 32-bit) via nibble-AND lookups at the end of add_constraints.
