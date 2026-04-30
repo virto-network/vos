@@ -733,6 +733,27 @@ pub enum Column {
     /// byte.
     #[size = 8]
     AbsCmpCarry,
+    // ── Phase 31: DivS sign-of-r uniqueness ──────────────────────────────
+    // Closes the OTHER half of PVM signed Euclidean uniqueness
+    // (`sign(r) = sign(b)` when r ≠ 0; r = 0 is the only case
+    // where the sign of r is unconstrained — bit 7 of all-zeros is 0
+    // so SignBitR = 0 in that case).  Mirrors Phase 29's byte-wise
+    // zero-check pattern but on `div_remainder` instead of `val_d`.
+    //
+    // The constraint `is_div_s · ¬div_by_zero · ValRPartialNZ[7] ·
+    // (SignBitR − SignBitB) = 0` forces SignBitR = SignBitB whenever
+    // div_remainder ≠ 0.  Combined with Phase 30's |r| < |d|, DivS
+    // uniqueness is now complete.
+    /// Per-byte inverse witness for div_remainder.  Constrained by
+    ///   `div_remainder[i] · (div_remainder[i] · ByteInv[i] − 1) = 0`
+    /// — same shape as Phase 29's ValDByteInv.
+    #[size = 8]
+    ValRByteInv,
+    /// Cumulative OR of div_remainder's byte-indicators.  Same
+    /// recurrence as Phase 29's ValDPartialNZ.  PartialNZ[7] = 1
+    /// ↔ div_remainder ≠ 0.
+    #[size = 8]
+    ValRPartialNZ,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

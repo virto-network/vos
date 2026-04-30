@@ -1089,6 +1089,68 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Phase 31: DivS sign-of-r uniqueness (`sign(r) = sign(b)` when r ≠ 0)
+        //
+        // Mirrors Phase 29's byte-wise zero-check pattern but on
+        // `div_remainder`.  PartialNZ accumulates OR of byte-
+        // indicators; PartialNZ[7] = 1 ↔ div_remainder ≠ 0.
+        //
+        // Final constraint:
+        //   is_div_s · ¬div_by_zero · ValRPartialNZ[7] ·
+        //                                  (SignBitR − SignBitB) = 0
+        // forces SignBitR = SignBitB whenever the remainder is non-
+        // zero, matching PVM's round-toward-zero convention where
+        // sign(r) = sign(b).  Combined with Phase 30's |r| < |d|,
+        // DivS uniqueness is now complete: there's exactly one (q, r)
+        // pair satisfying both bounds + the schoolbook + Phase 16
+        // sign-correction.
+        {
+            let val_r_byte_inv = crate::trace::trace_eval!(trace_eval, Column::ValRByteInv);
+            let val_r_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValRPartialNZ);
+            let sign_bit_b_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_bit_r_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
+
+            // Per-byte indicator constraint.  `div_remainder[i]·
+            // ByteInv[i]` must equal 1 whenever div_remainder[i] ≠ 0;
+            // when div_remainder[i] = 0 the constraint is trivially
+            // satisfied.
+            for i in 0..WORD_SIZE {
+                let byte_indicator = div_remainder[i].clone() * val_r_byte_inv[i].clone();
+                eval.add_constraint(
+                    is_real.clone() * div_remainder[i].clone()
+                        * (byte_indicator - E::F::one())
+                );
+            }
+
+            // PartialNZ recurrence (degree 3).
+            eval.add_constraint(
+                is_real.clone()
+                    * (val_r_partial_nz[0].clone()
+                        - div_remainder[0].clone() * val_r_byte_inv[0].clone())
+            );
+            for i in 1..WORD_SIZE {
+                let byte_indicator = div_remainder[i].clone() * val_r_byte_inv[i].clone();
+                let or_expr = val_r_partial_nz[i - 1].clone()
+                    + byte_indicator.clone()
+                    - val_r_partial_nz[i - 1].clone() * byte_indicator;
+                eval.add_constraint(
+                    is_real.clone() * (val_r_partial_nz[i].clone() - or_expr)
+                );
+            }
+
+            // Sign-of-r constraint.  Degree 4 (is_div_s · ¬div_by_zero
+            // · PartialNZ[7] · (SignBitR − SignBitB) — four degree-1
+            // factors, well within CpuChip's plain-constraint bound).
+            let div_s_active_p31 = is_div_s[0].clone()
+                * (E::F::one() - div_by_zero[0].clone());
+            eval.add_constraint(
+                div_s_active_p31
+                    * val_r_partial_nz[WORD_SIZE - 1].clone()
+                    * (sign_bit_r_p31[0].clone() - sign_bit_b_p31[0].clone())
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // MOVE: result = val_d
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
@@ -3248,6 +3310,23 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
             trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
             trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
+
+            // Phase 31: byte-wise zero-check for div_remainder
+            // (mirrors Phase 29's pattern for val_d).  Drives the
+            // sign-of-r uniqueness constraint.
+            let mut val_r_byte_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
+            let mut val_r_partial_nz = [0u8; 8];
+            let mut running_nz: u8 = 0;
+            for i in 0..8 {
+                let b = div_remainder[i];
+                if b != 0 {
+                    val_r_byte_inv[i] = stwo::core::fields::m31::BaseField::from(b as u32).inverse();
+                    running_nz = 1;
+                }
+                val_r_partial_nz[i] = running_nz;
+            }
+            trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
+            trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
 
             // Phase 21: DivCmpDiff / DivCmpCarry chain — pins r < d
             // on DivU rows.  Computed on every real row (carry chain
