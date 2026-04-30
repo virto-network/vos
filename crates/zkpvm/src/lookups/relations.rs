@@ -31,7 +31,7 @@ stwo_constraint_framework::relation!(
 // can't clear flags to skip per-op constraints — flag values are now
 // pinned to the canonical classify_opcode(opcode) decoding.
 //
-// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24 → 25 → 26 → 27 → 28 → 32):
+// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24 → 25 → 26 → 27 → 28 → 32 → 33):
 //   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
 //   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
@@ -40,13 +40,13 @@ stwo_constraint_framework::relation!(
 //   is_load_i8, is_load_i16, is_load_i32,
 //   is_mem_size_1, is_mem_size_2, is_mem_size_4, is_mem_size_8,
 //   is_store_direct, is_load_direct, is_mem_indirect,
-//   is_store_imm_any, is_store_imm_direct, is_store_ind, is_rotate_l64
-pub const PROG_MEMORY_N_FLAGS: usize = 41;
+//   is_store_imm_any, is_store_imm_direct, is_store_ind, is_rotate_l64,
+//   is_count_set_bits
+pub const PROG_MEMORY_N_FLAGS: usize = 42;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 41 flags + imm_y_canon[4] + branch_target_canon[4] = 66 limbs.
-//   is_rotate_l64 added in Phase 32 to drive the RotL64 result
-//   binding (result = UnsignedProductLow + mul_high) and the
-//   mul-schoolbook re-route.
+//   + 42 flags + imm_y_canon[4] + branch_target_canon[4] = 67 limbs.
+//   is_count_set_bits added in Phase 33 to drive the per-byte popcount
+//   lookup + result binding (result[0] = sum BytePopcount, result[1..8] = 0).
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(
@@ -83,6 +83,13 @@ const REL_BITWISE_AND_LOOKUP_SIZE: usize = 3;
 stwo_constraint_framework::relation!(
     BitwiseAndLookupElements,
     REL_BITWISE_AND_LOOKUP_SIZE
+);
+
+// (byte, popcount) — per-byte popcount lookup (Phase 33)
+const REL_POPCOUNT_LOOKUP_SIZE: usize = 2;
+stwo_constraint_framework::relation!(
+    PopcountLookupElements,
+    REL_POPCOUNT_LOOKUP_SIZE
 );
 
 // (cid[4], slot[1], value[8]) — Blake2b state lookup between boundary chip

@@ -165,6 +165,12 @@ pub(super) struct OpcodeFlags {
     /// + the rotation result binding.  RotR64 / RotL32 / RotR32
     /// are deferred to later phases.
     pub is_rotate_l64: bool,
+    /// Phase 33: 1 iff this opcode is `CountSetBits64` or `CountSetBits32`.
+    /// Drives the per-byte popcount lookup `(val_d[i], BytePopcount[i]) ∈
+    /// popcount` plus the result binding `result[0] =
+    /// sum(BytePopcount[0..N])` (N = 8 for 64-bit, N = 4 for 32-bit) and
+    /// `result[1..8] = 0`.
+    pub is_count_set_bits: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -230,8 +236,9 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::ReverseBytes => { f.is_reverse_bytes = true; }
         Opcode::SignExtend8 => { f.is_sign_ext_8 = true; }
         Opcode::SignExtend16 => { f.is_sign_ext_16 = true; }
-        Opcode::CountSetBits64 | Opcode::CountSetBits32
-        | Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
+        Opcode::CountSetBits64 => { f.is_count_set_bits = true; }
+        Opcode::CountSetBits32 => { f.is_count_set_bits = true; f.is_32bit = true; }
+        Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
         | Opcode::TrailingZeroBits64 | Opcode::TrailingZeroBits32
         | Opcode::Sbrk
             => {}
@@ -397,12 +404,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32):
-/// extract the 41 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33):
+/// extract the 42 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 41] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 42] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -424,5 +431,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 41] {
         f.is_store_imm_any as u8, f.is_store_imm_direct as u8,
         f.is_store_ind as u8,
         f.is_rotate_l64 as u8,
+        f.is_count_set_bits as u8,
     ]
 }

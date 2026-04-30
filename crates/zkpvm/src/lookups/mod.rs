@@ -16,7 +16,8 @@ pub use self::{
     relations::{
         BitwiseAndLookupElements, Blake2bCallLookupElements,
         Blake2bStateLookupElements, JumpTableLookupElements,
-        MemoryAccessLookupElements, PowerOfTwoLookupElements,
+        MemoryAccessLookupElements, PopcountLookupElements,
+        PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements,
         RegisterMemoryLookupElements,
     },
@@ -32,6 +33,7 @@ macros::register_relation! {
         MemoryAccessLookupElements,
         BitwiseAndLookupElements,
         PowerOfTwoLookupElements,
+        PopcountLookupElements,
         Blake2bStateLookupElements,
         Blake2bCallLookupElements,
     };

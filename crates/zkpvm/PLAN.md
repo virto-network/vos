@@ -129,13 +129,13 @@ infrastructure generalizes cleanly.
 
 ## BitManip remainder
 
-### Phase 33 — CountSetBits 32 / 64
+### Phase 33 — CountSetBits 32 / 64 — DONE
 
-- New `PopcountChip` producer holding `(byte, popcount(byte))`
-  for `byte ∈ [0, 256)` — 256-row preprocessed table.
-- New CpuChip emission per byte of val_b (gated on
-  `is_count_set_bits`): `(val_b[i], byte_popcount[i]) ∈ popcount`.
-- Sum constraint: `result = Σ byte_popcount[i]`.
+Landed: new `PopcountChip` (256-row `(byte, popcount(byte))`
+preprocessed table) plus per-byte CpuChip lookup
+`(val_d[i], BytePopcount[i]) ∈ popcount` and result binding
+`result[0] = Σ BytePopcount[..N]` (N = 4 if Is32Bit else 8),
+`result[1..8] = 0`.
 
 ### Phase 34 — LeadingZeroBits / TrailingZeroBits
 

@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -62,7 +62,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        JumpTableLookupElements,
+        (JumpTableLookupElements, PopcountLookupElements),
     );
 
 
@@ -79,10 +79,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            JumpTableLookupElements,
+            (JumpTableLookupElements, PopcountLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, jump_table_lookup) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup)) = lookup_elements;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1268,6 +1268,39 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // PHASE 33 — BITMANIP CountSetBits (CSB64 / CSB32):
+        //   result[0] = sum(BytePopcount[0..N])  (N = 4 if Is32Bit else 8)
+        //   result[1..8] = 0
+        //   per-byte popcount lookup `(val_d[i], BytePopcount[i]) ∈ popcount`
+        //     emitted further below near the other lookups.
+        // ════════════════════════════════════════════════════════════════════
+        let is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
+        let byte_popcount = crate::trace::trace_eval!(trace_eval, Column::BytePopcount);
+        // 64-bit case: result[0] = sum of all 8 byte-popcount witnesses.
+        // 32-bit case: result[0] = sum of low 4 byte-popcount witnesses.
+        // is_64bit was defined at the top of add_constraints as 1 - is_32bit.
+        let mut sum_lo4 = byte_popcount[0].clone();
+        for i in 1..4 {
+            sum_lo4 = sum_lo4 + byte_popcount[i].clone();
+        }
+        let mut sum_hi4 = byte_popcount[4].clone();
+        for i in 5..WORD_SIZE {
+            sum_hi4 = sum_hi4 + byte_popcount[i].clone();
+        }
+        // Combined sum: sum_lo4 + (1 - is_32bit) · sum_hi4.
+        // result[0] - that_sum = 0, gated on is_count_set_bits.
+        eval.add_constraint(
+            is_count_set_bits[0].clone()
+                * (result[0].clone() - sum_lo4 - is_64bit.clone() * sum_hi4)
+        );
+        // High bytes of result are zero on CSB rows (popcount ≤ 64 fits in result[0]).
+        for i in 1..WORD_SIZE {
+            eval.add_constraint(
+                is_count_set_bits[0].clone() * result[i].clone()
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // CONTROL FLOW: constrain next_pc based on branch/jump
         // ════════════════════════════════════════════════════════════════════
         let is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
@@ -1651,6 +1684,23 @@ impl BuiltInComponent for CpuChip {
             ));
         }
 
+        // Phase 33: Popcount lookup — per-byte (val_d[i], BytePopcount[i]) on
+        // CountSetBits rows.  Emitted for all 8 bytes of val_d regardless of
+        // is_32bit; the result-binding sums only the relevant bytes.  The
+        // PopcountChip's preprocessed table holds the canonical (byte,
+        // popcount(byte)) for byte ∈ [0, 256).  Producer multiplicity =
+        // is_count_set_bits per byte.
+        {
+            for i in 0..WORD_SIZE {
+                let tuple = vec![val_d[i].clone(), byte_popcount[i].clone()];
+                eval.add_to_relation(RelationEntry::new(
+                    popcount_lookup,
+                    is_count_set_bits[0].clone().into(),
+                    &tuple,
+                ));
+            }
+        }
+
         // Register-memory producers (Phase 9d): mirror of the interaction
         // trace emissions in the same order (ValB read → ValD read → Result
         // write) so finalize_logup_in_pairs pairs correctly.
@@ -2007,6 +2057,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_store_imm_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let f_is_store_ind = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
             let f_is_rotate_l64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
+            let f_is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2060,6 +2111,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_store_imm_direct[0].clone());
             tuple.push(f_is_store_ind[0].clone());
             tuple.push(f_is_rotate_l64[0].clone());
+            tuple.push(f_is_count_set_bits[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -3563,6 +3615,20 @@ impl BuiltInProverComponent for CpuChip {
             // 2^n + ShiftQuotient infra fires (gated on the extended
             // IsShiftConstrained above).
             trace.fill_columns(row, flags.is_rotate_l64, Column::IsRotateL64);
+            // Phase 33: CountSetBits — fill IsCountSetBits flag and the 8
+            // BytePopcount witnesses, and charge popcount_counts for each
+            // active emission so PopcountChip's multiplicity column balances.
+            trace.fill_columns(row, flags.is_count_set_bits, Column::IsCountSetBits);
+            let mut byte_popcount = [0u8; WORD_SIZE];
+            for i in 0..WORD_SIZE {
+                byte_popcount[i] = val_d_bytes[i].count_ones() as u8;
+            }
+            trace.fill_columns_bytes(row, &byte_popcount, Column::BytePopcount);
+            if flags.is_count_set_bits {
+                for i in 0..WORD_SIZE {
+                    side_note.popcount_counts[val_d_bytes[i] as usize] += 1;
+                }
+            }
             let mut mem_addr_carry = [0u8; 4];
             if flags.is_mem_indirect {
                 let val_b_bytes_le = val_b.to_le_bytes();
@@ -3895,6 +3961,22 @@ impl BuiltInProverComponent for CpuChip {
             );
         }
 
+        // Phase 33: Popcount lookup — per-byte (val_d[i], BytePopcount[i]) on
+        // CountSetBits rows.  Mirror of the verifier-side emission.
+        {
+            let popcount_lookup: &PopcountLookupElements = lookup_elements.as_ref();
+            let is_count_set_bits_col = crate::trace::original_base_column!(component_trace, Column::IsCountSetBits);
+            let byte_popcount_col = crate::trace::original_base_column!(component_trace, Column::BytePopcount);
+            for i in 0..WORD_SIZE {
+                logup.add_to_relation_with(
+                    popcount_lookup,
+                    [is_count_set_bits_col[0].clone()],
+                    |[active]| active.into(),
+                    &[val_d_cols[i].clone(), byte_popcount_col[i].clone()],
+                );
+            }
+        }
+
         // ── Register-memory producer emissions (Phase 9d) ──
         // Three potential register accesses per step: ValB read, ValD read,
         // Result write.  Each is gated by its Is* flag and emits a tuple
@@ -4130,6 +4212,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_store_imm_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreImmDirect);
             let f_is_store_ind = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
             let f_is_rotate_l64 = crate::trace::original_base_column!(component_trace, Column::IsRotateL64);
+            let f_is_count_set_bits = crate::trace::original_base_column!(component_trace, Column::IsCountSetBits);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -4184,6 +4267,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_store_imm_direct[0].clone());
             tuple.push(f_is_store_ind[0].clone());
             tuple.push(f_is_rotate_l64[0].clone());
+            tuple.push(f_is_count_set_bits[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

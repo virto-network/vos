@@ -63,6 +63,20 @@ commit.
   row after a Trap step (gated on per-opcode `IsTrap`)
   `[13e-redux]`.
 
+### BitManip
+- **ReverseBytes** — `result[i] = val_d[7−i]` `[12b-1]`.
+- **ZeroExtend16** — `result[0..2] = val_d[0..2]`,
+  `result[2..8] = 0` `[12b-1]`.
+- **SignExtend8 / SignExtend16** — `result[i] = 0xFF·SignExtBit`
+  on bytes ≥ source-width, with `SignExtBit` pinned to bit 7 of
+  the source byte via nibble-AND lookups `[12b-2, 17]`.
+- **CountSetBits32 / 64** — per-byte popcount via new
+  `PopcountChip` lookup table; `result[0] = sum(BytePopcount[..N])`
+  (N = 4 if Is32Bit, 8 if 64-bit), `result[1..8] = 0` `[33]`.
+- **RotL64** — encoded via the mul-schoolbook (`val_d = 2^n`):
+  `result = UnsignedProductLow + mul_high` (byte-wise sum, no
+  carry — bits non-overlapping by construction) `[32]`.
+
 ### Sign-bit pinning
 - `SignBitB / SignBitD / SignBitQ / SignBitR` — each pinned to
   bit 7 of its multiplexed source byte (val_b[7]/val_b[3] etc.)
@@ -158,15 +172,13 @@ biggest exposure-to-fix-cost ratio.  See
   infrastructure would close both).
 
 ### Rotate
-- **RotL32 / RotR32 / RotL64 / RotR64** (+ Imm / ImmAlt
-  variants) — still prover-trusted.  PVM rotate
-  `result = (val << n) | (val >> (W − n))` could be encoded via
-  the existing mul / div_rem schoolbook plus an OR-relation
-  with nibble lookups.
+- **RotL32 / RotR32 / RotR64** (+ Imm / ImmAlt variants) —
+  still prover-trusted.  RotR64 needs piecewise modular
+  arithmetic for `(64 − n) mod 64`; the 32-bit variants need
+  the same plus low-32-only handling.  RotL64 is closed in
+  Phase 32 via the mul-schoolbook re-route.
 
 ### BitManip
-- **CountSetBits 32 / 64** — popcount, needs per-byte
-  popcount table.
 - **LeadingZeroBits / TrailingZeroBits 32 / 64** — needs
   per-byte LZ/TZ tables + composition.
 - **Sbrk** — host-call-like; needs precompile-style integration.

@@ -106,6 +106,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
+    &chips::PopcountChip, // Phase 33 — per-byte popcount lookup table
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -122,6 +123,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
+    &chips::PopcountChip,
 ];
 
 pub use proof::{Proof, SegmentState};

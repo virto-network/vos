@@ -378,6 +378,73 @@ fn prove_reverse_bytes() {
     verify(proof, &side_note).expect("verification failed");
 }
 
+// Phase 33: CountSetBits (CSB64 / CSB32) via PopcountChip.
+#[test]
+fn prove_count_set_bits_64_smoke() {
+    // CountSetBits64 is TwoReg: φ'[rd] = popcount(φ[ra])
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0x0F0F_0F0F_0F0F_0F0Fu64; // 8 bytes × 4 bits each = 32 ones
+    let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run(), javm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 32);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_count_set_bits_64_full() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = u64::MAX; // all 64 bits set
+    let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 64);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_count_set_bits_64_zero() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0;
+    let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 0);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_count_set_bits_32_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    // High 32 bits all set (should be ignored), low 32 bits = 0xFF (8 ones)
+    regs[0] = 0xFFFF_FFFF_0000_00FFu64;
+    let code = vec![Opcode::CountSetBits32 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 8);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
 #[test]
 fn prove_sign_extend_8() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];

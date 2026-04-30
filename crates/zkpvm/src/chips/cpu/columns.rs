@@ -775,6 +775,21 @@ pub enum Column {
     /// binding (mirrors Phase 12c's UnsignedProductHi pattern).
     #[size = 8]
     UnsignedProductLow,
+    // ── Phase 33: CountSetBits binding via popcount lookup ─────────────────
+    /// Phase 33: 1 iff this opcode is `CountSetBits64` or `CountSetBits32`.
+    /// Pinned to `classify_opcode(opcode).is_count_set_bits` via
+    /// ProgramMemoryChip's preprocessed table.  Drives the per-byte
+    /// popcount lookup `(val_d[i], BytePopcount[i]) ∈ popcount` and the
+    /// result binding `result[0] = sum(BytePopcount[0..N])` (N = 4 if
+    /// Is32Bit else 8) plus `result[1..8] = 0`.
+    #[size = 1]
+    IsCountSetBits,
+    /// Phase 33: per-byte popcount witnesses for the 8 bytes of `val_d`.
+    /// `BytePopcount[i] = val_d[i].count_ones()` enforced via the
+    /// PopcountChip lookup; `result[0]` is the sum of either the low 4
+    /// (32-bit) or all 8 (64-bit).
+    #[size = 8]
+    BytePopcount,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
