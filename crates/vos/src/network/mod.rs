@@ -2443,6 +2443,10 @@ mod tests {
                     // peer timeouts so they don't all become
                     // candidates at once.
                     election_timeout_ms: (50, 150),
+                    // Heartbeat fires comfortably inside the
+                    // election window so followers' timers are
+                    // reset before they can challenge.
+                    heartbeat_interval_ms: 20,
                 },
                 Some(network),
             )
@@ -2454,14 +2458,11 @@ mod tests {
         net_b.set_raft_handler(Arc::new(w_b.handler()));
         net_c.set_raft_handler(Arc::new(w_c.handler()));
 
-        // Phase 3.2 has no heartbeats, so leadership flickers: the
-        // moment a Leader's quorum is settled, the *other* replicas
-        // are still racing their own election timers and may bump
-        // the term, forcing the leader to step down. We're only
-        // asserting that election *makes progress* — at some
-        // observation a Leader exists at term ≥ 1. Phase 3.3 adds
-        // heartbeats, at which point a steady-state leader is the
-        // right invariant.
+        // Phase 3.3: heartbeats keep followers' timers reset, so
+        // leadership is *stable* — once a Leader emerges it stays
+        // Leader and the term doesn't drift. Wait for a Leader,
+        // then sample for several heartbeat intervals and assert
+        // role + term hold.
         let until = StdInstant::now() + Duration::from_secs(5);
         let mut observed: Option<(u16, u64)> = None;
         loop {
@@ -2474,7 +2475,6 @@ mod tests {
                 if let Some(snap) = s {
                     if snap.role == Role::Leader && snap.current_term >= 1 {
                         observed = Some((*p, snap.current_term));
-                        // Sanity on the leader snapshot itself.
                         assert_eq!(snap.voted_for, Some(*p),
                             "a Leader voted for itself this term");
                         break;
@@ -2494,6 +2494,41 @@ mod tests {
         let (leader_prefix, leader_term) = observed.unwrap();
         assert!([prefix_a, prefix_b, prefix_c].contains(&leader_prefix));
         assert!(leader_term >= 1);
+
+        // ── Steady-state probe (phase 3.3) ────────────────────
+        // Sample for ~10 heartbeat intervals: the same node stays
+        // Leader, the term doesn't bump, and the followers stay
+        // Followers with their `voted_for` pointing at the leader.
+        std::thread::sleep(Duration::from_millis(200));
+        let leader_handle = match leader_prefix {
+            p if p == prefix_a => w_a.handler(),
+            p if p == prefix_b => w_b.handler(),
+            _ => w_c.handler(),
+        };
+        let snap_leader = leader_handle.snapshot().expect("leader alive");
+        assert_eq!(snap_leader.role, Role::Leader,
+            "phase 3.3: heartbeats must keep the leader from getting demoted; \
+             snap = {snap_leader:?}");
+        assert_eq!(snap_leader.current_term, leader_term,
+            "phase 3.3: term must not drift while the leader is heartbeating");
+
+        let other_snaps: Vec<_> = [(prefix_a, w_a.handler()),
+                                   (prefix_b, w_b.handler()),
+                                   (prefix_c, w_c.handler())]
+            .into_iter()
+            .filter(|(p, _)| *p != leader_prefix)
+            .map(|(p, h)| (p, h.snapshot().expect("follower alive")))
+            .collect();
+        for (p, snap) in &other_snaps {
+            assert_eq!(
+                snap.role, Role::Follower,
+                "follower at {p:#06x} must not have re-elected; snap = {snap:?}",
+            );
+            assert_eq!(
+                snap.current_term, leader_term,
+                "follower's term must match the leader's after the heartbeat round",
+            );
+        }
 
         // Cleanly stop the workers before joining the networks
         // so any in-flight outbound vote helpers exit.

@@ -79,6 +79,13 @@ pub struct WorkerConfig {
     /// Candidate cycle is drawn uniformly from this range. Tests
     /// shrink it to ~50ms; production defaults sit at 150-300ms.
     pub election_timeout_ms: (u64, u64),
+    /// Leader heartbeat interval in milliseconds. The leader
+    /// fires an empty `AppendEntries` to every follower on this
+    /// tick to reset their election timers. Should be
+    /// substantially smaller than `election_timeout_ms.0` so
+    /// followers always see a heartbeat before timing out
+    /// (Raft's standard guidance: ~10× smaller).
+    pub heartbeat_interval_ms: u64,
 }
 
 /// Inbound message processed by the worker loop.
@@ -115,6 +122,17 @@ pub(crate) enum RaftMsg {
         from_prefix: u16,
         term: u64,
         vote_granted: bool,
+    },
+    /// Drained by the worker after every outbound heartbeat
+    /// `send_raft_append` helper thread receives the peer's
+    /// reply. Used by the leader to detect a stale-term step-down
+    /// (peer's term > ours) and, in phase 4, to advance
+    /// match_index for replication.
+    AppendResponse {
+        from_prefix: u16,
+        term: u64,
+        success: bool,
+        match_index: u64,
     },
     /// Test/diagnostic: snapshot the worker's role + term.
     QueryState {
@@ -437,18 +455,36 @@ fn worker_loop(
                     last_log_index: state.log.last_index(),
                 });
             }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                if matches!(state.role, Role::Follower | Role::Candidate) {
-                    start_election(&mut state)?;
-                } else {
-                    // Leader: phase 3.2 doesn't run heartbeats yet,
-                    // so push the deadline out so we keep handling
-                    // inbound traffic without re-triggering elections.
-                    // Phase 3.3 replaces this with a real heartbeat
-                    // tick.
-                    state.election_deadline = Instant::now() + Duration::from_secs(60);
+            Ok(RaftMsg::AppendResponse {
+                from_prefix,
+                term,
+                success: _,
+                match_index: _,
+            }) => {
+                // Phase 3.3 only consumes the term to detect a
+                // stale-leader step-down. Phase 4 will use
+                // success + match_index to advance per-peer
+                // replication state.
+                if term > state.meta.current_term {
+                    debug!(
+                        me = state.cfg.me,
+                        peer = from_prefix,
+                        peer_term = term,
+                        our_term = state.meta.current_term,
+                        "raft: leader stepping down — peer at higher term",
+                    );
+                    state.meta.current_term = term;
+                    state.meta.voted_for = None;
+                    state.role = Role::Follower;
+                    state.votes_received.clear();
+                    state.persist_meta()?;
+                    state.reset_election_timer();
                 }
             }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => match state.role {
+                Role::Follower | Role::Candidate => start_election(&mut state)?,
+                Role::Leader => send_heartbeats(&mut state),
+            },
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -607,13 +643,71 @@ fn handle_vote_response(
                 quorum = state.quorum(),
                 "raft: elected leader",
             );
-            state.role = Role::Leader;
-            state.votes_received.clear();
-            // Phase 3.3 replaces this with a heartbeat tick.
-            state.election_deadline = Instant::now() + Duration::from_secs(60);
+            become_leader(state);
         }
     }
     Ok(())
+}
+
+/// Transition into the Leader role: clear the in-flight election,
+/// fire heartbeats immediately so followers' election timers reset
+/// before they can challenge us, and schedule the next tick.
+fn become_leader(state: &mut WorkerState) {
+    state.role = Role::Leader;
+    state.votes_received.clear();
+    send_heartbeats(state);
+}
+
+/// Fire one round of empty `AppendEntries` to every follower.
+/// Phase 3.3 carries no log entries — leader replication lands in
+/// phase 4. The reply is routed back through the worker's inbox
+/// as `RaftMsg::AppendResponse` so the tally happens on the
+/// single-threaded state machine.
+fn send_heartbeats(state: &mut WorkerState) {
+    let term = state.meta.current_term;
+    let me = state.cfg.me;
+    let rep_id = state.cfg.replication_id;
+    let prev_log_index = state.log.last_index();
+    let prev_log_term = state.log.last_term();
+    // Phase 4 will compute leader_commit from the strategy's
+    // commit-index advance; phase 3.3 sticks with prev_log_index
+    // (no committed entries past the leader's tail in this phase).
+    let leader_commit = prev_log_index;
+
+    if let Some(network) = state.network.clone() {
+        for peer_prefix in state.cfg.members.iter().copied() {
+            if peer_prefix == me {
+                continue;
+            }
+            let Some(peer_id) = network.peer_for_prefix(peer_prefix) else {
+                continue;
+            };
+            let rx = network.send_raft_append(
+                peer_id,
+                rep_id,
+                term,
+                me,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                Vec::new(),
+            );
+            let inbox_tx = state.inbox_tx.clone();
+            thread::spawn(move || {
+                if let Ok(resp) = rx.recv_timeout(VOTE_RPC_TIMEOUT) {
+                    let _ = inbox_tx.send(RaftMsg::AppendResponse {
+                        from_prefix: peer_prefix,
+                        term: resp.term,
+                        success: resp.success,
+                        match_index: resp.match_index,
+                    });
+                }
+            });
+        }
+    }
+
+    state.election_deadline =
+        Instant::now() + Duration::from_millis(state.cfg.heartbeat_interval_ms);
 }
 
 fn start_election(state: &mut WorkerState) -> Result<(), crate::commit::CommitError> {
@@ -670,9 +764,7 @@ fn start_election(state: &mut WorkerState) -> Result<(), crate::commit::CommitEr
 
     // Single-node mode degenerates to "self-vote is the quorum".
     if state.votes_received.len() >= state.quorum() {
-        state.role = Role::Leader;
-        state.votes_received.clear();
-        state.election_deadline = Instant::now() + Duration::from_secs(60);
+        become_leader(state);
     } else {
         state.reset_election_timer();
     }
@@ -706,6 +798,7 @@ mod tests {
             // Long timeout so unit tests that exercise inbound
             // RPCs aren't racing the election timer.
             election_timeout_ms: (5_000, 10_000),
+            heartbeat_interval_ms: 500,
         }
     }
 
@@ -834,6 +927,7 @@ mod tests {
             replication_id: [0xC0; 32],
             // Tiny timeout so the test doesn't have to wait long.
             election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 500,
         };
         let worker = RaftWorker::spawn(db.clone(), cfg, None);
         let h = worker.handler();
