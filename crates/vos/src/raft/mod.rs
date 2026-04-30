@@ -26,6 +26,10 @@
 
 #[cfg(feature = "storage")]
 pub mod log;
+#[cfg(feature = "storage")]
+pub mod strategy;
 
 #[cfg(feature = "storage")]
 pub use log::{LogEntry, RaftLog, RaftMeta, RAFT_LOG, RAFT_META};
+#[cfg(feature = "storage")]
+pub use strategy::{RaftCommit, RaftConfig};
