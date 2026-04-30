@@ -105,7 +105,8 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
     use crate::abi::pvm::hostcalls;
 
     let state_read = hostcalls::read(STATE_KEY, state_buf);
-    if state_read > 0 && state_read < state_buf.len() as u64 {
+    // See `fetch_raw` for why this is `<=`, not `<`.
+    if state_read > 0 && state_read <= state_buf.len() as u64 {
         state_read as usize
     } else {
         0
@@ -118,7 +119,11 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
 pub fn fetch_raw(buf: &mut [u8]) -> usize {
     use crate::abi::pvm::ecall;
     let n = ecall::ecall2(crate::abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
-    if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
+    // The host returns the *full* value length, so n > buf.len()
+    // signals the value was truncated to fit our buffer — treat
+    // as missing rather than decode garbage. n == buf.len() is a
+    // legitimate exact fit.
+    if n > 0 && n <= buf.len() as u64 { n as usize } else { 0 }
 }
 
 /// Build exit status bytes from context state.
@@ -152,7 +157,8 @@ pub fn emit_status<A: Actor>(ctx: &Context<A>) {
 #[cfg(feature = "service")]
 pub fn read_storage(key: &[u8], buf: &mut [u8]) -> usize {
     let n = crate::abi::pvm::hostcalls::read(key, buf);
-    if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
+    // See `fetch_raw` for why this is `<=`, not `<`.
+    if n > 0 && n <= buf.len() as u64 { n as usize } else { 0 }
 }
 
 /// Read and decode a typed value from per-service storage.

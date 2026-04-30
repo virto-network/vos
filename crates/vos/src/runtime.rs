@@ -819,7 +819,12 @@ fn handle_refine_hostcall(
                 let copy_len = item.len().min(buf_len);
                 kwrite(kernel, buf_ptr, &item[..copy_len]);
                 items.remove(0);
-                (copy_len as u64, 0)
+                // Return the full item length, not copy_len. The guest
+                // pairs this with `n <= buf_len` to detect truncation:
+                // n > buf_len means the value didn't fit. Returning
+                // copy_len here would conflate "fit exactly" with "was
+                // truncated", silently dropping items of size buf_len.
+                (item.len() as u64, 0)
             } else {
                 (0, 0)
             }
@@ -833,7 +838,10 @@ fn handle_refine_hostcall(
                 Some(v) => {
                     let copy_len = v.len().min(a3 as usize);
                     kwrite(kernel, a2 as u32, &v[..copy_len]);
-                    (copy_len as u64, 0)
+                    // Return the full value length so the guest can
+                    // detect truncation (n > buf_len). See FETCH for
+                    // the rationale.
+                    (v.len() as u64, 0)
                 }
                 None => (error::HOST_NONE, 0),
             }

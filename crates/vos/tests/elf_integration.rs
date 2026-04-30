@@ -1188,6 +1188,78 @@ fn display_multiple_vec_renders() {
 }
 
 #[test]
+fn fetch_at_buf_size_boundary_delivers_message() {
+    // Regression for the off-by-one in
+    // `lifecycle::{fetch_raw, read_storage, read_persisted_state}`:
+    // they treated `n == buf.len()` as "not found" rather than
+    // "fits exactly", silently dropping any value of size
+    // BUF_SIZE (4096 bytes). Fixed by returning the *full* value
+    // length from runtime-side STORAGE_R / FETCH so the guest can
+    // distinguish exact-fit from truncation, plus changing the
+    // guest's check from `<` to `<=`.
+    //
+    // Probe shape: build a TAG_DYNAMIC + Msg payload, pad it to
+    // exactly 4096 bytes by stuffing extra bytes onto the rkyv
+    // tail (the actor's `from_dynamic` decoder doesn't validate
+    // trailing bytes), then send it to crdt-counter.
+    //
+    // Pre-fix: the message gets silently dropped at fetch_raw,
+    // counter never sees `inc()`, count stays 0.
+    // Post-fix: the message arrives, dispatches, count goes to 1.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let mut node = VosNode::new();
+    let id = node.register(AgentConfig::new(counter_blob));
+    let counter = CrdtCounterClient::at(&node, id);
+
+    // Build a valid TAG_DYNAMIC + Msg("inc", tag=1) payload, padded
+    // to exactly 4096 bytes by inserting zero bytes between the
+    // TAG_DYNAMIC byte and the rkyv-archived Msg. rkyv archives
+    // are tail-anchored — the Archived type sits at the END of
+    // the buffer — so leading padding is tolerated by
+    // `access_unchecked` while trailing padding would break it.
+    let m = Msg::new("inc").with("tag", 1u32);
+    let encoded = m.encode();
+    let pad_len = 4096 - 1 - encoded.len();
+    let mut payload = Vec::with_capacity(4096);
+    payload.push(TAG_DYNAMIC);
+    payload.extend(std::iter::repeat(0u8).take(pad_len));
+    payload.extend_from_slice(&encoded);
+    assert_eq!(payload.len(), 4096, "payload size at the boundary");
+
+    // Use `node.invoke` rather than node.outbox_sender so the
+    // agent thread's invoke loop processes our payload without
+    // needing run_until_idle.
+    let _ = node.invoke(id, payload);
+
+    let count = counter.get().expect("get must succeed");
+    assert_eq!(
+        count, 1,
+        "exact-fit FETCH must deliver the message — pre-fix the guest \
+         dropped it because `fetch_raw` checked `n < buf.len()` and the \
+         runtime returned `copy_len` (== buf.len() for exact fits), so \
+         the actor never saw the inc()",
+    );
+
+    node.shutdown();
+    let _ = node.collect();
+}
+
+#[test]
 fn runtime_multiple_services_same_blob() {
     // Register same blob twice — both services are independent.
     let elf = example_elf("greeter");
