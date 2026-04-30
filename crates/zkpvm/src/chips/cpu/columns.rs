@@ -845,8 +845,24 @@ pub enum Column {
     /// Phase 35: integer quotient in
     /// `reg_val_d + ShiftAmountCompl = 64·ShiftQuotientCompl`.  Range-
     /// bounded by the 8-byte decomposition + Range256 byte checks.
+    /// Phase 36: same column reused for the modulus-32 variant
+    /// (RotR32) — the constraint then reads `reg_val_d +
+    /// ShiftAmountCompl = 32·ShiftQuotientCompl`.
     #[size = 8]
     ShiftQuotientCompl,
+    // ── Phase 36: 32-bit rotate flags ────────────────────────────────────
+    /// Phase 36: 1 iff this opcode is `RotL32`.  Pinned by
+    /// ProgramMemoryChip's preprocessed table.  Drives the 32-bit
+    /// mul-schoolbook re-route + result binding (low 4 bytes =
+    /// UnsignedProductLow + mul_high; high 4 bytes via Phase 19
+    /// sign-extension).
+    #[size = 1]
+    IsRotateL32,
+    /// Phase 36: 1 iff this opcode is `RotR32` or `RotR32Imm`.
+    /// Mirrors IsRotateR64 but with modulus 32 in the
+    /// complementary shift identity and PowerOfTwo lookup.
+    #[size = 1]
+    IsRotateR32,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

@@ -122,13 +122,21 @@ ShiftQuotientCompl` plus a separate PowerOfTwo lookup keyed on
 convention (immediate is the rotated value, register is the
 shift amount) clashes with the AIR's val_b/val_d layout.
 
-### Future — Rotate32 (RotL32 / RotR32) + RotR64ImmAlt
+### Phase 36 — RotL32 + RotR32 + RotR32Imm — DONE
 
-RotL32 / RotR32 need the same machinery over 4 bytes plus the
-sign-extension finalize from Phase 19.  RotR64ImmAlt needs a
-swapped-source trace-fill code path (val_b ← imm, val_d ←
-regs[reg_b]) plus a flag distinguishing the two TwoRegOneImm
-variants.  Both deferred.
+Re-routed the 32-bit mul-schoolbook (low-32 → UnsignedProductLow[0..4]),
+added per-rotate result bindings (low 4 bytes = sum of low + high),
+and pinned ShiftAmount/ShiftAmountCompl ∈ [0, 31] via a `val_d[4..8]
+= 0` constraint on 32-bit rotate rows.  Phase 19's sign-extension
+finalize covers the high 4 bytes uniformly across non-rotate Mul32
+and rotate-32 rows.
+
+### Future — RotR64ImmAlt + RotR32ImmAlt
+
+Both have swapped operand semantics (immediate is the rotated
+value, register is the shift amount).  Need a flag distinguishing
+the two TwoRegOneImm variants and a swapped-source trace-fill path
+(val_b ← imm, val_d ← regs[reg_b]).  Deferred.
 
 ## BitManip remainder
 

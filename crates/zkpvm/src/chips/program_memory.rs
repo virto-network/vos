@@ -207,11 +207,22 @@ pub enum PreprocessedColumn {
     /// `ValDPartialNZ`) + the TZ result binding.
     #[size = 1] IsTzb,
     /// Phase 35: 1 at PCs whose canonical decoding is `RotR64` /
-    /// `RotR64Imm` / `RotR64ImmAlt`.  Drives the rotate-right result
-    /// binding via the mul-schoolbook with `val_d = 2^((64 − n) mod
-    /// 64)` (instead of `2^n` like RotL64); result = UnsignedProductLow
-    /// + mul_high, identical sum shape.
+    /// `RotR64Imm`.  Drives the rotate-right result binding via the
+    /// mul-schoolbook with `val_d = 2^((64 − n) mod 64)` (instead of
+    /// `2^n` like RotL64); result = UnsignedProductLow + mul_high,
+    /// identical sum shape.
     #[size = 1] IsRotateR64,
+    /// Phase 36: 1 at PCs whose canonical decoding is `RotL32`.
+    /// Drives the 32-bit rotate-left result binding via the 32-bit
+    /// mul-schoolbook re-route (val_d = 2^(n mod 32); result low 4
+    /// bytes = UnsignedProductLow + mul_high; high 4 bytes = sign
+    /// extension from Phase 19).
+    #[size = 1] IsRotateL32,
+    /// Phase 36: 1 at PCs whose canonical decoding is `RotR32` or
+    /// `RotR32Imm`.  Mirror of IsRotateR64 with modulus 32: val_d
+    /// = 2^((32 − n) mod 32), result low 4 bytes = sum of both
+    /// halves.
+    #[size = 1] IsRotateR32,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -291,6 +302,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_lzb = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLzb);
         let f_is_tzb = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTzb);
         let f_is_rotate_r64 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateR64);
+        let f_is_rotate_l32 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateL32);
+        let f_is_rotate_r32 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateR32);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -351,6 +364,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_lzb[0].clone());
         tuple.push(f_is_tzb[0].clone());
         tuple.push(f_is_rotate_r64[0].clone());
+        tuple.push(f_is_rotate_l32[0].clone());
+        tuple.push(f_is_rotate_r32[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -437,6 +452,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsLzb,
                     PreprocessedColumn::IsTzb,
                     PreprocessedColumn::IsRotateR64,
+                    PreprocessedColumn::IsRotateL32,
+                    PreprocessedColumn::IsRotateR32,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -531,6 +548,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_lzb = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLzb);
         let f_is_tzb = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTzb);
         let f_is_rotate_r64 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateR64);
+        let f_is_rotate_l32 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateL32);
+        let f_is_rotate_r32 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateR32);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -590,6 +609,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_lzb[0].clone());
         tuple.push(f_is_tzb[0].clone());
         tuple.push(f_is_rotate_r64[0].clone());
+        tuple.push(f_is_rotate_l32[0].clone());
+        tuple.push(f_is_rotate_r32[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -623,7 +644,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 45],
+    flags: [u8; 47],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }

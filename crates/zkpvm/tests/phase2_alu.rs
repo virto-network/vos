@@ -835,6 +835,59 @@ fn prove_rotate_r64_by_one_zero_lsb() {
     test_three_reg_op(Opcode::RotR64, 0x2, 1, 0x1);
 }
 
+// ── Phase 36: RotL32 / RotR32 ──
+
+#[test]
+fn prove_rotate_l32_smoke() {
+    // RotL32 over the low 32 bits.  Sign-extension: result[31] becomes
+    // bit 7 of result[3] which the AIR sign-extends.
+    let a_lo = 0x12345678u32;
+    let n = 8u32;
+    let rotated = a_lo.rotate_left(n);
+    let expected = ((rotated as i32) as i64) as u64; // sign-extended
+    test_three_reg_op(Opcode::RotL32, a_lo as u64, n as u64, expected);
+}
+
+#[test]
+fn prove_rotate_l32_zero() {
+    let a_lo = 0xDEADBEEFu32;
+    // RotL32 by 0 → identity but sign-extended.
+    let expected = ((a_lo as i32) as i64) as u64;
+    test_three_reg_op(Opcode::RotL32, a_lo as u64, 0, expected);
+}
+
+#[test]
+fn prove_rotate_l32_msb() {
+    // a = 1 << 31 — top bit set; rotating left by 1 gives 1.
+    let a_lo: u32 = 1 << 31;
+    let expected = (a_lo.rotate_left(1) as i32) as i64 as u64;
+    test_three_reg_op(Opcode::RotL32, a_lo as u64, 1, expected);
+}
+
+#[test]
+fn prove_rotate_r32_smoke() {
+    let a_lo = 0x12345678u32;
+    let n = 8u32;
+    let rotated = a_lo.rotate_right(n);
+    let expected = ((rotated as i32) as i64) as u64;
+    test_three_reg_op(Opcode::RotR32, a_lo as u64, n as u64, expected);
+}
+
+#[test]
+fn prove_rotate_r32_zero() {
+    let a_lo = 0xDEADBEEFu32;
+    let expected = ((a_lo as i32) as i64) as u64;
+    test_three_reg_op(Opcode::RotR32, a_lo as u64, 0, expected);
+}
+
+#[test]
+fn prove_rotate_r32_full_word() {
+    let a_lo = 0xDEADBEEFu32;
+    // n=32 → 32 mod 32 = 0 → identity.
+    let expected = ((a_lo as i32) as i64) as u64;
+    test_three_reg_op(Opcode::RotR32, a_lo as u64, 32, expected);
+}
+
 #[test]
 fn prove_shlo_l64_negative_value() {
     // Exact values from blake2s step 242: left shift of a large (negative-looking) 64-bit value

@@ -183,15 +183,27 @@ pub(super) struct OpcodeFlags {
     /// LSB-direction first-non-zero indicator (Phase 29's
     /// ValDPartialNZ).
     pub is_tzb: bool,
-    /// Phase 35: 1 iff this opcode is `RotR64` / `RotR64Imm` /
-    /// `RotR64ImmAlt`.  PVM defines `RotR64(a, n) = (a >> n) |
-    /// (a << (64 − n))` for `n ∈ [0, 63]`.  Encoded by setting
-    /// `val_d = 2^((64 − n) mod 64)` (instead of `2^n` like
-    /// RotL64); the mul-schoolbook then computes both halves of
-    /// `a · 2^((64 − n) mod 64)` whose byte-wise sum equals the
-    /// rotated-right value (no carry — bits non-overlapping by
-    /// construction).
+    /// Phase 35: 1 iff this opcode is `RotR64` / `RotR64Imm`.
+    /// PVM defines `RotR64(a, n) = (a >> n) | (a << (64 − n))` for
+    /// `n ∈ [0, 63]`.  Encoded by setting `val_d = 2^((64 − n) mod
+    /// 64)` (instead of `2^n` like RotL64); the mul-schoolbook
+    /// then computes both halves of `a · 2^((64 − n) mod 64)`
+    /// whose byte-wise sum equals the rotated-right value (no
+    /// carry — bits non-overlapping by construction).
     pub is_rotate_r64: bool,
+    /// Phase 36: 1 iff this opcode is `RotL32`.  Same shape as
+    /// RotL64 but over a 32-bit value with sign-extension in the
+    /// high 4 bytes (Phase 19).  Re-uses the 32-bit mul-schoolbook
+    /// (val_d = 2^(n mod 32)) whose low-32 bytes go to
+    /// UnsignedProductLow[0..4] and high-32 to mul_high[0..4]; the
+    /// rotate result is byte-wise sum of those two halves over
+    /// bytes 0..4.
+    pub is_rotate_l32: bool,
+    /// Phase 36: 1 iff this opcode is `RotR32` / `RotR32Imm`.
+    /// Mirror of is_rotate_r64 but with modulus 32: val_d =
+    /// 2^((32 − n) mod 32); result low 4 bytes = UnsignedProductLow
+    /// + mul_high; high 4 bytes = sign-extension.
+    pub is_rotate_r32: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -233,7 +245,14 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_l64 = true;
         }
-        Opcode::RotL32 => { f.is_shift = true; f.shift_op = 3; f.is_32bit = true; }
+        // Phase 36: RotL32 — 32-bit mul-schoolbook re-route, val_d = 2^(n mod 32).
+        Opcode::RotL32 => {
+            f.is_shift = true;
+            f.shift_op = 3;
+            f.is_32bit = true;
+            f.is_mul = true;
+            f.is_rotate_l32 = true;
+        }
         // Phase 35: RotR64 + RotR64Imm — value in val_b, shift in
         // val_d.  Encoded via the mul-schoolbook with `val_d =
         // 2^((64 − n) mod 64)`; result = low + high (identical sum
@@ -249,7 +268,17 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_rotate_r64 = true;
         }
         Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
-        Opcode::RotR32 | Opcode::RotR32Imm | Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
+        // Phase 36: RotR32 + RotR32Imm — value in val_b, shift in val_d.
+        // Same shape as RotR64 but with modulus 32.  RotR32ImmAlt
+        // deferred for the same operand-swap reason as RotR64ImmAlt.
+        Opcode::RotR32 | Opcode::RotR32Imm => {
+            f.is_shift = true;
+            f.shift_op = 4;
+            f.is_32bit = true;
+            f.is_mul = true;
+            f.is_rotate_r32 = true;
+        }
+        Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
         // Compare
         Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.is_set_lt_u = true; }
         Opcode::SetLtS | Opcode::SetLtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
@@ -440,12 +469,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35):
-/// extract the 45 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35 + 36):
+/// extract the 47 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 45] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 47] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -471,5 +500,7 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 45] {
         f.is_lzb as u8,
         f.is_tzb as u8,
         f.is_rotate_r64 as u8,
+        f.is_rotate_l32 as u8,
+        f.is_rotate_r32 as u8,
     ]
 }

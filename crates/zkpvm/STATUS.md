@@ -92,6 +92,14 @@ commit.
   complement is pinned via a second shift-amount identity
   `RegValD + ShiftAmountCompl = 64 · ShiftQuotientCompl` plus a
   separate PowerOfTwo lookup keyed on `ShiftAmountCompl` `[35]`.
+- **RotL32 / RotR32 / RotR32Imm** — 32-bit equivalents of Phase
+  32/35: the 32-bit mul-schoolbook now writes low-32 to
+  `UnsignedProductLow[0..4]` (re-routed) and high-32 to
+  `mul_high[0..4]`; rotate result low 4 bytes = sum of the two
+  halves, high 4 bytes = sign-extension via Phase 19.  The
+  complementary shift identity uses modulus 32 (vs 64 for the
+  64-bit variants); a `val_d[4..8] = 0` constraint pins
+  ShiftAmount/ShiftAmountCompl ∈ [0, 31] uniquely `[36]`.
 
 ### Sign-bit pinning
 - `SignBitB / SignBitD / SignBitQ / SignBitR` — each pinned to
@@ -188,14 +196,12 @@ biggest exposure-to-fix-cost ratio.  See
   infrastructure would close both).
 
 ### Rotate
-- **RotL32 / RotR32 / RotR64ImmAlt** (+ remaining 32-bit Imm /
-  ImmAlt variants) — still prover-trusted.  RotR64ImmAlt has
-  swapped operand semantics (immediate is the rotated value,
-  register is the shift amount) which clashes with the AIR's
-  val_b/val_d layout — would need swapped trace fill.  The 32-
-  bit variants need the same machinery as Phase 32/35 plus the
-  low-32-only sign-extension finalize.  RotL64 closed in Phase
-  32; RotR64 + RotR64Imm closed in Phase 35.
+- **RotR64ImmAlt / RotR32ImmAlt** — still prover-trusted.
+  Both have swapped operand semantics (immediate is the
+  rotated value, register is the shift amount), which clashes
+  with the AIR's val_b/val_d layout.  Would need a swapped
+  trace-fill code path plus a flag distinguishing the two
+  TwoRegOneImm variants.
 
 ### BitManip
 - **Sbrk** — host-call-like; needs precompile-style integration.
