@@ -159,6 +159,9 @@ pub mod node;
 #[cfg(feature = "std")]
 pub mod commit;
 
+#[cfg(feature = "storage")]
+pub mod raft;
+
 #[cfg(feature = "network")]
 pub mod network;
 
