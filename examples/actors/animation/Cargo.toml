@@ -5,12 +5,6 @@ name = "animation"
 version = "0.1.0"
 edition = "2024"
 
-# `#[messages]` emits cfg gates for features defined on the
-# `vos` crate (worker, wasm, host). Allow them so cargo's
-# check-cfg lint doesn't fire on every macro expansion.
-[lints.rust.unexpected_cfgs]
-level = "allow"
-check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm", "host"))']
 
 [dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
