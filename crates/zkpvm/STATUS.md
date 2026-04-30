@@ -214,10 +214,12 @@ biggest exposure-to-fix-cost ratio.  See
 - **Sbrk** — host-call-like; needs precompile-style integration.
 
 ### Smaller
-- **`is_write` discriminator** on the memory-access lookup —
-  uses `is_store_col` directly.  With Phase 23 pinning
-  `is_store` from opcode this is sound; lacks an explicit
-  forge test confirming a load row can't claim `is_write=1`.
+- (closed by Phase 39) **`is_write` discriminator** on the
+  memory-access lookup — has direct forge-and-reject coverage:
+  `store_drops_mem_write_rejected` (drops the MemoryChip ledger
+  entry while the CpuChip producer still emits is_write=1) and
+  `load_injects_mem_write_rejected` (phantom write entry on a
+  Load row where IsStore=0 forces is_write=0 in the producer).
 
 ## Test posture
 

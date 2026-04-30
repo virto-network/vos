@@ -200,3 +200,42 @@ fn load_u64_forged_address_rejected() {
     }
     prove_and_verify(steps, &code, &bitmask);
 }
+
+// ── is_write discriminator forge tests ────────────────────────────────────
+// CpuChip emits the MemoryAccess lookup tuple (addr, value, ts, is_write)
+// with `is_write = is_store_col`.  IsStore is itself pinned to the
+// canonical opcode via ProgramMemoryChip (Phase 23).  These tests hit the
+// remaining "small" gap noted in PLAN: explicit forge-and-reject coverage
+// for the is_write lookup field (vs. having soundness inferred from
+// IsStore being opcode-pinned + ledger balance).
+
+#[test]
+#[should_panic(expected = "failed")]
+fn store_drops_mem_write_rejected() {
+    // Honest StoreIndU8 emits a MemoryAccess producer with is_write=1.
+    // Forging step.mem_write = None makes the MemoryChip ledger skip
+    // the entry, leaving the CpuChip producer unmatched → lookup
+    // imbalance → ConstraintsNotSatisfied.
+    let (code, bitmask, mut steps) = trace_store_load(0x42, 0x1000);
+    steps[0].mem_write = None;
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn load_injects_mem_write_rejected() {
+    // Forge step.mem_write on a Load row.  CpuChip on this row emits
+    // is_write=0 (since IsStore=0 from the canonical Load decoding),
+    // but the injected MemoryChip entry has is_write=1 → ledger
+    // imbalance.
+    let (code, bitmask, mut steps) = trace_store_load(0x42, 0x1000);
+    // steps[1] is the LoadIndU8.  Inject a phantom write at the load's
+    // address with the loaded value.
+    let r = steps[1].mem_read.as_ref().unwrap().clone();
+    steps[1].mem_write = Some(zkpvm::core::step::MemAccess {
+        address: r.address,
+        value: r.value,
+        size: r.size,
+    });
+    prove_and_verify(steps, &code, &bitmask);
+}
