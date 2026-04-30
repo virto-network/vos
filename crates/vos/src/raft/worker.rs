@@ -28,6 +28,7 @@
 //! [`Network::send_raft_vote`]: crate::network::Network::send_raft_vote
 //! [`RaftRpcHandler`]: crate::network::RaftRpcHandler
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::sync::mpsc as std_mpsc;
@@ -37,6 +38,7 @@ use std::time::{Duration, Instant};
 use redb::Database;
 use tracing::{debug, warn};
 
+use crate::commit::CommitError;
 use crate::network::{
     Network, RaftAppendResult, RaftEntry, RaftRpcHandler, RaftVoteResult,
 };
@@ -138,8 +140,37 @@ pub(crate) enum RaftMsg {
     QueryState {
         reply: std_mpsc::Sender<WorkerSnapshot>,
     },
+    /// Append a new entry to the leader's log. Used by the agent
+    /// thread (phase 5) and by tests injecting entries directly.
+    /// On a Leader: appends, returns the new index. On any other
+    /// role: returns `ProposeError::NotLeader`.
+    Propose {
+        payload: Vec<u8>,
+        reply: std_mpsc::Sender<Result<u64, ProposeError>>,
+    },
     Shutdown,
 }
+
+/// Reasons a propose can fail at the worker boundary.
+#[derive(Debug)]
+pub enum ProposeError {
+    /// This worker is currently `Follower` or `Candidate` — phase 5
+    /// will wire follower → leader forwarding; for now the caller
+    /// must retry against the cluster's leader.
+    NotLeader,
+    /// redb write failed on the append.
+    Storage(CommitError),
+}
+
+impl core::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLeader => write!(f, "propose: not leader"),
+            Self::Storage(e) => write!(f, "propose: storage: {e}"),
+        }
+    }
+}
+impl std::error::Error for ProposeError {}
 
 /// Diagnostic snapshot of a worker's state. Returned by
 /// [`WorkerHandle::snapshot`].
@@ -300,10 +331,28 @@ impl WorkerHandle {
         self.inbox.send(RaftMsg::QueryState { reply: tx }).ok()?;
         rx.recv_timeout(Duration::from_millis(500)).ok()
     }
+
+    /// Append a new payload to the cluster log. Caller is expected
+    /// to address a Leader; followers / candidates return
+    /// `NotLeader`. The returned index is the position the leader
+    /// reserved for the entry — replication to a quorum is async,
+    /// so the entry is *appended* by the time this returns but
+    /// only *committed* once a majority of followers ack via
+    /// `AppendResponse`. Phase 5 will turn this into a blocking
+    /// "propose-and-wait-for-commit" call from the agent thread.
+    pub fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError> {
+        let (tx, rx) = std_mpsc::channel();
+        self.inbox
+            .send(RaftMsg::Propose { payload, reply: tx })
+            .map_err(|_| ProposeError::NotLeader)?;
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap_or(Err(ProposeError::NotLeader))
+    }
 }
 
 /// Worker state. Owns the per-group state machine + the
-/// in-memory tally for an in-flight election.
+/// in-memory tally for an in-flight election + per-follower
+/// replication bookkeeping when leader.
 struct WorkerState {
     db: Arc<Database>,
     cfg: WorkerConfig,
@@ -316,16 +365,51 @@ struct WorkerState {
     role: Role,
     log: RaftLog,
     meta: RaftMeta,
-    /// Next election timeout. `Instant::now() >= deadline` triggers
-    /// a Follower → Candidate transition. Followers refresh this
-    /// on every accepted heartbeat / granted vote; candidates
-    /// refresh it when starting an election; leaders push it far
-    /// into the future (phase 3.3 replaces this with a heartbeat
-    /// tick).
+    /// Next election timeout. Followers refresh on every accepted
+    /// heartbeat / granted vote; candidates refresh when starting
+    /// an election; leaders use it as the heartbeat tick interval.
     election_deadline: Instant,
     /// Set of voters that have granted us a vote *in this term*.
     /// Includes ourselves the moment we become Candidate.
     votes_received: alloc::collections::BTreeSet<u16>,
+    /// Per-follower replication state. `None` unless we're Leader.
+    leader: Option<LeaderState>,
+}
+
+/// Per-follower replication bookkeeping. Initialized when a
+/// worker becomes Leader; cleared when it steps down.
+#[derive(Debug)]
+struct LeaderState {
+    /// Index of the next log entry to send to each follower.
+    /// Initialized to `leader.last_log_index + 1` and adjusted
+    /// based on each follower's `AppendResponse` (success bumps,
+    /// failure decrements).
+    next_index: BTreeMap<u16, u64>,
+    /// Highest log index known to be replicated to each follower.
+    /// Initialized to 0 and advanced on `AppendResponse {
+    /// success: true }`.
+    match_index: BTreeMap<u16, u64>,
+}
+
+impl LeaderState {
+    fn fresh(members: &[u16], me: u16, last_log_index: u64) -> Self {
+        let next_index = members
+            .iter()
+            .copied()
+            .filter(|p| *p != me)
+            .map(|p| (p, last_log_index + 1))
+            .collect();
+        let match_index = members
+            .iter()
+            .copied()
+            .filter(|p| *p != me)
+            .map(|p| (p, 0u64))
+            .collect();
+        Self {
+            next_index,
+            match_index,
+        }
+    }
 }
 
 impl WorkerState {
@@ -347,9 +431,30 @@ impl WorkerState {
             meta,
             election_deadline: Instant::now(),
             votes_received: alloc::collections::BTreeSet::new(),
+            leader: None,
         };
         s.reset_election_timer();
         Ok(s)
+    }
+
+    /// Peers' match_index plus our own implicit "last_log_index" —
+    /// used by the commit-advance routine to find the highest
+    /// index a majority has replicated. Returns sorted descending
+    /// so the position at index `quorum() - 1` is the highest
+    /// index a majority of cluster members (counting ourselves)
+    /// is at or above.
+    fn match_index_majority_floor(&self) -> Option<u64> {
+        let leader = self.leader.as_ref()?;
+        let mut indices: Vec<u64> = leader.match_index.values().copied().collect();
+        // Our own "match index" is our last_index — we have every
+        // entry we've appended.
+        indices.push(self.log.last_index());
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        let q = self.quorum();
+        if q == 0 || q > indices.len() {
+            return None;
+        }
+        Some(indices[q - 1])
     }
 
     fn persist_meta(&self) -> Result<(), crate::commit::CommitError> {
@@ -460,28 +565,20 @@ fn worker_loop(
             Ok(RaftMsg::AppendResponse {
                 from_prefix,
                 term,
-                success: _,
-                match_index: _,
+                success,
+                match_index,
             }) => {
-                // Phase 3.3 only consumes the term to detect a
-                // stale-leader step-down. Phase 4 will use
-                // success + match_index to advance per-peer
-                // replication state.
-                if term > state.meta.current_term {
-                    debug!(
-                        me = state.cfg.me,
-                        peer = from_prefix,
-                        peer_term = term,
-                        our_term = state.meta.current_term,
-                        "raft: leader stepping down — peer at higher term",
-                    );
-                    state.meta.current_term = term;
-                    state.meta.voted_for = None;
-                    state.role = Role::Follower;
-                    state.votes_received.clear();
-                    state.persist_meta()?;
-                    state.reset_election_timer();
-                }
+                handle_append_response(
+                    &mut state,
+                    from_prefix,
+                    term,
+                    success,
+                    match_index,
+                )?;
+            }
+            Ok(RaftMsg::Propose { payload, reply }) => {
+                let result = handle_propose(&mut state, payload);
+                let _ = reply.send(result);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => match state.role {
                 Role::Follower | Role::Candidate => start_election(&mut state)?,
@@ -632,8 +729,9 @@ fn handle_request_vote(
     if term > state.meta.current_term {
         state.meta.current_term = term;
         state.meta.voted_for = None;
-        state.role = Role::Follower;
-        state.votes_received.clear();
+        // Step down if we were Candidate / Leader at the lower
+        // term — clears `votes_received` and leader bookkeeping.
+        step_down(state);
         meta_changed = true;
     }
 
@@ -679,10 +777,8 @@ fn handle_vote_response(
     if term > state.meta.current_term {
         state.meta.current_term = term;
         state.meta.voted_for = None;
-        state.role = Role::Follower;
-        state.votes_received.clear();
         state.persist_meta()?;
-        state.reset_election_timer();
+        step_down(state);
         return Ok(());
     }
 
@@ -709,64 +805,226 @@ fn handle_vote_response(
 }
 
 /// Transition into the Leader role: clear the in-flight election,
-/// fire heartbeats immediately so followers' election timers reset
-/// before they can challenge us, and schedule the next tick.
+/// initialize per-follower replication state, and fire an
+/// immediate replication tick so followers' election timers reset
+/// before they can challenge us.
 fn become_leader(state: &mut WorkerState) {
     state.role = Role::Leader;
     state.votes_received.clear();
+    let last = state.log.last_index();
+    state.leader = Some(LeaderState::fresh(&state.cfg.members, state.cfg.me, last));
     send_heartbeats(state);
 }
 
-/// Fire one round of empty `AppendEntries` to every follower.
-/// Phase 3.3 carries no log entries — leader replication lands in
-/// phase 4. The reply is routed back through the worker's inbox
-/// as `RaftMsg::AppendResponse` so the tally happens on the
-/// single-threaded state machine.
+/// Step down from Leader / Candidate to Follower. Clears the
+/// transient role state (vote tally, per-follower bookkeeping)
+/// and resets the election timer.
+fn step_down(state: &mut WorkerState) {
+    state.role = Role::Follower;
+    state.votes_received.clear();
+    state.leader = None;
+    state.reset_election_timer();
+}
+
+/// Fire one round of `AppendEntries` to every follower. Each
+/// follower receives entries from its `next_index` up to the
+/// leader's tail (capped by `MAX_RAFT_ENTRIES` indirectly via
+/// the wire format's per-frame limit). If a follower is
+/// up-to-date, the call carries an empty entries vec — that's
+/// the heartbeat case. Replies route back through the worker's
+/// inbox as `RaftMsg::AppendResponse` so the per-follower
+/// bookkeeping is updated on the single-threaded state machine.
 fn send_heartbeats(state: &mut WorkerState) {
     let term = state.meta.current_term;
     let me = state.cfg.me;
     let rep_id = state.cfg.replication_id;
-    let prev_log_index = state.log.last_index();
-    let prev_log_term = state.log.last_term();
-    // Phase 4 will compute leader_commit from the strategy's
-    // commit-index advance; phase 3.3 sticks with prev_log_index
-    // (no committed entries past the leader's tail in this phase).
-    let leader_commit = prev_log_index;
+    let leader_last_index = state.log.last_index();
+    let leader_commit = state.meta.commit_index;
 
-    if let Some(network) = state.network.clone() {
-        for peer_prefix in state.cfg.members.iter().copied() {
-            if peer_prefix == me {
-                continue;
-            }
-            let Some(peer_id) = network.peer_for_prefix(peer_prefix) else {
-                continue;
-            };
-            let rx = network.send_raft_append(
-                peer_id,
-                rep_id,
-                term,
-                me,
-                prev_log_index,
-                prev_log_term,
-                leader_commit,
-                Vec::new(),
-            );
-            let inbox_tx = state.inbox_tx.clone();
-            thread::spawn(move || {
-                if let Ok(resp) = rx.recv_timeout(VOTE_RPC_TIMEOUT) {
-                    let _ = inbox_tx.send(RaftMsg::AppendResponse {
-                        from_prefix: peer_prefix,
-                        term: resp.term,
-                        success: resp.success,
-                        match_index: resp.match_index,
-                    });
-                }
-            });
+    let Some(network) = state.network.clone() else {
+        // No network → can't replicate. Just push the deadline so
+        // we don't spin. Tests in single-node mode hit this.
+        state.election_deadline =
+            Instant::now() + Duration::from_millis(state.cfg.heartbeat_interval_ms);
+        return;
+    };
+
+    let leader = match state.leader.as_ref() {
+        Some(l) => l.clone_indices(),
+        None => return,
+    };
+
+    for peer_prefix in state.cfg.members.iter().copied() {
+        if peer_prefix == me {
+            continue;
         }
+        let next_idx = leader.next_index.get(&peer_prefix).copied().unwrap_or(1);
+        // prev_log_index/term identifies the entry just before
+        // what we're about to send, so the follower's consistency
+        // check has something to anchor on.
+        let prev_log_index = next_idx.saturating_sub(1);
+        let prev_log_term = match state.log.term_at(prev_log_index) {
+            Ok(Some(t)) => t,
+            Ok(None) | Err(_) => 0,
+        };
+        // Read the entries to send. For a follower at the leader's
+        // tail (next_idx == last_index + 1), this is empty — a
+        // pure heartbeat.
+        let entries = if next_idx <= leader_last_index {
+            match state.log.entries(next_idx, leader_last_index) {
+                Ok(es) => es
+                    .into_iter()
+                    .map(|e| RaftEntry {
+                        term: e.term,
+                        payload: e.payload,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let Some(peer_id) = network.peer_for_prefix(peer_prefix) else {
+            continue;
+        };
+        let rx = network.send_raft_append(
+            peer_id,
+            rep_id,
+            term,
+            me,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            entries,
+        );
+        let inbox_tx = state.inbox_tx.clone();
+        thread::spawn(move || {
+            if let Ok(resp) = rx.recv_timeout(VOTE_RPC_TIMEOUT) {
+                let _ = inbox_tx.send(RaftMsg::AppendResponse {
+                    from_prefix: peer_prefix,
+                    term: resp.term,
+                    success: resp.success,
+                    match_index: resp.match_index,
+                });
+            }
+        });
     }
 
     state.election_deadline =
         Instant::now() + Duration::from_millis(state.cfg.heartbeat_interval_ms);
+}
+
+impl LeaderState {
+    /// Snapshot of the per-follower indices for the duration of
+    /// one `send_heartbeats` round. Used so we can release the
+    /// borrow on `state.leader` while we read the log + spawn
+    /// helper threads.
+    fn clone_indices(&self) -> Self {
+        Self {
+            next_index: self.next_index.clone(),
+            match_index: self.match_index.clone(),
+        }
+    }
+}
+
+fn handle_append_response(
+    state: &mut WorkerState,
+    from_prefix: u16,
+    term: u64,
+    success: bool,
+    match_index: u64,
+) -> Result<(), CommitError> {
+    // Stale-term detection: peer's term > ours → step down. Same
+    // shape phase 3 used.
+    if term > state.meta.current_term {
+        debug!(
+            me = state.cfg.me,
+            peer = from_prefix,
+            peer_term = term,
+            our_term = state.meta.current_term,
+            "raft: leader stepping down — peer at higher term",
+        );
+        state.meta.current_term = term;
+        state.meta.voted_for = None;
+        state.persist_meta()?;
+        step_down(state);
+        return Ok(());
+    }
+
+    // Only Leaders track per-follower replication.
+    if state.role != Role::Leader || term != state.meta.current_term {
+        return Ok(());
+    }
+
+    let leader = match state.leader.as_mut() {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    if success {
+        leader.match_index.insert(from_prefix, match_index);
+        leader.next_index.insert(from_prefix, match_index + 1);
+        try_advance_commit_index(state)?;
+    } else {
+        // Consistency-check failure: the follower has a divergent
+        // log at our `prev_log_index`. Walk our `next_index` for
+        // them backward by one and retry on the next heartbeat
+        // tick. (Phase 4 doesn't optimize the back-step rate;
+        // log compaction in phase 6 will replace the worst-case
+        // walk-to-zero with a snapshot install.)
+        let cur = leader.next_index.get(&from_prefix).copied().unwrap_or(1);
+        let new_next = cur.saturating_sub(1).max(1);
+        leader.next_index.insert(from_prefix, new_next);
+    }
+    Ok(())
+}
+
+/// Commit-advance: the highest index that's replicated on a
+/// majority of cluster members AND was appended in the current
+/// term moves the commit_index forward.
+fn try_advance_commit_index(state: &mut WorkerState) -> Result<(), CommitError> {
+    let Some(majority_floor) = state.match_index_majority_floor() else {
+        return Ok(());
+    };
+    if majority_floor <= state.meta.commit_index {
+        return Ok(());
+    }
+    // Raft safety: the leader can only commit entries from its
+    // current term via majority match. Earlier-term entries
+    // become committed implicitly when a later same-term entry
+    // commits.
+    let entry_term = state.log.term_at(majority_floor)?;
+    if entry_term != Some(state.meta.current_term) {
+        return Ok(());
+    }
+    debug!(
+        me = state.cfg.me,
+        from = state.meta.commit_index,
+        to = majority_floor,
+        "raft: leader advancing commit_index",
+    );
+    state.meta.commit_index = majority_floor;
+    // Phase 4.2 mirrors phase 4.1's follower-side stub: push
+    // last_applied straight to commit_index. Phase 5 plumbs the
+    // actor's dispatch through a reply channel and decouples
+    // these two indices.
+    state.meta.last_applied = state.meta.last_applied.max(majority_floor);
+    state.persist_meta()?;
+    Ok(())
+}
+
+fn handle_propose(state: &mut WorkerState, payload: Vec<u8>) -> Result<u64, ProposeError> {
+    if state.role != Role::Leader {
+        return Err(ProposeError::NotLeader);
+    }
+    let term = state.meta.current_term;
+    let txn = state.db.begin_write().map_err(|e| ProposeError::Storage(e.into()))?;
+    let index = state
+        .log
+        .append_in_txn(&txn, term, &payload)
+        .map_err(ProposeError::Storage)?;
+    txn.commit().map_err(|e| ProposeError::Storage(e.into()))?;
+    Ok(index)
 }
 
 fn start_election(state: &mut WorkerState) -> Result<(), crate::commit::CommitError> {
@@ -1128,5 +1386,52 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn propose_on_follower_is_rejected() {
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let h = worker.handler();
+        // Brand-new worker is Follower — propose must refuse.
+        let err = h.propose(b"x".to_vec()).unwrap_err();
+        assert!(matches!(err, ProposeError::NotLeader));
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn solo_leader_propose_appends_entry_to_log() {
+        // Single-member cluster: the worker becomes Leader on
+        // its first election. A propose then lands an entry at
+        // index 1, term 1 (the term of the win).
+        let (db, dir) = temp_db();
+        let cfg = WorkerConfig {
+            me: 0xAAAA,
+            members: vec![0xAAAA],
+            replication_id: [0xC0; 32],
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 500,
+        };
+        let worker = RaftWorker::spawn(db.clone(), cfg, None);
+        let h = worker.handler();
+        let _ = wait_for_role(&h, Role::Leader, Duration::from_millis(500));
+
+        let idx = h.propose(b"first".to_vec()).expect("propose");
+        assert_eq!(idx, 1);
+        let idx2 = h.propose(b"second".to_vec()).expect("propose 2");
+        assert_eq!(idx2, 2);
+
+        let log = RaftLog::open(db.clone()).unwrap();
+        assert_eq!(log.last_index(), 2);
+        let entries = log.entries(1, 2).unwrap();
+        assert_eq!(entries[0].payload, b"first");
+        assert_eq!(entries[1].payload, b"second");
+        // Both entries carry the term of the win — the test's
+        // first-and-only term.
+        assert_eq!(entries[0].term, entries[1].term);
+
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
