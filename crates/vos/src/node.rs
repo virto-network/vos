@@ -67,6 +67,13 @@ pub enum Consistency {
     /// atomically on every dispatch, and the observed-effect log
     /// is attached to each DAG node for deterministic replay.
     Crdt,
+    /// Raft consensus — every state-changing dispatch appends a
+    /// committed log entry. Phase 1 runs as a single-node
+    /// "self-quorum" mode (durable persistence + replay equivalent
+    /// to `Local` + a log); the cluster machinery (election,
+    /// AppendEntries, leader-forwarding `commit_with_log`) lands
+    /// in later phases.
+    Raft,
 }
 
 impl Default for Consistency {
@@ -1481,12 +1488,19 @@ fn agent_thread(
     }));
 
     let consistency = config.consistency;
-    let recording_enabled = consistency == Consistency::Crdt;
+    // Recording captures the per-dispatch `EffectLog` payload the
+    // strategy needs to replay deterministically on cold start.
+    // Both replicating strategies want it; the non-replicating ones
+    // ignore the log if handed.
+    let recording_enabled = matches!(
+        consistency,
+        Consistency::Crdt | Consistency::Raft,
+    );
     // Capture rep_id up front — config is consumed below.
     #[cfg(all(feature = "network", feature = "storage"))]
     let agent_rep_id: Option<[u8; 32]> = config.replication_id;
     let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        match build_agent_strategy(&config, id) {
+        match build_agent_strategy(&config, id, id.node_prefix()) {
             Ok(s) => s,
             Err(e) => {
                 let err = format!("strategy build failed: {e}");
@@ -1828,10 +1842,11 @@ fn dispatch_once(
 fn build_agent_strategy(
     config: &AgentConfig,
     id: ServiceId,
+    self_node_prefix: u16,
 ) -> Result<Box<dyn crate::commit::CommitStrategy>, crate::commit::CommitError> {
     #[cfg(feature = "storage")]
     {
-        let _ = id;
+        let _ = (id, self_node_prefix);
         match config.consistency {
             Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
             Consistency::Local => {
@@ -1859,6 +1874,24 @@ fn build_agent_strategy(
                     )
                 })?;
                 Ok(Box::new(crate::commit::CrdtCommit::open(&path)?))
+            }
+            Consistency::Raft => {
+                // Phase 1: single-node only. The cluster ID lives in
+                // `replication_id` if set (so phase 3's worker can
+                // self-discover peers via gossipsub) but isn't read
+                // here yet — phase 1 only needs `me` to seed
+                // `RaftConfig`, and that's the local node prefix.
+                let path = config.db_path(id).ok_or_else(|| {
+                    crate::commit::CommitError::Config(
+                        "Raft consistency requires data_dir on AgentConfig".into(),
+                    )
+                })?;
+                let cfg = crate::raft::RaftConfig {
+                    me: self_node_prefix,
+                    members: alloc::vec::Vec::new(),
+                    election_timeout_ms: (150, 300),
+                };
+                Ok(Box::new(crate::raft::RaftCommit::open(&path, cfg)?))
             }
         }
     }
