@@ -940,22 +940,48 @@ fn handle_refine_hostcall(
 /// Nested invokes (depth >= 2) belong to a child's refine and
 /// are irrelevant to the caller's session.
 ///
-/// **Cap enforcement.** When recording, the session carries a
-/// per-reply byte cap (16 KiB by default). Outputs larger than the
-/// cap are replaced — both in the log and in the caller's buffer —
-/// with a single STATUS_PANICKED byte. The caller's PVM observes
-/// `InvokeError::Panicked`; replay reproduces the same observation
-/// bit-for-bit. The intent is to keep DAG nodes bounded so a
-/// runaway worker can't poison consensus replicas with multi-MB
+/// **Buffer cap enforcement.** When the caller's `output` register
+/// carries a non-zero length in its high 32 bits (`output_buf_len`),
+/// the runtime refuses to write more than that into the caller's
+/// PVM memory. An over-cap reply is replaced with a one-byte
+/// `STATUS_PANICKED` envelope at the caller's `output_ptr`, so the
+/// guest sees `InvokeError::Panicked` rather than having its stack
+/// silently overrun. A length of 0 means a legacy guest predating
+/// the ABI extension — fall through to the unbounded write.
+///
+/// **Recording cap enforcement.** When recording, the session
+/// carries a per-reply byte cap (16 KiB by default). Outputs larger
+/// than that cap are replaced — both in the log and in the caller's
+/// buffer — with a single STATUS_PANICKED byte. The caller's PVM
+/// observes `InvokeError::Panicked`; replay reproduces the same
+/// observation bit-for-bit. The intent is to keep DAG nodes bounded
+/// so a runaway worker can't poison consensus replicas with multi-MB
 /// payloads.
 fn record_and_write_invoke(
     caller: &mut InvocationKernel,
     output_ptr: u32,
+    output_buf_len: usize,
     output: &[u8],
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
     use crate::actors::run::STATUS_PANICKED;
+
+    // Buffer cap fires first — if the reply doesn't fit in the
+    // caller's PVM buffer, kwrite would overrun. Surface it as a
+    // panic. This also feeds the recording log a STATUS_PANICKED
+    // marker (see Recording branch below), so replay sees the
+    // same observation.
+    if output_buf_len > 0 && output.len() > output_buf_len {
+        let truncated = alloc::vec![STATUS_PANICKED];
+        if depth == 1 {
+            if let crate::effect_log::EffectMode::Recording(s) = mode {
+                s.record(truncated.clone());
+            }
+        }
+        kwrite(caller, output_ptr, &truncated);
+        return truncated.len() as u64;
+    }
 
     if depth == 1 {
         if let crate::effect_log::EffectMode::Recording(s) = mode {
@@ -996,7 +1022,14 @@ fn handle_invoke(
     let input_ptr = caller.active_reg(8) as u32;
     let input_len = caller.active_reg(9) as usize;
     let gas_limit = caller.active_reg(10);
-    let output_ptr = caller.active_reg(11) as u32;
+    // Output register is packed: low 32 bits are the PVM address,
+    // high 32 bits are the buffer length. Legacy guests that
+    // predate this packing pass 0 in the high bits, in which case
+    // `record_and_write_invoke` skips the buffer cap and writes
+    // unbounded (preserving prior behaviour).
+    let output_packed = caller.active_reg(11);
+    let output_ptr = output_packed as u32;
+    let output_buf_len = (output_packed >> 32) as u32 as usize;
 
     // Replay fast path: at the top-level invoke under a replay
     // session, return the next recorded output instead of running
@@ -1016,7 +1049,7 @@ fn handle_invoke(
     }
 
     if depth >= MAX_INVOKE_DEPTH {
-        return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
+        return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_OOG], depth, mode);
     }
 
     let code_hash = kread_hash(caller, hash_ptr);
@@ -1070,19 +1103,19 @@ fn handle_invoke(
                         output.push(crate::actors::run::STATUS_DONE);
                         output.extend_from_slice(&0u32.to_le_bytes());
                         output.extend_from_slice(&reply);
-                        return record_and_write_invoke(caller, output_ptr, &output, depth, mode);
+                        return record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode);
                     }
                 }
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+                return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_NOT_FOUND], depth, mode);
             }
         }
     } else {
-        return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+        return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_NOT_FOUND], depth, mode);
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
         None => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+            return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_NOT_FOUND], depth, mode);
         }
     };
 
@@ -1097,7 +1130,7 @@ fn handle_invoke(
     let mut child = match InvocationKernel::new_cached(blob, &[], gas, code_cache) {
         Ok(k) => k,
         Err(_) => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+            return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_PANICKED], depth, mode);
         }
     };
     child.set_active_reg(7, 0); // refine
@@ -1135,13 +1168,13 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 error!(pc, ?target_svc_id, "child invoke panicked");
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+                return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_PANICKED], depth, mode);
             }
             KernelResult::OutOfGas => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
+                return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_OOG], depth, mode);
             }
             KernelResult::PageFault(_addr) => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+                return record_and_write_invoke(caller, output_ptr, output_buf_len, &[STATUS_PANICKED], depth, mode);
             }
             KernelResult::ProtocolCall { slot } => {
                 // Nested invokes by the child actor are not part
@@ -1198,7 +1231,7 @@ fn handle_invoke(
         raw_output
     };
 
-    record_and_write_invoke(caller, output_ptr, &output, depth, mode)
+    record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode)
 }
 
 /// Capture a continuation: hash flat_mem, store in the data layer,

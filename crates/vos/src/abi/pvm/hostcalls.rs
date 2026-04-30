@@ -42,7 +42,18 @@ pub fn peek(key: &[u8], value_buf: &mut [u8]) -> u64 {
 }
 
 /// Invoke a sub-PVM synchronously (refine phase).
-/// Runs target's refine entry, returns bytes written to `output`.
+/// Runs target's refine entry, returns the *full* reply length
+/// (which may exceed the caller's buffer — see truncation below).
+///
+/// The output argument is packed: the low 32 bits of the fifth
+/// register are `output.as_mut_ptr() as u32`, and the high 32 bits
+/// are `output.len() as u32`. The runtime uses the length to bound
+/// its write into the caller's PVM memory: when the producer's
+/// reply exceeds the caller's buffer, the runtime substitutes a
+/// single-byte `STATUS_PANICKED` envelope rather than overrunning
+/// the stack. A length of 0 in the high bits is interpreted as
+/// "legacy / no cap" so older PVM blobs that predate this ABI
+/// extension keep their previous behaviour (unsafe but unchanged).
 #[inline]
 pub fn invoke(
     code_hash: &[u8; 32],
@@ -50,13 +61,15 @@ pub fn invoke(
     gas_limit: u64,
     output: &mut [u8],
 ) -> u64 {
+    let output_packed = (output.as_mut_ptr() as u64)
+        | ((output.len() as u64) << 32);
     ecall5(
         hostcall::INVOKE,
         code_hash.as_ptr() as u64,
         input.as_ptr() as u64,
         input.len() as u64,
         gas_limit,
-        output.as_mut_ptr() as u64,
+        output_packed,
     )
 }
 
