@@ -131,6 +131,18 @@ and pinned ShiftAmount/ShiftAmountCompl ∈ [0, 31] via a `val_d[4..8]
 finalize covers the high 4 bytes uniformly across non-rotate Mul32
 and rotate-32 rows.
 
+### Phase 37 — 32-bit shift ShiftAmount uniqueness — DONE
+
+Closed a latent soundness gap surfaced while building Phase 36's
+32-bit rotate machinery.  The pre-existing 32-bit shift identity
+`reg_val_d = ShiftAmount + 32·ShiftQuotient` admits two valid
+byte-bounded shift values for any modulus-32 reg_val_d (e.g.,
+ShiftAmount = 0 with ShiftQuotient = 1, or ShiftAmount = 32 with
+ShiftQuotient = 0); the [0, 63] PowerOfTwo table accepts both.
+Phase 36 added `val_d[4..8] = 0` on rotate-32 rows; Phase 37
+widens the gate to all `is_32bit · is_shift_c` rows so
+ShloL32/ShloR32/SharR32 (+ Imm/ImmAlt variants) are covered too.
+
 ### Future — RotR64ImmAlt + RotR32ImmAlt
 
 Both have swapped operand semantics (immediate is the rotated

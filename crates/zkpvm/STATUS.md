@@ -38,6 +38,13 @@ commit.
   `PowerOfTwoChip` to bind `val_d = 2^shift_amount` `[6]`.
 - **ShloR** (logical right) / **SharR** (arithmetic right) —
   encoded via `is_div_rem=true`; same power-of-two lookup `[6]`.
+- **32-bit shift ShiftAmount uniqueness** — closed by an
+  additional `val_d[4..8] = 0` constraint on `is_32bit ·
+  is_shift_c` rows.  Without this, the [0, 63] PowerOfTwo table
+  admits two byte-bounded ShiftAmount values for any
+  modulus-32 reg_val_d, and a malicious prover could pick val_d
+  = 2^32 (instead of 2^0) for shift-by-32 to forge a 0 result
+  `[37]`.
 
 ### Compare
 - **SetLtU** — `cmp_lt_flag = 1 - cmp_carry[7]` from the

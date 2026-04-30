@@ -341,15 +341,28 @@ impl BuiltInComponent for CpuChip {
                         )
                 );
             }
-            // Phase 36: pin val_d high 4 bytes = 0 on 32-bit rotate rows.
-            // Combined with the PowerOfTwo lookup (table covers shifts
-            // [0, 63]), this forces ShiftAmount / ShiftAmountCompl ∈
-            // [0, 31] uniquely — necessary for soundness because the
-            // mod-32 shift identity admits two valid byte-bounded
-            // shift amounts otherwise.
+            // Phase 36 / 37: pin val_d high 4 bytes = 0 on ALL 32-bit
+            // shift-constrained rows.  Combined with the PowerOfTwo
+            // lookup (table covers shifts [0, 63]), this forces
+            // ShiftAmount / ShiftAmountCompl ∈ [0, 31] uniquely —
+            // necessary for soundness because the mod-32 shift
+            // identity admits two valid byte-bounded shift amounts
+            // otherwise (e.g., reg_val_d = 32 → ShiftAmount = 0 with
+            // ShiftQuotient = 1, or ShiftAmount = 32 with
+            // ShiftQuotient = 0; the first gives val_d = 1, the
+            // second val_d = 2^32, and the schoolbook produces
+            // different results between the two).
+            //
+            // Phase 36 originally scoped this to RotL32/RotR32 only,
+            // leaving the same gap open for ShloL32/ShloR32/SharR32
+            // (and their Imm/ImmAlt variants).  Phase 37 widens the
+            // gate to `is_32bit · is_shift_c` so all 32-bit
+            // shift-constrained rows are covered.
+            let is_shift_c_p37 = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
+            let is_32_shift_c = is_32bit[0].clone() * is_shift_c_p37[0].clone();
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
-                    is_rotate_32_either.clone() * val_d[i].clone()
+                    is_32_shift_c.clone() * val_d[i].clone()
                 );
             }
         }
