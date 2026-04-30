@@ -1499,6 +1499,187 @@ fn crdt_counter_converges_across_nodes_live() {
     let _ = std::fs::remove_dir_all(&dir_root);
 }
 
+#[test]
+#[cfg(feature = "network")]
+fn crdt_counter_burst_converges_under_concurrent_load() {
+    // Robustness probe: the existing convergence test does one
+    // inc() per side. Real workloads will have bursts of writes
+    // racing with each other and with the sync ticker. This
+    // probe drives N inc()s on each side concurrently from
+    // host-side threads (so the sync ticker, the agent threads,
+    // and the local invokes are all in flight at once) and
+    // asserts both replicas converge to 2*N.
+    //
+    // What can fail here that the single-inc test wouldn't catch:
+    //   - race between the agent's commit_with_log and the sync
+    //     ticker's insert_node + soft_restart_crdt
+    //   - a stale snapshot of `last_reply` carrying across an
+    //     unexpected soft restart
+    //   - tag collision causing two inc events to share a CID
+    //     (silent dedup → undercount on convergence)
+    //   - the BFS from FetchHeads stopping mid-fetch and
+    //     leaving the merged DAG short of a few nodes
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    const PER_SIDE: u32 = 5;
+    const EXPECTED: u64 = (PER_SIDE as u64) * 2;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_crdt_burst_{}_{}", std::process::id(), stamp,
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"crdt-counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_listen
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let counter_a = node_a.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let counter_b = node_b.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
+        std::time::Duration::from_secs(10),
+    ).expect("Hello completes");
+
+    let inc_with_tag = |tag: u32| -> Vec<u8> {
+        let m = Msg::new("inc").with("tag", tag);
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+
+    // Drive the bursts on background threads so both sides race.
+    // Tag values are partitioned: A uses 1..=N, B uses 100..=100+N,
+    // so neither replica sees a CID collision with the other.
+    let handle_a = node_a.invoke_handle();
+    let handle_b = node_b.invoke_handle();
+    let one_sec = std::time::Duration::from_secs(10);
+
+    let t_a = std::thread::spawn(move || {
+        for tag in 1..=PER_SIDE {
+            let _ = handle_a.invoke_with_timeout(counter_a, inc_with_tag(tag), one_sec);
+        }
+    });
+    let t_b = std::thread::spawn(move || {
+        for tag in 1..=PER_SIDE {
+            let _ = handle_b.invoke_with_timeout(counter_b, inc_with_tag(100 + tag), one_sec);
+        }
+    });
+    t_a.join().expect("burst A");
+    t_b.join().expect("burst B");
+
+    let get_payload = || {
+        let m = Msg::new("get");
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+    let read_count = |node: &VosNode, target: ServiceId| -> Option<u64> {
+        let bytes = node.invoke(target, get_payload())?;
+        let v: vos::value::Value = vos::Decode::decode(&bytes);
+        v.as_u64()
+    };
+
+    let final_a = wait_for(
+        || match read_count(&node_a, counter_a) {
+            Some(c) if c == EXPECTED => Some(c),
+            _ => None,
+        },
+        std::time::Duration::from_secs(15),
+    );
+    let final_b = wait_for(
+        || match read_count(&node_b, counter_b) {
+            Some(c) if c == EXPECTED => Some(c),
+            _ => None,
+        },
+        std::time::Duration::from_secs(15),
+    );
+    let observed_a = read_count(&node_a, counter_a);
+    let observed_b = read_count(&node_b, counter_b);
+    assert_eq!(
+        final_a, Some(EXPECTED),
+        "A did not converge to {EXPECTED} within deadline; last observed = {observed_a:?}",
+    );
+    assert_eq!(
+        final_b, Some(EXPECTED),
+        "B did not converge to {EXPECTED} within deadline; last observed = {observed_b:?}",
+    );
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
 #[cfg(feature = "network")]
 fn wait_for<T>(
     mut probe: impl FnMut() -> Option<T>,
