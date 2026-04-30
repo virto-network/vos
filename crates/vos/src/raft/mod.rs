@@ -28,8 +28,12 @@
 pub mod log;
 #[cfg(feature = "storage")]
 pub mod strategy;
+#[cfg(all(feature = "storage", feature = "network"))]
+pub mod worker;
 
 #[cfg(feature = "storage")]
 pub use log::{LogEntry, RaftLog, RaftMeta, RAFT_LOG, RAFT_META};
 #[cfg(feature = "storage")]
 pub use strategy::{RaftCommit, RaftConfig};
+#[cfg(all(feature = "storage", feature = "network"))]
+pub use worker::{RaftWorker, Role, WorkerConfig, WorkerHandle};
