@@ -43,6 +43,14 @@ const TAG_FETCH_HEADS: u8 = 0x20;
 const TAG_HEADS: u8 = 0x21;
 const TAG_FETCH_NODE: u8 = 0x22;
 const TAG_NODE_REPLY: u8 = 0x23;
+// Raft RPCs (phase 2). 0x30..=0x35 reserved for the basic
+// election + replication round; 0x36 reserved for follower-→-
+// leader propose forwarding (phase 5+); 0x37..=0x38 reserved
+// for snapshot install/response (phase 6+).
+const TAG_RAFT_APPEND_REQ: u8 = 0x30;
+const TAG_RAFT_APPEND_RESP: u8 = 0x31;
+const TAG_RAFT_VOTE_REQ: u8 = 0x32;
+const TAG_RAFT_VOTE_RESP: u8 = 0x33;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -59,6 +67,12 @@ pub const REPLICATION_ID_BYTES: usize = 32;
 /// number; this stops a malicious peer from forcing a large
 /// alloc. Realistic actor traffic stays in single digits.
 const MAX_HEADS: usize = 256;
+
+/// Cap on the number of log entries carried in one
+/// `AppendEntriesReq`. Healthy replication uses small batches;
+/// a bigger payload should be split across multiple RPCs.
+/// Bounds the per-frame allocation a malicious peer can force.
+const MAX_RAFT_ENTRIES: usize = 1024;
 
 /// Hard cap on a single encoded frame. Matches the producer-side
 /// reply cap in `node.rs` so an oversized payload is rejected at
@@ -110,6 +124,46 @@ pub enum Frame {
     /// fire-and-forget `Tell` so the request_response behaviour
     /// has something to deliver.
     Ack,
+    /// Raft `AppendEntries` RPC — leader replicating log entries
+    /// to followers. Heartbeats use the same frame with an empty
+    /// `entries` vec.
+    RaftAppendReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    },
+    /// Reply to [`Frame::RaftAppendReq`]. `match_index` is the
+    /// last log index the follower has replicated when `success`
+    /// is true; ignored otherwise.
+    RaftAppendResp {
+        term: u64,
+        success: bool,
+        match_index: u64,
+    },
+    /// Raft `RequestVote` RPC — candidate soliciting votes.
+    RaftVoteReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Reply to [`Frame::RaftVoteReq`].
+    RaftVoteResp { term: u64, vote_granted: bool },
+}
+
+/// One log entry carried inside an [`Frame::RaftAppendReq`].
+/// The payload is the raw `EffectLog::to_bytes()` already in
+/// the leader's `raft_log` table — the receiver writes it
+/// straight back out without re-encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftEntry {
+    pub term: u64,
+    pub payload: Vec<u8>,
 }
 
 impl Frame {
@@ -176,6 +230,54 @@ impl Frame {
             Frame::Ack => {
                 out.push(TAG_ACK);
             }
+            Frame::RaftAppendReq {
+                replication_id,
+                term,
+                leader_prefix,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                entries,
+            } => {
+                out.push(TAG_RAFT_APPEND_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&leader_prefix.to_le_bytes());
+                out.extend_from_slice(&prev_log_index.to_le_bytes());
+                out.extend_from_slice(&prev_log_term.to_le_bytes());
+                out.extend_from_slice(&leader_commit.to_le_bytes());
+                out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for e in entries {
+                    out.extend_from_slice(&e.term.to_le_bytes());
+                    out.extend_from_slice(&(e.payload.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&e.payload);
+                }
+            }
+            Frame::RaftAppendResp { term, success, match_index } => {
+                out.push(TAG_RAFT_APPEND_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.push(if *success { 1 } else { 0 });
+                out.extend_from_slice(&match_index.to_le_bytes());
+            }
+            Frame::RaftVoteReq {
+                replication_id,
+                term,
+                candidate_prefix,
+                last_log_index,
+                last_log_term,
+            } => {
+                out.push(TAG_RAFT_VOTE_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&candidate_prefix.to_le_bytes());
+                out.extend_from_slice(&last_log_index.to_le_bytes());
+                out.extend_from_slice(&last_log_term.to_le_bytes());
+            }
+            Frame::RaftVoteResp { term, vote_granted } => {
+                out.push(TAG_RAFT_VOTE_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.push(if *vote_granted { 1 } else { 0 });
+            }
         }
         out
     }
@@ -238,6 +340,59 @@ impl Frame {
                 Frame::NodeReply { node }
             }
             TAG_ACK => Frame::Ack,
+            TAG_RAFT_APPEND_REQ => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let term = r.u64()?;
+                let leader_prefix = r.u16()?;
+                let prev_log_index = r.u64()?;
+                let prev_log_term = r.u64()?;
+                let leader_commit = r.u64()?;
+                let n = r.u32()? as usize;
+                if n > MAX_RAFT_ENTRIES {
+                    return Err(FrameError::RaftEntriesTooMany(n));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let entry_term = r.u64()?;
+                    let payload = r.bytes_with_len_prefix()?;
+                    entries.push(RaftEntry { term: entry_term, payload });
+                }
+                Frame::RaftAppendReq {
+                    replication_id,
+                    term,
+                    leader_prefix,
+                    prev_log_index,
+                    prev_log_term,
+                    leader_commit,
+                    entries,
+                }
+            }
+            TAG_RAFT_APPEND_RESP => {
+                let term = r.u64()?;
+                let success = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                let match_index = r.u64()?;
+                Frame::RaftAppendResp { term, success, match_index }
+            }
+            TAG_RAFT_VOTE_REQ => Frame::RaftVoteReq {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+                term: r.u64()?,
+                candidate_prefix: r.u16()?,
+                last_log_index: r.u64()?,
+                last_log_term: r.u64()?,
+            },
+            TAG_RAFT_VOTE_RESP => {
+                let term = r.u64()?;
+                let vote_granted = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftVoteResp { term, vote_granted }
+            }
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -256,6 +411,7 @@ pub enum FrameError {
     TrailingBytes(usize),
     HeadsTooMany(usize),
     BadOption(u8),
+    RaftEntriesTooMany(usize),
 }
 
 impl core::fmt::Display for FrameError {
@@ -274,6 +430,9 @@ impl core::fmt::Display for FrameError {
                 write!(f, "heads count {n} exceeds cap {MAX_HEADS}")
             }
             FrameError::BadOption(b) => write!(f, "invalid Option discriminant {b}"),
+            FrameError::RaftEntriesTooMany(n) => {
+                write!(f, "raft entry count {n} exceeds cap {MAX_RAFT_ENTRIES}")
+            }
         }
     }
 }
@@ -313,6 +472,12 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, FrameError> {
         let s = self.take(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, FrameError> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
     fn bytes_with_len_prefix(&mut self) -> Result<Vec<u8>, FrameError> {
         let len = self.u32()? as usize;
@@ -508,6 +673,111 @@ mod tests {
         assert!(matches!(
             Frame::decode(&bad),
             Err(FrameError::PayloadTooLarge(_))
+        ));
+    }
+
+    // ── Raft frames ─────────────────────────────────────────────
+
+    #[test]
+    fn raft_append_req_roundtrip_empty_entries_is_heartbeat() {
+        roundtrip(Frame::RaftAppendReq {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            term: 7,
+            leader_prefix: 0x1234,
+            prev_log_index: 42,
+            prev_log_term: 6,
+            leader_commit: 41,
+            entries: vec![],
+        });
+    }
+
+    #[test]
+    fn raft_append_req_roundtrip_with_entries() {
+        roundtrip(Frame::RaftAppendReq {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            term: 7,
+            leader_prefix: 0x1234,
+            prev_log_index: 42,
+            prev_log_term: 6,
+            leader_commit: 43,
+            entries: vec![
+                RaftEntry { term: 6, payload: vec![] },
+                RaftEntry { term: 7, payload: b"first entry".to_vec() },
+                RaftEntry { term: 7, payload: vec![0x99; 4096] },
+            ],
+        });
+    }
+
+    #[test]
+    fn raft_append_resp_roundtrip_success_and_failure() {
+        roundtrip(Frame::RaftAppendResp {
+            term: 7,
+            success: true,
+            match_index: 42,
+        });
+        roundtrip(Frame::RaftAppendResp {
+            term: 7,
+            success: false,
+            match_index: 0,
+        });
+    }
+
+    #[test]
+    fn raft_vote_req_roundtrip() {
+        roundtrip(Frame::RaftVoteReq {
+            replication_id: [0x11; REPLICATION_ID_BYTES],
+            term: 9,
+            candidate_prefix: 0xBEEF,
+            last_log_index: 100,
+            last_log_term: 8,
+        });
+    }
+
+    #[test]
+    fn raft_vote_resp_roundtrip() {
+        roundtrip(Frame::RaftVoteResp { term: 9, vote_granted: true });
+        roundtrip(Frame::RaftVoteResp { term: 9, vote_granted: false });
+    }
+
+    #[test]
+    fn raft_append_resp_bad_success_byte_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_APPEND_RESP);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.push(2); // not 0 or 1
+        bad.extend_from_slice(&0u64.to_le_bytes()); // match_index
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::BadOption(2))
+        ));
+    }
+
+    #[test]
+    fn raft_vote_resp_bad_granted_byte_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_VOTE_RESP);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.push(7); // not 0 or 1
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::BadOption(7))
+        ));
+    }
+
+    #[test]
+    fn raft_append_entries_count_capped() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_APPEND_REQ);
+        bad.extend_from_slice(&[0u8; REPLICATION_ID_BYTES]);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.extend_from_slice(&0u16.to_le_bytes()); // leader_prefix
+        bad.extend_from_slice(&0u64.to_le_bytes()); // prev_log_index
+        bad.extend_from_slice(&0u64.to_le_bytes()); // prev_log_term
+        bad.extend_from_slice(&0u64.to_le_bytes()); // leader_commit
+        bad.extend_from_slice(&100_000u32.to_le_bytes()); // entries count
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::RaftEntriesTooMany(100_000))
         ));
     }
 }
