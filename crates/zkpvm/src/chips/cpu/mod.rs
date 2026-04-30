@@ -945,6 +945,150 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Phase 30: DivS |r| < |d| uniqueness
+        //
+        // Phase 21 closed `r < d` for DivU; signed div needs the
+        // analogous `|r| < |d|` (the magnitude half of PVM's signed
+        // Euclidean uniqueness).  Mechanism: two's-complement
+        // conditional negation chains compute |val_d| and
+        // |div_remainder| into AbsD / AbsR (active when SignBit = 1),
+        // then a Phase-21-style `(AbsD − 1 − AbsR) ≥ 0` chain pins
+        // `|val_d| > |div_remainder|`.
+        //
+        // Conditional negation per value X (one of val_d, div_remainder):
+        //   SignBitX = 0: Abs[i] = X[i],  AbsCarry[i] = 0.
+        //   SignBitX = 1: Abs[i] + AbsCarry[i]·256 = (255 − X[i]) + carry_in
+        //                 with carry_in[0] = 1, carry_in[i>0] = AbsCarry[i-1].
+        //
+        // Out of scope (deferred): `sign(r) = sign(b)` (or r = 0) — the
+        // other half of signed Euclidean uniqueness.  Without it a
+        // prover could swap (q, r) for (q − 1, r + d) when sign(r)
+        // and sign(d) differ AND |r + d| < |d|; closing it requires a
+        // byte-wise zero-check on div_remainder analogous to Phase
+        // 29's val_d zero-check.
+        {
+            let sign_bit_d_p30 = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+            let sign_bit_r_p30 = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
+            let abs_d = crate::trace::trace_eval!(trace_eval, Column::AbsD);
+            let abs_d_carry = crate::trace::trace_eval!(trace_eval, Column::AbsDCarry);
+            let abs_r = crate::trace::trace_eval!(trace_eval, Column::AbsR);
+            let abs_r_carry = crate::trace::trace_eval!(trace_eval, Column::AbsRCarry);
+            let abs_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::AbsCmpDiff);
+            let abs_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::AbsCmpCarry);
+
+            // Booleans (gated is_real so range is forced even on
+            // non-DivS rows where the chains are dormant).
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone() * abs_d_carry[i].clone()
+                        * (E::F::one() - abs_d_carry[i].clone())
+                );
+                eval.add_constraint(
+                    is_real.clone() * abs_r_carry[i].clone()
+                        * (E::F::one() - abs_r_carry[i].clone())
+                );
+                eval.add_constraint(
+                    is_real.clone() * abs_cmp_carry[i].clone()
+                        * (E::F::one() - abs_cmp_carry[i].clone())
+                );
+            }
+
+            // Conditional negation for AbsD.
+            //   Positive (SignBitD = 0): AbsD = val_d, AbsDCarry = 0.
+            //   Negative (SignBitD = 1):
+            //     AbsD[i] + AbsDCarry[i]·256 = (255 − val_d[i]) + carry_in
+            //     with carry_in[0] = 1.
+            let f_255_p30: E::F = E::F::from(BaseField::from(255));
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone()
+                        * (E::F::one() - sign_bit_d_p30[0].clone())
+                        * (abs_d[i].clone() - val_d[i].clone())
+                );
+                eval.add_constraint(
+                    is_real.clone()
+                        * (E::F::one() - sign_bit_d_p30[0].clone())
+                        * abs_d_carry[i].clone()
+                );
+                let neg_carry_in = if i == 0 {
+                    E::F::one()
+                } else {
+                    abs_d_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_real.clone()
+                        * sign_bit_d_p30[0].clone()
+                        * (
+                            abs_d[i].clone()
+                                + abs_d_carry[i].clone() * f256.clone()
+                                - f_255_p30.clone()
+                                + val_d[i].clone()
+                                - neg_carry_in
+                        )
+                );
+            }
+
+            // Same shape for AbsR.
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone()
+                        * (E::F::one() - sign_bit_r_p30[0].clone())
+                        * (abs_r[i].clone() - div_remainder[i].clone())
+                );
+                eval.add_constraint(
+                    is_real.clone()
+                        * (E::F::one() - sign_bit_r_p30[0].clone())
+                        * abs_r_carry[i].clone()
+                );
+                let neg_carry_in = if i == 0 {
+                    E::F::one()
+                } else {
+                    abs_r_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_real.clone()
+                        * sign_bit_r_p30[0].clone()
+                        * (
+                            abs_r[i].clone()
+                                + abs_r_carry[i].clone() * f256.clone()
+                                - f_255_p30.clone()
+                                + div_remainder[i].clone()
+                                - neg_carry_in
+                        )
+                );
+            }
+
+            // Comparison chain: AbsD > AbsR  iff  (AbsD − 1 − AbsR) ≥ 0.
+            // Encoded as `AbsD + ~AbsR` (carry_in[0] = 0); top carry = 1
+            // on |val_d| > |div_remainder| rows.  Mirrors Phase 21.
+            for i in 0..WORD_SIZE {
+                let carry_in = if i == 0 {
+                    E::F::zero()
+                } else {
+                    abs_cmp_carry[i - 1].clone()
+                };
+                eval.add_constraint(
+                    is_real.clone() * (
+                        abs_cmp_diff[i].clone()
+                            + abs_cmp_carry[i].clone() * f256.clone()
+                            - abs_d[i].clone()
+                            - f_255_p30.clone()
+                            + abs_r[i].clone()
+                            - carry_in
+                    )
+                );
+            }
+
+            // Top carry forced to 1 on `is_div_s · ¬div_by_zero` rows.
+            let div_s_active_p30 = is_div_s[0].clone()
+                * (E::F::one() - div_by_zero[0].clone());
+            eval.add_constraint(
+                div_s_active_p30
+                    * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone())
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // MOVE: result = val_d
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
@@ -2454,6 +2598,19 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
+        // Phase 30: range-check AbsCmpDiff bytes via Range256.  Same
+        // pattern as Phase 21 — 8 emissions per real row, even count.
+        {
+            let abs_cmp_diff_p30 = crate::trace::trace_eval!(trace_eval, Column::AbsCmpDiff);
+            for i in 0..WORD_SIZE {
+                eval.add_to_relation(RelationEntry::new(
+                    range256_lookup,
+                    is_real.clone().into(),
+                    &[abs_cmp_diff_p30[i].clone()],
+                ));
+            }
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -3119,6 +3276,64 @@ impl BuiltInProverComponent for CpuChip {
             // can't call side_note.add_range256 inline because the loop
             // already holds an immutable borrow of side_note.steps).
             for &b in &div_cmp_diff {
+                range_bytes.push(b);
+            }
+
+            // Phase 30: |val_d| / |div_remainder| via two's-complement
+            // conditional negation, then `|val_d| > |div_remainder|`
+            // via Phase-21-shaped chain.  Active on every real row
+            // (chain forced via boolean carries to be valid even on
+            // non-DivS rows where the top-carry constraint is dormant).
+            let mut abs_d = [0u8; WORD_SIZE];
+            let mut abs_d_carry = [0u8; WORD_SIZE];
+            let mut abs_r = [0u8; WORD_SIZE];
+            let mut abs_r_carry = [0u8; WORD_SIZE];
+            let sign_d_p30: u8 = if flags.is_32bit { (val_d_bytes[3] >> 7) & 1 } else { (val_d_bytes[7] >> 7) & 1 };
+            let sign_r_p30: u8 = if flags.is_32bit { (div_remainder[3] >> 7) & 1 } else { (div_remainder[7] >> 7) & 1 };
+            // AbsD chain.
+            if sign_d_p30 == 0 {
+                abs_d.copy_from_slice(&val_d_bytes);
+            } else {
+                let mut c: u16 = 1; // +1 of two's complement
+                for i in 0..WORD_SIZE {
+                    let s = (255u16 - val_d_bytes[i] as u16) + c;
+                    abs_d[i] = (s & 0xFF) as u8;
+                    c = s >> 8;
+                    abs_d_carry[i] = c as u8;
+                }
+            }
+            // AbsR chain.
+            if sign_r_p30 == 0 {
+                abs_r.copy_from_slice(&div_remainder);
+            } else {
+                let mut c: u16 = 1;
+                for i in 0..WORD_SIZE {
+                    let s = (255u16 - div_remainder[i] as u16) + c;
+                    abs_r[i] = (s & 0xFF) as u8;
+                    c = s >> 8;
+                    abs_r_carry[i] = c as u8;
+                }
+            }
+            // Comparison chain: `AbsD > AbsR` via `(AbsD + ~AbsR)` with
+            // carry_in[0] = 0; top carry = 1 iff AbsD > AbsR.
+            let mut abs_cmp_diff = [0u8; WORD_SIZE];
+            let mut abs_cmp_carry = [0u8; WORD_SIZE];
+            {
+                let mut c: u16 = 0;
+                for i in 0..WORD_SIZE {
+                    let s = abs_d[i] as u16 + (255u16 - abs_r[i] as u16) + c;
+                    abs_cmp_diff[i] = (s & 0xFF) as u8;
+                    c = s >> 8;
+                    abs_cmp_carry[i] = c as u8;
+                }
+            }
+            trace.fill_columns_bytes(row, &abs_d, Column::AbsD);
+            trace.fill_columns_bytes(row, &abs_d_carry, Column::AbsDCarry);
+            trace.fill_columns_bytes(row, &abs_r, Column::AbsR);
+            trace.fill_columns_bytes(row, &abs_r_carry, Column::AbsRCarry);
+            trace.fill_columns_bytes(row, &abs_cmp_diff, Column::AbsCmpDiff);
+            trace.fill_columns_bytes(row, &abs_cmp_carry, Column::AbsCmpCarry);
+            for &b in &abs_cmp_diff {
                 range_bytes.push(b);
             }
             // Phase 17 / 18: SignBitQ / SignBitR are pinned to bit 7
@@ -4070,6 +4285,24 @@ impl BuiltInProverComponent for CpuChip {
                 logup.add_to_relation_with(
                     range256_p21,
                     [is_pad_col_p21[0].clone()],
+                    |[pad]| {
+                        use stwo::prover::backend::simd::m31::PackedBaseField;
+                        (PackedBaseField::one() - pad).into()
+                    },
+                    &[col.clone()],
+                );
+            }
+        }
+
+        // Phase 30: range-check AbsCmpDiff bytes via Range256.
+        {
+            let range256_p30: &Range256LookupElements = lookup_elements.as_ref();
+            let is_pad_col_p30 = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+            let abs_cmp_diff_cols = crate::trace::original_base_column!(component_trace, Column::AbsCmpDiff);
+            for col in &abs_cmp_diff_cols {
+                logup.add_to_relation_with(
+                    range256_p30,
+                    [is_pad_col_p30[0].clone()],
                     |[pad]| {
                         use stwo::prover::backend::simd::m31::PackedBaseField;
                         (PackedBaseField::one() - pad).into()

@@ -691,6 +691,48 @@ pub enum Column {
     /// to `1 − PartialNZ[7]`.
     #[size = 8]
     ValDPartialNZ,
+    // ── Phase 30: DivS |r| < |d| uniqueness ───────────────────────────────
+    // Closes the off-by-(d) attack on DivS that Phase 21 closed for DivU
+    // (see PLAN.md).  Uniqueness for signed Euclidean division
+    // (round-toward-zero, PVM convention) requires both `|r| < |d|` AND
+    // `sign(r) = sign(b)` (or r = 0).  Phase 30 implements the magnitude
+    // half; the sign-of-r constraint is deferred.
+    //
+    // Mechanism: two's-complement conditional negation chains compute
+    // |val_d| and |div_remainder| into AbsD / AbsR; then the existing
+    // Phase-21-style `(AbsD - 1 - AbsR) ≥ 0` carry chain into
+    // AbsCmpDiff / AbsCmpCarry pins `|val_d| > |div_remainder|`.
+    //
+    // For each value (val_d / div_remainder):
+    //   if SignBit = 0: Abs[i] = value[i], AbsCarry[i] = 0
+    //   if SignBit = 1: Abs[i] + AbsCarry[i]·256
+    //                     = (255 − value[i]) + carry_in
+    //                  with carry_in[0] = 1 (the +1 of two's complement)
+    /// |val_d| absolute-value bytes.
+    #[size = 8]
+    AbsD,
+    /// Per-byte carry chain for the `~val_d + 1` two's-complement
+    /// negation (active when SignBitD = 1; forced to 0 when
+    /// SignBitD = 0).  Boolean per byte.
+    #[size = 8]
+    AbsDCarry,
+    /// |div_remainder| absolute-value bytes.
+    #[size = 8]
+    AbsR,
+    /// Per-byte carry chain for the `~div_remainder + 1` negation.
+    /// Boolean per byte.
+    #[size = 8]
+    AbsRCarry,
+    /// Byte-level diff for the `AbsD > AbsR` check (mirrors
+    /// DivCmpDiff from Phase 21 but on absolute values).  Range-
+    /// checked via Range256 to pin each byte to [0, 255].
+    #[size = 8]
+    AbsCmpDiff,
+    /// Per-byte carry chain for the `AbsD > AbsR` check.  Top carry
+    /// forced to 1 on `is_div_s · ¬div_by_zero` rows.  Boolean per
+    /// byte.
+    #[size = 8]
+    AbsCmpCarry,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
