@@ -178,59 +178,28 @@ commit.
 
 ## Open soundness gaps
 
-(in roughly priority order — closing the first few has the
-biggest exposure-to-fix-cost ratio.  See
-[`PLAN.md`](./PLAN.md) for full scoping.)
+None known on the common path.  Every PVM ISA opcode reachable
+from RISC-V actor code (or from synthetic forge tests) is bound
+by an algebraic constraint or terminally constrained.  The
+items the earlier draft of this file listed have all been
+closed:
 
-### Memory (post-Phase 26)
-- **MemValue on indirect stores** — `StoreInd[U][8/16/32/64]`
-  source value (`regs[ra]`) isn't in any AIR column.  Needs a
-  new `RegValA` column with register-memory ledger producer
-  (mirrors existing `RegValB` / `RegValD`).
-- **MemValue on StoreImm / StoreImmInd** — value is `imm_y`,
-  but `ImmYBytes` is currently only filled for `TwoRegTwoImm`
-  (LoadImmJumpInd).  Needs trace fill extension to `TwoImm`
-  / `OneRegTwoImm` categories.
-- **MemAddr on direct StoreImm** — `addr = imm_x` → equivalent
-  to Phase 25's binding once `IsLoadDirect+IsStoreDirect` is
-  widened (or a new `IsStoreImmDirect` flag added).
+- Memory: MemValue on indirect stores `[28]`; MemValue on
+  StoreImm / StoreImmInd `[27]`; MemAddr on direct StoreImm
+  `[27]`.
+- Divrem: DivS `r < d` uniqueness `[30]` + sign-of-r `[31]`;
+  DivByZero binding `[29]`.
+- Sign / extension: CmovIz / CmovNz val_d_is_zero `[29]`
+  (shared byte-wise zero-check with DivByZero).
+- Rotate: RotL64 `[32]`, RotR64 + RotR64Imm `[35]`, RotL32 +
+  RotR32 + RotR32Imm `[36]`, RotR64ImmAlt + RotR32ImmAlt `[40]`.
+- BitManip: CountSetBits 32/64 `[33]`, LeadingZeroBits +
+  TrailingZeroBits 32/64 `[34]`, Sbrk-as-terminal `[41]`.
+- Smaller: 32-bit shift ShiftAmount uniqueness `[37]`;
+  is_write discriminator forge tests `[39]`.
 
-### Divrem
-- **DivS r < d uniqueness** — Phase 21 covers DivU only.
-  Signed analogue is `|r| < |d|`, requires sign-aware
-  comparison (4 sub-cases on (sd, sr) with auxiliary AbsR/AbsD
-  columns or per-case carry chains).
-- **DivByZero binding** — on `div_by_zero = 1` the schoolbook
-  bypasses but `result` is unbound.  Closing it requires
-  forcing `val_d = 0 ↔ div_by_zero = 1` (both directions:
-  `→` is one line, `←` needs byte-wise zero-check via per-byte
-  inversion witness + cumulative-OR).
-
-### Sign / extension
-- **CmovIz / CmovNz** — `val_d_is_zero` is one-direction-pinned.
-  Same fix as DivByZero (shared byte-wise zero-check
-  infrastructure would close both).
-
-### Rotate
-- (closed by Phase 40) **RotR64ImmAlt / RotR32ImmAlt** —
-  swapped-operand variants now bound via the same swapped
-  trace-fill + reg_access path described above.
-
-### BitManip
-- (closed by Phase 41) **Sbrk** — JAR v0.8.0 removed it from the
-  ISA in favour of the grow_heap hostcall, so the interpreter
-  panics on execution.  Phase 41 marks it `is_exit + is_trap`
-  so the Phase 13e-redux terminal-row constraint forbids any
-  successor real row, matching the panic-and-stop semantics.
-  No precompile needed.
-
-### Smaller
-- (closed by Phase 39) **`is_write` discriminator** on the
-  memory-access lookup — has direct forge-and-reject coverage:
-  `store_drops_mem_write_rejected` (drops the MemoryChip ledger
-  entry while the CpuChip producer still emits is_write=1) and
-  `load_injects_mem_write_rejected` (phantom write entry on a
-  Load row where IsStore=0 forces is_write=0 in the producer).
+If further gaps surface (e.g. via a forge test or a careful
+re-audit), they belong here when discovered.
 
 ## Test posture
 
