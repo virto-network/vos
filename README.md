@@ -107,9 +107,34 @@ just demo-crdt-procs
 just demo-crdt-sync
 ```
 
-The full integration suite (32 tests covering agent dispatch, CRDT
-replication, registry sync, restart determinism, panic recovery, and
-cold-bootstrap catch-up) runs with:
+### Consistency modes
+
+Each actor in `space.toml` picks a `consistency` mode:
+
+| Mode | Replication | Read-from-any-replica | Writes block on |
+|---|---|---|---|
+| `ephemeral` | none, in-memory | n/a | nothing |
+| `local` | redb on local disk | n/a | local fsync |
+| `crdt` | merkle-CRDT, eventual | yes | local commit |
+| `raft` | Raft consensus, strict | leader only (today) | quorum ack |
+
+CRDT is the right pick when state is commutative (counters, sets,
+LWW maps, append-only logs) and reads-from-anywhere matter. Raft
+is the right pick when the actor's state is strictly sequenced
+and divergence is unacceptable (a ledger, a registry of unique
+names, anything where two concurrent writers each "winning"
+locally would corrupt the model). The `Consistency` enum is
+per-actor — different actors in the same space can mix modes
+freely.
+
+Raft requires a cluster membership list (every replica's
+`node_prefix`). See `examples/space-raft.toml` for a documented
+template.
+
+The full integration suite (43 tests covering agent dispatch, CRDT
+replication, Raft election + replication + compaction +
+snapshot install, registry sync, restart determinism, panic
+recovery, and cold-bootstrap catch-up) runs with:
 
 ```bash
 cargo test --all -- --test-threads=1
