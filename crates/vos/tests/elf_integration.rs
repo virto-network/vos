@@ -3813,3 +3813,209 @@ fn raft_counter_single_node_replays_log_after_restart() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn raft_counter_three_node_replicates_state_to_all_replicas() {
+    // Phase 5 boundary: the close-the-loop test for Consistency::Raft.
+    //
+    // Three networked VosNodes register a crdt-counter with
+    // Consistency::Raft + the same `members` list + the same
+    // replication_id. Once a leader emerges, drive `inc()` on
+    // the leader. The leader's commit_with_log proposes through
+    // its RaftWorker, blocks until the entry replicates to a
+    // quorum, then writes the post-apply state. Followers receive
+    // the new commit_index, their agent threads soft-restart,
+    // replay the freshly-committed log entries through their
+    // own runtime, and arrive at the same count.
+    //
+    // The test polls every replica via `get()` until they all
+    // return the same value. That's the proof that:
+    //   1. Raft elections work over real libp2p (phase 3).
+    //   2. AppendEntries replication works (phase 4).
+    //   3. commit_with_log blocks until quorum (phase 5.1).
+    //   4. node.rs wires the worker + relay (phase 5.2).
+    //   5. Followers' actor state catches up via sync_rx-driven
+    //      soft restart — same path CRDT uses.
+    use crdt_counter::CrdtCounterClient;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_raft_e2e_{}_{}", std::process::id(), stamp,
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    let dir_c = dir_root.join("c");
+    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"raft-crdt-counter");
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // ── Three Networks meshed via explicit dial-out. ──────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let kp_c = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let prefix_c = derive_node_prefix(&libp2p::PeerId::from(kp_c.public()));
+    if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_listen
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+    });
+    let b_listen = wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_b binds");
+    let b_dial: libp2p::Multiaddr = b_listen
+        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+    let net_c = Network::start(NetworkConfig {
+        keypair: kp_c, local_prefix: prefix_c,
+        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+    });
+
+    // ── Three VosNodes. ──────────────────────────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.attach_network(net_a);
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.attach_network(net_b);
+    let mut node_c = VosNode::with_prefix(prefix_c);
+    node_c.attach_network(net_c);
+
+    // Wait for the Hello triangle so the workers can find each
+    // other when register() spawns them.
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    let net_c_arc = node_c.network().expect("net_c");
+    wait_for(|| {
+        let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
+              && net_b_arc.peer_for_prefix(prefix_a).is_some();
+        let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
+              && net_c_arc.peer_for_prefix(prefix_a).is_some();
+        let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
+              && net_c_arc.peer_for_prefix(prefix_b).is_some();
+        (ab && ac && bc).then_some(())
+    }, Duration::from_secs(15)).expect("Hello triangle");
+
+    // Register the actor on every node.
+    let members = vec![prefix_a, prefix_b, prefix_c];
+    let counter_a = node_a.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(rep_id)
+            .persist(&dir_a),
+    );
+    let counter_b = node_b.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(rep_id)
+            .persist(&dir_b),
+    );
+    let counter_c = node_c.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(members)
+            .with_replication_id(rep_id)
+            .persist(&dir_c),
+    );
+
+    // ── Drive 3 inc()s with leader-retry. ────────────────────
+    // Followers refuse `commit_with_log` because their RaftCommit
+    // reports `NotLeader`. The macro-Client surfaces that as
+    // `Unreachable`. Leadership may also flip between successive
+    // inc() calls (election timer races), so each call does its
+    // own search across replicas.
+    let counters = [
+        (&node_a, counter_a),
+        (&node_b, counter_b),
+        (&node_c, counter_c),
+    ];
+    let try_inc = |tag: u32| -> bool {
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            for (node, id) in counters.iter() {
+                let client = CrdtCounterClient::at(*node, *id);
+                if client.inc(tag).is_ok() {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= until { return false; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert!(try_inc(1), "first inc must land on a leader");
+    assert!(try_inc(2), "second inc must land");
+    assert!(try_inc(3), "third inc must land");
+
+    // ── Wait for all three replicas to converge on count=3. ──
+    // The leader's commit_with_log already blocked on quorum,
+    // so by the time inc(3) returned the entry is committed
+    // cluster-wide. Followers process the apply notification on
+    // their next inbox poll (≤50 ms typically) and run
+    // soft_restart to replay the freshly-committed entries into
+    // their actor state.
+    let read_count = |node: &VosNode, id: ServiceId| -> Option<u64> {
+        CrdtCounterClient::at(node, id).get().ok()
+    };
+    let final_a = wait_for(
+        || (read_count(&node_a, counter_a) == Some(3)).then_some(3u64),
+        Duration::from_secs(15),
+    );
+    let final_b = wait_for(
+        || (read_count(&node_b, counter_b) == Some(3)).then_some(3u64),
+        Duration::from_secs(15),
+    );
+    let final_c = wait_for(
+        || (read_count(&node_c, counter_c) == Some(3)).then_some(3u64),
+        Duration::from_secs(15),
+    );
+    assert_eq!(final_a, Some(3),
+        "node A should converge to 3; last={:?}", read_count(&node_a, counter_a));
+    assert_eq!(final_b, Some(3),
+        "node B should converge to 3; last={:?}", read_count(&node_b, counter_b));
+    assert_eq!(final_c, Some(3),
+        "node C should converge to 3; last={:?}", read_count(&node_c, counter_c));
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = node_c.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}

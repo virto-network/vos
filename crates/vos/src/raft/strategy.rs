@@ -364,6 +364,18 @@ impl CommitStrategy for RaftCommit {
         // heartbeat path (AppendEntries with no entries, phase 4).
         Vec::new()
     }
+
+    fn is_writable(&self) -> bool {
+        match &self.role {
+            // Single-node mode is always writable — the agent
+            // is the only participant, no leadership to lose.
+            Role::SingleNode => true,
+            // Multi mode: writable iff this replica is currently
+            // the leader. Lock-free atomic read — doesn't bounce
+            // through the worker's mpsc inbox.
+            Role::Multi { worker, .. } => worker.role() == super::worker::Role::Leader,
+        }
+    }
 }
 
 fn read_state(db: &Database) -> Result<Option<Vec<u8>>, CommitError> {

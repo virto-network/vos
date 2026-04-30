@@ -136,6 +136,16 @@ pub trait CommitStrategy: Send {
     fn roots(&self) -> Vec<[u8; 32]> {
         Vec::new()
     }
+
+    /// Can this strategy currently accept new state-changing
+    /// dispatches? `false` means the agent thread should refuse
+    /// the invoke before running it (drop the reply channel so
+    /// the caller sees a transport-shaped failure) — typical for
+    /// a Raft replica that isn't currently the leader. Default:
+    /// `true` (every other strategy is always writable).
+    fn is_writable(&self) -> bool {
+        true
+    }
 }
 
 /// No-op strategy — state lives only in memory and is lost on exit.

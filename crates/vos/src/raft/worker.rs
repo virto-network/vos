@@ -31,6 +31,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -58,10 +59,25 @@ const VOTE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Follower,
-    #[allow(dead_code)]
     Candidate,
-    #[allow(dead_code)]
     Leader,
+}
+
+impl Role {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Follower => 0,
+            Self::Candidate => 1,
+            Self::Leader => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Candidate,
+            2 => Self::Leader,
+            _ => Self::Follower,
+        }
+    }
 }
 
 /// Configuration for a worker.
@@ -188,6 +204,11 @@ pub struct WorkerSnapshot {
 /// up the thread.
 pub struct RaftWorker {
     inbox: std_mpsc::Sender<RaftMsg>,
+    /// Atomic mirror of the worker's current role. Updated in
+    /// `WorkerState` on every transition; read by `WorkerHandle::role()`
+    /// for lock-free leader checks (the mpsc-based snapshot path
+    /// would race with a busy inbox).
+    role: Arc<AtomicU8>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -211,18 +232,21 @@ impl RaftWorker {
     ) -> Self {
         let (tx, rx) = std_mpsc::channel();
         let inbox_tx = tx.clone();
+        let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
+        let role_for_thread = role.clone();
         let join = thread::Builder::new()
             .name(alloc::format!("raft-worker-{:04x}", cfg.me))
             .spawn(move || {
-                if let Err(e) =
-                    worker_loop(db, cfg, network, rx, inbox_tx, apply_notifier)
-                {
+                if let Err(e) = worker_loop(
+                    db, cfg, network, rx, inbox_tx, apply_notifier, role_for_thread,
+                ) {
                     warn!(error = ?e, "raft: worker exited with error");
                 }
             })
             .expect("spawn raft worker");
         Self {
             inbox: tx,
+            role,
             join: Some(join),
         }
     }
@@ -233,7 +257,13 @@ impl RaftWorker {
     pub fn handler(&self) -> WorkerHandle {
         WorkerHandle {
             inbox: self.inbox.clone(),
+            role: self.role.clone(),
         }
+    }
+
+    /// Lock-free read of the worker's current role.
+    pub fn role(&self) -> Role {
+        Role::from_u8(self.role.load(Ordering::Relaxed))
     }
 
     /// Stop the worker and join the thread.
@@ -261,6 +291,15 @@ impl Drop for RaftWorker {
 #[derive(Clone)]
 pub struct WorkerHandle {
     inbox: std_mpsc::Sender<RaftMsg>,
+    role: Arc<AtomicU8>,
+}
+
+impl WorkerHandle {
+    /// Lock-free read of the worker's current role. Doesn't go
+    /// through the inbox so a busy worker doesn't lag the answer.
+    pub fn role(&self) -> Role {
+        Role::from_u8(self.role.load(Ordering::Relaxed))
+    }
 }
 
 impl RaftRpcHandler for WorkerHandle {
@@ -390,6 +429,10 @@ struct WorkerState {
     /// at most one (set at spawn time); a future multi-subscriber
     /// model would extend this to a Vec.
     apply_notifier: Option<std_mpsc::Sender<u64>>,
+    /// Mirror of `role` shared with `RaftWorker` / `WorkerHandle`
+    /// so external readers (e.g. `RaftCommit::is_writable`) don't
+    /// have to bounce through the inbox.
+    role_atomic: Arc<AtomicU8>,
 }
 
 /// Per-follower replication bookkeeping. Initialized when a
@@ -435,6 +478,7 @@ impl WorkerState {
         network: Option<Arc<Network>>,
         inbox_tx: std_mpsc::Sender<RaftMsg>,
         apply_notifier: Option<std_mpsc::Sender<u64>>,
+        role_atomic: Arc<AtomicU8>,
     ) -> Result<Self, crate::commit::CommitError> {
         let log = RaftLog::open(db.clone())?;
         let meta = RaftMeta::load(&db)?;
@@ -450,9 +494,21 @@ impl WorkerState {
             votes_received: alloc::collections::BTreeSet::new(),
             leader: None,
             apply_notifier,
+            role_atomic,
         };
         s.reset_election_timer();
+        s.publish_role();
         Ok(s)
+    }
+
+    fn publish_role(&self) {
+        self.role_atomic
+            .store(self.role.as_u8(), Ordering::Relaxed);
+    }
+
+    fn set_role(&mut self, role: Role) {
+        self.role = role;
+        self.publish_role();
     }
 
     fn fire_apply_notification(&self) {
@@ -526,8 +582,10 @@ fn worker_loop(
     inbox: std_mpsc::Receiver<RaftMsg>,
     inbox_tx: std_mpsc::Sender<RaftMsg>,
     apply_notifier: Option<std_mpsc::Sender<u64>>,
+    role_atomic: Arc<AtomicU8>,
 ) -> Result<(), crate::commit::CommitError> {
-    let mut state = WorkerState::open(db, cfg, network, inbox_tx, apply_notifier)?;
+    let mut state =
+        WorkerState::open(db, cfg, network, inbox_tx, apply_notifier, role_atomic)?;
     debug!(me = state.cfg.me, "raft: worker started in Follower role");
 
     loop {
@@ -646,7 +704,7 @@ fn handle_append_entries(
     // or a stale Leader at a lower term). Reset the election
     // timer regardless of the consistency check below — the
     // sender *is* the legitimate leader for this term.
-    state.role = Role::Follower;
+    state.set_role(Role::Follower);
     state.votes_received.clear();
     state.reset_election_timer();
 
@@ -840,7 +898,7 @@ fn handle_vote_response(
 /// immediate replication tick so followers' election timers reset
 /// before they can challenge us.
 fn become_leader(state: &mut WorkerState) {
-    state.role = Role::Leader;
+    state.set_role(Role::Leader);
     state.votes_received.clear();
     let last = state.log.last_index();
     state.leader = Some(LeaderState::fresh(&state.cfg.members, state.cfg.me, last));
@@ -851,7 +909,7 @@ fn become_leader(state: &mut WorkerState) {
 /// transient role state (vote tally, per-follower bookkeeping)
 /// and resets the election timer.
 fn step_down(state: &mut WorkerState) {
-    state.role = Role::Follower;
+    state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
     state.reset_election_timer();
@@ -1061,7 +1119,7 @@ fn handle_propose(state: &mut WorkerState, payload: Vec<u8>) -> Result<u64, Prop
 }
 
 fn start_election(state: &mut WorkerState) -> Result<(), crate::commit::CommitError> {
-    state.role = Role::Candidate;
+    state.set_role(Role::Candidate);
     state.meta.current_term += 1;
     state.meta.voted_for = Some(state.cfg.me);
     state.persist_meta()?;

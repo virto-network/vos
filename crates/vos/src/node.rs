@@ -1698,7 +1698,10 @@ fn agent_thread(
 
     // Queue initial payloads. When no init payloads are supplied we
     // still kick the actor with an empty envelope so `on_start`
-    // fires — matches the pre-refactor behaviour.
+    // fires — matches the pre-refactor behaviour. On a Raft
+    // follower the commit_with_log triggered by on_start will
+    // return NotLeader, and the inbox-loop's commit-fail handler
+    // soft-restarts the runtime to bring it back in sync.
     let mut pending: VecDeque<Vec<u8>> = config.init_payloads.into_iter().collect();
     if pending.is_empty() {
         pending.push_back(Vec::new());
@@ -1787,8 +1790,17 @@ fn agent_thread(
             // that produced it.
             if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
                 strategy.as_mut(), recording_enabled) {
-                fatal_error = Some(format!("commit failed during residual work: {e}"));
-                break;
+                // On a Raft follower the commit can return
+                // NotLeader. Log, soft-restart to bring the runtime
+                // back in sync, continue. CRDT failures are still
+                // unexpected but the same recovery applies.
+                warn!(%id, error = %e, "residual-work commit failed; soft-restarting");
+                #[cfg(all(feature = "network", feature = "storage"))]
+                if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {
+                    fatal_error = Some(format!("residual soft restart: {restart_err}"));
+                    break;
+                }
+                continue;
             }
             #[cfg(all(feature = "network", feature = "storage"))]
             publish_heads_if_replicated(
@@ -1810,8 +1822,18 @@ fn agent_thread(
         };
         if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
             strategy.as_mut(), recording_enabled) {
-            fatal_error = Some(format!("commit failed: {e}"));
-            break;
+            // Tell-style dispatch on a follower will return
+            // NotLeader. Soft-restart and continue rather than
+            // killing the agent; the message is effectively
+            // dropped (which is OK — clients should target the
+            // leader).
+            warn!(%id, error = %e, "tell-style commit failed; soft-restarting");
+            #[cfg(all(feature = "network", feature = "storage"))]
+            if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {
+                fatal_error = Some(format!("soft restart: {restart_err}"));
+                break;
+            }
+            continue;
         }
         #[cfg(all(feature = "network", feature = "storage"))]
         publish_heads_if_replicated(
@@ -1880,31 +1902,51 @@ fn handle_invoke_request(
         });
     }
 
-    // Send the raw reply, or signal a panic by dropping
-    // `reply_tx` so the caller's `recv_timeout` returns
-    // `Err(Disconnected)` (mapped to `None` at the boundary
-    // and surfaced as `ClientError::Unreachable` /
-    // `InvokeError::Panicked` upstream). The runtime
-    // distinguishes "handler ran to completion and returned
-    // `()`" from "handler panicked" by whether
-    // `take_last_reply` returns `Some(_)` (possibly empty,
-    // for unit replies) vs `None` (panic).
-    match runtime.take_last_reply(svc_id) {
-        Some(bytes) => send_reply_capped(req.reply_tx, bytes, svc_id),
-        None => drop(req.reply_tx),
-    }
-
-    // Persist whatever state changed (same path as a regular dispatch).
+    // Persist before replying. If the commit fails (e.g. Raft
+    // `NotLeader` because we lost leadership between dispatch
+    // and commit), we drop the reply so the caller sees
+    // `Unreachable` and can retry against the new leader. Doing
+    // it in this order means the client only sees success when
+    // the state is durable.
     let state = runtime
         .storage
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
-    if recording_enabled {
+    let commit_result = if recording_enabled {
         let log = runtime.finish_recording().expect("recording was started");
-        strategy.commit_with_log(&state, &log)?;
+        strategy.commit_with_log(&state, &log)
     } else if !state.is_empty() {
-        strategy.commit(&state)?;
+        strategy.commit(&state)
+    } else {
+        Ok(())
+    };
+
+    if let Err(e) = commit_result {
+        // Drop the reply (caller surfaces `Unreachable`) and
+        // soft-restart to bring the runtime back in sync with
+        // the durable log. Don't bubble the error — a transient
+        // `NotLeader` shouldn't kill the agent thread.
+        warn!(%svc_id, error = %e, "commit failed; soft-restarting and dropping reply");
+        drop(req.reply_tx);
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Err(restart_err) = soft_restart_crdt(runtime, svc_id, strategy) {
+            error!(%svc_id, "soft restart after commit failure: {restart_err}");
+        }
+        return Ok(());
+    }
+
+    // Commit succeeded. Send the raw reply, or signal a panic
+    // by dropping `reply_tx` so the caller's `recv_timeout`
+    // returns `Err(Disconnected)` (mapped to `None` at the
+    // boundary and surfaced as `ClientError::Unreachable` /
+    // `InvokeError::Panicked` upstream). The runtime
+    // distinguishes "handler ran to completion and returned `()`"
+    // from "handler panicked" by whether `take_last_reply`
+    // returns `Some(_)` (possibly empty) vs `None` (panic).
+    match runtime.take_last_reply(svc_id) {
+        Some(bytes) => send_reply_capped(req.reply_tx, bytes, svc_id),
+        None => drop(req.reply_tx),
     }
     Ok(())
 }
