@@ -223,15 +223,22 @@ biggest exposure-to-fix-cost ratio.  See
 
 - **Direct soundness tests** — every `*_negative.rs` suite has
   forge-the-result tests for the corresponding op family
-  (alu, control_flow, memory, register ledger).
-- **Coverage caveat**: the `forge_three_reg_result` helper only
-  mutates `step.regs_after[rd]`.  Forgery on auxiliary columns
+  (alu, control_flow, memory, register ledger).  Phase 38
+  extended coverage to every Phase-32–36 BitManip and rotate
+  opcode (CountSetBits 32/64, LeadingZeroBits 32/64,
+  TrailingZeroBits 64, RotL/R 32/64, RotR64 wraparound).
+- **Coverage caveat**: the `forge_three_reg_result` /
+  `forge_two_reg_result` helpers only mutate
+  `step.regs_after[rd]`.  Forgery on auxiliary witness columns
   (e.g. directly mutating `SignBitB` while keeping val_b honest,
   forge `q' = q − 1, r' = r + d` on DivU, …) requires a
   column-level mutator the test harness doesn't currently
   provide — in those cases the regression sweep being green is
   the practical "doesn't break" signal, while the constraint's
   own integer-vs-field analysis is the soundness argument.
+  Note that `forge_step_field` does cover step-level mutation
+  (opcode, reg_a/b/d, imm, skip_len) used in the bitmanip suite
+  for Phase 13b/13c authentication tests.
 - **Performance baseline**: `prove_vos_actor` proves real RISC-V
   actor binaries (blake2b ECALL, fibonacci, hash benches) in
   ~5 min on a modern x86 desktop.

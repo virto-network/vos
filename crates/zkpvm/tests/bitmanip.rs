@@ -213,3 +213,125 @@ fn forged_opcode_to_different_category_rejected() {
         s.opcode = Opcode::MoveReg;
     });
 }
+
+// ── Phase 33: CountSetBits forge tests ─────────────────────────────────────
+
+#[test]
+fn prove_count_set_bits_64() {
+    prove_two_reg(
+        Opcode::CountSetBits64, 2, 3,
+        0x0F0F_0F0F_0F0F_0F0F, // 32 ones
+        32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn count_set_bits_64_forged_count_rejected() {
+    forge_two_reg_result(
+        Opcode::CountSetBits64, 2, 3,
+        0x0F0F_0F0F_0F0F_0F0F,
+        31, // honest count is 32; forge to 31
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn count_set_bits_64_forged_high_byte_rejected() {
+    // Result high bytes must be 0; forge byte 1 to 1 → rejected.
+    forge_two_reg_result(
+        Opcode::CountSetBits64, 2, 3,
+        0x0F0F_0F0F_0F0F_0F0F,
+        32 | (1u64 << 8), // result[1] = 1
+    );
+}
+
+#[test]
+fn prove_count_set_bits_32() {
+    // High 32 bits ignored; low 32 = 0xFF → 8 ones.
+    prove_two_reg(
+        Opcode::CountSetBits32, 2, 3,
+        0xFFFF_FFFF_0000_00FF,
+        8,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn count_set_bits_32_forged_count_rejected() {
+    forge_two_reg_result(
+        Opcode::CountSetBits32, 2, 3,
+        0xFFFF_FFFF_0000_00FF,
+        9, // honest count is 8
+    );
+}
+
+// ── Phase 34: LeadingZeroBits / TrailingZeroBits forge tests ──────────────
+
+#[test]
+fn prove_leading_zero_bits_64() {
+    prove_two_reg(
+        Opcode::LeadingZeroBits64, 2, 3,
+        0x0000_0000_0001_0000, // bit 16 set → 47 leading zeros
+        47,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn leading_zero_bits_64_forged_count_rejected() {
+    forge_two_reg_result(
+        Opcode::LeadingZeroBits64, 2, 3,
+        0x0000_0000_0001_0000,
+        48,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn leading_zero_bits_64_forged_zero_input_rejected() {
+    // val_d = 0 → result must be 64; forge to 0.
+    forge_two_reg_result(
+        Opcode::LeadingZeroBits64, 2, 3,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn prove_trailing_zero_bits_64() {
+    prove_two_reg(
+        Opcode::TrailingZeroBits64, 2, 3,
+        0x0000_0000_0010_0000, // bit 20 set → 20 trailing zeros
+        20,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn trailing_zero_bits_64_forged_count_rejected() {
+    forge_two_reg_result(
+        Opcode::TrailingZeroBits64, 2, 3,
+        0x0000_0000_0010_0000,
+        21,
+    );
+}
+
+#[test]
+fn prove_leading_zero_bits_32_zero_low() {
+    prove_two_reg(
+        Opcode::LeadingZeroBits32, 2, 3,
+        0xFFFF_FFFF_0000_0000, // low 32 = 0 → result 32
+        32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn leading_zero_bits_32_forged_count_rejected() {
+    forge_two_reg_result(
+        Opcode::LeadingZeroBits32, 2, 3,
+        0xFFFF_FFFF_0000_0000,
+        16, // honest count is 32 (low 32 are zero)
+    );
+}

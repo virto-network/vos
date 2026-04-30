@@ -567,3 +567,84 @@ fn load_imm_forged_result_rejected() {
     steps[0].regs_after[2] = 99; // forge — `result = val_d = imm` should reject
     prove_and_verify(steps, &code, &bitmask);
 }
+
+// ── Phase 32 / 35 / 36: Rotate forge tests ─────────────────────────────────
+
+#[test]
+fn rotate_l64_positive_smoke() {
+    // 0x1 rotate-left 1 = 0x2.
+    prove_three_reg(Opcode::RotL64, 2, 0, 1, 0x1, 1, 0x2);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rotate_l64_forged_result_rejected() {
+    // Honest: 0x1 rotate-left 1 = 0x2.  Forge: claim 0x4.
+    forge_three_reg_result(Opcode::RotL64, 2, 0, 1, 0x1, 1, /*forged*/ 0x4);
+}
+
+#[test]
+fn rotate_r64_positive_smoke() {
+    // 0x2 rotate-right 1 = 0x1.
+    prove_three_reg(Opcode::RotR64, 2, 0, 1, 0x2, 1, 0x1);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rotate_r64_forged_result_rejected() {
+    // Honest: 0x2 rotate-right 1 = 0x1.  Forge: claim 0x4 (would be RotL).
+    forge_three_reg_result(Opcode::RotR64, 2, 0, 1, 0x2, 1, /*forged*/ 0x4);
+}
+
+#[test]
+fn rotate_r64_wraparound_positive() {
+    // 0x1 rotate-right 1 → 0x8000_0000_0000_0000 (LSB wraps to MSB).
+    prove_three_reg(
+        Opcode::RotR64, 2, 0, 1,
+        0x1, 1,
+        0x8000_0000_0000_0000,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rotate_r64_wraparound_forged_result_rejected() {
+    forge_three_reg_result(
+        Opcode::RotR64, 2, 0, 1,
+        0x1, 1,
+        /*forged*/ 0x8000_0000_0000_0001,
+    );
+}
+
+#[test]
+fn rotate_l32_positive_smoke() {
+    // 0x12345678 rotate-left 8 = 0x34567812 (sign-extended to u64).
+    let a: u32 = 0x1234_5678;
+    let expected = ((a.rotate_left(8) as i32) as i64) as u64;
+    prove_three_reg(Opcode::RotL32, 2, 0, 1, a as u64, 8, expected);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rotate_l32_forged_result_rejected() {
+    let a: u32 = 0x1234_5678;
+    let honest = ((a.rotate_left(8) as i32) as i64) as u64;
+    let forged = honest ^ 0x1; // flip a bit
+    forge_three_reg_result(Opcode::RotL32, 2, 0, 1, a as u64, 8, forged);
+}
+
+#[test]
+fn rotate_r32_positive_smoke() {
+    let a: u32 = 0x1234_5678;
+    let expected = ((a.rotate_right(8) as i32) as i64) as u64;
+    prove_three_reg(Opcode::RotR32, 2, 0, 1, a as u64, 8, expected);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rotate_r32_forged_result_rejected() {
+    let a: u32 = 0x1234_5678;
+    let honest = ((a.rotate_right(8) as i32) as i64) as u64;
+    let forged = honest ^ 0x1;
+    forge_three_reg_result(Opcode::RotR32, 2, 0, 1, a as u64, 8, forged);
+}

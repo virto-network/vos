@@ -182,17 +182,23 @@ demand from a benchmark / actor.
 
 ### Negative tests via column-level mutator
 
-Several phases (17, 18, 21, 22, 24) note "indirect coverage" —
-the AIR's regression sweep proves the constraint is satisfied on
-honest traces, but a *direct* "forge column X to a wrong value"
-test would require a column-level mutator the test harness
-doesn't currently expose.
+Phase 38 added forge-the-result tests for every Phase-32–36
+BitManip and rotate opcode (CountSetBits 32/64,
+LeadingZeroBits 32/64, TrailingZeroBits 64, RotL/R 32/64,
+RotR64 wraparound).  These exercise the result-binding
+constraints via `forge_two_reg_result` / `forge_three_reg_result`.
 
-Adding a `forge_column` helper to `tests/common/mod.rs` (mutate a
-specific column at a specific row before proving) would let every
-existing phase add explicit forge-and-reject tests.  ~30 lines of
-infra; closes the "pin + forge test" symmetry across the 7+
-phases that currently rely on indirect coverage.
+A *true* column-level mutator (forge `SignBitB` while keeping
+val_b honest, forge `q' = q − 1, r' = r + d` on DivU, …)
+would require exposing the prover's main-trace generation hook
+so a test can mutate a single Column at a specific row before
+finalizing.  Still deferred — implementing it would mean either
+(a) splitting `prove` into a `generate_main_trace` step + a
+`prove_from_trace` step, or (b) adding a back-door
+`generate_main_trace_with_mutator` API.  Both are tractable
+~50 LoC changes but no soundness gap depends on this alone:
+all the tested constraints are bound to result columns that
+forge-the-result already exercises.
 
 ### Documentation upkeep
 
