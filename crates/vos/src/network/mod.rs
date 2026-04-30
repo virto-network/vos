@@ -32,7 +32,7 @@
 mod codec;
 mod wire;
 
-pub use wire::{Frame, FrameError, MAX_FRAME_BYTES};
+pub use wire::{Frame, FrameError, RaftEntry, MAX_FRAME_BYTES};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,6 +104,58 @@ pub trait SyncProvider: Send + Sync {
     fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>>;
 }
 
+/// Inbound result from an [`AppendEntries`](Frame::RaftAppendReq)
+/// RPC, returned by [`RaftRpcHandler::append_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftAppendResult {
+    pub term: u64,
+    pub success: bool,
+    pub match_index: u64,
+}
+
+/// Inbound result from a [`RequestVote`](Frame::RaftVoteReq) RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftVoteResult {
+    pub term: u64,
+    pub vote_granted: bool,
+}
+
+/// Local handler for inbound Raft RPCs. Mirrors [`SyncProvider`]'s
+/// shape: the swarm thread invokes the trait methods on its current-
+/// thread runtime, so implementations must be fast. Any redb writes
+/// implied by an `append_entries` call should be funnelled through
+/// the handler's own background task; the trait returns synchronously
+/// only the *response* the peer sees.
+pub trait RaftRpcHandler: Send + Sync {
+    /// Inbound `AppendEntries` from `from_prefix`. Returns the
+    /// response the peer will read. Implementations are responsible
+    /// for log consistency checks, term updates, applying entries,
+    /// and any local persistence — the network layer just delivers
+    /// the call and ferries the answer back.
+    fn append_entries(
+        &self,
+        replication_id: &[u8; 32],
+        from_prefix: u16,
+        term: u64,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    ) -> RaftAppendResult;
+
+    /// Inbound `RequestVote` from `from_prefix`. Returns the
+    /// response. Implementations are responsible for the
+    /// up-to-date check and the at-most-one-vote-per-term rule.
+    fn request_vote(
+        &self,
+        replication_id: &[u8; 32],
+        from_prefix: u16,
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> RaftVoteResult;
+}
+
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
 /// frames flow in. Cheap to clone — owned by both the swarm
 /// thread and any [`Network`] callers that want to look up a
@@ -132,6 +184,11 @@ pub struct Network {
     /// Read by the swarm thread on every inbound `FetchHeads` /
     /// `FetchNode` to look up the local replica.
     sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    /// Set via [`set_raft_handler`](Self::set_raft_handler).
+    /// Read by the swarm thread on every inbound
+    /// `RaftAppendReq` / `RaftVoteReq` to dispatch into the
+    /// local Raft state machine.
+    raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -199,6 +256,30 @@ enum NetworkCmd {
         replication_id: [u8; 32],
         sender: std_mpsc::Sender<PeerId>,
     },
+    /// Send a Raft `AppendEntries` RPC to a specific peer. Reply
+    /// channel yields `RaftAppendResult` on success; dropped on
+    /// transport failure (caller's recv yields `Disconnected`).
+    SendRaftAppend {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+        reply: std_mpsc::Sender<RaftAppendResult>,
+    },
+    /// Send a Raft `RequestVote` RPC to a specific peer.
+    SendRaftVote {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+        reply: std_mpsc::Sender<RaftVoteResult>,
+    },
     Shutdown,
 }
 
@@ -207,6 +288,8 @@ enum OutboundReply {
     Invoke(std_mpsc::Sender<Vec<u8>>),
     Heads(std_mpsc::Sender<Vec<[u8; 32]>>),
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
+    RaftAppend(std_mpsc::Sender<RaftAppendResult>),
+    RaftVote(std_mpsc::Sender<RaftVoteResult>),
 }
 
 impl Network {
@@ -220,6 +303,8 @@ impl Network {
             Arc::new(Mutex::new(None));
         let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> =
             Arc::new(Mutex::new(None));
+        let raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>> =
+            Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
@@ -227,6 +312,7 @@ impl Network {
         let listen_addrs_for_thread = listen_addrs.clone();
         let invoke_dispatcher_for_thread = invoke_dispatcher.clone();
         let sync_provider_for_thread = sync_provider.clone();
+        let raft_handler_for_thread = raft_handler.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -246,6 +332,7 @@ impl Network {
                 inbox_tx,
                 invoke_dispatcher_for_thread,
                 sync_provider_for_thread,
+                raft_handler_for_thread,
             ));
         });
 
@@ -258,6 +345,7 @@ impl Network {
             inbox_rx: Mutex::new(Some(inbox_rx)),
             invoke_dispatcher,
             sync_provider,
+            raft_handler,
             join: Some(join),
         }
     }
@@ -279,6 +367,70 @@ impl Network {
         if let Ok(mut g) = self.sync_provider.lock() {
             *g = Some(provider);
         }
+    }
+
+    /// Install the handler used to answer inbound `RaftAppendReq` /
+    /// `RaftVoteReq` frames against the local Raft state machine.
+    /// Without it, peers asking us to append entries or vote get
+    /// no reply (the channel times out or surfaces as a transport
+    /// error to the caller).
+    pub fn set_raft_handler(&self, handler: Arc<dyn RaftRpcHandler>) {
+        if let Ok(mut g) = self.raft_handler.lock() {
+            *g = Some(handler);
+        }
+    }
+
+    /// Send a Raft `AppendEntries` RPC to a specific peer. Receiver
+    /// yields `RaftAppendResult`; on transport failure the Sender
+    /// is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raft_append(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    ) -> std_mpsc::Receiver<RaftAppendResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftAppend {
+            target_peer,
+            replication_id,
+            term,
+            leader_prefix,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            entries,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a Raft `RequestVote` RPC to a specific peer.
+    pub fn send_raft_vote(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> std_mpsc::Receiver<RaftVoteResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftVote {
+            target_peer,
+            replication_id,
+            term,
+            candidate_prefix,
+            last_log_index,
+            last_log_term,
+            reply: tx,
+        });
+        rx
     }
 
     /// Ask a peer for the current root CIDs of a replication
@@ -484,6 +636,7 @@ async fn network_main(
     inbox_tx: std_mpsc::Sender<InboundTell>,
     invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -545,6 +698,7 @@ async fn network_main(
                     &mut outbound_replies,
                     &invoke_dispatcher,
                     &sync_provider,
+                    &raft_handler,
                     &response_tx,
                     &hint_senders,
                 );
@@ -635,6 +789,56 @@ async fn network_main(
                     Some(NetworkCmd::RegisterHintSender { replication_id, sender }) => {
                         hint_senders.insert(replication_id, sender);
                     }
+                    Some(NetworkCmd::SendRaftAppend {
+                        target_peer,
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                        entries,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftAppendReq {
+                            replication_id,
+                            term,
+                            leader_prefix,
+                            prev_log_index,
+                            prev_log_term,
+                            leader_commit,
+                            entries,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftAppend(reply));
+                        debug!(%target_peer, term, "network: sent RaftAppend");
+                    }
+                    Some(NetworkCmd::SendRaftVote {
+                        target_peer,
+                        replication_id,
+                        term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftVoteReq {
+                            replication_id,
+                            term,
+                            candidate_prefix,
+                            last_log_index,
+                            last_log_term,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftVote(reply));
+                        debug!(%target_peer, term, "network: sent RaftVote");
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
@@ -722,6 +926,7 @@ fn handle_swarm_event(
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    raft_handler: &Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
@@ -771,7 +976,8 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(VosBehaviourEvent::ReqResp(rr_event)) => {
             handle_req_resp(
                 swarm, rr_event, local_prefix, prefix_map, inbox,
-                outbound_replies, invoke_dispatcher, sync_provider, response_tx,
+                outbound_replies, invoke_dispatcher, sync_provider,
+                raft_handler, response_tx,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {
@@ -790,6 +996,7 @@ fn handle_req_resp(
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    raft_handler: &Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -861,6 +1068,97 @@ fn handle_req_resp(
                             .req_resp
                             .send_response(channel, Frame::NodeReply { node });
                     }
+                    Frame::RaftAppendReq {
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                        entries,
+                    } => {
+                        // Hand off to a blocking task: handlers may
+                        // do redb writes (append entries, advance
+                        // last_applied), which would park the
+                        // current_thread runtime if awaited inline.
+                        // Same shape used by InvokeRequest above.
+                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.append_entries(
+                                    &replication_id,
+                                    leader_prefix,
+                                    term,
+                                    prev_log_index,
+                                    prev_log_term,
+                                    leader_commit,
+                                    entries,
+                                ),
+                                None => {
+                                    warn!(
+                                        leader_prefix,
+                                        "network: inbound RaftAppendReq with no handler; \
+                                         replying with success=false",
+                                    );
+                                    RaftAppendResult {
+                                        term,
+                                        success: false,
+                                        match_index: 0,
+                                    }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftAppendResp {
+                                    term: resp.term,
+                                    success: resp.success,
+                                    match_index: resp.match_index,
+                                },
+                            ));
+                        });
+                    }
+                    Frame::RaftVoteReq {
+                        replication_id,
+                        term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                    } => {
+                        // Vote logic touches redb (writes voted_for /
+                        // current_term), so dispatch on a blocking task.
+                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.request_vote(
+                                    &replication_id,
+                                    candidate_prefix,
+                                    term,
+                                    last_log_index,
+                                    last_log_term,
+                                ),
+                                None => {
+                                    warn!(
+                                        candidate_prefix,
+                                        "network: inbound RaftVoteReq with no handler; \
+                                         replying vote_granted=false",
+                                    );
+                                    RaftVoteResult {
+                                        term,
+                                        vote_granted: false,
+                                    }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftVoteResp {
+                                    term: resp.term,
+                                    vote_granted: resp.vote_granted,
+                                },
+                            ));
+                        });
+                    }
                     other => {
                         warn!(%peer, ?other, "network: unexpected frame in request slot");
                         let _ = swarm
@@ -887,6 +1185,22 @@ fn handle_req_resp(
                     }
                     (Frame::NodeReply { node }, Some(OutboundReply::Node(tx))) => {
                         let _ = tx.send(node);
+                    }
+                    (
+                        Frame::RaftAppendResp { term, success, match_index },
+                        Some(OutboundReply::RaftAppend(tx)),
+                    ) => {
+                        let _ = tx.send(RaftAppendResult {
+                            term,
+                            success,
+                            match_index,
+                        });
+                    }
+                    (
+                        Frame::RaftVoteResp { term, vote_granted },
+                        Some(OutboundReply::RaftVote(tx)),
+                    ) => {
+                        let _ = tx.send(RaftVoteResult { term, vote_granted });
                     }
                     (other, _) => {
                         warn!(%peer, ?other, "network: response shape mismatched pending request");
