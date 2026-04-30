@@ -825,6 +825,28 @@ pub enum Column {
     /// for i = 2, 1, 0.
     #[size = 4]
     ValDPartialNZMsbLo,
+    // ── Phase 35: RotR64 binding via mul-schoolbook + complementary shift ──
+    /// Phase 35: 1 iff this opcode is `RotR64` / `RotR64Imm` /
+    /// `RotR64ImmAlt`.  Pinned to `classify_opcode(opcode).is_rotate_r64`
+    /// via ProgramMemoryChip's preprocessed table.  Drives:
+    ///   - val_d = 2^ShiftAmountCompl (PowerOfTwo lookup, separate from
+    ///     the classic shift's lookup);
+    ///   - reg_val_d + ShiftAmountCompl = 64·ShiftQuotientCompl
+    ///     (complementary shift-amount identity);
+    ///   - result = UnsignedProductLow + mul_high (paired with RotL64).
+    #[size = 1]
+    IsRotateR64,
+    /// Phase 35: complementary shift amount = `(64 − n) mod 64` where
+    /// `n = reg_val_d mod 64`.  Used as the PowerOfTwo lookup key on
+    /// RotR64 rows, so val_d gets pinned to `2^((64 − n) mod 64)`.
+    /// Range-bounded to [0, 63] by the lookup table size.
+    #[size = 1]
+    ShiftAmountCompl,
+    /// Phase 35: integer quotient in
+    /// `reg_val_d + ShiftAmountCompl = 64·ShiftQuotientCompl`.  Range-
+    /// bounded by the 8-byte decomposition + Range256 byte checks.
+    #[size = 8]
+    ShiftQuotientCompl,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

@@ -183,6 +183,15 @@ pub(super) struct OpcodeFlags {
     /// LSB-direction first-non-zero indicator (Phase 29's
     /// ValDPartialNZ).
     pub is_tzb: bool,
+    /// Phase 35: 1 iff this opcode is `RotR64` / `RotR64Imm` /
+    /// `RotR64ImmAlt`.  PVM defines `RotR64(a, n) = (a >> n) |
+    /// (a << (64 − n))` for `n ∈ [0, 63]`.  Encoded by setting
+    /// `val_d = 2^((64 − n) mod 64)` (instead of `2^n` like
+    /// RotL64); the mul-schoolbook then computes both halves of
+    /// `a · 2^((64 − n) mod 64)` whose byte-wise sum equals the
+    /// rotated-right value (no carry — bits non-overlapping by
+    /// construction).
+    pub is_rotate_r64: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -225,7 +234,21 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_rotate_l64 = true;
         }
         Opcode::RotL32 => { f.is_shift = true; f.shift_op = 3; f.is_32bit = true; }
-        Opcode::RotR64 | Opcode::RotR64Imm | Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
+        // Phase 35: RotR64 + RotR64Imm — value in val_b, shift in
+        // val_d.  Encoded via the mul-schoolbook with `val_d =
+        // 2^((64 − n) mod 64)`; result = low + high (identical sum
+        // shape to RotL64 but with the complementary shift amount).
+        // RotR64ImmAlt keeps the shift_op=4 / no-constraint encoding
+        // because its operand convention (imm is the rotated value,
+        // regs[rb] is the shift) clashes with the AIR's val_b/val_d
+        // layout — would need swapped trace fill, deferred.
+        Opcode::RotR64 | Opcode::RotR64Imm => {
+            f.is_shift = true;
+            f.shift_op = 4;
+            f.is_mul = true;
+            f.is_rotate_r64 = true;
+        }
+        Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
         Opcode::RotR32 | Opcode::RotR32Imm | Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
         // Compare
         Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.is_set_lt_u = true; }
@@ -417,12 +440,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34):
-/// extract the 44 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35):
+/// extract the 45 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 44] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 45] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -447,5 +470,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 44] {
         f.is_count_set_bits as u8,
         f.is_lzb as u8,
         f.is_tzb as u8,
+        f.is_rotate_r64 as u8,
     ]
 }

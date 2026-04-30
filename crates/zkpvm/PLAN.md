@@ -103,29 +103,32 @@ emissions per row.  ~500 lines.  Largest of the open phases.
 
 ## Rotate
 
-### Phase 31 — Rotate64 binding
+### Phase 32 — RotL64 — DONE
 
-Bind `RotL64(a, n) = (a << n) | (a >> (64 − n))` in-circuit.
+Mul-schoolbook re-route: low-64 of `a · 2^n` → UnsignedProductLow,
+high-64 → mul_high.  Result = low + high (byte-wise sum, no carry —
+bits non-overlapping by construction).  Original PLAN's "OR via
+nibble ANDs" approach was over-engineered; sum works because
+rotation guarantees the two halves' bits don't overlap.
 
-- Re-use the mul-schoolbook for the `a · 2^n` low + high split
-  (already computes both `mul` and `mul_high`).  Set
-  `is_mul=true` in classify for RotL64.
-- New `RotResult[8]` column computed as the byte-wise OR of
-  `mul[0..8]` and `mul_high[0..8]`.  Range-check via 8 nibble
-  ANDs against BitwiseLookupChip.
-- Constraint on rotate rows: `result[i] = mul[i] + mul_high[i]
-  − bitwise_and(mul[i], mul_high[i])` (which is the OR identity;
-  the AND term is provided by an additional `RotAnd[8]` column
-  range-checked via the existing nibble-AND lookup).
+### Phase 35 — RotR64 / RotR64Imm — DONE
 
-Estimated scope: ~16 columns + 8 lookups per real row.  Similar
-in shape to Phase 17's sign-bit pinning.
+Same shape as Phase 32 but with the *complementary* power:
+`val_d = 2^((64 − n) mod 64)` so the schoolbook's low+high yield
+the rotated-right value.  The complement is pinned via a second
+shift-amount identity `RegValD + ShiftAmountCompl = 64 ·
+ShiftQuotientCompl` plus a separate PowerOfTwo lookup keyed on
+`ShiftAmountCompl`.  RotR64ImmAlt deferred — its operand
+convention (immediate is the rotated value, register is the
+shift amount) clashes with the AIR's val_b/val_d layout.
 
-### Phase 32 — Rotate32 binding
+### Future — Rotate32 (RotL32 / RotR32) + RotR64ImmAlt
 
-Same shape as Phase 31 over 4 bytes, with the sign-extension
-finalize from Phase 19.  Could fold into Phase 31 if the
-infrastructure generalizes cleanly.
+RotL32 / RotR32 need the same machinery over 4 bytes plus the
+sign-extension finalize from Phase 19.  RotR64ImmAlt needs a
+swapped-source trace-fill code path (val_b ← imm, val_d ←
+regs[reg_b]) plus a flag distinguishing the two TwoRegOneImm
+variants.  Both deferred.
 
 ## BitManip remainder
 

@@ -264,7 +264,12 @@ impl BuiltInComponent for CpuChip {
         // shift-amount conventions or a 32-bit schoolbook re-route.
         {
             let is_rotate_l64_p32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
-            let one_minus_rotate = E::F::one() - is_rotate_l64_p32[0].clone();
+            let is_rotate_r64_p35 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            // Phase 35: extend "non-rotate" exclusion to also cover
+            // RotR64 rows (which now drive is_mul=true via shift_op=4).
+            let one_minus_rotate = E::F::one()
+                - is_rotate_l64_p32[0].clone()
+                - is_rotate_r64_p35[0].clone();
             // Non-rotate is_mul_low rows (Mul64 / MulImm64 / ShloL64 / etc.):
             //   result[i] = UnsignedProductLow[i].
             for i in 0..WORD_SIZE {
@@ -274,12 +279,15 @@ impl BuiltInComponent for CpuChip {
                         * (result[i].clone() - unsigned_product_low[i].clone())
                 );
             }
-            // RotL64 rows: result[i] = UnsignedProductLow[i] + mul_high[i]
-            // (byte-wise sum, no carry — bits non-overlapping by
-            // construction of rotation).
+            // RotL64 / RotR64 rows: result[i] = UnsignedProductLow[i] +
+            // mul_high[i] (byte-wise sum, no carry — bits non-overlapping
+            // by construction of rotation).  RotL64 uses val_d = 2^n;
+            // RotR64 uses val_d = 2^((64 − n) mod 64).
+            let is_rotate_either = is_rotate_l64_p32[0].clone()
+                + is_rotate_r64_p35[0].clone();
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_rotate_l64_p32[0].clone()
+                    is_rotate_either.clone()
                         * (
                             result[i].clone()
                                 - unsigned_product_low[i].clone()
@@ -1834,15 +1842,39 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // Power-of-two lookup: proves val_d = 2^shift_amount for constrained shifts
+        // Power-of-two lookup: proves val_d = 2^shift_amount for constrained shifts.
+        //
+        // Phase 35 split: gate the classic emission on `is_shift_c · (1 −
+        // is_rotate_r64)` so RotR64 rows fall through.  For RotR64 rows
+        // val_d gets pinned to `2^ShiftAmountCompl` instead, via a second
+        // emission keyed on `ShiftAmountCompl`.  The two emissions are
+        // mutually exclusive (RotR64 always has is_rotate_r64 = 1; classic
+        // shift / RotL64 rows have is_rotate_r64 = 0) so val_d is never
+        // doubly-pinned.
+        let is_rotate_r64_pow2 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+        let shift_amount_compl_pow2 = crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
         {
             let shift_amount = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
             let is_shift_c = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
             let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
             tuple.extend_from_slice(&val_d);
+            // Multiplicity: is_shift_c · (1 − is_rotate_r64).  Degree 2.
+            let mult = is_shift_c[0].clone()
+                * (E::F::one() - is_rotate_r64_pow2[0].clone());
             eval.add_to_relation(RelationEntry::new(
                 pow2_lookup,
-                is_shift_c[0].clone().into(),
+                mult.into(),
+                &tuple,
+            ));
+        }
+        // Phase 35: separate PowerOfTwo emission for RotR64 keyed on
+        // ShiftAmountCompl.
+        {
+            let mut tuple: Vec<E::F> = vec![shift_amount_compl_pow2[0].clone()];
+            tuple.extend_from_slice(&val_d);
+            eval.add_to_relation(RelationEntry::new(
+                pow2_lookup,
+                is_rotate_r64_pow2[0].clone().into(),
                 &tuple,
             ));
         }
@@ -2019,7 +2051,26 @@ impl BuiltInComponent for CpuChip {
                 is_real.clone()
                     * val_d_is_reg[0].clone()
                     * is_shift_c[0].clone()
-                    * (reg_val_d_field - shift_amount_e[0].clone() - modulus * shift_q_field)
+                    * (reg_val_d_field.clone() - shift_amount_e[0].clone() - modulus * shift_q_field)
+            );
+
+            // Phase 35: complementary shift-amount identity for RotR64 rows.
+            //   reg_val_d + ShiftAmountCompl = 64 · ShiftQuotientCompl.
+            // ShiftAmountCompl ∈ [0, 63] (pinned by the new pow2 lookup),
+            // ShiftQuotientCompl is 8-byte range-bounded; together they
+            // uniquely determine ShiftAmountCompl = (64 − n_real) mod 64
+            // where n_real = reg_val_d mod 64.  Independent of the
+            // classic identity above so both can fire on RotR64 rows.
+            let shift_q_compl = crate::trace::trace_eval!(trace_eval, Column::ShiftQuotientCompl);
+            let shift_amount_compl = crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
+            let is_rotate_r64_p35_id = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            let shift_q_compl_field = crate::framework::eval::combine_le_u64::<E>(&shift_q_compl);
+            let sixty_four = E::F::from(BaseField::from(64u32));
+            eval.add_constraint(
+                is_real.clone()
+                    * is_rotate_r64_p35_id[0].clone()
+                    * (reg_val_d_field + shift_amount_compl[0].clone()
+                        - sixty_four * shift_q_compl_field)
             );
 
             let mut tuple: Vec<E::F> = vec![result_reg_idx[0].clone()];
@@ -2241,6 +2292,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
             let f_is_lzb = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
             let f_is_tzb = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
+            let f_is_rotate_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2297,6 +2349,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_count_set_bits[0].clone());
             tuple.push(f_is_lzb[0].clone());
             tuple.push(f_is_tzb[0].clone());
+            tuple.push(f_is_rotate_r64[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -3024,15 +3077,32 @@ impl BuiltInProverComponent for CpuChip {
 
             // For left/right shifts and Phase-32 RotL64: save shift
             // amount, then replace val_d with 2^shift_amount.
+            //
+            // Phase 35: RotR64 is also a pow2-replacement, but with
+            // val_d = 2^((64 − n_real) mod 64) (the complement) so the
+            // mul-schoolbook's low+high yields the rotated-right value.
             let mut saved_shift_amount: u8 = 0;
+            let mut saved_shift_amount_compl: u8 = 0;
+            let mut saved_shift_quotient_compl: u64 = 0;
             let is_pow2_replacement = (flags.is_shift && flags.shift_op <= 2)
-                || flags.is_rotate_l64;
+                || flags.is_rotate_l64
+                || flags.is_rotate_r64;
             if is_pow2_replacement {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
-                let shift = val_d % modulus;
+                let shift = val_d % modulus; // n_real = reg_val_d mod 64
                 saved_shift_amount = shift as u8;
-                val_d = 1u64 << shift;
-                side_note.power_of_two_counts[shift as usize] += 1;
+                if flags.is_rotate_r64 {
+                    // val_d = 2^((64 − n_real) mod 64).
+                    let compl = if shift == 0 { 0 } else { 64 - shift };
+                    saved_shift_amount_compl = compl as u8;
+                    // reg_val_d + compl = 64 · ShiftQuotientCompl.
+                    saved_shift_quotient_compl = (val_d + compl) / 64;
+                    val_d = 1u64 << compl;
+                    side_note.power_of_two_counts[compl as usize] += 1;
+                } else {
+                    val_d = 1u64 << shift;
+                    side_note.power_of_two_counts[shift as usize] += 1;
+                }
             }
 
             // Truncate for 32-bit ALU ops (including divrem for right shifts)
@@ -3292,7 +3362,7 @@ impl BuiltInProverComponent for CpuChip {
 
             // ── Shift auxiliary ──
             let shift_amount = if flags.is_shift {
-                if flags.shift_op <= 2 || flags.is_rotate_l64 {
+                if flags.shift_op <= 2 || flags.is_rotate_l64 || flags.is_rotate_r64 {
                     saved_shift_amount // saved before val_d was replaced
                 } else {
                     let modulus = if flags.is_32bit { 32u64 } else { 64 };
@@ -3303,12 +3373,18 @@ impl BuiltInProverComponent for CpuChip {
             };
             trace.fill_columns(row, shift_amount, Column::ShiftAmount);
             trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
-            // Phase 32: extend IsShiftConstrained to cover RotL64 too,
-            // so val_d gets rewritten to 2^n + ShiftQuotient + PowerOfTwo
-            // lookup all fire for rotate rows.  shift_op = 3 is RotL.
+            // Phase 32 / 35: extend IsShiftConstrained to cover RotL64 +
+            // RotR64.  val_d gets rewritten to 2^n (RotL) or 2^((64 − n)
+            // mod 64) (RotR); the val_d-vs-RegValD cross-constraint then
+            // skips the equality check for those rows.
             let is_shift_constrained = (flags.is_shift && flags.shift_op <= 2)
-                || flags.is_rotate_l64;
+                || flags.is_rotate_l64
+                || flags.is_rotate_r64;
             trace.fill_columns(row, is_shift_constrained, Column::IsShiftConstrained);
+            // Phase 35: RotR64 — fill the complementary shift columns.
+            trace.fill_columns(row, flags.is_rotate_r64, Column::IsRotateR64);
+            trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
+            trace.fill_columns(row, saved_shift_quotient_compl, Column::ShiftQuotientCompl);
 
             // ── Flags ──
             trace.fill_columns(row, false, Column::IsPadding);
@@ -3979,6 +4055,7 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
             let shift_q: u64 = if (flags.is_shift && flags.shift_op <= 2)
                 || flags.is_rotate_l64
+                || flags.is_rotate_r64
             {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
                 reg_val_d_u64 / modulus
@@ -4170,18 +4247,34 @@ impl BuiltInProverComponent for CpuChip {
             );
         }
 
-        // Power-of-two lookup: (shift_amount, val_d[8]) when is_shift && shift_op ∈ {0,1}
-        // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained
+        // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained.
+        // Phase 35 split: classic emission keyed on ShiftAmount with multiplicity
+        // `is_shift_c · (1 − is_rotate_r64)`, plus a new emission keyed on
+        // ShiftAmountCompl with multiplicity `is_rotate_r64`.
         let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
         let shift_amount_col = crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
         let is_shift_constrained = crate::trace::original_base_column!(component_trace, Column::IsShiftConstrained);
+        let is_rotate_r64_col_pow2 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
+        let shift_amount_compl_col = crate::trace::original_base_column!(component_trace, Column::ShiftAmountCompl);
         let val_d_cols = crate::trace::original_base_column!(component_trace, Column::ValD);
         {
             let mut tuple: Vec<_> = vec![shift_amount_col[0].clone()];
             tuple.extend_from_slice(&val_d_cols);
             logup.add_to_relation_with(
                 pow2_lookup,
-                [is_shift_constrained[0].clone()],
+                [is_shift_constrained[0].clone(), is_rotate_r64_col_pow2[0].clone()],
+                |[shc, r64]| (shc - r64).into(),
+                &tuple,
+            );
+        }
+        // Phase 35: separate PowerOfTwo emission for RotR64 keyed on
+        // ShiftAmountCompl.
+        {
+            let mut tuple: Vec<_> = vec![shift_amount_compl_col[0].clone()];
+            tuple.extend_from_slice(&val_d_cols);
+            logup.add_to_relation_with(
+                pow2_lookup,
+                [is_rotate_r64_col_pow2[0].clone()],
                 |[active]| active.into(),
                 &tuple,
             );
@@ -4459,6 +4552,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_count_set_bits = crate::trace::original_base_column!(component_trace, Column::IsCountSetBits);
             let f_is_lzb = crate::trace::original_base_column!(component_trace, Column::IsLzb);
             let f_is_tzb = crate::trace::original_base_column!(component_trace, Column::IsTzb);
+            let f_is_rotate_r64 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -4516,6 +4610,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_count_set_bits[0].clone());
             tuple.push(f_is_lzb[0].clone());
             tuple.push(f_is_tzb[0].clone());
+            tuple.push(f_is_rotate_r64[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

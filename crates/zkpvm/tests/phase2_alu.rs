@@ -801,6 +801,40 @@ fn prove_rotate_l64_by_one() {
     test_three_reg_op(Opcode::RotL64, 0x8000_0000_0000_0001, 1, 0x3);
 }
 
+// ── Phase 35: RotR64 ──
+
+#[test]
+fn prove_rotate_r64_smoke() {
+    let a = 0x123456789ABCDEF0u64;
+    let n = 16u64;
+    test_three_reg_op(Opcode::RotR64, a, n, a.rotate_right(n as u32));
+}
+
+#[test]
+fn prove_rotate_r64_zero() {
+    // n = 0 → identity.
+    test_three_reg_op(Opcode::RotR64, 0xDEAD_BEEF_CAFE_BABE, 0, 0xDEAD_BEEF_CAFE_BABE);
+}
+
+#[test]
+fn prove_rotate_r64_full_word() {
+    // n = 64 → 64 mod 64 = 0 → identity.
+    let a = 0x0123_4567_89AB_CDEFu64;
+    test_three_reg_op(Opcode::RotR64, a, 64, a.rotate_right((64 % 64) as u32));
+}
+
+#[test]
+fn prove_rotate_r64_by_one() {
+    // Bit-level: rotating 0x3 right by 1 → 0x8000000000000001.
+    test_three_reg_op(Opcode::RotR64, 0x3, 1, 0x8000_0000_0000_0001);
+}
+
+#[test]
+fn prove_rotate_r64_by_one_zero_lsb() {
+    // Rotating 0x2 right by 1 → 0x1 (no wraparound — LSB was 0).
+    test_three_reg_op(Opcode::RotR64, 0x2, 1, 0x1);
+}
+
 #[test]
 fn prove_shlo_l64_negative_value() {
     // Exact values from blake2s step 242: left shift of a large (negative-looking) 64-bit value

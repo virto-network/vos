@@ -86,6 +86,12 @@ commit.
 - **RotL64** — encoded via the mul-schoolbook (`val_d = 2^n`):
   `result = UnsignedProductLow + mul_high` (byte-wise sum, no
   carry — bits non-overlapping by construction) `[32]`.
+- **RotR64 / RotR64Imm** — same shape as RotL64 but with the
+  *complementary* power: `val_d = 2^((64 − n) mod 64)` so the
+  schoolbook's low + high yield the rotated-right value.  The
+  complement is pinned via a second shift-amount identity
+  `RegValD + ShiftAmountCompl = 64 · ShiftQuotientCompl` plus a
+  separate PowerOfTwo lookup keyed on `ShiftAmountCompl` `[35]`.
 
 ### Sign-bit pinning
 - `SignBitB / SignBitD / SignBitQ / SignBitR` — each pinned to
@@ -182,11 +188,14 @@ biggest exposure-to-fix-cost ratio.  See
   infrastructure would close both).
 
 ### Rotate
-- **RotL32 / RotR32 / RotR64** (+ Imm / ImmAlt variants) —
-  still prover-trusted.  RotR64 needs piecewise modular
-  arithmetic for `(64 − n) mod 64`; the 32-bit variants need
-  the same plus low-32-only handling.  RotL64 is closed in
-  Phase 32 via the mul-schoolbook re-route.
+- **RotL32 / RotR32 / RotR64ImmAlt** (+ remaining 32-bit Imm /
+  ImmAlt variants) — still prover-trusted.  RotR64ImmAlt has
+  swapped operand semantics (immediate is the rotated value,
+  register is the shift amount) which clashes with the AIR's
+  val_b/val_d layout — would need swapped trace fill.  The 32-
+  bit variants need the same machinery as Phase 32/35 plus the
+  low-32-only sign-extension finalize.  RotL64 closed in Phase
+  32; RotR64 + RotR64Imm closed in Phase 35.
 
 ### BitManip
 - **Sbrk** — host-call-like; needs precompile-style integration.
