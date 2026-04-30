@@ -2541,4 +2541,208 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Phase-4.3 boundary: 3-node cluster, elect a leader, propose
+    /// three entries via the leader's `WorkerHandle::propose`, and
+    /// wait for both followers to replicate them. Direct redb
+    /// introspection asserts every replica has the same three
+    /// rows in `raft_log` and `last_applied == 3`.
+    #[test]
+    fn three_node_cluster_replicates_proposed_entries() {
+        use crate::raft::{RaftMeta, RaftWorker, Role, WorkerConfig, RAFT_LOG};
+        use redb::ReadableTableMetadata;
+        use std::time::Instant as StdInstant;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let kp_c = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let prefix_c = derive_node_prefix(&PeerId::from(kp_c.public()));
+        if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+            eprintln!("SKIP: prefix collision; rerun");
+            return;
+        }
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_a, local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()], bootstrap: vec![],
+        }));
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        ).expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_b, local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()], bootstrap: vec![a_dial.clone()],
+        }));
+        let b_addr = wait_for(
+            || net_b.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        ).expect("net_b binds");
+        let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+        let net_c = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_c, local_prefix: prefix_c,
+            listen: vec![listen_addr], bootstrap: vec![a_dial, b_dial],
+        }));
+
+        wait_for(|| {
+            let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                  && net_b.peer_for_prefix(prefix_a).is_some();
+            let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                  && net_c.peer_for_prefix(prefix_a).is_some();
+            let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                  && net_c.peer_for_prefix(prefix_b).is_some();
+            (ab && ac && bc).then_some(())
+        }, Duration::from_secs(15))
+        .expect("3-node Hello mesh forms");
+
+        let dir = std::env::temp_dir().join(format!(
+            "vos_raft_replicate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk_worker = |me, network: Arc<Network>, db_name: &str| {
+            let path = dir.join(db_name);
+            let db = Arc::new(redb::Database::create(&path).unwrap());
+            (
+                path,
+                RaftWorker::spawn(
+                    db,
+                    WorkerConfig {
+                        me,
+                        members: vec![prefix_a, prefix_b, prefix_c],
+                        replication_id: [0xC2; 32],
+                        election_timeout_ms: (50, 150),
+                        heartbeat_interval_ms: 20,
+                    },
+                    Some(network),
+                ),
+            )
+        };
+        let (path_a, w_a) = mk_worker(prefix_a, net_a.clone(), "a.redb");
+        let (path_b, w_b) = mk_worker(prefix_b, net_b.clone(), "b.redb");
+        let (path_c, w_c) = mk_worker(prefix_c, net_c.clone(), "c.redb");
+        net_a.set_raft_handler(Arc::new(w_a.handler()));
+        net_b.set_raft_handler(Arc::new(w_b.handler()));
+        net_c.set_raft_handler(Arc::new(w_c.handler()));
+
+        // ── Wait for a leader. ────────────────────────────────
+        let until = StdInstant::now() + Duration::from_secs(5);
+        let mut leader: Option<u16> = None;
+        loop {
+            for (p, h) in [
+                (prefix_a, w_a.handler()),
+                (prefix_b, w_b.handler()),
+                (prefix_c, w_c.handler()),
+            ] {
+                if let Some(snap) = h.snapshot() {
+                    if snap.role == Role::Leader {
+                        leader = Some(p);
+                        break;
+                    }
+                }
+            }
+            if leader.is_some() { break; }
+            assert!(StdInstant::now() < until, "no leader within deadline");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let leader_prefix = leader.unwrap();
+        let leader_handle = match leader_prefix {
+            p if p == prefix_a => w_a.handler(),
+            p if p == prefix_b => w_b.handler(),
+            _ => w_c.handler(),
+        };
+
+        // ── Propose three entries on the leader. ──────────────
+        let payloads = [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
+        for p in &payloads {
+            let idx = leader_handle.propose(p.clone()).expect("propose");
+            assert!(idx >= 1);
+        }
+
+        // ── Wait for all replicas to commit_index ≥ 3. ────────
+        // Phase 4.2's commit-advance fires when a follower's
+        // match_index reaches 3 → leader's commit_index = 3 →
+        // next heartbeat propagates leader_commit to followers →
+        // their commit_index = 3 too. So followers see the new
+        // commit one heartbeat *after* the leader does. Probe
+        // commit_index, not last_log_index, so the test is only
+        // green once the propagation completes. Snapshot also
+        // exposes last_log_index for diagnostics on failure.
+        //
+        // The snapshot doesn't expose commit_index directly — read
+        // it via redb at probe time using a non-blocking write
+        // txn. Since the worker holds the only Database handle
+        // for its file, we instead query commit_index through a
+        // synthetic AppendEntries (a zero-entry heartbeat from
+        // peer prefix 0, term 0 — refused, but the response
+        // exposes the worker's current term, not commit_index).
+        // Simpler: extend WorkerSnapshot with commit_index.
+        let until = StdInstant::now() + Duration::from_secs(3);
+        loop {
+            let snaps = [
+                (prefix_a, w_a.handler().snapshot()),
+                (prefix_b, w_b.handler().snapshot()),
+                (prefix_c, w_c.handler().snapshot()),
+            ];
+            let all_committed = snaps.iter().all(|(_, s)| {
+                s.as_ref().is_some_and(|x| x.commit_index >= 3)
+            });
+            if all_committed { break; }
+            if StdInstant::now() >= until {
+                panic!(
+                    "all replicas did not reach commit_index ≥ 3 within \
+                     deadline; snaps: {snaps:?}",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // ── Probe each replica's redb directly. ──────────────
+        // We need the workers stopped before opening the redb
+        // files (they hold the exclusive file lock). Shut them
+        // down + collect, then read.
+        w_a.shutdown();
+        w_b.shutdown();
+        w_c.shutdown();
+
+        for (label, path) in [("A", &path_a), ("B", &path_b), ("C", &path_c)] {
+            let db = redb::Database::create(path).expect("reopen");
+            let txn = db.begin_read().expect("read txn");
+            let log_table = txn.open_table(RAFT_LOG).expect("raft_log");
+            let n_rows = log_table.len().expect("len");
+            assert_eq!(
+                n_rows, 3,
+                "replica {label} should have exactly 3 raft_log rows; \
+                 got {n_rows}",
+            );
+            let meta = RaftMeta::load(&db).expect("meta");
+            // Phase 4 stubs `last_applied` to track `commit_index`,
+            // and `commit_index` advances to 3 once the majority
+            // matches the leader. The leader sees this directly;
+            // the follower sees it the next heartbeat after the
+            // leader's commit advance.
+            assert_eq!(
+                meta.commit_index, 3,
+                "replica {label} commit_index should advance to 3",
+            );
+            assert_eq!(
+                meta.last_applied, 3,
+                "replica {label} last_applied tracks commit_index in phase 4",
+            );
+        }
+
+        match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -180,6 +180,8 @@ pub struct WorkerSnapshot {
     pub current_term: u64,
     pub voted_for: Option<u16>,
     pub last_log_index: u64,
+    pub commit_index: u64,
+    pub last_applied: u64,
 }
 
 /// Owning handle to a running worker. Drop-or-`shutdown` cleans
@@ -560,6 +562,8 @@ fn worker_loop(
                     current_term: state.meta.current_term,
                     voted_for: state.meta.voted_for,
                     last_log_index: state.log.last_index(),
+                    commit_index: state.meta.commit_index,
+                    last_applied: state.meta.last_applied,
                 });
             }
             Ok(RaftMsg::AppendResponse {
