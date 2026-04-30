@@ -90,7 +90,7 @@ impl VosTransport {
 impl Transport<u16> for VosTransport {
     type Error = VosTransportError;
 
-    fn send_append(
+    async fn send_append(
         &self,
         peer: u16,
         req: AppendEntriesReq<u16>,
@@ -117,9 +117,14 @@ impl Transport<u16> for VosTransport {
             req.leader_commit,
             entries,
         );
-        let r = rx
-            .recv_timeout(RPC_TIMEOUT)
-            .map_err(|_| VosTransportError::NoReply)?;
+        // The Network handle returns a sync `std::sync::mpsc::Receiver`.
+        // Block on it from a thread-pool task so we don't park the
+        // worker future. The `blocking::unblock` adapter is too
+        // heavyweight; we use a one-shot tokio-blocking shim
+        // adapted as a future via `oneshot`.
+        let r = recv_timeout(rx, RPC_TIMEOUT)
+            .await
+            .ok_or(VosTransportError::NoReply)?;
         Ok(AppendEntriesResp {
             term: r.term,
             success: r.success,
@@ -127,7 +132,7 @@ impl Transport<u16> for VosTransport {
         })
     }
 
-    fn send_vote(
+    async fn send_vote(
         &self,
         peer: u16,
         req: RequestVoteReq<u16>,
@@ -144,16 +149,16 @@ impl Transport<u16> for VosTransport {
             req.last_log_index,
             req.last_log_term,
         );
-        let r = rx
-            .recv_timeout(RPC_TIMEOUT)
-            .map_err(|_| VosTransportError::NoReply)?;
+        let r = recv_timeout(rx, RPC_TIMEOUT)
+            .await
+            .ok_or(VosTransportError::NoReply)?;
         Ok(RequestVoteResp {
             term: r.term,
             vote_granted: r.vote_granted,
         })
     }
 
-    fn send_install(
+    async fn send_install(
         &self,
         peer: u16,
         req: InstallSnapshotReq<u16>,
@@ -171,9 +176,31 @@ impl Transport<u16> for VosTransport {
             req.last_included_term,
             req.snapshot,
         );
-        let r = rx
-            .recv_timeout(RPC_TIMEOUT)
-            .map_err(|_| VosTransportError::NoReply)?;
+        let r = recv_timeout(rx, RPC_TIMEOUT)
+            .await
+            .ok_or(VosTransportError::NoReply)?;
         Ok(InstallSnapshotResp { term: r.term })
     }
+}
+
+/// Bridge a sync `std::sync::mpsc::Receiver` into an async future
+/// by spawning a short-lived blocking thread that receives with a
+/// timeout and forwards the result through a oneshot channel.
+///
+/// The receiver is only ever delivered a single value (the libp2p
+/// reply), so the helper thread parks at most for `timeout` and
+/// then exits.
+async fn recv_timeout<T: Send + 'static>(
+    rx: std::sync::mpsc::Receiver<T>,
+    timeout: Duration,
+) -> Option<T> {
+    let (tx, mut out) = futures_channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let r = rx.recv_timeout(timeout).ok();
+        let _ = tx.send(r);
+    });
+    // The oneshot completes when the helper thread exits; if it
+    // exits with `None`, the receiver gives `Some(None)`. Flatten.
+    let inner = (&mut out).await.ok().flatten();
+    inner
 }

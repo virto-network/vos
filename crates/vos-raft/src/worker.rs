@@ -1,24 +1,45 @@
-//! Per-replication-group Raft worker — the consensus state
-//! machine.
+//! Per-replication-group Raft worker — async, runtime-agnostic.
 //!
-//! Owns: role, term, vote, per-follower replication indices,
-//! election timer. Single-writer for the [`Storage`] backend.
-//! Talks to peers through [`Transport`].
+//! The worker is a single async future that loops over four
+//! signal sources via `futures::select!`:
 //!
-//! Today: sync API, std mpsc inbox, real OS threads for outbound
-//! RPCs. Commit 4 swaps to async (`futures::select!` over the
-//! inbox + `Clock::sleep_until`) and replaces the helper threads
-//! with executor-spawned tasks.
+//! 1. **Inbox** (`futures_channel::mpsc::UnboundedReceiver`) —
+//!    [`RaftMsg`] messages from external callers (RPC handlers,
+//!    proposes, snapshot queries, shutdown).
+//! 2. **Election timer** ([`Clock::sleep_until`]) — fires when
+//!    the current `election_deadline` expires; promotes a
+//!    Follower to Candidate or makes a Leader send heartbeats.
+//! 3. **In-flight outbound RPCs** (`FuturesUnordered`) — every
+//!    `transport.send_*()` future the worker emits parks here
+//!    until the peer (or the transport's own timeout) replies.
+//!    Completed futures inject their results back into the
+//!    state machine via [`handle_*_response`] paths.
+//! 4. **Cooperative yield** — none required; the loop is
+//!    naturally yielding because every storage / transport call
+//!    is async.
+//!
+//! No threads spawned. No runtime selected. The host driving
+//! this future picks the executor (tokio, embassy, async-std,
+//! a deterministic simulator). The std-feature
+//! [`Worker::spawn`] convenience runs the future on a dedicated
+//! thread using the `futures-executor` crate as a tiny
+//! single-task executor — fine for vos's use case but not
+//! mandatory.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::fmt::Debug;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc as std_mpsc;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use core::time::Duration;
 
+use futures_channel::mpsc as fmpsc;
+use futures_channel::oneshot;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::FutureExt;
+
+use crate::clock::{Clock, Rng};
 use crate::config::{Config, NodeId};
 use crate::log_entry::LogEntry;
 use crate::meta::Meta;
@@ -29,13 +50,6 @@ use crate::rpc::{
 };
 use crate::storage::{Storage, WriteBatch};
 use crate::transport::Transport;
-
-/// Hard upper bound on how long a single outbound vote helper
-/// thread waits for a peer's reply before giving up. The election
-/// timeout will fire long before this — the cap exists only so a
-/// peer that drops a request without ever replying doesn't leak a
-/// helper thread for the lifetime of the worker.
-pub const VOTE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hysteresis for the leader's auto-compaction. The worker only
 /// compacts when the eligible-up-to-index is at least this many
@@ -53,8 +67,7 @@ pub enum ProposeError<E> {
     Storage(E),
 }
 
-/// Diagnostic snapshot of a worker's state. Returned by
-/// [`WorkerHandle::snapshot`].
+/// Diagnostic snapshot of a worker's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSnapshot<N: NodeId> {
     pub role: Role,
@@ -65,98 +78,115 @@ pub struct WorkerSnapshot<N: NodeId> {
     pub last_applied: u64,
 }
 
-/// Inbound message processed by the worker loop. Variants pair
-/// the inbound RPC types with reply channels so the request /
-/// response pattern stays explicit.
+/// Inbound message processed by the worker loop.
 #[allow(dead_code)]
 pub enum RaftMsg<N: NodeId> {
     AppendEntries {
         from: N,
         req: AppendEntriesReq<N>,
-        reply: std_mpsc::Sender<AppendEntriesResp>,
+        reply: oneshot::Sender<AppendEntriesResp>,
     },
     RequestVote {
         from: N,
         req: RequestVoteReq<N>,
-        reply: std_mpsc::Sender<RequestVoteResp>,
+        reply: oneshot::Sender<RequestVoteResp>,
     },
     InstallSnapshot {
         from: N,
         req: InstallSnapshotReq<N>,
-        reply: std_mpsc::Sender<InstallSnapshotResp>,
+        reply: oneshot::Sender<InstallSnapshotResp>,
     },
-    /// Drained after every outbound `send_vote` / `send_append`
-    /// / `send_install` helper thread receives the peer's reply.
-    /// The variant carries the peer + the response so the worker
-    /// can update per-peer bookkeeping on its single-threaded
-    /// loop.
-    VoteResponse {
-        from: N,
-        resp: RequestVoteResp,
-    },
-    AppendResponse {
-        from: N,
-        resp: AppendEntriesResp,
-    },
-    InstallSnapshotResponse {
-        from: N,
-        resp: InstallSnapshotResp,
-        last_included_index: u64,
-    },
-    /// Append a new entry to the leader's log. Used by the agent
-    /// thread (the host's commit_with_log path).
+    /// Append a new entry to the leader's log.
     Propose {
         payload: Vec<u8>,
-        reply: std_mpsc::Sender<Result<u64, ProposeError<()>>>,
+        reply: oneshot::Sender<Result<u64, ProposeError<()>>>,
     },
     QueryState {
-        reply: std_mpsc::Sender<WorkerSnapshot<N>>,
+        reply: oneshot::Sender<WorkerSnapshot<N>>,
     },
     Shutdown,
 }
 
-/// Owning handle to a running worker. Drop or [`shutdown`] cleans
-/// up the thread.
+/// Sender half of the worker inbox. Cheap to clone.
+pub type Inbox<N> = fmpsc::UnboundedSender<RaftMsg<N>>;
+
+// ── std-only spawn helper ───────────────────────────────────
+
+/// Owning handle to a worker driven on a dedicated std thread.
+/// Drop or [`shutdown`] cleans up.
+///
+/// Embedded hosts skip this and call [`run_worker`] directly on
+/// their own executor.
 ///
 /// [`shutdown`]: Self::shutdown
+#[cfg(feature = "std")]
 pub struct Worker<N: NodeId> {
-    inbox: std_mpsc::Sender<RaftMsg<N>>,
+    inbox: Inbox<N>,
     role: Arc<AtomicU8>,
-    join: Option<JoinHandle<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(feature = "std")]
 impl<N: NodeId> Worker<N> {
-    /// Spawn a worker thread for one replication group.
-    ///
-    /// `apply_notifier` receives the new `commit_index` value
-    /// each time the worker advances it (leader's quorum match
-    /// or follower's heartbeat that bumps `leader_commit`).
+    /// Spawn a worker thread for one replication group, driven
+    /// by a [`StdClock`](crate::StdClock) +
+    /// [`StdRng`](crate::StdRng). The thread runs a single-task
+    /// `futures_executor::block_on` over the worker future.
     pub fn spawn<S, T>(
         storage: S,
         transport: Arc<T>,
         cfg: Config<N>,
-        apply_notifier: Option<std_mpsc::Sender<u64>>,
+        apply_notifier: Option<std::sync::mpsc::Sender<u64>>,
     ) -> Self
     where
         S: Storage<N>,
         T: Transport<N>,
     {
-        let (tx, rx) = std_mpsc::channel();
-        let inbox_tx = tx.clone();
+        Self::spawn_with(
+            storage,
+            transport,
+            cfg,
+            apply_notifier,
+            crate::clock::StdClock,
+            crate::clock::StdRng::from_entropy(),
+        )
+    }
+
+    /// Like [`spawn`](Self::spawn) but with caller-supplied
+    /// [`Clock`] and [`Rng`]. Useful for deterministic simulators
+    /// or hosts that want to plug in `tokio::time` directly.
+    pub fn spawn_with<S, T, C, R>(
+        storage: S,
+        transport: Arc<T>,
+        cfg: Config<N>,
+        apply_notifier: Option<std::sync::mpsc::Sender<u64>>,
+        clock: C,
+        rng: R,
+    ) -> Self
+    where
+        S: Storage<N>,
+        T: Transport<N>,
+        C: Clock,
+        R: Rng,
+    {
+        let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
-        let join = thread::Builder::new()
+        let inbox_for_thread = tx.clone();
+        let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
-                let _ = worker_loop::<N, S, T>(
+                futures_executor::block_on(run_worker(
                     storage,
                     transport,
                     cfg,
+                    inbox_for_thread,
                     rx,
-                    inbox_tx,
                     apply_notifier,
+                    clock,
+                    rng,
                     role_for_thread,
-                );
+                ));
             })
             .expect("spawn raft worker");
         Self {
@@ -181,16 +211,17 @@ impl<N: NodeId> Worker<N> {
 
     /// Stop the worker and join the thread.
     pub fn shutdown(mut self) {
-        let _ = self.inbox.send(RaftMsg::Shutdown);
+        let _ = self.inbox.unbounded_send(RaftMsg::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
     }
 }
 
+#[cfg(feature = "std")]
 impl<N: NodeId> Drop for Worker<N> {
     fn drop(&mut self) {
-        let _ = self.inbox.send(RaftMsg::Shutdown);
+        let _ = self.inbox.unbounded_send(RaftMsg::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -200,7 +231,7 @@ impl<N: NodeId> Drop for Worker<N> {
 /// Cheap-to-clone handle for sending messages into the worker.
 #[derive(Clone)]
 pub struct WorkerHandle<N: NodeId> {
-    inbox: std_mpsc::Sender<RaftMsg<N>>,
+    inbox: Inbox<N>,
     role: Arc<AtomicU8>,
 }
 
@@ -211,103 +242,101 @@ impl<N: NodeId> WorkerHandle<N> {
     }
 
     /// Cheap-to-clone sender for spawning helper tasks.
-    pub fn sender(&self) -> std_mpsc::Sender<RaftMsg<N>> {
+    pub fn sender(&self) -> Inbox<N> {
         self.inbox.clone()
     }
 
-    /// Test / diagnostic — block briefly waiting for the worker
-    /// to send back a snapshot. `None` if the worker is shut
-    /// down or busy beyond the deadline.
-    pub fn snapshot(&self) -> Option<WorkerSnapshot<N>> {
-        let (tx, rx) = std_mpsc::channel();
-        self.inbox.send(RaftMsg::QueryState { reply: tx }).ok()?;
-        rx.recv_timeout(Duration::from_millis(500)).ok()
-    }
-
-    /// Append a new payload to the cluster log. Caller is
-    /// expected to address a Leader; followers / candidates
-    /// return `NotLeader`. The returned index is where the
-    /// leader reserved a slot — replication to a quorum is
-    /// async.
-    pub fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError<()>> {
-        let (tx, rx) = std_mpsc::channel();
+    /// Diagnostic snapshot of the worker's current state.
+    /// `None` if the worker is shut down.
+    pub async fn snapshot(&self) -> Option<WorkerSnapshot<N>> {
+        let (tx, rx) = oneshot::channel();
         self.inbox
-            .send(RaftMsg::Propose { payload, reply: tx })
-            .map_err(|_| ProposeError::NotLeader)?;
-        rx.recv_timeout(Duration::from_secs(2))
-            .unwrap_or(Err(ProposeError::NotLeader))
+            .unbounded_send(RaftMsg::QueryState { reply: tx })
+            .ok()?;
+        rx.await.ok()
     }
 
-    /// Inbound `AppendEntries` from a peer — sends to the worker
-    /// inbox and blocks on the reply.
-    pub fn handle_inbound_append(
+    /// Append a new payload to the cluster log.
+    pub async fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError<()>> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .unbounded_send(RaftMsg::Propose { payload, reply: tx })
+            .map_err(|_| ProposeError::NotLeader)?;
+        rx.await.unwrap_or(Err(ProposeError::NotLeader))
+    }
+
+    /// Inbound `AppendEntries` from a peer.
+    pub async fn handle_inbound_append(
         &self,
         from: N,
         req: AppendEntriesReq<N>,
     ) -> AppendEntriesResp {
-        let (tx, rx) = std_mpsc::channel();
+        let (tx, rx) = oneshot::channel();
+        let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::AppendEntries { from, req: req.clone(), reply: tx })
+            .unbounded_send(RaftMsg::AppendEntries { from, req, reply: tx })
             .is_err()
         {
             return AppendEntriesResp {
-                term: req.term,
+                term,
                 success: false,
                 match_index: 0,
             };
         }
-        rx.recv().unwrap_or(AppendEntriesResp {
-            term: req.term,
+        rx.await.unwrap_or(AppendEntriesResp {
+            term,
             success: false,
             match_index: 0,
         })
     }
 
     /// Inbound `RequestVote` from a peer.
-    pub fn handle_inbound_vote(
+    pub async fn handle_inbound_vote(
         &self,
         from: N,
         req: RequestVoteReq<N>,
     ) -> RequestVoteResp {
-        let (tx, rx) = std_mpsc::channel();
+        let (tx, rx) = oneshot::channel();
+        let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::RequestVote { from, req, reply: tx })
+            .unbounded_send(RaftMsg::RequestVote { from, req, reply: tx })
             .is_err()
         {
             return RequestVoteResp {
-                term: req.term,
+                term,
                 vote_granted: false,
             };
         }
-        rx.recv().unwrap_or(RequestVoteResp {
-            term: req.term,
+        rx.await.unwrap_or(RequestVoteResp {
+            term,
             vote_granted: false,
         })
     }
 
     /// Inbound `InstallSnapshot` from a peer.
-    pub fn handle_inbound_install(
+    pub async fn handle_inbound_install(
         &self,
         from: N,
         req: InstallSnapshotReq<N>,
     ) -> InstallSnapshotResp {
-        let (tx, rx) = std_mpsc::channel();
+        let (tx, rx) = oneshot::channel();
         let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::InstallSnapshot { from, req, reply: tx })
+            .unbounded_send(RaftMsg::InstallSnapshot { from, req, reply: tx })
             .is_err()
         {
             return InstallSnapshotResp { term };
         }
-        rx.recv().unwrap_or(InstallSnapshotResp { term })
+        rx.await.unwrap_or(InstallSnapshotResp { term })
     }
 }
 
-/// Per-follower replication bookkeeping. Initialized when a
-/// worker becomes Leader; cleared when it steps down.
+// ── Internal state ──────────────────────────────────────────
+
+/// Per-follower replication bookkeeping.
 #[derive(Debug, Clone)]
 struct LeaderState<N: NodeId> {
     next_index: BTreeMap<N, u64>,
@@ -335,51 +364,68 @@ impl<N: NodeId> LeaderState<N> {
     }
 }
 
-/// Worker state. Owns the per-group state machine + the
-/// in-memory tally for an in-flight election + per-follower
-/// replication bookkeeping when leader.
-struct WorkerState<N: NodeId, S: Storage<N>, T: Transport<N>> {
+/// Outbound RPC future result. Each variant is what the worker
+/// would have received over the inbox in the pre-async design;
+/// here we just pull it straight from the future.
+enum RpcOutcome<N: NodeId> {
+    Append {
+        from: N,
+        result: Option<AppendEntriesResp>,
+    },
+    Vote {
+        from: N,
+        result: Option<RequestVoteResp>,
+    },
+    Install {
+        from: N,
+        result: Option<InstallSnapshotResp>,
+        last_included_index: u64,
+    },
+}
+
+/// In-flight RPC future. Driven by [`FuturesUnordered`] inside
+/// the main loop's `select!`.
+type RpcFut<N> = Pin<Box<dyn Future<Output = RpcOutcome<N>> + Send>>;
+
+struct WorkerState<N, S, T, C, R>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+{
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
-    inbox_tx: std_mpsc::Sender<RaftMsg<N>>,
     role: Role,
     meta: Meta<N>,
-    election_deadline: Instant,
+    election_deadline: C::Instant,
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
-    apply_notifier: Option<std_mpsc::Sender<u64>>,
+    apply_notifier: Option<ApplyNotifier>,
     role_atomic: Arc<AtomicU8>,
+    clock: C,
+    rng: R,
 }
 
-impl<N: NodeId, S: Storage<N>, T: Transport<N>> WorkerState<N, S, T> {
-    fn open(
-        storage: S,
-        transport: Arc<T>,
-        cfg: Config<N>,
-        inbox_tx: std_mpsc::Sender<RaftMsg<N>>,
-        apply_notifier: Option<std_mpsc::Sender<u64>>,
-        role_atomic: Arc<AtomicU8>,
-    ) -> Result<Self, S::Error> {
-        let meta = storage.load_meta()?;
-        let mut s = Self {
-            storage,
-            transport,
-            cfg,
-            inbox_tx,
-            role: Role::Follower,
-            meta,
-            election_deadline: Instant::now(),
-            votes_received: BTreeSet::new(),
-            leader: None,
-            apply_notifier,
-            role_atomic,
-        };
-        s.reset_election_timer();
-        s.publish_role();
-        Ok(s)
-    }
+/// Abstraction over the apply-notification channel. Std hosts
+/// pass `std::sync::mpsc::Sender<u64>`; future commits will
+/// generalize this to a no_std-compatible sink trait.
+#[cfg(feature = "std")]
+type ApplyNotifier = std::sync::mpsc::Sender<u64>;
 
+#[cfg(not(feature = "std"))]
+type ApplyNotifier = core::convert::Infallible;
+
+impl<N, S, T, C, R> WorkerState<N, S, T, C, R>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+{
     fn publish_role(&self) {
         self.role_atomic
             .store(self.role.as_u8(), Ordering::Relaxed);
@@ -390,43 +436,56 @@ impl<N: NodeId, S: Storage<N>, T: Transport<N>> WorkerState<N, S, T> {
         self.publish_role();
     }
 
+    #[cfg(feature = "std")]
     fn fire_apply_notification(&self) {
         if let Some(tx) = self.apply_notifier.as_ref() {
             let _ = tx.send(self.meta.commit_index);
         }
     }
 
+    #[cfg(not(feature = "std"))]
+    fn fire_apply_notification(&self) {
+        // No-std: notifier type is `Infallible` so there's
+        // nothing to send into. A future commit lifts this to a
+        // generic sink trait.
+    }
+
     fn reset_election_timer(&mut self) {
         let (lo, hi) = self.cfg.election_timeout_ms;
         let span = (hi.saturating_sub(lo)).max(1);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
-            .unwrap_or(0);
-        // Combine the wall-clock nanos with a hash of `me` so peers
-        // don't all time out simultaneously.
+        let r = self.rng.next_u64();
         let me_seed = {
             use core::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
+            // A trivial FNV-ish hash so we don't pull stdlib's
+            // DefaultHasher (which lives in std::collections).
+            // Quality requirements are mild — just per-peer
+            // separation of jitter.
+            struct Fnv(u64);
+            impl Hasher for Fnv {
+                fn finish(&self) -> u64 {
+                    self.0
+                }
+                fn write(&mut self, bytes: &[u8]) {
+                    for b in bytes {
+                        self.0 = self.0.wrapping_mul(1099511628211);
+                        self.0 ^= u64::from(*b);
+                    }
+                }
+            }
+            let mut h = Fnv(0xCBF29CE484222325);
             <N as Hash>::hash(&self.cfg.me, &mut h);
             h.finish()
         };
-        let jitter = (nanos.wrapping_mul(0x9E3779B97F4A7C15) ^ me_seed ^ self.meta.current_term)
-            % span;
+        let jitter = (r ^ me_seed ^ self.meta.current_term) % span;
         let timeout = Duration::from_millis(lo + jitter);
-        self.election_deadline = Instant::now() + timeout;
+        self.election_deadline = self.clock.add(self.clock.now(), timeout);
     }
 
-    /// Quorum size — majority of total members (counting self).
     fn quorum(&self) -> usize {
         self.cfg.quorum()
     }
 
-    /// Snapshot of `match_index` values (followers + leader's
-    /// own last_index) sorted descending. Position
-    /// `quorum() - 1` is the highest index a majority is at or
-    /// above.
-    fn match_index_majority_floor(&self) -> Option<u64> {
+    async fn match_index_majority_floor(&self) -> Option<u64> {
         let leader = self.leader.as_ref()?;
         let mut indices: Vec<u64> = leader.match_index.values().copied().collect();
         indices.push(self.storage.last_index());
@@ -439,81 +498,198 @@ impl<N: NodeId, S: Storage<N>, T: Transport<N>> WorkerState<N, S, T> {
     }
 }
 
-fn worker_loop<N, S, T>(
+// ── Public driver ───────────────────────────────────────────
+
+/// Run a worker future to completion. Returns `Ok` on
+/// `RaftMsg::Shutdown`, `Err` on a fatal storage error.
+///
+/// Embedded hosts call this directly inside their executor.
+/// Std hosts typically use [`Worker::spawn`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_worker<N, S, T, C, R>(
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
-    inbox: std_mpsc::Receiver<RaftMsg<N>>,
-    inbox_tx: std_mpsc::Sender<RaftMsg<N>>,
-    apply_notifier: Option<std_mpsc::Sender<u64>>,
+    _inbox_tx: Inbox<N>,
+    inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
+    apply_notifier: Option<ApplyNotifier>,
+    clock: C,
+    rng: R,
     role_atomic: Arc<AtomicU8>,
-) -> Result<(), S::Error>
-where
+) where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
-    let mut state = WorkerState::<N, S, T>::open(
+    let meta = match storage.load_meta().await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let mut state = WorkerState {
         storage,
         transport,
         cfg,
-        inbox_tx,
+        role: Role::Follower,
+        meta,
+        election_deadline: clock.now(),
+        votes_received: BTreeSet::new(),
+        leader: None,
         apply_notifier,
         role_atomic,
-    )?;
+        clock,
+        rng,
+    };
+    state.reset_election_timer();
+    state.publish_role();
+
+    let mut inbox_rx = inbox_rx;
+    let mut pending: FuturesUnordered<RpcFut<N>> = FuturesUnordered::new();
 
     loop {
-        let now = Instant::now();
-        let timeout = state.election_deadline.saturating_duration_since(now);
-        match inbox.recv_timeout(timeout) {
-            Ok(RaftMsg::Shutdown) => break,
-            Ok(RaftMsg::AppendEntries { from, req, reply }) => {
-                let resp = handle_append_entries(&mut state, from, req)?;
-                let _ = reply.send(resp);
+        // The select! macro's timer arm needs a fused future.
+        // `clock.sleep_until(deadline)` returns C::Sleep — wrap
+        // it with `.fuse()` so it's safe to poll past completion
+        // (FuturesUnordered already hands us fused items).
+        let timer = state.clock.sleep_until(state.election_deadline).fuse();
+        futures_util::pin_mut!(timer);
+
+        let next_inbox = inbox_rx.next().fuse();
+        futures_util::pin_mut!(next_inbox);
+
+        // FuturesUnordered::next() returns None when empty, so
+        // we never block on it forever — the timer or inbox
+        // will fire first. Wrapped in a fuse for symmetry.
+        let next_pending = pending.next().fuse();
+        futures_util::pin_mut!(next_pending);
+
+        futures_util::select! {
+            msg = next_inbox => {
+                match msg {
+                    Some(RaftMsg::Shutdown) => break,
+                    Some(other) => handle_msg(&mut state, &mut pending, other).await,
+                    None => break,
+                }
             }
-            Ok(RaftMsg::RequestVote { from, req, reply }) => {
-                let resp = handle_request_vote(&mut state, from, req)?;
-                let _ = reply.send(resp);
+            _ = timer => {
+                on_timer(&mut state, &mut pending).await;
             }
-            Ok(RaftMsg::InstallSnapshot { from, req, reply }) => {
-                let resp = handle_install_snapshot(&mut state, from, req)?;
-                let _ = reply.send(resp);
+            outcome = next_pending => {
+                if let Some(o) = outcome {
+                    handle_rpc_outcome(&mut state, &mut pending, o).await;
+                }
             }
-            Ok(RaftMsg::AppendResponse { from, resp }) => {
-                handle_append_response(&mut state, from, resp)?;
-            }
-            Ok(RaftMsg::VoteResponse { from, resp }) => {
-                handle_vote_response(&mut state, from, resp)?;
-            }
-            Ok(RaftMsg::InstallSnapshotResponse { from, resp, last_included_index }) => {
-                handle_install_snapshot_response(&mut state, from, resp, last_included_index)?;
-            }
-            Ok(RaftMsg::Propose { payload, reply }) => {
-                let result = handle_propose(&mut state, payload);
-                let _ = reply.send(result);
-            }
-            Ok(RaftMsg::QueryState { reply }) => {
-                let _ = reply.send(WorkerSnapshot {
-                    role: state.role,
-                    current_term: state.meta.current_term,
-                    voted_for: state.meta.voted_for,
-                    last_log_index: state.storage.last_index(),
-                    commit_index: state.meta.commit_index,
-                    last_applied: state.meta.last_applied,
-                });
-            }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => match state.role {
-                Role::Follower | Role::Candidate => start_election(&mut state)?,
-                Role::Leader => send_heartbeats(&mut state)?,
-            },
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
 }
 
-fn handle_append_entries<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+async fn handle_msg<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+    msg: RaftMsg<N>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+{
+    match msg {
+        RaftMsg::AppendEntries { from, req, reply } => {
+            if let Ok(resp) = handle_append_entries(state, from, req).await {
+                let _ = reply.send(resp);
+            }
+        }
+        RaftMsg::RequestVote { from, req, reply } => {
+            if let Ok(resp) = handle_request_vote(state, from, req).await {
+                let _ = reply.send(resp);
+            }
+        }
+        RaftMsg::InstallSnapshot { from, req, reply } => {
+            if let Ok(resp) = handle_install_snapshot(state, from, req).await {
+                let _ = reply.send(resp);
+            }
+        }
+        RaftMsg::Propose { payload, reply } => {
+            let r = handle_propose(state, payload, pending).await;
+            let _ = reply.send(r);
+        }
+        RaftMsg::QueryState { reply } => {
+            let _ = reply.send(WorkerSnapshot {
+                role: state.role,
+                current_term: state.meta.current_term,
+                voted_for: state.meta.voted_for,
+                last_log_index: state.storage.last_index(),
+                commit_index: state.meta.commit_index,
+                last_applied: state.meta.last_applied,
+            });
+        }
+        RaftMsg::Shutdown => unreachable!("handled in run_worker"),
+    }
+}
+
+async fn on_timer<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+{
+    match state.role {
+        Role::Follower | Role::Candidate => {
+            let _ = start_election(state, pending).await;
+        }
+        Role::Leader => {
+            let _ = send_heartbeats(state, pending).await;
+        }
+    }
+}
+
+async fn handle_rpc_outcome<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+    _pending: &mut FuturesUnordered<RpcFut<N>>,
+    outcome: RpcOutcome<N>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+{
+    match outcome {
+        RpcOutcome::Append {
+            from,
+            result: Some(resp),
+        } => {
+            let _ = handle_append_response(state, from, resp).await;
+        }
+        RpcOutcome::Vote {
+            from,
+            result: Some(resp),
+        } => {
+            let _ = handle_vote_response(state, from, resp).await;
+        }
+        RpcOutcome::Install {
+            from,
+            result: Some(resp),
+            last_included_index,
+        } => {
+            let _ =
+                handle_install_snapshot_response(state, from, resp, last_included_index).await;
+        }
+        // Transport returned Err — treat as no answer.
+        RpcOutcome::Append { .. } | RpcOutcome::Vote { .. } | RpcOutcome::Install { .. } => {}
+    }
+}
+
+// ── Inbound RPC handlers ────────────────────────────────────
+
+async fn handle_append_entries<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     _from: N,
     req: AppendEntriesReq<N>,
 ) -> Result<AppendEntriesResp, S::Error>
@@ -521,6 +697,8 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if req.term < state.meta.current_term {
         return Ok(AppendEntriesResp {
@@ -529,7 +707,6 @@ where
             match_index: 0,
         });
     }
-
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
@@ -539,15 +716,16 @@ where
     state.leader = None;
     state.reset_election_timer();
 
-    let our_prev_term = state.storage.term_at(req.prev_log_index)?;
+    let our_prev_term = state.storage.term_at(req.prev_log_index).await?;
     let consistent = our_prev_term == Some(req.prev_log_term);
     if !consistent {
-        // Persist the term/voted_for changes (if any) on a
-        // failed append — durability matters even on refusal.
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
         return Ok(AppendEntriesResp {
             term: state.meta.current_term,
             success: false,
@@ -555,17 +733,12 @@ where
         });
     }
 
-    // Find the first divergence between leader's batch and ours,
-    // truncating from there. If everything matches up to our
-    // tail, nothing to truncate; we'll just append the leftover.
     let mut conflict_at: Option<u64> = None;
     let mut already_present = 0usize;
     for (i, e) in req.entries.iter().enumerate() {
         let idx = req.prev_log_index + 1 + i as u64;
-        match state.storage.term_at(idx)? {
-            Some(t) if t == e.term => {
-                already_present += 1;
-            }
+        match state.storage.term_at(idx).await? {
+            Some(t) if t == e.term => already_present += 1,
             Some(_) => {
                 conflict_at = Some(idx);
                 break;
@@ -597,13 +770,16 @@ where
         }
     }
 
-    state.storage.commit_batch(WriteBatch {
-        truncate_after,
-        compact_to: None,
-        appends,
-        state: None,
-        meta: Some(state.meta.clone()),
-    })?;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            truncate_after,
+            compact_to: None,
+            appends,
+            state: None,
+            meta: Some(state.meta.clone()),
+        })
+        .await?;
 
     if commit_advanced {
         state.fire_apply_notification();
@@ -616,8 +792,8 @@ where
     })
 }
 
-fn handle_request_vote<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+async fn handle_request_vote<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     _from: N,
     req: RequestVoteReq<N>,
 ) -> Result<RequestVoteResp, S::Error>
@@ -625,6 +801,8 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if req.term < state.meta.current_term {
         return Ok(RequestVoteResp {
@@ -632,7 +810,6 @@ where
             vote_granted: false,
         });
     }
-
     let mut meta_changed = false;
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
@@ -645,12 +822,10 @@ where
     let our_last_index = state.storage.last_index();
     let candidate_up_to_date = (req.last_log_term > our_last_term)
         || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
-
     let already_voted_otherwise = state
         .meta
         .voted_for
         .is_some_and(|v| v != req.candidate);
-
     let granted = !already_voted_otherwise && candidate_up_to_date;
 
     if granted {
@@ -660,10 +835,13 @@ where
     }
 
     if meta_changed {
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
     }
 
     Ok(RequestVoteResp {
@@ -672,8 +850,8 @@ where
     })
 }
 
-fn handle_install_snapshot<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+async fn handle_install_snapshot<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     _from: N,
     req: InstallSnapshotReq<N>,
 ) -> Result<InstallSnapshotResp, S::Error>
@@ -681,6 +859,8 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if req.term < state.meta.current_term {
         return Ok(InstallSnapshotResp {
@@ -697,11 +877,13 @@ where
     state.reset_election_timer();
 
     if req.last_included_index <= state.storage.snap_last_index() {
-        // Idempotent retry — refresh meta + reply.
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
         return Ok(InstallSnapshotResp {
             term: state.meta.current_term,
         });
@@ -712,12 +894,15 @@ where
     state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
     state.meta.last_applied = state.meta.last_applied.max(req.last_included_index);
 
-    state.storage.commit_batch(WriteBatch {
-        compact_to: Some((req.last_included_index, req.last_included_term)),
-        state: Some(req.snapshot),
-        meta: Some(state.meta.clone()),
-        ..Default::default()
-    })?;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            compact_to: Some((req.last_included_index, req.last_included_term)),
+            state: Some(req.snapshot),
+            meta: Some(state.meta.clone()),
+            ..Default::default()
+        })
+        .await?;
 
     state.fire_apply_notification();
     Ok(InstallSnapshotResp {
@@ -725,8 +910,10 @@ where
     })
 }
 
-fn handle_append_response<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+// ── Outbound RPC response handlers ──────────────────────────
+
+async fn handle_append_response<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     from: N,
     resp: AppendEntriesResp,
 ) -> Result<(), S::Error>
@@ -734,14 +921,19 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
         state.meta.voted_for = None;
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
         step_down(state);
         return Ok(());
     }
@@ -755,7 +947,7 @@ where
     if resp.success {
         leader.match_index.insert(from, resp.match_index);
         leader.next_index.insert(from, resp.match_index + 1);
-        try_advance_commit_index(state)?;
+        try_advance_commit_index(state).await?;
     } else {
         let cur = leader.next_index.get(&from).copied().unwrap_or(1);
         let new_next = cur.saturating_sub(1).max(1);
@@ -764,8 +956,8 @@ where
     Ok(())
 }
 
-fn handle_install_snapshot_response<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+async fn handle_install_snapshot_response<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     from: N,
     resp: InstallSnapshotResp,
     last_included_index: u64,
@@ -774,14 +966,19 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
         state.meta.voted_for = None;
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
         step_down(state);
         return Ok(());
     }
@@ -798,8 +995,8 @@ where
     Ok(())
 }
 
-fn handle_vote_response<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+async fn handle_vote_response<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     from: N,
     resp: RequestVoteResp,
 ) -> Result<(), S::Error>
@@ -807,14 +1004,19 @@ where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
         state.meta.voted_for = None;
-        state.storage.commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })?;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
         step_down(state);
         return Ok(());
     }
@@ -824,20 +1026,30 @@ where
     if resp.vote_granted {
         state.votes_received.insert(from);
         if state.votes_received.len() >= state.quorum() {
-            become_leader(state)?;
+            // Become leader. We can't pass `pending` here without
+            // major plumbing churn — call become_leader inline,
+            // and the next timer tick will fire heartbeats.
+            become_leader_no_heartbeat(state).await?;
+            // Trigger a heartbeat by collapsing the deadline.
+            state.election_deadline = state.clock.now();
         }
     }
     Ok(())
 }
 
-fn handle_propose<N, S, T>(
-    state: &mut WorkerState<N, S, T>,
+// ── Higher-level transitions ────────────────────────────────
+
+async fn handle_propose<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
     payload: Vec<u8>,
+    _pending: &mut FuturesUnordered<RpcFut<N>>,
 ) -> Result<u64, ProposeError<()>>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     if state.role != Role::Leader {
         return Err(ProposeError::NotLeader);
@@ -855,31 +1067,36 @@ where
             appends: alloc::vec![entry],
             ..Default::default()
         })
+        .await
         .map_err(|_| ProposeError::Storage(()))?;
-    // Single-node cluster: own last_index IS the quorum, advance
-    // commit synchronously.
-    let _ = try_advance_commit_index(state);
+    let _ = try_advance_commit_index(state).await;
     Ok(new_index)
 }
 
-fn become_leader<N, S, T>(state: &mut WorkerState<N, S, T>) -> Result<(), S::Error>
+async fn become_leader_no_heartbeat<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+) -> Result<(), S::Error>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     state.set_role(Role::Leader);
     state.votes_received.clear();
     let last = state.storage.last_index();
     state.leader = Some(LeaderState::fresh(&state.cfg.members, state.cfg.me, last));
-    send_heartbeats(state)
+    Ok(())
 }
 
-fn step_down<N, S, T>(state: &mut WorkerState<N, S, T>)
+fn step_down<N, S, T, C, R>(state: &mut WorkerState<N, S, T, C, R>)
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     state.set_role(Role::Follower);
     state.votes_received.clear();
@@ -887,37 +1104,49 @@ where
     state.reset_election_timer();
 }
 
-fn try_advance_commit_index<N, S, T>(state: &mut WorkerState<N, S, T>) -> Result<(), S::Error>
+async fn try_advance_commit_index<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+) -> Result<(), S::Error>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
-    let Some(majority_floor) = state.match_index_majority_floor() else {
+    let Some(majority_floor) = state.match_index_majority_floor().await else {
         return Ok(());
     };
     if majority_floor <= state.meta.commit_index {
         return Ok(());
     }
-    let entry_term = state.storage.term_at(majority_floor)?;
+    let entry_term = state.storage.term_at(majority_floor).await?;
     if entry_term != Some(state.meta.current_term) {
         return Ok(());
     }
     state.meta.commit_index = majority_floor;
     state.meta.last_applied = state.meta.last_applied.max(majority_floor);
-    state.storage.commit_batch(WriteBatch {
-        meta: Some(state.meta.clone()),
-        ..Default::default()
-    })?;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            meta: Some(state.meta.clone()),
+            ..Default::default()
+        })
+        .await?;
     state.fire_apply_notification();
     Ok(())
 }
 
-fn send_heartbeats<N, S, T>(state: &mut WorkerState<N, S, T>) -> Result<(), S::Error>
+async fn send_heartbeats<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+) -> Result<(), S::Error>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     let term = state.meta.current_term;
     let me = state.cfg.me;
@@ -937,9 +1166,8 @@ where
         }
         let next_idx = leader.next_index.get(&peer).copied().unwrap_or(1);
 
-        // Snapshot fallback: peer is behind the snap pointer.
         if next_idx <= snap_idx && snap_idx > 0 {
-            let snapshot = state.storage.read_state().unwrap_or_default();
+            let snapshot = state.storage.read_state().await.unwrap_or_default();
             let req = InstallSnapshotReq {
                 leader: me,
                 term,
@@ -948,27 +1176,29 @@ where
                 snapshot,
             };
             let transport = state.transport.clone();
-            let inbox_tx = state.inbox_tx.clone();
-            thread::spawn(move || {
-                if let Ok(resp) = transport.send_install(peer, req) {
-                    let _ = inbox_tx.send(RaftMsg::InstallSnapshotResponse {
-                        from: peer,
-                        resp,
-                        last_included_index: snap_idx,
-                    });
+            let fut: RpcFut<N> = Box::pin(async move {
+                let result = transport.send_install(peer, req).await.ok();
+                RpcOutcome::Install {
+                    from: peer,
+                    result,
+                    last_included_index: snap_idx,
                 }
             });
+            pending.push(fut);
             continue;
         }
 
         let prev_log_index = next_idx.saturating_sub(1);
-        let prev_log_term = state.storage.term_at(prev_log_index)?.unwrap_or(0);
+        let prev_log_term = state
+            .storage
+            .term_at(prev_log_index)
+            .await?
+            .unwrap_or(0);
         let entries = if next_idx <= leader_last_index {
-            state.storage.entries(next_idx, leader_last_index)?
+            state.storage.entries(next_idx, leader_last_index).await?
         } else {
             Vec::new()
         };
-
         let req = AppendEntriesReq {
             leader: me,
             term,
@@ -978,26 +1208,31 @@ where
             entries,
         };
         let transport = state.transport.clone();
-        let inbox_tx = state.inbox_tx.clone();
-        thread::spawn(move || {
-            if let Ok(resp) = transport.send_append(peer, req) {
-                let _ = inbox_tx.send(RaftMsg::AppendResponse { from: peer, resp });
-            }
+        let fut: RpcFut<N> = Box::pin(async move {
+            let result = transport.send_append(peer, req).await.ok();
+            RpcOutcome::Append { from: peer, result }
         });
+        pending.push(fut);
     }
 
-    let _ = try_compact(state);
+    let _ = try_compact(state).await;
 
-    state.election_deadline =
-        Instant::now() + Duration::from_millis(state.cfg.heartbeat_interval_ms);
+    // Schedule the next heartbeat.
+    state.election_deadline = state
+        .clock
+        .add(state.clock.now(), Duration::from_millis(state.cfg.heartbeat_interval_ms));
     Ok(())
 }
 
-fn try_compact<N, S, T>(state: &mut WorkerState<N, S, T>) -> Result<(), S::Error>
+async fn try_compact<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+) -> Result<(), S::Error>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     let leader = match state.leader.as_ref() {
         Some(l) => l,
@@ -1011,33 +1246,44 @@ where
     if floor <= snap || floor.saturating_sub(snap) < COMPACT_HYSTERESIS {
         return Ok(());
     }
-    let term_at_floor = match state.storage.term_at(floor)? {
+    let term_at_floor = match state.storage.term_at(floor).await? {
         Some(t) => t,
         None => return Ok(()),
     };
     state.meta.snap_last_index = floor;
     state.meta.snap_last_term = term_at_floor;
-    state.storage.commit_batch(WriteBatch {
-        compact_to: Some((floor, term_at_floor)),
-        meta: Some(state.meta.clone()),
-        ..Default::default()
-    })?;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            compact_to: Some((floor, term_at_floor)),
+            meta: Some(state.meta.clone()),
+            ..Default::default()
+        })
+        .await?;
     Ok(())
 }
 
-fn start_election<N, S, T>(state: &mut WorkerState<N, S, T>) -> Result<(), S::Error>
+async fn start_election<N, S, T, C, R>(
+    state: &mut WorkerState<N, S, T, C, R>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+) -> Result<(), S::Error>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
+    C: Clock,
+    R: Rng,
 {
     state.set_role(Role::Candidate);
     state.meta.current_term += 1;
     state.meta.voted_for = Some(state.cfg.me);
-    state.storage.commit_batch(WriteBatch {
-        meta: Some(state.meta.clone()),
-        ..Default::default()
-    })?;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            meta: Some(state.meta.clone()),
+            ..Default::default()
+        })
+        .await?;
     state.votes_received.clear();
     state.votes_received.insert(state.cfg.me);
 
@@ -1057,16 +1303,17 @@ where
             last_log_term,
         };
         let transport = state.transport.clone();
-        let inbox_tx = state.inbox_tx.clone();
-        thread::spawn(move || {
-            if let Ok(resp) = transport.send_vote(peer, req) {
-                let _ = inbox_tx.send(RaftMsg::VoteResponse { from: peer, resp });
-            }
+        let fut: RpcFut<N> = Box::pin(async move {
+            let result = transport.send_vote(peer, req).await.ok();
+            RpcOutcome::Vote { from: peer, result }
         });
+        pending.push(fut);
     }
 
     if state.votes_received.len() >= state.quorum() {
-        become_leader(state)?;
+        become_leader_no_heartbeat(state).await?;
+        // Next loop iteration's timer fires immediately.
+        state.election_deadline = state.clock.now();
     } else {
         state.reset_election_timer();
     }
@@ -1076,8 +1323,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{StdClock, StdRng};
     use crate::storage::MemStorage;
     use crate::transport::test_helpers::RecordingTransport;
+    use crate::testutil::block_on;
 
     fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
         Config {
@@ -1094,14 +1343,16 @@ mod tests {
     fn worker_starts_in_follower_role() {
         let storage = MemStorage::<u16>::new();
         let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn(
+        let worker = Worker::spawn_with(
             storage,
             transport,
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
             None,
+            StdClock,
+            StdRng::from_entropy(),
         );
         let h = worker.handler();
-        let snap = h.snapshot().expect("worker alive");
+        let snap = block_on(h.snapshot()).expect("worker alive");
         assert_eq!(snap.role, Role::Follower);
         assert_eq!(snap.current_term, 0);
         assert_eq!(snap.voted_for, None);
@@ -1115,25 +1366,32 @@ mod tests {
         let transport = Arc::new(RecordingTransport::default());
         let mut cfg = cfg(0xAAAA, alloc::vec![0xAAAA]);
         cfg.election_timeout_ms = (10, 30);
-        let worker = Worker::spawn(storage, transport, cfg, None);
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg,
+            None,
+            StdClock,
+            StdRng::from_entropy(),
+        );
         let h = worker.handler();
 
-        // Wait for self-election.
         let until = std::time::Instant::now() + Duration::from_millis(500);
         loop {
-            if let Some(s) = h.snapshot() {
-                if s.role == Role::Leader { break; }
+            if let Some(s) = block_on(h.snapshot()) {
+                if s.role == Role::Leader {
+                    break;
+                }
             }
             assert!(std::time::Instant::now() < until, "no leadership");
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        let idx = h.propose(alloc::vec![1, 2, 3]).expect("propose");
+        let idx = block_on(h.propose(alloc::vec![1, 2, 3])).expect("propose");
         assert_eq!(idx, 1);
-        let snap = h.snapshot().unwrap();
+        let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.role, Role::Leader);
         assert_eq!(snap.last_log_index, 1);
-        // Single-node quorum advances commit immediately.
         assert_eq!(snap.commit_index, 1);
         assert_eq!(snap.last_applied, 1);
 
@@ -1144,14 +1402,16 @@ mod tests {
     fn follower_accepts_heartbeat_and_advances_term() {
         let storage = MemStorage::<u16>::new();
         let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn(
+        let worker = Worker::spawn_with(
             storage,
             transport,
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
             None,
+            StdClock,
+            StdRng::from_entropy(),
         );
         let h = worker.handler();
-        let resp = h.handle_inbound_append(
+        let resp = block_on(h.handle_inbound_append(
             0xBBBB,
             AppendEntriesReq {
                 leader: 0xBBBB,
@@ -1161,10 +1421,10 @@ mod tests {
                 leader_commit: 0,
                 entries: alloc::vec![],
             },
-        );
+        ));
         assert!(resp.success);
         assert_eq!(resp.term, 5);
-        let snap = h.snapshot().unwrap();
+        let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.current_term, 5);
         worker.shutdown();
     }

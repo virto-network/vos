@@ -3822,6 +3822,8 @@ dependencies = [
  "clap",
  "crdt-counter",
  "dlmalloc",
+ "futures-channel",
+ "futures-executor",
  "grey-transpiler",
  "javm",
  "libloading",
@@ -3853,6 +3855,12 @@ dependencies = [
 [[package]]
 name = "vos-raft"
 version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+]
 
 [[package]]
 name = "vosx"

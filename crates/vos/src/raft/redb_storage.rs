@@ -90,11 +90,11 @@ impl Storage<u16> for RedbStorage {
         self.log.snap_last_term()
     }
 
-    fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
+    async fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
         self.log.term_at(index)
     }
 
-    fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
         let raw = self.log.entries(start, end)?;
         Ok(raw
             .into_iter()
@@ -106,15 +106,15 @@ impl Storage<u16> for RedbStorage {
             .collect())
     }
 
-    fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
+    async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
         Ok(self.state_cache.clone())
     }
 
-    fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
+    async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
         Ok(meta_from_raft(&self.meta))
     }
 
-    fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
+    async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
         // Empty batch: nothing to do. Avoids opening a write txn
         // for a no-op call.
         let touches_log = batch.truncate_after.is_some()
@@ -250,6 +250,10 @@ mod tests {
         }
     }
 
+    fn block_on<F: core::future::Future>(f: F) -> F::Output {
+        futures_executor::block_on(f)
+    }
+
     #[test]
     fn fresh_storage_reports_empty_state() {
         let (db, dir) = temp_db();
@@ -258,8 +262,8 @@ mod tests {
         assert_eq!(s.last_term(), 0);
         assert_eq!(s.snap_last_index(), 0);
         assert_eq!(s.snap_last_term(), 0);
-        assert_eq!(s.read_state().unwrap(), Vec::<u8>::new());
-        let m = s.load_meta().unwrap();
+        assert_eq!(block_on(s.read_state()).unwrap(), Vec::<u8>::new());
+        let m = block_on(s.load_meta()).unwrap();
         assert_eq!(m, Meta::<u16>::default());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -268,22 +272,20 @@ mod tests {
     fn append_then_read_roundtrips_through_disk() {
         let (db, dir) = temp_db();
         let mut s = RedbStorage::open(db.clone()).unwrap();
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             appends: alloc::vec![
                 entry(1, 1, b"a"),
                 entry(2, 1, b"b"),
                 entry(3, 2, b"c"),
             ],
             ..Default::default()
-        })
+        }))
         .unwrap();
         assert_eq!(s.last_index(), 3);
         assert_eq!(s.last_term(), 2);
-        let raw = s.entries(1, 3).unwrap();
+        let raw = block_on(s.entries(1, 3)).unwrap();
         assert_eq!(raw.len(), 3);
         assert_eq!(raw[0].payload, b"a".to_vec());
-        // Reopen on the same db handle — caches must come back
-        // from disk identically.
         drop(s);
         let s2 = RedbStorage::open(db).unwrap();
         assert_eq!(s2.last_index(), 3);
@@ -303,19 +305,18 @@ mod tests {
             snap_last_index: 0,
             snap_last_term: 0,
         };
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             appends: alloc::vec![entry(1, 4, b"first")],
             state: Some(b"snapshot-after-first".to_vec()),
             meta: Some(m.clone()),
             ..Default::default()
-        })
+        }))
         .unwrap();
-        assert_eq!(s.read_state().unwrap(), b"snapshot-after-first".to_vec());
-        assert_eq!(s.load_meta().unwrap(), m);
-        // Reopen — same expectations.
+        assert_eq!(block_on(s.read_state()).unwrap(), b"snapshot-after-first".to_vec());
+        assert_eq!(block_on(s.load_meta()).unwrap(), m);
         let s2 = RedbStorage::open(db).unwrap();
-        assert_eq!(s2.read_state().unwrap(), b"snapshot-after-first".to_vec());
-        assert_eq!(s2.load_meta().unwrap(), m);
+        assert_eq!(block_on(s2.read_state()).unwrap(), b"snapshot-after-first".to_vec());
+        assert_eq!(block_on(s2.load_meta()).unwrap(), m);
         assert_eq!(s2.last_index(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -324,22 +325,21 @@ mod tests {
     fn truncate_then_append_grafts_new_tail() {
         let (db, dir) = temp_db();
         let mut s = RedbStorage::open(db).unwrap();
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             appends: alloc::vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 1, b"c")],
             ..Default::default()
-        })
+        }))
         .unwrap();
-        // Drop tail past index 1, then graft (2,2,..)(3,2,..) on top.
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             truncate_after: Some(1),
             appends: alloc::vec![entry(2, 2, b"B"), entry(3, 2, b"C")],
             ..Default::default()
-        })
+        }))
         .unwrap();
         assert_eq!(s.last_index(), 3);
         assert_eq!(s.last_term(), 2);
-        assert_eq!(s.term_at(2).unwrap(), Some(2));
-        assert_eq!(s.term_at(3).unwrap(), Some(2));
+        assert_eq!(block_on(s.term_at(2)).unwrap(), Some(2));
+        assert_eq!(block_on(s.term_at(3)).unwrap(), Some(2));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -347,22 +347,21 @@ mod tests {
     fn compact_drops_head_and_anchors_term() {
         let (db, dir) = temp_db();
         let mut s = RedbStorage::open(db).unwrap();
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             appends: alloc::vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 2, b"c")],
             ..Default::default()
-        })
+        }))
         .unwrap();
-        s.commit_batch(WriteBatch {
+        block_on(s.commit_batch(WriteBatch {
             compact_to: Some((2, 1)),
             ..Default::default()
-        })
+        }))
         .unwrap();
         assert_eq!(s.snap_last_index(), 2);
         assert_eq!(s.snap_last_term(), 1);
-        assert_eq!(s.term_at(2).unwrap(), Some(1));
-        assert_eq!(s.term_at(3).unwrap(), Some(2));
-        // Pre-compaction entry 1 is gone.
-        assert_eq!(s.term_at(1).unwrap(), None);
+        assert_eq!(block_on(s.term_at(2)).unwrap(), Some(1));
+        assert_eq!(block_on(s.term_at(3)).unwrap(), Some(2));
+        assert_eq!(block_on(s.term_at(1)).unwrap(), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

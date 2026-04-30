@@ -7,11 +7,23 @@ license.workspace = true
 
 [features]
 default = ["std"]
-# `std` enables std-using helpers (e.g. `Default` impls that touch
-# `std::time`). The core data types in this crate compile without
-# `std` so embedded targets can pull them in unchanged. Storage,
-# transport, and the worker loop arrive in later commits and will
-# add their own feature gates.
-std = []
+# `std` enables std-using helpers: `StdClock` (a per-`Delay`
+# thread-spawning timer that's robust under heavy `cargo test`
+# parallelism), `StdRng` (entropy from the system clock), and the
+# `Worker::spawn` helper that drives the async worker loop on a
+# dedicated thread with a tiny single-task executor. Without `std`
+# the same async types compile and can be driven by an
+# Embassy / async-std / custom executor.
+std = ["dep:futures-executor"]
 
 [dependencies]
+# Channels + `select!` + `FuturesUnordered`. `mpsc` needs std,
+# but the rest works on no_std + alloc — a future commit will
+# add a no_std-friendly channel abstraction so the worker can
+# run unchanged on Embassy.
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }
+futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await-macro", "std"] }
+# Std-only minimal executor used by `Worker::spawn` to drive the
+# worker future on a dedicated thread.
+futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }

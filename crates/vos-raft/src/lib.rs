@@ -24,6 +24,7 @@
 
 extern crate alloc;
 
+pub mod clock;
 pub mod config;
 pub mod log_entry;
 pub mod meta;
@@ -32,9 +33,15 @@ pub mod rpc;
 pub mod storage;
 pub mod transport;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 #[cfg(feature = "std")]
 pub mod worker;
 
+pub use clock::{Clock, Rng};
+#[cfg(feature = "std")]
+pub use clock::{StdClock, StdRng};
 pub use config::{Config, NodeId};
 pub use log_entry::LogEntry;
 pub use meta::Meta;

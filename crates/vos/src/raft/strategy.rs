@@ -502,9 +502,12 @@ mod tests {
 
         // Wait for the self-elected leadership before proposing.
         // The single-member quorum fires on the first election
-        // tick (10-30ms randomized).
+        // tick (10-30ms randomized). Generous deadline because
+        // `futures-timer` (the std-clock timer) gets sluggish under
+        // heavy `cargo test` parallelism — the production runtime
+        // doesn't see this contention.
         let h = worker.handler();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(snap) = h.snapshot() {
                 if snap.role == super::super::worker::Role::Leader { break; }

@@ -1,7 +1,7 @@
 //! Transport trait. Sends Raft RPCs to other replicas and
 //! receives their responses.
 //!
-//! The trait is intentionally minimal: send a request, get a
+//! The trait is intentionally minimal: send a request, await a
 //! response, period. Implementations decide:
 //!
 //! - **Routing**. The trait operates on `NodeId`s; the impl
@@ -14,7 +14,10 @@
 //! - **Encoding**. The crate ships pure-data RPC structs;
 //!   serialization is the impl's problem.
 //!
-//! Sync API for now. Commit 4 turns these into `async fn`.
+//! Async API. The worker drives multiple in-flight outbound
+//! RPCs from a single task using `FuturesUnordered` — no thread
+//! spawning required, so the same code runs on Embassy as on
+//! tokio.
 
 use core::fmt::Debug;
 
@@ -28,34 +31,30 @@ use crate::rpc::{
 pub trait Transport<N: NodeId>: Send + Sync + 'static {
     type Error: Debug + Send + Sync + 'static;
 
-    /// Send `AppendEntries` to `peer` and block until the reply
-    /// arrives (or transport says "no answer"). The worker
-    /// invokes this from a helper task in the current
-    /// implementation; the upcoming async version invokes it
-    /// directly on the worker future and lets the executor
-    /// multiplex.
+    /// Send `AppendEntries` to `peer` and await the reply (or a
+    /// "no answer" error from the transport).
     fn send_append(
         &self,
         peer: N,
         req: AppendEntriesReq<N>,
-    ) -> Result<AppendEntriesResp, Self::Error>;
+    ) -> impl core::future::Future<Output = Result<AppendEntriesResp, Self::Error>> + Send;
 
     /// Send `RequestVote` to `peer`.
     fn send_vote(
         &self,
         peer: N,
         req: RequestVoteReq<N>,
-    ) -> Result<RequestVoteResp, Self::Error>;
+    ) -> impl core::future::Future<Output = Result<RequestVoteResp, Self::Error>> + Send;
 
     /// Send `InstallSnapshot` to `peer`. Snapshot bytes are
     /// inside `req.snapshot`; the transport may chunk them as
-    /// it sees fit, but the trait method returns once the peer
-    /// has applied the *whole* snapshot.
+    /// it sees fit, but the future resolves once the peer has
+    /// applied the *whole* snapshot.
     fn send_install(
         &self,
         peer: N,
         req: InstallSnapshotReq<N>,
-    ) -> Result<InstallSnapshotResp, Self::Error>;
+    ) -> impl core::future::Future<Output = Result<InstallSnapshotResp, Self::Error>> + Send;
 }
 
 #[cfg(test)]
@@ -87,20 +86,22 @@ pub(crate) mod test_helpers {
 
     impl Transport<u16> for RecordingTransport {
         type Error = core::convert::Infallible;
-        fn send_append(
+        async fn send_append(
             &self,
             peer: u16,
             req: AppendEntriesReq<u16>,
         ) -> Result<AppendEntriesResp, Self::Error> {
             let term = self.canned_term.load(Ordering::Relaxed);
-            self.appends.lock().unwrap().push((peer, req.clone()));
+            let len = req.entries.len() as u64;
+            let prev = req.prev_log_index;
+            self.appends.lock().unwrap().push((peer, req));
             Ok(AppendEntriesResp {
                 term,
                 success: true,
-                match_index: req.prev_log_index + req.entries.len() as u64,
+                match_index: prev + len,
             })
         }
-        fn send_vote(
+        async fn send_vote(
             &self,
             peer: u16,
             req: RequestVoteReq<u16>,
@@ -112,7 +113,7 @@ pub(crate) mod test_helpers {
                 vote_granted: true,
             })
         }
-        fn send_install(
+        async fn send_install(
             &self,
             peer: u16,
             req: InstallSnapshotReq<u16>,

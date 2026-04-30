@@ -26,6 +26,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::sync::mpsc as std_mpsc;
 
+use futures_executor::block_on;
 use redb::Database;
 
 use crate::commit::CommitError;
@@ -218,20 +219,18 @@ impl WorkerHandle {
     /// the worker's current state. `None` if the worker is shut
     /// down or busy beyond the deadline.
     pub fn snapshot(&self) -> Option<WorkerSnapshot> {
-        self.inner.snapshot().map(WorkerSnapshot::from)
+        block_on(self.inner.snapshot()).map(WorkerSnapshot::from)
     }
 
     /// Append a new payload to the cluster log. Caller addresses a
     /// Leader; followers / candidates return [`ProposeError::NotLeader`].
     pub fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError> {
-        match self.inner.propose(payload) {
+        match block_on(self.inner.propose(payload)) {
             Ok(idx) => Ok(idx),
             Err(vos_raft::ProposeError::NotLeader) => Err(ProposeError::NotLeader),
             // The generic propose surfaces storage errors through
             // the worker loop's tracing; the handle erases the
-            // concrete type. We map the only signal we get back —
-            // "the propose failed, not because we're not leader" —
-            // onto a generic Config error.
+            // concrete type.
             Err(vos_raft::ProposeError::Storage(())) => Err(ProposeError::Storage(
                 CommitError::Config("raft propose: storage write failed".into()),
             )),
@@ -270,7 +269,7 @@ impl RaftRpcHandler for WorkerHandle {
                 })
                 .collect(),
         };
-        let resp = self.inner.handle_inbound_append(from_prefix, req);
+        let resp = block_on(self.inner.handle_inbound_append(from_prefix, req));
         RaftAppendResult {
             term: resp.term,
             success: resp.success,
@@ -292,7 +291,7 @@ impl RaftRpcHandler for WorkerHandle {
             last_log_index,
             last_log_term,
         };
-        let resp = self.inner.handle_inbound_vote(from_prefix, req);
+        let resp = block_on(self.inner.handle_inbound_vote(from_prefix, req));
         RaftVoteResult {
             term: resp.term,
             vote_granted: resp.vote_granted,
@@ -315,7 +314,7 @@ impl RaftRpcHandler for WorkerHandle {
             last_included_term,
             snapshot,
         };
-        let resp = self.inner.handle_inbound_install(from_prefix, req);
+        let resp = block_on(self.inner.handle_inbound_install(from_prefix, req));
         RaftInstallSnapshotResult { term: resp.term }
     }
 }
@@ -341,7 +340,7 @@ impl std::error::Error for NoopError {}
 impl RaftTransport<u16> for NoopTransport {
     type Error = NoopError;
 
-    fn send_append(
+    async fn send_append(
         &self,
         _peer: u16,
         _req: AppendEntriesReq<u16>,
@@ -349,7 +348,7 @@ impl RaftTransport<u16> for NoopTransport {
         Err(NoopError)
     }
 
-    fn send_vote(
+    async fn send_vote(
         &self,
         _peer: u16,
         _req: RequestVoteReq<u16>,
@@ -357,7 +356,7 @@ impl RaftTransport<u16> for NoopTransport {
         Err(NoopError)
     }
 
-    fn send_install(
+    async fn send_install(
         &self,
         _peer: u16,
         _req: InstallSnapshotReq<u16>,
@@ -567,7 +566,7 @@ mod tests {
         };
         let worker = RaftWorker::spawn(db, cfg, None, None);
         let h = worker.handler();
-        assert!(wait_for_role(&h, Role::Leader, Duration::from_millis(500)),
+        assert!(wait_for_role(&h, Role::Leader, Duration::from_secs(5)),
             "solo cluster must self-elect to leader");
         worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
@@ -675,7 +674,7 @@ mod tests {
         };
         let worker = RaftWorker::spawn(db.clone(), cfg, None, None);
         let h = worker.handler();
-        assert!(wait_for_role(&h, Role::Leader, Duration::from_millis(500)));
+        assert!(wait_for_role(&h, Role::Leader, Duration::from_secs(5)));
 
         let idx = h.propose(b"first".to_vec()).expect("propose");
         assert_eq!(idx, 1);

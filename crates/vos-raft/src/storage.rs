@@ -1,9 +1,12 @@
 //! Storage trait. Hides the on-disk shape of the Raft log + meta
 //! + snapshot state behind a small handful of read/write methods.
 //!
-//! Sync API for now. A later commit will make the methods
-//! `async` so embedded users running on Embassy / async storage
-//! drivers can implement without spawning blocking tasks.
+//! Async API. Implementations whose backend is genuinely
+//! synchronous (an in-memory `BTreeMap`, a redb txn) are free to
+//! return ready futures from inside an `async fn` body — there's
+//! no required yield. Implementations on top of async storage
+//! drivers (Embassy SPI flash, an async key-value store) can
+//! `.await` natively.
 //!
 //! ## Design notes
 //!
@@ -83,10 +86,16 @@ impl<N: NodeId> Default for WriteBatch<N> {
 /// Implementations own the on-disk representation. The crate
 /// ships a [`MemStorage`](crate::storage::MemStorage) for tests;
 /// vos provides a redb-backed impl in its own module.
+///
+/// `last_*` / `snap_last_*` are sync — they're hot-path reads
+/// the worker checks on every loop iteration, and an
+/// implementation is expected to keep them in memory. The
+/// random-access + write methods are `async fn` so an embedded
+/// SPI-flash impl can yield while the bus transfers bytes.
 pub trait Storage<N: NodeId>: Send + 'static {
     type Error: Debug + Send + Sync + 'static;
 
-    // ── Cached log-tail scalars ─────────────────────────────
+    // ── Cached log-tail scalars (sync) ──────────────────────
     /// Index of the highest entry currently in the log. `0` =
     /// no entries (and no snapshot either).
     fn last_index(&self) -> u64;
@@ -100,32 +109,46 @@ pub trait Storage<N: NodeId>: Send + 'static {
     /// snapshot exists.
     fn snap_last_term(&self) -> u64;
 
-    // ── Random-access reads ─────────────────────────────────
+    // ── Random-access reads (async) ─────────────────────────
     /// Term of the entry at `index`, or `None` if out of range.
     /// Index `0` is the implicit pre-log slot — both sides agree
     /// it has term `0`. `index == snap_last_index` returns the
     /// snap term; `index < snap_last_index` returns `None`
     /// (the entry has been compacted away).
-    fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error>;
+    fn term_at(
+        &self,
+        index: u64,
+    ) -> impl core::future::Future<Output = Result<Option<u64>, Self::Error>> + Send;
 
     /// Read entries `[start..=end]` in index order. Indices that
     /// have been compacted are silently skipped — callers asking
     /// for those should fall back to a snapshot install.
-    fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error>;
+    fn entries(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> impl core::future::Future<Output = Result<Vec<LogEntry>, Self::Error>> + Send;
 
     /// Read the snapshot row. Empty `Vec` when no snapshot has
     /// been installed.
-    fn read_state(&self) -> Result<Vec<u8>, Self::Error>;
+    fn read_state(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send;
 
     /// Read all durable scalars. Default for a fresh log:
     /// `Meta::default()`.
-    fn load_meta(&self) -> Result<Meta<N>, Self::Error>;
+    fn load_meta(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Meta<N>, Self::Error>> + Send;
 
-    // ── Atomic write ────────────────────────────────────────
+    // ── Atomic write (async) ────────────────────────────────
     /// Apply a [`WriteBatch`] atomically, refresh whatever the
     /// implementation needs for its cached `last_*` / `snap_*`
     /// readers, and return.
-    fn commit_batch(&mut self, batch: WriteBatch<N>) -> Result<(), Self::Error>;
+    fn commit_batch(
+        &mut self,
+        batch: WriteBatch<N>,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // ── In-memory test backend ──────────────────────────────────
@@ -182,7 +205,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         self.meta.snap_last_term
     }
 
-    fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
+    async fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
         if index == 0 {
             return Ok(Some(0));
         }
@@ -195,7 +218,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.log.get(&index).map(|e| e.term))
     }
 
-    fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
         if start > end {
             return Ok(Vec::new());
         }
@@ -207,15 +230,15 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
             .collect())
     }
 
-    fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
+    async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
         Ok(self.state.clone())
     }
 
-    fn load_meta(&self) -> Result<Meta<N>, Self::Error> {
+    async fn load_meta(&self) -> Result<Meta<N>, Self::Error> {
         Ok(self.meta.clone())
     }
 
-    fn commit_batch(&mut self, batch: WriteBatch<N>) -> Result<(), Self::Error> {
+    async fn commit_batch(&mut self, batch: WriteBatch<N>) -> Result<(), Self::Error> {
         if let Some(after) = batch.truncate_after {
             self.log.retain(|k, _| *k <= after);
         }
@@ -245,6 +268,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use crate::testutil::block_on;
 
     type Mem = MemStorage<u16>;
 
@@ -258,66 +282,79 @@ mod tests {
 
     #[test]
     fn fresh_storage_has_zero_indices() {
-        let s = Mem::new();
-        assert_eq!(s.last_index(), 0);
-        assert_eq!(s.last_term(), 0);
-        assert_eq!(s.snap_last_index(), 0);
-        assert_eq!(s.term_at(0).unwrap(), Some(0));
-        assert_eq!(s.term_at(1).unwrap(), None);
+        block_on(async {
+            let s = Mem::new();
+            assert_eq!(s.last_index(), 0);
+            assert_eq!(s.last_term(), 0);
+            assert_eq!(s.snap_last_index(), 0);
+            assert_eq!(s.term_at(0).await.unwrap(), Some(0));
+            assert_eq!(s.term_at(1).await.unwrap(), None);
+        });
     }
 
     #[test]
     fn append_and_read_roundtrip() {
-        let mut s = Mem::new();
-        s.commit_batch(WriteBatch {
-            appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(s.last_index(), 3);
-        assert_eq!(s.last_term(), 2);
-        assert_eq!(s.term_at(2).unwrap(), Some(1));
-        assert_eq!(s.entries(1, 3).unwrap().len(), 3);
+        block_on(async {
+            let mut s = Mem::new();
+            s.commit_batch(WriteBatch {
+                appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(s.last_index(), 3);
+            assert_eq!(s.last_term(), 2);
+            assert_eq!(s.term_at(2).await.unwrap(), Some(1));
+            assert_eq!(s.entries(1, 3).await.unwrap().len(), 3);
+        });
     }
 
     #[test]
     fn truncate_after_drops_tail() {
-        let mut s = Mem::new();
-        s.commit_batch(WriteBatch {
-            appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
-            ..Default::default()
-        })
-        .unwrap();
-        s.commit_batch(WriteBatch {
-            truncate_after: Some(1),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(s.last_index(), 1);
-        assert_eq!(s.entries(1, 5).unwrap().len(), 1);
+        block_on(async {
+            let mut s = Mem::new();
+            s.commit_batch(WriteBatch {
+                appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            s.commit_batch(WriteBatch {
+                truncate_after: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(s.last_index(), 1);
+            assert_eq!(s.entries(1, 5).await.unwrap().len(), 1);
+        });
     }
 
     #[test]
     fn compact_drops_head_and_anchors_term() {
-        let mut s = Mem::new();
-        s.commit_batch(WriteBatch {
-            appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
-            ..Default::default()
-        })
-        .unwrap();
-        s.commit_batch(WriteBatch {
-            compact_to: Some((2, 1)),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(s.snap_last_index(), 2);
-        assert_eq!(s.snap_last_term(), 1);
-        assert_eq!(s.term_at(1).unwrap(), None,
-            "compacted entry returns None");
-        assert_eq!(s.term_at(2).unwrap(), Some(1),
-            "snap boundary returns snap_last_term");
-        assert_eq!(s.term_at(3).unwrap(), Some(2));
-        assert_eq!(s.entries(1, 5).unwrap().len(), 1,
-            "only entry 3 survives compaction");
+        block_on(async {
+            let mut s = Mem::new();
+            s.commit_batch(WriteBatch {
+                appends: vec![entry(1, 1), entry(2, 1), entry(3, 2)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            s.commit_batch(WriteBatch {
+                compact_to: Some((2, 1)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(s.snap_last_index(), 2);
+            assert_eq!(s.snap_last_term(), 1);
+            assert_eq!(s.term_at(1).await.unwrap(), None,
+                "compacted entry returns None");
+            assert_eq!(s.term_at(2).await.unwrap(), Some(1),
+                "snap boundary returns snap_last_term");
+            assert_eq!(s.term_at(3).await.unwrap(), Some(2));
+            assert_eq!(s.entries(1, 5).await.unwrap().len(), 1,
+                "only entry 3 survives compaction");
+        });
     }
 }

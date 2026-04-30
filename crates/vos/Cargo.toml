@@ -49,6 +49,12 @@ merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
+# Drives vos-raft's async Storage / Transport futures from inside
+# the existing sync Network::set_raft_handler / RaftCommit code
+# paths. Always-on (cheap, std-only) so the storage/network feature
+# gates don't have to fan it out.
+futures-executor = { version = "0.3", default-features = false, features = ["std"] }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 
 [dev-dependencies]
 # Tests need typed access to the registry actor — `host` pulls
