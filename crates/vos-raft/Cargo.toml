@@ -29,3 +29,8 @@ std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
 futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
 futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Property-based testing — randomly generated AppendEntries /
+# RequestVote sequences vs. Raft safety invariants.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
