@@ -445,6 +445,154 @@ fn prove_count_set_bits_32_smoke() {
     verify(proof, &side_note).expect("verification failed");
 }
 
+// Phase 34: LeadingZeroBits / TrailingZeroBits via BitcountChip.
+#[test]
+fn prove_leading_zero_bits_64_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0x0000_0000_0001_0000u64; // bit 16 set → LZ = 47
+    let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run(), javm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 47);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_leading_zero_bits_64_zero() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0;
+    let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 64);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_leading_zero_bits_64_msb() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 1u64 << 63; // MSB set → LZ = 0
+    let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 0);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_leading_zero_bits_32_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    // Low 32 bits = 1 → LZ32 = 31.  High 32 bits arbitrary (ignored).
+    regs[0] = 0xDEAD_BEEF_0000_0001u64;
+    let code = vec![Opcode::LeadingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 31);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_leading_zero_bits_32_zero_low() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    // Low 32 bits = 0, high 32 bits set → LZ32 = 32.
+    regs[0] = 0xFFFF_FFFF_0000_0000u64;
+    let code = vec![Opcode::LeadingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 32);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_trailing_zero_bits_64_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0x0000_0000_0010_0000u64; // bit 20 set → TZ = 20
+    let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 20);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_trailing_zero_bits_64_zero() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0;
+    let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 64);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_trailing_zero_bits_64_lsb() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 1; // LSB set → TZ = 0
+    let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 0);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
+#[test]
+fn prove_trailing_zero_bits_32_zero_low() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    // Low 32 bits = 0, high 32 bits set.  Interpreter: TZ32 of 0 = 32.
+    regs[0] = 0xFFFF_FFFF_0000_0000u64;
+    let code = vec![Opcode::TrailingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].regs_after[1], 32);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
 #[test]
 fn prove_sign_extend_8() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];

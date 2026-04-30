@@ -196,6 +196,16 @@ pub enum PreprocessedColumn {
     /// the result binding `result[0] = sum(BytePopcount[0..N])`,
     /// `result[1..8] = 0`.
     #[size = 1] IsCountSetBits,
+    /// Phase 34: 1 at PCs whose canonical decoding is
+    /// `LeadingZeroBits64` or `LeadingZeroBits32`.  Drives the
+    /// per-byte bitcount lookup + the LZ result binding (first-non-
+    /// zero MSB-direction indicator over `ValDPartialNZMsb`).
+    #[size = 1] IsLzb,
+    /// Phase 34: 1 at PCs whose canonical decoding is
+    /// `TrailingZeroBits64` or `TrailingZeroBits32`.  Drives the
+    /// LSB-direction first-non-zero indicator (reuses Phase 29's
+    /// `ValDPartialNZ`) + the TZ result binding.
+    #[size = 1] IsTzb,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
@@ -272,6 +282,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         let f_is_store_ind = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsStoreInd);
         let f_is_rotate_l64 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsRotateL64);
         let f_is_count_set_bits = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsCountSetBits);
+        let f_is_lzb = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLzb);
+        let f_is_tzb = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTzb);
         let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
             trace_eval, PreprocessedColumn::BranchTargetCanon
@@ -329,6 +341,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(f_is_store_ind[0].clone());
         tuple.push(f_is_rotate_l64[0].clone());
         tuple.push(f_is_count_set_bits[0].clone());
+        tuple.push(f_is_lzb[0].clone());
+        tuple.push(f_is_tzb[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -412,6 +426,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     PreprocessedColumn::IsStoreInd,
                     PreprocessedColumn::IsRotateL64,
                     PreprocessedColumn::IsCountSetBits,
+                    PreprocessedColumn::IsLzb,
+                    PreprocessedColumn::IsTzb,
                 ];
                 for (i, col) in flag_cols.iter().enumerate() {
                     trace.fill_columns(row, d.flags[i], *col);
@@ -503,6 +519,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let f_is_store_ind = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsStoreInd);
         let f_is_rotate_l64 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsRotateL64);
         let f_is_count_set_bits = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsCountSetBits);
+        let f_is_lzb = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsLzb);
+        let f_is_tzb = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::IsTzb);
         let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
             component_trace, PreprocessedColumn::BranchTargetCanon
@@ -559,6 +577,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(f_is_store_ind[0].clone());
         tuple.push(f_is_rotate_l64[0].clone());
         tuple.push(f_is_count_set_bits[0].clone());
+        tuple.push(f_is_lzb[0].clone());
+        tuple.push(f_is_tzb[0].clone());
         tuple.extend_from_slice(&imm_y_canon);
         tuple.extend_from_slice(&branch_target_canon);
 
@@ -592,7 +612,7 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    flags: [u8; 42],
+    flags: [u8; 44],
     branch_target_canon: u32,
     imm_y_canon: u32,
 }

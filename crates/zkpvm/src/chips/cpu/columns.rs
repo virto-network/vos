@@ -790,6 +790,41 @@ pub enum Column {
     /// (32-bit) or all 8 (64-bit).
     #[size = 8]
     BytePopcount,
+    // ── Phase 34: LeadingZero / TrailingZero binding via bitcount lookup ──
+    /// Phase 34: 1 iff this opcode is `LeadingZeroBits64 / 32`.
+    /// Pinned to `classify_opcode(opcode).is_lzb` via ProgramMemoryChip's
+    /// preprocessed table.
+    #[size = 1]
+    IsLzb,
+    /// Phase 34: 1 iff this opcode is `TrailingZeroBits64 / 32`.
+    #[size = 1]
+    IsTzb,
+    /// Phase 34: per-byte leading-zeros witnesses for the 8 bytes of `val_d`.
+    /// `BitOpLzByte[i] = val_d[i].leading_zeros()` (8 if val_d[i] = 0)
+    /// enforced via the BitcountChip lookup.  Used for both LZ32 and LZ64
+    /// rows; only the relevant prefix participates in the result formula.
+    #[size = 8]
+    BitOpLzByte,
+    /// Phase 34: per-byte trailing-zeros witnesses for the 8 bytes of `val_d`.
+    /// `BitOpTzByte[i] = val_d[i].trailing_zeros()` (8 if val_d[i] = 0).
+    #[size = 8]
+    BitOpTzByte,
+    /// Phase 34: cumulative-OR of byte_indicator[i..7] (MSB-direction
+    /// prefix non-zero indicator).  Mirrors Phase 29's `ValDPartialNZ`
+    /// but walking from byte 7 down to byte 0.  `ValDPartialNZMsb[7] =
+    /// byte_indicator[7]`, `ValDPartialNZMsb[i] = ValDPartialNZMsb[i+1]
+    /// OR byte_indicator[i]`.  Used for LZ64's first-non-zero-from-MSB
+    /// indicator.
+    #[size = 8]
+    ValDPartialNZMsb,
+    /// Phase 34: cumulative-OR of byte_indicator[i..3] (MSB-direction
+    /// prefix non-zero indicator over the LOW 4 bytes only).  Used for
+    /// LZ32, where the high 4 bytes of `val_d` are ignored.  Layout:
+    /// `ValDPartialNZMsbLo[3] = byte_indicator[3]`, then
+    /// `ValDPartialNZMsbLo[i] = ValDPartialNZMsbLo[i+1] OR byte_indicator[i]`
+    /// for i = 2, 1, 0.
+    #[size = 4]
+    ValDPartialNZMsbLo,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

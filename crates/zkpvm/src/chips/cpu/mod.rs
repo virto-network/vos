@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -62,7 +62,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements),
     );
 
 
@@ -79,10 +79,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup)) = lookup_elements;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -1301,6 +1301,169 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // PHASE 34 — BITMANIP LeadingZeroBits / TrailingZeroBits 32 / 64.
+        //
+        // Per-byte LZ/TZ are bound via a separate (byte, lz, tz) lookup
+        // (BitcountChip, 256-row preprocessed table).  The result formula
+        // uses Phase 29's `ValDPartialNZ` (LSB-direction prefix-OR) for
+        // TZ, and a new `ValDPartialNZMsb[8]` (MSB-direction prefix-OR)
+        // plus `ValDPartialNZMsbLo[4]` (MSB over low-4-bytes only) for
+        // LZ.  All three chains piggyback on Phase 29's `ValDByteInv` to
+        // compute byte indicators.
+        //
+        // First-non-zero indicator at position i: `is_first_nz[i] =
+        //   partial[i] − partial[i-1]` (with partial[-1] := 0).  For a
+        //   non-zero val_d this is 1 at exactly one index k (the first
+        //   non-zero byte) and 0 elsewhere; for val_d = 0 it's 0 at all
+        //   positions.  Sum_{i} is_first_nz[i] = partial[last]
+        //   (telescoping), so when val_d = 0 the default 64/32 fallback
+        //   is gated on `1 − partial[last]`.
+        //
+        // Result formulas:
+        //   TZ64: result[0] = sum_{i=0..7} is_first_nz[i] · (8·i + TzByte[i])
+        //                     + (1 − partial[7]) · 64
+        //   TZ32: result[0] = sum_{i=0..3} is_first_nz[i] · (8·i + TzByte[i])
+        //                     + (1 − partial[3]) · 32
+        //   LZ64: result[0] = sum_{i=0..7} is_first_nz_msb[i] · (8·(7−i)
+        //                       + LzByte[i])
+        //                     + (1 − partial_msb[0]) · 64
+        //   LZ32: result[0] = sum_{i=0..3} is_first_nz_msb_lo[i] · (8·(3−i)
+        //                       + LzByte[i])
+        //                     + (1 − partial_msb_lo[0]) · 32
+        // ════════════════════════════════════════════════════════════════════
+        let is_lzb = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
+        let is_tzb = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
+        let bit_op_lz_byte = crate::trace::trace_eval!(trace_eval, Column::BitOpLzByte);
+        let bit_op_tz_byte = crate::trace::trace_eval!(trace_eval, Column::BitOpTzByte);
+        let val_d_partial_nz_p34 = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
+        let val_d_partial_nz_msb = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsb);
+        let val_d_partial_nz_msb_lo = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
+        let val_d_byte_inv_p34 = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
+
+        // ── ValDPartialNZMsb[8] recurrence (MSB direction over all 8 bytes).
+        // partial_msb[7] = byte_indicator[7];
+        // partial_msb[i] = partial_msb[i+1] OR byte_indicator[i].
+        eval.add_constraint(
+            is_real.clone()
+                * (val_d_partial_nz_msb[7].clone()
+                    - val_d[7].clone() * val_d_byte_inv_p34[7].clone())
+        );
+        for i in (0..7).rev() {
+            let byte_ind = val_d[i].clone() * val_d_byte_inv_p34[i].clone();
+            let or_expr = val_d_partial_nz_msb[i + 1].clone()
+                + byte_ind.clone()
+                - val_d_partial_nz_msb[i + 1].clone() * byte_ind;
+            eval.add_constraint(
+                is_real.clone() * (val_d_partial_nz_msb[i].clone() - or_expr)
+            );
+        }
+
+        // ── ValDPartialNZMsbLo[4] recurrence (MSB direction over low 4
+        //   bytes only — for LZ32, where high bytes of val_d are ignored).
+        // partial_msb_lo[3] = byte_indicator[3];
+        // partial_msb_lo[i] = partial_msb_lo[i+1] OR byte_indicator[i].
+        eval.add_constraint(
+            is_real.clone()
+                * (val_d_partial_nz_msb_lo[3].clone()
+                    - val_d[3].clone() * val_d_byte_inv_p34[3].clone())
+        );
+        for i in (0..3).rev() {
+            let byte_ind = val_d[i].clone() * val_d_byte_inv_p34[i].clone();
+            let or_expr = val_d_partial_nz_msb_lo[i + 1].clone()
+                + byte_ind.clone()
+                - val_d_partial_nz_msb_lo[i + 1].clone() * byte_ind;
+            eval.add_constraint(
+                is_real.clone() * (val_d_partial_nz_msb_lo[i].clone() - or_expr)
+            );
+        }
+
+        // ── TZ result binding ──
+        // is_first_nz[0] = partial[0]; is_first_nz[i] = partial[i] − partial[i-1].
+        let mut tz_lo4 = E::F::zero();
+        let mut tz_hi4 = E::F::zero();
+        for i in 0..WORD_SIZE {
+            let prev = if i == 0 {
+                E::F::zero()
+            } else {
+                val_d_partial_nz_p34[i - 1].clone()
+            };
+            let is_first_nz = val_d_partial_nz_p34[i].clone() - prev;
+            let term = is_first_nz
+                * (E::F::from(BaseField::from(8u32 * i as u32))
+                    + bit_op_tz_byte[i].clone());
+            if i < 4 {
+                tz_lo4 = tz_lo4 + term;
+            } else {
+                tz_hi4 = tz_hi4 + term;
+            }
+        }
+        // 64-bit branch: tz_lo4 + tz_hi4 + (1 - partial[7]) · 64.
+        // 32-bit branch: tz_lo4 + (1 - partial[3]) · 32.
+        let tz_default_64 = E::F::from(BaseField::from(64u32))
+            * (E::F::one() - val_d_partial_nz_p34[7].clone());
+        let tz_default_32 = E::F::from(BaseField::from(32u32))
+            * (E::F::one() - val_d_partial_nz_p34[3].clone());
+        let tz_expr = tz_lo4
+            + is_64bit.clone() * (tz_hi4 + tz_default_64)
+            + is_32bit[0].clone() * tz_default_32;
+        eval.add_constraint(
+            is_tzb[0].clone() * (result[0].clone() - tz_expr)
+        );
+
+        // ── LZ result binding ──
+        // is_first_nz_msb[i] = partial_msb[i] − partial_msb[i+1] (with
+        //   partial_msb[8] := 0 for i = 7).
+        // is_first_nz_msb_lo[i] over the LOW 4 bytes uses partial_msb_lo
+        //   (which spans only bytes 0..3), with partial_msb_lo[4] := 0
+        //   for i = 3.
+        let mut lz_64 = E::F::zero();
+        for i in 0..WORD_SIZE {
+            let next = if i + 1 < WORD_SIZE {
+                val_d_partial_nz_msb[i + 1].clone()
+            } else {
+                E::F::zero()
+            };
+            let is_first_nz_msb = val_d_partial_nz_msb[i].clone() - next;
+            // For LZ64: position contribution is 8·(7 − i).
+            let pos_weight = 8u32 * (7 - i as u32);
+            let term = is_first_nz_msb
+                * (E::F::from(BaseField::from(pos_weight))
+                    + bit_op_lz_byte[i].clone());
+            lz_64 = lz_64 + term;
+        }
+        let lz_default_64 = E::F::from(BaseField::from(64u32))
+            * (E::F::one() - val_d_partial_nz_msb[0].clone());
+        // LZ32 sums over bytes 0..3 with position contribution 8·(3 − i).
+        let mut lz_32 = E::F::zero();
+        for i in 0..4 {
+            let next = if i + 1 < 4 {
+                val_d_partial_nz_msb_lo[i + 1].clone()
+            } else {
+                E::F::zero()
+            };
+            let is_first_nz_msb_lo = val_d_partial_nz_msb_lo[i].clone() - next;
+            let pos_weight = 8u32 * (3 - i as u32);
+            let term = is_first_nz_msb_lo
+                * (E::F::from(BaseField::from(pos_weight))
+                    + bit_op_lz_byte[i].clone());
+            lz_32 = lz_32 + term;
+        }
+        let lz_default_32 = E::F::from(BaseField::from(32u32))
+            * (E::F::one() - val_d_partial_nz_msb_lo[0].clone());
+        let lz_expr = is_64bit.clone() * (lz_64 + lz_default_64)
+            + is_32bit[0].clone() * (lz_32 + lz_default_32);
+        eval.add_constraint(
+            is_lzb[0].clone() * (result[0].clone() - lz_expr)
+        );
+
+        // High bytes of result are zero on LZ/TZ rows.
+        for i in 1..WORD_SIZE {
+            eval.add_constraint(
+                (is_lzb[0].clone() + is_tzb[0].clone()) * result[i].clone()
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // CONTROL FLOW: constrain next_pc based on branch/jump
         // ════════════════════════════════════════════════════════════════════
         let is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
@@ -1701,6 +1864,24 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
+        // Phase 34: Bitcount lookup — per-byte (val_d[i], BitOpLzByte[i],
+        // BitOpTzByte[i]) on LZ/TZ rows.  Producer multiplicity =
+        // is_lzb + is_tzb (mutually exclusive — at most one is 1 per row).
+        {
+            for i in 0..WORD_SIZE {
+                let tuple = vec![
+                    val_d[i].clone(),
+                    bit_op_lz_byte[i].clone(),
+                    bit_op_tz_byte[i].clone(),
+                ];
+                eval.add_to_relation(RelationEntry::new(
+                    bitcount_lookup,
+                    (is_lzb[0].clone() + is_tzb[0].clone()).into(),
+                    &tuple,
+                ));
+            }
+        }
+
         // Register-memory producers (Phase 9d): mirror of the interaction
         // trace emissions in the same order (ValB read → ValD read → Result
         // write) so finalize_logup_in_pairs pairs correctly.
@@ -2058,6 +2239,8 @@ impl BuiltInComponent for CpuChip {
             let f_is_store_ind = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
             let f_is_rotate_l64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
             let f_is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
+            let f_is_lzb = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
+            let f_is_tzb = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2112,6 +2295,8 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_store_ind[0].clone());
             tuple.push(f_is_rotate_l64[0].clone());
             tuple.push(f_is_count_set_bits[0].clone());
+            tuple.push(f_is_lzb[0].clone());
+            tuple.push(f_is_tzb[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -3629,6 +3814,47 @@ impl BuiltInProverComponent for CpuChip {
                     side_note.popcount_counts[val_d_bytes[i] as usize] += 1;
                 }
             }
+            // Phase 34: LeadingZeroBits / TrailingZeroBits witnesses.
+            // Per-byte LZ/TZ (8 if byte = 0, else byte.leading_zeros() /
+            // trailing_zeros()).  ValDPartialNZMsb (MSB-direction OR over
+            // 8 bytes) and ValDPartialNZMsbLo (MSB-direction OR over the
+            // low 4 bytes only — for LZ32).
+            trace.fill_columns(row, flags.is_lzb, Column::IsLzb);
+            trace.fill_columns(row, flags.is_tzb, Column::IsTzb);
+            let mut bit_op_lz = [0u8; WORD_SIZE];
+            let mut bit_op_tz = [0u8; WORD_SIZE];
+            for i in 0..WORD_SIZE {
+                let b = val_d_bytes[i];
+                bit_op_lz[i] = if b == 0 { 8 } else { b.leading_zeros() as u8 };
+                bit_op_tz[i] = if b == 0 { 8 } else { b.trailing_zeros() as u8 };
+            }
+            trace.fill_columns_bytes(row, &bit_op_lz, Column::BitOpLzByte);
+            trace.fill_columns_bytes(row, &bit_op_tz, Column::BitOpTzByte);
+            // ValDPartialNZMsb: cumulative-OR from byte 7 down.
+            let mut val_d_partial_nz_msb = [0u8; WORD_SIZE];
+            let mut running_msb: u8 = 0;
+            for i in (0..WORD_SIZE).rev() {
+                let nz = if val_d_bytes[i] != 0 { 1 } else { 0 };
+                running_msb |= nz;
+                val_d_partial_nz_msb[i] = running_msb;
+            }
+            trace.fill_columns_bytes(row, &val_d_partial_nz_msb, Column::ValDPartialNZMsb);
+            // ValDPartialNZMsbLo: cumulative-OR from byte 3 down (low 4 only).
+            let mut val_d_partial_nz_msb_lo = [0u8; 4];
+            let mut running_msb_lo: u8 = 0;
+            for i in (0..4).rev() {
+                let nz = if val_d_bytes[i] != 0 { 1 } else { 0 };
+                running_msb_lo |= nz;
+                val_d_partial_nz_msb_lo[i] = running_msb_lo;
+            }
+            trace.fill_columns_bytes(row, &val_d_partial_nz_msb_lo, Column::ValDPartialNZMsbLo);
+            // Charge bitcount_counts for the 8 emissions when this is an
+            // LZ/TZ row.  Mutually exclusive — at most one of is_lzb / is_tzb.
+            if flags.is_lzb || flags.is_tzb {
+                for i in 0..WORD_SIZE {
+                    side_note.bitcount_counts[val_d_bytes[i] as usize] += 1;
+                }
+            }
             let mut mem_addr_carry = [0u8; 4];
             if flags.is_mem_indirect {
                 let val_b_bytes_le = val_b.to_le_bytes();
@@ -3977,6 +4203,24 @@ impl BuiltInProverComponent for CpuChip {
             }
         }
 
+        // Phase 34: Bitcount lookup — per-byte (val_d[i], BitOpLzByte[i],
+        // BitOpTzByte[i]) on LZ/TZ rows.  Multiplicity = is_lzb + is_tzb.
+        {
+            let bitcount_lookup: &BitcountLookupElements = lookup_elements.as_ref();
+            let is_lzb_col = crate::trace::original_base_column!(component_trace, Column::IsLzb);
+            let is_tzb_col = crate::trace::original_base_column!(component_trace, Column::IsTzb);
+            let lz_col = crate::trace::original_base_column!(component_trace, Column::BitOpLzByte);
+            let tz_col = crate::trace::original_base_column!(component_trace, Column::BitOpTzByte);
+            for i in 0..WORD_SIZE {
+                logup.add_to_relation_with(
+                    bitcount_lookup,
+                    [is_lzb_col[0].clone(), is_tzb_col[0].clone()],
+                    |[lz, tz]| (lz + tz).into(),
+                    &[val_d_cols[i].clone(), lz_col[i].clone(), tz_col[i].clone()],
+                );
+            }
+        }
+
         // ── Register-memory producer emissions (Phase 9d) ──
         // Three potential register accesses per step: ValB read, ValD read,
         // Result write.  Each is gated by its Is* flag and emits a tuple
@@ -4213,6 +4457,8 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_store_ind = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
             let f_is_rotate_l64 = crate::trace::original_base_column!(component_trace, Column::IsRotateL64);
             let f_is_count_set_bits = crate::trace::original_base_column!(component_trace, Column::IsCountSetBits);
+            let f_is_lzb = crate::trace::original_base_column!(component_trace, Column::IsLzb);
+            let f_is_tzb = crate::trace::original_base_column!(component_trace, Column::IsTzb);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -4268,6 +4514,8 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_store_ind[0].clone());
             tuple.push(f_is_rotate_l64[0].clone());
             tuple.push(f_is_count_set_bits[0].clone());
+            tuple.push(f_is_lzb[0].clone());
+            tuple.push(f_is_tzb[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

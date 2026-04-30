@@ -14,6 +14,7 @@ pub use self::logup_trace_builder::LogupTraceBuilder;
 pub use self::{
     range_check::Range256LookupElements,
     relations::{
+        BitcountLookupElements,
         BitwiseAndLookupElements, Blake2bCallLookupElements,
         Blake2bStateLookupElements, JumpTableLookupElements,
         MemoryAccessLookupElements, PopcountLookupElements,
@@ -34,6 +35,7 @@ macros::register_relation! {
         BitwiseAndLookupElements,
         PowerOfTwoLookupElements,
         PopcountLookupElements,
+        BitcountLookupElements,
         Blake2bStateLookupElements,
         Blake2bCallLookupElements,
     };

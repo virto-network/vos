@@ -73,6 +73,16 @@ commit.
 - **CountSetBits32 / 64** — per-byte popcount via new
   `PopcountChip` lookup table; `result[0] = sum(BytePopcount[..N])`
   (N = 4 if Is32Bit, 8 if 64-bit), `result[1..8] = 0` `[33]`.
+- **LeadingZeroBits / TrailingZeroBits 32 / 64** — per-byte
+  (lz, tz) via new `BitcountChip` lookup table; result formulas
+  walk a "first-non-zero-byte" indicator built from Phase 29's
+  `ValDByteInv` byte-zero-check infra.  TZ uses Phase 29's
+  LSB-direction `ValDPartialNZ` chain; LZ uses two new
+  cumulative-OR chains: `ValDPartialNZMsb[8]` (MSB direction
+  over all 8 bytes, for LZ64) and `ValDPartialNZMsbLo[4]` (MSB
+  over the low 4 bytes only, for LZ32).  Default fallback is
+  64 / 32 when val_d (or low 4 bytes) is zero.  `result[1..8] = 0`
+  `[34]`.
 - **RotL64** — encoded via the mul-schoolbook (`val_d = 2^n`):
   `result = UnsignedProductLow + mul_high` (byte-wise sum, no
   carry — bits non-overlapping by construction) `[32]`.
@@ -179,8 +189,6 @@ biggest exposure-to-fix-cost ratio.  See
   Phase 32 via the mul-schoolbook re-route.
 
 ### BitManip
-- **LeadingZeroBits / TrailingZeroBits 32 / 64** — needs
-  per-byte LZ/TZ tables + composition.
 - **Sbrk** — host-call-like; needs precompile-style integration.
 
 ### Smaller

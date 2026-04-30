@@ -25,6 +25,9 @@ pub struct SideNote {
     /// Phase 33: popcount lookup counts: byte → multiplicity (set by CpuChip
     /// on CountSetBits32 / CountSetBits64 rows).
     pub popcount_counts: Vec<u32>,
+    /// Phase 34: bitcount (lz, tz) lookup counts: byte → multiplicity (set
+    /// by CpuChip on LeadingZeroBits / TrailingZeroBits rows).
+    pub bitcount_counts: Vec<u32>,
     /// Blake2b compression calls to prove via the Blake2bChip.
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// Per-byte memory operations for each blake2b ECALL (reads for h, m;
@@ -69,6 +72,7 @@ impl SideNote {
             num_initial_mem_entries: 0,
             power_of_two_counts: vec![0u32; 64],
             popcount_counts: vec![0u32; 256],
+            bitcount_counts: vec![0u32; 256],
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],

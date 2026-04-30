@@ -94,7 +94,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) {
         "RegMemory", "RegMemBoundary",
         "ProgBoundary", "ProgMemory", "JumpTable",
         "Range256", "BitwiseLookup", "PowerOfTwo",
-        "Popcount",
+        "Popcount", "Bitcount",
     ];
 
     let traces: Vec<ComponentTrace> = components

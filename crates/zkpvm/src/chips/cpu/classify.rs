@@ -171,6 +171,18 @@ pub(super) struct OpcodeFlags {
     /// sum(BytePopcount[0..N])` (N = 8 for 64-bit, N = 4 for 32-bit) and
     /// `result[1..8] = 0`.
     pub is_count_set_bits: bool,
+    /// Phase 34: 1 iff this opcode is `LeadingZeroBits64` or
+    /// `LeadingZeroBits32`.  Drives the per-byte bitcount lookup
+    /// `(val_d[i], BitOpLzByte[i], BitOpTzByte[i]) ∈ bitcount` plus
+    /// the LZ result binding (sums over the first-non-zero MSB-direction
+    /// indicator), with default `64` (or `32` if Is32Bit) when val_d
+    /// is zero.  Result high bytes pinned to 0.
+    pub is_lzb: bool,
+    /// Phase 34: 1 iff this opcode is `TrailingZeroBits64` or
+    /// `TrailingZeroBits32`.  Symmetric to is_lzb but using the
+    /// LSB-direction first-non-zero indicator (Phase 29's
+    /// ValDPartialNZ).
+    pub is_tzb: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -238,10 +250,11 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::SignExtend16 => { f.is_sign_ext_16 = true; }
         Opcode::CountSetBits64 => { f.is_count_set_bits = true; }
         Opcode::CountSetBits32 => { f.is_count_set_bits = true; f.is_32bit = true; }
-        Opcode::LeadingZeroBits64 | Opcode::LeadingZeroBits32
-        | Opcode::TrailingZeroBits64 | Opcode::TrailingZeroBits32
-        | Opcode::Sbrk
-            => {}
+        Opcode::LeadingZeroBits64 => { f.is_lzb = true; }
+        Opcode::LeadingZeroBits32 => { f.is_lzb = true; f.is_32bit = true; }
+        Opcode::TrailingZeroBits64 => { f.is_tzb = true; }
+        Opcode::TrailingZeroBits32 => { f.is_tzb = true; f.is_32bit = true; }
+        Opcode::Sbrk => {}
         // Branches (conditional) — classify by comparison type
         // For Le/Gt variants we'll flip the operand order / invert
         Opcode::BranchEq | Opcode::BranchEqImm
@@ -404,12 +417,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33):
-/// extract the 42 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34):
+/// extract the 44 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 42] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 44] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -432,5 +445,7 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 42] {
         f.is_store_ind as u8,
         f.is_rotate_l64 as u8,
         f.is_count_set_bits as u8,
+        f.is_lzb as u8,
+        f.is_tzb as u8,
     ]
 }

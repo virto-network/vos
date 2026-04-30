@@ -137,12 +137,17 @@ preprocessed table) plus per-byte CpuChip lookup
 `result[0] = Σ BytePopcount[..N]` (N = 4 if Is32Bit else 8),
 `result[1..8] = 0`.
 
-### Phase 34 — LeadingZeroBits / TrailingZeroBits
+### Phase 34 — LeadingZeroBits / TrailingZeroBits — DONE
 
-Trickier than popcount because the per-byte answer depends on
-position (LZ stops counting at the first non-zero byte).
-Needs a "first-non-zero-byte" auxiliary witness with
-inversion-witness for soundness.
+Landed: new `BitcountChip` (256-row `(byte, lz, tz)` preprocessed
+table) plus per-byte CpuChip lookup `(val_d[i], BitOpLzByte[i],
+BitOpTzByte[i]) ∈ bitcount` and result bindings driven by
+"first-non-zero-byte" indicators built from Phase 29's
+`ValDByteInv` byte-zero-check infra.  TZ reuses Phase 29's
+LSB-direction `ValDPartialNZ`; LZ adds `ValDPartialNZMsb[8]`
+(MSB direction over 8 bytes, for LZ64) and `ValDPartialNZMsbLo[4]`
+(MSB over low 4 bytes, for LZ32).  Default fallback 64/32 when
+val_d (or low 4) is zero.  `result[1..8] = 0`.
 
 ### Phase 35 — Sbrk
 

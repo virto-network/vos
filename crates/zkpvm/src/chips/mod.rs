@@ -1,3 +1,4 @@
+pub mod bitcount;
 pub mod blake2b;
 pub mod bitwise_lookup;
 pub mod cpu;
@@ -12,6 +13,7 @@ pub mod range_multiplicity;
 pub mod register_memory;
 pub mod register_memory_boundary;
 
+pub use bitcount::BitcountChip;
 pub use blake2b::{Blake2bChip, Blake2bCall, blake2b_compress};
 pub use bitwise_lookup::BitwiseLookupChip;
 pub use cpu::CpuChip;
