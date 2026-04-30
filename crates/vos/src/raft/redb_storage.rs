@@ -126,57 +126,76 @@ impl Storage<u16> for RedbStorage {
             return Ok(());
         }
 
-        let txn = self.db.begin_write()?;
+        // Snapshot the RaftLog cache *before* any mutation. The
+        // `*_in_txn` helpers update `self.log.{last_index,
+        // last_term, snap_last_*}` in place; if the txn commit
+        // fails (or any earlier step inside the closure errors),
+        // we restore the snapshot so the cache stays consistent
+        // with disk.
+        let cache_snap = self.log.cache_snapshot();
 
-        // Order matches the WriteBatch contract:
-        //   1) truncate the divergent tail
-        //   2) compact below the new snap pointer
-        //   3) append the leader's authoritative tail
-        //   4) replace state row (snapshot install, or
-        //      single-node apply)
-        //   5) replace meta scalars
-        if let Some(after) = batch.truncate_after {
-            self.log.truncate_after_in_txn(&txn, after)?;
-        }
-        if let Some((idx, term)) = batch.compact_to {
-            self.log.compact_to_in_txn(&txn, idx, term)?;
-        }
-        for entry in &batch.appends {
-            // RaftLog::append_in_txn assigns the index from its
-            // cached tail rather than honoring `entry.index`. The
-            // worker only ever asks us to append at the next slot,
-            // so the indices match — but assert to catch a future
-            // caller passing something inconsistent.
-            let assigned =
-                self.log
-                    .append_in_txn(&txn, entry.term, &entry.payload)?;
-            debug_assert_eq!(
-                assigned, entry.index,
-                "RedbStorage: append index drift (entry={}, assigned={})",
-                entry.index, assigned,
-            );
-        }
-        let new_state = batch.state.as_deref();
-        if let Some(state_bytes) = new_state {
-            let mut state_table = txn.open_table(STATE_TABLE)?;
-            state_table.insert(STATE_KEY, state_bytes)?;
-        }
         let new_meta = batch.meta.as_ref().cloned();
-        if let Some(m) = &new_meta {
-            let raft_meta = raft_from_meta(m);
-            raft_meta.write_in_txn(&txn)?;
-        }
+        let new_state = batch.state.clone();
+        let mut do_txn = || -> Result<(), CommitError> {
+            let txn = self.db.begin_write()?;
 
-        txn.commit()?;
+            // Order matches the WriteBatch contract:
+            //   1) truncate the divergent tail
+            //   2) compact below the new snap pointer
+            //   3) append the leader's authoritative tail
+            //   4) replace state row (snapshot install, or
+            //      single-node apply)
+            //   5) replace meta scalars
+            if let Some(after) = batch.truncate_after {
+                self.log.truncate_after_in_txn(&txn, after)?;
+            }
+            if let Some((idx, term)) = batch.compact_to {
+                self.log.compact_to_in_txn(&txn, idx, term)?;
+            }
+            for entry in &batch.appends {
+                // RaftLog::append_in_txn assigns the index from
+                // its cached tail rather than honoring
+                // `entry.index`. The worker only ever asks us to
+                // append at the next slot, so the indices match
+                // — but assert to catch a future caller passing
+                // something inconsistent.
+                let assigned =
+                    self.log.append_in_txn(&txn, entry.term, &entry.payload)?;
+                debug_assert_eq!(
+                    assigned, entry.index,
+                    "RedbStorage: append index drift (entry={}, assigned={})",
+                    entry.index, assigned,
+                );
+            }
+            if let Some(state_bytes) = new_state.as_deref() {
+                let mut state_table = txn.open_table(STATE_TABLE)?;
+                state_table.insert(STATE_KEY, state_bytes)?;
+            }
+            if let Some(m) = &new_meta {
+                let raft_meta = raft_from_meta(m);
+                raft_meta.write_in_txn(&txn)?;
+            }
+
+            txn.commit()?;
+            Ok(())
+        };
+
+        // Closure can't borrow `self` mutably twice, so structure
+        // it as a fn-pointer-style call: `do_txn` already captures
+        // `&mut self.log` through `self.log.*_in_txn(&txn, …)`.
+        // Run, then restore on error.
+        if let Err(e) = do_txn() {
+            self.log.cache_restore(cache_snap);
+            return Err(e);
+        }
 
         // Refresh in-memory caches now that disk is durable.
         // RaftLog's own caches were updated in-place by
-        // {truncate,compact,append}_in_txn, so all that's left is
-        // the meta + state row.
+        // {truncate,compact,append}_in_txn — kept on success.
         if let Some(m) = new_meta {
             self.meta = raft_from_meta(&m);
         }
-        if let Some(state_bytes) = batch.state {
+        if let Some(state_bytes) = new_state {
             self.state_cache = state_bytes;
         }
         Ok(())

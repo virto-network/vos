@@ -87,6 +87,21 @@ pub struct RaftLog {
     snap_last_term: u64,
 }
 
+/// Snapshot of [`RaftLog`]'s in-memory cache fields. Returned by
+/// [`RaftLog::cache_snapshot`] and consumed by
+/// [`RaftLog::cache_restore`] so a caller orchestrating an
+/// atomic redb txn can roll back the cache if the txn commit
+/// fails — the `*_in_txn` helpers mutate `self` *before* the
+/// caller commits, so without rollback an i/o failure leaves
+/// `last_index` / `snap_*` ahead of disk.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheSnapshot {
+    last_index: u64,
+    last_term: u64,
+    snap_last_index: u64,
+    snap_last_term: u64,
+}
+
 impl RaftLog {
     /// Open the log on the given database, recovering the cached
     /// tail + snapshot pointer from disk. Empty log →
@@ -137,6 +152,30 @@ impl RaftLog {
             snap_last_index,
             snap_last_term,
         })
+    }
+
+    /// Capture the current in-memory cache fields. Pair with
+    /// [`cache_restore`](Self::cache_restore) to roll back after a
+    /// txn commit failure — the `*_in_txn` helpers mutate `self`
+    /// before the caller commits, so an i/o failure mid-flight
+    /// would otherwise leave the cache ahead of disk.
+    pub fn cache_snapshot(&self) -> CacheSnapshot {
+        CacheSnapshot {
+            last_index: self.last_index,
+            last_term: self.last_term,
+            snap_last_index: self.snap_last_index,
+            snap_last_term: self.snap_last_term,
+        }
+    }
+
+    /// Restore a previously captured cache snapshot. Used after a
+    /// txn commit failure to undo the in-place mutations made by
+    /// `*_in_txn` helpers.
+    pub fn cache_restore(&mut self, s: CacheSnapshot) {
+        self.last_index = s.last_index;
+        self.last_term = s.last_term;
+        self.snap_last_index = s.snap_last_index;
+        self.snap_last_term = s.snap_last_term;
     }
 
     /// Highest index that's been compacted out of `RAFT_LOG`.
@@ -608,6 +647,53 @@ mod tests {
         assert_eq!(log.snap_last_term(), 7);
         assert_eq!(log.last_index(), 99);
         assert_eq!(log.last_term(), 7);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_snapshot_restore_round_trips_each_field() {
+        let (db, dir) = temp_db();
+        let mut log = RaftLog::open(db.clone()).unwrap();
+        // Seed a non-trivial cache state.
+        let txn = db.begin_write().unwrap();
+        for term in [1u64, 1, 2] {
+            log.append_in_txn(&txn, term, b"x").unwrap();
+        }
+        log.compact_to_in_txn(&txn, 2, 1).unwrap();
+        txn.commit().unwrap();
+
+        // Snapshot, drift each field, restore, verify identity.
+        let snap = log.cache_snapshot();
+        let drifted = {
+            let txn = db.begin_write().unwrap();
+            // Mutate via the public *_in_txn helpers but DON'T
+            // commit — this is the failure-injection scenario.
+            log.append_in_txn(&txn, 99, b"would-be-orphan").unwrap();
+            // Don't commit; drop the txn implicitly. The cache has
+            // moved ahead of disk.
+            drop(txn);
+            log.cache_snapshot()
+        };
+        assert_ne!(drifted.last_index, snap.last_index,
+            "cache must move ahead of disk after an uncommitted *_in_txn");
+
+        log.cache_restore(snap);
+        let restored = log.cache_snapshot();
+        assert_eq!(restored.last_index, snap.last_index);
+        assert_eq!(restored.last_term, snap.last_term);
+        assert_eq!(restored.snap_last_index, snap.snap_last_index);
+        assert_eq!(restored.snap_last_term, snap.snap_last_term);
+
+        // After restore the live cache matches what's actually on
+        // disk: a reopen reports identical fields.
+        drop(log);
+        let reopened = RaftLog::open(db).unwrap();
+        let from_disk = reopened.cache_snapshot();
+        assert_eq!(from_disk.last_index, snap.last_index);
+        assert_eq!(from_disk.last_term, snap.last_term);
+        assert_eq!(from_disk.snap_last_index, snap.snap_last_index);
+        assert_eq!(from_disk.snap_last_term, snap.snap_last_term);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
