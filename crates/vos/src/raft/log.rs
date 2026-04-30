@@ -241,15 +241,17 @@ impl RaftLog {
         if up_to_index <= self.snap_last_index {
             return Ok(());
         }
-        if up_to_index > self.last_index {
-            return Err(CommitError::Config(alloc::format!(
-                "raft_log compact: refused to compact past last_index ({} > {})",
-                up_to_index, self.last_index,
-            )));
-        }
+        // Compaction past `last_index` is the snapshot-install case
+        // — a stale follower receiving the leader's authoritative
+        // state covering entries it never had. Drop everything we
+        // have (it's all <= up_to_index by definition) and set the
+        // pointer; subsequent appends will land at index
+        // `up_to_index + 1` because last_index now equals the snap
+        // pointer.
         {
             let mut table = txn.open_table(RAFT_LOG)?;
-            for k in (self.snap_last_index + 1)..=up_to_index {
+            let drop_to = up_to_index.min(self.last_index);
+            for k in (self.snap_last_index + 1)..=drop_to {
                 table.remove(k)?;
             }
         }
@@ -260,6 +262,16 @@ impl RaftLog {
         }
         self.snap_last_index = up_to_index;
         self.snap_last_term = up_to_term;
+        // After a compact-past-last_index install, `last_index`
+        // jumps to the snap pointer — entries 1..=up_to_index are
+        // gone *and* there were no entries past them. Without this
+        // bump, an immediately-following propose would try to
+        // append at `last_index + 1`, which would collide with the
+        // snap-covered range instead of going to `up_to_index + 1`.
+        if up_to_index > self.last_index {
+            self.last_index = up_to_index;
+            self.last_term = up_to_term;
+        }
         Ok(())
     }
 
@@ -568,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_idempotent_and_refuses_past_tail() {
+    fn compact_idempotent_and_jumps_past_tail_for_snapshot_install() {
         let (db, dir) = temp_db();
         let mut log = RaftLog::open(db.clone()).unwrap();
         for _ in 0..3 {
@@ -585,10 +597,17 @@ mod tests {
         log.compact_to_in_txn(&txn, 2, 1).unwrap();
         txn.commit().unwrap();
         assert_eq!(log.snap_last_index(), 2);
-        // Compact past last_index is rejected.
+        // Compact past last_index is the snapshot-install case —
+        // a far-behind follower receiving a snapshot covering
+        // entries it never had. Drop everything we have, jump the
+        // snap pointer + last_index to the leader's pointer.
         let txn = db.begin_write().unwrap();
-        let err = log.compact_to_in_txn(&txn, 99, 1);
-        assert!(err.is_err());
+        log.compact_to_in_txn(&txn, 99, 7).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(log.snap_last_index(), 99);
+        assert_eq!(log.snap_last_term(), 7);
+        assert_eq!(log.last_index(), 99);
+        assert_eq!(log.last_term(), 7);
         let _ = std::fs::remove_dir_all(dir);
     }
 

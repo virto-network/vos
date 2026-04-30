@@ -32,6 +32,9 @@ pub mod rpc;
 pub mod storage;
 pub mod transport;
 
+#[cfg(feature = "std")]
+pub mod worker;
+
 pub use config::{Config, NodeId};
 pub use log_entry::LogEntry;
 pub use meta::Meta;
@@ -42,3 +45,6 @@ pub use rpc::{
 };
 pub use storage::{MemStorage, Storage, WriteBatch};
 pub use transport::Transport;
+
+#[cfg(feature = "std")]
+pub use worker::{ProposeError, RaftMsg, Worker, WorkerHandle, WorkerSnapshot};

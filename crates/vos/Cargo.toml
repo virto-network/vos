@@ -28,7 +28,7 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
-vos-raft = { path = "../vos-raft", default-features = false }
+vos-raft = { path = "../vos-raft", default-features = false, features = ["std"] }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 
 # std-only: PVM runtime and vosx binary dependencies

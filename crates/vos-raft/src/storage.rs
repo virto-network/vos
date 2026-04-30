@@ -39,7 +39,7 @@ use crate::meta::Meta;
 /// the appends, then state, then meta — that's the order Raft
 /// expects when (e.g.) a follower truncates a divergent tail and
 /// grafts the leader's authoritative version.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WriteBatch<N: NodeId> {
     /// Drop every entry whose `index > truncate_after`. No-op
     /// when `None` or when `truncate_after >= last_index`.
@@ -61,6 +61,21 @@ pub struct WriteBatch<N: NodeId> {
     /// Replace the durable scalars. `None` = leave them in
     /// place.
     pub meta: Option<Meta<N>>,
+}
+
+// Manual impl so the empty-batch shorthand `..Default::default()`
+// doesn't force `N: Default` onto every caller. `Option<Meta<N>>`
+// is `None` regardless of whether `N` itself is `Default`.
+impl<N: NodeId> Default for WriteBatch<N> {
+    fn default() -> Self {
+        Self {
+            truncate_after: None,
+            compact_to: None,
+            appends: Vec::new(),
+            state: None,
+            meta: None,
+        }
+    }
 }
 
 /// Storage backend for one Raft replica.
