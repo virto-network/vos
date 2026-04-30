@@ -2177,4 +2177,182 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Phase-2 boundary for Raft: the wire frames + libp2p plumbing
+    /// route an outbound `AppendEntries` / `RequestVote` to the
+    /// remote peer, the stub handler observes the call, and the
+    /// canned response makes it back through the caller's channel.
+    /// No election or replication logic is exercised — that's
+    /// phase 3+ — but every wire bit is.
+    #[test]
+    fn raft_rpcs_route_through_libp2p_to_handler_and_back() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex as StdMutex;
+
+        // Stub handler: record the inbound RPC params and reply
+        // with deterministic canned values so the caller's
+        // assertions can pin down both directions.
+        struct StubHandler {
+            append_calls: StdMutex<Vec<(u16, u64, u64, u64, u64, usize)>>,
+            vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
+            term: AtomicU64,
+        }
+        impl StubHandler {
+            fn new(initial_term: u64) -> Self {
+                Self {
+                    append_calls: StdMutex::new(Vec::new()),
+                    vote_calls: StdMutex::new(Vec::new()),
+                    term: AtomicU64::new(initial_term),
+                }
+            }
+        }
+        impl RaftRpcHandler for StubHandler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                prev_log_term: u64,
+                leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                self.append_calls.lock().unwrap().push((
+                    from_prefix,
+                    term,
+                    prev_log_index,
+                    prev_log_term,
+                    leader_commit,
+                    entries.len(),
+                ));
+                let local_term = self.term.load(Ordering::Relaxed);
+                RaftAppendResult {
+                    term: local_term,
+                    success: term >= local_term,
+                    match_index: prev_log_index + entries.len() as u64,
+                }
+            }
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                from_prefix: u16,
+                term: u64,
+                last_log_index: u64,
+                last_log_term: u64,
+            ) -> RaftVoteResult {
+                self.vote_calls.lock().unwrap().push((
+                    from_prefix,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                ));
+                let local_term = self.term.load(Ordering::Relaxed);
+                RaftVoteResult {
+                    term: local_term,
+                    vote_granted: term >= local_term,
+                }
+            }
+        }
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = 0xAAAA;
+        let prefix_b = 0xBBBB;
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        ).expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        // Install the stub on B — A is the leader-side caller.
+        let handler = Arc::new(StubHandler::new(7));
+        net_b.set_raft_handler(handler.clone());
+
+        // Wait for the Hello handshake so A has a PeerId for B.
+        wait_for(|| {
+            (net_a.peer_for_prefix(prefix_b).is_some()
+                && net_b.peer_for_prefix(prefix_a).is_some()).then_some(())
+        }, Duration::from_secs(10))
+        .expect("Hello completes");
+        let target_b = net_a.peer_for_prefix(prefix_b).unwrap();
+        let rep_id = [0xC0u8; 32];
+
+        // ── AppendEntries: send two entries from term 8. ──────
+        let entries = vec![
+            RaftEntry { term: 8, payload: b"first".to_vec() },
+            RaftEntry { term: 8, payload: b"second".to_vec() },
+        ];
+        let rx = net_a.send_raft_append(
+            target_b, rep_id,
+            8,                  // term
+            prefix_a,           // leader_prefix
+            10,                 // prev_log_index
+            7,                  // prev_log_term
+            10,                 // leader_commit
+            entries,
+        );
+        let resp = rx.recv_timeout(Duration::from_secs(5))
+            .expect("AppendEntries response");
+        assert_eq!(resp.term, 7, "stub returned its own term");
+        assert!(resp.success, "term=8 >= local 7 → success");
+        assert_eq!(resp.match_index, 12, "prev_log_index + entries.len()");
+
+        // ── Stub recorded the inbound call. ───────────────────
+        let calls = handler.append_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (prefix_a, 8u64, 10u64, 7u64, 10u64, 2usize),
+            "from_prefix, term, prev_idx, prev_term, leader_commit, entries.len",
+        );
+        drop(calls);
+
+        // ── RequestVote: term 9 with up-to-date log. ──────────
+        let rx = net_a.send_raft_vote(
+            target_b, rep_id,
+            9,                  // term
+            prefix_a,           // candidate_prefix
+            12,                 // last_log_index
+            8,                  // last_log_term
+        );
+        let resp = rx.recv_timeout(Duration::from_secs(5))
+            .expect("RequestVote response");
+        assert_eq!(resp.term, 7);
+        assert!(resp.vote_granted, "term=9 >= local 7 → granted");
+
+        let calls = handler.vote_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (prefix_a, 9u64, 12u64, 8u64));
+        drop(calls);
+
+        // ── No-handler fallback: a peer with no handler installed
+        // returns success=false / vote_granted=false (not a hang). ──
+        // Reverse the direction: B asks A, but A has no handler.
+        let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+        let rx = net_b.send_raft_append(
+            target_a, rep_id, 1, prefix_b, 0, 0, 0, vec![],
+        );
+        let resp = rx.recv_timeout(Duration::from_secs(5))
+            .expect("no-handler response");
+        assert!(!resp.success, "no handler installed → success=false");
+        assert_eq!(resp.match_index, 0);
+
+        net_a.join();
+        net_b.join();
+    }
 }
