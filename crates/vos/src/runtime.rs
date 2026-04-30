@@ -875,7 +875,11 @@ fn handle_refine_hostcall(
                 Some(d) => {
                     let copy_len = d.len().min(buf_len);
                     kwrite(kernel, buf_ptr, &d[..copy_len]);
-                    (copy_len as u64, 0)
+                    // Return the full preimage length (mirrors STORAGE_R
+                    // / FETCH) so guests can detect truncation. No
+                    // current caller in vos but the contract should be
+                    // consistent across the read-into-buffer hostcalls.
+                    (d.len() as u64, 0)
                 }
                 None => (error::HOST_NONE, 0),
             }
