@@ -2786,6 +2786,152 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
 }
 
 #[test]
+fn crdt_counter_shutdown_under_active_load() {
+    // Robustness probe: a CRDT counter is being hammered with
+    // inc()s on a side thread when `shutdown` + `collect` fire.
+    // The node must:
+    //   1. Stop accepting new work without crashing the host
+    //      thread or the side thread.
+    //   2. Drain currently-queued invokes (or fail them with a
+    //      clean error — never hang).
+    //   3. Release the redb file so a follow-on boot at the
+    //      same data_dir doesn't get "Database already open."
+    //
+    // Earlier in this session a real bug was fixed where
+    // sync threads weren't joined and the redb file stayed
+    // locked across a node restart (commit 3d56179). This test
+    // exercises a tighter loop — interleaving inc() with
+    // shutdown — to make sure that fix holds under contention.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_shut_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    let mut node = VosNode::new();
+    let counter_id = node.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir)
+            .with_replication_id(rep_id),
+    );
+
+    // Side thread hammers inc() until the side handle's invoke
+    // returns None (which happens once the agent's invoke route
+    // is dropped at shutdown). Tracks tag values produced so
+    // the post-shutdown reboot can reason about prior state.
+    let handle = node.invoke_handle();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let count_clone = count.clone();
+
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let inc_with_tag = |tag: u32| -> Vec<u8> {
+        let m = Msg::new("inc").with("tag", tag);
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+
+    let one_sec = std::time::Duration::from_secs(2);
+    let burst = std::thread::spawn(move || {
+        let mut tag: u32 = 1;
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match handle.invoke_with_timeout(counter_id, inc_with_tag(tag), one_sec) {
+                Some(_) => { count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                None => break,
+            }
+            tag += 1;
+        }
+    });
+
+    // Let the burst run for a bit so there's actually work in
+    // flight when shutdown lands.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Hard test: collect (which drives shutdown internally) must
+    // return without hanging even though the side thread is
+    // still pumping invokes. The side thread's next invoke after
+    // routes are dropped will return None and let it exit.
+    let collect_started = std::time::Instant::now();
+    node.shutdown();
+    let _agent_results = node.collect();
+    let collect_elapsed = collect_started.elapsed();
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    burst.join().expect("burst thread should exit cleanly");
+
+    // collect() should be fast — agent threads exit on a
+    // 50 ms inbox poll, sync threads on the SYNC_INTERVAL tick.
+    // Generous deadline accounts for CI variance, but a hang
+    // would mean someone is blocked indefinitely.
+    assert!(
+        collect_elapsed < std::time::Duration::from_secs(5),
+        "collect() took {collect_elapsed:?}; a hang here means shutdown \
+         leaked a blocked thread (sync tick? worker dispatch loop?)",
+    );
+    let landed = count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(landed > 0, "expected at least one inc to land before shutdown");
+
+    // Reboot at the same data_dir. The redb file must be unlocked
+    // — the regression we're guarding against is a sync thread
+    // holding the last `Arc<Database>` past collect's join.
+    {
+        let mut node2 = VosNode::new();
+        let id2 = node2.register(
+            AgentConfig::new(counter_blob)
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        assert_eq!(id2, counter_id, "service id should be stable across boots");
+        let counter2 = CrdtCounterClient::at(&node2, id2);
+        let count_after = counter2.get().expect("get must work after reboot");
+        assert_eq!(
+            count_after, landed as u64,
+            "post-reboot count must match the number of inc() calls that returned \
+             before shutdown — the agent persists the DAG node before sending its \
+             reply, so every successful invoke is on disk by the time the next call \
+             returns",
+        );
+        node2.shutdown();
+        let _ = node2.collect();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(feature = "network")]
 fn crdt_counter_offline_node_catches_up_after_restart() {
     // Cross-node restart: A and B start in sync, both at
