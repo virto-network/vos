@@ -13,7 +13,8 @@ use vos::value::Args;
 
 use crate::hyperspace::{flush_registry_announces, heartbeat_loop, AnnouncePlan};
 use crate::manifest::{
-    apply_init, encode_on_start, resolve_entry_path, resolve_replication_id, toml_to_value,
+    apply_init, encode_on_start, parse_members, resolve_entry_path,
+    resolve_replication_id, toml_to_value,
     ConsistencyDef, Manifest,
 };
 use crate::network::start_network_if_needed;
@@ -229,7 +230,7 @@ fn register_agents(
             if let Some(d) = state_dir {
                 cfg = cfg.persist(d);
             }
-            if a.consistency == ConsistencyDef::Crdt {
+            if matches!(a.consistency, ConsistencyDef::Crdt | ConsistencyDef::Raft) {
                 if let Some(rep_id) = resolve_replication_id(
                     &child.name,
                     child.replication_id.as_deref(),
@@ -237,6 +238,9 @@ fn register_agents(
                 ) {
                     cfg = cfg.with_replication_id(rep_id);
                 }
+            }
+            if a.consistency == ConsistencyDef::Raft {
+                cfg = cfg.with_members(parse_members(&a.members));
             }
             cfg = apply_init(cfg, &child.init, &elf_data, name_ids, provides_map);
             if !child.on_start.is_empty() {
@@ -275,12 +279,15 @@ fn register_agents(
         if let Some(d) = state_dir {
             cfg = cfg.persist(d);
         }
-        if a.consistency == ConsistencyDef::Crdt {
+        if matches!(a.consistency, ConsistencyDef::Crdt | ConsistencyDef::Raft) {
             if let Some(rep_id) = resolve_replication_id(
                 &a.name, a.replication_id.as_deref(), &blob,
             ) {
                 cfg = cfg.with_replication_id(rep_id);
             }
+        }
+        if a.consistency == ConsistencyDef::Raft {
+            cfg = cfg.with_members(parse_members(&a.members));
         }
         cfg = apply_init(cfg, &a.init, &elf_data, name_ids, provides_map);
         if !a.on_start.is_empty() {

@@ -46,6 +46,7 @@ enum ConsistencyArg {
     Ephemeral,
     Local,
     Crdt,
+    Raft,
 }
 
 impl From<ConsistencyArg> for vos::node::Consistency {
@@ -54,6 +55,7 @@ impl From<ConsistencyArg> for vos::node::Consistency {
             ConsistencyArg::Ephemeral => vos::node::Consistency::Ephemeral,
             ConsistencyArg::Local => vos::node::Consistency::Local,
             ConsistencyArg::Crdt => vos::node::Consistency::Crdt,
+            ConsistencyArg::Raft => vos::node::Consistency::Raft,
         }
     }
 }

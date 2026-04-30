@@ -18,7 +18,7 @@
 //! [[agent]]
 //!   name = "scheduler"
 //!   path | service = ...             # exactly one
-//!   consistency = "ephemeral" | "local" | "crdt"
+//!   consistency = "ephemeral" | "local" | "crdt" | "raft"
 //!   provides = ["role-1", ...]
 //!   init = { ... }
 //!   actors = [ { name = "ledger", path = "...", init = { ... } }, ... ]
@@ -113,14 +113,20 @@ pub struct AgentDef {
     pub provides: Vec<String>,
     #[serde(default)]
     pub init: BTreeMap<String, toml::Value>,
-    /// Replication group identifier. Only meaningful when
-    /// `consistency = "crdt"`. Three forms:
+    /// Replication group identifier. Meaningful for `crdt` and
+    /// `raft` consistency modes. Three forms:
     ///   - omitted / "auto" — derive from `blake2b(name || 0 || blob)`,
     ///     so two replicas of the same code+name auto-share a group
     ///   - 64-char hex string — explicit, for cross-cluster pinning
-    ///   - "off" — no replication (DAG stays purely local)
+    ///   - "off" — no replication (DAG stays purely local; raft
+    ///     degenerates to single-node mode)
     #[serde(default)]
     pub replication_id: Option<String>,
+    /// Static cluster membership for `consistency = "raft"`.
+    /// Each entry is a 4-char hex `node_prefix`. Every replica's
+    /// manifest must list the same set in the same order.
+    #[serde(default)]
+    pub members: Vec<String>,
     /// Messages to send to this agent immediately after startup.
     /// Each entry is encoded as a TAG_DYNAMIC + rkyv(Msg) payload
     /// and queued via `AgentConfig::init_payloads`. Useful for
@@ -169,6 +175,11 @@ pub enum ConsistencyDef {
     Ephemeral,
     Local,
     Crdt,
+    /// Raft consensus. Requires a non-empty `members` list (every
+    /// participating replica's `node_prefix` as a 4-char hex
+    /// string). Strict consistency: state mutations block until
+    /// a majority of members has the new entry.
+    Raft,
 }
 
 impl From<ConsistencyDef> for vos::node::Consistency {
@@ -177,6 +188,7 @@ impl From<ConsistencyDef> for vos::node::Consistency {
             ConsistencyDef::Ephemeral => vos::node::Consistency::Ephemeral,
             ConsistencyDef::Local => vos::node::Consistency::Local,
             ConsistencyDef::Crdt => vos::node::Consistency::Crdt,
+            ConsistencyDef::Raft => vos::node::Consistency::Raft,
         }
     }
 }
@@ -315,6 +327,24 @@ pub fn resolve_replication_id(name: &str, spec: Option<&str>, blob: &[u8]) -> Op
             )),
         },
     }
+}
+
+/// Parse a manifest's `members = ["abcd", "ef01", ...]` into the
+/// node-prefix list `vos::raft` expects. Each entry is exactly
+/// 4 hex chars (a u16). Errors out on anything malformed —
+/// silently dropping a member would leave an asymmetric Raft
+/// cluster, which is far worse than a startup failure.
+pub fn parse_members(spec: &[String]) -> Vec<u16> {
+    spec.iter()
+        .map(|s| {
+            let s = s.trim().trim_start_matches("0x");
+            u16::from_str_radix(s, 16).unwrap_or_else(|_| {
+                die(&format!(
+                    "raft member must be a 4-char hex node_prefix; got {s:?}",
+                ))
+            })
+        })
+        .collect()
 }
 
 fn auto_replication_id(name: &str, blob: &[u8]) -> [u8; 32] {
@@ -530,4 +560,45 @@ pub fn toml_to_value(
 
 pub fn is_manifest(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_members_decodes_4char_hex() {
+        let m = parse_members(&[
+            "abcd".into(),
+            "0xEF01".into(),
+            "  0042  ".into(),
+        ]);
+        assert_eq!(m, vec![0xABCD, 0xEF01, 0x0042]);
+    }
+
+    #[test]
+    fn raft_consistency_round_trips_through_toml() {
+        let toml = r#"
+space = "demo"
+
+[node]
+identity = "auto"
+listen = ["/ip4/127.0.0.1/tcp/0"]
+
+[[agent]]
+name = "ledger"
+path = "/dev/null"
+consistency = "raft"
+members = ["abcd", "ef01"]
+replication_id = "auto"
+"#;
+        let parsed: Manifest = toml::from_str(toml).expect("parse manifest");
+        assert_eq!(parsed.agent.len(), 1);
+        assert_eq!(parsed.agent[0].consistency, ConsistencyDef::Raft);
+        assert_eq!(parsed.agent[0].members, vec![
+            "abcd".to_string(),
+            "ef01".to_string(),
+        ]);
+        assert_eq!(parse_members(&parsed.agent[0].members), vec![0xABCD, 0xEF01]);
+    }
 }
