@@ -3255,6 +3255,141 @@ fn registry_remove_replicates_across_nodes() {
 }
 
 #[test]
+fn crdt_read_only_get_does_not_append_dag_nodes() {
+    // Robustness probe: calling `get()` on a CRDT counter is
+    // a pure read — the actor's `count` field doesn't change.
+    // The runtime's commit pipeline detects this and skips the
+    // DAG-node append (`crdt_commit_skips_unchanged_plain_commits`
+    // covers the unit), but the *end-to-end* claim is that no
+    // matter how often callers `get()`, the DAG size only grows
+    // when state actually mutates. If pure reads bloat the DAG,
+    // consensus history grows without bound and replay cost
+    // explodes.
+    //
+    // Probe shape: drive 1 inc() (1 DAG node), then 50 get()s
+    // (no new nodes), then another inc() (1 more node). Counts
+    // dag-table row count by opening redb directly.
+    use crdt_counter::CrdtCounterClient;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let dir = std::env::temp_dir().join(format!(
+        "vos_dag_growth_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"counter");
+        h.update(&[0u8]);
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    let count_dag_rows = |db_path: &std::path::Path| -> usize {
+        use redb::ReadableTableMetadata;
+        let db = redb::Database::create(db_path).expect("open redb");
+        let txn = db.begin_read().expect("read txn");
+        let table = match txn.open_table(vos::commit::DAG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return 0,
+            Err(e) => panic!("open DAG_TABLE: {e}"),
+        };
+        table.len().expect("len") as usize
+    };
+
+    let counter_id;
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(counter_blob)
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        counter_id = id;
+        let counter = CrdtCounterClient::at(&node, id);
+
+        // Phase 1: one inc → one DAG node.
+        counter.inc(1).expect("inc 1");
+        node.shutdown();
+        let _ = node.collect();
+    }
+
+    let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
+    assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+    let after_one_inc = count_dag_rows(&db_path);
+    assert_eq!(
+        after_one_inc, 1,
+        "exactly one DAG row after one inc(); got {after_one_inc}",
+    );
+
+    // Phase 2: many get()s — DAG row count must not grow.
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(grey_transpiler::link_elf(&counter_data).expect("transpile"))
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        assert_eq!(id, counter_id);
+        let counter = CrdtCounterClient::at(&node, id);
+        for _ in 0..50 {
+            assert_eq!(counter.get().expect("get during read-burst"), 1);
+        }
+        node.shutdown();
+        let _ = node.collect();
+    }
+    let after_50_reads = count_dag_rows(&db_path);
+    assert_eq!(
+        after_50_reads, after_one_inc,
+        "DAG row count grew from {after_one_inc} to {after_50_reads} after 50 \
+         pure read get()s — read-only dispatches must not append DAG nodes \
+         or consensus history bloats without bound",
+    );
+
+    // Phase 3: another inc → exactly one more node.
+    {
+        let mut node = VosNode::new();
+        let id = node.register(
+            AgentConfig::new(grey_transpiler::link_elf(&counter_data).expect("transpile"))
+                .with_consistency(Consistency::Crdt)
+                .persist(&dir)
+                .with_replication_id(rep_id),
+        );
+        assert_eq!(id, counter_id);
+        let counter = CrdtCounterClient::at(&node, id);
+        counter.inc(2).expect("inc 2");
+        assert_eq!(counter.get().expect("get post-inc"), 2);
+        node.shutdown();
+        let _ = node.collect();
+    }
+    let after_two_incs = count_dag_rows(&db_path);
+    assert_eq!(
+        after_two_incs, 2,
+        "expected exactly 2 DAG rows after 2 inc()s + 50 get()s, got {after_two_incs}",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(feature = "network")]
 fn registry_concurrent_announce_and_remove_converges() {
     // Robustness probe: a classic remove-vs-write race. After a
