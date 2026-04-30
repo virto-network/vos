@@ -3255,6 +3255,113 @@ fn registry_remove_replicates_across_nodes() {
 }
 
 #[test]
+fn scheduler_drops_non_existent_children_and_keeps_others_running() {
+    // Robustness probe: the scheduler drives multiple children
+    // each tick. If one child reports NOT_FOUND (or any non-Yielded
+    // result), it should be dropped from the run queue but every
+    // other child must still be invoked. The headline regression
+    // would be: a single bad child kills the whole dispatch loop
+    // because the scheduler aborts on the first failure, or worse,
+    // the scheduler itself panics when an InvokeResult variant
+    // isn't gracefully handled.
+    //
+    // Setup: scheduler init with children=[99, 100, 101]. The
+    // external_invoke handler routes 99 + 101 to the echo worker
+    // (so they DONE/Yielded normally) and returns None for 100
+    // (so the runtime emits STATUS_NOT_FOUND). After one tick:
+    //   - invokes_99 + invokes_101 must both be > 0
+    //   - rt.panics must be 0 (scheduler itself didn't crash)
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+    };
+    let echo_so = {
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        std::path::PathBuf::from(format!("{}/../../target/{profile}/libecho_worker.so", workspace))
+    };
+    if !echo_so.exists() { eprintln!("SKIP: echo-worker not built"); return; }
+
+    let blob = transpile_actor(&agent_data);
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    let good_a = vos::abi::service::ServiceId(99);
+    let missing = vos::abi::service::ServiceId(100);
+    let good_b = vos::abi::service::ServiceId(101);
+
+    let invokes_a = std::sync::Arc::new(AtomicU32::new(0));
+    let invokes_missing = std::sync::Arc::new(AtomicU32::new(0));
+    let invokes_b = std::sync::Arc::new(AtomicU32::new(0));
+    let ia = invokes_a.clone();
+    let im = invokes_missing.clone();
+    let ib = invokes_b.clone();
+
+    let plugin: &'static _ = Box::leak(Box::new(
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+    ));
+    let instance = std::sync::Mutex::new(plugin.create());
+
+    rt.set_external_invoke(Box::new(move |target, msg| {
+        match target {
+            t if t == good_a => {
+                ia.fetch_add(1, Ordering::Relaxed);
+                let mut inst = instance.lock().unwrap();
+                inst.dispatch_raw(msg).ok().or(Some(Vec::new()))
+            }
+            t if t == good_b => {
+                ib.fetch_add(1, Ordering::Relaxed);
+                let mut inst = instance.lock().unwrap();
+                inst.dispatch_raw(msg).ok().or(Some(Vec::new()))
+            }
+            t if t == missing => {
+                im.fetch_add(1, Ordering::Relaxed);
+                None  // → runtime emits STATUS_NOT_FOUND to caller
+            }
+            _ => None,
+        }
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(
+            vec![good_a.0, missing.0, good_b.0],
+        ));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(agent_id, Vec::new());
+    rt.run_blocking();
+
+    assert_eq!(rt.panics, 0,
+        "scheduler must not panic when one of its children is NOT_FOUND");
+    let na = invokes_a.load(Ordering::Relaxed);
+    let nm = invokes_missing.load(Ordering::Relaxed);
+    let nb = invokes_b.load(Ordering::Relaxed);
+    assert!(na > 0, "good child A (99) should have been invoked at least once, got {na}");
+    assert!(nb > 0, "good child B (101) should have been invoked at least once, got {nb}");
+    assert!(nm > 0, "missing child (100) should have been *attempted* at least once, got {nm}");
+
+    // The scheduler's tick re-queues yielded children but drops
+    // NOT_FOUND ones. Across all ticks the missing child should
+    // be attempted exactly the number of times the scheduler
+    // tried to enqueue it — typically just once at start. The
+    // good children get re-invoked each tick they yield. So
+    // good >= missing. A regression where missing gets retried
+    // every tick (queue not pruned) shows up as `nm > na`.
+    assert!(
+        na >= nm && nb >= nm,
+        "scheduler should drop the missing child rather than retry it each tick \
+         — got A={na}, missing={nm}, B={nb}",
+    );
+}
+
+#[test]
 fn crdt_read_only_get_does_not_append_dag_nodes() {
     // Robustness probe: calling `get()` on a CRDT counter is
     // a pure read — the actor's `count` field doesn't change.
