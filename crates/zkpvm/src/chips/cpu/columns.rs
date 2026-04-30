@@ -754,6 +754,27 @@ pub enum Column {
     /// ↔ div_remainder ≠ 0.
     #[size = 8]
     ValRPartialNZ,
+    // ── Phase 32: RotL64 binding via mul-schoolbook + sum ─────────────────
+    // RotL64(a, n) = (a << n) | (a >> (64 − n)) = mul_low + mul_high
+    // (byte-wise, no carry; the bits of the two halves never overlap by
+    // construction of rotation).  The existing 64-bit mul-schoolbook
+    // already computes both halves of `a · 2^n` (with val_d = 2^n via
+    // PowerOfTwo lookup) — Phase 32 re-routes the low-64 from `result`
+    // to the new UnsignedProductLow column, then adds two result
+    // bindings:
+    //   non-rotate is_mul_low: result = UnsignedProductLow.
+    //   RotL64:                 result = UnsignedProductLow + mul_high.
+    /// Phase 32: 1 iff this opcode is `RotL64`.  Drives the rotation
+    /// result binding (result = UnsignedProductLow + mul_high) and
+    /// the mul-schoolbook re-route.
+    #[size = 1]
+    IsRotateL64,
+    /// Phase 32: low-64 bytes of the unsigned schoolbook product
+    /// `a · val_d` for `is_mul · is_64bit · ¬is_mul_upper` rows.
+    /// Decouples the schoolbook computation from the per-op result
+    /// binding (mirrors Phase 12c's UnsignedProductHi pattern).
+    #[size = 8]
+    UnsignedProductLow,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

@@ -153,6 +153,18 @@ pub(super) struct OpcodeFlags {
     /// emission to the register-memory ledger, plus the
     /// MemValue ↔ RegValA byte-wise binding.
     pub is_store_ind: bool,
+    /// Phase 32: 1 iff this opcode is `RotL64` — rotate-left 64-bit.
+    /// PVM defines `RotL64(a, n) = (a << n) | (a >> (64 − n))` for
+    /// `n ∈ [0, 63]`.  Encoded via the existing mul-schoolbook
+    /// (val_d = 2^n) which produces both the low 64 (= `a << n`
+    /// truncated) and high 64 (= `a >> (64 − n)`) of `a · 2^n`.
+    /// Since the rotation's two halves have non-overlapping bits
+    /// (by construction), OR = byte-wise SUM, so
+    /// `result = UnsignedProductLow + mul_high` (no carry).
+    /// Drives the schoolbook re-route (low-64 → UnsignedProductLow)
+    /// + the rotation result binding.  RotR64 / RotL32 / RotR32
+    /// are deferred to later phases.
+    pub is_rotate_l64: bool,
 }
 
 pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -186,7 +198,14 @@ pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; }
         Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
-        Opcode::RotL64 => { f.is_shift = true; f.shift_op = 3; }
+        // Phase 32: RotL64 reuses the mul-schoolbook (val_d = 2^n)
+        // to compute both halves of `a · 2^n`; result = low + high.
+        Opcode::RotL64 => {
+            f.is_shift = true;
+            f.shift_op = 3;
+            f.is_mul = true;
+            f.is_rotate_l64 = true;
+        }
         Opcode::RotL32 => { f.is_shift = true; f.shift_op = 3; f.is_32bit = true; }
         Opcode::RotR64 | Opcode::RotR64Imm | Opcode::RotR64ImmAlt => { f.is_shift = true; f.shift_op = 4; }
         Opcode::RotR32 | Opcode::RotR32Imm | Opcode::RotR32ImmAlt => { f.is_shift = true; f.shift_op = 4; f.is_32bit = true; }
@@ -378,12 +397,12 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28):
-/// extract the 40 category/sub-category flags in the order matching
+/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32):
+/// extract the 41 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 40] {
+pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 41] {
     let f = classify_opcode(op);
     [
         f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
@@ -404,5 +423,6 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 40] {
         f.is_mem_indirect as u8,
         f.is_store_imm_any as u8, f.is_store_imm_direct as u8,
         f.is_store_ind as u8,
+        f.is_rotate_l64 as u8,
     ]
 }

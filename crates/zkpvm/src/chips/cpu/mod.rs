@@ -204,6 +204,14 @@ impl BuiltInComponent for CpuChip {
         // result binding: UU/SU/SS all share the same unsigned-product
         // computation, but `result` is derived differently per variant
         // (UU = unsigned_product_hi; SU/SS subtract a sign correction).
+        // Phase 32: low-64 schoolbook output now lands in
+        // UnsignedProductLow (was: result).  Decouples the schoolbook
+        // computation from the per-op result binding, mirroring the
+        // Phase 12c pattern for is_mul_upper rows.  Result is bound
+        // separately below:
+        //   non-rotate is_mul_low: result = UnsignedProductLow.
+        //   RotL64:                 result = UnsignedProductLow + mul_high.
+        let unsigned_product_low = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
         for k in 0..16usize {
             let mut partial_sum = E::F::zero();
             for i in 0..WORD_SIZE {
@@ -213,7 +221,7 @@ impl BuiltInComponent for CpuChip {
                 }
             }
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let out_normal = if k < 8 { result[k].clone() } else { mul_high[k - 8].clone() };
+            let out_normal = if k < 8 { unsigned_product_low[k].clone() } else { mul_high[k - 8].clone() };
             let out_upper = if k < 8 { mul_high[k].clone() } else { unsigned_product_hi[k - 8].clone() };
             let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
             let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
@@ -243,6 +251,42 @@ impl BuiltInComponent for CpuChip {
                 is_mul[0].clone() * is_32bit[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
+        }
+
+        // Phase 32: result bindings for the 64-bit schoolbook re-route.
+        //   non-rotate is_mul_low: result = UnsignedProductLow.
+        //   IsRotateL64:           result = UnsignedProductLow + mul_high.
+        //
+        // Decoupled from the schoolbook constraint (which now writes
+        // low-64 to UnsignedProductLow regardless of op), so adding
+        // RotL64 didn't require changing the schoolbook itself.
+        // RotR64 / RotL32 / RotR32 deferred — they need separate
+        // shift-amount conventions or a 32-bit schoolbook re-route.
+        {
+            let is_rotate_l64_p32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
+            let one_minus_rotate = E::F::one() - is_rotate_l64_p32[0].clone();
+            // Non-rotate is_mul_low rows (Mul64 / MulImm64 / ShloL64 / etc.):
+            //   result[i] = UnsignedProductLow[i].
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone()
+                        * one_minus_rotate.clone()
+                        * (result[i].clone() - unsigned_product_low[i].clone())
+                );
+            }
+            // RotL64 rows: result[i] = UnsignedProductLow[i] + mul_high[i]
+            // (byte-wise sum, no carry — bits non-overlapping by
+            // construction of rotation).
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_rotate_l64_p32[0].clone()
+                        * (
+                            result[i].clone()
+                                - unsigned_product_low[i].clone()
+                                - mul_high[i].clone()
+                        )
+                );
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1962,6 +2006,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_store_imm_any = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
             let f_is_store_imm_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let f_is_store_ind = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
+            let f_is_rotate_l64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2014,6 +2059,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_store_imm_any[0].clone());
             tuple.push(f_is_store_imm_direct[0].clone());
             tuple.push(f_is_store_ind[0].clone());
+            tuple.push(f_is_rotate_l64[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -2739,9 +2785,12 @@ impl BuiltInProverComponent for CpuChip {
 
             let flags = classify_opcode(step.opcode);
 
-            // For left/right shifts: save shift amount, then replace val_d with 2^shift_amount
+            // For left/right shifts and Phase-32 RotL64: save shift
+            // amount, then replace val_d with 2^shift_amount.
             let mut saved_shift_amount: u8 = 0;
-            if flags.is_shift && (flags.shift_op <= 2) {
+            let is_pow2_replacement = (flags.is_shift && flags.shift_op <= 2)
+                || flags.is_rotate_l64;
+            if is_pow2_replacement {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
                 let shift = val_d % modulus;
                 saved_shift_amount = shift as u8;
@@ -2792,6 +2841,11 @@ impl BuiltInProverComponent for CpuChip {
             let mut mul_carry = [0u8; 16];
             let mut mul_carry_hi = [0u8; 16];
             let mut unsigned_product_hi_bytes = [0u8; WORD_SIZE];
+            // Phase 32: low-64 bytes of the unsigned schoolbook product.
+            // Filled on 64-bit `is_mul_low` rows so the schoolbook
+            // constraint is satisfied (the schoolbook now writes
+            // low-64 here instead of `result`).
+            let mut unsigned_product_low_bytes = [0u8; WORD_SIZE];
             let mut mul_corr_term_a = [0u8; WORD_SIZE];
             let mut mul_corr_term_b = [0u8; WORD_SIZE];
             let mut mul_corr_carry = [0u8; WORD_SIZE];
@@ -2814,7 +2868,12 @@ impl BuiltInProverComponent for CpuChip {
                     let high = (full >> 64) as u64;
                     unsigned_product_hi_bytes = high.to_le_bytes();
                 } else {
+                    // 64-bit is_mul_low (Mul64 / MulImm64 / ShloL64 /
+                    // RotL64 / etc.).  Low-64 → UnsignedProductLow,
+                    // high-64 → mul_high.
+                    let low = full as u64;
                     let high = (full >> 64) as u64;
+                    unsigned_product_low_bytes = low.to_le_bytes();
                     mul_high = high.to_le_bytes();
                 }
                 let input_limbs = if flags.is_32bit { 4 } else { WORD_SIZE };
@@ -2871,6 +2930,7 @@ impl BuiltInProverComponent for CpuChip {
             trace.fill_columns_bytes(row, &mul_carry, Column::MulCarry);
             trace.fill_columns_bytes(row, &mul_carry_hi, Column::MulCarryHi);
             trace.fill_columns_bytes(row, &unsigned_product_hi_bytes, Column::UnsignedProductHi);
+            trace.fill_columns_bytes(row, &unsigned_product_low_bytes, Column::UnsignedProductLow);
             trace.fill_columns_bytes(row, &mul_corr_term_a, Column::MulCorrTermA);
             trace.fill_columns_bytes(row, &mul_corr_term_b, Column::MulCorrTermB);
             trace.fill_columns_bytes(row, &mul_corr_carry, Column::MulCorrCarry);
@@ -2995,7 +3055,7 @@ impl BuiltInProverComponent for CpuChip {
 
             // ── Shift auxiliary ──
             let shift_amount = if flags.is_shift {
-                if flags.shift_op <= 2 {
+                if flags.shift_op <= 2 || flags.is_rotate_l64 {
                     saved_shift_amount // saved before val_d was replaced
                 } else {
                     let modulus = if flags.is_32bit { 32u64 } else { 64 };
@@ -3006,7 +3066,11 @@ impl BuiltInProverComponent for CpuChip {
             };
             trace.fill_columns(row, shift_amount, Column::ShiftAmount);
             trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
-            let is_shift_constrained = flags.is_shift && (flags.shift_op <= 2);
+            // Phase 32: extend IsShiftConstrained to cover RotL64 too,
+            // so val_d gets rewritten to 2^n + ShiftQuotient + PowerOfTwo
+            // lookup all fire for rotate rows.  shift_op = 3 is RotL.
+            let is_shift_constrained = (flags.is_shift && flags.shift_op <= 2)
+                || flags.is_rotate_l64;
             trace.fill_columns(row, is_shift_constrained, Column::IsShiftConstrained);
 
             // ── Flags ──
@@ -3495,6 +3559,10 @@ impl BuiltInProverComponent for CpuChip {
                 0
             };
             trace.fill_columns(row, reg_val_a_u64, Column::RegValA);
+            // Phase 32: RotL64 flag.  RotL64's val_d gets rewritten to
+            // 2^n + ShiftQuotient infra fires (gated on the extended
+            // IsShiftConstrained above).
+            trace.fill_columns(row, flags.is_rotate_l64, Column::IsRotateL64);
             let mut mem_addr_carry = [0u8; 4];
             if flags.is_mem_indirect {
                 let val_b_bytes_le = val_b.to_le_bytes();
@@ -3617,7 +3685,9 @@ impl BuiltInProverComponent for CpuChip {
             // Phase 9f: raw register value behind ValD + the shift quotient.
             let reg_val_d_u64 = accesses.val_d_read.map(|(_, v)| v).unwrap_or(0);
             trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
-            let shift_q: u64 = if flags.is_shift && flags.shift_op <= 2 {
+            let shift_q: u64 = if (flags.is_shift && flags.shift_op <= 2)
+                || flags.is_rotate_l64
+            {
                 let modulus = if flags.is_32bit { 32u64 } else { 64 };
                 reg_val_d_u64 / modulus
             } else {
@@ -4059,6 +4129,7 @@ impl BuiltInProverComponent for CpuChip {
             let f_is_store_imm_any = crate::trace::original_base_column!(component_trace, Column::IsStoreImmAny);
             let f_is_store_imm_direct = crate::trace::original_base_column!(component_trace, Column::IsStoreImmDirect);
             let f_is_store_ind = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
+            let f_is_rotate_l64 = crate::trace::original_base_column!(component_trace, Column::IsRotateL64);
             let imm_y_for_lookup = crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::original_base_column!(
                 component_trace, Column::BranchTarget
@@ -4112,6 +4183,7 @@ impl BuiltInProverComponent for CpuChip {
             tuple.push(f_is_store_imm_any[0].clone());
             tuple.push(f_is_store_imm_direct[0].clone());
             tuple.push(f_is_store_ind[0].clone());
+            tuple.push(f_is_rotate_l64[0].clone());
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 

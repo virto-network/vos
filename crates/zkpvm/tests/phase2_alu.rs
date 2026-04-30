@@ -554,6 +554,38 @@ fn prove_mul_upper_uu_large() {
         ((0x0102030405060708u128 * 0x0807060504030201u128) >> 64) as u64);
 }
 
+// ── Phase 32: RotL64 ──
+
+#[test]
+fn prove_rotate_l64_smoke() {
+    // RotL64(0x123456789ABCDEF0, 16) = 0x56789ABCDEF01234.
+    let a = 0x123456789ABCDEF0u64;
+    let n = 16u64;
+    test_three_reg_op(Opcode::RotL64, a, n, a.rotate_left(n as u32));
+}
+
+#[test]
+fn prove_rotate_l64_zero() {
+    // n = 0 → identity.
+    test_three_reg_op(Opcode::RotL64, 0xDEAD_BEEF_CAFE_BABE, 0, 0xDEAD_BEEF_CAFE_BABE);
+}
+
+#[test]
+fn prove_rotate_l64_full_word() {
+    // n mod 64: shifting by 64 should be identity.  Encoded as
+    // n = 64 → 64 mod 64 = 0.  Whether the interpreter picks
+    // shift = n mod 64 or rotates by 64 directly, the answer is
+    // the input unchanged.
+    let a = 0x0123_4567_89AB_CDEFu64;
+    test_three_reg_op(Opcode::RotL64, a, 64, a.rotate_left((64 % 64) as u32));
+}
+
+#[test]
+fn prove_rotate_l64_by_one() {
+    // Bit-level: rotating 0x8000000000000001 left by 1 → 0x3.
+    test_three_reg_op(Opcode::RotL64, 0x8000_0000_0000_0001, 1, 0x3);
+}
+
 #[test]
 fn prove_shlo_l64_negative_value() {
     // Exact values from blake2s step 242: left shift of a large (negative-looking) 64-bit value
