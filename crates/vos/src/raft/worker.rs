@@ -53,6 +53,14 @@ use super::log::{RaftLog, RaftMeta};
 /// helper thread for the lifetime of the worker.
 const VOTE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Hysteresis for the leader's auto-compaction. The worker will
+/// only compact when the eligible-up-to-index is at least this
+/// many entries past the current snap pointer; otherwise we'd
+/// be opening a write txn on every heartbeat tick to drop a
+/// single entry. Tuned conservatively — production workloads
+/// can lower it freely.
+const COMPACT_HYSTERESIS: u64 = 16;
+
 /// Cluster role for a replication group. Phase 3.1 only ever
 /// stays in `Follower`; `Candidate` / `Leader` arrive in 3.2 / 3.3
 /// and are listed here so the role transitions are explicit.
@@ -1000,8 +1008,55 @@ fn send_heartbeats(state: &mut WorkerState) {
         });
     }
 
+    // Try to compact the log opportunistically. We only drop
+    // entries that every peer has already acknowledged (so no
+    // follower ever asks for one we just deleted) and only when
+    // the savings are big enough to be worth a write txn.
+    if let Err(e) = try_compact(state) {
+        warn!(me = state.cfg.me, error = ?e, "raft: leader compaction failed");
+    }
+
     state.election_deadline =
         Instant::now() + Duration::from_millis(state.cfg.heartbeat_interval_ms);
+}
+
+/// Compact the log up to the lowest replicated index — every
+/// follower has acknowledged at least up to that point, so no
+/// AppendEntries we send next will ask for a freshly-deleted
+/// entry. No-op below the hysteresis threshold; no-op when the
+/// new boundary doesn't move past the existing snap pointer.
+fn try_compact(state: &mut WorkerState) -> Result<(), CommitError> {
+    let leader = match state.leader.as_ref() {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    // Floor: lowest match across followers, plus the leader's
+    // own last_index (since we always have everything we
+    // appended). If a follower hasn't acked anything yet
+    // (match_index == 0), the floor stays at 0 and we don't
+    // compact — that follower would otherwise be stranded.
+    let mut floor = state.log.last_index();
+    for v in leader.match_index.values() {
+        floor = floor.min(*v);
+    }
+    let snap = state.log.snap_last_index();
+    if floor <= snap || floor.saturating_sub(snap) < COMPACT_HYSTERESIS {
+        return Ok(());
+    }
+    let term_at_floor = match state.log.term_at(floor)? {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let txn = state.db.begin_write()?;
+    state.log.compact_to_in_txn(&txn, floor, term_at_floor)?;
+    txn.commit()?;
+    debug!(
+        me = state.cfg.me,
+        from = snap,
+        to = floor,
+        "raft: leader compacted log",
+    );
+    Ok(())
 }
 
 impl LeaderState {

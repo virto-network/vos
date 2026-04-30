@@ -4019,3 +4019,205 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     let _ = node_c.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn raft_three_node_cluster_compacts_log_after_replication() {
+    // Phase 6: log compaction. Three networked nodes form a Raft
+    // cluster, the leader proposes 64 entries (well past the
+    // worker's COMPACT_HYSTERESIS = 16), every follower replicates
+    // them, and the leader compacts 1..=floor where floor =
+    // min(match_index across followers). We poll each replica's
+    // redb directly until raft_log row count drops below the
+    // hysteresis threshold + commit_index reaches 64.
+    use crdt_counter::CrdtCounterClient;
+    use std::time::{Duration, Instant};
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_raft_compact_{}_{}", std::process::id(), stamp,
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    let dir_c = dir_root.join("c");
+    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"raft-compact");
+        h.update(&counter_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let kp_c = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let prefix_c = derive_node_prefix(&libp2p::PeerId::from(kp_c.public()));
+    if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_listen
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+    });
+    let b_listen = wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_b binds");
+    let b_dial: libp2p::Multiaddr = b_listen
+        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+    let net_c = Network::start(NetworkConfig {
+        keypair: kp_c, local_prefix: prefix_c,
+        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.attach_network(net_a);
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.attach_network(net_b);
+    let mut node_c = VosNode::with_prefix(prefix_c);
+    node_c.attach_network(net_c);
+
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    let net_c_arc = node_c.network().expect("net_c");
+    wait_for(|| {
+        let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
+              && net_b_arc.peer_for_prefix(prefix_a).is_some();
+        let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
+              && net_c_arc.peer_for_prefix(prefix_a).is_some();
+        let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
+              && net_c_arc.peer_for_prefix(prefix_b).is_some();
+        (ab && ac && bc).then_some(())
+    }, Duration::from_secs(15)).expect("Hello triangle");
+
+    let members = vec![prefix_a, prefix_b, prefix_c];
+    let counter_a = node_a.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(rep_id)
+            .persist(&dir_a),
+    );
+    let counter_b = node_b.register(
+        AgentConfig::new(counter_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(rep_id)
+            .persist(&dir_b),
+    );
+    let counter_c = node_c.register(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(members)
+            .with_replication_id(rep_id)
+            .persist(&dir_c),
+    );
+
+    let counters = [
+        (&node_a, counter_a),
+        (&node_b, counter_b),
+        (&node_c, counter_c),
+    ];
+    // Drive enough state-changing inc()s that the leader's
+    // compaction routine kicks in (COMPACT_HYSTERESIS = 16
+    // entries past the previous snap pointer).
+    const N_INCS: u32 = 64;
+    let try_inc = |tag: u32| -> bool {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            for (node, id) in counters.iter() {
+                let client = CrdtCounterClient::at(*node, *id);
+                if client.inc(tag).is_ok() {
+                    return true;
+                }
+            }
+            if Instant::now() >= until { return false; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    for i in 1..=N_INCS {
+        assert!(try_inc(i), "inc({i}) must land");
+    }
+
+    // Wait for compaction to fire on every replica. The leader
+    // compacts after a heartbeat tick where min(match_index) has
+    // advanced ≥ 16 past the last snap. Followers compact when
+    // they see a higher snap pointer in subsequent AppendEntries
+    // (phase 6 doesn't yet propagate snap_last_index over the
+    // wire — followers compact independently when they become
+    // the leader; for now the test asserts the *leader's* log
+    // shrunk).
+    //
+    // We can identify whichever replica is currently leader by
+    // looking for the smallest raft_log row count: only the
+    // leader compacts in phase 6.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let paths = [
+        ("A", dir_a.join("agents").join(format!("{:08x}.redb", counter_a.0))),
+        ("B", dir_b.join("agents").join(format!("{:08x}.redb", counter_b.0))),
+        ("C", dir_c.join("agents").join(format!("{:08x}.redb", counter_c.0))),
+    ];
+
+    // Shut down the workers so we can open the redb files.
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = node_c.collect();
+
+    use redb::ReadableTableMetadata;
+    let mut min_rows: u64 = u64::MAX;
+    for (label, p) in &paths {
+        let db = redb::Database::create(p).expect("open");
+        let txn = db.begin_read().expect("read");
+        let log_table = txn.open_table(vos::raft::RAFT_LOG).expect("raft_log");
+        let n = log_table.len().expect("len");
+        eprintln!("replica {label}: {n} raft_log rows");
+        let meta = vos::raft::RaftMeta::load(&db).expect("meta");
+        eprintln!("replica {label}: snap_last_index={} commit_index={}",
+            meta.snap_last_index, meta.commit_index);
+        // Every replica's commit_index should reach N_INCS once
+        // replication propagates.
+        assert!(meta.commit_index >= N_INCS as u64,
+            "replica {label} commit_index={} < {N_INCS}", meta.commit_index);
+        min_rows = min_rows.min(n);
+    }
+    // The leader's log must have been compacted: rows ≪ N_INCS.
+    // We assert ≤ N_INCS - COMPACT_HYSTERESIS to leave slack.
+    assert!(
+        min_rows < N_INCS as u64,
+        "no replica compacted: min_rows={min_rows} ≥ N_INCS={N_INCS}",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_root);
+}

@@ -34,6 +34,8 @@ const META_TERM: &str = "current_term";
 const META_VOTED_FOR: &str = "voted_for";
 const META_COMMIT_INDEX: &str = "commit_index";
 const META_LAST_APPLIED: &str = "last_applied";
+const META_SNAP_INDEX: &str = "snap_last_index";
+const META_SNAP_TERM: &str = "snap_last_term";
 
 /// One Raft log entry. Index is 1-based and contiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,20 +70,30 @@ impl LogEntry {
 }
 
 /// Persistent Raft log. Wraps the `RAFT_LOG` redb table and caches
-/// the tail (`last_index`, `last_term`) to keep append cheap. The
-/// cache is recomputed on `open` from the actual table tail.
+/// the tail (`last_index`, `last_term`) plus the snapshot pointer
+/// (`snap_last_index`, `snap_last_term`) to keep append + lookup
+/// cheap. The cache is recomputed on `open` from the on-disk table
+/// state and from `RaftMeta`.
 pub struct RaftLog {
     db: Arc<Database>,
     last_index: u64,
     last_term: u64,
+    /// Highest log index that has been compacted away. Entries
+    /// with index ≤ snap_last_index are no longer in `RAFT_LOG`;
+    /// `term_at(snap_last_index)` returns
+    /// [`snap_last_term`](Self::snap_last_term) so consistency
+    /// checks can still anchor on the boundary entry.
+    snap_last_index: u64,
+    snap_last_term: u64,
 }
 
 impl RaftLog {
-    /// Open the log on the given database, recovering the cached tail
-    /// from disk. Empty log → `last_index = 0`, `last_term = 0`.
+    /// Open the log on the given database, recovering the cached
+    /// tail + snapshot pointer from disk. Empty log →
+    /// `last_index = 0`, `last_term = 0`, `snap_last_* = 0`.
     pub fn open(db: Arc<Database>) -> Result<Self, CommitError> {
         let txn = db.begin_read()?;
-        let (last_index, last_term) = match txn.open_table(RAFT_LOG) {
+        let (last_index_raw, last_term_raw) = match txn.open_table(RAFT_LOG) {
             Ok(t) => match t.last()? {
                 Some((k, v)) => {
                     let entry = LogEntry::decode(k.value(), v.value()).ok_or_else(|| {
@@ -97,11 +109,46 @@ impl RaftLog {
             Err(redb::TableError::TableDoesNotExist(_)) => (0, 0),
             Err(e) => return Err(e.into()),
         };
+        // Pull snap pointer from RaftMeta directly so RaftLog +
+        // RaftMeta agree on the boundary without requiring callers
+        // to thread it through.
+        let (snap_last_index, snap_last_term) = match txn.open_table(RAFT_META) {
+            Ok(t) => {
+                let snap_idx = t.get(META_SNAP_INDEX)?.map(|v| u64_le(v.value())).unwrap_or(0);
+                let snap_term = t.get(META_SNAP_TERM)?.map(|v| u64_le(v.value())).unwrap_or(0);
+                (snap_idx, snap_term)
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => (0, 0),
+            Err(e) => return Err(e.into()),
+        };
+        // After compaction the table is empty for `1..=snap_last_index`,
+        // so an empty table doesn't mean "no entries" — it means
+        // "everything was compacted into the snapshot". Treat the
+        // snap pointer as the effective tail when the table is empty.
+        let (last_index, last_term) = if last_index_raw == 0 && snap_last_index > 0 {
+            (snap_last_index, snap_last_term)
+        } else {
+            (last_index_raw, last_term_raw)
+        };
         Ok(Self {
             db,
             last_index,
             last_term,
+            snap_last_index,
+            snap_last_term,
         })
+    }
+
+    /// Highest index that's been compacted out of `RAFT_LOG`.
+    /// Entries with index > this are still in the table.
+    pub fn snap_last_index(&self) -> u64 {
+        self.snap_last_index
+    }
+
+    /// Term of the entry at `snap_last_index`. Used by AppendEntries
+    /// consistency checks that anchor on the snap boundary.
+    pub fn snap_last_term(&self) -> u64 {
+        self.snap_last_term
     }
 
     pub fn last_index(&self) -> u64 {
@@ -137,11 +184,18 @@ impl RaftLog {
         Ok(index)
     }
 
-    /// Read entries `[start..=end]` in index order. Used by phase 1's
-    /// `replay_logs` to walk `1..=last_applied`. Phase 4 will also
-    /// use it for AppendEntries replication batches.
+    /// Read entries `[start..=end]` in index order. Indices that
+    /// have been compacted away (index ≤ `snap_last_index`) are
+    /// silently skipped — callers asking for those should fall
+    /// back to a snapshot install (later phase) or accept that
+    /// only the post-snapshot tail of the requested range is
+    /// returned.
     pub fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, CommitError> {
         if start > end {
+            return Ok(Vec::new());
+        }
+        let effective_start = start.max(self.snap_last_index + 1);
+        if effective_start > end {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read()?;
@@ -150,8 +204,8 @@ impl RaftLog {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::with_capacity((end - start + 1) as usize);
-        for kv in table.range(start..=end)? {
+        let mut out = Vec::with_capacity((end - effective_start + 1) as usize);
+        for kv in table.range(effective_start..=end)? {
             let (k, v) = kv?;
             let entry = LogEntry::decode(k.value(), v.value()).ok_or_else(|| {
                 CommitError::Config(alloc::format!(
@@ -162,6 +216,51 @@ impl RaftLog {
             out.push(entry);
         }
         Ok(out)
+    }
+
+    /// Compact the log up to and including `up_to_index`. Drops
+    /// every row in `RAFT_LOG` with index ≤ `up_to_index`,
+    /// records the snap pointer in `RAFT_META` so a follow-on
+    /// `term_at(up_to_index)` still returns
+    /// `Some(up_to_term)`, and refreshes the cached
+    /// `snap_last_*` fields. No-op when `up_to_index` ≤ the
+    /// current snap pointer (idempotent retries are safe).
+    ///
+    /// Caller is responsible for the wisdom of the choice —
+    /// compacting past a follower's `match_index` strands that
+    /// follower (it'll need a snapshot install to catch up,
+    /// which lands in a later phase). The worker computes
+    /// `min(match_index across followers, own last_index)`
+    /// before calling this.
+    pub fn compact_to_in_txn(
+        &mut self,
+        txn: &redb::WriteTransaction,
+        up_to_index: u64,
+        up_to_term: u64,
+    ) -> Result<(), CommitError> {
+        if up_to_index <= self.snap_last_index {
+            return Ok(());
+        }
+        if up_to_index > self.last_index {
+            return Err(CommitError::Config(alloc::format!(
+                "raft_log compact: refused to compact past last_index ({} > {})",
+                up_to_index, self.last_index,
+            )));
+        }
+        {
+            let mut table = txn.open_table(RAFT_LOG)?;
+            for k in (self.snap_last_index + 1)..=up_to_index {
+                table.remove(k)?;
+            }
+        }
+        {
+            let mut meta = txn.open_table(RAFT_META)?;
+            meta.insert(META_SNAP_INDEX, &up_to_index.to_le_bytes()[..])?;
+            meta.insert(META_SNAP_TERM, &up_to_term.to_le_bytes()[..])?;
+        }
+        self.snap_last_index = up_to_index;
+        self.snap_last_term = up_to_term;
+        Ok(())
     }
 
     /// Total entry count, read straight from redb. Used by tests
@@ -179,9 +278,20 @@ impl RaftLog {
     /// out of range. Index 0 is the implicit pre-log slot — both
     /// sides agree it has term 0, which lets a leader send the
     /// very first entry with `prev_log_index=0`/`prev_log_term=0`.
+    /// `index == snap_last_index` returns the snap term so
+    /// consistency checks anchored on the boundary still resolve
+    /// after a compaction. `index < snap_last_index` returns
+    /// `None` — the entry is gone, the leader must send a
+    /// snapshot or an entry past the boundary.
     pub fn term_at(&self, index: u64) -> Result<Option<u64>, CommitError> {
         if index == 0 {
             return Ok(Some(0));
+        }
+        if index < self.snap_last_index {
+            return Ok(None);
+        }
+        if index == self.snap_last_index && self.snap_last_index > 0 {
+            return Ok(Some(self.snap_last_term));
         }
         if index > self.last_index {
             return Ok(None);
@@ -213,8 +323,17 @@ impl RaftLog {
         if from_index >= self.last_index {
             return Ok(());
         }
+        if from_index < self.snap_last_index {
+            return Err(CommitError::Config(alloc::format!(
+                "raft_log truncate: refused to drop entries past the snap pointer \
+                 (from_index={from_index} < snap_last_index={})",
+                self.snap_last_index,
+            )));
+        }
         let new_last_term = if from_index == 0 {
             0
+        } else if from_index == self.snap_last_index {
+            self.snap_last_term
         } else {
             let table = txn.open_table(RAFT_LOG)?;
             match table.get(from_index)? {
@@ -256,6 +375,15 @@ pub struct RaftMeta {
     pub voted_for: Option<u16>,
     pub commit_index: u64,
     pub last_applied: u64,
+    /// Highest log index that's been compacted out of `RAFT_LOG`.
+    /// Mirrors `RaftLog::snap_last_index`. Persisted so a worker
+    /// restart can reconstruct the snap pointer without scanning
+    /// the table.
+    pub snap_last_index: u64,
+    /// Term of the entry at `snap_last_index`. Used by
+    /// AppendEntries consistency checks anchored on the
+    /// snap boundary.
+    pub snap_last_term: u64,
 }
 
 impl RaftMeta {
@@ -282,6 +410,12 @@ impl RaftMeta {
         if let Some(v) = table.get(META_LAST_APPLIED)? {
             m.last_applied = u64_le(v.value());
         }
+        if let Some(v) = table.get(META_SNAP_INDEX)? {
+            m.snap_last_index = u64_le(v.value());
+        }
+        if let Some(v) = table.get(META_SNAP_TERM)? {
+            m.snap_last_term = u64_le(v.value());
+        }
         Ok(m)
     }
 
@@ -298,6 +432,8 @@ impl RaftMeta {
         };
         t.insert(META_COMMIT_INDEX, &self.commit_index.to_le_bytes()[..])?;
         t.insert(META_LAST_APPLIED, &self.last_applied.to_le_bytes()[..])?;
+        t.insert(META_SNAP_INDEX, &self.snap_last_index.to_le_bytes()[..])?;
+        t.insert(META_SNAP_TERM, &self.snap_last_term.to_le_bytes()[..])?;
         Ok(())
     }
 }
@@ -383,6 +519,80 @@ mod tests {
     }
 
     #[test]
+    fn compact_drops_entries_and_preserves_boundary_term() {
+        let (db, dir) = temp_db();
+        let mut log = RaftLog::open(db.clone()).unwrap();
+        // Append 5 entries: terms 1, 1, 2, 2, 3.
+        let terms = [1u64, 1, 2, 2, 3];
+        for t in terms {
+            let txn = db.begin_write().unwrap();
+            log.append_in_txn(&txn, t, b"x").unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(log.last_index(), 5);
+        assert_eq!(log.snap_last_index(), 0);
+
+        // Compact up to index 3 (term 2).
+        let txn = db.begin_write().unwrap();
+        log.compact_to_in_txn(&txn, 3, 2).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(log.snap_last_index(), 3);
+        assert_eq!(log.snap_last_term(), 2);
+
+        // term_at on the boundary still returns Some(2); below
+        // returns None; above reads the table normally.
+        assert_eq!(log.term_at(0).unwrap(), Some(0));
+        assert_eq!(log.term_at(2).unwrap(), None,
+            "compacted-away entry must report None");
+        assert_eq!(log.term_at(3).unwrap(), Some(2),
+            "snap boundary returns snap_last_term");
+        assert_eq!(log.term_at(4).unwrap(), Some(2));
+        assert_eq!(log.term_at(5).unwrap(), Some(3));
+        assert_eq!(log.term_at(6).unwrap(), None);
+
+        // Range read silently skips compacted entries.
+        let entries = log.entries(1, 5).unwrap();
+        assert_eq!(entries.len(), 2,
+            "only entries 4 and 5 survive the compaction");
+        assert_eq!(entries[0].index, 4);
+        assert_eq!(entries[1].index, 5);
+
+        // Reopen — snap pointer comes back from RaftMeta.
+        drop(log);
+        let log = RaftLog::open(db.clone()).unwrap();
+        assert_eq!(log.snap_last_index(), 3);
+        assert_eq!(log.snap_last_term(), 2);
+        assert_eq!(log.last_index(), 5);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_idempotent_and_refuses_past_tail() {
+        let (db, dir) = temp_db();
+        let mut log = RaftLog::open(db.clone()).unwrap();
+        for _ in 0..3 {
+            let txn = db.begin_write().unwrap();
+            log.append_in_txn(&txn, 1, b"x").unwrap();
+            txn.commit().unwrap();
+        }
+        // First compact succeeds.
+        let txn = db.begin_write().unwrap();
+        log.compact_to_in_txn(&txn, 2, 1).unwrap();
+        txn.commit().unwrap();
+        // Same compact is a no-op.
+        let txn = db.begin_write().unwrap();
+        log.compact_to_in_txn(&txn, 2, 1).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(log.snap_last_index(), 2);
+        // Compact past last_index is rejected.
+        let txn = db.begin_write().unwrap();
+        let err = log.compact_to_in_txn(&txn, 99, 1);
+        assert!(err.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn meta_round_trips_through_txn() {
         let (db, dir) = temp_db();
         let m = RaftMeta {
@@ -390,6 +600,8 @@ mod tests {
             voted_for: Some(0xDEAD),
             commit_index: 42,
             last_applied: 41,
+            snap_last_index: 30,
+            snap_last_term: 6,
         };
         let txn = db.begin_write().unwrap();
         m.write_in_txn(&txn).unwrap();
