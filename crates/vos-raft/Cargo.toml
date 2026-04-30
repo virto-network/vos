@@ -1,0 +1,17 @@
+[package]
+name = "vos-raft"
+description = "Transport- and storage-agnostic Raft consensus core. no_std + alloc compatible (with the `std` feature off)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+# `std` enables std-using helpers (e.g. `Default` impls that touch
+# `std::time`). The core data types in this crate compile without
+# `std` so embedded targets can pull them in unchanged. Storage,
+# transport, and the worker loop arrive in later commits and will
+# add their own feature gates.
+std = []
+
+[dependencies]

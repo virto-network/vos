@@ -3838,6 +3838,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "vos-macros",
+ "vos-raft",
 ]
 
 [[package]]
@@ -3848,6 +3849,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "vos-raft"
+version = "0.1.0"
 
 [[package]]
 name = "vosx"

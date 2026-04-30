@@ -79,32 +79,11 @@ const VOTE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// can lower it freely.
 const COMPACT_HYSTERESIS: u64 = 16;
 
-/// Cluster role for a replication group. Phase 3.1 only ever
-/// stays in `Follower`; `Candidate` / `Leader` arrive in 3.2 / 3.3
-/// and are listed here so the role transitions are explicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Follower,
-    Candidate,
-    Leader,
-}
-
-impl Role {
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Follower => 0,
-            Self::Candidate => 1,
-            Self::Leader => 2,
-        }
-    }
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Candidate,
-            2 => Self::Leader,
-            _ => Self::Follower,
-        }
-    }
-}
+// `Role` is re-exported from `vos-raft`. Keeping it in the
+// crate-public path under `vos::raft::Role` so existing call
+// sites continue to work; the carve-out commit doesn't change
+// any public types, only their definition site.
+pub use vos_raft::Role;
 
 /// Configuration for a worker.
 #[derive(Debug, Clone)]
