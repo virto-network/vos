@@ -3253,3 +3253,161 @@ fn registry_remove_replicates_across_nodes() {
     let _ = node_b.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn registry_concurrent_announce_and_remove_converges() {
+    // Robustness probe: a classic remove-vs-write race. After a
+    // shared seed entry exists on both replicas, A drives `remove`
+    // and B drives a fresh `announce` for the *same* name with new
+    // metadata, with no synchronisation between them and no wait
+    // for one to finish before the other.
+    //
+    // The registry is LWW (the last replay through the dispatch
+    // pipeline wins) and replay order is determined by the
+    // merkle-DAG sort, which is deterministic across replicas.
+    // So the load-bearing claim isn't "the announce wins" or
+    // "the remove wins" — it's "both replicas eventually agree
+    // on whichever wins". Divergence here would mean one replica
+    // reports the entry exists while the other reports it gone:
+    // exactly the failure mode CRDTs are supposed to make
+    // impossible.
+    use registry::RegistryClient;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let actor_path = format!(
+        "{}/../actors/registry/target/riscv64em-javm/release/registry-actor.elf",
+        workspace,
+    );
+    let elf = match std::fs::read(&actor_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: registry-actor not built"); return; }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir()
+        .join(format!("vos_race_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id = registry::replication_id("race-test");
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.register_at_id(
+        AgentConfig::new(blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.register_at_id(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(|| (net_a_arc.peer_for_prefix(prefix_b).is_some()
+            && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
+        Duration::from_secs(10)).expect("Hello completes");
+
+    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
+    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
+
+    // ── Phase 1: A seeds an entry; both converge to seeing it ──
+    client_a.announce("kunekt/svc".into(), prefix_a as u32, 1, vec!["v1".into()])
+        .expect("seed announce");
+    wait_for(
+        || client_b.lookup("kunekt/svc".into()).ok().flatten(),
+        Duration::from_secs(10),
+    ).expect("B converges to seed entry");
+
+    // ── Phase 2: race ──────────────────────────────────────────
+    // Fire both mutations back-to-back with no convergence wait
+    // between them. The local invokes return as soon as each
+    // replica's CRDT commit lands; the cross-replica merge is
+    // what we're stressing.
+    client_a.remove("kunekt/svc".into()).expect("A: remove");
+    client_b.announce("kunekt/svc".into(), prefix_b as u32, 99, vec!["v2".into()])
+        .expect("B: re-announce");
+
+    // ── Phase 3: convergence — agree on whatever wins ─────────
+    let agree = wait_for(
+        || {
+            let a = client_a.lookup("kunekt/svc".into()).ok().flatten();
+            let b = client_b.lookup("kunekt/svc".into()).ok().flatten();
+            let same = match (&a, &b) {
+                (None, None) => true,
+                (Some(ea), Some(eb)) =>
+                    ea.owner_prefix == eb.owner_prefix
+                        && ea.service_id == eb.service_id
+                        && ea.roles == eb.roles
+                        && ea.name == eb.name,
+                _ => false,
+            };
+            if same { Some(a) } else { None }
+        },
+        Duration::from_secs(20),
+    );
+    let final_view = agree.expect(
+        "replicas did not converge on a single view of kunekt/svc within deadline; \
+         this is a CRDT divergence bug — the merge order isn't deterministic between A and B",
+    );
+
+    // Sanity: whichever side wins, it must be one of the two
+    // possible outcomes (gone or B's v2). Anything else means
+    // the seed announce somehow re-surfaced from the DAG.
+    match final_view {
+        None => {
+            // Remove won — both replicas agree the entry is gone.
+        }
+        Some(entry) => {
+            assert_eq!(entry.owner_prefix, prefix_b,
+                "if announce wins it must be B's announce; seeing prefix_a here means \
+                 the seed announce came back from the dead");
+            assert_eq!(entry.service_id, 99,
+                "service_id must match B's announce when announce wins");
+            assert_eq!(entry.roles, vec!["v2".to_string()],
+                "roles must match B's v2 announce");
+        }
+    }
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
