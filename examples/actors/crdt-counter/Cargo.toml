@@ -12,6 +12,13 @@ edition = "2024"
 default = []
 host = []
 
+# `#[messages]` emits cfg gates for features defined on the `vos`
+# crate (worker, wasm). Declare them so cargo's check-cfg lint
+# doesn't flag every macro expansion.
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+
 [lib]
 name = "crdt_counter"
 path = "src/lib.rs"
