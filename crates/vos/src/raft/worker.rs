@@ -410,8 +410,8 @@ fn worker_loop(
                 from_prefix,
                 term,
                 prev_log_index,
-                prev_log_term: _,
-                leader_commit: _,
+                prev_log_term,
+                leader_commit,
                 entries,
                 reply,
             }) => {
@@ -420,7 +420,9 @@ fn worker_loop(
                     from_prefix,
                     term,
                     prev_log_index,
-                    entries.len(),
+                    prev_log_term,
+                    leader_commit,
+                    entries,
                 )?;
                 let _ = reply.send(resp);
             }
@@ -496,7 +498,9 @@ fn handle_append_entries(
     from_prefix: u16,
     term: u64,
     prev_log_index: u64,
-    entries_len: usize,
+    prev_log_term: u64,
+    leader_commit: u64,
+    entries: Vec<RaftEntry>,
 ) -> Result<RaftAppendResult, crate::commit::CommitError> {
     // Stale leader: term too low, refuse without changing anything.
     if term < state.meta.current_term {
@@ -507,34 +511,33 @@ fn handle_append_entries(
         });
     }
 
-    let mut meta_changed = false;
     if term > state.meta.current_term {
         state.meta.current_term = term;
         state.meta.voted_for = None;
-        meta_changed = true;
     }
-    // Any AppendEntries from a current-term leader is a
-    // legitimate signal to step down to Follower (whether we're
-    // already a Follower or a stale Candidate / Leader at a
-    // lower term). The role transition is the leader's
-    // authority asserting itself.
+    // Any AppendEntries from a current-term leader is a legitimate
+    // signal to step down to Follower (whether we were Candidate
+    // or a stale Leader at a lower term). Reset the election
+    // timer regardless of the consistency check below — the
+    // sender *is* the legitimate leader for this term.
     state.role = Role::Follower;
     state.votes_received.clear();
     state.reset_election_timer();
 
-    // Phase 3.2 still only handles heartbeats (empty entries).
-    // Real replication lands in phase 4.
-    if entries_len > 0 {
-        if meta_changed {
-            state.persist_meta()?;
-        }
-        warn!(
-            me = state.cfg.me,
-            from_prefix,
-            entries_len,
-            "raft: phase 3.2 worker rejects non-empty AppendEntries; \
-             leader replication lands in phase 4",
-        );
+    // Consistency check: our log at prev_log_index must have
+    // term prev_log_term. If we don't have an entry at
+    // prev_log_index, or its term differs, refuse — the leader
+    // will retry with an earlier prev_log_index until our logs
+    // converge. (Phase 4 has no log compaction, so the retry
+    // walks back at most last_index entries.)
+    let our_prev_term = state.log.term_at(prev_log_index)?;
+    let consistent = our_prev_term == Some(prev_log_term);
+    if !consistent {
+        // Persist the term/voted_for changes (if any) even on a
+        // failed append — the higher-term observation must be
+        // durable before we reply, otherwise a crash + restart
+        // could grant a vote at a now-stale term.
+        state.persist_meta()?;
         return Ok(RaftAppendResult {
             term: state.meta.current_term,
             success: false,
@@ -542,14 +545,70 @@ fn handle_append_entries(
         });
     }
 
-    if meta_changed {
-        state.persist_meta()?;
+    // Apply the entries inside one redb txn:
+    //   1. Truncate any of our entries past prev_log_index that
+    //      conflict with the leader's batch (different term at
+    //      the same index).
+    //   2. Append the new ones starting at prev_log_index + 1.
+    //   3. Advance commit_index = min(leader_commit, last_index).
+    //   4. Persist meta + log atomically.
+    let txn = state.db.begin_write()?;
+
+    // Find the first divergence between leader's batch and ours,
+    // truncating from there. If everything matches up to our
+    // tail, nothing to truncate; we'll just append the leftover.
+    let mut conflict_at: Option<u64> = None;
+    let mut already_present = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let idx = prev_log_index + 1 + i as u64;
+        match state.log.term_at(idx)? {
+            Some(t) if t == e.term => {
+                already_present += 1;
+            }
+            Some(_) => {
+                conflict_at = Some(idx);
+                break;
+            }
+            None => break,
+        }
     }
+    if let Some(idx) = conflict_at {
+        state.log.truncate_after_in_txn(&txn, idx - 1)?;
+    }
+    for (i, e) in entries.iter().enumerate().skip(already_present) {
+        let idx = prev_log_index + 1 + i as u64;
+        // Append in order. truncate_after_in_txn (if it ran) has
+        // dropped everything past prev_log_index + already_present;
+        // append fills back from there.
+        let _ = idx; // index is implicit in append_in_txn
+        state.log.append_in_txn(&txn, e.term, &e.payload)?;
+    }
+
+    let last_new_index = prev_log_index + entries.len() as u64;
+    if leader_commit > state.meta.commit_index {
+        let new_commit = leader_commit.min(last_new_index);
+        if new_commit > state.meta.commit_index {
+            state.meta.commit_index = new_commit;
+            // Phase 4 advances `last_applied` straight to
+            // `commit_index`. The actor's dispatch isn't yet wired
+            // through the worker (that's phase 5) — we're just
+            // tracking the storage shape so phase 5 has a clean
+            // boundary to plug into. The replay path in
+            // `RaftCommit::replay_logs` consumes 1..=last_applied,
+            // so the agent's cold-start replay still produces the
+            // right state.
+            state.meta.last_applied = state.meta.last_applied.max(new_commit);
+        }
+    }
+    state.meta.write_in_txn(&txn)?;
+    txn.commit()?;
+
+    let _ = from_prefix; // logged at the dispatch site if needed
 
     Ok(RaftAppendResult {
         term: state.meta.current_term,
         success: true,
-        match_index: prev_log_index,
+        match_index: last_new_index,
     })
 }
 
@@ -854,30 +913,142 @@ mod tests {
     }
 
     #[test]
-    fn append_entries_with_payload_is_refused_in_phase_3_1() {
+    fn follower_appends_entries_and_advances_commit_index() {
+        // Phase 4.1: AppendEntries with non-empty `entries` and a
+        // matching prev_log_index/term is accepted, the entries
+        // land in `raft_log`, and `commit_index` advances to
+        // min(leader_commit, last_new_index).
         let (db, dir) = temp_db();
         let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
         let h = worker.handler();
 
+        // Leader sends two entries from the empty pre-log slot.
         let resp = h.append_entries(
             &[0xC0; 32], 0xBBBB,
-            5, 0, 0, 0,
-            vec![RaftEntry { term: 5, payload: b"x".to_vec() }],
-        );
-        assert!(!resp.success, "non-empty entries refused until phase 4");
-        // But the term still advanced.
-        assert_eq!(resp.term, 5);
-
-        // Heartbeats after the bumped term still succeed.
-        let resp = h.append_entries(
-            &[0xC0; 32], 0xBBBB, 5, 0, 0, 0, vec![],
+            5,                  // term
+            0,                  // prev_log_index
+            0,                  // prev_log_term
+            2,                  // leader_commit (covers both entries)
+            vec![
+                RaftEntry { term: 5, payload: b"a".to_vec() },
+                RaftEntry { term: 5, payload: b"b".to_vec() },
+            ],
         );
         assert!(resp.success);
+        assert_eq!(resp.match_index, 2);
+        assert_eq!(resp.term, 5);
 
-        // Log table is empty — the rejected entry was never appended.
         let log = RaftLog::open(db.clone()).unwrap();
-        assert_eq!(log.last_index(), 0);
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.last_term(), 5);
+        let entries = log.entries(1, 2).unwrap();
+        assert_eq!(entries[0].payload, b"a");
+        assert_eq!(entries[1].payload, b"b");
 
+        let meta = RaftMeta::load(&db).unwrap();
+        assert_eq!(meta.commit_index, 2);
+        assert_eq!(meta.last_applied, 2);
+
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follower_rejects_inconsistent_prev_log() {
+        // Append two entries successfully, then a leader at a
+        // higher term arrives claiming `prev_log_index=2`,
+        // `prev_log_term=99` — our entry at index 2 has term 5,
+        // not 99, so the consistency check refuses.
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let h = worker.handler();
+        h.append_entries(
+            &[0xC0; 32], 0xBBBB, 5, 0, 0, 0,
+            vec![
+                RaftEntry { term: 5, payload: b"a".to_vec() },
+                RaftEntry { term: 5, payload: b"b".to_vec() },
+            ],
+        );
+        let resp = h.append_entries(
+            &[0xC0; 32], 0xBBBB,
+            7,    // term (we adopt this)
+            2,    // prev_log_index
+            99,   // prev_log_term — doesn't match our 5
+            2,
+            vec![RaftEntry { term: 7, payload: b"c".to_vec() }],
+        );
+        assert!(!resp.success, "consistency check refuses divergent prev_log_term");
+        assert_eq!(resp.term, 7, "term still adopted on a refusal");
+        // The new term *is* persisted even on refusal.
+        let meta = RaftMeta::load(&db).unwrap();
+        assert_eq!(meta.current_term, 7);
+        // The log was not extended.
+        let log = RaftLog::open(db.clone()).unwrap();
+        assert_eq!(log.last_index(), 2);
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follower_truncates_conflicting_tail_then_appends() {
+        // Two entries land at term 5. A new leader at term 6
+        // claims a different entry at index 2. We truncate our
+        // index 2 and append the leader's authoritative version.
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let h = worker.handler();
+        h.append_entries(
+            &[0xC0; 32], 0xBBBB, 5, 0, 0, 0,
+            vec![
+                RaftEntry { term: 5, payload: b"a".to_vec() },
+                RaftEntry { term: 5, payload: b"old-b".to_vec() },
+            ],
+        );
+        let resp = h.append_entries(
+            &[0xC0; 32], 0xCCCC,
+            6,
+            1,    // prev_log_index — matches our entry at term 5
+            5,    // prev_log_term — also matches
+            2,
+            // entries[0] at index 2: leader has term 6, we have
+            // term 5 → conflict, truncate, replace.
+            vec![RaftEntry { term: 6, payload: b"new-b".to_vec() }],
+        );
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 2);
+
+        let log = RaftLog::open(db.clone()).unwrap();
+        let entries = log.entries(1, 2).unwrap();
+        assert_eq!(entries[0].payload, b"a", "entry 1 untouched");
+        assert_eq!(entries[1].payload, b"new-b", "entry 2 replaced");
+        assert_eq!(entries[1].term, 6);
+
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follower_idempotent_on_already_present_entries() {
+        // Same-term retry of an already-replicated batch must be
+        // idempotent — no duplicate appends, match_index reflects
+        // the existing tail.
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let h = worker.handler();
+        for _ in 0..3 {
+            let resp = h.append_entries(
+                &[0xC0; 32], 0xBBBB, 5, 0, 0, 2,
+                vec![
+                    RaftEntry { term: 5, payload: b"a".to_vec() },
+                    RaftEntry { term: 5, payload: b"b".to_vec() },
+                ],
+            );
+            assert!(resp.success);
+            assert_eq!(resp.match_index, 2);
+        }
+        let log = RaftLog::open(db.clone()).unwrap();
+        assert_eq!(log.len().unwrap(), 2,
+            "duplicate AppendEntries retries must not bloat the log");
         worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }

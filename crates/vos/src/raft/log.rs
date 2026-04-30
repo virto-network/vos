@@ -174,6 +174,76 @@ impl RaftLog {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Term of the entry at `index`, or `None` if the index is
+    /// out of range. Index 0 is the implicit pre-log slot — both
+    /// sides agree it has term 0, which lets a leader send the
+    /// very first entry with `prev_log_index=0`/`prev_log_term=0`.
+    pub fn term_at(&self, index: u64) -> Result<Option<u64>, CommitError> {
+        if index == 0 {
+            return Ok(Some(0));
+        }
+        if index > self.last_index {
+            return Ok(None);
+        }
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(RAFT_LOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let row = table.get(index)?;
+        Ok(row
+            .and_then(|v| LogEntry::decode(index, v.value()))
+            .map(|e| e.term))
+    }
+
+    /// Truncate all entries with `index > from_index` inside the
+    /// caller-supplied write txn. Refreshes the cached
+    /// `last_index` / `last_term` to reflect the post-truncate
+    /// tail. Used by a follower whose leader's `AppendEntries`
+    /// claims a different entry at an overlapping index — the
+    /// follower drops its stale tail before grafting the leader's
+    /// authoritative version.
+    pub fn truncate_after_in_txn(
+        &mut self,
+        txn: &redb::WriteTransaction,
+        from_index: u64,
+    ) -> Result<(), CommitError> {
+        if from_index >= self.last_index {
+            return Ok(());
+        }
+        let new_last_term = if from_index == 0 {
+            0
+        } else {
+            let table = txn.open_table(RAFT_LOG)?;
+            match table.get(from_index)? {
+                Some(row) => LogEntry::decode(from_index, row.value())
+                    .ok_or_else(|| {
+                        CommitError::Config(alloc::format!(
+                            "raft_log truncate: row at index {from_index} \
+                             failed to decode",
+                        ))
+                    })?
+                    .term,
+                None => {
+                    return Err(CommitError::Config(alloc::format!(
+                        "raft_log truncate: row at index {from_index} \
+                         missing before truncate",
+                    )));
+                }
+            }
+        };
+        {
+            let mut table = txn.open_table(RAFT_LOG)?;
+            for k in (from_index + 1)..=self.last_index {
+                table.remove(k)?;
+            }
+        }
+        self.last_index = from_index;
+        self.last_term = new_last_term;
+        Ok(())
+    }
 }
 
 /// Durable Raft scalars. Loaded once at boot, written under the same
