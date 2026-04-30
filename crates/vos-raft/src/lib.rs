@@ -26,13 +26,19 @@ extern crate alloc;
 
 pub mod config;
 pub mod log_entry;
+pub mod meta;
 pub mod role;
 pub mod rpc;
+pub mod storage;
+pub mod transport;
 
-pub use config::Config;
+pub use config::{Config, NodeId};
 pub use log_entry::LogEntry;
+pub use meta::Meta;
 pub use role::Role;
 pub use rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
     RequestVoteReq, RequestVoteResp,
 };
+pub use storage::{MemStorage, Storage, WriteBatch};
+pub use transport::Transport;
