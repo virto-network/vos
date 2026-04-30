@@ -2449,6 +2449,7 @@ mod tests {
                     heartbeat_interval_ms: 20,
                 },
                 Some(network),
+                None,
             )
         };
         let w_a = mk_worker(prefix_a, net_a.clone(), "a.redb");
@@ -2623,6 +2624,7 @@ mod tests {
                         heartbeat_interval_ms: 20,
                     },
                     Some(network),
+                    None,
                 ),
             )
         };

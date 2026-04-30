@@ -19,6 +19,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use redb::Database;
 
@@ -26,21 +28,33 @@ use crate::commit::{CommitError, CommitStrategy, STATE_KEY, STATE_TABLE};
 use crate::effect_log::EffectLog;
 
 use super::log::{RaftLog, RaftMeta};
+use super::worker::{ProposeError, RaftWorker, WorkerHandle};
 
-/// Phase-1 placeholder for cluster state. Acts as if the local node
-/// is the only voter, so a `commit_with_log` applies the entry as
-/// soon as it lands on disk. Phase 3 adds a `Multi` variant
-/// alongside this one and `commit_with_log` dispatches on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Cluster role for a `RaftCommit`. Single-node mode is "self
+/// quorum is the only voter" — every commit appends + applies in
+/// one txn, no peers involved. Multi-node mode owns a
+/// [`RaftWorker`] and routes `commit_with_log` through propose +
+/// quorum-wait.
 enum Role {
     /// Self-quorum; commit-and-apply is a single redb txn.
     SingleNode,
+    /// Cluster mode. Owns the worker thread and an apply receiver
+    /// it drains in `commit_with_log` until the proposed entry's
+    /// commit_index is reached.
+    Multi {
+        worker: RaftWorker,
+        /// Receives every new `commit_index` value the worker
+        /// observes (own quorum advance OR follower receiving a
+        /// heartbeat with a higher leader_commit). Exclusive to
+        /// this RaftCommit instance.
+        apply_rx: std_mpsc::Receiver<u64>,
+    },
 }
 
 /// Configuration for a Raft replication group. Phase 1 only uses
 /// `me` informationally (it lives in `RaftMeta::voted_for` once
 /// elections land); `members` and `election_timeout_ms` are wired
-/// at phase 3.
+/// at phase 3, `heartbeat_interval_ms` at phase 3.3.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     /// Local node prefix (libp2p-derived `node_prefix`). Identifies
@@ -53,6 +67,17 @@ pub struct RaftConfig {
     /// Randomized election-timeout window (low, high) in milliseconds.
     /// Ignored in phase 1.
     pub election_timeout_ms: (u64, u64),
+    /// Leader heartbeat interval in milliseconds. Should be
+    /// substantially smaller than `election_timeout_ms.0`.
+    pub heartbeat_interval_ms: u64,
+    /// Replication group ID — typically `blake2b(blob || actor_name)`.
+    /// All cluster members of the same Raft group share this. Used
+    /// for outbound RPC routing and as the gossipsub topic key.
+    pub replication_id: [u8; 32],
+    /// Hard cap on how long `commit_with_log` waits for an
+    /// in-flight propose to commit before failing with
+    /// `CommitError::Config("propose timed out")`. Defaults to 5 s.
+    pub propose_timeout_ms: u64,
 }
 
 impl Default for RaftConfig {
@@ -61,6 +86,9 @@ impl Default for RaftConfig {
             me: 0,
             members: Vec::new(),
             election_timeout_ms: (150, 300),
+            heartbeat_interval_ms: 50,
+            replication_id: [0u8; 32],
+            propose_timeout_ms: 5_000,
         }
     }
 }
@@ -92,16 +120,18 @@ pub struct RaftCommit {
 }
 
 impl RaftCommit {
-    /// Open (or create) a Raft-backed strategy at `path`.
+    /// Open (or create) a Raft-backed strategy at `path`. Returns
+    /// a `SingleNode` strategy — every commit is self-quorumed.
+    /// Use [`open_multi`](Self::open_multi) for a real cluster.
     pub fn open(path: &std::path::Path, cfg: RaftConfig) -> Result<Self, CommitError> {
         let db = Arc::new(Database::create(path)?);
         Self::from_db_arc(db, cfg)
     }
 
-    /// Build a `RaftCommit` on a pre-opened `Arc<redb::Database>`.
-    /// Mirrors `CrdtCommit::from_db_arc` so a future host that
-    /// pre-opens the file (e.g. to share it with a sync ticker)
-    /// can do the same here.
+    /// Build a single-node `RaftCommit` on a pre-opened
+    /// `Arc<redb::Database>`. Mirrors `CrdtCommit::from_db_arc`
+    /// so a future host that pre-opens the file (e.g. to share it
+    /// with a sync ticker) can do the same here.
     pub fn from_db_arc(db: Arc<Database>, cfg: RaftConfig) -> Result<Self, CommitError> {
         let log = RaftLog::open(db.clone())?;
         let meta = RaftMeta::load(&db)?;
@@ -115,6 +145,44 @@ impl RaftCommit {
             shutdown: Arc::new(AtomicBool::new(false)),
             cfg,
         })
+    }
+
+    /// Build a multi-node `RaftCommit` that owns a [`RaftWorker`].
+    /// `commit_with_log` proposes through the worker, blocks until
+    /// the entry is committed by quorum, then persists state.
+    ///
+    /// `apply_rx` receives every commit-index advance the worker
+    /// observes (own quorum match OR follower receiving a higher
+    /// `leader_commit` from a heartbeat). The receiver should be
+    /// the matched half of the `Sender` handed to `RaftWorker::spawn`.
+    pub fn from_worker(
+        db: Arc<Database>,
+        cfg: RaftConfig,
+        worker: RaftWorker,
+        apply_rx: std_mpsc::Receiver<u64>,
+    ) -> Result<Self, CommitError> {
+        let log = RaftLog::open(db.clone())?;
+        let meta = RaftMeta::load(&db)?;
+        let last_state = read_state(&db)?.unwrap_or_default();
+        Ok(Self {
+            db,
+            log,
+            meta,
+            last_state,
+            role: Role::Multi { worker, apply_rx },
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cfg,
+        })
+    }
+
+    /// Read-only access to the worker handle when in `Multi` mode.
+    /// Useful for installing it as the `RaftRpcHandler` on a
+    /// network. Returns `None` for `SingleNode`.
+    pub fn worker_handle(&self) -> Option<WorkerHandle> {
+        match &self.role {
+            Role::Multi { worker, .. } => Some(worker.handler()),
+            Role::SingleNode => None,
+        }
     }
 
     /// Borrow the underlying redb database. Useful for tests that
@@ -188,16 +256,71 @@ impl CommitStrategy for RaftCommit {
         log: &EffectLog,
     ) -> Result<(), CommitError> {
         // Skip-on-unchanged — pure reads must not bloat the log.
-        // Same rule `CrdtCommit::commit_with_log` follows; the
-        // argument is even stronger here because every Raft entry
-        // costs an RTT under multi-node mode (phase 3+).
+        // Even stronger here than for CRDT because every Raft
+        // entry costs an RTT under multi-node mode.
         if state == self.last_state.as_slice() {
             return Ok(());
         }
         let payload = log.to_bytes();
-        match self.role {
+        let propose_timeout = Duration::from_millis(self.cfg.propose_timeout_ms);
+        match &self.role {
             Role::SingleNode => {
                 self.append_and_apply_single_node(state, &payload)?;
+            }
+            Role::Multi { worker, apply_rx } => {
+                let handle = worker.handler();
+                let idx = handle.propose(payload).map_err(|e| match e {
+                    ProposeError::NotLeader => CommitError::Config(
+                        "raft commit_with_log: this replica is not the leader".into(),
+                    ),
+                    ProposeError::Storage(inner) => inner,
+                })?;
+                // Drain apply notifications until the worker
+                // reports commit_index ≥ idx. In flight at this
+                // moment: the worker is shipping AppendEntries to
+                // followers and tallying their match_index; once
+                // a quorum reaches `idx`, `try_advance_commit_index`
+                // fires the notifier.
+                let deadline = std::time::Instant::now() + propose_timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CommitError::Config(alloc::format!(
+                            "raft commit_with_log: propose at index {idx} did not \
+                             reach a quorum within {} ms",
+                            self.cfg.propose_timeout_ms,
+                        )));
+                    }
+                    match apply_rx.recv_timeout(remaining) {
+                        Ok(committed) if committed >= idx => break,
+                        Ok(_) => continue, // earlier index — keep waiting
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                            return Err(CommitError::Config(alloc::format!(
+                                "raft commit_with_log: timeout waiting for index {idx}",
+                            )));
+                        }
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(CommitError::Config(
+                                "raft commit_with_log: worker apply channel closed".into(),
+                            ));
+                        }
+                    }
+                }
+                // Quorum-committed. Persist the state row in our
+                // own txn (worker owns log + meta; agent owns
+                // state). On crash between this txn and the
+                // worker's commit_index advance, restart will see
+                // commit_index ≥ idx and replay the log to
+                // rebuild state — same shape used for cold start.
+                let txn = self.db.begin_write()?;
+                {
+                    let mut state_table = txn.open_table(STATE_TABLE)?;
+                    state_table.insert(STATE_KEY, state)?;
+                }
+                txn.commit()?;
+                // Refresh our cached meta from disk so
+                // `last_applied()` reflects the worker's advance.
+                self.meta = RaftMeta::load(&self.db)?;
             }
         }
         self.last_state = state.to_vec();
@@ -277,6 +400,19 @@ mod tests {
         }
     }
 
+    fn cfg_multi(me: u16, members: Vec<u16>) -> RaftConfig {
+        RaftConfig {
+            me,
+            members,
+            // Tiny timeouts so the single-member self-quorum
+            // election fires before the test's propose call.
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 500,
+            replication_id: [0xC0; 32],
+            propose_timeout_ms: 2_000,
+        }
+    }
+
     #[test]
     fn empty_strategy_returns_no_state_and_no_replay() {
         let (path, dir) = temp_path();
@@ -321,6 +457,67 @@ mod tests {
         for (i, log) in logs.iter().enumerate() {
             assert_eq!(log.msg, alloc::vec![i as u8; 4]);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multi_mode_solo_cluster_propose_and_persist() {
+        // Single-member "cluster": the worker self-elects in
+        // milliseconds (its self-vote is the quorum), then a
+        // commit_with_log proposes through it, blocks on the
+        // apply notification, and persists state. This is the
+        // tightest end-to-end test of the propose-and-wait path
+        // without needing a real network.
+        use super::super::worker::{RaftWorker, WorkerConfig};
+
+        let (path, dir) = temp_path();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let cfg = cfg_multi(0xAAAA, vec![0xAAAA]);
+
+        let (apply_tx, apply_rx) = std_mpsc::channel::<u64>();
+        let worker = RaftWorker::spawn(
+            db.clone(),
+            WorkerConfig {
+                me: cfg.me,
+                members: cfg.members.clone(),
+                replication_id: cfg.replication_id,
+                election_timeout_ms: cfg.election_timeout_ms,
+                heartbeat_interval_ms: cfg.heartbeat_interval_ms,
+            },
+            None, // no network — single-node self-quorum doesn't need one
+            Some(apply_tx),
+        );
+
+        // Wait for the self-elected leadership before proposing.
+        // The single-member quorum fires on the first election
+        // tick (10-30ms randomized).
+        let h = worker.handler();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if let Some(snap) = h.snapshot() {
+                if snap.role == super::super::worker::Role::Leader { break; }
+            }
+            assert!(std::time::Instant::now() < deadline, "no leadership");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let mut s = RaftCommit::from_worker(db.clone(), cfg, worker, apply_rx).unwrap();
+
+        // First propose: state=v1, log=msg1.
+        let log = EffectLog::for_msg(b"first".to_vec());
+        s.commit_with_log(b"state-v1", &log).unwrap();
+        assert_eq!(s.restore(), Some(b"state-v1".to_vec()));
+        assert_eq!(s.last_applied(), 1);
+
+        // Idempotent skip on unchanged state — no new log entry.
+        s.commit_with_log(b"state-v1", &log).unwrap();
+        assert_eq!(s.last_applied(), 1);
+
+        // Second propose: state=v2.
+        s.commit_with_log(b"state-v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
+        assert_eq!(s.restore(), Some(b"state-v2".to_vec()));
+        assert_eq!(s.last_applied(), 2);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

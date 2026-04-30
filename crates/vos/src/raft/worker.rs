@@ -192,21 +192,31 @@ pub struct RaftWorker {
 }
 
 impl RaftWorker {
-    /// Spawn a worker thread for one replication group. `network`
-    /// is `None` for unit tests and single-node mode (no outbound
-    /// RPCs); a `Some(_)` enables real elections by giving the
-    /// worker a way to call peers.
+    /// Spawn a worker thread for one replication group.
+    ///
+    /// - `network` is `None` for unit tests and single-node mode
+    ///   (no outbound RPCs); a `Some(_)` enables real elections.
+    /// - `apply_notifier` receives the new `commit_index` value
+    ///   each time the worker advances it (on either the leader's
+    ///   quorum match or a follower's heartbeat that bumps
+    ///   `leader_commit`). `RaftCommit::Multi` uses this to
+    ///   unblock its `commit_with_log` once the proposed entry's
+    ///   index has been committed; the agent thread uses it as a
+    ///   soft-restart trigger to catch up state on followers.
     pub fn spawn(
         db: Arc<Database>,
         cfg: WorkerConfig,
         network: Option<Arc<Network>>,
+        apply_notifier: Option<std_mpsc::Sender<u64>>,
     ) -> Self {
         let (tx, rx) = std_mpsc::channel();
         let inbox_tx = tx.clone();
         let join = thread::Builder::new()
             .name(alloc::format!("raft-worker-{:04x}", cfg.me))
             .spawn(move || {
-                if let Err(e) = worker_loop(db, cfg, network, rx, inbox_tx) {
+                if let Err(e) =
+                    worker_loop(db, cfg, network, rx, inbox_tx, apply_notifier)
+                {
                     warn!(error = ?e, "raft: worker exited with error");
                 }
             })
@@ -376,6 +386,10 @@ struct WorkerState {
     votes_received: alloc::collections::BTreeSet<u16>,
     /// Per-follower replication state. `None` unless we're Leader.
     leader: Option<LeaderState>,
+    /// Subscribers to commit-index advances. Phase 5.1 carries
+    /// at most one (set at spawn time); a future multi-subscriber
+    /// model would extend this to a Vec.
+    apply_notifier: Option<std_mpsc::Sender<u64>>,
 }
 
 /// Per-follower replication bookkeeping. Initialized when a
@@ -420,6 +434,7 @@ impl WorkerState {
         cfg: WorkerConfig,
         network: Option<Arc<Network>>,
         inbox_tx: std_mpsc::Sender<RaftMsg>,
+        apply_notifier: Option<std_mpsc::Sender<u64>>,
     ) -> Result<Self, crate::commit::CommitError> {
         let log = RaftLog::open(db.clone())?;
         let meta = RaftMeta::load(&db)?;
@@ -434,9 +449,18 @@ impl WorkerState {
             election_deadline: Instant::now(),
             votes_received: alloc::collections::BTreeSet::new(),
             leader: None,
+            apply_notifier,
         };
         s.reset_election_timer();
         Ok(s)
+    }
+
+    fn fire_apply_notification(&self) {
+        if let Some(tx) = self.apply_notifier.as_ref() {
+            // Drop on send error — the consumer side closing means
+            // it's no longer interested. Doesn't fail the worker.
+            let _ = tx.send(self.meta.commit_index);
+        }
     }
 
     /// Peers' match_index plus our own implicit "last_log_index" —
@@ -501,8 +525,9 @@ fn worker_loop(
     network: Option<Arc<Network>>,
     inbox: std_mpsc::Receiver<RaftMsg>,
     inbox_tx: std_mpsc::Sender<RaftMsg>,
+    apply_notifier: Option<std_mpsc::Sender<u64>>,
 ) -> Result<(), crate::commit::CommitError> {
-    let mut state = WorkerState::open(db, cfg, network, inbox_tx)?;
+    let mut state = WorkerState::open(db, cfg, network, inbox_tx, apply_notifier)?;
     debug!(me = state.cfg.me, "raft: worker started in Follower role");
 
     loop {
@@ -686,23 +711,25 @@ fn handle_append_entries(
     }
 
     let last_new_index = prev_log_index + entries.len() as u64;
+    let mut commit_advanced = false;
     if leader_commit > state.meta.commit_index {
         let new_commit = leader_commit.min(last_new_index);
         if new_commit > state.meta.commit_index {
             state.meta.commit_index = new_commit;
             // Phase 4 advances `last_applied` straight to
-            // `commit_index`. The actor's dispatch isn't yet wired
-            // through the worker (that's phase 5) — we're just
-            // tracking the storage shape so phase 5 has a clean
-            // boundary to plug into. The replay path in
+            // `commit_index`. The replay path in
             // `RaftCommit::replay_logs` consumes 1..=last_applied,
-            // so the agent's cold-start replay still produces the
-            // right state.
+            // so the agent's cold-start / soft-restart replay still
+            // produces the right state.
             state.meta.last_applied = state.meta.last_applied.max(new_commit);
+            commit_advanced = true;
         }
     }
     state.meta.write_in_txn(&txn)?;
     txn.commit()?;
+    if commit_advanced {
+        state.fire_apply_notification();
+    }
 
     let _ = from_prefix; // logged at the dispatch site if needed
 
@@ -1008,12 +1035,9 @@ fn try_advance_commit_index(state: &mut WorkerState) -> Result<(), CommitError> 
         "raft: leader advancing commit_index",
     );
     state.meta.commit_index = majority_floor;
-    // Phase 4.2 mirrors phase 4.1's follower-side stub: push
-    // last_applied straight to commit_index. Phase 5 plumbs the
-    // actor's dispatch through a reply channel and decouples
-    // these two indices.
     state.meta.last_applied = state.meta.last_applied.max(majority_floor);
     state.persist_meta()?;
+    state.fire_apply_notification();
     Ok(())
 }
 
@@ -1028,6 +1052,11 @@ fn handle_propose(state: &mut WorkerState, payload: Vec<u8>) -> Result<u64, Prop
         .append_in_txn(&txn, term, &payload)
         .map_err(ProposeError::Storage)?;
     txn.commit().map_err(|e| ProposeError::Storage(e.into()))?;
+    // Single-node cluster: the leader's own last_index IS the
+    // quorum (no AppendResponse will ever fire to trigger
+    // commit-advance). Try advancing now so a single-node
+    // commit_with_log completes synchronously.
+    try_advance_commit_index(state).map_err(ProposeError::Storage)?;
     Ok(index)
 }
 
@@ -1126,7 +1155,7 @@ mod tests {
     #[test]
     fn request_vote_grants_when_log_is_empty() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         // Empty log on both sides + higher term + no prior vote
         // → grant. Up-to-date check passes trivially.
@@ -1140,7 +1169,7 @@ mod tests {
     #[test]
     fn append_entries_heartbeat_advances_term_and_persists() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
 
         // Heartbeat at term 5 from leader prefix 0xBBBB.
@@ -1181,7 +1210,7 @@ mod tests {
         // land in `raft_log`, and `commit_index` advances to
         // min(leader_commit, last_new_index).
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
 
         // Leader sends two entries from the empty pre-log slot.
@@ -1222,7 +1251,7 @@ mod tests {
         // `prev_log_term=99` — our entry at index 2 has term 5,
         // not 99, so the consistency check refuses.
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         h.append_entries(
             &[0xC0; 32], 0xBBBB, 5, 0, 0, 0,
@@ -1257,7 +1286,7 @@ mod tests {
         // claims a different entry at index 2. We truncate our
         // index 2 and append the leader's authoritative version.
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         h.append_entries(
             &[0xC0; 32], 0xBBBB, 5, 0, 0, 0,
@@ -1295,7 +1324,7 @@ mod tests {
         // idempotent — no duplicate appends, match_index reflects
         // the existing tail.
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         for _ in 0..3 {
             let resp = h.append_entries(
@@ -1318,7 +1347,7 @@ mod tests {
     #[test]
     fn worker_shuts_down_cleanly() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         // Drop sends shutdown + joins.
         drop(worker);
         // DB is still openable post-drop.
@@ -1329,7 +1358,7 @@ mod tests {
     #[test]
     fn at_most_one_vote_per_term() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         // First voter wins term 5.
         let resp = h.request_vote(&[0xC0; 32], 0xBBBB, 5, 0, 0);
@@ -1362,7 +1391,7 @@ mod tests {
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 500,
         };
-        let worker = RaftWorker::spawn(db.clone(), cfg, None);
+        let worker = RaftWorker::spawn(db.clone(), cfg, None, None);
         let h = worker.handler();
         // Wait for the election to fire + complete.
         let snap = wait_for_role(&h, Role::Leader, Duration::from_millis(500));
@@ -1395,7 +1424,7 @@ mod tests {
     #[test]
     fn propose_on_follower_is_rejected() {
         let (db, dir) = temp_db();
-        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None);
+        let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
         // Brand-new worker is Follower — propose must refuse.
         let err = h.propose(b"x".to_vec()).unwrap_err();
@@ -1417,7 +1446,7 @@ mod tests {
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 500,
         };
-        let worker = RaftWorker::spawn(db.clone(), cfg, None);
+        let worker = RaftWorker::spawn(db.clone(), cfg, None, None);
         let h = worker.handler();
         let _ = wait_for_role(&h, Role::Leader, Duration::from_millis(500));
 

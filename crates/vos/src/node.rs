@@ -1888,8 +1888,7 @@ fn build_agent_strategy(
                 })?;
                 let cfg = crate::raft::RaftConfig {
                     me: self_node_prefix,
-                    members: alloc::vec::Vec::new(),
-                    election_timeout_ms: (150, 300),
+                    ..crate::raft::RaftConfig::default()
                 };
                 Ok(Box::new(crate::raft::RaftCommit::open(&path, cfg)?))
             }
