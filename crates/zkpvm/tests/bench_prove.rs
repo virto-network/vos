@@ -243,7 +243,13 @@ fn bench_prove_log14() {
     bench_at_log_size(14);
 }
 
+// `cargo test --workspace` runs every `#[test]` by default; log16 needs
+// ≥16 GB of RAM and OOMs on smaller hosts.  Mark `#[ignore]` so the
+// default sweep doesn't trip on it; run explicitly with `cargo test
+// --test bench_prove bench_prove_log16 -- --ignored --nocapture` on a
+// box with the headroom.
 #[test]
+#[ignore = "needs ≥16 GB RAM; run explicitly with --ignored"]
 fn bench_prove_log16() {
     bench_at_log_size(16);
 }
