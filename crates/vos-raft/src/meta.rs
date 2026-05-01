@@ -21,8 +21,25 @@ pub struct Meta<N: NodeId> {
     /// Highest log index known to be replicated to a majority.
     /// Always ≤ `last_log_index`.
     pub commit_index: u64,
-    /// Highest log index applied to the state machine. Always
+    /// Highest log index the worker has notified the host's
+    /// [`ApplySink`](crate::ApplySink) about. Always
     /// ≤ `commit_index`.
+    ///
+    /// **Caveat — this is _not_ "applied to a state machine".**
+    /// `vos-raft` is a consensus core, not a replicated state
+    /// machine; it has no state machine to apply to. The worker
+    /// bumps this synchronously with `commit_index` on every
+    /// advance and persists it so a restart can resume
+    /// notifications without replaying entries the sink has
+    /// already seen. The actual apply (write the materialized
+    /// state row, dispatch to actor runtime, etc.) happens in
+    /// the host crate, which should track its own
+    /// "applied-to-disk" index separately if its apply pipeline
+    /// is async or can lag behind notification. A future commit
+    /// may decouple this field's bump from the commit advance
+    /// so a host with a real async apply pipeline can persist
+    /// each apply atomically with the corresponding state row
+    /// write.
     pub last_applied: u64,
     /// Highest log index that has been compacted out of the
     /// live log. The state at this index lives in the snapshot

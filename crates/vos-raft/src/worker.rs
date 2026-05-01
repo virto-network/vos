@@ -79,6 +79,10 @@ pub struct WorkerSnapshot<N: NodeId> {
     pub voted_for: Option<N>,
     pub last_log_index: u64,
     pub commit_index: u64,
+    /// Mirror of [`Meta::last_applied`](crate::Meta::last_applied)
+    /// — see the docs there for the caveat about what this
+    /// field actually means (TL;DR: notification index, not
+    /// state-machine apply index).
     pub last_applied: u64,
     /// Highest log index that has been compacted into the
     /// snapshot. `0` when no compaction has happened yet.
@@ -838,6 +842,11 @@ where
         let new_commit = req.leader_commit.min(last_new_index);
         if new_commit > state.meta.commit_index {
             state.meta.commit_index = new_commit;
+            // `last_applied` is bumped synchronously with
+            // `commit_index` because the worker has no
+            // separate apply pipeline — see Meta::last_applied
+            // doc. A host with async apply must track its own
+            // post-apply index separately.
             state.meta.last_applied = state.meta.last_applied.max(new_commit);
             commit_advanced = true;
         }
