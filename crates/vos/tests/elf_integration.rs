@@ -4014,9 +4014,61 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     assert_eq!(final_c, Some(3),
         "node C should converge to 3; last={:?}", read_count(&node_c, counter_c));
 
+    // Capture the redb paths before collecting (which drops the
+    // VosNode and frees the DB exclusive lock). The check below
+    // probes each replica's on-disk meta directly so we know
+    // every node — leader AND followers — reached
+    // `last_applied >= 3`. This pins host-side apply tracking
+    // post-`last_applied` decouple: the worker bumps
+    // `commit_index` via heartbeat propagation, the agent
+    // notification fires soft_restart, the runtime replays
+    // entries, and `RaftCommit::commit()` writes
+    // `last_applied = commit_index` atomically with the
+    // state row.
+    let dirs = [
+        ("A", dir_a.clone()),
+        ("B", dir_b.clone()),
+        ("C", dir_c.clone()),
+    ];
+
     let _ = node_a.collect();
     let _ = node_b.collect();
     let _ = node_c.collect();
+
+    /// Vos persists agent redb files at
+    /// `{data_dir}/agents/{svc_id:08x}.redb`. Walk the agents
+    /// subdir and return the first .redb path.
+    fn first_agent_redb(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let agents = data_dir.join("agents");
+        let entries = std::fs::read_dir(&agents).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "redb") {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    for (label, dir) in &dirs {
+        let path = first_agent_redb(dir)
+            .unwrap_or_else(|| panic!("replica {label}: no .redb under {}/agents", dir.display()));
+        let db = redb::Database::create(&path).expect("open redb");
+        let meta = vos::raft::RaftMeta::load(&db).expect("load meta");
+        assert!(
+            meta.commit_index >= 3,
+            "replica {label}: commit_index = {} < 3",
+            meta.commit_index,
+        );
+        assert!(
+            meta.last_applied >= 3,
+            "replica {label}: last_applied = {} < 3 — \
+             host-side apply tracking didn't catch up to \
+             the worker's commit_index",
+            meta.last_applied,
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir_root);
 }
 
