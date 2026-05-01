@@ -100,20 +100,20 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 
 fn make_worker() -> Worker<u16> {
     let storage = MemStorage::<u16>::new();
+    let mut cfg = vos_raft::Config::new(
+        0xAAAA,
+        vec![0xAAAA, 0xBBBB, 0xCCCC],
+        [0xC0; 32],
+    );
+    // Long enough that no spontaneous election fires during the
+    // property test — we want to observe *only* the random RPC
+    // sequence's effect on state.
+    cfg.election_timeout_ms = (60_000, 120_000);
+    cfg.heartbeat_interval_ms = 50;
     Worker::spawn_with(
         storage,
         Arc::new(NoopTransport),
-        vos_raft::Config {
-            me: 0xAAAA,
-            members: vec![0xAAAA, 0xBBBB, 0xCCCC],
-            // Long enough that no spontaneous election fires
-            // during the property test — we want to observe
-            // *only* the random RPC sequence's effect on state.
-            election_timeout_ms: (60_000, 120_000),
-            heartbeat_interval_ms: 50,
-            propose_timeout_ms: 5_000,
-            replication_id: [0xC0; 32],
-        },
+        cfg,
         None,
         StdClock,
         StdRng::from_entropy(),

@@ -160,17 +160,13 @@ impl Transport<u16> for MockTransport {
 }
 
 fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
-    Config {
-        me,
-        members,
-        // Tight timeouts so the test runs fast. The dedicated
-        // `StdClock` thread-spawning behavior makes this robust
-        // even under heavy `cargo test` parallelism.
-        election_timeout_ms: (30, 80),
-        heartbeat_interval_ms: 15,
-        propose_timeout_ms: 5_000,
-        replication_id: [0xC0; 32],
-    }
+    // Tight timeouts so the test runs fast. The dedicated
+    // `StdClock` thread-spawning behavior makes this robust
+    // even under heavy `cargo test` parallelism.
+    let mut c = Config::new(me, members, [0xC0; 32]);
+    c.election_timeout_ms = (30, 80);
+    c.heartbeat_interval_ms = 15;
+    c
 }
 
 /// Wait for a predicate to hold or panic on timeout.

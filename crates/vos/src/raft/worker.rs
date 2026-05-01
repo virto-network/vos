@@ -70,17 +70,10 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     fn into_raft(self) -> RaftCfg<u16> {
-        RaftCfg {
-            me: self.me,
-            members: self.members,
-            election_timeout_ms: self.election_timeout_ms,
-            heartbeat_interval_ms: self.heartbeat_interval_ms,
-            // Not used directly by the worker loop — propose-and-wait
-            // timeouts live in `RaftCommit::cfg.propose_timeout_ms`.
-            // Kept as a sane default so the config is complete.
-            propose_timeout_ms: 5_000,
-            replication_id: self.replication_id,
-        }
+        let mut c = RaftCfg::new(self.me, self.members, self.replication_id);
+        c.election_timeout_ms = self.election_timeout_ms;
+        c.heartbeat_interval_ms = self.heartbeat_interval_ms;
+        c
     }
 }
 
@@ -230,10 +223,11 @@ impl WorkerHandle {
             Err(vos_raft::ProposeError::NotLeader) => Err(ProposeError::NotLeader),
             // The generic propose surfaces storage errors through
             // the worker loop's tracing; the handle erases the
-            // concrete type.
-            Err(vos_raft::ProposeError::Storage(())) => Err(ProposeError::Storage(
-                CommitError::Config("raft propose: storage write failed".into()),
-            )),
+            // concrete type. Wildcard catches future ProposeError
+            // variants vos-raft adds (the type is `#[non_exhaustive]`).
+            Err(_) => Err(ProposeError::Storage(CommitError::Config(
+                "raft propose: storage write failed".into(),
+            ))),
         }
     }
 }

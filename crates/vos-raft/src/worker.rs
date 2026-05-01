@@ -58,7 +58,12 @@ use crate::transport::Transport;
 pub const COMPACT_HYSTERESIS: u64 = 16;
 
 /// Reasons a [`WorkerHandle::propose`] can fail.
+///
+/// `#[non_exhaustive]` because new failure modes (timeout,
+/// channel-closed, fatal-storage-error) will land in minor
+/// versions; callers should match with a wildcard.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ProposeError<E> {
     /// This worker is currently `Follower` or `Candidate`. The
     /// caller must retry against the cluster's leader.
@@ -68,7 +73,13 @@ pub enum ProposeError<E> {
 }
 
 /// Diagnostic snapshot of a worker's state.
+///
+/// `#[non_exhaustive]` because future commits will surface
+/// additional state (`snap_last_index`, leader-hint, in-flight
+/// RPCs) — construction is internal-only and consumers should
+/// always match with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WorkerSnapshot<N: NodeId> {
     pub role: Role,
     pub current_term: u64,
@@ -79,7 +90,16 @@ pub struct WorkerSnapshot<N: NodeId> {
 }
 
 /// Inbound message processed by the worker loop.
+///
+/// `#[non_exhaustive]` on the enum so we can grow new RPC kinds
+/// (e.g., a future `PreVote`, learner-add/remove, leader-transfer)
+/// without breaking callers. The variant payloads include
+/// `oneshot::Sender<…>` from `futures-channel`, so the enum
+/// itself is internal protocol — most code should not match on
+/// it directly. Use [`WorkerHandle::handle_inbound_*`] /
+/// [`WorkerHandle::propose`] instead.
 #[allow(dead_code)]
+#[non_exhaustive]
 pub enum RaftMsg<N: NodeId> {
     AppendEntries {
         from: N,
@@ -172,7 +192,6 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
-        let inbox_for_thread = tx.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
@@ -180,7 +199,6 @@ impl<N: NodeId> Worker<N> {
                     storage,
                     transport,
                     cfg,
-                    inbox_for_thread,
                     rx,
                     apply_notifier,
                     clock,
@@ -500,8 +518,8 @@ where
 
 // ── Public driver ───────────────────────────────────────────
 
-/// Run a worker future to completion. Returns `Ok` on
-/// `RaftMsg::Shutdown`, `Err` on a fatal storage error.
+/// Run a worker future to completion. Returns when the inbox
+/// receives a `RaftMsg::Shutdown` or the inbox sender is dropped.
 ///
 /// Embedded hosts call this directly inside their executor.
 /// Std hosts typically use [`Worker::spawn`].
@@ -510,7 +528,6 @@ pub async fn run_worker<N, S, T, C, R>(
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
-    _inbox_tx: Inbox<N>,
     inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
     apply_notifier: Option<ApplyNotifier>,
     clock: C,
@@ -1329,14 +1346,10 @@ mod tests {
     use crate::testutil::block_on;
 
     fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
-        Config {
-            me,
-            members,
-            election_timeout_ms: (5_000, 10_000),
-            heartbeat_interval_ms: 500,
-            propose_timeout_ms: 5_000,
-            replication_id: [0u8; 32],
-        }
+        let mut c = Config::new(me, members, [0u8; 32]);
+        c.election_timeout_ms = (5_000, 10_000);
+        c.heartbeat_interval_ms = 500;
+        c
     }
 
     #[test]

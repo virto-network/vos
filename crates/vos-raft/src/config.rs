@@ -17,9 +17,14 @@ impl<T> NodeId for T where T: Copy + Eq + Ord + Hash + Debug + Send + Sync + 'st
 
 /// Per-replica configuration. Every field is pure data; nothing
 /// here resolves peers, opens databases, or contacts the network.
-/// The worker (in a later commit) consumes a `Config` once at
-/// construction.
+/// The worker consumes a `Config` once at construction.
+///
+/// Marked `#[non_exhaustive]` so additional tuning knobs can land
+/// in minor versions without breaking SemVer. Construct via
+/// `Config { ..Default::default() }` or with explicit field
+/// initialization plus the leading `..` rest pattern.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config<N: NodeId> {
     /// This replica's identity. Has to appear in `members`.
     pub me: N,
@@ -38,16 +43,28 @@ pub struct Config<N: NodeId> {
     /// followers always see a heartbeat before timing out.
     /// Standard Raft guidance: ~10× smaller.
     pub heartbeat_interval_ms: u64,
-    /// Hard cap on how long a propose-and-wait blocks waiting
-    /// for the proposed entry's commit_index to land. Defaults
-    /// to 5 seconds.
-    pub propose_timeout_ms: u64,
     /// Replication group ID — used as a routing key when a
     /// transport multiplexes multiple Raft groups over one
     /// physical channel (e.g. libp2p with several actors). The
     /// worker doesn't interpret this; it just hands it to the
     /// transport.
     pub replication_id: [u8; 32],
+}
+
+impl<N: NodeId> Config<N> {
+    /// Construct with sensible defaults for everything except the
+    /// caller-required fields. Election timeouts default to
+    /// 150–300ms and the heartbeat interval to 50ms — Raft's
+    /// "10× smaller" guidance with margin.
+    pub fn new(me: N, members: Vec<N>, replication_id: [u8; 32]) -> Self {
+        Self {
+            me,
+            members,
+            election_timeout_ms: (150, 300),
+            heartbeat_interval_ms: 50,
+            replication_id,
+        }
+    }
 }
 
 impl<N: NodeId> Config<N> {
@@ -66,14 +83,7 @@ mod tests {
     use alloc::vec;
 
     fn cfg(members: Vec<u16>) -> Config<u16> {
-        Config {
-            me: members[0],
-            members,
-            election_timeout_ms: (150, 300),
-            heartbeat_interval_ms: 50,
-            propose_timeout_ms: 5_000,
-            replication_id: [0u8; 32],
-        }
+        Config::new(members[0], members, [0u8; 32])
     }
 
     #[test]
