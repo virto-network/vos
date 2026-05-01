@@ -51,7 +51,12 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
 pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
-    verify_with_max_log_size(proof, side_note, DEFAULT_MAX_LOG_SIZE)
+    verify_with_options(
+        proof,
+        side_note,
+        DEFAULT_MAX_LOG_SIZE,
+        &crate::proof::PcsPolicy::STANDARD,
+    )
 }
 
 /// Caller-supplied per-component `log_size` cap variant of `verify`.
@@ -60,6 +65,28 @@ pub fn verify_with_max_log_size(
     proof: Proof,
     side_note: &SideNote,
     max_log_size: u32,
+) -> Result<(), VerificationError> {
+    verify_with_options(proof, side_note, max_log_size, &crate::proof::PcsPolicy::STANDARD)
+}
+
+/// Phase 49: enforce a custom `PcsPolicy` (FRI shape + PoW floor)
+/// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
+/// override for stricter (more security) or looser (test harness)
+/// floors.  See SECURITY.md "Proof shape".
+pub fn verify_with_pcs_policy(
+    proof: Proof,
+    side_note: &SideNote,
+    policy: &crate::proof::PcsPolicy,
+) -> Result<(), VerificationError> {
+    verify_with_options(proof, side_note, DEFAULT_MAX_LOG_SIZE, policy)
+}
+
+/// Both knobs at once.
+pub fn verify_with_options(
+    proof: Proof,
+    side_note: &SideNote,
+    max_log_size: u32,
+    policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
     let components = BASE_COMPONENTS;
     // Phase 42: reject proofs from a different AIR shape early, before
@@ -79,6 +106,12 @@ pub fn verify_with_max_log_size(
         return Err(VerificationError::InvalidStructure(format!(
             "proof log_size {offending} exceeds cap {max_log_size}"
         )));
+    }
+    // Phase 49: enforce the PcsPolicy floor — reject under-spec'd
+    // pcs_configs before any cryptographic work.  Default policy is
+    // PcsPolicy::STANDARD.
+    if let Err(msg) = crate::proof::check_pcs_policy(&proof.pcs_config, policy) {
+        return Err(VerificationError::InvalidStructure(msg));
     }
     let Proof {
         stark_proof: proof,

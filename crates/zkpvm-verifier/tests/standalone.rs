@@ -88,6 +88,74 @@ fn standalone_verify_rejects_format_version_mismatch() {
     );
 }
 
+// Phase 49: pcs_config policy floor.  A proof generated with a
+// weaker PcsConfig (lower pow_bits / fewer FRI queries / smaller
+// blowup) than PcsPolicy::STANDARD must be rejected by the
+// default verify_standalone path before any cryptographic work.
+#[test]
+fn standalone_verify_rejects_weak_pcs_config() {
+    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
+    use zkpvm::prove_with_config;
+
+    let code = vec![Opcode::Trap as u8];
+    let bitmask = vec![1];
+    let registers = [0u64; PVM_REGISTER_COUNT];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], registers, vec![0u8; 4 * 1024 * 1024], 1000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+
+    // Prove with a config below STANDARD policy: pow_bits = 0, only
+    // 1 FRI query.  Honest prover output but at "test-grade" security.
+    let weak_config = PcsConfig {
+        pow_bits: 0,
+        fri_config: FriConfig::new(0, 4, 1),
+    };
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
+    let preprocessed_commitment = proof.stark_proof.commitments[0];
+
+    let err = zkpvm_verifier::verify_standalone(proof, preprocessed_commitment)
+        .expect_err("default verify_standalone must reject weak pcs_config");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("pow_bits") || msg.contains("n_queries"),
+        "expected pcs_config policy rejection, got: {msg}");
+}
+
+#[test]
+fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
+    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
+    use zkpvm::prove_with_config;
+
+    let code = vec![Opcode::Trap as u8];
+    let bitmask = vec![1];
+    let registers = [0u64; PVM_REGISTER_COUNT];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], registers, vec![0u8; 4 * 1024 * 1024], 1000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+
+    let weak_config = PcsConfig {
+        pow_bits: 0,
+        fri_config: FriConfig::new(0, 4, 1),
+    };
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
+    let preprocessed_commitment = proof.stark_proof.commitments[0];
+
+    // Relaxed policy that allows weaker configs (e.g. for test
+    // harnesses).  The proof must verify under this policy.
+    let test_policy = zkpvm_verifier::PcsPolicy {
+        min_pow_bits: 0,
+        min_fri_queries: 1,
+        min_fri_log_blowup: 4,
+    };
+    zkpvm_verifier::verify_standalone_with_pcs_policy(proof, preprocessed_commitment, &test_policy)
+        .expect("relaxed-policy verify must accept the weak proof");
+}
+
 // Phase 43: log_size cap test.  We don't need to forge a giant proof
 // — just call the variant with an unrealistically tight cap and check
 // the early rejection fires.

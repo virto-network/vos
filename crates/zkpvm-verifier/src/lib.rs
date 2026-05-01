@@ -33,6 +33,11 @@ use stwo_constraint_framework::TraceLocationAllocator;
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
 pub use zkpvm::{Proof, PROOF_FORMAT_VERSION};
+// Phase 49: PcsPolicy floor — see SECURITY.md "Proof shape".
+pub use zkpvm::proof::{
+    check_pcs_policy, PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES,
+    STANDARD_MIN_POW_BITS,
+};
 
 use zkpvm::framework_access::{
     create_verifier_components, draw_all_lookup_elements, AllLookupElements,
@@ -68,7 +73,12 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
-    verify_standalone_with_max_log_size(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)
+    verify_standalone_with_options(
+        proof,
+        preprocessed_commitment,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::STANDARD,
+    )
 }
 
 /// Same as `verify_standalone` but with a caller-supplied per-component
@@ -85,6 +95,38 @@ pub fn verify_standalone_with_max_log_size(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
+) -> Result<(), VerificationError> {
+    verify_standalone_with_options(
+        proof,
+        preprocessed_commitment,
+        max_log_size,
+        &PcsPolicy::STANDARD,
+    )
+}
+
+/// Phase 49: enforce a custom `PcsPolicy` (FRI shape + PoW floor)
+/// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
+/// override for stricter (more security) or looser (test harness)
+/// floors.  See SECURITY.md "Proof shape".
+pub fn verify_standalone_with_pcs_policy(
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    policy: &PcsPolicy,
+) -> Result<(), VerificationError> {
+    verify_standalone_with_options(
+        proof,
+        preprocessed_commitment,
+        DEFAULT_MAX_LOG_SIZE,
+        policy,
+    )
+}
+
+/// Both knobs at once.
+pub fn verify_standalone_with_options(
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    max_log_size: u32,
+    policy: &PcsPolicy,
 ) -> Result<(), VerificationError> {
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
@@ -107,6 +149,14 @@ pub fn verify_standalone_with_max_log_size(
             "proof log_size {offending} exceeds cap {max_log_size} \
              (set max_log_size higher or reject this proof)"
         )));
+    }
+    // Phase 49: enforce the PcsPolicy floor — reject under-spec'd
+    // pcs_configs (low pow_bits, low n_queries, low log_blowup_factor)
+    // before any cryptographic work.  Default policy is
+    // PcsPolicy::STANDARD; deployers needing more / less specify a
+    // custom one.
+    if let Err(msg) = check_pcs_policy(&proof.pcs_config, policy) {
+        return Err(VerificationError::InvalidStructure(msg));
     }
     let Proof {
         stark_proof,

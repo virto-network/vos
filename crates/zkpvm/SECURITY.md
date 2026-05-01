@@ -137,9 +137,16 @@ either:
    inspects `proof.pcs_config` and rejects weaker-than-policy
    configs.
 
-There is no built-in check because some legitimate deployments
-(test harnesses, low-stakes batches) want lower-cost proofs.  The
-default config is appropriate for production.
+**Phase 49 update**: there is now a built-in `PcsPolicy::STANDARD`
+check.  `verify` and `verify_standalone` reject any proof whose
+`pcs_config` falls below the floor (`pow_bits ≥ 20`, `n_queries ≥
+19`, `log_blowup_factor ≥ 4` — what `production_pcs_config()`
+generates).  Deployers needing strictly more (e.g. higher pow_bits
+for a higher-stakes deployment) call
+`verify_*_with_pcs_policy(&PcsPolicy { min_pow_bits: 24, .. })`.
+Deployers running test harnesses with intentionally-weak configs
+call the same with `min_pow_bits = 0`, etc.  The default rejects
+weak configs; opt-in to weaker policy is explicit.
 
 ## Deployment checklist
 

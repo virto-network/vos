@@ -151,7 +151,10 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::BitcountChip,
 ];
 
-pub use proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
+pub use proof::{
+    check_pcs_policy, PcsPolicy, Proof, SegmentState, PROOF_FORMAT_VERSION,
+    STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
+};
 #[cfg(feature = "prover")]
 pub use prove::{prove, prove_with_config, prove_profiled, prove_profiled_with_config, ProveProfile, production_pcs_config};
 #[cfg(feature = "debug-internals")]
@@ -159,7 +162,10 @@ pub use prove::debug_claimed_sums;
 pub use stwo::core::pcs::PcsConfig;
 pub use stwo::core::fri::FriConfig;
 #[cfg(feature = "prover")]
-pub use verify::{verify, verify_chain, verify_with_max_log_size, DEFAULT_MAX_LOG_SIZE};
+pub use verify::{
+    verify, verify_chain, verify_with_max_log_size, verify_with_options,
+    verify_with_pcs_policy, DEFAULT_MAX_LOG_SIZE,
+};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
 #[cfg(feature = "prover")]
