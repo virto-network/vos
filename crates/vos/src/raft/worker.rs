@@ -235,6 +235,28 @@ impl WorkerHandle {
     }
 }
 
+/// `RaftRpcHandler` impl for [`WorkerHandle`].
+///
+/// Each method bridges the sync trait API expected by the
+/// libp2p layer (`Network::set_raft_handler`) to the underlying
+/// async [`vos_raft::WorkerHandle`] by `block_on`-ing the call.
+/// The block is always executed on a `tokio::task::spawn_blocking`
+/// worker — see `Network::run_swarm` (`crates/vos/src/network/mod.rs`,
+/// search for `RaftAppendReq`): every inbound Raft frame is
+/// dispatched off the swarm thread before invoking the handler,
+/// so:
+///
+/// 1. The swarm thread never blocks on the worker.
+/// 2. An outbound `VosTransport::send_*` posted to the swarm
+///    from this same blocking thread can make progress while
+///    the inbound handler is still parked on its worker reply.
+/// 3. No deadlock is possible between inbound RPC dispatch and
+///    outbound RPC delivery, even if both touch the same
+///    libp2p `request_response` plumbing.
+///
+/// The `block_on` here is therefore safe — it parks a tokio
+/// blocking-pool thread, not the swarm thread, and the worker
+/// has its own dedicated thread to make progress.
 impl RaftRpcHandler for WorkerHandle {
     fn append_entries(
         &self,
