@@ -266,11 +266,45 @@ which translates to a 15-30% prove-time reduction at log14
 (roughly 2.5-4 seconds saved out of 12.92).  No soundness
 change.
 
-Each fold is mechanical but spans ~5 places per column (column
-enum, prog_mem flag list, prog_mem tuple emission verifier-side,
+#### Implementation gotcha (from a Phase 53 trial run)
+
+Each fold spans ~5 places per column (column enum,
+prog_mem flag list, prog_mem tuple emission verifier-side,
 prog_mem tuple emission prover-side, classify_opcode_for_program_memory,
-trace fill).  Plan: do them in batches of 5-10 columns with a
-sweep after each batch.
+trace fill).  Three of these are mechanical; the prover-side
+prog_mem tuple emission is the gotcha:
+
+  // Verifier side (cpu/mod.rs add_constraints) — column → sum:
+  tuple.push(mu_uu[0].clone() + mu_su[0].clone() + mu_ss[0].clone());
+
+  // Prover side (cpu/interaction.rs) — `FinalizedColumn` does
+  // NOT impl `Add`, so this DOES NOT compile:
+  // tuple.push(f_mu_uu[0].clone() + f_mu_su[0].clone() + f_mu_ss[0].clone());
+
+The prover-side mirror needs `add_to_relation_computed` (the
+closure-based variant of `add_to_relation_with`) where each
+tuple element is computed per-vec-index from the underlying
+`FinalizedColumn::at(vec_idx)` values.  See the existing
+MemoryAccess byte-level lookup in interaction.rs for the
+pattern — it already uses `add_to_relation_computed` to
+synthesize `addr + byte_idx` per row.
+
+So a column fold needs both:
+1. Verifier-side: replace column read with sum expression.
+2. Prover-side: convert the tuple emission from
+   `add_to_relation_with` (slice-based) to
+   `add_to_relation_computed` (closure-based) AND build the
+   tuple element from `mu_uu_c.at(vec_idx) + mu_su_c.at(vec_idx)
+   + mu_ss_c.at(vec_idx)` inside the closure.
+
+That conversion is mechanical but per-emission, not per-fold —
+once the prog_mem tuple emission switches to
+`add_to_relation_computed`, every subsequent fold is free.  Plan:
+the first fold also lifts the prog_mem tuple to the
+closure-based emission; later folds just edit the closure.
+
+Plan: do folds in batches of 5-10 columns with a sweep after
+each batch.
 
 ### Phase 54 — per-opcode-family chip shards
 
