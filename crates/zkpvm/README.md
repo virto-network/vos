@@ -153,8 +153,22 @@ shape (CONSTRAINTS.md rule 1).
   phases delivered each piece.
 - [`PLAN.md`](./PLAN.md) — prioritized phase plan for the remaining
   soundness gaps.
+- [`SECURITY.md`](./SECURITY.md) — trust boundary, what a
+  verified proof guarantees / does not guarantee, deployment
+  checklist.  **Read this before pointing real users at a
+  deployed verifier.**
 - [`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md)
   — house rules for adding constraints to CpuChip.
+
+## Examples
+
+```sh
+cargo run -p zkpvm --example prove_and_verify --release
+```
+
+End-to-end: bytecode → trace → prove → standalone verify →
+serialize / deserialize round-trip.  Runs in a few seconds on a
+modern desktop and prints the proof size + per-stage timing.
 
 ## Adapted from
 
