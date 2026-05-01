@@ -157,6 +157,10 @@ shape (CONSTRAINTS.md rule 1).
   verified proof guarantees / does not guarantee, deployment
   checklist.  **Read this before pointing real users at a
   deployed verifier.**
+- [`BENCHMARKS.md`](./BENCHMARKS.md) — single-thread proving
+  throughput at log_size 10/12/14, per-stage breakdown,
+  apples-to-apples comparison against Nexus zkVM 2.x's
+  published Stwo numbers.
 - [`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md)
   — house rules for adding constraints to CpuChip.
 
