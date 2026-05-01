@@ -217,9 +217,17 @@ impl<N: NodeId> Worker<N> {
 
     /// Like [`spawn`](Self::spawn) but with caller-supplied
     /// [`Clock`], [`Rng`], and [`ApplySink`]. Useful for
-    /// deterministic simulators, hosts that want to plug in
-    /// `tokio::time` directly, or embedded users with a custom
+    /// deterministic simulators or embedded users with a custom
     /// notification channel.
+    ///
+    /// **NOTE — this helper drives the worker future on
+    /// `futures-executor::block_on`, which has no timer driver.**
+    /// Clocks whose `Sleep` future requires an external runtime
+    /// (e.g. `TokioClock`'s `tokio::time::Sleep`) will panic on
+    /// the first poll. For tokio hosts use
+    /// [`spawn_with_tokio_runtime`](Self::spawn_with_tokio_runtime).
+    /// For Embassy / async-std / smol hosts, call
+    /// [`run_worker`] directly under your own executor.
     pub fn spawn_with<S, T, C, R, A>(
         storage: S,
         transport: Arc<T>,
@@ -242,6 +250,60 @@ impl<N: NodeId> Worker<N> {
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
                 futures_executor::block_on(run_worker(
+                    storage,
+                    transport,
+                    cfg,
+                    rx,
+                    apply_sink,
+                    clock,
+                    rng,
+                    role_for_thread,
+                ));
+            })
+            .expect("spawn raft worker");
+        Self {
+            inbox: Inbox { inner: tx },
+            role,
+            join: Some(join),
+        }
+    }
+
+    /// Like [`spawn_with`] but drives the worker on a
+    /// dedicated tokio current-thread runtime (with the timer
+    /// driver enabled). Required when using
+    /// [`TokioClock`](crate::TokioClock), whose `Sleep` future
+    /// can't be polled on `futures-executor`.
+    ///
+    /// Requires the `tokio` feature.
+    ///
+    /// [`spawn_with`]: Self::spawn_with
+    #[cfg(feature = "tokio")]
+    pub fn spawn_with_tokio_runtime<S, T, C, R, A>(
+        storage: S,
+        transport: Arc<T>,
+        cfg: Config<N>,
+        apply_sink: A,
+        clock: C,
+        rng: R,
+    ) -> Self
+    where
+        S: Storage<N>,
+        T: Transport<N>,
+        C: Clock,
+        R: Rng,
+        A: ApplySink,
+    {
+        let (tx, rx) = fmpsc::unbounded();
+        let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
+        let role_for_thread = role.clone();
+        let join = std::thread::Builder::new()
+            .name(alloc::format!("raft-worker-{:?}", cfg.me))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("build tokio current-thread runtime for raft worker");
+                rt.block_on(run_worker(
                     storage,
                     transport,
                     cfg,

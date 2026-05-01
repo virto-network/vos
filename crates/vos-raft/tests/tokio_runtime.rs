@@ -1,10 +1,11 @@
 //! Smoke test for the [`TokioClock`] adapter.
 //!
-//! Spawns a solo cluster wired with `TokioClock` and a tokio
-//! runtime. Verifies the worker self-elects, accepts a propose,
-//! and shuts down cleanly. This is the recommended config for
-//! tokio-native hosts (avoids `StdClock`'s per-`Delay` thread
-//! spawning).
+//! Exercises [`Worker::spawn_with_tokio_runtime`] — the helper
+//! that drives the worker future on a tokio current-thread
+//! runtime with `enable_time()`, which is what `TokioClock`'s
+//! `Sleep` future requires. The plain [`Worker::spawn_with`]
+//! would panic on the first poll because `futures-executor`
+//! has no timer driver.
 
 #![cfg(all(feature = "std", feature = "tokio"))]
 
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use vos_raft::{
     AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, RequestVoteReq, Role,
-    StdRng, TokioClock, Transport,
+    StdRng, TokioClock, Transport, Worker,
 };
 
 struct NoopT;
@@ -51,77 +52,77 @@ impl Transport<u16> for NoopT {
 
 #[test]
 fn solo_cluster_self_elects_with_tokio_clock() {
-    // The `Worker::spawn_with` thread-spawning convenience runs
-    // `futures_executor::block_on` on the dedicated thread.
-    // `TokioClock::sleep_until` returns a `tokio::time::Sleep`
-    // — that needs a tokio runtime to drive its waker. Build a
-    // current-thread tokio runtime on the worker thread and
-    // drive the worker future on it.
-    //
-    // To avoid bundling a custom executor here, the simplest
-    // way is: spawn a thread that owns a tokio runtime and
-    // calls `runtime.block_on(run_worker(...))`. But the
-    // existing `Worker::spawn_with` uses `futures_executor`,
-    // which doesn't drive tokio timers.
-    //
-    // Workaround for this smoke test: use the lower-level
-    // `vos_raft::worker::run_worker` directly, dispatched on a
-    // tokio current-thread runtime.
-
-    use std::sync::atomic::AtomicU8;
-    use std::time::Duration;
-    use vos_raft::worker::run_worker;
-
     let storage = MemStorage::<u16>::new();
     let transport = Arc::new(NoopT);
     let mut cfg = Config::new(0xAAAA, vec![0xAAAA], [0xC0; 32]);
     cfg.election_timeout_ms = (10, 30);
     cfg.heartbeat_interval_ms = 5;
 
-    let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
-    let role_clone = role.clone();
+    let worker = Worker::spawn_with_tokio_runtime(
+        storage,
+        transport,
+        cfg,
+        (),
+        TokioClock,
+        StdRng::from_entropy(),
+    );
 
-    let (tx, rx) = futures_channel::mpsc::unbounded::<vos_raft::RaftMsg<u16>>();
-
-    // Drive the worker on a dedicated thread running a tokio
-    // current-thread runtime. The `TokioClock` registers its
-    // sleeps with this runtime's timer driver — no thread
-    // spawning per `Delay`.
-    let join = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async move {
-            run_worker(
-                storage,
-                transport,
-                cfg,
-                rx,
-                (),
-                TokioClock,
-                StdRng::from_entropy(),
-                role_clone,
-            )
-            .await
-        });
-    });
-
-    // Poll the role atomic for self-election. Solo cluster wins
-    // its first election (quorum = 1).
-    let until = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        if Role::from_u8(role.load(std::sync::atomic::Ordering::Relaxed)) == Role::Leader {
-            break;
-        }
+    // Solo cluster wins its first election (quorum = 1) under
+    // any working clock — the value of this test is that
+    // `TokioClock::sleep_until` actually fires (without the
+    // tokio runtime built inside the spawn helper, the first
+    // poll panics with "no Tokio reactor running").
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while worker.role() != Role::Leader {
         assert!(
             std::time::Instant::now() < until,
-            "solo cluster failed to self-elect under TokioClock",
+            "solo cluster failed to self-elect under TokioClock + spawn_with_tokio_runtime",
         );
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    // Tell the worker to shut down by dropping the inbox sender.
-    drop(tx);
-    let _ = join.join();
+    worker.shutdown();
+}
+
+/// Pins the documented incompatibility: `Worker::spawn_with`
+/// drives the worker on `futures-executor`, which has no
+/// timer driver. `TokioClock`'s `Sleep` future panics on the
+/// first poll with "no Tokio reactor running". This test asserts
+/// the worker thread terminates without becoming Leader — the
+/// panic kills the worker thread but doesn't propagate up to
+/// the test. If this test ever starts passing (becoming Leader),
+/// the worker probably gained an internal tokio runtime and the
+/// docs should be updated.
+#[test]
+fn spawn_with_panics_with_tokio_clock_no_runtime() {
+    let storage = MemStorage::<u16>::new();
+    let transport = Arc::new(NoopT);
+    let mut cfg = Config::new(0xAAAA, vec![0xAAAA], [0xC0; 32]);
+    cfg.election_timeout_ms = (10, 30);
+    cfg.heartbeat_interval_ms = 5;
+
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg,
+        (),
+        TokioClock,
+        StdRng::from_entropy(),
+    );
+
+    // Give the worker thread enough time to poll its first
+    // `sleep_until` and panic. Then verify it never reached
+    // Leader: the panic on the first poll prevented the
+    // election from completing.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_ne!(
+        worker.role(),
+        Role::Leader,
+        "spawn_with + TokioClock without a tokio runtime should panic on first poll, \
+         not silently elect a leader",
+    );
+    // Drop the worker without calling shutdown; the thread has
+    // already aborted. Calling shutdown would join a thread that
+    // panicked, which is fine but adds noise.
+    drop(worker);
 }

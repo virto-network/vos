@@ -35,16 +35,12 @@ tokio = ["std", "dep:tokio"]
 futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
 futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
-# Tokio adapter — std-only, optional. Provides `TokioClock`.
-tokio = { version = "1", optional = true, default-features = false, features = ["time"] }
+# Tokio adapter — std-only, optional. Provides `TokioClock` plus
+# `Worker::spawn_with_tokio_runtime` (needs `rt` for the
+# current-thread runtime builder).
+tokio = { version = "1", optional = true, default-features = false, features = ["time", "rt"] }
 
 [dev-dependencies]
 # Property-based testing — randomly generated AppendEntries /
 # RequestVote sequences vs. Raft safety invariants.
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
-# Tokio runtime + macros + futures-channel re-import for the
-# `TokioClock` smoke test. The test is feature-gated to
-# `cfg(feature = "tokio")`, so these dev-deps only matter when
-# the test runs.
-tokio = { version = "1", default-features = false, features = ["time", "rt", "macros"] }
-futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }

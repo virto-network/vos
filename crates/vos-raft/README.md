@@ -50,9 +50,13 @@ The std-feature defaults trade some thread spawns for simplicity:
   This avoids `futures-timer`'s shared-timer-wheel contention
   under heavy `cargo test` parallelism but is wasteful at
   scale. **Production tokio-native deployments should enable
-  the `tokio` feature and use `TokioClock` instead** — it
-  registers sleeps with the host's tokio timer driver and
-  doesn't spawn anything per `Delay`.
+  the `tokio` feature and use `TokioClock` via
+  [`Worker::spawn_with_tokio_runtime`]** — that helper runs
+  the worker future on a tokio current-thread runtime
+  (`enable_time()` set), which `TokioClock`'s `Sleep` requires.
+  Plain [`Worker::spawn_with`] uses `futures-executor` and
+  panics on the first `TokioClock` poll because it has no
+  timer driver.
 - vos's `VosTransport` (in the `vos` crate, not here) spawns a
   helper thread per outbound RPC to bridge libp2p's sync reply
   channel to an async future.
@@ -62,12 +66,12 @@ introduced by the std-feature convenience layer.
 
 ### Picking a `Clock` impl
 
-| Host                    | Recommended `Clock`               | Why                                           |
-|-------------------------|-----------------------------------|-----------------------------------------------|
-| tokio                   | `TokioClock` (`tokio` feature)    | Native `tokio::time::sleep_until`, no spawns |
-| Embassy / no_std        | Your own (e.g. `embassy_time::Timer` wrapper) | No std deps                                  |
-| async-std / smol / quick smoke | `StdClock` (default)       | No external runtime dep, thread-per-Delay    |
-| Deterministic simulator | Your own (virtual clock)          | Ticks under test control                     |
+| Host                    | Recommended `Clock`               | How to drive                                          |
+|-------------------------|-----------------------------------|-------------------------------------------------------|
+| tokio                   | `TokioClock` (`tokio` feature)    | `Worker::spawn_with_tokio_runtime(...)` — builds a current-thread runtime on the worker thread with `enable_time()` |
+| Embassy / no_std        | Your own (e.g. `embassy_time::Timer` wrapper) | Call `run_worker(...).await` on Embassy's executor    |
+| async-std / smol / quick smoke | `StdClock` (default)       | `Worker::spawn(...)` / `Worker::spawn_with(...)` — uses `futures-executor` |
+| Deterministic simulator | Your own (virtual clock)          | Drive `run_worker` manually under your test harness   |
 
 ## API surface
 

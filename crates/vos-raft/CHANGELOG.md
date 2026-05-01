@@ -9,9 +9,11 @@ surface is intentionally small but reserves room to grow via
 ### Added
 - **`TokioClock`** behind the new `tokio` feature — uses
   `tokio::time::sleep_until` instead of `StdClock`'s thread-per-`Delay`
-  approach. Recommended for tokio-native hosts; use
-  `Worker::spawn_with(..., TokioClock, ...)` and drive the
-  worker future on a tokio current-thread runtime.
+  approach. Recommended for tokio-native hosts. Spawn via
+  [`Worker::spawn_with_tokio_runtime`] (which builds a tokio
+  current-thread runtime with `enable_time()` on the worker
+  thread); plain `spawn_with` panics on the first `TokioClock`
+  poll because `futures-executor` has no timer driver.
 - **Async-by-default `Storage<N>` and `Transport<N>` traits**.
   Methods return `impl Future + Send`. Synchronous backends
   (`MemStorage`, the redb adapter in `vos`) just return ready
