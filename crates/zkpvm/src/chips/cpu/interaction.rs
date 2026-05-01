@@ -146,7 +146,14 @@ pub(super) fn generate_interaction_trace(
         // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
         // For each byte i: lookup (hi_nib_b, hi_nib_d, hi_nib_and) and (lo_nib_b, lo_nib_d, lo_nib_and)
         let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
-        let is_bitwise = crate::trace::original_base_column!(component_trace, Column::IsBitwise);
+        // Phase 53c: IsBitwise = sum of 6 sub-flags.  Pass them as
+        // 6-column multiplicity to add_to_relation_with's array.
+        let is_and_c = crate::trace::original_base_column!(component_trace, Column::IsAnd);
+        let is_or_c = crate::trace::original_base_column!(component_trace, Column::IsOr);
+        let is_xor_c = crate::trace::original_base_column!(component_trace, Column::IsXor);
+        let is_andinv_c = crate::trace::original_base_column!(component_trace, Column::IsAndInv);
+        let is_orinv_c = crate::trace::original_base_column!(component_trace, Column::IsOrInv);
+        let is_xnor_c = crate::trace::original_base_column!(component_trace, Column::IsXnor);
         let val_b_cols = crate::trace::original_base_column!(component_trace, Column::ValB);
         let val_d_cols = crate::trace::original_base_column!(component_trace, Column::ValD);
         let and_result_cols = crate::trace::original_base_column!(component_trace, Column::AndResult);
@@ -158,8 +165,11 @@ pub(super) fn generate_interaction_trace(
             // High nibble lookup: (val_b_hi[i], val_d_hi[i], and_result_hi[i])
             logup.add_to_relation_with(
                 bitwise_and,
-                [is_bitwise[0].clone()],
-                |[bw]| bw.into(),
+                [
+                    is_and_c[0].clone(), is_or_c[0].clone(), is_xor_c[0].clone(),
+                    is_andinv_c[0].clone(), is_orinv_c[0].clone(), is_xnor_c[0].clone(),
+                ],
+                |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
                 &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
             );
             // Low nibble lookup: (val_b_lo[i], val_d_lo[i], and_result_lo[i])
@@ -172,8 +182,11 @@ pub(super) fn generate_interaction_trace(
             let and_hi_i = and_result_hi_nib[i].clone();
             logup.add_to_relation_computed(
                 bitwise_and,
-                [is_bitwise[0].clone()],
-                |[bw]| bw.into(),
+                [
+                    is_and_c[0].clone(), is_or_c[0].clone(), is_xor_c[0].clone(),
+                    is_andinv_c[0].clone(), is_orinv_c[0].clone(), is_xnor_c[0].clone(),
+                ],
+                |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
                 3,
                 |vec_idx| {
                     let b_lo = val_b_col_i.at(vec_idx) - val_b_hi_i.at(vec_idx) * sixteen;
@@ -453,7 +466,13 @@ pub(super) fn generate_interaction_trace(
             // Phase 53: IsMulUpper folded into (mu_uu+mu_su+mu_ss).
             // The prog_mem tuple slot is filled via a closure
             // override below since the column no longer exists.
-            let f_is_bitwise = crate::trace::original_base_column!(component_trace, Column::IsBitwise);
+            // Phase 53c: IsBitwise folded; sum below via closure override.
+            let f_is_and = crate::trace::original_base_column!(component_trace, Column::IsAnd);
+            let f_is_or = crate::trace::original_base_column!(component_trace, Column::IsOr);
+            let f_is_xor = crate::trace::original_base_column!(component_trace, Column::IsXor);
+            let f_is_and_inv = crate::trace::original_base_column!(component_trace, Column::IsAndInv);
+            let f_is_or_inv = crate::trace::original_base_column!(component_trace, Column::IsOrInv);
+            let f_is_xnor = crate::trace::original_base_column!(component_trace, Column::IsXnor);
             let f_is_shift = crate::trace::original_base_column!(component_trace, Column::IsShift);
             let f_is_compare = crate::trace::original_base_column!(component_trace, Column::IsCompare);
             let f_is_move = crate::trace::original_base_column!(component_trace, Column::IsMove);
@@ -516,7 +535,8 @@ pub(super) fn generate_interaction_trace(
             // Phase 53: placeholder for the folded IsMulUpper slot;
             // overridden in the closure below to (mu_uu+mu_su+mu_ss).
             tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
-            tuple.push(f_is_bitwise[0].clone());
+            // Phase 53c: placeholder for the folded IsBitwise slot.
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_shift[0].clone());
             tuple.push(f_is_compare[0].clone());
             tuple.push(f_is_move[0].clone());
@@ -563,17 +583,23 @@ pub(super) fn generate_interaction_trace(
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
-            // Phase 53: IsMulUpper slot is at tuple index 20
+            // Phase 53/53c: folded slot indices in the tuple
             // (pc[4] + opcode + skip_len + 3·reg + imm[8] + is_add
-            // + is_sub + is_mul = 20).  The closure substitutes
-            // (mu_uu+mu_su+mu_ss) for the placeholder.
+            // + is_sub + is_mul = 20; +1 for is_mul_upper, etc.).
             const IS_MUL_UPPER_SLOT: usize = 20;
+            const IS_BITWISE_SLOT: usize = 21;
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {
                 let is_pad = is_pad_col[0].clone();
                 let mu_uu_c = f_is_mul_upper_uu[0].clone();
                 let mu_su_c = f_is_mul_upper_su[0].clone();
                 let mu_ss_c = f_is_mul_upper_ss[0].clone();
+                let bw_and_c = f_is_and[0].clone();
+                let bw_or_c = f_is_or[0].clone();
+                let bw_xor_c = f_is_xor[0].clone();
+                let bw_andinv_c = f_is_and_inv[0].clone();
+                let bw_orinv_c = f_is_or_inv[0].clone();
+                let bw_xnor_c = f_is_xnor[0].clone();
                 logup.add_to_relation_computed(
                     prog_mem,
                     [is_pad],
@@ -587,6 +613,8 @@ pub(super) fn generate_interaction_trace(
                         move |i| {
                             let mut t: Vec<_> = tuple_clone.iter().map(|c| c.at(i)).collect();
                             t[IS_MUL_UPPER_SLOT] = mu_uu_c.at(i) + mu_su_c.at(i) + mu_ss_c.at(i);
+                            t[IS_BITWISE_SLOT] = bw_and_c.at(i) + bw_or_c.at(i) + bw_xor_c.at(i)
+                                + bw_andinv_c.at(i) + bw_orinv_c.at(i) + bw_xnor_c.at(i);
                             t
                         }
                     },

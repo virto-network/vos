@@ -77,6 +77,11 @@ pub fn prove_and_verify(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
 /// distinguish "logup imbalance" (per-component sums non-zero, total
 /// non-zero) from "structural pair-shape blow-up" (sums zero, prover still
 /// rejects).  See `crates/zkpvm/src/chips/cpu/CONSTRAINTS.md`.
+///
+/// Phase 44 gated `debug_claimed_sums` behind the `debug-internals`
+/// feature; this helper is therefore only available with
+/// `cargo test --features zkpvm/debug-internals`.
+#[cfg(feature = "debug-internals")]
 pub fn prove_and_verify_with_debug(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
     let mut side_note = zkpvm::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
     eprintln!("--- per-component logup sums ---");

@@ -93,7 +93,7 @@ impl BuiltInComponent for CpuChip {
         let is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
         let is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
-        let _is_bitwise = crate::trace::trace_eval!(trace_eval, Column::IsBitwise);
+        // Phase 53c: IsBitwise folded — sum expression below.
         let is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
         let is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
         let is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
@@ -1933,7 +1933,11 @@ impl BuiltInComponent for CpuChip {
         // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
         {
             let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
-            let is_bitwise_flag = crate::trace::trace_eval!(trace_eval, Column::IsBitwise);
+            // Phase 53c: IsBitwise = sum of per-op sub-flags.
+            let is_bitwise_e = || -> E::F {
+                is_and_flag[0].clone() + is_or_flag[0].clone() + is_xor_flag[0].clone()
+                    + is_and_inv_flag[0].clone() + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone()
+            };
             let val_b_hi_nib = crate::trace::trace_eval!(trace_eval, Column::ValBHiNib);
             let val_d_hi_nib = crate::trace::trace_eval!(trace_eval, Column::ValDHiNib);
             let and_result_hi_nib = crate::trace::trace_eval!(trace_eval, Column::AndResultHiNib);
@@ -1942,7 +1946,7 @@ impl BuiltInComponent for CpuChip {
                 // High nibble lookup
                 eval.add_to_relation(RelationEntry::new(
                     bitwise_and_lookup,
-                    is_bitwise_flag[0].clone().into(),
+                    is_bitwise_e().into(),
                     &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
                 ));
                 // Low nibble lookup: lo = byte - hi * 16
@@ -1951,7 +1955,7 @@ impl BuiltInComponent for CpuChip {
                 let and_lo = and_result[i].clone() - and_result_hi_nib[i].clone() * sixteen.clone();
                 eval.add_to_relation(RelationEntry::new(
                     bitwise_and_lookup,
-                    is_bitwise_flag[0].clone().into(),
+                    is_bitwise_e().into(),
                     &[b_lo, d_lo, and_lo],
                 ));
             }
@@ -2378,7 +2382,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
             let f_is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
             // Phase 53: IsMulUpper is the sum of the three sub-flags.
-            let f_is_bitwise = crate::trace::trace_eval!(trace_eval, Column::IsBitwise);
+            // Phase 53c: IsBitwise as the sum expression (no column).
             let f_is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
             let f_is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
             let f_is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
@@ -2443,7 +2447,11 @@ impl BuiltInComponent for CpuChip {
                     + f_is_mul_upper_su[0].clone()
                     + f_is_mul_upper_ss[0].clone(),
             );
-            tuple.push(f_is_bitwise[0].clone());
+            // Phase 53c: IsBitwise as the sum expression.
+            tuple.push(
+                is_and_flag[0].clone() + is_or_flag[0].clone() + is_xor_flag[0].clone()
+                    + is_and_inv_flag[0].clone() + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone(),
+            );
             tuple.push(f_is_shift[0].clone());
             tuple.push(f_is_compare[0].clone());
             tuple.push(f_is_move[0].clone());

@@ -63,8 +63,12 @@ pub enum Column {
     IsSub,
     #[size = 1]
     IsMul,
-    #[size = 1]
-    IsBitwise,
+    // Phase 53c: IsBitwise folded into (IsAnd + IsOr + IsXor +
+    // IsAndInv + IsOrInv + IsXnor).  Verifier-side gates use the
+    // sum expression; prover-side prog_mem closure overrides the
+    // slot.  Strictly stronger soundness than before — the lookup
+    // balance now pins the sum to the canonical IsBitwise (was:
+    // only IsBitwise itself was pinned, sum could diverge).
     #[size = 1]
     IsShift,
     #[size = 1]
