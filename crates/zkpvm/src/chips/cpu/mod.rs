@@ -1396,11 +1396,11 @@ impl BuiltInComponent for CpuChip {
         // is_64bit was defined at the top of add_constraints as 1 - is_32bit.
         let mut sum_lo4 = byte_popcount[0].clone();
         for i in 1..4 {
-            sum_lo4 = sum_lo4 + byte_popcount[i].clone();
+            sum_lo4 += byte_popcount[i].clone();
         }
         let mut sum_hi4 = byte_popcount[4].clone();
         for i in 5..WORD_SIZE {
-            sum_hi4 = sum_hi4 + byte_popcount[i].clone();
+            sum_hi4 += byte_popcount[i].clone();
         }
         // Combined sum: sum_lo4 + (1 - is_32bit) · sum_hi4.
         // result[0] - that_sum = 0, gated on is_count_set_bits.
@@ -1507,9 +1507,9 @@ impl BuiltInComponent for CpuChip {
                 * (E::F::from(BaseField::from(8u32 * i as u32))
                     + bit_op_tz_byte[i].clone());
             if i < 4 {
-                tz_lo4 = tz_lo4 + term;
+                tz_lo4 += term;
             } else {
-                tz_hi4 = tz_hi4 + term;
+                tz_hi4 += term;
             }
         }
         // 64-bit branch: tz_lo4 + tz_hi4 + (1 - partial[7]) · 64.
@@ -1544,7 +1544,7 @@ impl BuiltInComponent for CpuChip {
             let term = is_first_nz_msb
                 * (E::F::from(BaseField::from(pos_weight))
                     + bit_op_lz_byte[i].clone());
-            lz_64 = lz_64 + term;
+            lz_64 += term;
         }
         let lz_default_64 = E::F::from(BaseField::from(64u32))
             * (E::F::one() - val_d_partial_nz_msb[0].clone());
@@ -1561,7 +1561,7 @@ impl BuiltInComponent for CpuChip {
             let term = is_first_nz_msb_lo
                 * (E::F::from(BaseField::from(pos_weight))
                     + bit_op_lz_byte[i].clone());
-            lz_32 = lz_32 + term;
+            lz_32 += term;
         }
         let lz_default_32 = E::F::from(BaseField::from(32u32))
             * (E::F::one() - val_d_partial_nz_msb_lo[0].clone());

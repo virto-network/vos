@@ -35,3 +35,17 @@ zkpvm-verifier = { workspace = true }
 
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }
+# AIR fill code is byte-position-indexed throughout (val_b[0..8],
+# carry chains, schoolbook positions).  `for i in 0..8 { col[i] =
+# ... }` is the natural shape; the iterator-based clippy suggestion
+# (`for (i, item) in col.iter_mut().enumerate()`) obscures that
+# `i` is a position in the constrained byte layout.
+needless_range_loop = { level = "allow", priority = 0 }
+# Lookup-tuple builders take many small arguments by design (one
+# per column); collapsing them into a struct-arg would just rename
+# the same parameters.
+too_many_arguments = { level = "allow", priority = 0 }
+# Hand-formatted ASCII tables / continuation lines in doc-comments
+# don't always satisfy the markdown 2-space-indent rule; the
+# rendered output is fine in both rustdoc and our review tooling.
+doc_lazy_continuation = { level = "allow", priority = 0 }
