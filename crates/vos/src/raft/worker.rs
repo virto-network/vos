@@ -106,6 +106,7 @@ impl std::error::Error for ProposeError {}
 /// the historical API; the generic `vos_raft::WorkerSnapshot<N>`
 /// stays internal.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WorkerSnapshot {
     pub role: Role,
     pub current_term: u64,
@@ -113,6 +114,7 @@ pub struct WorkerSnapshot {
     pub last_log_index: u64,
     pub commit_index: u64,
     pub last_applied: u64,
+    pub snap_last_index: u64,
 }
 
 impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
@@ -124,6 +126,7 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
             last_log_index: s.last_log_index,
             commit_index: s.commit_index,
             last_applied: s.last_applied,
+            snap_last_index: s.snap_last_index,
         }
     }
 }

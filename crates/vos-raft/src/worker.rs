@@ -75,9 +75,8 @@ pub enum ProposeError<E> {
 /// Diagnostic snapshot of a worker's state.
 ///
 /// `#[non_exhaustive]` because future commits will surface
-/// additional state (`snap_last_index`, leader-hint, in-flight
-/// RPCs) — construction is internal-only and consumers should
-/// always match with `..`.
+/// additional state (leader-hint, in-flight RPCs) — construction
+/// is internal-only and consumers should always match with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WorkerSnapshot<N: NodeId> {
@@ -87,6 +86,11 @@ pub struct WorkerSnapshot<N: NodeId> {
     pub last_log_index: u64,
     pub commit_index: u64,
     pub last_applied: u64,
+    /// Highest log index that has been compacted into the
+    /// snapshot. `0` when no compaction has happened yet.
+    /// Useful for proptest invariants that need to assert the
+    /// snap pointer never regresses.
+    pub snap_last_index: u64,
 }
 
 /// Inbound message processed by the worker loop.
@@ -667,6 +671,7 @@ async fn handle_msg<N, S, T, C, R, A>(
                 last_log_index: state.storage.last_index(),
                 commit_index: state.meta.commit_index,
                 last_applied: state.meta.last_applied,
+                snap_last_index: state.storage.snap_last_index(),
             });
         }
         RaftMsg::Shutdown => unreachable!("handled in run_worker"),
