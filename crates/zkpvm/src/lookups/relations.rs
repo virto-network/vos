@@ -110,6 +110,25 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_STATE_LOOKUP_SIZE
 );
 
+// Phase 54a — Multiplication lookup.  CpuChip emits one producer per
+// `is_mul + is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss` row;
+// MulChip consumes once per real (non-padding) row.  Tuple binds the
+// per-row mul I/O state so MulChip's AIR can re-prove the schoolbook
+// identity over its narrower trace in a future sub-phase.
+//
+// Tuple: (val_b[8], val_d[8], result[8], mul_high[8], is_mul_lo[1],
+//         is_mul_upper_uu[1], is_mul_upper_su[1], is_mul_upper_ss[1],
+//         is_32bit[1]) — 37 limbs.  `is_mul_lo` is CpuChip's original
+// IsMul flag (low 64 bits of product written to result).  The four
+// variant flags partition mul rows so MulChip can dispatch the
+// appropriate sign-correction logic per row.
+const REL_MULTIPLICATION_LOOKUP_SIZE: usize =
+    WORD_SIZE + WORD_SIZE + WORD_SIZE + WORD_SIZE + 5;
+stwo_constraint_framework::relation!(
+    MultiplicationLookupElements,
+    REL_MULTIPLICATION_LOOKUP_SIZE
+);
+
 // (h_ptr[4], m_ptr[4], t_low[8], f[1], ts[8]) — binds Blake2bChip's HPtr,
 // MPtr, T[0..8], F and CallTs to CpuChip's ECALL-step register snapshot +
 // timestamp so the precompile can't fabricate the pointer / counter /

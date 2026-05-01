@@ -277,6 +277,25 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_bytes(row, &mul_corr_term_b, Column::MulCorrTermB);
             trace.fill_columns_bytes(row, &mul_corr_carry, Column::MulCorrCarry);
 
+            // Phase 54a: capture this mul row for MulChip's main trace.
+            // Must mirror exactly the val_b / val_d / Result / MulHigh
+            // values written above (post-pow2-replacement, post-32-bit
+            // truncation, signedness-adjusted result).
+            if flags.is_mul {
+                let mul_high_u64 = u64::from_le_bytes(mul_high);
+                side_note.mul_entries.push(crate::side_note::MulEntry {
+                    val_b,
+                    val_d,
+                    result,
+                    mul_high: mul_high_u64,
+                    is_mul_lo: !flags.is_mul_upper,
+                    is_mul_upper_uu: flags.is_mul_upper_uu,
+                    is_mul_upper_su: flags.is_mul_upper_su,
+                    is_mul_upper_ss: flags.is_mul_upper_ss,
+                    is_32bit: flags.is_32bit,
+                });
+            }
+
             // ── Bitwise auxiliary ──
             let mut and_result = [0u8; WORD_SIZE];
             if flags.is_bitwise {

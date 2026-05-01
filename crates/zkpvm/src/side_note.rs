@@ -58,6 +58,25 @@ pub struct SideNote {
     /// Set by CpuChip's trace fill from the JumpInd steps; consumed by
     /// JumpTableChip's main-trace fill as Multiplicity.
     pub jump_table_counts: Vec<u32>,
+    /// Phase 54a: per-mul-row witness pushed by CpuChip's trace_fill so
+    /// MulChip's main trace mirrors CpuChip's val_b/val_d/result/mul_high
+    /// exactly.  Must match the column values CpuChip writes — see
+    /// chips/mul.rs's collect path.
+    pub mul_entries: Vec<MulEntry>,
+}
+
+/// Single mul-row witness for the MultiplicationLookup balance.
+#[derive(Clone, Debug)]
+pub struct MulEntry {
+    pub val_b: u64,
+    pub val_d: u64,
+    pub result: u64,
+    pub mul_high: u64,
+    pub is_mul_lo: bool,
+    pub is_mul_upper_uu: bool,
+    pub is_mul_upper_su: bool,
+    pub is_mul_upper_ss: bool,
+    pub is_32bit: bool,
 }
 
 impl SideNote {
@@ -79,6 +98,7 @@ impl SideNote {
             program_memory_counts: HashMap::new(),
             jump_table: Vec::new(),
             jump_table_counts: Vec::new(),
+            mul_entries: Vec::new(),
         }
     }
 

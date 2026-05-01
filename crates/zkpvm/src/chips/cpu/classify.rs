@@ -8,7 +8,7 @@
 use javm::instruction::Opcode;
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct OpcodeFlags {
+pub(crate) struct OpcodeFlags {
     pub is_add: bool,
     pub is_sub: bool,
     pub is_mul: bool,
@@ -215,7 +215,7 @@ pub(super) struct OpcodeFlags {
     pub is_rotate_r_imm_alt: bool,
 }
 
-pub(super) fn classify_opcode(op: Opcode) -> OpcodeFlags {
+pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
     let mut f = OpcodeFlags::default();
     match op {
         Opcode::Add64 | Opcode::AddImm64 => { f.is_add = true; }

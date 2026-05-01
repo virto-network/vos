@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -34,7 +34,7 @@ use crate::lookups::AllLookupElements;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
-mod classify;
+pub(crate) mod classify;
 mod columns;
 mod reg_access;
 // Phase 47 split: trace fill + interaction-trace generation moved into
@@ -66,7 +66,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements),
     );
 
 
@@ -83,10 +83,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup)) = lookup_elements;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -3186,6 +3186,42 @@ impl BuiltInComponent for CpuChip {
                     range256_lookup,
                     is_real.clone().into(),
                     &[abs_cmp_diff_p30[i].clone()],
+                ));
+            }
+        }
+
+        // ── Phase 54a: MultiplicationLookup producer ──
+        // Two paired emissions per row.  MulChip consumes the same
+        // tuple per real (non-padding) row.
+        {
+            let f_is_mul_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMul);
+            let f_mu_uu_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
+            let f_mu_su_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
+            let f_mu_ss_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
+            let f_is_32bit_p54 = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let val_b_p54 = crate::trace::trace_eval!(trace_eval, Column::ValB);
+            let val_d_p54 = crate::trace::trace_eval!(trace_eval, Column::ValD);
+            let result_p54 = crate::trace::trace_eval!(trace_eval, Column::Result);
+            let mul_high_p54 = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
+            let is_mul_lo_e = f_is_mul_p54[0].clone()
+                - f_mu_uu_p54[0].clone()
+                - f_mu_su_p54[0].clone()
+                - f_mu_ss_p54[0].clone();
+            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(37);
+            tuple_p54.extend_from_slice(&val_b_p54);
+            tuple_p54.extend_from_slice(&val_d_p54);
+            tuple_p54.extend_from_slice(&result_p54);
+            tuple_p54.extend_from_slice(&mul_high_p54);
+            tuple_p54.push(is_mul_lo_e);
+            tuple_p54.push(f_mu_uu_p54[0].clone());
+            tuple_p54.push(f_mu_su_p54[0].clone());
+            tuple_p54.push(f_mu_ss_p54[0].clone());
+            tuple_p54.push(f_is_32bit_p54[0].clone());
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    mul_lookup,
+                    f_is_mul_p54[0].clone().into(),
+                    &tuple_p54,
                 ));
             }
         }
