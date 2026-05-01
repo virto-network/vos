@@ -515,6 +515,24 @@ impl RaftMeta {
         t.insert(META_SNAP_TERM, &self.snap_last_term.to_le_bytes()[..])?;
         Ok(())
     }
+
+    /// Write only the host-managed `META_LAST_APPLIED` row,
+    /// leaving every worker-managed field
+    /// (`current_term`, `voted_for`, `commit_index`,
+    /// `snap_last_*`) untouched. Used by
+    /// `RaftCommit::{commit, commit_with_log}` so the host's
+    /// apply-progress write doesn't clobber concurrent
+    /// worker-side advances of `commit_index` /
+    /// `current_term` with stale values snapshotted at the
+    /// time of the host's `RaftMeta::load`.
+    pub fn write_host_fields_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+    ) -> Result<(), CommitError> {
+        let mut t = txn.open_table(RAFT_META)?;
+        t.insert(META_LAST_APPLIED, &self.last_applied.to_le_bytes()[..])?;
+        Ok(())
+    }
 }
 
 fn u64_le(b: &[u8]) -> u64 {

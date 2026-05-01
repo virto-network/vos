@@ -255,7 +255,13 @@ impl CommitStrategy for RaftCommit {
         }
         if new_last_applied > self.meta.last_applied {
             self.meta.last_applied = new_last_applied;
-            self.meta.write_in_txn(&txn)?;
+            // Write ONLY META_LAST_APPLIED, not the full
+            // RaftMeta — we loaded `self.meta` earlier; the
+            // worker may have advanced `commit_index` /
+            // `current_term` since, and writing the full row
+            // would clobber those advances with our stale
+            // snapshot.
+            self.meta.write_host_fields_in_txn(&txn)?;
         }
         txn.commit()?;
         self.last_state = state.to_vec();
@@ -324,7 +330,10 @@ impl CommitStrategy for RaftCommit {
                 // pointer; the host owns state + last_applied).
                 // Atomic write so a crash here either rolls
                 // back the apply entirely or commits state and
-                // last_applied together.
+                // last_applied together. `write_host_fields_in_txn`
+                // touches ONLY `META_LAST_APPLIED` so we don't
+                // race the worker's concurrent writes to the
+                // worker-owned scalars.
                 self.meta = RaftMeta::load(&self.db)?;
                 self.meta.last_applied = self.meta.last_applied.max(idx);
                 let txn = self.db.begin_write()?;
@@ -332,7 +341,7 @@ impl CommitStrategy for RaftCommit {
                     let mut state_table = txn.open_table(STATE_TABLE)?;
                     state_table.insert(STATE_KEY, state)?;
                 }
-                self.meta.write_in_txn(&txn)?;
+                self.meta.write_host_fields_in_txn(&txn)?;
                 txn.commit()?;
             }
         }
