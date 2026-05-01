@@ -1938,4 +1938,84 @@ mod tests {
 
         worker.shutdown();
     }
+
+    /// Duplicate `InstallSnapshot` delivery (same `req` twice
+    /// in a row) must be idempotent: snap pointer doesn't move
+    /// past the second call's `last_included_index`, the state
+    /// row isn't double-written, the term is adopted only once.
+    ///
+    /// The cluster-level `cluster_converges_under_full_duplication`
+    /// integration test never actually exercises this path
+    /// because it doesn't trigger compaction (5 entries,
+    /// hysteresis 16). This unit test pins the receiver-side
+    /// idempotence directly.
+    #[test]
+    fn install_snapshot_is_idempotent_on_duplicate_delivery() {
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let h = worker.handler();
+
+        // First install: term 7, last_included_index 50,
+        // last_included_term 6, snapshot bytes 0xAA…
+        let req = || InstallSnapshotReq {
+            leader: 0xBBBB,
+            term: 7,
+            last_included_index: 50,
+            last_included_term: 6,
+            snapshot: alloc::vec![0xAA; 16],
+        };
+
+        let r1 = block_on(h.handle_inbound_install(0xBBBB, req()));
+        assert_eq!(r1.term, 7);
+        let snap1 = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap1.snap_last_index, 50);
+        assert_eq!(snap1.commit_index, 50);
+        assert_eq!(snap1.current_term, 7);
+
+        // Duplicate delivery — same RPC bits. The receiver hits
+        // the `req.last_included_index <= snap_last_index`
+        // idempotent branch and no-ops.
+        let r2 = block_on(h.handle_inbound_install(0xBBBB, req()));
+        assert_eq!(r2.term, 7);
+        let snap2 = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            snap2.snap_last_index, 50,
+            "duplicate install must not move the snap pointer",
+        );
+        assert_eq!(
+            snap2.commit_index, 50,
+            "duplicate install must not double-bump commit_index",
+        );
+        assert_eq!(snap2.current_term, 7);
+
+        // Triple-check: the same install at a LOWER index also
+        // no-ops (already covered by `install_snapshot_at_lower_index_is_no_op`
+        // in vos's facade tests, but worth re-asserting here).
+        let r3 = block_on(h.handle_inbound_install(
+            0xBBBB,
+            InstallSnapshotReq {
+                leader: 0xBBBB,
+                term: 7,
+                last_included_index: 30,
+                last_included_term: 5,
+                snapshot: alloc::vec![0xBB; 8],
+            },
+        ));
+        assert_eq!(r3.term, 7);
+        let snap3 = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            snap3.snap_last_index, 50,
+            "lower-index install must not regress the snap pointer",
+        );
+
+        worker.shutdown();
+    }
 }
