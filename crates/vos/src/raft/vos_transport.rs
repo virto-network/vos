@@ -185,22 +185,57 @@ impl Transport<u16> for VosTransport {
 
 /// Bridge a sync `std::sync::mpsc::Receiver` into an async future
 /// by spawning a short-lived blocking thread that receives with a
-/// timeout and forwards the result through a oneshot channel.
+/// short polling cadence and forwards the result through a
+/// oneshot channel.
 ///
-/// The receiver is only ever delivered a single value (the libp2p
-/// reply), so the helper thread parks at most for `timeout` and
-/// then exits.
+/// **Why polling, not one big `recv_timeout(2s)`.** The earlier
+/// version blocked the helper thread for the full `RPC_TIMEOUT`
+/// even when the future had already been dropped (worker
+/// shutdown, `FuturesUnordered` discard, election-storm churn).
+/// Up to 2s of orphaned threads accumulated under cancellation
+/// pressure. The polling loop checks
+/// [`futures_channel::oneshot::Sender::is_canceled`] every
+/// `POLL_INTERVAL` so a cancelled future drops its helper
+/// within tens of milliseconds — bounding the zombie-thread
+/// window to a constant regardless of `RPC_TIMEOUT`.
 async fn recv_timeout<T: Send + 'static>(
     rx: std::sync::mpsc::Receiver<T>,
     timeout: Duration,
 ) -> Option<T> {
-    let (tx, mut out) = futures_channel::oneshot::channel();
+    /// How often the helper thread checks for cancellation. Short
+    /// enough that a dropped future doesn't strand a thread for
+    /// long; long enough that `try_recv` overhead is negligible.
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let (tx, out) = futures_channel::oneshot::channel();
     std::thread::spawn(move || {
-        let r = rx.recv_timeout(timeout).ok();
-        let _ = tx.send(r);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // Future was dropped — bail early. This is the whole
+            // reason for polling: cancellation lands within
+            // POLL_INTERVAL instead of waiting out the full
+            // `timeout`.
+            if tx.is_canceled() {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let _ = tx.send(None);
+                return;
+            }
+            let wait = (deadline - now).min(POLL_INTERVAL);
+            match rx.recv_timeout(wait) {
+                Ok(v) => {
+                    let _ = tx.send(Some(v));
+                    return;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+            }
+        }
     });
-    // The oneshot completes when the helper thread exits; if it
-    // exits with `None`, the receiver gives `Some(None)`. Flatten.
-    let inner = (&mut out).await.ok().flatten();
-    inner
+    out.await.ok().flatten()
 }

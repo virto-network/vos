@@ -2823,7 +2823,10 @@ mod tests {
         // peer prefix 0, term 0 — refused, but the response
         // exposes the worker's current term, not commit_index).
         // Simpler: extend WorkerSnapshot with commit_index.
-        let until = StdInstant::now() + Duration::from_secs(3);
+        // Generous deadline because libp2p loopback latency under
+        // heavy `cargo test` parallelism can balloon when the
+        // tokio blocking pool is saturated by other tests.
+        let until = StdInstant::now() + Duration::from_secs(10);
         loop {
             let snaps = [
                 (prefix_a, w_a.handler().snapshot()),
