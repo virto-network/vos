@@ -41,6 +41,19 @@ use zkpvm::framework_access::{
 /// Verification hash type (Blake2s Merkle root)
 pub use stwo::core::vcs::blake2_hash::Blake2sHash as CommitmentHash;
 
+/// Default per-component log_size cap used by `verify_standalone`.
+///
+/// At log_size = 24 each chip's main trace has 2^24 ≈ 16M rows; the
+/// FRI/Merkle phase commits those plus the preprocessed and
+/// interaction traces.  This is well above the largest trace the
+/// `prove_vos_actor` benchmark suite produces and well below the
+/// log_size where verification CPU/memory cost becomes onerous.
+///
+/// Callers who need to accept larger proofs (e.g. for batched
+/// proving over very long executions) should call
+/// `verify_standalone_with_max_log_size` with an explicit bound.
+pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+
 /// Verify a PVM execution proof.
 ///
 /// # Arguments
@@ -55,6 +68,24 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
+    verify_standalone_with_max_log_size(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)
+}
+
+/// Same as `verify_standalone` but with a caller-supplied per-component
+/// `log_size` cap.  Use this when you need to accept proofs over larger
+/// traces than `DEFAULT_MAX_LOG_SIZE` admits, or — more usefully —
+/// tighten the cap for a specific deployment that knows its proof
+/// shapes are smaller.
+///
+/// Reject path: any `log_size > max_log_size` returns
+/// `InvalidStructure` before the verifier touches commitments,
+/// preventing a malicious prover from forcing the verifier into a
+/// giant Merkle commitment phase.
+pub fn verify_standalone_with_max_log_size(
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    max_log_size: u32,
+) -> Result<(), VerificationError> {
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
     // length check assumes the AIR shape this verifier was compiled
@@ -63,6 +94,18 @@ pub fn verify_standalone(
         return Err(VerificationError::InvalidStructure(format!(
             "proof format version mismatch: verifier expects {}, proof has {}",
             PROOF_FORMAT_VERSION, proof.format_version,
+        )));
+    }
+    // Phase 43: cap log_sizes so a malicious prover can't force the
+    // verifier into arbitrarily large Merkle commitments.  We check
+    // each component's log_size individually against the cap; the
+    // dominant cost in verification is roughly O(2^max_log_size · k)
+    // per component (k constant), so a single oversized log_size is
+    // enough to DoS.
+    if let Some(&offending) = proof.log_sizes.iter().find(|&&ls| ls > max_log_size) {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof log_size {offending} exceeds cap {max_log_size} \
+             (set max_log_size higher or reject this proof)"
         )));
     }
     let Proof {

@@ -136,7 +136,7 @@ pub use prove::debug_claimed_sums;
 pub use stwo::core::pcs::PcsConfig;
 pub use stwo::core::fri::FriConfig;
 #[cfg(feature = "prover")]
-pub use verify::{verify, verify_chain};
+pub use verify::{verify, verify_chain, verify_with_max_log_size, DEFAULT_MAX_LOG_SIZE};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
 #[cfg(feature = "prover")]

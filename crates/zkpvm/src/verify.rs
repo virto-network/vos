@@ -44,7 +44,23 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
     Ok(())
 }
 
+/// Default per-component log_size cap used by `verify`.  See
+/// `zkpvm_verifier::DEFAULT_MAX_LOG_SIZE` for the rationale; same value
+/// kept in sync deliberately so prover-side and verifier-only paths
+/// reject at the same threshold.
+pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
+    verify_with_max_log_size(proof, side_note, DEFAULT_MAX_LOG_SIZE)
+}
+
+/// Caller-supplied per-component `log_size` cap variant of `verify`.
+/// See `verify` for the default and `Phase 43` for the rationale.
+pub fn verify_with_max_log_size(
+    proof: Proof,
+    side_note: &SideNote,
+    max_log_size: u32,
+) -> Result<(), VerificationError> {
     let components = BASE_COMPONENTS;
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
@@ -55,6 +71,13 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
             "proof format version mismatch: verifier expects {}, proof has {}",
             crate::proof::PROOF_FORMAT_VERSION,
             proof.format_version,
+        )));
+    }
+    // Phase 43: cap log_sizes so a malicious prover can't force a
+    // giant Merkle commitment phase.
+    if let Some(&offending) = proof.log_sizes.iter().find(|&&ls| ls > max_log_size) {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof log_size {offending} exceeds cap {max_log_size}"
         )));
     }
     let Proof {

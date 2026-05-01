@@ -88,6 +88,32 @@ fn standalone_verify_rejects_format_version_mismatch() {
     );
 }
 
+// Phase 43: log_size cap test.  We don't need to forge a giant proof
+// — just call the variant with an unrealistically tight cap and check
+// the early rejection fires.
+#[test]
+fn standalone_verify_rejects_oversized_log_size() {
+    let code = vec![Opcode::Trap as u8];
+    let bitmask = vec![1];
+    let registers = [0u64; PVM_REGISTER_COUNT];
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], registers, vec![0u8; 4 * 1024 * 1024], 1000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    tracing.run();
+    let steps = tracing.into_trace();
+
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    let proof = prove(&mut side_note).expect("proving failed");
+    let preprocessed_commitment = proof.stark_proof.commitments[0];
+
+    // Cap = 0: even the smallest legitimate proof has log_sizes >= LOG_N_LANES.
+    let err = zkpvm_verifier::verify_standalone_with_max_log_size(
+        proof, preprocessed_commitment, 0,
+    ).expect_err("should reject — cap is zero");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("exceeds cap"), "got: {msg}");
+}
+
 #[test]
 fn standalone_verify_rejects_zero_format_version() {
     // Pre-Phase-42 serialized proofs (which lack the field) deserialize
