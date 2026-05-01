@@ -112,27 +112,42 @@ impl<S: Storage<u16> + Sync> Storage<u16> for FaultStorage<S> {
         self.inner.read_state().await.map_err(map_err)
     }
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
-        // Decrement-on-fault: each scheduled fault consumes one
-        // call.
-        let prev = self.fail_load_meta.fetch_sub(1, Ordering::Relaxed);
-        if prev > 0 {
+        if take_fault_budget(&self.fail_load_meta) {
             return Err(FaultErr);
-        }
-        // Restore the counter (we underflowed if it was 0).
-        if prev == 0 {
-            self.fail_load_meta.store(0, Ordering::Relaxed);
         }
         self.inner.load_meta().await.map_err(map_err)
     }
     async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
-        let prev = self.fail_commit.fetch_sub(1, Ordering::Relaxed);
-        if prev > 0 {
+        if take_fault_budget(&self.fail_commit) {
             return Err(FaultErr);
         }
-        if prev == 0 {
-            self.fail_commit.store(0, Ordering::Relaxed);
-        }
         self.inner.commit_batch(batch).await.map_err(map_err)
+    }
+}
+
+/// Atomically consume one fault from `budget`. Returns `true`
+/// if the call should fail.
+///
+/// Naive `fetch_sub` + post-hoc underflow guard races: under
+/// heavy contention with `budget == 1`, two concurrent callers
+/// can both observe a positive `prev` (one sees 1, the other
+/// sees `u64::MAX` from the underflow flicker before the store
+/// repairs it) and BOTH fail when only one should. CAS loop
+/// closes the window — `compare_exchange` only succeeds for
+/// one caller per decrement.
+fn take_fault_budget(budget: &AtomicU64) -> bool {
+    loop {
+        let cur = budget.load(Ordering::Relaxed);
+        if cur == 0 {
+            return false;
+        }
+        if budget
+            .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        // Lost the CAS — another thread mutated; retry.
     }
 }
 
@@ -418,3 +433,44 @@ fn noop_waker() -> core::task::Waker {
 // some of the symbols on certain feature combinations.
 #[allow(dead_code)]
 fn _unused_check<C: Clock, R: Rng, A: ApplySink>() {}
+
+/// Race regression: many concurrent threads draining a budget
+/// of N must observe EXACTLY N "you fail" verdicts in total —
+/// no underflow, no double-spend. The CAS loop in
+/// `take_fault_budget` is what makes this hold.
+#[test]
+fn fault_budget_is_race_safe() {
+    use std::sync::Arc as StdArc;
+    use std::thread;
+
+    const BUDGET: u64 = 100;
+    const THREADS: usize = 16;
+    const PER_THREAD_CALLS: usize = 200;
+
+    let budget = StdArc::new(AtomicU64::new(BUDGET));
+    let total_fails = StdArc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..THREADS {
+        let b = budget.clone();
+        let f = total_fails.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..PER_THREAD_CALLS {
+                if take_fault_budget(&b) {
+                    f.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let observed = total_fails.load(Ordering::Relaxed);
+    assert_eq!(
+        observed, BUDGET,
+        "fault budget race: scheduled {BUDGET} faults but {observed} call sites failed",
+    );
+    // Counter is exhausted: subsequent calls must always pass.
+    assert!(!take_fault_budget(&budget));
+}
