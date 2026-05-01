@@ -1467,10 +1467,10 @@ mod tests {
 
         let until = std::time::Instant::now() + Duration::from_millis(500);
         loop {
-            if let Some(s) = block_on(h.snapshot()) {
-                if s.role == Role::Leader {
-                    break;
-                }
+            if let Some(s) = block_on(h.snapshot())
+                && s.role == Role::Leader
+            {
+                break;
             }
             assert!(std::time::Instant::now() < until, "no leadership");
             std::thread::sleep(Duration::from_millis(5));

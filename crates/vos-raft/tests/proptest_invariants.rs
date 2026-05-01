@@ -398,19 +398,18 @@ proptest! {
                 );
                 if let Some((prev_entry_term, prev_worker_term)) =
                     entry_history.get(idx).copied()
+                    && *entry_term != prev_entry_term
                 {
-                    if *entry_term != prev_entry_term {
-                        // Divergence at the same index — only valid
-                        // if the worker's term advanced since the
-                        // last observation (a higher-term leader's
-                        // truncate-and-graft is the authorized path).
-                        prop_assert!(
-                            snap.current_term > prev_worker_term,
-                            "log-matching violation at index {idx}: entry term \
-                             changed {prev_entry_term} -> {entry_term} without \
-                             worker term advancing (was {prev_worker_term})",
-                        );
-                    }
+                    // Divergence at the same index — only valid
+                    // if the worker's term advanced since the
+                    // last observation (a higher-term leader's
+                    // truncate-and-graft is the authorized path).
+                    prop_assert!(
+                        snap.current_term > prev_worker_term,
+                        "log-matching violation at index {idx}: entry term \
+                         changed {prev_entry_term} -> {entry_term} without \
+                         worker term advancing (was {prev_worker_term})",
+                    );
                 }
                 entry_history.insert(*idx, (*entry_term, snap.current_term));
             }

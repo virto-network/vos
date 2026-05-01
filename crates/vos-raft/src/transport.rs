@@ -63,13 +63,16 @@ pub(crate) mod test_helpers {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    /// Shared log of recorded RPCs of one variant.
+    pub type RpcLog<R> = alloc::sync::Arc<std::sync::Mutex<Vec<(u16, R)>>>;
+
     /// Test transport that records every outbound RPC and
     /// always replies with a fixed canned response. Useful for
     /// unit-testing the worker's outbound logic in isolation.
     pub struct RecordingTransport {
-        pub appends: alloc::sync::Arc<std::sync::Mutex<Vec<(u16, AppendEntriesReq<u16>)>>>,
-        pub votes: alloc::sync::Arc<std::sync::Mutex<Vec<(u16, RequestVoteReq<u16>)>>>,
-        pub installs: alloc::sync::Arc<std::sync::Mutex<Vec<(u16, InstallSnapshotReq<u16>)>>>,
+        pub appends: RpcLog<AppendEntriesReq<u16>>,
+        pub votes: RpcLog<RequestVoteReq<u16>>,
+        pub installs: RpcLog<InstallSnapshotReq<u16>>,
         pub canned_term: AtomicU64,
     }
 
