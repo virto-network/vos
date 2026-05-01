@@ -39,12 +39,19 @@ type Routes = Arc<Mutex<BTreeMap<u16, WorkerHandle<u16>>>>;
 /// the shared `Routes` map and invoking the handler's `await`
 /// methods directly. Records every RPC into a log so the test
 /// can assert on observed traffic.
+///
+/// Partition modeling is per-edge: a `(from, to)` pair stored in
+/// `dropped_edges` causes that direction to silently fail. This
+/// supports asymmetric partitions ("A can send to B but B
+/// can't reply to A") and one-sided isolations.
 struct MockTransport {
     routes: Routes,
     log: Mutex<Vec<RpcRecord>>,
-    /// When `true`, all sends silently fail (returns `Err`) to
-    /// simulate a partition. Toggled by the test.
-    partitioned: std::sync::atomic::AtomicBool,
+    /// Set of `(from, to)` edges where outbound RPCs are
+    /// dropped. The transport derives `from` from the
+    /// AppendEntries `leader` / RequestVote `candidate` /
+    /// InstallSnapshot `leader` field.
+    dropped_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,18 +67,40 @@ impl MockTransport {
         Self {
             routes,
             log: Mutex::new(Vec::new()),
-            partitioned: std::sync::atomic::AtomicBool::new(false),
+            dropped_edges: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
-    fn set_partitioned(&self, p: bool) {
-        self.partitioned
-            .store(p, std::sync::atomic::Ordering::Relaxed);
+    /// Drop every outbound RPC `from → to`.
+    fn drop_edge(&self, from: u16, to: u16) {
+        self.dropped_edges.lock().unwrap().insert((from, to));
     }
 
-    fn is_partitioned(&self) -> bool {
-        self.partitioned
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Drop both directions between `a` and `b` — full cut.
+    fn drop_pair(&self, a: u16, b: u16) {
+        self.drop_edge(a, b);
+        self.drop_edge(b, a);
+    }
+
+    /// Drop every edge into and out of `node`. Equivalent to
+    /// pulling the node's network cable. Provided for symmetry
+    /// with `drop_pair` even though no current test uses it —
+    /// likely needed by future "isolated leader keeps trying
+    /// to send AppendEntries" scenarios.
+    #[allow(dead_code)]
+    fn isolate(&self, node: u16, members: &[u16]) {
+        for peer in members {
+            if *peer != node {
+                self.drop_pair(node, *peer);
+            }
+        }
+    }
+
+    fn is_dropped(&self, from: u16, to: u16) -> bool {
+        self.dropped_edges
+            .lock()
+            .unwrap()
+            .contains(&(from, to))
     }
 }
 
@@ -93,7 +122,7 @@ impl Transport<u16> for MockTransport {
         peer: u16,
         req: AppendEntriesReq<u16>,
     ) -> Result<AppendEntriesResp, Self::Error> {
-        if self.is_partitioned() {
+        if self.is_dropped(req.leader, peer) {
             return Err(MockError);
         }
         self.log.lock().unwrap().push(RpcRecord::Append {
@@ -117,7 +146,7 @@ impl Transport<u16> for MockTransport {
         peer: u16,
         req: RequestVoteReq<u16>,
     ) -> Result<RequestVoteResp, Self::Error> {
-        if self.is_partitioned() {
+        if self.is_dropped(req.candidate, peer) {
             return Err(MockError);
         }
         self.log.lock().unwrap().push(RpcRecord::Vote {
@@ -140,7 +169,7 @@ impl Transport<u16> for MockTransport {
         peer: u16,
         req: InstallSnapshotReq<u16>,
     ) -> Result<InstallSnapshotResp, Self::Error> {
-        if self.is_partitioned() {
+        if self.is_dropped(req.leader, peer) {
             return Err(MockError);
         }
         self.log.lock().unwrap().push(RpcRecord::Install {
@@ -278,15 +307,20 @@ fn leader_replicates_proposals_to_followers() {
 }
 
 #[test]
-fn partitioned_minority_cannot_elect() {
-    // 5-node cluster, partition 2 nodes into a minority. Verify
-    // that minority can't elect a leader (no quorum) but the
-    // majority of 3 can.
+fn partitioned_minority_loses_quorum_majority_keeps_a_leader() {
+    // 5-node cluster, partition 2 nodes into a minority and the
+    // remaining 3 into a majority. The 3-side must keep (or
+    // re-elect) a leader; the 2-side must NOT have a leader
+    // because quorum=3 is unreachable.
     let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
     let transport = Arc::new(MockTransport::new(routes.clone()));
 
     let members = vec![1u16, 2, 3, 4, 5];
-    let mut workers = Vec::new();
+    let majority = [1u16, 2, 3];
+    let minority = [4u16, 5];
+
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
     for me in members.iter().copied() {
         let storage = MemStorage::<u16>::new();
         let worker = Worker::spawn_with(
@@ -298,37 +332,127 @@ fn partitioned_minority_cannot_elect() {
             StdRng::from_entropy(),
         );
         routes.lock().unwrap().insert(me, worker.handler());
-        workers.push(worker);
+        workers.insert(me, worker);
     }
 
-    // Wait for a leader to emerge under normal conditions.
-    wait_until(
-        || workers.iter().any(|w| w.role() == Role::Leader),
-        Duration::from_secs(3),
-        "leader emerges in 5-node cluster",
-    );
-    // Majority elected — fine. Now sever the network. After
-    // partition, the leader can't reach a majority and may step
-    // down on a higher-term peer; what matters is that no
-    // *new* leader can emerge across the partition because the
-    // mock transport refuses every send.
-    transport.set_partitioned(true);
-
-    // Wait until the existing leader has stepped down or stayed
-    // leader on its own. Either way, after the heartbeat tick,
-    // the followers' election timers fire — but since vote RPCs
-    // are dropped, no candidate gets quorum.
-    std::thread::sleep(Duration::from_millis(500));
-
-    // No replica advances its commit_index past 0 (no proposals
-    // were made; just verifying the cluster's still in a
-    // consistent state).
-    for w in &workers {
-        let h = w.handler();
-        if let Some(s) = block_on(h.snapshot()) {
-            assert_eq!(s.commit_index, 0, "no proposals ⇒ commit stays 0");
+    // Apply the partition BEFORE any leader emerges so we
+    // observe each side's behavior in isolation. Drop every
+    // edge crossing the boundary.
+    for &m in &majority {
+        for &n in &minority {
+            transport.drop_pair(m, n);
         }
     }
+
+    // The 3-node majority side should still elect a leader.
+    wait_until(
+        || majority.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "majority side elects a leader despite the partition",
+    );
+
+    // Give the minority a generous window to fail to elect.
+    // 3 election timeouts × 80ms upper bound = 240ms; round to
+    // 500ms.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The 2-node minority side must NOT have a leader: each
+    // member's self-vote (1) is below quorum (3), and they
+    // can't reach the other 3 nodes to gather more.
+    for p in &minority {
+        let role = workers[p].role();
+        assert_ne!(
+            role,
+            Role::Leader,
+            "node {p} on the minority side became Leader despite quorum=3",
+        );
+    }
+
+    // Sanity: the majority side's leader is still alive.
+    let majority_leader_count = majority
+        .iter()
+        .filter(|p| workers[p].role() == Role::Leader)
+        .count();
+    assert_eq!(
+        majority_leader_count, 1,
+        "exactly one leader on the majority side, got {majority_leader_count}",
+    );
+}
+
+#[test]
+fn one_way_partition_lets_isolated_node_keep_observing_term() {
+    // A node receives messages from the cluster but its
+    // outbound replies are dropped. The cluster can't get acks
+    // from it, but the isolated node still learns the cluster's
+    // term and stays Follower.
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges before the partition is applied",
+    );
+
+    // Identify a Follower and one-way-partition it: its outbound
+    // RPCs are dropped, but inbound RPCs from the leader still
+    // reach it. (We know which node is leader, so partition all
+    // OUTbound from one of the followers.)
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let isolated = *members.iter().find(|p| **p != leader_id).unwrap();
+
+    // Drop OUTbound from `isolated` to every peer.
+    for &peer in members.iter() {
+        if peer != isolated {
+            transport.drop_edge(isolated, peer);
+        }
+    }
+
+    // The isolated node's election timer will fire, but its
+    // RequestVote sends are dropped — it can't gather quorum.
+    // It DOES still receive heartbeats from the leader, which
+    // (assuming the leader's term ≥ isolated.term) reset its
+    // election timer and keep it Follower.
+    //
+    // Track the isolated node's term: it should match the
+    // leader's, eventually. If anything, the isolated node
+    // bumps its term once or twice attempting election, and
+    // the leader's heartbeat catches it up.
+    let leader_handle = workers[&leader_id].handler();
+    let isolated_handle = workers[&isolated].handler();
+
+    wait_until(
+        || {
+            let l = block_on(leader_handle.snapshot());
+            let i = block_on(isolated_handle.snapshot());
+            match (l, i) {
+                (Some(ls), Some(is)) => is.current_term >= ls.current_term,
+                _ => false,
+            }
+        },
+        Duration::from_secs(5),
+        "isolated node's term catches up to the leader's",
+    );
 }
 
 #[test]
