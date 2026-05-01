@@ -75,6 +75,16 @@ surface is intentionally small but reserves room to grow via
   own chunking on top.
 - **No learner role** — every `Config::members` entry is a full
   voter.
+- **Storage error is "drop and forget"**: when
+  `Storage::commit_batch` returns `Err`, the worker's
+  in-memory `state.meta` is already mutated (term bump, vote,
+  etc.) but the on-disk row stays at the pre-call value. The
+  worker doesn't retry the specific failed write — the next
+  inbound RPC that touches the same fields recomputes and
+  commits. Single-shot transient errors are tolerated; a
+  persistently-failing storage backend will diverge in-memory
+  from disk indefinitely. Future work: queue failed writes for
+  retry, or drain the in-memory mutation on Err.
 - *(removed)* `Meta::last_applied` is no longer part of the
   worker's meta — the host tracks its own apply progress.
   See `Meta`'s docs.
