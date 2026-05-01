@@ -442,7 +442,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
             // Phase 53c: IsBitwise folded — no column to fill.
             trace.fill_columns(row, flags.is_shift, Column::IsShift);
-            trace.fill_columns(row, flags.is_compare, Column::IsCompare);
+            // Phase 53d: IsCompare folded — no column to fill.
             trace.fill_columns(row, flags.is_move, Column::IsMove);
             trace.fill_columns(row, flags.is_32bit, Column::Is32Bit);
             trace.fill_columns(row, flags.is_and, Column::IsAnd);

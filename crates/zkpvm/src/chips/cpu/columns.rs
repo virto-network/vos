@@ -71,8 +71,11 @@ pub enum Column {
     // only IsBitwise itself was pinned, sum could diverge).
     #[size = 1]
     IsShift,
-    #[size = 1]
-    IsCompare,
+    // Phase 53d: IsCompare folded into the 8-sub-flag sum
+    // (IsSetLtU + IsSetLtS + IsCmovIz + IsCmovNz + IsMinS + IsMinU
+    // + IsMaxS + IsMaxU).  Same closure-override pattern as
+    // Phase 53b/c.  Strictly stronger soundness — sub-flag sum
+    // now pinned to canonical via the prog_mem lookup balance.
     #[size = 1]
     IsMove,
     #[size = 1]

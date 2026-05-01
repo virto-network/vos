@@ -61,14 +61,31 @@ pub(super) fn generate_interaction_trace(
         }
 
         // Range256 lookups for cmp_sub_result bytes (carry chain soundness)
-        let is_compare_col = crate::trace::original_base_column!(component_trace, Column::IsCompare);
+        // Phase 53d: IsCompare is the sum of 8 sub-flags now.  The
+        // multiplicity for this lookup is `is_compare + is_branch`,
+        // which expands to `sum_8_subflags + is_branch`.  Pass all 9
+        // columns and sum in the closure.
+        let is_setltu_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtU);
+        let is_setlts_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtS);
+        let is_cmoviz_col = crate::trace::original_base_column!(component_trace, Column::IsCmovIz);
+        let is_cmovnz_col = crate::trace::original_base_column!(component_trace, Column::IsCmovNz);
+        let is_mins_col = crate::trace::original_base_column!(component_trace, Column::IsMinS);
+        let is_minu_col = crate::trace::original_base_column!(component_trace, Column::IsMinU);
+        let is_maxs_col = crate::trace::original_base_column!(component_trace, Column::IsMaxS);
+        let is_maxu_col = crate::trace::original_base_column!(component_trace, Column::IsMaxU);
         let is_branch_col = crate::trace::original_base_column!(component_trace, Column::IsBranch);
         let cmp_sub_result = crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
         for col in &cmp_sub_result {
             logup.add_to_relation_with(
                 range256,
-                [is_compare_col[0].clone(), is_branch_col[0].clone()],
-                |[cmp, br]| (cmp + br).into(),
+                [
+                    is_setltu_col[0].clone(), is_setlts_col[0].clone(),
+                    is_cmoviz_col[0].clone(), is_cmovnz_col[0].clone(),
+                    is_mins_col[0].clone(),   is_minu_col[0].clone(),
+                    is_maxs_col[0].clone(),   is_maxu_col[0].clone(),
+                    is_branch_col[0].clone(),
+                ],
+                |[a, b, c, d, e, f, g, h, br]| (a + b + c + d + e + f + g + h + br).into(),
                 &[col.clone()],
             );
         }
@@ -474,7 +491,7 @@ pub(super) fn generate_interaction_trace(
             let f_is_or_inv = crate::trace::original_base_column!(component_trace, Column::IsOrInv);
             let f_is_xnor = crate::trace::original_base_column!(component_trace, Column::IsXnor);
             let f_is_shift = crate::trace::original_base_column!(component_trace, Column::IsShift);
-            let f_is_compare = crate::trace::original_base_column!(component_trace, Column::IsCompare);
+            // Phase 53d: IsCompare folded; closure override below.
             let f_is_move = crate::trace::original_base_column!(component_trace, Column::IsMove);
             let f_is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
             let f_is_branch = crate::trace::original_base_column!(component_trace, Column::IsBranch);
@@ -538,7 +555,8 @@ pub(super) fn generate_interaction_trace(
             // Phase 53c: placeholder for the folded IsBitwise slot.
             tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_shift[0].clone());
-            tuple.push(f_is_compare[0].clone());
+            // Phase 53d: placeholder for the folded IsCompare slot.
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_move[0].clone());
             tuple.push(f_is_32bit[0].clone());
             tuple.push(f_is_branch[0].clone());
@@ -583,11 +601,12 @@ pub(super) fn generate_interaction_trace(
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
-            // Phase 53/53c: folded slot indices in the tuple
+            // Phase 53/53c/53d: folded slot indices in the tuple
             // (pc[4] + opcode + skip_len + 3·reg + imm[8] + is_add
             // + is_sub + is_mul = 20; +1 for is_mul_upper, etc.).
             const IS_MUL_UPPER_SLOT: usize = 20;
             const IS_BITWISE_SLOT: usize = 21;
+            const IS_COMPARE_SLOT: usize = 23;
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {
                 let is_pad = is_pad_col[0].clone();
@@ -600,6 +619,14 @@ pub(super) fn generate_interaction_trace(
                 let bw_andinv_c = f_is_and_inv[0].clone();
                 let bw_orinv_c = f_is_or_inv[0].clone();
                 let bw_xnor_c = f_is_xnor[0].clone();
+                let cmp_setltu_c = is_setltu_col[0].clone();
+                let cmp_setlts_c = is_setlts_col[0].clone();
+                let cmp_cmoviz_c = is_cmoviz_col[0].clone();
+                let cmp_cmovnz_c = is_cmovnz_col[0].clone();
+                let cmp_mins_c = is_mins_col[0].clone();
+                let cmp_minu_c = is_minu_col[0].clone();
+                let cmp_maxs_c = is_maxs_col[0].clone();
+                let cmp_maxu_c = is_maxu_col[0].clone();
                 logup.add_to_relation_computed(
                     prog_mem,
                     [is_pad],
@@ -615,6 +642,10 @@ pub(super) fn generate_interaction_trace(
                             t[IS_MUL_UPPER_SLOT] = mu_uu_c.at(i) + mu_su_c.at(i) + mu_ss_c.at(i);
                             t[IS_BITWISE_SLOT] = bw_and_c.at(i) + bw_or_c.at(i) + bw_xor_c.at(i)
                                 + bw_andinv_c.at(i) + bw_orinv_c.at(i) + bw_xnor_c.at(i);
+                            t[IS_COMPARE_SLOT] = cmp_setltu_c.at(i) + cmp_setlts_c.at(i)
+                                + cmp_cmoviz_c.at(i) + cmp_cmovnz_c.at(i)
+                                + cmp_mins_c.at(i) + cmp_minu_c.at(i)
+                                + cmp_maxs_c.at(i) + cmp_maxu_c.at(i);
                             t
                         }
                     },

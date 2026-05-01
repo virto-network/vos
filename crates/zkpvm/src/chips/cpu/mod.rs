@@ -95,7 +95,10 @@ impl BuiltInComponent for CpuChip {
         let is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
         // Phase 53c: IsBitwise folded — sum expression below.
         let is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
-        let is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
+        // Phase 53d: IsCompare folded — sum-expression closure used
+        // at every reader site below.  Sub-flag readers are defined
+        // further down at function scope.
+
         let is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
         let is_neg_add = crate::trace::trace_eval!(trace_eval, Column::IsNegAdd);
         let is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
@@ -129,10 +132,19 @@ impl BuiltInComponent for CpuChip {
         let is_set_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtS);
         let is_cmov_iz_flag = crate::trace::trace_eval!(trace_eval, Column::IsCmovIz);
         let is_cmov_nz_flag = crate::trace::trace_eval!(trace_eval, Column::IsCmovNz);
-        let _is_min_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsMinS);
+        // Phase 53d: drop the underscores — these now feed the
+        // IsCompare sum expression (was: declared but unused).
+        let is_min_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsMinS);
         let is_min_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsMinU);
-        let _is_max_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsMaxS);
+        let is_max_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsMaxS);
         let is_max_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsMaxU);
+        // Phase 53d: IsCompare = sum of the 8 compare sub-flags above.
+        let is_compare_e = || -> E::F {
+            is_set_lt_u_flag[0].clone() + is_set_lt_s_flag[0].clone()
+                + is_cmov_iz_flag[0].clone() + is_cmov_nz_flag[0].clone()
+                + is_min_s_flag[0].clone() + is_min_u_flag[0].clone()
+                + is_max_s_flag[0].clone() + is_max_u_flag[0].clone()
+        };
 
         let f256 = E::F::from(BaseField::from(256u32));
         let f255 = E::F::from(BaseField::from(255u32));
@@ -603,7 +615,7 @@ impl BuiltInComponent for CpuChip {
         // For SetLtS (compare_op=1): needs sign bit analysis (prover-trusted for now)
         // For CmovIz/Nz, Min/Max: prover-trusted (constrained result via execution semantics)
         // ════════════════════════════════════════════════════════════════════
-        let is_cmp_or_branch = is_compare[0].clone() + is_branch[0].clone();
+        let is_cmp_or_branch = is_compare_e() + is_branch[0].clone();
         // Constrain the cmp_carry chain: val_b + ~val_d + 1 (two's complement subtraction)
         // sub_result[i] + carry[i]*256 = val_b[i] + 255 - val_d[i] + carry_in
         // sub_result[i] is range-checked via Range256 lookup below.
@@ -642,7 +654,7 @@ impl BuiltInComponent for CpuChip {
             // Constrain val_d_is_zero: if flag=1, all val_d limbs must be 0
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_compare[0].clone() * val_d_is_zero[0].clone() * val_d[i].clone()
+                    is_compare_e() * val_d_is_zero[0].clone() * val_d[i].clone()
                 );
             }
 
@@ -2384,7 +2396,7 @@ impl BuiltInComponent for CpuChip {
             // Phase 53: IsMulUpper is the sum of the three sub-flags.
             // Phase 53c: IsBitwise as the sum expression (no column).
             let f_is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
-            let f_is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
+            // Phase 53d: IsCompare folded — sum expression below.
             let f_is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
             let f_is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
             let f_is_branch = crate::trace::trace_eval!(trace_eval, Column::IsBranch);
@@ -2453,7 +2465,8 @@ impl BuiltInComponent for CpuChip {
                     + is_and_inv_flag[0].clone() + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone(),
             );
             tuple.push(f_is_shift[0].clone());
-            tuple.push(f_is_compare[0].clone());
+            // Phase 53d: IsCompare as the sum expression.
+            tuple.push(is_compare_e());
             tuple.push(f_is_move[0].clone());
             tuple.push(f_is_32bit[0].clone());
             tuple.push(f_is_branch[0].clone());
