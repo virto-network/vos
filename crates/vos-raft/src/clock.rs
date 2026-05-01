@@ -71,6 +71,42 @@ pub trait Rng: Send + 'static {
     fn next_u64(&mut self) -> u64;
 }
 
+/// Sink that receives `commit_index` advances. The worker calls
+/// [`notify`](Self::notify) every time `commit_index` moves
+/// forward — either because a leader's quorum-match advanced it
+/// or a follower received a heartbeat with a higher
+/// `leader_commit`.
+///
+/// Provided so embedded hosts can plug in whatever channel
+/// primitive their executor offers (Embassy's
+/// `embassy_sync::channel`, a custom MPMC, an inline closure)
+/// without depending on `std::sync::mpsc`. Std hosts can pass
+/// `std::sync::mpsc::Sender<u64>` directly via the blanket impl
+/// below; embedded users with no apply-side consumer can pass
+/// `()` and the notifications are silently dropped.
+pub trait ApplySink: Send + 'static {
+    /// Called by the worker after every commit-index advance.
+    /// Implementations should be cheap — the call happens
+    /// inside the worker's hot loop. Errors are not propagated
+    /// (a closed channel is not a worker failure).
+    fn notify(&self, commit_index: u64);
+}
+
+/// No-op sink. Embedded users with no apply-side consumer can
+/// pass `()` to suppress the notifications entirely.
+impl ApplySink for () {
+    fn notify(&self, _commit_index: u64) {}
+}
+
+/// Wire `std::sync::mpsc::Sender<u64>` straight into the worker
+/// — vos's `RaftCommit::Multi` uses this path.
+#[cfg(feature = "std")]
+impl ApplySink for std::sync::mpsc::Sender<u64> {
+    fn notify(&self, commit_index: u64) {
+        let _ = self.send(commit_index);
+    }
+}
+
 // ── Std-feature defaults ─────────────────────────────────────
 
 /// Standard-library [`Clock`] implementation. Wraps

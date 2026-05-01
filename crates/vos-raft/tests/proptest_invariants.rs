@@ -114,7 +114,7 @@ fn make_worker() -> Worker<u16> {
         storage,
         Arc::new(NoopTransport),
         cfg,
-        None,
+        (),
         StdClock,
         StdRng::from_entropy(),
     )

@@ -195,7 +195,7 @@ fn three_node_cluster_elects_a_leader() {
             storage,
             transport.clone(),
             cfg,
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
@@ -236,7 +236,7 @@ fn leader_replicates_proposals_to_followers() {
             storage,
             transport.clone(),
             cfg(me, members.clone()),
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
@@ -293,7 +293,7 @@ fn partitioned_minority_cannot_elect() {
             storage,
             transport.clone(),
             cfg(me, members.clone()),
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
@@ -348,7 +348,7 @@ fn leader_replicates_to_a_lagging_follower() {
             storage,
             transport.clone(),
             cfg(me, members.clone()),
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );

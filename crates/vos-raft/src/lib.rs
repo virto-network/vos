@@ -39,7 +39,7 @@ pub(crate) mod testutil;
 #[cfg(feature = "std")]
 pub mod worker;
 
-pub use clock::{Clock, Rng};
+pub use clock::{ApplySink, Clock, Rng};
 #[cfg(feature = "std")]
 pub use clock::{StdClock, StdRng};
 pub use config::{Config, NodeId};

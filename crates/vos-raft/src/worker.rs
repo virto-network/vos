@@ -39,7 +39,7 @@ use futures_channel::oneshot;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
 
-use crate::clock::{Clock, Rng};
+use crate::clock::{ApplySink, Clock, Rng};
 use crate::config::{Config, NodeId};
 use crate::log_entry::LogEntry;
 use crate::meta::Meta;
@@ -152,6 +152,13 @@ impl<N: NodeId> Worker<N> {
     /// by a [`StdClock`](crate::StdClock) +
     /// [`StdRng`](crate::StdRng). The thread runs a single-task
     /// `futures_executor::block_on` over the worker future.
+    ///
+    /// `apply_notifier` is the historical std-only convenience: a
+    /// `None` suppresses commit notifications (sink = `()`) and
+    /// `Some(sender)` plugs the channel directly into the worker.
+    /// For embedded use or custom sinks, call
+    /// [`spawn_with`](Self::spawn_with) and pass any
+    /// [`ApplySink`].
     pub fn spawn<S, T>(
         storage: S,
         transport: Arc<T>,
@@ -162,24 +169,39 @@ impl<N: NodeId> Worker<N> {
         S: Storage<N>,
         T: Transport<N>,
     {
-        Self::spawn_with(
-            storage,
-            transport,
-            cfg,
-            apply_notifier,
-            crate::clock::StdClock,
-            crate::clock::StdRng::from_entropy(),
-        )
+        // Translate the historical Option<Sender> into the
+        // generic ApplySink at the call site so the inner
+        // `spawn_with` signature stays uniform.
+        match apply_notifier {
+            Some(tx) => Self::spawn_with(
+                storage,
+                transport,
+                cfg,
+                tx,
+                crate::clock::StdClock,
+                crate::clock::StdRng::from_entropy(),
+            ),
+            None => Self::spawn_with(
+                storage,
+                transport,
+                cfg,
+                (),
+                crate::clock::StdClock,
+                crate::clock::StdRng::from_entropy(),
+            ),
+        }
     }
 
     /// Like [`spawn`](Self::spawn) but with caller-supplied
-    /// [`Clock`] and [`Rng`]. Useful for deterministic simulators
-    /// or hosts that want to plug in `tokio::time` directly.
-    pub fn spawn_with<S, T, C, R>(
+    /// [`Clock`], [`Rng`], and [`ApplySink`]. Useful for
+    /// deterministic simulators, hosts that want to plug in
+    /// `tokio::time` directly, or embedded users with a custom
+    /// notification channel.
+    pub fn spawn_with<S, T, C, R, A>(
         storage: S,
         transport: Arc<T>,
         cfg: Config<N>,
-        apply_notifier: Option<std::sync::mpsc::Sender<u64>>,
+        apply_sink: A,
         clock: C,
         rng: R,
     ) -> Self
@@ -188,6 +210,7 @@ impl<N: NodeId> Worker<N> {
         T: Transport<N>,
         C: Clock,
         R: Rng,
+        A: ApplySink,
     {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
@@ -200,7 +223,7 @@ impl<N: NodeId> Worker<N> {
                     transport,
                     cfg,
                     rx,
-                    apply_notifier,
+                    apply_sink,
                     clock,
                     rng,
                     role_for_thread,
@@ -405,13 +428,14 @@ enum RpcOutcome<N: NodeId> {
 /// the main loop's `select!`.
 type RpcFut<N> = Pin<Box<dyn Future<Output = RpcOutcome<N>> + Send>>;
 
-struct WorkerState<N, S, T, C, R>
+struct WorkerState<N, S, T, C, R, A>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     storage: S,
     transport: Arc<T>,
@@ -421,28 +445,21 @@ where
     election_deadline: C::Instant,
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
-    apply_notifier: Option<ApplyNotifier>,
+    apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
     rng: R,
 }
 
-/// Abstraction over the apply-notification channel. Std hosts
-/// pass `std::sync::mpsc::Sender<u64>`; future commits will
-/// generalize this to a no_std-compatible sink trait.
-#[cfg(feature = "std")]
-type ApplyNotifier = std::sync::mpsc::Sender<u64>;
-
-#[cfg(not(feature = "std"))]
-type ApplyNotifier = core::convert::Infallible;
-
-impl<N, S, T, C, R> WorkerState<N, S, T, C, R>
+impl<N, S, T, C, R, A> WorkerState<N, S, T, C, R, A>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
     C: Clock,
+    A: ApplySink,
     R: Rng,
+    A: ApplySink,
 {
     fn publish_role(&self) {
         self.role_atomic
@@ -454,18 +471,8 @@ where
         self.publish_role();
     }
 
-    #[cfg(feature = "std")]
     fn fire_apply_notification(&self) {
-        if let Some(tx) = self.apply_notifier.as_ref() {
-            let _ = tx.send(self.meta.commit_index);
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn fire_apply_notification(&self) {
-        // No-std: notifier type is `Infallible` so there's
-        // nothing to send into. A future commit lifts this to a
-        // generic sink trait.
+        self.apply_sink.notify(self.meta.commit_index);
     }
 
     fn reset_election_timer(&mut self) {
@@ -524,12 +531,12 @@ where
 /// Embedded hosts call this directly inside their executor.
 /// Std hosts typically use [`Worker::spawn`].
 #[allow(clippy::too_many_arguments)]
-pub async fn run_worker<N, S, T, C, R>(
+pub async fn run_worker<N, S, T, C, R, A>(
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
     inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
-    apply_notifier: Option<ApplyNotifier>,
+    apply_sink: A,
     clock: C,
     rng: R,
     role_atomic: Arc<AtomicU8>,
@@ -539,6 +546,7 @@ pub async fn run_worker<N, S, T, C, R>(
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     let meta = match storage.load_meta().await {
         Ok(m) => m,
@@ -553,7 +561,7 @@ pub async fn run_worker<N, S, T, C, R>(
         election_deadline: clock.now(),
         votes_received: BTreeSet::new(),
         leader: None,
-        apply_notifier,
+        apply_sink,
         role_atomic,
         clock,
         rng,
@@ -601,8 +609,8 @@ pub async fn run_worker<N, S, T, C, R>(
     }
 }
 
-async fn handle_msg<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_msg<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     pending: &mut FuturesUnordered<RpcFut<N>>,
     msg: RaftMsg<N>,
 ) where
@@ -611,6 +619,7 @@ async fn handle_msg<N, S, T, C, R>(
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     match msg {
         RaftMsg::AppendEntries { from, req, reply } => {
@@ -646,8 +655,8 @@ async fn handle_msg<N, S, T, C, R>(
     }
 }
 
-async fn on_timer<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn on_timer<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     pending: &mut FuturesUnordered<RpcFut<N>>,
 ) where
     N: NodeId,
@@ -655,6 +664,7 @@ async fn on_timer<N, S, T, C, R>(
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     match state.role {
         Role::Follower | Role::Candidate => {
@@ -666,8 +676,8 @@ async fn on_timer<N, S, T, C, R>(
     }
 }
 
-async fn handle_rpc_outcome<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_rpc_outcome<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     _pending: &mut FuturesUnordered<RpcFut<N>>,
     outcome: RpcOutcome<N>,
 ) where
@@ -676,6 +686,7 @@ async fn handle_rpc_outcome<N, S, T, C, R>(
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     match outcome {
         RpcOutcome::Append {
@@ -705,8 +716,8 @@ async fn handle_rpc_outcome<N, S, T, C, R>(
 
 // ── Inbound RPC handlers ────────────────────────────────────
 
-async fn handle_append_entries<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_append_entries<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     _from: N,
     req: AppendEntriesReq<N>,
 ) -> Result<AppendEntriesResp, S::Error>
@@ -716,6 +727,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if req.term < state.meta.current_term {
         return Ok(AppendEntriesResp {
@@ -809,8 +821,8 @@ where
     })
 }
 
-async fn handle_request_vote<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_request_vote<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     _from: N,
     req: RequestVoteReq<N>,
 ) -> Result<RequestVoteResp, S::Error>
@@ -820,6 +832,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if req.term < state.meta.current_term {
         return Ok(RequestVoteResp {
@@ -867,8 +880,8 @@ where
     })
 }
 
-async fn handle_install_snapshot<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_install_snapshot<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     _from: N,
     req: InstallSnapshotReq<N>,
 ) -> Result<InstallSnapshotResp, S::Error>
@@ -878,6 +891,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if req.term < state.meta.current_term {
         return Ok(InstallSnapshotResp {
@@ -929,8 +943,8 @@ where
 
 // ── Outbound RPC response handlers ──────────────────────────
 
-async fn handle_append_response<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_append_response<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     from: N,
     resp: AppendEntriesResp,
 ) -> Result<(), S::Error>
@@ -940,6 +954,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
@@ -973,8 +988,8 @@ where
     Ok(())
 }
 
-async fn handle_install_snapshot_response<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_install_snapshot_response<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     from: N,
     resp: InstallSnapshotResp,
     last_included_index: u64,
@@ -985,6 +1000,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
@@ -1012,8 +1028,8 @@ where
     Ok(())
 }
 
-async fn handle_vote_response<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_vote_response<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     from: N,
     resp: RequestVoteResp,
 ) -> Result<(), S::Error>
@@ -1023,6 +1039,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if resp.term > state.meta.current_term {
         state.meta.current_term = resp.term;
@@ -1056,8 +1073,8 @@ where
 
 // ── Higher-level transitions ────────────────────────────────
 
-async fn handle_propose<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn handle_propose<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     payload: Vec<u8>,
     _pending: &mut FuturesUnordered<RpcFut<N>>,
 ) -> Result<u64, ProposeError<()>>
@@ -1067,6 +1084,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     if state.role != Role::Leader {
         return Err(ProposeError::NotLeader);
@@ -1090,8 +1108,8 @@ where
     Ok(new_index)
 }
 
-async fn become_leader_no_heartbeat<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn become_leader_no_heartbeat<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -1099,6 +1117,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     state.set_role(Role::Leader);
     state.votes_received.clear();
@@ -1107,13 +1126,14 @@ where
     Ok(())
 }
 
-fn step_down<N, S, T, C, R>(state: &mut WorkerState<N, S, T, C, R>)
+fn step_down<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     state.set_role(Role::Follower);
     state.votes_received.clear();
@@ -1121,8 +1141,8 @@ where
     state.reset_election_timer();
 }
 
-async fn try_advance_commit_index<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn try_advance_commit_index<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -1130,6 +1150,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     let Some(majority_floor) = state.match_index_majority_floor().await else {
         return Ok(());
@@ -1154,8 +1175,8 @@ where
     Ok(())
 }
 
-async fn send_heartbeats<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn send_heartbeats<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     pending: &mut FuturesUnordered<RpcFut<N>>,
 ) -> Result<(), S::Error>
 where
@@ -1164,6 +1185,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     let term = state.meta.current_term;
     let me = state.cfg.me;
@@ -1241,8 +1263,8 @@ where
     Ok(())
 }
 
-async fn try_compact<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn try_compact<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -1250,6 +1272,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     let leader = match state.leader.as_ref() {
         Some(l) => l,
@@ -1280,8 +1303,8 @@ where
     Ok(())
 }
 
-async fn start_election<N, S, T, C, R>(
-    state: &mut WorkerState<N, S, T, C, R>,
+async fn start_election<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
     pending: &mut FuturesUnordered<RpcFut<N>>,
 ) -> Result<(), S::Error>
 where
@@ -1290,6 +1313,7 @@ where
     T: Transport<N>,
     C: Clock,
     R: Rng,
+    A: ApplySink,
 {
     state.set_role(Role::Candidate);
     state.meta.current_term += 1;
@@ -1360,7 +1384,7 @@ mod tests {
             storage,
             transport,
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
@@ -1383,7 +1407,7 @@ mod tests {
             storage,
             transport,
             cfg,
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
@@ -1419,7 +1443,7 @@ mod tests {
             storage,
             transport,
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            None,
+            (),
             StdClock,
             StdRng::from_entropy(),
         );
