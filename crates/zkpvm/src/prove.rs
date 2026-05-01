@@ -129,7 +129,14 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) {
     }
 }
 
-/// Compute blake3 hash of final memory state by applying all writes to initial memory.
+/// Compute blake3 hash of final memory state by applying all writes to
+/// initial memory.
+///
+/// Cost: O(initial_memory.len() + Σ writes).  Allocates a full clone
+/// of `initial_memory`, so for actor binaries with multi-MB memory
+/// regions this dominates `prove`'s memory footprint.  Future work
+/// could swap this for an in-place Merkle commitment over the byte-
+/// level memory ledger (which we already build for the MemoryChip).
 fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::step::PvmStep]) -> [u8; 32] {
     let mut mem = initial_memory.to_vec();
     for step in steps {
@@ -137,15 +144,14 @@ fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::
             let addr = w.address as usize;
             let bytes = w.value.to_le_bytes();
             let sz = w.size as usize;
-            if addr + sz <= mem.len() {
-                mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
-            } else {
-                // Extend memory if needed
-                if addr + sz > mem.len() {
-                    mem.resize(addr + sz, 0);
-                }
-                mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
+            // Grow `mem` if a write goes past the current end.  Honest
+            // PvmStep entries are bounded by the interpreter's memory
+            // size, so this should never fire in normal operation —
+            // but trust-but-verify since `steps` is caller-supplied.
+            if addr + sz > mem.len() {
+                mem.resize(addr + sz, 0);
             }
+            mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
         }
     }
     *blake3::hash(&mem).as_bytes()
