@@ -233,17 +233,29 @@ impl CommitStrategy for RaftCommit {
 
     fn commit(&mut self, state: &[u8]) -> Result<(), CommitError> {
         // Plain commit path — used by post-replay state
-        // materialization in the agent's cold-start flow. Doesn't
+        // materialization in the agent's cold-start flow AND
+        // the follower's apply-on-commit-advance path. Doesn't
         // append a log entry (no log to attach), only updates the
-        // materialized state row, so it's symmetric with what
-        // `CrdtCommit::commit` (LocalCommit fall-through) does.
+        // materialized state row + advances `last_applied` to
+        // match the worker's `commit_index` (everything up to
+        // commit_index has now been applied to produce `state`).
         if state == self.last_state.as_slice() {
             return Ok(());
         }
+        // Reload meta to learn the worker's current commit_index.
+        // The agent calls commit() after running the replay loop
+        // up through every committed log entry, so commit_index
+        // is the exact point our `last_applied` should reach.
+        self.meta = RaftMeta::load(&self.db)?;
+        let new_last_applied = self.meta.commit_index;
         let txn = self.db.begin_write()?;
         {
             let mut state_table = txn.open_table(STATE_TABLE)?;
             state_table.insert(STATE_KEY, state)?;
+        }
+        if new_last_applied > self.meta.last_applied {
+            self.meta.last_applied = new_last_applied;
+            self.meta.write_in_txn(&txn)?;
         }
         txn.commit()?;
         self.last_state = state.to_vec();
@@ -306,21 +318,22 @@ impl CommitStrategy for RaftCommit {
                         }
                     }
                 }
-                // Quorum-committed. Persist the state row in our
-                // own txn (worker owns log + meta; agent owns
-                // state). On crash between this txn and the
-                // worker's commit_index advance, restart will see
-                // commit_index ≥ idx and replay the log to
-                // rebuild state — same shape used for cold start.
+                // Quorum-committed. Persist the state row +
+                // bump `last_applied` in our own txn (the worker
+                // owns log + commit_index + voted_for + snap
+                // pointer; the host owns state + last_applied).
+                // Atomic write so a crash here either rolls
+                // back the apply entirely or commits state and
+                // last_applied together.
+                self.meta = RaftMeta::load(&self.db)?;
+                self.meta.last_applied = self.meta.last_applied.max(idx);
                 let txn = self.db.begin_write()?;
                 {
                     let mut state_table = txn.open_table(STATE_TABLE)?;
                     state_table.insert(STATE_KEY, state)?;
                 }
+                self.meta.write_in_txn(&txn)?;
                 txn.commit()?;
-                // Refresh our cached meta from disk so
-                // `last_applied()` reflects the worker's advance.
-                self.meta = RaftMeta::load(&self.db)?;
             }
         }
         self.last_state = state.to_vec();
@@ -328,13 +341,23 @@ impl CommitStrategy for RaftCommit {
     }
 
     fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {
-        if self.meta.last_applied == 0 {
+        // Returns every committed entry past the snap pointer.
+        // The runtime is responsible for idempotent replay
+        // semantics — `EffectLog::dispatch` runs as a "replay
+        // session" that rebuilds state from scratch. Bounding
+        // by `commit_index` (not `last_applied`) is what makes
+        // the follower path work: a follower's worker advances
+        // commit_index via heartbeats, the agent runs replay,
+        // calls `commit()` which bumps last_applied.
+        if self.meta.commit_index == 0 {
             return Ok(Vec::new());
         }
-        // Phase 6 will start this from `snap_last_index + 1`; for
-        // now the log is uncompacted so 1..=last_applied is the
-        // full causal history.
-        let entries = self.log.entries(1, self.meta.last_applied)?;
+        let start = self.meta.snap_last_index.saturating_add(1);
+        let end = self.meta.commit_index;
+        if start > end {
+            return Ok(Vec::new());
+        }
+        let entries = self.log.entries(start, end)?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let eff = EffectLog::from_bytes(&e.payload).ok_or_else(|| {

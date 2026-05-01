@@ -373,12 +373,13 @@ proptest! {
                 "snap_last_index went backwards: {} -> {}",
                 prev_snap, snap.snap_last_index,
             );
-            // Worker's own internal invariant: last_applied always
-            // covers the snap pointer.
+            // Worker's own internal invariant: commit_index
+            // always covers the snap pointer (you can't commit
+            // less than what's been compacted away).
             prop_assert!(
-                snap.last_applied >= snap.snap_last_index,
-                "last_applied {} < snap_last_index {}",
-                snap.last_applied, snap.snap_last_index,
+                snap.commit_index >= snap.snap_last_index,
+                "commit_index {} < snap_last_index {}",
+                snap.commit_index, snap.snap_last_index,
             );
 
             // Invariant 3: log-matching. Walk the live entry set

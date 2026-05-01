@@ -79,15 +79,8 @@ pub struct WorkerSnapshot<N: NodeId> {
     pub voted_for: Option<N>,
     pub last_log_index: u64,
     pub commit_index: u64,
-    /// Mirror of [`Meta::last_applied`](crate::Meta::last_applied)
-    /// — see the docs there for the caveat about what this
-    /// field actually means (TL;DR: notification index, not
-    /// state-machine apply index).
-    pub last_applied: u64,
     /// Highest log index that has been compacted into the
     /// snapshot. `0` when no compaction has happened yet.
-    /// Useful for proptest invariants that need to assert the
-    /// snap pointer never regresses.
     pub snap_last_index: u64,
 }
 
@@ -696,7 +689,6 @@ async fn handle_msg<N, S, T, C, R, A>(
                 voted_for: state.meta.voted_for,
                 last_log_index: state.storage.last_index(),
                 commit_index: state.meta.commit_index,
-                last_applied: state.meta.last_applied,
                 snap_last_index: state.storage.snap_last_index(),
             });
         }
@@ -842,12 +834,6 @@ where
         let new_commit = req.leader_commit.min(last_new_index);
         if new_commit > state.meta.commit_index {
             state.meta.commit_index = new_commit;
-            // `last_applied` is bumped synchronously with
-            // `commit_index` because the worker has no
-            // separate apply pipeline — see Meta::last_applied
-            // doc. A host with async apply must track its own
-            // post-apply index separately.
-            state.meta.last_applied = state.meta.last_applied.max(new_commit);
             commit_advanced = true;
         }
     }
@@ -976,7 +962,6 @@ where
     state.meta.snap_last_index = req.last_included_index;
     state.meta.snap_last_term = req.last_included_term;
     state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
-    state.meta.last_applied = state.meta.last_applied.max(req.last_included_index);
 
     state
         .storage
@@ -1215,7 +1200,6 @@ where
         return Ok(());
     }
     state.meta.commit_index = majority_floor;
-    state.meta.last_applied = state.meta.last_applied.max(majority_floor);
     state
         .storage
         .commit_batch(WriteBatch {
@@ -1482,7 +1466,6 @@ mod tests {
         assert_eq!(snap.role, Role::Leader);
         assert_eq!(snap.last_log_index, 1);
         assert_eq!(snap.commit_index, 1);
-        assert_eq!(snap.last_applied, 1);
 
         worker.shutdown();
     }
@@ -1691,7 +1674,6 @@ mod tests {
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.snap_last_index, 100);
         assert_eq!(snap.commit_index, 100);
-        assert_eq!(snap.last_applied, 100);
         // last_log_index follows the snap pointer when the live
         // log is empty (per `MemStorage::last_index` fallback).
         assert_eq!(snap.last_log_index, 100);

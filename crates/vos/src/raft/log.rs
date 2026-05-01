@@ -487,6 +487,34 @@ impl RaftMeta {
         t.insert(META_SNAP_TERM, &self.snap_last_term.to_le_bytes()[..])?;
         Ok(())
     }
+
+    /// Write only the worker-managed fields, leaving
+    /// `META_LAST_APPLIED` untouched. Used by `RedbStorage::commit_batch`
+    /// because the worker doesn't track `last_applied` —
+    /// `RaftCommit::commit_with_log` is the sole writer for
+    /// that row, and clobbering it from the worker path would
+    /// race the host's apply progress.
+    pub fn write_worker_fields_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+    ) -> Result<(), CommitError> {
+        let mut t = txn.open_table(RAFT_META)?;
+        t.insert(META_TERM, &self.current_term.to_le_bytes()[..])?;
+        match self.voted_for {
+            Some(p) => {
+                t.insert(META_VOTED_FOR, &p.to_le_bytes()[..])?;
+            }
+            None => {
+                t.remove(META_VOTED_FOR)?;
+            }
+        };
+        t.insert(META_COMMIT_INDEX, &self.commit_index.to_le_bytes()[..])?;
+        // Deliberately NOT writing META_LAST_APPLIED — see method
+        // doc.
+        t.insert(META_SNAP_INDEX, &self.snap_last_index.to_le_bytes()[..])?;
+        t.insert(META_SNAP_TERM, &self.snap_last_term.to_le_bytes()[..])?;
+        Ok(())
+    }
 }
 
 fn u64_le(b: &[u8]) -> u64 {

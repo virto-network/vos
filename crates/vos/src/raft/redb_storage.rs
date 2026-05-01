@@ -186,8 +186,13 @@ impl Storage<u16> for RedbStorage {
                 state_table.insert(STATE_KEY, state_bytes)?;
             }
             if let Some(m) = &new_meta {
-                let raft_meta = raft_from_meta(m);
-                raft_meta.write_in_txn(&txn)?;
+                // Merge the worker-managed fields into the
+                // existing on-disk RaftMeta (preserves
+                // `last_applied`, which the worker doesn't
+                // manage). The actual write skips
+                // META_LAST_APPLIED.
+                let raft_meta = raft_from_meta(&self.meta, m);
+                raft_meta.write_worker_fields_in_txn(&txn)?;
             }
 
             txn.commit()?;
@@ -208,7 +213,11 @@ impl Storage<u16> for RedbStorage {
         // {truncate,compact,append}_in_txn — kept on success. The
         // state row is intentionally not cached (see `read_state`).
         if let Some(m) = new_meta {
-            self.meta = raft_from_meta(&m);
+            // Re-merge with the cached `last_applied` so the
+            // in-memory cache stays consistent with disk
+            // (which we just wrote without touching
+            // META_LAST_APPLIED).
+            self.meta = raft_from_meta(&self.meta, &m);
         }
         let _ = new_state;
         Ok(())
@@ -231,25 +240,31 @@ fn read_state_bytes(db: &Database) -> Result<Vec<u8>, CommitError> {
 }
 
 /// Convert `vos::raft::log::RaftMeta` (vos's own shape) → the
-/// generic `vos_raft::Meta<u16>` the trait operates on.
+/// generic `vos_raft::Meta<u16>` the trait operates on. Drops
+/// `last_applied` — the worker doesn't track it; vos's
+/// `RaftCommit` reads/writes it on its own.
 fn meta_from_raft(m: &RaftMeta) -> Meta<u16> {
     Meta {
         current_term: m.current_term,
         voted_for: m.voted_for,
         commit_index: m.commit_index,
-        last_applied: m.last_applied,
         snap_last_index: m.snap_last_index,
         snap_last_term: m.snap_last_term,
     }
 }
 
-/// Convert `vos_raft::Meta<u16>` → `vos::raft::log::RaftMeta`.
-fn raft_from_meta(m: &Meta<u16>) -> RaftMeta {
+/// Convert `vos_raft::Meta<u16>` → `vos::raft::log::RaftMeta`,
+/// preserving the existing `last_applied` from `prev` (the
+/// worker doesn't manage it). Used internally to keep the
+/// in-memory cache consistent; the on-disk write path uses
+/// [`RaftMeta::write_worker_fields_in_txn`] which simply
+/// doesn't touch `META_LAST_APPLIED`.
+fn raft_from_meta(prev: &RaftMeta, m: &Meta<u16>) -> RaftMeta {
     RaftMeta {
         current_term: m.current_term,
         voted_for: m.voted_for,
         commit_index: m.commit_index,
-        last_applied: m.last_applied,
+        last_applied: prev.last_applied,
         snap_last_index: m.snap_last_index,
         snap_last_term: m.snap_last_term,
     }
@@ -333,7 +348,6 @@ mod tests {
             current_term: 4,
             voted_for: Some(7),
             commit_index: 1,
-            last_applied: 1,
             snap_last_index: 0,
             snap_last_term: 0,
         };

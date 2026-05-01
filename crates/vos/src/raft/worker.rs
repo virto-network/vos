@@ -113,7 +113,6 @@ pub struct WorkerSnapshot {
     pub voted_for: Option<u16>,
     pub last_log_index: u64,
     pub commit_index: u64,
-    pub last_applied: u64,
     pub snap_last_index: u64,
 }
 
@@ -125,7 +124,6 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
             voted_for: s.voted_for,
             last_log_index: s.last_log_index,
             commit_index: s.commit_index,
-            last_applied: s.last_applied,
             snap_last_index: s.snap_last_index,
         }
     }
@@ -650,7 +648,10 @@ mod tests {
         assert_eq!(meta.snap_last_index, 3);
         assert_eq!(meta.snap_last_term, 2);
         assert_eq!(meta.commit_index, 3);
-        assert_eq!(meta.last_applied, 3);
+        // `last_applied` is the host's responsibility (see
+        // vos_raft::Meta doc) — the worker no longer bumps it
+        // on snapshot install. Vos's `RaftCommit::commit_with_log`
+        // bumps it when the apply path runs.
 
         let log = RaftLog::open(db.clone()).unwrap();
         assert_eq!(log.snap_last_index(), 3);

@@ -68,10 +68,9 @@ surface is intentionally small but reserves room to grow via
   own chunking on top.
 - **No learner role** — every `Config::members` entry is a full
   voter.
-- **`Meta::last_applied` semantics** — currently bumped
-  synchronously with `commit_index`. Hosts with async apply
-  pipelines should track their own post-apply index separately
-  (see [`Meta::last_applied`] doc).
+- *(removed)* `Meta::last_applied` is no longer part of the
+  worker's meta — the host tracks its own apply progress.
+  See `Meta`'s docs.
 - **`StdClock::sleep_until` spawns a thread per `Delay`** to avoid
   `futures-timer`'s shared-timer contention under heavy
   parallelism. Production deployments should plug their host

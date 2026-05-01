@@ -2874,10 +2874,16 @@ mod tests {
                 meta.commit_index, 3,
                 "replica {label} commit_index should advance to 3",
             );
-            assert_eq!(
-                meta.last_applied, 3,
-                "replica {label} last_applied tracks commit_index in phase 4",
-            );
+            // `last_applied` is now the host's responsibility
+            // (vos_raft::Meta no longer tracks it). On the leader
+            // it's bumped by `RaftCommit::commit_with_log`'s state
+            // write; followers' `last_applied` only advances when
+            // their agent thread runs the apply path. This test
+            // probes redb directly without going through RaftCommit
+            // on the followers, so we only check `commit_index`
+            // here — the apply-tracking integration test in
+            // `tests/elf_integration.rs` covers the host-level
+            // last_applied advance end-to-end.
         }
 
         match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
