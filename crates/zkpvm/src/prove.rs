@@ -86,6 +86,14 @@ pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -
 }
 
 /// Debug: print per-component claimed sums (logup) and check if they balance.
+///
+/// Gated behind the `debug-internals` feature — production builds
+/// don't expose this.  Useful when adding a new constraint and the
+/// regression sweep fails: per-component sums help distinguish
+/// "ConstraintsNotSatisfied" (some chip writes a wrong column value)
+/// from "claimed logup sum is not zero" (lookup imbalance — usually
+/// a missing emission or wrong multiplicity).
+#[cfg(feature = "debug-internals")]
 pub fn debug_claimed_sums(side_note: &mut SideNote) {
     use num_traits::Zero;
     let components = BASE_COMPONENTS;

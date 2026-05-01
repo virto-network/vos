@@ -8,8 +8,14 @@ license.workspace = true
 default = ["prover"]
 # Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
 # and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
-# 11c will make it no_std-friendly).
+# no_std-friendly).
 prover = ["dep:rayon", "dep:blake3"]
+# Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
+# logup imbalances.  Off by default so the production prover surface
+# stays clean; turn on with `--features debug-internals` to bisect
+# "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
+# modes when adding constraints.
+debug-internals = ["prover"]
 
 [dependencies]
 zkpvm-derive = { workspace = true }

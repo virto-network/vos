@@ -53,8 +53,31 @@
 //!
 //! - `prover` (default) — trace generation, proof creation, blake3
 //!   commitments, rayon parallelism.  Pulls in heavy deps.
+//! - `debug-internals` — exposes [`debug_claimed_sums`] for bisecting
+//!   prover-side logup imbalances when adding a new constraint.  Off
+//!   by default; production callers don't need it.
 //! - `--no-default-features` — verifier-only, `no_std` compatible,
 //!   minimal dep tree.
+//!
+//! ## API stability
+//!
+//! Items at this crate's root (`zkpvm::*`) are the **stable surface**:
+//! [`prove`], [`prove_with_config`], [`verify`],
+//! [`verify_with_max_log_size`], [`verify_chain`],
+//! [`Proof`], [`SegmentState`], [`SideNote`],
+//! [`PROOF_FORMAT_VERSION`], [`DEFAULT_MAX_LOG_SIZE`], [`PcsConfig`],
+//! [`FriConfig`], [`production_pcs_config`],
+//! [`program_commitment_of_proof`], [`program_commitment_hex`],
+//! [`ProgramCommitment`].  These are versioned by
+//! [`PROOF_FORMAT_VERSION`]: a verifier compiled against version N
+//! rejects proofs from any other N.
+//!
+//! Sub-modules ([`chips`], [`core`], [`framework_access`],
+//! [`air_column`], [`trace`], [`proof`]) are **internal — their
+//! shapes change without notice**.  They're public only because the
+//! companion `zkpvm-verifier` crate links against them and the AIR
+//! column derives need crate-root access.  External consumers should
+//! not rely on these.
 
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
@@ -131,7 +154,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
 pub use proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
 #[cfg(feature = "prover")]
 pub use prove::{prove, prove_with_config, prove_profiled, prove_profiled_with_config, ProveProfile, production_pcs_config};
-#[cfg(feature = "prover")]
+#[cfg(feature = "debug-internals")]
 pub use prove::debug_claimed_sums;
 pub use stwo::core::pcs::PcsConfig;
 pub use stwo::core::fri::FriConfig;
