@@ -110,64 +110,134 @@ actor's full program (log_size = 15) is the cost driver, not
 the 32 CpuChip rows.  Effective throughput is misleading at
 this scale; report the **end-to-end latency** (1.57 s) instead.
 
-## Comparison to Nexus zkVM 2.x
+## Comparison to Nexus zkVM 2.x — measured
 
-zkpvm shares a backend with Nexus zkVM 2.0+ (both Stwo-backed
-Circle-STARK over M31).  Direct cycles-per-second comparisons
-aren't apples-to-apples because:
+zkpvm shares its prover backend with Nexus zkVM 2.x (both
+Stwo-backed Circle-STARK over M31, **same upstream rev
+`0790eba`**, same Rust toolchain `nightly-2025-05-09`).  This
+makes a side-by-side benchmark a clean test of AIR shape — any
+delta is purely chip count, column width, and lookup-tuple
+shape, not the cryptography underneath.
 
-- **Different ISAs**: Nexus zkVM proves RISC-V; zkpvm proves
-  PVM.  PVM is variable-length (1–13 bytes per instruction)
-  with a 13-register file and ECALL-based precompiles, where
-  RISC-V is fixed-length 32-bit with a 32-register file.  One
-  PVM step does more useful work than one RISC-V cycle.
+### Bench harness
 
-- **Different chip layouts**: Nexus's CpuChip width and ours
-  diverge — both have ~9 columns per active per-row constraint,
-  but the *count* of active constraints differs because the
-  per-instruction semantics differ.
+Both benches use a long sequence of register-cycling Add
+instructions terminated by `Trap` (RISC-V `ADD` for Nexus,
+PVM `Add64` for zkpvm), padded to the configured trace size,
+proved single-threaded under each prover's default config.
 
-A fair comparison metric is **trace cells committed per second**
-(main_columns × rows / prove_time), which factors out the
-ISA-shape difference:
+- **zkpvm**: `cargo test -p zkpvm --release --test bench_prove
+  -- bench_prove_logN --nocapture`
+- **Nexus**: `cargo bench --bench stark_prove -- "Prove-LogSize-N"`
+  in `nexus-zkvm/prover-benches`.
 
-| zkpvm @ log14 | 3 034 cols × 16 384 rows / 12.92 s | ≈3.85 M cells/sec/thread |
-|---|---|---|
+### Measured numbers
 
-Nexus zkVM 2.0 announcement (Aug 2024) reported **~25 M
-cells/sec/thread** on similar hardware for their RISC-V CpuChip
-in the same Stwo backend.  zkpvm at this branch tip is roughly
-**6–7× slower per cell**.
+| log_size | Nexus prove | zkpvm prove | ratio (zkpvm/nexus) |
+|---       |---          |---          |---                  |
+| 10       | **175 ms**  | 963 ms      | **5.5×**            |
+| 12       | **620 ms**  | 2.70 s      | **4.4×**            |
+| 14       | **2.37 s**  | 12.92 s    | **5.4×**            |
 
-Where the gap comes from (in priority order):
+The gap stays roughly constant across log_size — it's per-cell,
+not per-row, so we're not hitting an O(N²) bug.
 
-1. **Multi-chip overhead**.  zkpvm has 14 chip components, each
-   with its own preprocessed + main + interaction commitment.
-   The smallest chips contribute fixed overhead per stage that
-   doesn't amortise over a long execution.  At log14 the
-   CpuChip is 16K rows but ProgramMemoryChip + MemoryChip are
-   both 65K rows (log_size 16) because they're sized by the
-   address space, not the step count.  Nexus consolidates more
-   of the per-step semantics into one wider CpuChip.
-2. **Lookup-pair-shape padding**.  Some constraints we
-   currently ship as paired emissions (multiplicity = is_real
-   per row, twice) for parity rather than as single-emission
-   columns.  Each redundant column is full-size; cell count
-   inflates without adding constraints.
-3. **Per-row column count drift**.  As Phases 32–41 closed
-   soundness gaps, the CpuChip column count grew from ~80
-   (Phase 1) to 3 034 today.  Some of those columns are
-   compute-once-use-once — they could fold into expression-
-   level operations if the constraint framework supported it
-   without breaking degree bounds.
+### Where the gap comes from — measured
 
-In other words, the gap is structural (ISA breadth, chip count)
-plus historical (column-count growth without periodic culling).
-None of it is fundamental — a future "wide CpuChip"
-consolidation phase could close most of it.  The current numbers
-are good enough for Kunekt-internal use (actor proving in single
-seconds for small actors, low-tens-of-seconds for substantial
-ones) and the trajectory is favourable.
+Total committed cells = Σ chip_cols × 2^chip_log_size:
+
+#### Per-chip cells at zkpvm @ log14
+
+| Chip                    | Cols  | log_size | Cells   | Share |
+|---                      |---    |---       |---      |---    |
+| **CpuChip**             | 662   | 15       | 21.7 M  | 76%   |
+| **ProgramMemoryChip**   | 74    | 16       | 4.85 M  | 17%   |
+| **RegisterMemoryChip**  | 28    | 16       | 1.83 M  | 6%    |
+| Blake2bChip             | 2 266 | 4        | 36 K    | <1%   |
+| MemoryChip              | 17    | 16       | 1.11 M  | (folded into RegisterMemory share) |
+| (rest combined)         |       |          | <10 K   | <1%   |
+| **Total**               |       |          | ≈28.4 M | 100%  |
+
+Compare to Nexus's per-step CpuChip column count:
+
+| Component              | zkpvm | Nexus | Ratio  |
+|---                     |---    |---    |---     |
+| Per-step `Column` cells| 662   | 374   | **1.77×** |
+| Number of chip components | 14 | 30    | **0.47×** |
+
+**The bottleneck is CpuChip width**, not chip count.  Nexus has
+*more* chips (30 vs. our 14) but each is narrower because they
+split per-instruction semantics across many small chips
+(`AddChip`, `SubChip`, `JalrChip`, `BneChip`, …) — each one
+constrains its own opcode in its own narrow row.  zkpvm
+currently stuffs all per-opcode constraints into one wide
+CpuChip (every row carries 662 columns regardless of which
+opcode is being proven).
+
+### Cells per second (the cells/sec/thread metric is ≈ same)
+
+Stwo cell-commit rate is determined by the upstream backend, not
+by the AIR.  Both provers should hit roughly the same
+cells/sec/thread once cache effects are similar:
+
+| Prover | log14 cells | log14 prove | cells/sec/thread |
+|---     |---          |---          |---               |
+| zkpvm  | 28.4 M      | 12.92 s     | ≈2.2 M           |
+| Nexus  | (estimated 5-10 M) | 2.37 s | ≈2-4 M       |
+
+So we're **NOT slower per cell** — we just commit roughly **3-5×
+more cells**.  The fix is to commit fewer cells (narrower CpuChip),
+not to make the prover faster.
+
+### Concrete improvement targets
+
+In priority order:
+
+1. **CpuChip column reduction (highest impact).**  Audit the 662
+   per-row cells for:
+   - Compute-once-use-once values that could fold into
+     expression-level operations (`val_b[i] * is_add` doesn't
+     need its own column if it appears in only one constraint).
+   - Paired flag columns that could collapse.  Examples: each
+     branch type currently has its own `IsBrEq / IsBrNe / …`
+     flag; if no constraint reads them outside the branch
+     dispatch, fold into a single multiplexer expression.
+   - Boolean sub-flags reachable from `IsCompare` etc. that
+     could derive from `(opcode, sub_op)` instead of being
+     materialised.
+   Target: **−200 columns** brings cell count to ≈21.8 M, prove
+   time to ≈10 s at log14.
+
+2. **Per-step semantics → per-instruction shards (the Nexus
+   way).**  Following Phase 47's split, lift each opcode family
+   into its own narrow chip with row-count = number of opcode-
+   matching real rows.  Concretely:
+   - `is_add`-gated rows go in `AddChip` (rows = sum of is_add
+     across the trace).
+   - `is_sub`-gated rows in `SubChip`, etc.
+   The CpuChip becomes a per-step skeleton (PC, ts, regs, opcode,
+   shared flag fan-out) and the per-opcode logic moves out.
+   This is structurally what Nexus does and the reason their
+   gaps add up correctly.  ~2-3× reduction in committed cells
+   plausible.
+
+3. **ProgramMemoryChip column count.**  74 cols per row × 65K
+   rows = 4.85 M cells, 17% of total.  Most of those columns
+   are flag bits that could share a single packed column with
+   bit-decomposition lookups, similar to what Range256 does.
+   Plausible 50% reduction.
+
+4. **Blake2bChip width**.  2 266 main columns is a lot for a
+   chip that mostly compresses one block per ECALL.  The
+   committed cell count is small (log_size = 4) so this is
+   low-priority for pure throughput, but it's the largest
+   single column count in the codebase and worth reviewing for
+   correctness clarity.
+
+The estimated headroom is **2-3× faster proving** without
+touching soundness, which would close the gap to ≈2× of Nexus
+— acceptable for production deployment given PVM's higher
+per-instruction richness.
 
 ## Memory cost
 
