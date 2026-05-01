@@ -33,39 +33,46 @@ use crate::commit::{CommitError, STATE_KEY, STATE_TABLE};
 use super::log::{RaftLog, RaftMeta};
 
 /// `vos_raft::Storage<u16>` impl on top of a shared
-/// `Arc<redb::Database>`. Owns its in-memory cache of the log
-/// tail + snap pointer + meta scalars + materialized state row;
-/// `commit_batch` refreshes them after the txn commits so the
-/// cheap reads stay correct.
+/// `Arc<redb::Database>`. Caches the log tail + snap pointer + meta
+/// scalars (these are fast-path reads the worker hits every loop
+/// iteration). The materialized state row is *not* cached and is
+/// re-read from disk on every `read_state` call.
+///
+/// ## Why state isn't cached
+///
+/// vos has two writers for the state row sharing the same `db`
+/// handle:
+///
+/// 1. The worker, via `commit_batch.state` (snapshot install).
+/// 2. `RaftCommit::commit_with_log`, which writes the state row in
+///    its own txn after the leader's quorum-commit unblocks.
+///
+/// If the worker cached `state_cache` at open time and only refreshed
+/// it on its own writes, an outbound `InstallSnapshot` would ship
+/// stale bytes — the leader's `read_state` would return the cache
+/// from the moment the worker spawned, not the post-`commit_with_log`
+/// row that's actually on disk. Re-reading on every `read_state`
+/// keeps the leader's snapshot bytes consistent with the materialized
+/// state, at the cost of one extra read txn per snapshot send (rare).
 pub struct RedbStorage {
     db: Arc<Database>,
     log: RaftLog,
     meta: RaftMeta,
-    /// Cached actor state row. Mirrors the row written under
-    /// [`STATE_TABLE`] / [`STATE_KEY`]. Empty `Vec` = no state
-    /// row materialized yet.
-    state_cache: Vec<u8>,
 }
 
 impl RedbStorage {
     /// Open a `RedbStorage` on `db`, recovering the log tail +
-    /// snap pointer + meta scalars + state row from disk. Empty
-    /// log / no state row → all zeros / empty `Vec`.
+    /// snap pointer + meta scalars from disk. Empty log → all
+    /// zeros.
     pub fn open(db: Arc<Database>) -> Result<Self, CommitError> {
         let log = RaftLog::open(db.clone())?;
         let meta = RaftMeta::load(&db)?;
-        let state_cache = read_state_bytes(&db)?;
-        Ok(Self {
-            db,
-            log,
-            meta,
-            state_cache,
-        })
+        Ok(Self { db, log, meta })
     }
 
     /// Borrow the underlying database. Used by the worker's
-    /// snapshot-install path (which reads the state row through
-    /// the storage handle rather than caching it).
+    /// snapshot-install path and by tests that introspect the
+    /// raw redb tables.
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -107,7 +114,14 @@ impl Storage<u16> for RedbStorage {
     }
 
     async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
-        Ok(self.state_cache.clone())
+        // Re-read every time. Vos's `RaftCommit::commit_with_log`
+        // writes the state row in its own txn, out-of-band of the
+        // worker's `commit_batch`, so a cached copy here would go
+        // stale and the leader would ship the pre-`commit_with_log`
+        // bytes to a fresh follower over `InstallSnapshot`. One
+        // read txn per snapshot send is cheap; snapshot sends are
+        // rare.
+        read_state_bytes(&self.db)
     }
 
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
@@ -191,13 +205,12 @@ impl Storage<u16> for RedbStorage {
 
         // Refresh in-memory caches now that disk is durable.
         // RaftLog's own caches were updated in-place by
-        // {truncate,compact,append}_in_txn — kept on success.
+        // {truncate,compact,append}_in_txn — kept on success. The
+        // state row is intentionally not cached (see `read_state`).
         if let Some(m) = new_meta {
             self.meta = raft_from_meta(&m);
         }
-        if let Some(state_bytes) = new_state {
-            self.state_cache = state_bytes;
-        }
+        let _ = new_state;
         Ok(())
     }
 }
@@ -359,6 +372,45 @@ mod tests {
         assert_eq!(s.last_term(), 2);
         assert_eq!(block_on(s.term_at(2)).unwrap(), Some(2));
         assert_eq!(block_on(s.term_at(3)).unwrap(), Some(2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_state_picks_up_out_of_band_writes() {
+        // Vos's `RaftCommit::commit_with_log` writes the state row
+        // in its own txn, separately from the worker's
+        // `commit_batch`. RedbStorage must re-read on every
+        // `read_state` so the leader's outbound `InstallSnapshot`
+        // ships current bytes, not whatever was on disk when the
+        // worker last touched the row.
+        let (db, dir) = temp_db();
+        let mut s = RedbStorage::open(db.clone()).unwrap();
+
+        // Worker writes v1 through commit_batch.
+        block_on(s.commit_batch(WriteBatch {
+            state: Some(b"worker-v1".to_vec()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(block_on(s.read_state()).unwrap(), b"worker-v1".to_vec());
+
+        // Out-of-band writer (mimicking `RaftCommit::commit_with_log`)
+        // overwrites the state row WITHOUT going through the
+        // RedbStorage instance.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                t.insert(STATE_KEY, b"out-of-band-v2".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Without the cache, `read_state` reflects the new on-disk
+        // value immediately. (Pre-fix this returned the stale
+        // `b"worker-v1"`.)
+        assert_eq!(block_on(s.read_state()).unwrap(), b"out-of-band-v2".to_vec());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
