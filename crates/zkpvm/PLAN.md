@@ -310,21 +310,97 @@ each batch.
 
 Following Phase 47's split, extract each opcode family from
 CpuChip into its own narrow chip with row count = number of
-matching real rows.  Mirrors Nexus's structure:
+matching real rows.  Mirrors Nexus's structure.
 
-- `AddChip`: rows = sum of `is_add` across the trace.  Holds
-  `val_b[8]`, `val_d[8]`, `result[8]`, `carry[8]`.  ~32 cells
-  per row.
-- `SubChip`, `MulChip`, `DivRemChip`, `BitwiseChip`,
-  `ShiftChip`, `BranchChip`, `LoadChip`, `StoreChip`,
-  `BitManipChip`, `RotateChip`, `CompareChip`, `MoveChip`.
+After Phase 53b–f closed the column-fold pass (5 commits, 5
+columns dropped, wall-clock impact within trial noise), this is
+the structural change that can actually close the ~5× Nexus gap.
 
-CpuChip becomes the per-step skeleton (PC, ts, regs, opcode,
-shared flag fan-out) — drop to ~80 cells per row.
+#### Architecture
 
-This is the structural change that closes the Nexus gap.  ~2-3x
-total cell reduction expected.  Major rewrite — needs careful
-phase plan, expected to span 5-10 sub-phases.
+Each extracted chip pairs with CpuChip via a per-family **lookup
+relation**:
+- CpuChip emits one *producer* tuple per real row of that
+  family, multiplicity = the family flag (`is_mul`, `is_compare`,
+  …).  Tuple shape encodes the inputs/outputs the family chip
+  needs to bind: `(val_b[8], val_d[8], result[8], plus
+  family-specific extras)`.
+- The family chip has rows = ceil_log2(count of producer rows
+  this trace), padded with `IsPadding=1` rows to the next
+  power-of-two-of-lanes.  Same pattern as `MemoryChip`.
+- The family chip *consumes* one tuple per real row with mult
+  -1 and adds its own AIR constraints (carry chains, sign
+  correction, etc.) over its narrow column set.
+
+For an opcode family that fires on (e.g.) 5% of CpuChip rows at
+log14 (~16K rows, so ~800 family rows), the chip's `log_size`
+≈ 10 vs CpuChip's 14 — a 16× row reduction.  The cells that used
+to be zero on 95% of CpuChip rows are simply not committed.
+
+#### Sub-phase plan
+
+Order chosen by isolation + cell footprint:
+
+- **54a — `MulChip` foundation (lookup relation + skeleton)**.
+  Define `MultiplicationLookupElements` with tuple
+  `(val_b[8], val_d[8], result_low[8], result_high[8],
+  is_signed_b, is_signed_d, is_32bit)`.  Add `MulChip` as a
+  consumer-only chip that reads its trace from
+  `side_note.mul_entries` (new field) and pads to LOG_N_LANES if
+  empty.  CpuChip becomes a producer.  No constraints moved yet
+  — both sides still have the schoolbook AIR; lookup balance
+  alone is the gate.  Validates wiring.
+- **54b — Move schoolbook mul carry chain into `MulChip`**.
+  Drop the schoolbook carry-chain constraints from CpuChip.
+  Move `MulCarry[16]`, `MulCarryHi[16]` into `MulChip`'s column
+  set.  Same for the sign-correction columns added in Phase 12c.
+  CpuChip keeps `MulHigh[8]` (still pushed to the producer
+  tuple); MulChip witnesses its own carry chains.
+- **54c — Drop `MulHigh[8]` from CpuChip**.  Result high is
+  computed inside MulChip; for `IsMulUpper*` rows the producer
+  tuple's `result_high` slot uses CpuChip's `Result[8]`, for
+  `IsMul*` rows MulChip's internal `mul_high_witness` is used
+  instead.  CpuChip net: -40 cells (`MulHigh` 8 + `MulCarry` 16
+  + `MulCarryHi` 16) ≈ 12% of CpuChip's row width.
+- **54d — Repeat for `BitwiseChip`** (BitwiseAndLookup already
+  models the lookup; this is moving the byte-wise AND wiring).
+  CpuChip drops `AndResult[8] + ValBHiNib[8] + ValDHiNib[8] +
+  AndResultHiNib[8] = 32 cells`.
+- **54e — `CompareChip`**.  Drops `CmpCarry[8] + CmpSubResult[8]
+  + ByteEq[8] + ByteDiffInv[8] = 32 cells`.  Trickier — branch
+  decision still lives on CpuChip, so the relation tuple needs
+  to expose `cmp_lt_flag`, `eq_flag` back to CpuChip.
+- **54f — `DivRemChip`**.  Drops `DivCmpDiff[8] +
+  DivCmpCarry[8] + DivByZero + DivMulCarry + ValRPartialNZ[8] +
+  …` ≈ 30 cells.
+
+Each sub-phase: one commit, runs full sweep + bench, commit
+message documents wall-clock delta vs prior phase.
+
+Cumulative target: drop CpuChip by ~130 cells (660 → ~530),
+combined with the per-family chips' narrower commitments.  At
+~5% mul / 10% bitwise / 15% compare-or-branch typical workload,
+the cells saved on CpuChip side outweigh the cells added on
+chip side by ~5–8×.
+
+#### Risks / open questions
+
+- **Producer-multiplicity wiring**: CpuChip emits a producer per
+  family-row; the family chip consumes one tuple per family-row.
+  Need to ensure the lookup balance forces a 1:1 binding
+  (no prover wiggle room to insert extra family rows or skip
+  real ones).  Pattern: producer mult = `is_family_flag`,
+  consumer mult = -(1 - is_padding).  Family chip's row count
+  derived from `side_note.steps.iter().filter(is_family).count()`,
+  not prover-chosen.
+- **Cross-chip column fan-in**: cells like `Result[8]` are
+  written by every opcode and read by both CpuChip downstream
+  constraints AND family-chip constraints.  These stay on
+  CpuChip and ride through the producer tuple.
+- **Padding rows on family chips**: family chip's IsPadding=1
+  rows must not consume from the lookup, otherwise lookup
+  balance fails.  Standard pattern: gate consumer multiplicity
+  on `(1 - is_padding)`.
 
 ### Phase 55 — ProgramMemoryChip column compaction
 
