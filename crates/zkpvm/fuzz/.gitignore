@@ -1,0 +1,5 @@
+# cargo-fuzz artifacts
+target/
+corpus/
+artifacts/
+coverage/

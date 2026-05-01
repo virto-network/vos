@@ -1,0 +1,36 @@
+[package]
+name = "zkpvm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# This subcrate intentionally does NOT inherit the workspace —
+# `cargo fuzz` builds it under its own settings (libFuzzer
+# instrumentation, custom rustc flags) and a workspace member
+# would conflict.  Pin deps via `path` to the same source tree.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+zkpvm = { path = ".." }
+zkpvm-verifier = { path = "../../zkpvm-verifier" }
+
+# Skip the test profile's default panic strategy override;
+# libfuzzer-sys requires panic=abort on its own targets.
+[profile.release]
+debug = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[[bin]]
+name = "prove_verify_roundtrip"
+path = "fuzz_targets/prove_verify_roundtrip.rs"
+test = false
+doc = false

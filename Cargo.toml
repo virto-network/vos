@@ -15,6 +15,10 @@ exclude = [
     # it up as a workspace member.
     "crates/actors",
     "crates/actors/registry",
+    # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
+    # rustc flags via `cargo fuzz`.  Excluding it from the main
+    # workspace keeps `cargo build --workspace` working on stable.
+    "crates/zkpvm/fuzz",
 ]
 
 [workspace.package]

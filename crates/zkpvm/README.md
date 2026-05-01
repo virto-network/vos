@@ -170,6 +170,24 @@ End-to-end: bytecode → trace → prove → standalone verify →
 serialize / deserialize round-trip.  Runs in a few seconds on a
 modern desktop and prints the proof size + per-stage timing.
 
+## Fuzzing
+
+The `fuzz/` subcrate is a libFuzzer harness exercising the
+prove-then-verify roundtrip on random PVM bytecode.  Excluded
+from the workspace so the main `cargo build` doesn't pull in
+nightly-only deps; run it explicitly:
+
+```sh
+cargo install cargo-fuzz   # one-time
+cd crates/zkpvm
+cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
+```
+
+Findings (panics, `verify_standalone` failures on honest prove
+output) land in `fuzz/artifacts/`.  Reseed the corpus with
+`fuzz/corpus/prove_verify_roundtrip/` files between runs to
+build coverage incrementally.
+
 ## Adapted from
 
 - [Nexus zkVM](https://github.com/nexus-xyz/nexus-zkvm) — original
