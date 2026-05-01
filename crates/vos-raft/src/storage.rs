@@ -84,8 +84,8 @@ impl<N: NodeId> Default for WriteBatch<N> {
 /// Storage backend for one Raft replica.
 ///
 /// Implementations own the on-disk representation. The crate
-/// ships a [`MemStorage`](crate::storage::MemStorage) for tests;
-/// vos provides a redb-backed impl in its own module.
+/// ships a [`MemStorage`] for tests; vos provides a redb-backed
+/// impl in its own module.
 ///
 /// `last_*` / `snap_last_*` are sync — they're hot-path reads
 /// the worker checks on every loop iteration, and an

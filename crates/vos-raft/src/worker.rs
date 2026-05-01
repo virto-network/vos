@@ -13,7 +13,7 @@
 //!    `transport.send_*()` future the worker emits parks here
 //!    until the peer (or the transport's own timeout) replies.
 //!    Completed futures inject their results back into the
-//!    state machine via [`handle_*_response`] paths.
+//!    state machine via the `handle_*_response` paths.
 //! 4. **Cooperative yield** — none required; the loop is
 //!    naturally yielding because every storage / transport call
 //!    is async.
@@ -98,7 +98,7 @@ pub struct WorkerSnapshot<N: NodeId> {
 /// without breaking callers. The variant payloads include
 /// `oneshot::Sender<…>` from `futures-channel`, so the enum
 /// itself is internal protocol — most code should not match on
-/// it directly. Use [`WorkerHandle::handle_inbound_*`] /
+/// it directly. Use `WorkerHandle::handle_inbound_*` /
 /// [`WorkerHandle::propose`] instead.
 #[allow(dead_code)]
 #[non_exhaustive]

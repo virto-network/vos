@@ -36,9 +36,9 @@ impl Role {
         }
     }
 
-    /// Inverse of [`as_u8`]. Out-of-range values (which can't
-    /// happen if the producer also uses `as_u8`) decode as
-    /// `Follower` — the safe default.
+    /// Inverse of [`Self::as_u8`]. Out-of-range values (which
+    /// can't happen if the producer also uses `as_u8`) decode
+    /// as `Follower` — the safe default.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Candidate,
