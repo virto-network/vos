@@ -126,7 +126,35 @@ pub enum RaftMsg<N: NodeId> {
 }
 
 /// Sender half of the worker inbox. Cheap to clone.
-pub type Inbox<N> = fmpsc::UnboundedSender<RaftMsg<N>>;
+///
+/// Opaque newtype around the underlying channel sender. Hidden
+/// so future commits can swap the channel impl
+/// (`futures-channel::mpsc` today, possibly an `embassy_sync`
+/// MPMC or a no_std-friendly `MsgSink` trait later) without
+/// breaking SemVer. Construct via [`Worker::handler`] /
+/// [`WorkerHandle::sender`]; the only public operations are
+/// [`Inbox::send`] and `Clone`.
+pub struct Inbox<N: NodeId> {
+    inner: fmpsc::UnboundedSender<RaftMsg<N>>,
+}
+
+impl<N: NodeId> Clone for Inbox<N> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<N: NodeId> Inbox<N> {
+    /// Send a message into the worker. `Err` only if the worker
+    /// has shut down (the receiver has been dropped).
+    pub fn send(&self, msg: RaftMsg<N>) -> Result<(), RaftMsg<N>> {
+        self.inner
+            .unbounded_send(msg)
+            .map_err(|e| e.into_inner())
+    }
+}
 
 // ── std-only spawn helper ───────────────────────────────────
 
@@ -229,7 +257,7 @@ impl<N: NodeId> Worker<N> {
             })
             .expect("spawn raft worker");
         Self {
-            inbox: tx,
+            inbox: Inbox { inner: tx },
             role,
             join: Some(join),
         }
@@ -250,7 +278,7 @@ impl<N: NodeId> Worker<N> {
 
     /// Stop the worker and join the thread.
     pub fn shutdown(mut self) {
-        let _ = self.inbox.unbounded_send(RaftMsg::Shutdown);
+        let _ = self.inbox.send(RaftMsg::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -260,7 +288,7 @@ impl<N: NodeId> Worker<N> {
 #[cfg(feature = "std")]
 impl<N: NodeId> Drop for Worker<N> {
     fn drop(&mut self) {
-        let _ = self.inbox.unbounded_send(RaftMsg::Shutdown);
+        let _ = self.inbox.send(RaftMsg::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -290,7 +318,7 @@ impl<N: NodeId> WorkerHandle<N> {
     pub async fn snapshot(&self) -> Option<WorkerSnapshot<N>> {
         let (tx, rx) = oneshot::channel();
         self.inbox
-            .unbounded_send(RaftMsg::QueryState { reply: tx })
+            .send(RaftMsg::QueryState { reply: tx })
             .ok()?;
         rx.await.ok()
     }
@@ -299,7 +327,7 @@ impl<N: NodeId> WorkerHandle<N> {
     pub async fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError<()>> {
         let (tx, rx) = oneshot::channel();
         self.inbox
-            .unbounded_send(RaftMsg::Propose { payload, reply: tx })
+            .send(RaftMsg::Propose { payload, reply: tx })
             .map_err(|_| ProposeError::NotLeader)?;
         rx.await.unwrap_or(Err(ProposeError::NotLeader))
     }
@@ -314,7 +342,7 @@ impl<N: NodeId> WorkerHandle<N> {
         let term = req.term;
         if self
             .inbox
-            .unbounded_send(RaftMsg::AppendEntries { from, req, reply: tx })
+            .send(RaftMsg::AppendEntries { from, req, reply: tx })
             .is_err()
         {
             return AppendEntriesResp {
@@ -340,7 +368,7 @@ impl<N: NodeId> WorkerHandle<N> {
         let term = req.term;
         if self
             .inbox
-            .unbounded_send(RaftMsg::RequestVote { from, req, reply: tx })
+            .send(RaftMsg::RequestVote { from, req, reply: tx })
             .is_err()
         {
             return RequestVoteResp {
@@ -364,7 +392,7 @@ impl<N: NodeId> WorkerHandle<N> {
         let term = req.term;
         if self
             .inbox
-            .unbounded_send(RaftMsg::InstallSnapshot { from, req, reply: tx })
+            .send(RaftMsg::InstallSnapshot { from, req, reply: tx })
             .is_err()
         {
             return InstallSnapshotResp { term };
