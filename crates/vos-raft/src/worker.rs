@@ -167,6 +167,14 @@ pub struct Worker<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// Set to `true` by the worker thread if `run_worker`
+    /// returned `Err` (which today means
+    /// `Storage::load_meta` failed at init). Read via
+    /// [`Worker::init_failed`] — gives the host a yes/no
+    /// signal that init succeeded; the `Err`'s payload isn't
+    /// surfaced (would require carrying `S::Error` in the
+    /// `Worker` type parameter).
+    init_failed: Arc<core::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "std")]
@@ -246,10 +254,12 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
+        let init_failed = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let init_failed_for_thread = init_failed.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
-                futures_executor::block_on(run_worker(
+                let res = futures_executor::block_on(run_worker(
                     storage,
                     transport,
                     cfg,
@@ -259,12 +269,17 @@ impl<N: NodeId> Worker<N> {
                     rng,
                     role_for_thread,
                 ));
+                if res.is_err() {
+                    init_failed_for_thread
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
             })
             .expect("spawn raft worker");
         Self {
             inbox: Inbox { inner: tx },
             role,
             join: Some(join),
+            init_failed,
         }
     }
 
@@ -296,6 +311,8 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
+        let init_failed = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let init_failed_for_thread = init_failed.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
@@ -303,7 +320,7 @@ impl<N: NodeId> Worker<N> {
                     .enable_time()
                     .build()
                     .expect("build tokio current-thread runtime for raft worker");
-                rt.block_on(run_worker(
+                let res = rt.block_on(run_worker(
                     storage,
                     transport,
                     cfg,
@@ -313,13 +330,33 @@ impl<N: NodeId> Worker<N> {
                     rng,
                     role_for_thread,
                 ));
+                if res.is_err() {
+                    init_failed_for_thread
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
             })
             .expect("spawn raft worker");
         Self {
             inbox: Inbox { inner: tx },
             role,
             join: Some(join),
+            init_failed,
         }
+    }
+
+    /// `true` if the worker thread exited with an init failure
+    /// (today: `Storage::load_meta` returned `Err`). Lock-free
+    /// atomic read; reading after a brief idle window is the
+    /// reliable check.
+    ///
+    /// `false` either means init succeeded OR the worker is
+    /// still running. To distinguish, also check
+    /// [`Worker::role`] or `snapshot()` — a successfully-started
+    /// worker reports a real role; a never-started one returns
+    /// `Follower` from the atomic mirror but its inbox is dead.
+    pub fn init_failed(&self) -> bool {
+        self.init_failed
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Cheap clone-able handle.
@@ -610,8 +647,14 @@ where
 
 // ── Public driver ───────────────────────────────────────────
 
-/// Run a worker future to completion. Returns when the inbox
-/// receives a `RaftMsg::Shutdown` or the inbox sender is dropped.
+/// Run a worker future to completion.
+///
+/// Returns `Ok(())` on `RaftMsg::Shutdown` or when the inbox
+/// sender is dropped (clean termination). Returns `Err(_)` if
+/// the initial `Storage::load_meta` call fails — the worker
+/// can't safely start without its persisted meta state. Hosts
+/// using [`Worker::spawn`] / [`Worker::spawn_with_tokio_runtime`]
+/// can read the result via [`Worker::join_result`].
 ///
 /// Embedded hosts call this directly inside their executor.
 /// Std hosts typically use [`Worker::spawn`].
@@ -625,7 +668,8 @@ pub async fn run_worker<N, S, T, C, R, A>(
     clock: C,
     rng: R,
     role_atomic: Arc<AtomicU8>,
-) where
+) -> Result<(), S::Error>
+where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
@@ -633,10 +677,7 @@ pub async fn run_worker<N, S, T, C, R, A>(
     R: Rng,
     A: ApplySink,
 {
-    let meta = match storage.load_meta().await {
-        Ok(m) => m,
-        Err(_) => return,
-    };
+    let meta = storage.load_meta().await?;
     let mut state = WorkerState {
         storage,
         transport,
@@ -711,6 +752,7 @@ pub async fn run_worker<N, S, T, C, R, A>(
             }
         }
     }
+    Ok(())
 }
 
 async fn handle_msg<N, S, T, C, R, A>(

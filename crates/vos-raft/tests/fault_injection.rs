@@ -361,12 +361,12 @@ fn propose_storage_failure_surfaces_to_caller_and_worker_recovers() {
     worker.shutdown();
 }
 
-/// A `load_meta` failure during worker startup causes the worker
-/// to exit silently. The host has no observable signal beyond
-/// `Worker::shutdown` returning immediately. Documented as a
-/// known limitation in CHANGELOG.
+/// A `load_meta` failure during worker startup is now
+/// observable via [`Worker::init_failed`]: the worker thread
+/// exits with `Err` from `run_worker`, which the spawn helper
+/// catches and surfaces through the shared atomic flag.
 #[test]
-fn worker_exits_silently_on_load_meta_failure_at_startup() {
+fn worker_signals_init_failure_on_load_meta_error() {
     let storage = FaultStorage::new(MemStorage::<u16>::new());
     let fail = storage.fail_load_meta_handle();
     // Fail the very first load_meta call (the one in run_worker).
@@ -381,16 +381,43 @@ fn worker_exits_silently_on_load_meta_failure_at_startup() {
         StdRng::from_entropy(),
     );
 
-    // The worker thread should exit promptly on the load_meta
-    // error. shutdown() joins the thread; if the worker had
-    // entered the loop it would still be alive after a short
-    // wait, but here it returns immediately.
+    // The worker thread exits promptly on the load_meta error.
+    // Give it a moment to set the flag.
     std::thread::sleep(Duration::from_millis(50));
 
-    // snapshot() returns None because the worker is gone. (The
-    // inbox sender's channel is still alive — the receiver was
-    // moved into the worker thread which has now dropped it,
-    // so unbounded_send returns Err and snapshot returns None.)
+    // STRONG signal: init_failed reports true. This is the new
+    // observability surface — pre-RD3 the host could only infer
+    // failure from snapshot() returning None, which is ambiguous
+    // (could mean the worker is busy, the channel is full, etc).
+    assert!(
+        worker.init_failed(),
+        "init failure flag must be set after load_meta returns Err",
+    );
+
+    // Happy-path complement: with no fault, init_failed stays
+    // false. Ship this assertion alongside the failure case so
+    // a regression that defaults the flag to true would be
+    // caught.
+    {
+        let healthy_storage = FaultStorage::new(MemStorage::<u16>::new());
+        let healthy_worker = Worker::spawn_with(
+            healthy_storage,
+            Arc::new(NoopT),
+            solo_cfg(),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !healthy_worker.init_failed(),
+            "init_failed must be false when init succeeded",
+        );
+        healthy_worker.shutdown();
+    }
+
+    // Also still verify the legacy signal: snapshot() returns
+    // None because the worker is gone.
     let h = worker.handler();
     let snap = block_on(h.snapshot());
     assert!(
