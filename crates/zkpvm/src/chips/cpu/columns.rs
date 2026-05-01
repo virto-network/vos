@@ -272,9 +272,10 @@ pub enum Column {
     IsExit,
     #[size = 1]
     IsLoad,
-    /// 1 if this is a store instruction
-    #[size = 1]
-    IsStore,
+    // Phase 53f: IsStore folded into (IsStoreDirect + IsStoreImmAny +
+    // IsStoreInd).  Verifier-side gates use the sum expression; prover-
+    // side prog_mem closure overrides the tuple slot.  The byte-level
+    // memory access lookup uses the same sum as its is_write column.
     /// Memory address (4 limbs, u32) — only valid when IsLoad or IsStore
     #[size = 4]
     MemAddr,

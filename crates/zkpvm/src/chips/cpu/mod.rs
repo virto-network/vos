@@ -148,6 +148,15 @@ impl BuiltInComponent for CpuChip {
                 + is_br_lt_s[0].clone() + is_br_ge_s[0].clone()
                 + is_br_le_s[0].clone() + is_br_gt_s[0].clone()
         };
+        // Phase 53f: IsStore folded — sum of the 3 store-class sub-flags.
+        let is_store_direct_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+        let is_store_imm_any_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
+        let is_store_ind_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
+        let is_store_e = || -> E::F {
+            is_store_direct_e[0].clone()
+                + is_store_imm_any_e[0].clone()
+                + is_store_ind_e[0].clone()
+        };
         let is_set_lt_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtU);
         let is_set_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtS);
         let is_cmov_iz_flag = crate::trace::trace_eval!(trace_eval, Column::IsCmovIz);
@@ -1832,7 +1841,7 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
         // Memory access lookup (producer side)
         // ════════════════════════════════════════════════════════════════════
-        let is_store_col = crate::trace::trace_eval!(trace_eval, Column::IsStore);
+        // Phase 53f: IsStore folded — `is_store_e()` is the sum.
         let mem_addr = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
         let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
         let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
@@ -1850,7 +1859,7 @@ impl BuiltInComponent for CpuChip {
             // timestamp
             tuple.extend_from_slice(&timestamp);
             // is_write
-            tuple.push(is_store_col[0].clone());
+            tuple.push(is_store_e());
 
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
@@ -2415,7 +2424,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
             let f_is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let f_is_load = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
-            let f_is_store = crate::trace::trace_eval!(trace_eval, Column::IsStore);
+            // Phase 53f: IsStore folded — sum expression below.
             let f_is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
             let f_is_neg_add = crate::trace::trace_eval!(trace_eval, Column::IsNegAdd);
             let f_is_reverse_bytes = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
@@ -2486,7 +2495,8 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_jump[0].clone());
             tuple.push(f_is_div_rem[0].clone());
             tuple.push(f_is_load[0].clone());
-            tuple.push(f_is_store[0].clone());
+            // Phase 53f: IsStore as the sum expression.
+            tuple.push(is_store_e());
             tuple.push(f_is_exit[0].clone());
             tuple.push(f_is_neg_add[0].clone());
             tuple.push(f_is_reverse_bytes[0].clone());

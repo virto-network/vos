@@ -106,8 +106,12 @@ pub(super) fn generate_interaction_trace(
         }
 
         // Memory access lookups — byte-level (up to 8 entries per memory op)
+        // Phase 53f: IsStore folded — `is_write` is the sum of the 3
+        // store-class sub-flags (IsStoreDirect + IsStoreImmAny + IsStoreInd).
         let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
-        let is_store = crate::trace::original_base_column!(component_trace, Column::IsStore);
+        let is_store_direct_mem = crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
+        let is_store_imm_any_mem = crate::trace::original_base_column!(component_trace, Column::IsStoreImmAny);
+        let is_store_ind_mem = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
         let mem_addr = crate::trace::original_base_column!(component_trace, Column::MemAddr);
         let mem_value = crate::trace::original_base_column!(component_trace, Column::MemValue);
         let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
@@ -121,7 +125,9 @@ pub(super) fn generate_interaction_trace(
             let mem_addr_c = mem_addr.clone();
             let mem_value_c = mem_value.clone();
             let timestamp_c = timestamp.clone();
-            let is_store_c = is_store.clone();
+            let is_sd_c = is_store_direct_mem[0].clone();
+            let is_sia_c = is_store_imm_any_mem[0].clone();
+            let is_si_c = is_store_ind_mem[0].clone();
             logup.add_to_relation_computed(
                 mem_lookup,
                 [mem_byte_active[byte_idx].clone()],
@@ -136,8 +142,8 @@ pub(super) fn generate_interaction_trace(
                     tuple.push(mem_value_c[byte_idx].at(vec_idx));
                     // timestamp
                     for col in &timestamp_c { tuple.push(col.at(vec_idx)); }
-                    // is_write
-                    tuple.push(is_store_c[0].at(vec_idx));
+                    // is_write = IsStoreDirect + IsStoreImmAny + IsStoreInd
+                    tuple.push(is_sd_c.at(vec_idx) + is_sia_c.at(vec_idx) + is_si_c.at(vec_idx));
                     tuple
                 },
             );
@@ -513,7 +519,7 @@ pub(super) fn generate_interaction_trace(
             let f_is_jump = crate::trace::original_base_column!(component_trace, Column::IsJump);
             let f_is_div_rem = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
             let f_is_load = crate::trace::original_base_column!(component_trace, Column::IsLoad);
-            let f_is_store = crate::trace::original_base_column!(component_trace, Column::IsStore);
+            // Phase 53f: IsStore folded; closure override below.
             let f_is_exit = crate::trace::original_base_column!(component_trace, Column::IsExit);
             let f_is_neg_add = crate::trace::original_base_column!(component_trace, Column::IsNegAdd);
             let f_is_reverse_bytes = crate::trace::original_base_column!(component_trace, Column::IsReverseBytes);
@@ -579,7 +585,8 @@ pub(super) fn generate_interaction_trace(
             tuple.push(f_is_jump[0].clone());
             tuple.push(f_is_div_rem[0].clone());
             tuple.push(f_is_load[0].clone());
-            tuple.push(f_is_store[0].clone());
+            // Phase 53f: placeholder for the folded IsStore slot.
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_exit[0].clone());
             tuple.push(f_is_neg_add[0].clone());
             tuple.push(f_is_reverse_bytes[0].clone());
@@ -617,13 +624,14 @@ pub(super) fn generate_interaction_trace(
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
-            // Phase 53/53c/53d/53e: folded slot indices in the tuple
+            // Phase 53/53c/53d/53e/53f: folded slot indices in the tuple
             // (pc[4] + opcode + skip_len + 3·reg + imm[8] + is_add
             // + is_sub + is_mul = 20; +1 for is_mul_upper, etc.).
             const IS_MUL_UPPER_SLOT: usize = 20;
             const IS_BITWISE_SLOT: usize = 21;
             const IS_COMPARE_SLOT: usize = 23;
             const IS_BRANCH_SLOT: usize = 26;
+            const IS_STORE_SLOT: usize = 30;
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {
                 let is_pad = is_pad_col[0].clone();
@@ -654,6 +662,9 @@ pub(super) fn generate_interaction_trace(
                 let br_ge_s_c = is_br_ge_s_col[0].clone();
                 let br_le_s_c = is_br_le_s_col[0].clone();
                 let br_gt_s_c = is_br_gt_s_col[0].clone();
+                let st_dir_c = f_is_store_direct[0].clone();
+                let st_imm_any_c = f_is_store_imm_any[0].clone();
+                let st_ind_c = f_is_store_ind[0].clone();
                 logup.add_to_relation_computed(
                     prog_mem,
                     [is_pad],
@@ -678,6 +689,7 @@ pub(super) fn generate_interaction_trace(
                                 + br_le_u_c.at(i) + br_gt_u_c.at(i)
                                 + br_lt_s_c.at(i) + br_ge_s_c.at(i)
                                 + br_le_s_c.at(i) + br_gt_s_c.at(i);
+                            t[IS_STORE_SLOT] = st_dir_c.at(i) + st_imm_any_c.at(i) + st_ind_c.at(i);
                             t
                         }
                     },

@@ -887,7 +887,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             // ── Memory access columns ──
             trace.fill_columns(row, flags.is_exit, Column::IsExit);
             trace.fill_columns(row, flags.is_load, Column::IsLoad);
-            trace.fill_columns(row, flags.is_store, Column::IsStore);
+            // Phase 53f: IsStore folded — sum of the 3 store sub-flags.
             // Phase 20: signed-load flags + sign-bit pinning.
             trace.fill_columns(row, flags.is_load_i8, Column::IsLoadI8);
             trace.fill_columns(row, flags.is_load_i16, Column::IsLoadI16);
