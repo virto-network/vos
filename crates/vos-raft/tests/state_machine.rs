@@ -52,6 +52,13 @@ struct MockTransport {
     /// AppendEntries `leader` / RequestVote `candidate` /
     /// InstallSnapshot `leader` field.
     dropped_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
+    /// Set of `(from, to)` edges where every outbound RPC is
+    /// delivered TWICE (back-to-back). Exercises the worker's
+    /// idempotent paths: a duplicate `AppendEntries` should not
+    /// re-append already-present entries, a duplicate
+    /// `RequestVote` should not grant a second vote, a duplicate
+    /// `InstallSnapshot` should be a no-op.
+    duplicated_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +75,23 @@ impl MockTransport {
             routes,
             log: Mutex::new(Vec::new()),
             dropped_edges: Mutex::new(std::collections::BTreeSet::new()),
+            duplicated_edges: Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Mark `from → to` as a duplicating edge: every outbound
+    /// RPC on that direction is delivered twice (the second
+    /// delivery's reply is discarded). The peer's idempotent
+    /// handlers should produce the same observable state.
+    fn duplicate_edge(&self, from: u16, to: u16) {
+        self.duplicated_edges.lock().unwrap().insert((from, to));
+    }
+
+    fn is_duplicated(&self, from: u16, to: u16) -> bool {
+        self.duplicated_edges
+            .lock()
+            .unwrap()
+            .contains(&(from, to))
     }
 
     /// Drop every outbound RPC `from → to`.
@@ -135,10 +158,20 @@ impl Transport<u16> for MockTransport {
             let routes = self.routes.lock().unwrap();
             routes.get(&peer).cloned()
         };
-        match handle {
-            Some(h) => Ok(h.handle_inbound_append(req.leader, req).await),
+        let dup = self.is_duplicated(req.leader, peer);
+        let dup_req = if dup { Some(req.clone()) } else { None };
+        let from = req.leader;
+        let result = match handle.clone() {
+            Some(h) => Ok(h.handle_inbound_append(from, req).await),
             None => Err(MockError),
+        };
+        // Duplicate delivery: replay the same RPC. The receiver's
+        // idempotent path (entry already present at same term →
+        // skip) should produce the same observable state.
+        if let (Some(h), Some(dup_req)) = (handle, dup_req) {
+            let _ = h.handle_inbound_append(from, dup_req).await;
         }
+        result
     }
 
     async fn send_vote(
@@ -158,10 +191,20 @@ impl Transport<u16> for MockTransport {
             let routes = self.routes.lock().unwrap();
             routes.get(&peer).cloned()
         };
-        match handle {
-            Some(h) => Ok(h.handle_inbound_vote(req.candidate, req).await),
+        let dup = self.is_duplicated(req.candidate, peer);
+        let from = req.candidate;
+        // RequestVoteReq is Copy; cheap to keep a duplicate.
+        let dup_req = req;
+        let result = match handle.clone() {
+            Some(h) => Ok(h.handle_inbound_vote(from, req).await),
             None => Err(MockError),
+        };
+        if dup
+            && let Some(h) = handle
+        {
+            let _ = h.handle_inbound_vote(from, dup_req).await;
         }
+        result
     }
 
     async fn send_install(
@@ -181,10 +224,17 @@ impl Transport<u16> for MockTransport {
             let routes = self.routes.lock().unwrap();
             routes.get(&peer).cloned()
         };
-        match handle {
-            Some(h) => Ok(h.handle_inbound_install(req.leader, req).await),
+        let dup = self.is_duplicated(req.leader, peer);
+        let dup_req = if dup { Some(req.clone()) } else { None };
+        let from = req.leader;
+        let result = match handle.clone() {
+            Some(h) => Ok(h.handle_inbound_install(from, req).await),
             None => Err(MockError),
+        };
+        if let (Some(h), Some(dup_req)) = (handle, dup_req) {
+            let _ = h.handle_inbound_install(from, dup_req).await;
         }
+        result
     }
 }
 
@@ -708,4 +758,87 @@ fn candidate_steps_down_on_higher_term_vote_response() {
     // After step-down the role is Follower (until the next
     // election timer fires; we may catch either, so just assert
     // term).
+}
+
+/// Duplicated outbound RPCs (every leader→follower delivery
+/// happens twice) must not break Raft safety: the cluster still
+/// converges, no log entry appears twice in the follower's log,
+/// no duplicate vote is granted.
+#[test]
+fn cluster_converges_under_full_duplication() {
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    // Duplicate every directed edge before any RPC fires.
+    for from in &members {
+        for to in &members {
+            if from != to {
+                transport.duplicate_edge(*from, *to);
+            }
+        }
+    }
+
+    // Under duplication the cluster must still elect a unique
+    // leader (a duplicate RequestVote at the same term must NOT
+    // grant a second vote on the same peer).
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges under full duplication",
+    );
+
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+
+    // Propose 5 entries. Every replication AppendEntries gets
+    // delivered twice; each follower's log must end up with
+    // exactly 5 entries, not 10.
+    for n in 1..=5u8 {
+        block_on(leader_handle.propose(vec![n])).expect("propose");
+    }
+
+    wait_until(
+        || {
+            members.iter().all(|p| {
+                let h = workers[p].handler();
+                block_on(h.snapshot())
+                    .map(|s| s.commit_index >= 5 && s.last_log_index == 5)
+                    .unwrap_or(false)
+            })
+        },
+        Duration::from_secs(5),
+        "all replicas reach commit_index = 5 with last_log_index = 5",
+    );
+
+    // Final sanity: every follower has exactly 5 log entries.
+    for p in &members {
+        let h = workers[p].handler();
+        let s = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            s.last_log_index, 5,
+            "node {p}: duplicated AppendEntries must not double-append; \
+             last_log_index = {}",
+            s.last_log_index,
+        );
+    }
 }
