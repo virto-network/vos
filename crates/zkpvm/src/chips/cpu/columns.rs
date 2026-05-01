@@ -104,9 +104,10 @@ pub enum Column {
     /// to represent a 16-bit value.  See MulCarry doc.
     #[size = 16]
     MulCarryHi,
-    /// 1 if this is MulUpper (result = high bits, mul_high = low bits)
-    #[size = 1]
-    IsMulUpper,
+    // Phase 53: IsMulUpper folded into (IsMulUpperUU + IsMulUpperSU
+    // + IsMulUpperSS).  Verifier-side reads use the sum expression
+    // directly; prover-side prog_mem tuple emission overrides the
+    // sum slot in its closure (see cpu/interaction.rs).
     // ── Bitwise auxiliary: per-byte AND result ──
     /// and_result[i] = val_b[i] AND val_d[i] (8 bytes)
     #[size = 8]

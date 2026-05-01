@@ -434,7 +434,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_add, Column::IsAdd);
             trace.fill_columns(row, flags.is_sub, Column::IsSub);
             trace.fill_columns(row, flags.is_mul, Column::IsMul);
-            trace.fill_columns(row, flags.is_mul_upper, Column::IsMulUpper);
+            // Phase 53: IsMulUpper folded into the (mu_uu+mu_su+mu_ss)
+            // sum expression — no CpuChip column to fill.
             trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
             trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
             trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);

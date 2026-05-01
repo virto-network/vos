@@ -450,7 +450,9 @@ pub(super) fn generate_interaction_trace(
             let f_is_add = crate::trace::original_base_column!(component_trace, Column::IsAdd);
             let f_is_sub = crate::trace::original_base_column!(component_trace, Column::IsSub);
             let f_is_mul = crate::trace::original_base_column!(component_trace, Column::IsMul);
-            let f_is_mul_upper = crate::trace::original_base_column!(component_trace, Column::IsMulUpper);
+            // Phase 53: IsMulUpper folded into (mu_uu+mu_su+mu_ss).
+            // The prog_mem tuple slot is filled via a closure
+            // override below since the column no longer exists.
             let f_is_bitwise = crate::trace::original_base_column!(component_trace, Column::IsBitwise);
             let f_is_shift = crate::trace::original_base_column!(component_trace, Column::IsShift);
             let f_is_compare = crate::trace::original_base_column!(component_trace, Column::IsCompare);
@@ -511,7 +513,9 @@ pub(super) fn generate_interaction_trace(
             tuple.push(f_is_add[0].clone());
             tuple.push(f_is_sub[0].clone());
             tuple.push(f_is_mul[0].clone());
-            tuple.push(f_is_mul_upper[0].clone());
+            // Phase 53: placeholder for the folded IsMulUpper slot;
+            // overridden in the closure below to (mu_uu+mu_su+mu_ss).
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_bitwise[0].clone());
             tuple.push(f_is_shift[0].clone());
             tuple.push(f_is_compare[0].clone());
@@ -559,9 +563,17 @@ pub(super) fn generate_interaction_trace(
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
+            // Phase 53: IsMulUpper slot is at tuple index 20
+            // (pc[4] + opcode + skip_len + 3·reg + imm[8] + is_add
+            // + is_sub + is_mul = 20).  The closure substitutes
+            // (mu_uu+mu_su+mu_ss) for the placeholder.
+            const IS_MUL_UPPER_SLOT: usize = 20;
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {
                 let is_pad = is_pad_col[0].clone();
+                let mu_uu_c = f_is_mul_upper_uu[0].clone();
+                let mu_su_c = f_is_mul_upper_su[0].clone();
+                let mu_ss_c = f_is_mul_upper_ss[0].clone();
                 logup.add_to_relation_computed(
                     prog_mem,
                     [is_pad],
@@ -572,7 +584,11 @@ pub(super) fn generate_interaction_trace(
                     tuple.len(),
                     {
                         let tuple_clone: Vec<_> = tuple.clone();
-                        move |i| tuple_clone.iter().map(|c| c.at(i)).collect()
+                        move |i| {
+                            let mut t: Vec<_> = tuple_clone.iter().map(|c| c.at(i)).collect();
+                            t[IS_MUL_UPPER_SLOT] = mu_uu_c.at(i) + mu_su_c.at(i) + mu_ss_c.at(i);
+                            t
+                        }
                     },
                 );
             }

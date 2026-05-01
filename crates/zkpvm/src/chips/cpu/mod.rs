@@ -189,8 +189,14 @@ impl BuiltInComponent for CpuChip {
         // 64-bit: val_b[0..8] * val_d[0..8] = result[0..8] + mul_high[0..8] * 2^64 (16 positions)
         // 32-bit: val_b[0..4] * val_d[0..4] = result[0..4] + mul_high[0..4] * 2^32 (8 positions)
         // ════════════════════════════════════════════════════════════════════
-        let is_mul_upper = crate::trace::trace_eval!(trace_eval, Column::IsMulUpper);
-        let is_mul_low = E::F::one() - is_mul_upper[0].clone();
+        // Phase 53: IsMulUpper folded into the sum expression.
+        let mu_uu_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
+        let mu_su_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
+        let mu_ss_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
+        let is_mul_upper_e = || -> E::F {
+            mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone()
+        };
+        let is_mul_low = E::F::one() - is_mul_upper_e();
         let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
         let unsigned_product_hi = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
         // Helper: full 16-bit carry value at position k.
@@ -230,7 +236,7 @@ impl BuiltInComponent for CpuChip {
             let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
             let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
             eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone() * c_normal);
-            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_upper[0].clone() * c_upper);
+            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_upper_e() * c_upper);
         }
         // 32-bit mul constraint (positions 0..7, using low 4 limbs).  The
         // 32-bit case never produces carries > 8 bits (max partial = 4·0xFE01
@@ -438,12 +444,10 @@ impl BuiltInComponent for CpuChip {
             for f in [&mu_uu, &mu_su, &mu_ss] {
                 eval.add_constraint(f[0].clone() * (E::F::one() - f[0].clone()));
             }
-            // Variant flags partition is_mul_upper:
-            //   is_mul_upper = is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss.
-            eval.add_constraint(
-                is_mul_upper[0].clone()
-                    - mu_uu[0].clone() - mu_su[0].clone() - mu_ss[0].clone()
-            );
+            // Phase 53: with IsMulUpper folded into the
+            // (mu_uu + mu_su + mu_ss) expression there's no
+            // standalone column to pin against the partition identity
+            // — the expression IS the column by definition.
 
             // Term definitions (degree 3 each — flag · sign_bit · operand byte).
             //
@@ -484,7 +488,7 @@ impl BuiltInComponent for CpuChip {
                     corr_carry[i - 1].clone()
                 };
                 eval.add_constraint(
-                    is_mul_upper[0].clone() * (
+                    is_mul_upper_e() * (
                         unsigned_product_hi[i].clone()
                             + corr_carry[i].clone() * f256.clone()
                             - result[i].clone()
@@ -2373,7 +2377,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
             let f_is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
             let f_is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
-            let f_is_mul_upper = crate::trace::trace_eval!(trace_eval, Column::IsMulUpper);
+            // Phase 53: IsMulUpper is the sum of the three sub-flags.
             let f_is_bitwise = crate::trace::trace_eval!(trace_eval, Column::IsBitwise);
             let f_is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
             let f_is_compare = crate::trace::trace_eval!(trace_eval, Column::IsCompare);
@@ -2433,7 +2437,12 @@ impl BuiltInComponent for CpuChip {
             tuple.push(f_is_add[0].clone());
             tuple.push(f_is_sub[0].clone());
             tuple.push(f_is_mul[0].clone());
-            tuple.push(f_is_mul_upper[0].clone());
+            // Phase 53: IsMulUpper as the sum expression.
+            tuple.push(
+                f_is_mul_upper_uu[0].clone()
+                    + f_is_mul_upper_su[0].clone()
+                    + f_is_mul_upper_ss[0].clone(),
+            );
             tuple.push(f_is_bitwise[0].clone());
             tuple.push(f_is_shift[0].clone());
             tuple.push(f_is_compare[0].clone());
