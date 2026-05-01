@@ -583,26 +583,45 @@ pub async fn run_worker<N, S, T, C, R, A>(
         let next_inbox = inbox_rx.next().fuse();
         futures_util::pin_mut!(next_inbox);
 
-        // FuturesUnordered::next() returns None when empty, so
-        // we never block on it forever — the timer or inbox
-        // will fire first. Wrapped in a fuse for symmetry.
-        let next_pending = pending.next().fuse();
-        futures_util::pin_mut!(next_pending);
-
-        futures_util::select! {
-            msg = next_inbox => {
-                match msg {
-                    Some(RaftMsg::Shutdown) => break,
-                    Some(other) => handle_msg(&mut state, &mut pending, other).await,
-                    None => break,
+        // CRITICAL: `FuturesUnordered::next()` resolves
+        // `Ready(None)` *immediately* when the set is empty.
+        // Including it as a select! arm during the (common)
+        // intervals when no outbound RPCs are in flight produces a
+        // 100%-CPU spin — every iteration the empty-set arm fires,
+        // we ignore the `None`, loop, fire again. Branch on
+        // `pending.is_empty()` to drop the arm entirely in that
+        // case so the select! parks on timer + inbox.
+        if pending.is_empty() {
+            futures_util::select! {
+                msg = next_inbox => {
+                    match msg {
+                        Some(RaftMsg::Shutdown) => break,
+                        Some(other) => handle_msg(&mut state, other).await,
+                        None => break,
+                    }
+                }
+                _ = timer => {
+                    on_timer(&mut state, &mut pending).await;
                 }
             }
-            _ = timer => {
-                on_timer(&mut state, &mut pending).await;
-            }
-            outcome = next_pending => {
-                if let Some(o) = outcome {
-                    handle_rpc_outcome(&mut state, &mut pending, o).await;
+        } else {
+            let next_pending = pending.next().fuse();
+            futures_util::pin_mut!(next_pending);
+            futures_util::select! {
+                msg = next_inbox => {
+                    match msg {
+                        Some(RaftMsg::Shutdown) => break,
+                        Some(other) => handle_msg(&mut state, other).await,
+                        None => break,
+                    }
+                }
+                _ = timer => {
+                    on_timer(&mut state, &mut pending).await;
+                }
+                outcome = next_pending => {
+                    if let Some(o) = outcome {
+                        handle_rpc_outcome(&mut state, o).await;
+                    }
                 }
             }
         }
@@ -611,7 +630,6 @@ pub async fn run_worker<N, S, T, C, R, A>(
 
 async fn handle_msg<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
     msg: RaftMsg<N>,
 ) where
     N: NodeId,
@@ -638,7 +656,7 @@ async fn handle_msg<N, S, T, C, R, A>(
             }
         }
         RaftMsg::Propose { payload, reply } => {
-            let r = handle_propose(state, payload, pending).await;
+            let r = handle_propose(state, payload).await;
             let _ = reply.send(r);
         }
         RaftMsg::QueryState { reply } => {
@@ -678,7 +696,6 @@ async fn on_timer<N, S, T, C, R, A>(
 
 async fn handle_rpc_outcome<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
-    _pending: &mut FuturesUnordered<RpcFut<N>>,
     outcome: RpcOutcome<N>,
 ) where
     N: NodeId,
@@ -1076,7 +1093,6 @@ where
 async fn handle_propose<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
     payload: Vec<u8>,
-    _pending: &mut FuturesUnordered<RpcFut<N>>,
 ) -> Result<u64, ProposeError<()>>
 where
     N: NodeId,
@@ -1464,5 +1480,79 @@ mod tests {
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.current_term, 5);
         worker.shutdown();
+    }
+
+    /// Regression for the empty-`FuturesUnordered` busy-spin.
+    ///
+    /// Pre-fix the worker's `select!` polled `pending.next()`
+    /// every iteration; an empty `FuturesUnordered::next()`
+    /// resolves `Ready(None)` immediately, so the loop never
+    /// parked — it burned 100% CPU until a timer or inbox event
+    /// happened to win the race.
+    ///
+    /// We detect a spin by wrapping the clock and counting
+    /// `sleep_until` calls. The worker calls it once per loop
+    /// iteration to rebuild the timer arm of `select!`, so the
+    /// counter doubles as a loop-iteration counter. A parked loop
+    /// hits it only when a real event fires (single digits per
+    /// 100ms); a spinning loop hits it >10k times per 100ms on a
+    /// modern CPU.
+    #[test]
+    fn idle_worker_does_not_spin_on_empty_pending() {
+        use core::sync::atomic::{AtomicU64, Ordering as AO};
+        use std::sync::Arc as StdArc;
+
+        #[derive(Clone)]
+        struct CountingClock {
+            sleep_calls: StdArc<AtomicU64>,
+        }
+        impl crate::clock::Clock for CountingClock {
+            type Instant = std::time::Instant;
+            type Sleep = crate::clock::StdSleep;
+            fn now(&self) -> Self::Instant {
+                std::time::Instant::now()
+            }
+            fn add(&self, t: Self::Instant, d: Duration) -> Self::Instant {
+                t.checked_add(d).unwrap_or(t)
+            }
+            fn sleep_until(&self, deadline: Self::Instant) -> Self::Sleep {
+                self.sleep_calls.fetch_add(1, AO::Relaxed);
+                StdClock.sleep_until(deadline)
+            }
+        }
+
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        // Multi-member cluster, RecordingTransport never replies,
+        // election timer 10s so it doesn't fire during measurement,
+        // and `pending` stays empty (no outbound RPCs queued) for
+        // the whole window.
+        let mut cfg_idle =
+            Config::new(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC], [0u8; 32]);
+        cfg_idle.election_timeout_ms = (10_000, 10_000);
+        cfg_idle.heartbeat_interval_ms = 1_000;
+
+        let sleep_calls = StdArc::new(AtomicU64::new(0));
+        let clock = CountingClock {
+            sleep_calls: sleep_calls.clone(),
+        };
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg_idle,
+            (),
+            clock,
+            StdRng::from_entropy(),
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        let n = sleep_calls.load(AO::Relaxed);
+        worker.shutdown();
+        // Empirically: ~5 with the fix, ~12_000 in a spin.
+        // 10_000 is a wide threshold — any spin lights this up.
+        assert!(
+            n < 10_000,
+            "idle worker called sleep_until {n} times in 100ms — busy-spin regression",
+        );
     }
 }
