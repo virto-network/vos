@@ -452,7 +452,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_or_inv, Column::IsOrInv);
             trace.fill_columns(row, flags.is_xnor, Column::IsXnor);
             trace.fill_columns(row, flags.is_neg_add, Column::IsNegAdd);
-            trace.fill_columns(row, flags.is_branch, Column::IsBranch);
+            // Phase 53e: IsBranch folded into the 10 br_* sub-flag sum.
             trace.fill_columns(row, flags.is_br_eq, Column::IsBrEq);
             trace.fill_columns(row, flags.is_br_ne, Column::IsBrNe);
             trace.fill_columns(row, flags.is_br_lt_u, Column::IsBrLtU);

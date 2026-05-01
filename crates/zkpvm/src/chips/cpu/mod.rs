@@ -127,7 +127,27 @@ impl BuiltInComponent for CpuChip {
         let cmp_carry = crate::trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
         let cmp_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
-        let is_branch = crate::trace::trace_eval!(trace_eval, Column::IsBranch);
+        // Phase 53e: IsBranch folded — sum of the 10 IsBr* sub-flags.
+        // The sub-flag bindings used to live in the branch-constraint
+        // block (~line 1641); pull them up here so `is_branch_e()` is
+        // in scope at every reader site.
+        let is_br_eq = crate::trace::trace_eval!(trace_eval, Column::IsBrEq);
+        let is_br_ne = crate::trace::trace_eval!(trace_eval, Column::IsBrNe);
+        let is_br_lt_u = crate::trace::trace_eval!(trace_eval, Column::IsBrLtU);
+        let is_br_ge_u = crate::trace::trace_eval!(trace_eval, Column::IsBrGeU);
+        let is_br_le_u = crate::trace::trace_eval!(trace_eval, Column::IsBrLeU);
+        let is_br_gt_u = crate::trace::trace_eval!(trace_eval, Column::IsBrGtU);
+        let is_br_lt_s = crate::trace::trace_eval!(trace_eval, Column::IsBrLtS);
+        let is_br_ge_s = crate::trace::trace_eval!(trace_eval, Column::IsBrGeS);
+        let is_br_le_s = crate::trace::trace_eval!(trace_eval, Column::IsBrLeS);
+        let is_br_gt_s = crate::trace::trace_eval!(trace_eval, Column::IsBrGtS);
+        let is_branch_e = || -> E::F {
+            is_br_eq[0].clone() + is_br_ne[0].clone()
+                + is_br_lt_u[0].clone() + is_br_ge_u[0].clone()
+                + is_br_le_u[0].clone() + is_br_gt_u[0].clone()
+                + is_br_lt_s[0].clone() + is_br_ge_s[0].clone()
+                + is_br_le_s[0].clone() + is_br_gt_s[0].clone()
+        };
         let is_set_lt_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtU);
         let is_set_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtS);
         let is_cmov_iz_flag = crate::trace::trace_eval!(trace_eval, Column::IsCmovIz);
@@ -615,7 +635,7 @@ impl BuiltInComponent for CpuChip {
         // For SetLtS (compare_op=1): needs sign bit analysis (prover-trusted for now)
         // For CmovIz/Nz, Min/Max: prover-trusted (constrained result via execution semantics)
         // ════════════════════════════════════════════════════════════════════
-        let is_cmp_or_branch = is_compare_e() + is_branch[0].clone();
+        let is_cmp_or_branch = is_compare_e() + is_branch_e();
         // Constrain the cmp_carry chain: val_b + ~val_d + 1 (two's complement subtraction)
         // sub_result[i] + carry[i]*256 = val_b[i] + 255 - val_d[i] + carry_in
         // sub_result[i] is range-checked via Range256 lookup below.
@@ -1626,28 +1646,20 @@ impl BuiltInComponent for CpuChip {
         // Constraint: is_branch * branch_taken * (next_pc - branch_target) = 0
         for i in 0..4 {
             eval.add_constraint(
-                is_branch[0].clone() * branch_taken[0].clone()
+                is_branch_e() * branch_taken[0].clone()
                 * (next_pc[i].clone() - branch_target[i].clone())
             );
         }
 
         // branch_taken must be boolean
         eval.add_constraint(
-            is_branch[0].clone() * branch_taken[0].clone() * (E::F::one() - branch_taken[0].clone())
+            is_branch_e() * branch_taken[0].clone() * (E::F::one() - branch_taken[0].clone())
         );
 
         // ── Branch condition constraints ──
-        // Constrain that branch_taken matches the comparison semantics per type
-        let is_br_eq = crate::trace::trace_eval!(trace_eval, Column::IsBrEq);
-        let is_br_ne = crate::trace::trace_eval!(trace_eval, Column::IsBrNe);
-        let is_br_lt_u = crate::trace::trace_eval!(trace_eval, Column::IsBrLtU);
-        let is_br_ge_u = crate::trace::trace_eval!(trace_eval, Column::IsBrGeU);
-        let is_br_le_u = crate::trace::trace_eval!(trace_eval, Column::IsBrLeU);
-        let is_br_gt_u = crate::trace::trace_eval!(trace_eval, Column::IsBrGtU);
-        let is_br_lt_s = crate::trace::trace_eval!(trace_eval, Column::IsBrLtS);
-        let is_br_ge_s = crate::trace::trace_eval!(trace_eval, Column::IsBrGeS);
-        let is_br_le_s = crate::trace::trace_eval!(trace_eval, Column::IsBrLeS);
-        let is_br_gt_s = crate::trace::trace_eval!(trace_eval, Column::IsBrGtS);
+        // Phase 53e: branch sub-flag bindings moved up to function
+        // scope (line ~134) so `is_branch_e()` is reachable from
+        // earlier sites (line ~620 cmp+branch range gate).
         let byte_eq_cols = crate::trace::trace_eval!(trace_eval, Column::ByteEq);
         let byte_diff_inv = crate::trace::trace_eval!(trace_eval, Column::ByteDiffInv);
 
@@ -1655,14 +1667,14 @@ impl BuiltInComponent for CpuChip {
         for i in 0..WORD_SIZE {
             let diff = val_b[i].clone() - val_d[i].clone();
             eval.add_constraint(
-                is_branch[0].clone() * byte_eq_cols[i].clone()
+                is_branch_e() * byte_eq_cols[i].clone()
                 * (E::F::one() - byte_eq_cols[i].clone())
             );
             eval.add_constraint(
-                is_branch[0].clone() * byte_eq_cols[i].clone() * diff.clone()
+                is_branch_e() * byte_eq_cols[i].clone() * diff.clone()
             );
             eval.add_constraint(
-                is_branch[0].clone() * (E::F::one() - byte_eq_cols[i].clone())
+                is_branch_e() * (E::F::one() - byte_eq_cols[i].clone())
                 * (diff * byte_diff_inv[i].clone() - E::F::one())
             );
         }
@@ -1769,7 +1781,7 @@ impl BuiltInComponent for CpuChip {
             let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
             let is_sequential = E::F::one() - is_pad[0].clone()
                 - is_jump[0].clone()
-                - is_branch[0].clone() * branch_taken[0].clone()
+                - is_branch_e() * branch_taken[0].clone()
                 - is_exit[0].clone();
 
             // Byte 0: next_pc[0] + carry[0]*256 = pc[0] + 1 + skip_len
@@ -2399,7 +2411,7 @@ impl BuiltInComponent for CpuChip {
             // Phase 53d: IsCompare folded — sum expression below.
             let f_is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
             let f_is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
-            let f_is_branch = crate::trace::trace_eval!(trace_eval, Column::IsBranch);
+            // Phase 53e: IsBranch folded — sum expression below.
             let f_is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
             let f_is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let f_is_load = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
@@ -2469,7 +2481,8 @@ impl BuiltInComponent for CpuChip {
             tuple.push(is_compare_e());
             tuple.push(f_is_move[0].clone());
             tuple.push(f_is_32bit[0].clone());
-            tuple.push(f_is_branch[0].clone());
+            // Phase 53e: IsBranch as the sum expression.
+            tuple.push(is_branch_e());
             tuple.push(f_is_jump[0].clone());
             tuple.push(f_is_div_rem[0].clone());
             tuple.push(f_is_load[0].clone());

@@ -61,10 +61,9 @@ pub(super) fn generate_interaction_trace(
         }
 
         // Range256 lookups for cmp_sub_result bytes (carry chain soundness)
-        // Phase 53d: IsCompare is the sum of 8 sub-flags now.  The
-        // multiplicity for this lookup is `is_compare + is_branch`,
-        // which expands to `sum_8_subflags + is_branch`.  Pass all 9
-        // columns and sum in the closure.
+        // Phase 53d/53e: IsCompare = sum of 8 compare sub-flags, IsBranch
+        // = sum of 10 branch sub-flags.  The multiplicity for this lookup
+        // is `is_compare + is_branch` which expands to all 18 sub-flags.
         let is_setltu_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtU);
         let is_setlts_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtS);
         let is_cmoviz_col = crate::trace::original_base_column!(component_trace, Column::IsCmovIz);
@@ -73,7 +72,16 @@ pub(super) fn generate_interaction_trace(
         let is_minu_col = crate::trace::original_base_column!(component_trace, Column::IsMinU);
         let is_maxs_col = crate::trace::original_base_column!(component_trace, Column::IsMaxS);
         let is_maxu_col = crate::trace::original_base_column!(component_trace, Column::IsMaxU);
-        let is_branch_col = crate::trace::original_base_column!(component_trace, Column::IsBranch);
+        let is_br_eq_col = crate::trace::original_base_column!(component_trace, Column::IsBrEq);
+        let is_br_ne_col = crate::trace::original_base_column!(component_trace, Column::IsBrNe);
+        let is_br_lt_u_col = crate::trace::original_base_column!(component_trace, Column::IsBrLtU);
+        let is_br_ge_u_col = crate::trace::original_base_column!(component_trace, Column::IsBrGeU);
+        let is_br_le_u_col = crate::trace::original_base_column!(component_trace, Column::IsBrLeU);
+        let is_br_gt_u_col = crate::trace::original_base_column!(component_trace, Column::IsBrGtU);
+        let is_br_lt_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrLtS);
+        let is_br_ge_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrGeS);
+        let is_br_le_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrLeS);
+        let is_br_gt_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrGtS);
         let cmp_sub_result = crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
         for col in &cmp_sub_result {
             logup.add_to_relation_with(
@@ -83,9 +91,16 @@ pub(super) fn generate_interaction_trace(
                     is_cmoviz_col[0].clone(), is_cmovnz_col[0].clone(),
                     is_mins_col[0].clone(),   is_minu_col[0].clone(),
                     is_maxs_col[0].clone(),   is_maxu_col[0].clone(),
-                    is_branch_col[0].clone(),
+                    is_br_eq_col[0].clone(),  is_br_ne_col[0].clone(),
+                    is_br_lt_u_col[0].clone(), is_br_ge_u_col[0].clone(),
+                    is_br_le_u_col[0].clone(), is_br_gt_u_col[0].clone(),
+                    is_br_lt_s_col[0].clone(), is_br_ge_s_col[0].clone(),
+                    is_br_le_s_col[0].clone(), is_br_gt_s_col[0].clone(),
                 ],
-                |[a, b, c, d, e, f, g, h, br]| (a + b + c + d + e + f + g + h + br).into(),
+                |[a, b, c, d, e, f, g, h, br_eq, br_ne, br_lt_u, br_ge_u, br_le_u, br_gt_u, br_lt_s, br_ge_s, br_le_s, br_gt_s]|
+                    (a + b + c + d + e + f + g + h
+                        + br_eq + br_ne + br_lt_u + br_ge_u + br_le_u + br_gt_u
+                        + br_lt_s + br_ge_s + br_le_s + br_gt_s).into(),
                 &[col.clone()],
             );
         }
@@ -494,7 +509,7 @@ pub(super) fn generate_interaction_trace(
             // Phase 53d: IsCompare folded; closure override below.
             let f_is_move = crate::trace::original_base_column!(component_trace, Column::IsMove);
             let f_is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
-            let f_is_branch = crate::trace::original_base_column!(component_trace, Column::IsBranch);
+            // Phase 53e: IsBranch folded; closure override below.
             let f_is_jump = crate::trace::original_base_column!(component_trace, Column::IsJump);
             let f_is_div_rem = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
             let f_is_load = crate::trace::original_base_column!(component_trace, Column::IsLoad);
@@ -559,7 +574,8 @@ pub(super) fn generate_interaction_trace(
             tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_move[0].clone());
             tuple.push(f_is_32bit[0].clone());
-            tuple.push(f_is_branch[0].clone());
+            // Phase 53e: placeholder for the folded IsBranch slot.
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple.push(f_is_jump[0].clone());
             tuple.push(f_is_div_rem[0].clone());
             tuple.push(f_is_load[0].clone());
@@ -601,12 +617,13 @@ pub(super) fn generate_interaction_trace(
             tuple.extend_from_slice(&imm_y_for_lookup);
             tuple.extend_from_slice(&branch_target_for_lookup);
 
-            // Phase 53/53c/53d: folded slot indices in the tuple
+            // Phase 53/53c/53d/53e: folded slot indices in the tuple
             // (pc[4] + opcode + skip_len + 3·reg + imm[8] + is_add
             // + is_sub + is_mul = 20; +1 for is_mul_upper, etc.).
             const IS_MUL_UPPER_SLOT: usize = 20;
             const IS_BITWISE_SLOT: usize = 21;
             const IS_COMPARE_SLOT: usize = 23;
+            const IS_BRANCH_SLOT: usize = 26;
             // Two paired emissions, multiplicity = is_real = 1 - is_padding.
             for _ in 0..2 {
                 let is_pad = is_pad_col[0].clone();
@@ -627,6 +644,16 @@ pub(super) fn generate_interaction_trace(
                 let cmp_minu_c = is_minu_col[0].clone();
                 let cmp_maxs_c = is_maxs_col[0].clone();
                 let cmp_maxu_c = is_maxu_col[0].clone();
+                let br_eq_c = is_br_eq_col[0].clone();
+                let br_ne_c = is_br_ne_col[0].clone();
+                let br_lt_u_c = is_br_lt_u_col[0].clone();
+                let br_ge_u_c = is_br_ge_u_col[0].clone();
+                let br_le_u_c = is_br_le_u_col[0].clone();
+                let br_gt_u_c = is_br_gt_u_col[0].clone();
+                let br_lt_s_c = is_br_lt_s_col[0].clone();
+                let br_ge_s_c = is_br_ge_s_col[0].clone();
+                let br_le_s_c = is_br_le_s_col[0].clone();
+                let br_gt_s_c = is_br_gt_s_col[0].clone();
                 logup.add_to_relation_computed(
                     prog_mem,
                     [is_pad],
@@ -646,6 +673,11 @@ pub(super) fn generate_interaction_trace(
                                 + cmp_cmoviz_c.at(i) + cmp_cmovnz_c.at(i)
                                 + cmp_mins_c.at(i) + cmp_minu_c.at(i)
                                 + cmp_maxs_c.at(i) + cmp_maxu_c.at(i);
+                            t[IS_BRANCH_SLOT] = br_eq_c.at(i) + br_ne_c.at(i)
+                                + br_lt_u_c.at(i) + br_ge_u_c.at(i)
+                                + br_le_u_c.at(i) + br_gt_u_c.at(i)
+                                + br_lt_s_c.at(i) + br_ge_s_c.at(i)
+                                + br_le_s_c.at(i) + br_gt_s_c.at(i);
                             t
                         }
                     },

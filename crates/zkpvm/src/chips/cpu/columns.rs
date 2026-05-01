@@ -212,9 +212,11 @@ pub enum Column {
     #[size = 8]
     ShiftQuotient,
     // ── Control flow ──
-    /// Conditional branch (BranchEq/Ne/Lt/Ge + imm variants)
-    #[size = 1]
-    IsBranch,
+    // Phase 53e: IsBranch folded into the 10-sub-flag sum
+    // (IsBrEq + IsBrNe + IsBrLtU + IsBrGeU + IsBrLeU + IsBrGtU
+    //  + IsBrLtS + IsBrGeS + IsBrLeS + IsBrGtS).  Same closure-
+    // override pattern as Phase 53b/c/d.  Strictly stronger
+    // soundness — the lookup balance forces sum == canonical.
     /// Branch comparison type flags (exactly one is set when IsBranch=1)
     #[size = 1]
     IsBrEq,
