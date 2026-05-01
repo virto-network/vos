@@ -46,7 +46,7 @@ use crate::meta::Meta;
 use crate::role::Role;
 use crate::rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    RequestVoteReq, RequestVoteResp,
+    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 use crate::storage::{Storage, WriteBatch};
 use crate::transport::Transport;
@@ -105,6 +105,11 @@ pub enum RaftMsg<N: NodeId> {
         from: N,
         req: RequestVoteReq<N>,
         reply: oneshot::Sender<RequestVoteResp>,
+    },
+    PreVote {
+        from: N,
+        req: PreVoteReq<N>,
+        reply: oneshot::Sender<PreVoteResp>,
     },
     InstallSnapshot {
         from: N,
@@ -478,6 +483,28 @@ impl<N: NodeId> WorkerHandle<N> {
         })
     }
 
+    /// Inbound `PreVote` from a would-be candidate. Replies
+    /// `vote_granted = true` only if our log is at least as
+    /// stale as the requester's claimed log AND we haven't
+    /// heard from a leader recently. Does NOT mutate
+    /// `voted_for` or `current_term`.
+    pub async fn handle_inbound_prevote(
+        &self,
+        from: N,
+        req: PreVoteReq<N>,
+    ) -> PreVoteResp {
+        let (tx, rx) = oneshot::channel();
+        let term = req.next_term;
+        if self
+            .inbox
+            .send(RaftMsg::PreVote { from, req, reply: tx })
+            .is_err()
+        {
+            return PreVoteResp { term, vote_granted: false };
+        }
+        rx.await.unwrap_or(PreVoteResp { term, vote_granted: false })
+    }
+
     /// Inbound `InstallSnapshot` from a peer.
     pub async fn handle_inbound_install(
         &self,
@@ -539,6 +566,11 @@ enum RpcOutcome<N: NodeId> {
         from: N,
         result: Option<RequestVoteResp>,
     },
+    PreVote {
+        from: N,
+        next_term: u64,
+        result: Option<PreVoteResp>,
+    },
     Install {
         from: N,
         result: Option<InstallSnapshotResp>,
@@ -565,6 +597,13 @@ where
     role: Role,
     meta: Meta<N>,
     election_deadline: C::Instant,
+    /// Wall-clock instant of the most recent successful
+    /// AppendEntries receipt from a current-term leader. `None`
+    /// until the first heartbeat lands. Used by the pre-vote
+    /// leader-check (refuse pre-vote only when we've heard from
+    /// a leader recently — distinct from "election deadline is
+    /// in the future", which is true for any fresh follower).
+    last_heartbeat_received: Option<C::Instant>,
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
     apply_sink: A,
@@ -685,6 +724,7 @@ where
         role: Role::Follower,
         meta,
         election_deadline: clock.now(),
+        last_heartbeat_received: None,
         votes_received: BTreeSet::new(),
         leader: None,
         apply_sink,
@@ -777,6 +817,10 @@ async fn handle_msg<N, S, T, C, R, A>(
                 let _ = reply.send(resp);
             }
         }
+        RaftMsg::PreVote { from, req, reply } => {
+            let resp = handle_request_prevote(state, from, req);
+            let _ = reply.send(resp);
+        }
         RaftMsg::InstallSnapshot { from, req, reply } => {
             if let Ok(resp) = handle_install_snapshot(state, from, req).await {
                 let _ = reply.send(resp);
@@ -812,7 +856,29 @@ async fn on_timer<N, S, T, C, R, A>(
     A: ApplySink,
 {
     match state.role {
-        Role::Follower | Role::Candidate => {
+        // Follower whose timer expired: start the pre-election
+        // phase (or skip it if `cfg.pre_vote == false`).
+        Role::Follower => {
+            if state.cfg.pre_vote {
+                let _ = start_pre_election(state, pending).await;
+            } else {
+                let _ = start_election(state, pending).await;
+            }
+        }
+        // PreCandidate whose timer expired: pre-election round
+        // didn't get quorum within the timeout. Reset and try
+        // another pre-vote round (fresh randomized timer
+        // prevents lockstep).
+        Role::PreCandidate => {
+            let _ = start_pre_election(state, pending).await;
+        }
+        // Candidate whose timer expired: send the real
+        // RequestVote round. Either we're here freshly-promoted
+        // from PreCandidate (term bump + self-vote happen
+        // inside `start_election`), or we already started this
+        // term's election and the timeout expired without
+        // quorum.
+        Role::Candidate => {
             let _ = start_election(state, pending).await;
         }
         Role::Leader => {
@@ -845,6 +911,13 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
         } => {
             let _ = handle_vote_response(state, from, resp).await;
         }
+        RpcOutcome::PreVote {
+            from,
+            next_term,
+            result: Some(resp),
+        } => {
+            let _ = handle_prevote_response(state, from, next_term, resp).await;
+        }
         RpcOutcome::Install {
             from,
             result: Some(resp),
@@ -854,7 +927,10 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
                 handle_install_snapshot_response(state, from, resp, last_included_index).await;
         }
         // Transport returned Err — treat as no answer.
-        RpcOutcome::Append { .. } | RpcOutcome::Vote { .. } | RpcOutcome::Install { .. } => {}
+        RpcOutcome::Append { .. }
+        | RpcOutcome::Vote { .. }
+        | RpcOutcome::PreVote { .. }
+        | RpcOutcome::Install { .. } => {}
     }
 }
 
@@ -888,6 +964,9 @@ where
     state.votes_received.clear();
     state.leader = None;
     state.reset_election_timer();
+    // We've heard from a current-term leader — record it for
+    // the pre-vote leader-check.
+    state.last_heartbeat_received = Some(state.clock.now());
 
     let our_prev_term = state.storage.term_at(req.prev_log_index).await?;
     let consistent = our_prev_term == Some(req.prev_log_term);
@@ -1021,6 +1100,57 @@ where
         term: state.meta.current_term,
         vote_granted: granted,
     })
+}
+
+/// Inbound `PreVote` handler. Critically, this MUST NOT mutate
+/// `current_term` or `voted_for` — we answer the hypothetical
+/// "would you vote for me at `next_term`?" without committing.
+///
+/// Refuses if (1) the requester's `next_term` isn't actually
+/// higher than ours, (2) we've heard from a current-term leader
+/// within `election_timeout_ms.0` (the leader-check that gives
+/// pre-vote its term-stability property), or (3) the requester's
+/// log is staler than ours (Raft §5.4.1).
+fn handle_request_prevote<N, S, T, C, R, A>(
+    state: &WorkerState<N, S, T, C, R, A>,
+    _from: N,
+    req: PreVoteReq<N>,
+) -> PreVoteResp
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if req.next_term <= state.meta.current_term {
+        return PreVoteResp {
+            term: state.meta.current_term,
+            vote_granted: false,
+        };
+    }
+    let now = state.clock.now();
+    if let Some(last_hb) = state.last_heartbeat_received {
+        let stale_threshold = state.clock.add(
+            last_hb,
+            core::time::Duration::from_millis(state.cfg.election_timeout_ms.0),
+        );
+        if now < stale_threshold {
+            return PreVoteResp {
+                term: state.meta.current_term,
+                vote_granted: false,
+            };
+        }
+    }
+    let our_last_term = state.storage.last_term();
+    let our_last_index = state.storage.last_index();
+    let up_to_date = (req.last_log_term > our_last_term)
+        || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
+    PreVoteResp {
+        term: state.meta.current_term,
+        vote_granted: up_to_date,
+    }
 }
 
 async fn handle_install_snapshot<N, S, T, C, R, A>(
@@ -1207,6 +1337,58 @@ where
             // and the next timer tick will fire heartbeats.
             become_leader_no_heartbeat(state).await?;
             // Trigger a heartbeat by collapsing the deadline.
+            state.election_deadline = state.clock.now();
+        }
+    }
+    Ok(())
+}
+
+/// Outcome handler for a `PreVote` reply. On quorum-yes,
+/// transitions PreCandidate → Candidate and collapses the
+/// election deadline so the next `on_timer` fires
+/// `start_election` immediately.
+async fn handle_prevote_response<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    from: N,
+    next_term: u64,
+    resp: PreVoteResp,
+) -> Result<(), S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    // A peer at a strictly higher term tells us we're stale.
+    if resp.term > state.meta.current_term {
+        state.meta.current_term = resp.term;
+        state.meta.voted_for = None;
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                meta: Some(state.meta.clone()),
+                ..Default::default()
+            })
+            .await?;
+        step_down(state);
+        return Ok(());
+    }
+    // Stale next_term or wrong role.
+    if state.role != Role::PreCandidate
+        || next_term != state.meta.current_term + 1
+    {
+        return Ok(());
+    }
+    if resp.vote_granted {
+        state.votes_received.insert(from);
+        if state.votes_received.len() >= state.quorum() {
+            // Pre-vote quorum reached. Promote to Candidate and
+            // collapse the timer; `on_timer`'s next fire will
+            // call `start_election` which bumps the term and
+            // sends real RequestVotes.
+            state.set_role(Role::Candidate);
             state.election_deadline = state.clock.now();
         }
     }
@@ -1440,6 +1622,65 @@ where
             ..Default::default()
         })
         .await?;
+    Ok(())
+}
+
+/// Pre-election phase. Sets role to `PreCandidate`, sends
+/// `PreVote` to every peer asking "would you grant a real vote
+/// at `current_term + 1`?". Does NOT bump `current_term` or
+/// persist `voted_for`. On quorum-yes (handled in
+/// `handle_prevote_response`), promotes to Candidate and
+/// `on_timer` fires `start_election` next.
+///
+/// Solo cluster (members.len() <= 1): self-vote alone is the
+/// quorum; skip pre-vote and go straight to `start_election`.
+async fn start_pre_election<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+) -> Result<(), S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if state.cfg.members.len() <= 1 {
+        return start_election(state, pending).await;
+    }
+    state.set_role(Role::PreCandidate);
+    state.votes_received.clear();
+    state.votes_received.insert(state.cfg.me);
+
+    let next_term = state.meta.current_term + 1;
+    let me = state.cfg.me;
+    let last_log_index = state.storage.last_index();
+    let last_log_term = state.storage.last_term();
+
+    for peer in state.cfg.members.iter().copied() {
+        if peer == me {
+            continue;
+        }
+        let req = PreVoteReq {
+            candidate: me,
+            next_term,
+            last_log_index,
+            last_log_term,
+        };
+        let transport = state.transport.clone();
+        let fut: RpcFut<N> = Box::pin(async move {
+            let result = transport.send_prevote(peer, req).await.ok();
+            RpcOutcome::PreVote {
+                from: peer,
+                next_term,
+                result,
+            }
+        });
+        pending.push(fut);
+    }
+
+    state.reset_election_timer();
     Ok(())
 }
 

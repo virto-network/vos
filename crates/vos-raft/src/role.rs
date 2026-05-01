@@ -12,9 +12,16 @@ pub enum Role {
     /// and RequestVote; will start a new election if no
     /// heartbeat arrives within the election timeout.
     Follower,
-    /// Soliciting votes for an election we started. Stays here
-    /// until we either gather a quorum (→ Leader) or observe a
-    /// higher term (→ Follower).
+    /// Sending PreVote RPCs to gauge whether a real election
+    /// would succeed at `current_term + 1`. Has NOT yet bumped
+    /// `current_term` or persisted a self-vote. Transitions to
+    /// `Candidate` on quorum of yes-replies, or back to
+    /// `Follower` on no-reply or any higher-term response.
+    PreCandidate,
+    /// Soliciting votes for a real election. Term has been
+    /// bumped, self-vote persisted. Stays here until we either
+    /// gather a quorum (→ Leader) or observe a higher term
+    /// (→ Follower).
     Candidate,
     /// Authoritative for the current term. Replicates entries
     /// to followers and emits heartbeats to keep their election
@@ -33,6 +40,7 @@ impl Role {
             Self::Follower => 0,
             Self::Candidate => 1,
             Self::Leader => 2,
+            Self::PreCandidate => 3,
         }
     }
 
@@ -43,6 +51,7 @@ impl Role {
         match v {
             1 => Self::Candidate,
             2 => Self::Leader,
+            3 => Self::PreCandidate,
             _ => Self::Follower,
         }
     }
@@ -54,7 +63,7 @@ mod tests {
 
     #[test]
     fn role_round_trips_through_u8() {
-        for r in [Role::Follower, Role::Candidate, Role::Leader] {
+        for r in [Role::Follower, Role::PreCandidate, Role::Candidate, Role::Leader] {
             assert_eq!(Role::from_u8(r.as_u8()), r);
         }
     }

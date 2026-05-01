@@ -101,7 +101,7 @@ pub use meta::Meta;
 pub use role::Role;
 pub use rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    RequestVoteReq, RequestVoteResp,
+    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 pub use storage::{MemStorage, Storage, WriteBatch};
 pub use transport::Transport;

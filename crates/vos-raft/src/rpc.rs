@@ -53,6 +53,46 @@ pub struct RequestVoteResp {
     pub vote_granted: bool,
 }
 
+/// Raft `PreVote` from a would-be candidate → other replicas.
+///
+/// PreVote (Ongaro thesis §9.6) prevents term inflation from a
+/// flapping partition. A node that suspects a leader failure
+/// first asks "would you vote for me at `next_term`?" *without*
+/// bumping its own `current_term` or persisting `voted_for`.
+/// Only if a quorum of replies say yes does it transition to
+/// Candidate, bump term, and send real `RequestVote`s.
+///
+/// Without PreVote: a partitioned follower whose link flaps will
+/// time out, become Candidate at term+1, get isolated again,
+/// time out at term+2, etc. — and when it rejoins, its inflated
+/// term forces the working leader to step down. With PreVote,
+/// the would-be candidate's preliminary check returns "no, I
+/// have a healthy leader" and the term stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreVoteReq<N> {
+    pub candidate: N,
+    /// The term the candidate WOULD bump to if granted. The
+    /// receiver does NOT adopt this term — it just answers the
+    /// hypothetical.
+    pub next_term: u64,
+    pub last_log_index: u64,
+    pub last_log_term: u64,
+}
+
+/// Reply to [`PreVoteReq`]. Replicas grant a pre-vote when the
+/// requester's log is at least as up-to-date as theirs AND they
+/// haven't heard from a leader recently (their election timer
+/// hasn't been reset). If the candidate is in fact stale, the
+/// replier's `term` lets it learn the current term and skip the
+/// pointless real election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreVoteResp {
+    /// The replier's `current_term`. Used by the candidate to
+    /// learn it's stale and skip starting a real election.
+    pub term: u64,
+    pub vote_granted: bool,
+}
+
 /// Raft `InstallSnapshot` from leader → follower. Sent when the
 /// leader has compacted past the follower's `match_index` and
 /// can no longer serve the consistency check from log entries.

@@ -7,6 +7,16 @@ surface is intentionally small but reserves room to grow via
 ## [Unreleased]
 
 ### Added
+- **Pre-vote** (Ongaro thesis §9.6) — prevents term inflation
+  from a flapping partition. New `Role::PreCandidate`, new
+  `PreVoteReq`/`PreVoteResp` RPC types, new
+  `Transport::send_prevote` method (with a default impl that
+  refuses, so existing transports degrade gracefully). New
+  `Config::pre_vote` flag (default `true`); set to `false`
+  if your transport doesn't yet route `PreVoteReq` over the
+  wire — the worker skips the pre-vote phase and falls back
+  to plain Raft. Vos's `RaftCommit` defaults to `false`
+  pending libp2p frame support.
 - **`TokioClock`** behind the new `tokio` feature — uses
   `tokio::time::sleep_until` instead of `StdClock`'s thread-per-`Delay`
   approach. Recommended for tokio-native hosts. Spawn via

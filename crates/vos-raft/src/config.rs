@@ -57,6 +57,23 @@ pub struct Config<N: NodeId> {
     /// production workloads with high churn can lower it.
     /// Embedded targets writing to flash may want it larger.
     pub compact_hysteresis: u64,
+    /// Enable the pre-vote phase (Ongaro thesis §9.6).
+    ///
+    /// When `true` (default), a follower whose election timer
+    /// expires first sends `PreVoteReq` to peers asking "would
+    /// you grant me a real vote at `current_term + 1`?". Only
+    /// on quorum-yes does it bump its term and start a real
+    /// election. This prevents term inflation from a flapping
+    /// partition.
+    ///
+    /// Set `false` if your `Transport` impl doesn't support the
+    /// `send_prevote` method (e.g., the wire frame doesn't yet
+    /// carry `PreVoteReq` / `PreVoteResp`). With pre-vote
+    /// disabled, the worker skips the phase entirely and goes
+    /// straight to `start_election` from Follower — equivalent
+    /// to plain Raft. The cluster loses the term-stability
+    /// guarantee but remains correct.
+    pub pre_vote: bool,
 }
 
 impl<N: NodeId> Config<N> {
@@ -73,6 +90,7 @@ impl<N: NodeId> Config<N> {
             heartbeat_interval_ms: 50,
             replication_id,
             compact_hysteresis: 16,
+            pre_vote: true,
         }
     }
 }

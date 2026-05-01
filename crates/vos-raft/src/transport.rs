@@ -24,7 +24,7 @@ use core::fmt::Debug;
 use crate::config::NodeId;
 use crate::rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    RequestVoteReq, RequestVoteResp,
+    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 
 /// Transport for one replication group.
@@ -45,6 +45,46 @@ pub trait Transport<N: NodeId>: Send + Sync + 'static {
         peer: N,
         req: RequestVoteReq<N>,
     ) -> impl core::future::Future<Output = Result<RequestVoteResp, Self::Error>> + Send;
+
+    /// Send `PreVote` to `peer`. The would-be candidate uses
+    /// this to ask "would you grant me a real vote at
+    /// `next_term`?" without bumping its own term.
+    ///
+    /// Default impl returns `Err(Self::Error::default())` so
+    /// implementations that haven't been updated for pre-vote
+    /// gracefully degrade to plain Raft (the worker treats
+    /// every error reply as "no answer" and falls back to
+    /// starting a real election after the timeout). Wire-up is
+    /// strictly opt-in: you only need to override this when
+    /// you've taught the transport to deliver `PreVoteReq` /
+    /// `PreVoteResp` over your physical channel. Until then,
+    /// the worker's pre-vote phase functions as a brief delay,
+    /// not as a strict prevention — concrete transports should
+    /// implement it before depending on the term-inflation
+    /// guarantee in production.
+    ///
+    /// Default impl is provided for source-compat; embedded
+    /// transports without pre-vote wire support should keep
+    /// the default and document the limitation.
+    fn send_prevote(
+        &self,
+        peer: N,
+        req: PreVoteReq<N>,
+    ) -> impl core::future::Future<Output = Result<PreVoteResp, Self::Error>> + Send {
+        // Default: pretend the prevote was rejected so the
+        // candidate falls back to skipping pre-vote. The
+        // _peer/_req params are explicitly read here so the
+        // closure captures them and the default body is
+        // identical regardless of `Send` plumbing.
+        let _ = peer;
+        let _ = req;
+        async {
+            Ok(PreVoteResp {
+                term: 0,
+                vote_granted: false,
+            })
+        }
+    }
 
     /// Send `InstallSnapshot` to `peer`. Snapshot bytes are
     /// inside `req.snapshot`; the transport may chunk them as
@@ -72,6 +112,7 @@ pub(crate) mod test_helpers {
     pub struct RecordingTransport {
         pub appends: RpcLog<AppendEntriesReq<u16>>,
         pub votes: RpcLog<RequestVoteReq<u16>>,
+        pub prevotes: RpcLog<PreVoteReq<u16>>,
         pub installs: RpcLog<InstallSnapshotReq<u16>>,
         pub canned_term: AtomicU64,
     }
@@ -81,6 +122,7 @@ pub(crate) mod test_helpers {
             Self {
                 appends: Default::default(),
                 votes: Default::default(),
+                prevotes: Default::default(),
                 installs: Default::default(),
                 canned_term: AtomicU64::new(0),
             }
@@ -124,6 +166,21 @@ pub(crate) mod test_helpers {
             let term = self.canned_term.load(Ordering::Relaxed);
             self.installs.lock().unwrap().push((peer, req));
             Ok(InstallSnapshotResp { term })
+        }
+        async fn send_prevote(
+            &self,
+            peer: u16,
+            req: PreVoteReq<u16>,
+        ) -> Result<PreVoteResp, Self::Error> {
+            let term = self.canned_term.load(Ordering::Relaxed);
+            self.prevotes.lock().unwrap().push((peer, req));
+            // Default canned answer: grant — same shape as
+            // send_vote. Tests that need a different answer can
+            // construct a custom transport.
+            Ok(PreVoteResp {
+                term,
+                vote_granted: true,
+            })
         }
     }
 }

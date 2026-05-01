@@ -73,6 +73,14 @@ impl WorkerConfig {
         let mut c = RaftCfg::new(self.me, self.members, self.replication_id);
         c.election_timeout_ms = self.election_timeout_ms;
         c.heartbeat_interval_ms = self.heartbeat_interval_ms;
+        // Pre-vote disabled until vos's libp2p frame layer
+        // routes `PreVoteReq` / `PreVoteResp`. Without that
+        // wire support, the worker would stay in PreCandidate
+        // forever (no peer can reply, no quorum, no
+        // promotion). Plain-Raft elections work fine — vos
+        // loses the term-inflation-prevention property until
+        // the network is upgraded.
+        c.pre_vote = false;
         c
     }
 }

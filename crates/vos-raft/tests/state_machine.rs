@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use futures_executor::block_on;
 use vos_raft::{
     AppendEntriesReq, AppendEntriesResp, Config, InstallSnapshotReq, InstallSnapshotResp,
-    MemStorage, RequestVoteReq, RequestVoteResp, Role, StdClock, StdRng, Transport, Worker,
-    WorkerHandle,
+    MemStorage, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock,
+    StdRng, Transport, Worker, WorkerHandle,
 };
 
 /// Inbox lookup. Each peer's `WorkerHandle` is registered here
@@ -205,6 +205,24 @@ impl Transport<u16> for MockTransport {
             let _ = h.handle_inbound_vote(from, dup_req).await;
         }
         result
+    }
+
+    async fn send_prevote(
+        &self,
+        peer: u16,
+        req: PreVoteReq<u16>,
+    ) -> Result<PreVoteResp, Self::Error> {
+        if self.is_dropped(req.candidate, peer) {
+            return Err(MockError);
+        }
+        let handle = {
+            let routes = self.routes.lock().unwrap();
+            routes.get(&peer).cloned()
+        };
+        match handle {
+            Some(h) => Ok(h.handle_inbound_prevote(req.candidate, req).await),
+            None => Err(MockError),
+        }
     }
 
     async fn send_install(
@@ -609,6 +627,22 @@ impl Transport<u16> for BumpTermTransport {
     ) -> Result<InstallSnapshotResp, Self::Error> {
         Ok(InstallSnapshotResp { term: self.bumped_term })
     }
+    async fn send_prevote(
+        &self,
+        _peer: u16,
+        req: PreVoteReq<u16>,
+    ) -> Result<PreVoteResp, Self::Error> {
+        // Mimic a healthy peer at the candidate's current term:
+        // grant the pre-vote, report `next_term - 1` (i.e., the
+        // candidate's view of its own current_term, which is
+        // what a peer at the same term would report). This lets
+        // the candidate proceed to the real election where the
+        // bumped-term refusal in `send_vote` lands.
+        Ok(PreVoteResp {
+            term: req.next_term.saturating_sub(1),
+            vote_granted: true,
+        })
+    }
 }
 
 /// Leader steps down when an `AppendResponse` reports a higher
@@ -673,6 +707,19 @@ fn leader_steps_down_on_higher_term_append_response() {
             _req: InstallSnapshotReq<u16>,
         ) -> Result<InstallSnapshotResp, E> {
             Ok(InstallSnapshotResp { term: self.bumped_term })
+        }
+        async fn send_prevote(
+            &self,
+            _peer: u16,
+            req: PreVoteReq<u16>,
+        ) -> Result<PreVoteResp, E> {
+            // Same shape as the BumpTermTransport version but
+            // gated by the `bumped` flag.
+            let granted = !self.bumped.load(AO::Relaxed);
+            Ok(PreVoteResp {
+                term: req.next_term.saturating_sub(1),
+                vote_granted: granted,
+            })
         }
     }
 
@@ -841,4 +888,106 @@ fn cluster_converges_under_full_duplication() {
             s.last_log_index,
         );
     }
+}
+
+/// Pre-vote prevents term inflation from a flapping partition.
+///
+/// Setup: 3-node cluster with a stable leader at term T. We
+/// then partition one follower OUT of the cluster — its
+/// outbound RequestVote/PreVote can't reach the leader or the
+/// other follower. Without pre-vote, the isolated follower
+/// would:
+///   1. Time out election.
+///   2. Bump its term to T+1.
+///   3. Time out again (still isolated).
+///   4. Bump to T+2, T+3, ...
+///
+/// And on rejoin, its inflated term forces the leader to step
+/// down (Raft §5.1).
+///
+/// With pre-vote, the isolated follower's PreVote sends are
+/// dropped (transport refuses for the partitioned edge), so the
+/// pre-vote round never gets quorum, and the follower's
+/// `current_term` stays put. The leader's term is preserved
+/// across the partition.
+#[test]
+fn isolated_follower_does_not_inflate_term_under_pre_vote() {
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    // Wait for a stable leader at some term.
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges before partition",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_term = block_on(workers[&leader_id].handler().snapshot())
+        .expect("leader alive")
+        .current_term;
+
+    // Pick any non-leader node and isolate it: drop every
+    // outbound edge from it to its peers, AND every inbound
+    // edge from peers (so it can't receive heartbeats either).
+    let isolated = *members.iter().find(|p| **p != leader_id).unwrap();
+    transport.isolate(isolated, &members);
+
+    // Idle for ~10 election timeouts. Without pre-vote the
+    // isolated node would have bumped term ~10 times (election
+    // timeout 30-80ms; idle window 1000ms). With pre-vote, its
+    // pre-election rounds get dropped (no peer can reply),
+    // never reach quorum, and its term stays put.
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // The isolated node's term should be no more than 1 above
+    // the leader's term at partition time. (One bump is
+    // possible if it last received a heartbeat just barely
+    // before the partition began and the leader-check window
+    // expired before isolation took full effect — but
+    // pre-vote should keep it pinned.)
+    let isolated_snap = block_on(workers[&isolated].handler().snapshot())
+        .expect("isolated alive");
+    let drift = isolated_snap.current_term.saturating_sub(leader_term);
+    assert!(
+        drift <= 1,
+        "pre-vote failed to prevent term inflation: \
+         leader_term={leader_term}, isolated_term={} (drift={drift})",
+        isolated_snap.current_term,
+    );
+
+    // The leader's own term should be unchanged: pre-vote
+    // requests from the isolated node never reached it (and
+    // even if they had, pre-vote doesn't bump the responder's
+    // term).
+    let leader_snap_after = block_on(workers[&leader_id].handler().snapshot())
+        .expect("leader alive");
+    assert_eq!(
+        leader_snap_after.current_term, leader_term,
+        "leader's term must not have advanced during the partition",
+    );
+    assert_eq!(
+        leader_snap_after.role,
+        Role::Leader,
+        "leader must still be leader after the partition",
+    );
 }
