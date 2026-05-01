@@ -43,11 +43,19 @@ use vos_raft::{
 pub struct FaultStorage<S: Storage<u16> + Sync> {
     inner: S,
     /// `commit_batch` will return `Err` for this many subsequent
-    /// calls. Decremented per call.
+    /// calls.
     fail_commit: Arc<AtomicU64>,
     /// `load_meta` will return `Err` for this many subsequent
     /// calls.
     fail_load_meta: Arc<AtomicU64>,
+    /// `term_at` will return `Err` for this many subsequent
+    /// calls. Lets us exercise the AppendEntries consistency-check
+    /// failure path.
+    fail_term_at: Arc<AtomicU64>,
+    /// `entries` will return `Err` for this many subsequent
+    /// calls. Lets us exercise the heartbeat-construction
+    /// failure path.
+    fail_entries: Arc<AtomicU64>,
 }
 
 impl<S: Storage<u16> + Sync> FaultStorage<S> {
@@ -56,6 +64,8 @@ impl<S: Storage<u16> + Sync> FaultStorage<S> {
             inner,
             fail_commit: Arc::new(AtomicU64::new(0)),
             fail_load_meta: Arc::new(AtomicU64::new(0)),
+            fail_term_at: Arc::new(AtomicU64::new(0)),
+            fail_entries: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -65,6 +75,15 @@ impl<S: Storage<u16> + Sync> FaultStorage<S> {
 
     pub fn fail_load_meta_handle(&self) -> Arc<AtomicU64> {
         self.fail_load_meta.clone()
+    }
+
+    pub fn fail_term_at_handle(&self) -> Arc<AtomicU64> {
+        self.fail_term_at.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_entries_handle(&self) -> Arc<AtomicU64> {
+        self.fail_entries.clone()
     }
 }
 
@@ -103,9 +122,15 @@ impl<S: Storage<u16> + Sync> Storage<u16> for FaultStorage<S> {
         self.inner.snap_last_term()
     }
     async fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
+        if take_fault_budget(&self.fail_term_at) {
+            return Err(FaultErr);
+        }
         self.inner.term_at(index).await.map_err(map_err)
     }
     async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+        if take_fault_budget(&self.fail_entries) {
+            return Err(FaultErr);
+        }
         self.inner.entries(start, end).await.map_err(map_err)
     }
     async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
@@ -426,6 +451,67 @@ fn worker_signals_init_failure_on_load_meta_error() {
     );
 
     // Drop or shutdown joins the (already exited) thread.
+    worker.shutdown();
+}
+
+/// `term_at` failure during the AppendEntries consistency check
+/// propagates `Err` from `handle_append_entries`, the handler
+/// drops the reply silently (same shape as the
+/// `commit_batch`-failure case). The fallback fires from
+/// `WorkerHandle::handle_inbound_append`'s default reply.
+///
+/// First-call failure path verified here covers the
+/// `state.storage.term_at(req.prev_log_index).await?` site at
+/// the start of the consistency check.
+#[test]
+fn term_at_failure_during_consistency_check() {
+    let storage = FaultStorage::new(MemStorage::<u16>::new());
+    let fail_term = storage.fail_term_at_handle();
+    // First (and only) term_at call in this RPC's path will fail.
+    fail_term.store(1, Ordering::Relaxed);
+
+    let worker = Worker::spawn_with(
+        storage,
+        Arc::new(NoopT),
+        multi_cfg(),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let h = worker.handler();
+
+    let fut = h.handle_inbound_append(
+        0xBBBB,
+        AppendEntriesReq {
+            leader: 0xBBBB,
+            term: 5,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        },
+    );
+    let resp = run_with_timeout(fut, Duration::from_millis(200))
+        .expect("handle returned");
+    assert!(
+        !resp.success,
+        "follower must report failure when term_at lookup fails",
+    );
+
+    // After the fault budget is exhausted, the same RPC succeeds.
+    fail_term.store(0, Ordering::Relaxed);
+    let resp2 = block_on(h.handle_inbound_append(
+        0xBBBB,
+        AppendEntriesReq {
+            leader: 0xBBBB,
+            term: 5,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        },
+    ));
+    assert!(resp2.success, "second call must succeed once term_at faults clear");
     worker.shutdown();
 }
 
