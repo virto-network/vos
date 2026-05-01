@@ -221,3 +221,88 @@ When adding a new phase:
 - Update the deferred-pieces table in this file's relevant
   section.
 - Cross-reference `[N]` from columns.rs / classify.rs doc-comments.
+
+## Performance roadmap (Phases 52+)
+
+Phase 52 ran a side-by-side bench against Nexus zkVM 2.x on the
+same hardware, same Stwo upstream rev, same Rust toolchain.
+Result: zkpvm proves at roughly 5x the wall time of Nexus across
+log_size 10/12/14.  Per-cell cost is similar (we share the
+backend) — we just commit ≈3-5x more cells.  Top diagnoses:
+
+- **CpuChip is 1.77x wider per row** than Nexus's
+  (662 vs. 374 cells).  662 cols x 32K rows at log14 = 21.7M
+  cells, 76% of all committed cells.
+
+- **CpuChip is monolithic.**  Nexus splits per-opcode semantics
+  across 30 narrow per-instruction chips (AddChip, SubChip,
+  JalrChip, BneChip, ...), each constraining one opcode in its
+  own narrow row.  zkpvm crams every opcode constraint into one
+  wide CpuChip; every row carries 662 columns regardless of
+  which opcode is on it.
+
+See [`BENCHMARKS.md`](./BENCHMARKS.md) for the measured numbers
+and cell-count breakdown.
+
+### Phase 53 — CpuChip column audit + targeted reduction
+
+Survey the 662 per-row cells for fold-able columns:
+
+- **Sum-of-flags columns** like `IsMulUpper` (= `IsMulUpperUU +
+  IsMulUpperSU + IsMulUpperSS`) are pinned by an existing
+  identity constraint; the column is redundant if every reader
+  uses the sum directly.  Drop the column, replace readers with
+  the expression, drop the identity constraint.
+- **Source-byte multiplexers** like `SignSrcB` (=
+  `(1-Is32Bit)·val_b[7] + Is32Bit·val_b[3]`) materialise a
+  constant-degree expression of existing columns.  Same
+  treatment.
+- **Hi-nibble witnesses** like `SignBHiNib`: these ARE witnesses
+  (the prover writes them) but only feed a single nibble-AND
+  lookup.  Cannot fold without restructuring the lookup.
+
+Estimated headroom: -100 to -200 columns (CpuChip 662 → ~500),
+which translates to a 15-30% prove-time reduction at log14
+(roughly 2.5-4 seconds saved out of 12.92).  No soundness
+change.
+
+Each fold is mechanical but spans ~5 places per column (column
+enum, prog_mem flag list, prog_mem tuple emission verifier-side,
+prog_mem tuple emission prover-side, classify_opcode_for_program_memory,
+trace fill).  Plan: do them in batches of 5-10 columns with a
+sweep after each batch.
+
+### Phase 54 — per-opcode-family chip shards
+
+Following Phase 47's split, extract each opcode family from
+CpuChip into its own narrow chip with row count = number of
+matching real rows.  Mirrors Nexus's structure:
+
+- `AddChip`: rows = sum of `is_add` across the trace.  Holds
+  `val_b[8]`, `val_d[8]`, `result[8]`, `carry[8]`.  ~32 cells
+  per row.
+- `SubChip`, `MulChip`, `DivRemChip`, `BitwiseChip`,
+  `ShiftChip`, `BranchChip`, `LoadChip`, `StoreChip`,
+  `BitManipChip`, `RotateChip`, `CompareChip`, `MoveChip`.
+
+CpuChip becomes the per-step skeleton (PC, ts, regs, opcode,
+shared flag fan-out) — drop to ~80 cells per row.
+
+This is the structural change that closes the Nexus gap.  ~2-3x
+total cell reduction expected.  Major rewrite — needs careful
+phase plan, expected to span 5-10 sub-phases.
+
+### Phase 55 — ProgramMemoryChip column compaction
+
+74 cols x 65K rows = 4.85M cells, 17% of committed total.  Most
+of those cols are flag bits that could share a single packed
+column with bit-decomposition lookups (similar to the existing
+Range256 pattern).  Plausible 50% reduction = 2.4M fewer cells.
+
+### Phase 56 — Blake2bChip review
+
+2266 main columns is the largest single chip-column count in
+the codebase.  log_size = 4 keeps committed cells low (≈36K),
+so prove-time impact is small.  Worth reviewing for clarity —
+the chip was an early port and may have inherited columns that
+are now over-decomposed.
