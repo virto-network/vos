@@ -50,6 +50,24 @@ impl Transport<u16> for NoopT {
     }
 }
 
+/// `spawn_with_tokio_runtime` + `TokioClock` reaches Leader.
+///
+/// **What this test proves:** the `tokio::time::Sleep` returned
+/// by `TokioClock::sleep_until` is successfully driven by the
+/// current-thread runtime built inside `spawn_with_tokio_runtime`.
+/// Without the runtime, the first poll would panic
+/// (the companion test `spawn_with_panics_with_tokio_clock_no_runtime`
+/// pins that failure mode).
+///
+/// **What this test does NOT prove:** that `TokioClock` is
+/// behaviorally distinct from `StdClock`. Substituting
+/// `StdClock` for `TokioClock` here would still pass because
+/// `StdClock::Sleep` (a thread-spawn-based future) doesn't
+/// need tokio's timer driver and works under any executor.
+/// The TokioClock/StdClock distinction is about per-`Sleep`
+/// overhead (no thread spawn vs one thread spawn), which is a
+/// performance property, not an observable behavioral one.
+/// The strong differentiator is the panic test below.
 #[test]
 fn solo_cluster_self_elects_with_tokio_clock() {
     let storage = MemStorage::<u16>::new();
@@ -67,11 +85,6 @@ fn solo_cluster_self_elects_with_tokio_clock() {
         StdRng::from_entropy(),
     );
 
-    // Solo cluster wins its first election (quorum = 1) under
-    // any working clock — the value of this test is that
-    // `TokioClock::sleep_until` actually fires (without the
-    // tokio runtime built inside the spawn helper, the first
-    // poll panics with "no Tokio reactor running").
     let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while worker.role() != Role::Leader {
         assert!(
