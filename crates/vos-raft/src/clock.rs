@@ -249,6 +249,39 @@ impl Rng for StdRng {
     }
 }
 
+// ── Tokio-feature adapter ────────────────────────────────────
+
+/// Tokio-native [`Clock`] implementation. Wraps
+/// [`tokio::time::Instant`] for `now` / `add` and
+/// [`tokio::time::sleep_until`] for the sleep future.
+///
+/// Recommended for tokio-native hosts: avoids the thread-spawn
+/// overhead of [`StdClock::sleep_until`]. The clock has no state;
+/// the timer driver is provided by the host's tokio runtime.
+///
+/// Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokioClock;
+
+#[cfg(feature = "tokio")]
+impl Clock for TokioClock {
+    type Instant = tokio::time::Instant;
+    type Sleep = tokio::time::Sleep;
+
+    fn now(&self) -> Self::Instant {
+        tokio::time::Instant::now()
+    }
+
+    fn add(&self, instant: Self::Instant, duration: Duration) -> Self::Instant {
+        instant.checked_add(duration).unwrap_or(instant)
+    }
+
+    fn sleep_until(&self, deadline: Self::Instant) -> Self::Sleep {
+        tokio::time::sleep_until(deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

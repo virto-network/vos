@@ -93,6 +93,8 @@ pub mod worker;
 pub use clock::{ApplySink, Clock, Rng};
 #[cfg(feature = "std")]
 pub use clock::{StdClock, StdRng};
+#[cfg(feature = "tokio")]
+pub use clock::TokioClock;
 pub use config::{Config, NodeId};
 pub use log_entry::LogEntry;
 pub use meta::Meta;

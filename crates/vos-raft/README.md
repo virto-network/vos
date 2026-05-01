@@ -49,15 +49,25 @@ The std-feature defaults trade some thread spawns for simplicity:
   that calls `std::thread::sleep` and wakes the parent task.
   This avoids `futures-timer`'s shared-timer-wheel contention
   under heavy `cargo test` parallelism but is wasteful at
-  scale. Production deployments should plug their host
-  runtime's timer (`tokio::time`, `embassy_time`) directly
-  via the `Clock` trait.
+  scale. **Production tokio-native deployments should enable
+  the `tokio` feature and use `TokioClock` instead** — it
+  registers sleeps with the host's tokio timer driver and
+  doesn't spawn anything per `Delay`.
 - vos's `VosTransport` (in the `vos` crate, not here) spawns a
   helper thread per outbound RPC to bridge libp2p's sync reply
   channel to an async future.
 
 The core itself does not spawn anything; thread spawns are
 introduced by the std-feature convenience layer.
+
+### Picking a `Clock` impl
+
+| Host                    | Recommended `Clock`               | Why                                           |
+|-------------------------|-----------------------------------|-----------------------------------------------|
+| tokio                   | `TokioClock` (`tokio` feature)    | Native `tokio::time::sleep_until`, no spawns |
+| Embassy / no_std        | Your own (e.g. `embassy_time::Timer` wrapper) | No std deps                                  |
+| async-std / smol / quick smoke | `StdClock` (default)       | No external runtime dep, thread-per-Delay    |
+| Deterministic simulator | Your own (virtual clock)          | Ticks under test control                     |
 
 ## API surface
 

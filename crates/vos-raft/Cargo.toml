@@ -21,6 +21,12 @@ default = ["std"]
 # `Transport` traits, `MemStorage`). An embedded host implements
 # the worker driver itself against its async runtime.
 std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
+# `tokio` enables `TokioClock` — a `Clock` impl that uses
+# `tokio::time::sleep_until` instead of `StdClock`'s per-`Delay`
+# thread spawning. Recommended for tokio-native hosts; transparent
+# to the worker (just plug into `Worker::spawn_with`). Implies
+# `std`.
+tokio = ["std", "dep:tokio"]
 
 [dependencies]
 # Channels + `select!` + `FuturesUnordered` — only used by the
@@ -29,8 +35,16 @@ std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
 futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
 futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+# Tokio adapter — std-only, optional. Provides `TokioClock`.
+tokio = { version = "1", optional = true, default-features = false, features = ["time"] }
 
 [dev-dependencies]
 # Property-based testing — randomly generated AppendEntries /
 # RequestVote sequences vs. Raft safety invariants.
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+# Tokio runtime + macros + futures-channel re-import for the
+# `TokioClock` smoke test. The test is feature-gated to
+# `cfg(feature = "tokio")`, so these dev-deps only matter when
+# the test runs.
+tokio = { version = "1", default-features = false, features = ["time", "rt", "macros"] }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }

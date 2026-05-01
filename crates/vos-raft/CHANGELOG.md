@@ -7,6 +7,11 @@ surface is intentionally small but reserves room to grow via
 ## [Unreleased]
 
 ### Added
+- **`TokioClock`** behind the new `tokio` feature — uses
+  `tokio::time::sleep_until` instead of `StdClock`'s thread-per-`Delay`
+  approach. Recommended for tokio-native hosts; use
+  `Worker::spawn_with(..., TokioClock, ...)` and drive the
+  worker future on a tokio current-thread runtime.
 - **Async-by-default `Storage<N>` and `Transport<N>` traits**.
   Methods return `impl Future + Send`. Synchronous backends
   (`MemStorage`, the redb adapter in `vos`) just return ready
@@ -73,8 +78,9 @@ surface is intentionally small but reserves room to grow via
   See `Meta`'s docs.
 - **`StdClock::sleep_until` spawns a thread per `Delay`** to avoid
   `futures-timer`'s shared-timer contention under heavy
-  parallelism. Production deployments should plug their host
-  runtime's timer directly via the [`Clock`] trait.
+  parallelism. Tokio-native hosts should enable the `tokio`
+  feature and use `TokioClock` (`tokio::time::sleep_until`,
+  no thread spawns).
 
 ### Comparison vs `openraft`
 
