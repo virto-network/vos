@@ -4025,11 +4025,12 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
 fn raft_three_node_cluster_compacts_log_after_replication() {
     // Phase 6: log compaction. Three networked nodes form a Raft
     // cluster, the leader proposes 64 entries (well past the
-    // worker's COMPACT_HYSTERESIS = 16), every follower replicates
-    // them, and the leader compacts 1..=floor where floor =
-    // min(match_index across followers). We poll each replica's
-    // redb directly until raft_log row count drops below the
-    // hysteresis threshold + commit_index reaches 64.
+    // worker's default `Config::compact_hysteresis = 16`), every
+    // follower replicates them, and the leader compacts
+    // 1..=floor where floor = min(match_index across followers).
+    // We poll each replica's redb directly until raft_log row
+    // count drops below the hysteresis threshold + commit_index
+    // reaches 64.
     use crdt_counter::CrdtCounterClient;
     use std::time::{Duration, Instant};
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -4150,8 +4151,9 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         (&node_c, counter_c),
     ];
     // Drive enough state-changing inc()s that the leader's
-    // compaction routine kicks in (COMPACT_HYSTERESIS = 16
-    // entries past the previous snap pointer).
+    // compaction routine kicks in (default
+    // `Config::compact_hysteresis = 16` entries past the previous
+    // snap pointer).
     const N_INCS: u32 = 64;
     let try_inc = |tag: u32| -> bool {
         let until = Instant::now() + Duration::from_secs(20);
@@ -4213,7 +4215,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         min_rows = min_rows.min(n);
     }
     // The leader's log must have been compacted: rows ≪ N_INCS.
-    // We assert ≤ N_INCS - COMPACT_HYSTERESIS to leave slack.
+    // We assert ≤ N_INCS - compact_hysteresis to leave slack.
     assert!(
         min_rows < N_INCS as u64,
         "no replica compacted: min_rows={min_rows} ≥ N_INCS={N_INCS}",

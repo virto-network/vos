@@ -49,13 +49,22 @@ pub struct Config<N: NodeId> {
     /// worker doesn't interpret this; it just hands it to the
     /// transport.
     pub replication_id: [u8; 32],
+    /// Hysteresis for the leader's auto-compaction. The worker
+    /// only compacts when the eligible-up-to-index is at least
+    /// this many entries past the current snap pointer; otherwise
+    /// it would open a write txn on every heartbeat tick to drop
+    /// a single entry. Tuned conservatively at 16 by default —
+    /// production workloads with high churn can lower it.
+    /// Embedded targets writing to flash may want it larger.
+    pub compact_hysteresis: u64,
 }
 
 impl<N: NodeId> Config<N> {
     /// Construct with sensible defaults for everything except the
     /// caller-required fields. Election timeouts default to
     /// 150–300ms and the heartbeat interval to 50ms — Raft's
-    /// "10× smaller" guidance with margin.
+    /// "10× smaller" guidance with margin. Compaction hysteresis
+    /// defaults to 16.
     pub fn new(me: N, members: Vec<N>, replication_id: [u8; 32]) -> Self {
         Self {
             me,
@@ -63,6 +72,7 @@ impl<N: NodeId> Config<N> {
             election_timeout_ms: (150, 300),
             heartbeat_interval_ms: 50,
             replication_id,
+            compact_hysteresis: 16,
         }
     }
 }

@@ -51,12 +51,6 @@ use crate::rpc::{
 use crate::storage::{Storage, WriteBatch};
 use crate::transport::Transport;
 
-/// Hysteresis for the leader's auto-compaction. The worker only
-/// compacts when the eligible-up-to-index is at least this many
-/// entries past the current snap pointer; otherwise we'd open a
-/// write txn on every heartbeat tick to drop a single entry.
-pub const COMPACT_HYSTERESIS: u64 = 16;
-
 /// Reasons a [`WorkerHandle::propose`] can fail.
 ///
 /// `#[non_exhaustive]` because new failure modes (timeout,
@@ -1304,7 +1298,7 @@ where
         floor = floor.min(*v);
     }
     let snap = state.storage.snap_last_index();
-    if floor <= snap || floor.saturating_sub(snap) < COMPACT_HYSTERESIS {
+    if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());
     }
     let term_at_floor = match state.storage.term_at(floor).await? {
