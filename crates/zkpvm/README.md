@@ -170,6 +170,20 @@ End-to-end: bytecode → trace → prove → standalone verify →
 serialize / deserialize round-trip.  Runs in a few seconds on a
 modern desktop and prints the proof size + per-stage timing.
 
+```sh
+cargo run -p zkpvm --example multi_segment --release
+```
+
+Multi-segment proving: traces a 7-step program, slices the
+trace into two segments, proves each independently, and then
+runs `verify_chain` to check both per-segment validity AND
+boundary continuity (`segment_n.final_state ==
+segment_{n+1}.initial_state`).  Demonstrates the streaming-proof
+workflow for executions that exceed a single proof's log_size or
+that you want to prove across N parallel workers.  The example
+also forges segment 2's timestamp by one to show that
+`verify_chain` rejects mismatched boundaries.
+
 ## Fuzzing
 
 The `fuzz/` subcrate is a libFuzzer harness exercising the
