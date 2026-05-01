@@ -1804,4 +1804,96 @@ mod tests {
         assert!(!r.vote_granted, "shorter-log-same-term candidate must be refused");
         worker.shutdown();
     }
+
+    /// At-most-one-vote-per-term, more rigorously: the same
+    /// candidate asking twice at the same term must get the same
+    /// answer (idempotent grant), but the second grant must NOT
+    /// re-bump `voted_for` or fire a fresh persist. A
+    /// DIFFERENT candidate asking at the same term must be
+    /// refused — only one candidate per term ever wins our vote.
+    ///
+    /// The existing proptest property checks only two DIFFERENT
+    /// candidates; this test pins the same-candidate-twice
+    /// case so a future regression that mistakenly granted
+    /// duplicates would be caught at the unit level.
+    #[test]
+    fn at_most_one_vote_per_term_handles_same_candidate_twice() {
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let h = worker.handler();
+
+        // First vote: granted to candidate 0xBBBB at term 4.
+        let r1 = block_on(h.handle_inbound_vote(
+            0xBBBB,
+            RequestVoteReq {
+                candidate: 0xBBBB,
+                term: 4,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        ));
+        assert!(r1.vote_granted);
+        let snap1 = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap1.voted_for, Some(0xBBBB));
+        assert_eq!(snap1.current_term, 4);
+
+        // SAME candidate asks again at the SAME term — idempotent
+        // grant. The receiver may re-grant (since voted_for ==
+        // candidate), but voted_for / current_term must be
+        // unchanged.
+        let r2 = block_on(h.handle_inbound_vote(
+            0xBBBB,
+            RequestVoteReq {
+                candidate: 0xBBBB,
+                term: 4,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        ));
+        assert!(
+            r2.vote_granted,
+            "same-candidate re-ask at same term must be granted (idempotent)",
+        );
+        let snap2 = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            snap2.voted_for,
+            Some(0xBBBB),
+            "voted_for must still point at the same candidate after re-ask",
+        );
+        assert_eq!(snap2.current_term, 4);
+
+        // DIFFERENT candidate at SAME term — refused. This is
+        // the actual safety property: at most one candidate per
+        // term wins.
+        let r3 = block_on(h.handle_inbound_vote(
+            0xCCCC,
+            RequestVoteReq {
+                candidate: 0xCCCC,
+                term: 4,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        ));
+        assert!(
+            !r3.vote_granted,
+            "different candidate at the same term must be refused — \
+             only one vote per term",
+        );
+        let snap3 = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            snap3.voted_for,
+            Some(0xBBBB),
+            "voted_for must NOT have been overwritten by the rejected RequestVote",
+        );
+
+        worker.shutdown();
+    }
 }
