@@ -149,3 +149,13 @@ lint:
 # Check everything compiles without building artifacts
 check:
     cargo check --all-targets
+
+# Verify vos-raft builds on representative no_std + alloc embedded
+# targets. Catches regressions to the alloc-only code paths
+# (anything accidentally pulling in std::collections, std::time,
+# etc.) at CI time before a downstream Embassy / firmware user
+# breaks. Requires the riscv32imc-unknown-none-elf and
+# thumbv7em-none-eabihf rustup targets.
+check-no-std:
+    cargo build -p vos-raft --no-default-features --target thumbv7em-none-eabihf
+    cargo build -p vos-raft --no-default-features --target riscv32imc-unknown-none-elf
