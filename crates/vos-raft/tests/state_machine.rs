@@ -385,3 +385,203 @@ fn leader_replicates_to_a_lagging_follower() {
         "all replicas reach commit_index ≥ 5",
     );
 }
+
+/// `BumpTermTransport` returns a fixed bumped-term response to
+/// every outbound RPC, simulating a leader/candidate that has
+/// fallen behind the cluster's current term. The worker's
+/// `handle_*_response` paths must step the local replica down to
+/// Follower and persist the new term.
+struct BumpTermTransport {
+    /// Term value reported in every outbound response.
+    bumped_term: u64,
+}
+
+#[derive(Debug)]
+struct BumpTermErr;
+impl core::fmt::Display for BumpTermErr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "bump-term")
+    }
+}
+impl std::error::Error for BumpTermErr {}
+
+impl Transport<u16> for BumpTermTransport {
+    type Error = BumpTermErr;
+    async fn send_append(
+        &self,
+        _peer: u16,
+        _req: AppendEntriesReq<u16>,
+    ) -> Result<AppendEntriesResp, Self::Error> {
+        Ok(AppendEntriesResp {
+            term: self.bumped_term,
+            success: false,
+            match_index: 0,
+        })
+    }
+    async fn send_vote(
+        &self,
+        _peer: u16,
+        _req: RequestVoteReq<u16>,
+    ) -> Result<RequestVoteResp, Self::Error> {
+        Ok(RequestVoteResp {
+            term: self.bumped_term,
+            vote_granted: false,
+        })
+    }
+    async fn send_install(
+        &self,
+        _peer: u16,
+        _req: InstallSnapshotReq<u16>,
+    ) -> Result<InstallSnapshotResp, Self::Error> {
+        Ok(InstallSnapshotResp { term: self.bumped_term })
+    }
+}
+
+/// Leader steps down when an `AppendResponse` reports a higher
+/// term than its own. Raft §5.1: any RPC reply at a higher term
+/// causes the receiver to revert to Follower and adopt the term.
+#[test]
+fn leader_steps_down_on_higher_term_append_response() {
+    // Stateful transport: grants the FIRST vote (so the
+    // candidate becomes Leader), then on the leader's first
+    // outbound AppendEntries returns a bumped term and stops
+    // granting subsequent votes. Without the "stop granting
+    // votes" gate, the worker would oscillate Leader → Follower
+    // → Candidate → Leader → ... eventually reaching a term ≥
+    // bumped_term where step-down stops firing, and the test's
+    // polling loop could miss the brief Follower window.
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
+
+    struct StepDownTransport {
+        bumped_term: u64,
+        bumped: AtomicBool,
+    }
+    #[derive(Debug)]
+    struct E;
+    impl core::fmt::Display for E {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "x")
+        }
+    }
+    impl std::error::Error for E {}
+    impl Transport<u16> for StepDownTransport {
+        type Error = E;
+        async fn send_vote(
+            &self,
+            _peer: u16,
+            req: RequestVoteReq<u16>,
+        ) -> Result<RequestVoteResp, E> {
+            // First vote: grant at candidate's term so it wins.
+            // Once the leader has been bumped, refuse to grant
+            // further votes so the worker stays Follower.
+            let granted = !self.bumped.load(AO::Relaxed);
+            Ok(RequestVoteResp {
+                term: req.term,
+                vote_granted: granted,
+            })
+        }
+        async fn send_append(
+            &self,
+            _peer: u16,
+            _req: AppendEntriesReq<u16>,
+        ) -> Result<AppendEntriesResp, E> {
+            // Mark the bumped flag so the next vote round refuses.
+            self.bumped.store(true, AO::Relaxed);
+            Ok(AppendEntriesResp {
+                term: self.bumped_term,
+                success: false,
+                match_index: 0,
+            })
+        }
+        async fn send_install(
+            &self,
+            _peer: u16,
+            _req: InstallSnapshotReq<u16>,
+        ) -> Result<InstallSnapshotResp, E> {
+            Ok(InstallSnapshotResp { term: self.bumped_term })
+        }
+    }
+
+    let transport = Arc::new(StepDownTransport {
+        bumped_term: 99,
+        bumped: AtomicBool::new(false),
+    });
+    let storage = MemStorage::<u16>::new();
+    let mut cfg_2 = Config::new(0xAAAA, vec![0xAAAA, 0xBBBB], [0xC0; 32]);
+    cfg_2.election_timeout_ms = (30, 80);
+    cfg_2.heartbeat_interval_ms = 15;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg_2,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+
+    // The candidate wins the first election (vote granted), then
+    // its first heartbeat receives the bumped reply and steps
+    // down. After that the transport refuses further votes, so
+    // the worker stays Follower at term ≥ 99.
+    let h = worker.handler();
+    wait_until(
+        || {
+            block_on(h.snapshot())
+                .map(|s| s.role == Role::Follower && s.current_term >= 99)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "leader steps down on bumped-term AppendResponse and stays Follower",
+    );
+
+    let snap = block_on(h.snapshot()).unwrap();
+    assert_eq!(snap.role, Role::Follower);
+    assert!(
+        snap.current_term >= 99,
+        "term must reach (and stay at) the bumped value reported by the peer; got {}",
+        snap.current_term,
+    );
+}
+
+/// Candidate steps down when a `VoteResponse` reports a higher
+/// term than its own. Symmetric to the AppendResponse case.
+#[test]
+fn candidate_steps_down_on_higher_term_vote_response() {
+    let transport = Arc::new(BumpTermTransport { bumped_term: 99 });
+    let storage = MemStorage::<u16>::new();
+    // 2-node cluster — needs the peer's vote to win, so the
+    // candidate is forced to send a RequestVote and observe
+    // the bumped reply.
+    let mut cfg_2 = Config::new(0xAAAA, vec![0xAAAA, 0xBBBB], [0xC0; 32]);
+    cfg_2.election_timeout_ms = (30, 80);
+    cfg_2.heartbeat_interval_ms = 15;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg_2,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+
+    // The candidate's first RequestVote receives term=99 —
+    // worker steps down to Follower and adopts the new term.
+    // Election timer resets and may fire again at term 100, etc.,
+    // each time getting bumped back. So we observe by checking
+    // current_term reaches at least 99.
+    let h = worker.handler();
+    wait_until(
+        || {
+            block_on(h.snapshot())
+                .map(|s| s.current_term >= 99)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "current_term reaches the bumped value reported by the peer",
+    );
+    let snap = block_on(h.snapshot()).unwrap();
+    assert!(snap.current_term >= 99);
+    // After step-down the role is Follower (until the next
+    // election timer fires; we may catch either, so just assert
+    // term).
+}

@@ -1560,4 +1560,173 @@ mod tests {
             "idle worker called sleep_until {n} times in 100ms — busy-spin regression",
         );
     }
+
+    /// Multi-entry truncation: a follower's tail conflicts with the
+    /// leader's batch starting at the *first* entry, so all
+    /// pre-existing entries must be dropped. Single-entry truncation
+    /// is exercised by `follower_truncates_conflicting_tail_then_appends`
+    /// in vos's facade tests; this verifies the ≥2-entry conflict
+    /// path doesn't have an off-by-one in the truncate-from index.
+    #[test]
+    fn follower_truncates_multiple_entries_at_root_conflict() {
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let h = worker.handler();
+
+        // Seed the follower with three entries at term 1.
+        let r1 = block_on(h.handle_inbound_append(
+            0xBBBB,
+            AppendEntriesReq {
+                leader: 0xBBBB,
+                term: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: alloc::vec![
+                    LogEntry { index: 1, term: 1, payload: alloc::vec![1] },
+                    LogEntry { index: 2, term: 1, payload: alloc::vec![1] },
+                    LogEntry { index: 3, term: 1, payload: alloc::vec![1] },
+                ],
+            },
+        ));
+        assert!(r1.success);
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap.last_log_index, 3);
+
+        // Higher-term leader sends three NEW entries at the same
+        // indices — every existing entry diverges from the first.
+        // The follower must drop all three and graft the new ones.
+        let r2 = block_on(h.handle_inbound_append(
+            0xCCCC,
+            AppendEntriesReq {
+                leader: 0xCCCC,
+                term: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: alloc::vec![
+                    LogEntry { index: 1, term: 2, payload: alloc::vec![2] },
+                    LogEntry { index: 2, term: 2, payload: alloc::vec![2] },
+                    LogEntry { index: 3, term: 2, payload: alloc::vec![2] },
+                ],
+            },
+        ));
+        assert!(r2.success);
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap.last_log_index, 3);
+        assert_eq!(snap.current_term, 2);
+        worker.shutdown();
+    }
+
+    /// Snapshot install where `last_included_index > last_log_index`:
+    /// a stale follower whose log is far behind the leader's snap
+    /// pointer. The follower drops everything, sets snap pointer +
+    /// last_index to the leader's value, replaces state row.
+    #[test]
+    fn snapshot_install_past_last_log_index() {
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let h = worker.handler();
+
+        // Fresh follower (last_log_index = 0). Leader installs a
+        // snapshot at index 100.
+        let resp = block_on(h.handle_inbound_install(
+            0xBBBB,
+            InstallSnapshotReq {
+                leader: 0xBBBB,
+                term: 5,
+                last_included_index: 100,
+                last_included_term: 4,
+                snapshot: alloc::vec![0xAA; 32],
+            },
+        ));
+        assert_eq!(resp.term, 5);
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap.snap_last_index, 100);
+        assert_eq!(snap.commit_index, 100);
+        assert_eq!(snap.last_applied, 100);
+        // last_log_index follows the snap pointer when the live
+        // log is empty (per `MemStorage::last_index` fallback).
+        assert_eq!(snap.last_log_index, 100);
+        worker.shutdown();
+    }
+
+    /// Vote rejected because the candidate's log is less up-to-date
+    /// than the follower's. Raft §5.4.1: a follower refuses if its
+    /// own last entry has a higher term, or the same term with a
+    /// higher index.
+    #[test]
+    fn vote_refused_when_candidate_log_is_stale() {
+        let storage = MemStorage::<u16>::new();
+        let transport = Arc::new(RecordingTransport::default());
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let h = worker.handler();
+
+        // Seed the follower's log with one entry at term 5.
+        let r = block_on(h.handle_inbound_append(
+            0xBBBB,
+            AppendEntriesReq {
+                leader: 0xBBBB,
+                term: 5,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: alloc::vec![LogEntry {
+                    index: 1, term: 5, payload: alloc::vec![1],
+                }],
+            },
+        ));
+        assert!(r.success);
+
+        // Candidate at term 6 with a stale log (last_log_term=2,
+        // way behind our term 5). Refused.
+        let r = block_on(h.handle_inbound_vote(
+            0xCCCC,
+            RequestVoteReq {
+                candidate: 0xCCCC,
+                term: 6,
+                last_log_index: 99, // even though the index is high…
+                last_log_term: 2,   // …the term is below ours.
+            },
+        ));
+        assert!(!r.vote_granted, "stale-log candidate must be refused");
+        // Term still updates (§5.1: bumps on RequestVote at higher term).
+        assert_eq!(r.term, 6);
+
+        // Same-term-but-shorter-log: also refused.
+        let r = block_on(h.handle_inbound_vote(
+            0xCCCC,
+            RequestVoteReq {
+                candidate: 0xCCCC,
+                term: 7,
+                last_log_index: 0,
+                last_log_term: 5,
+            },
+        ));
+        assert!(!r.vote_granted, "shorter-log-same-term candidate must be refused");
+        worker.shutdown();
+    }
 }
