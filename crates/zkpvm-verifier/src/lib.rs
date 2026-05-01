@@ -28,8 +28,11 @@ use stwo::{
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
-// Re-export the Proof type
-pub use zkpvm::Proof;
+// Re-export the Proof type + the format-version constant the verifier
+// was compiled against.  Callers can compare against
+// `proof.format_version` themselves for early rejection at the network
+// boundary, or just rely on `verify_standalone`'s built-in check.
+pub use zkpvm::{Proof, PROOF_FORMAT_VERSION};
 
 use zkpvm::framework_access::{
     create_verifier_components, draw_all_lookup_elements, AllLookupElements,
@@ -52,6 +55,16 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
+    // Phase 42: reject proofs from a different AIR shape early, before
+    // any cryptographic work.  Done first because every subsequent
+    // length check assumes the AIR shape this verifier was compiled
+    // against.
+    if proof.format_version != PROOF_FORMAT_VERSION {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof format version mismatch: verifier expects {}, proof has {}",
+            PROOF_FORMAT_VERSION, proof.format_version,
+        )));
+    }
     let Proof {
         stark_proof,
         claimed_sums,

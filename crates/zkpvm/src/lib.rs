@@ -128,7 +128,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::BitcountChip,
 ];
 
-pub use proof::{Proof, SegmentState};
+pub use proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
 #[cfg(feature = "prover")]
 pub use prove::{prove, prove_with_config, prove_profiled, prove_profiled_with_config, ProveProfile, production_pcs_config};
 #[cfg(feature = "prover")]

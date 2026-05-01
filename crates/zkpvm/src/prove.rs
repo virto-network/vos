@@ -22,7 +22,7 @@ use crate::trace::{
 use super::BASE_COMPONENTS;
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
-pub use crate::proof::{Proof, SegmentState};
+pub use crate::proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
 
 /// Timing breakdown of the proving pipeline.
 #[derive(Clone, Debug)]
@@ -304,6 +304,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
     };
 
     Ok((Proof {
+        format_version: PROOF_FORMAT_VERSION,
         stark_proof: proof,
         claimed_sums,
         num_components,

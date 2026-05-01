@@ -46,6 +46,17 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
 
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
     let components = BASE_COMPONENTS;
+    // Phase 42: reject proofs from a different AIR shape early, before
+    // any cryptographic work.  `format_version` is bumped whenever the
+    // chip list / column counts / lookup-tuple shape changes in a way
+    // that would make an older verifier silently accept the wrong thing.
+    if proof.format_version != crate::proof::PROOF_FORMAT_VERSION {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof format version mismatch: verifier expects {}, proof has {}",
+            crate::proof::PROOF_FORMAT_VERSION,
+            proof.format_version,
+        )));
+    }
     let Proof {
         stark_proof: proof,
         claimed_sums,
