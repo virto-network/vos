@@ -2251,8 +2251,20 @@ where
             ..Default::default()
         })
         .await?;
+    let me = state.cfg.me;
+    let me_was_voter = final_members.contains(&me);
     state.effective_cfg = ActiveConfig::steady(final_members);
     rebuild_leader_tracking(state);
+    // If the membership change removed us from the new
+    // configuration, retire (Ongaro thesis §4.3): the leader
+    // keeps serving long enough to replicate the final
+    // non-joint entry, then steps down so the next leader
+    // emerges from the new set. Without this the removed
+    // leader runs forever, blocking elections in the new set
+    // until its term-mismatch eventually wins out.
+    if !me_was_voter {
+        step_down(state);
+    }
     Ok(())
 }
 

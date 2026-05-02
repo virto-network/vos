@@ -140,10 +140,6 @@ surface is intentionally small but reserves room to grow via
 ### Known limitations (deferred for future commits)
 - **No learner role** — every `Config::members` entry is a full
   voter.
-- **No leader-removed retirement** — when a `change_membership`
-  removes the current leader, the leader keeps serving until
-  the final non-joint ConfigChange entry replicates. It does
-  not preemptively step down on commit of the joint entry.
 - **Membership recovery via snapshot is not surfaced** — when
   the leader compacts past a `ConfigChange` entry, only the
   log-tail scan recovers the active config on restart. Hosts

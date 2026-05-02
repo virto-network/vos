@@ -1480,3 +1480,67 @@ fn change_membership_grows_cluster_via_joint_consensus() {
         "after joint phase retires, a new change_membership must be accepted, got {post:?}",
     );
 }
+
+/// A leader that removes itself from the new configuration must
+/// step down once the final non-joint entry commits, so the
+/// remaining replicas elect a new leader from the new set
+/// (Ongaro thesis §4.3).
+#[test]
+fn change_membership_removing_leader_makes_it_step_down() {
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let initial = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in initial.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, initial.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || initial.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *initial
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+
+    // Remove the leader: new membership is the other two nodes.
+    let new_members: Vec<u16> = initial
+        .iter()
+        .copied()
+        .filter(|p| *p != leader_id)
+        .collect();
+    let _joint_index = block_on(leader_handle.change_membership(new_members.clone()))
+        .expect("change_membership accepted");
+
+    // The leader must step down once the final non-joint entry
+    // commits. Allow generous time — finalization happens after
+    // a quorum from the joint set, then the leader replicates
+    // the final entry.
+    wait_until(
+        || workers[&leader_id].role() != Role::Leader,
+        Duration::from_secs(10),
+        "removed leader steps down",
+    );
+
+    // The remaining nodes elect a new leader from the new set.
+    wait_until(
+        || new_members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(10),
+        "new leader emerges from the post-transition set",
+    );
+}
