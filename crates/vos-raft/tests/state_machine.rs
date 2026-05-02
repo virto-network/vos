@@ -1367,6 +1367,8 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
                 offset,
                 done: was_final,
                 data,
+                members: Vec::new(),
+                joint_old: None,
             },
         ));
         chunks_sent += 1;
@@ -1429,6 +1431,8 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             offset: 0,
             done: false,
             data: chunk_a.clone(),
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r0.bytes_received, 16);
@@ -1445,6 +1449,8 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             offset: 0,
             done: false,
             data: chunk_a.clone(),
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r0_dup.bytes_received, 16);
@@ -1460,6 +1466,8 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             offset: 16,
             done: true,
             data: chunk_b,
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r1.bytes_received, 32);
@@ -1501,6 +1509,8 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
             offset: 0,
             done: false,
             data: vec![0xAA; 16],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r0.bytes_received, 16);
@@ -1517,6 +1527,8 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
             offset: 100,
             done: false,
             data: vec![0xCC; 16],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(
@@ -1570,6 +1582,8 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             offset: 0,
             done: false,
             data: vec![0xAA; 24],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r0.bytes_received, 24, "first chunk must accept under cap");
@@ -1587,6 +1601,8 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             offset: 24,
             done: true,
             data: vec![0xBB; 16],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(
@@ -1613,6 +1629,8 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             offset: 0,
             done: true,
             data: vec![0xCC; 16],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(r2.bytes_received, 16);

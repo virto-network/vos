@@ -6,6 +6,36 @@ surface is intentionally small but reserves room to grow via
 
 ## [Unreleased]
 
+### Audit follow-ups (May 2026)
+
+Two further hardening changes from the audit's "remaining
+caveats" list:
+
+- **`InstallSnapshotReq` carries cluster membership**
+  (wire-breaking). New `members: Vec<N>` and
+  `joint_old: Option<Vec<N>>` fields populate from the leader's
+  `effective_cfg` on the final chunk (`done = true`); the
+  follower writes them via `WriteBatch::active_config` in the
+  same atomic install batch. Closes the long-standing gap
+  where a fresh follower whose first activity was an
+  `InstallSnapshot` at a high index had no way to learn the
+  cluster's current shape and would silently retain its static
+  `Config::members`. Empty `members` on the wire is
+  interpreted as "leader from an older crate version" and
+  preserves the prior behavior (keep current `effective_cfg`).
+  Pinned by
+  `install_snapshot_adopts_leader_supplied_membership_on_fresh_follower`.
+  Vos's libp2p frame layer doesn't yet ferry the new fields —
+  same caveat as the existing chunked-offset gap; vos workers
+  don't currently emit `change_membership` either, so the
+  divergence is benign in practice until membership changes
+  land in vos.
+- **`try_compact` runtime-caps floor at `commit_index`**
+  (defense-in-depth). The previous `debug_assert!` only fired
+  in debug builds; in release a future refactor that broke the
+  no-op invariant could silently compact past committed state.
+  The cap is one extra `min` per heartbeat tick.
+
 ### Audit fixes (May 2026 protocol-correctness review)
 
 Four safety/liveness bugs surfaced during a protocol audit:

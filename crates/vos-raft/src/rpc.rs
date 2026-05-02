@@ -119,8 +119,22 @@ pub struct PreVoteResp {
 /// buffer.len()`; the leader resumes from there. The default
 /// in-crate impl assumes strict in-order delivery and resets if
 /// the offset doesn't match.
+///
+/// ## Membership
+///
+/// Snapshots ferry the leader's `effective_cfg` so a follower
+/// whose first activity is an InstallSnapshot at a high index
+/// can learn the cluster membership at that point — the snapshot
+/// bytes are opaque to the consensus layer, so without this the
+/// follower would have to fall back to its static `Config::members`
+/// (potentially wrong if the cluster has changed shape since
+/// boot). The leader copies these from its in-memory active
+/// configuration; the follower writes them via
+/// `WriteBatch::active_config` in the same atomic install batch
+/// as the snap-pointer advance. Only present on the FINAL chunk
+/// (`done = true`) — intermediate chunks leave them empty / None.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallSnapshotReq<N> {
+pub struct InstallSnapshotReq<N: NodeId> {
     pub leader: N,
     pub term: u64,
     pub last_included_index: u64,
@@ -135,6 +149,20 @@ pub struct InstallSnapshotReq<N> {
     pub done: bool,
     /// Bytes for *this chunk only* (not the whole snapshot).
     pub data: Vec<u8>,
+    /// Cluster membership at `last_included_index`. The leader
+    /// fills from its `effective_cfg.current`; the follower
+    /// adopts this as its post-install membership view. Only
+    /// meaningful on the final chunk (`done = true`); set to an
+    /// empty Vec on intermediate chunks. An empty Vec on the
+    /// final chunk is interpreted as "leader didn't supply
+    /// membership" and the follower keeps whatever
+    /// `effective_cfg` it had pre-install (back-compat with
+    /// transports that haven't been updated).
+    pub members: Vec<N>,
+    /// Joint-old set when `last_included_index` falls in a
+    /// joint-consensus phase, otherwise `None`. Mirrors
+    /// `EntryKind::ConfigChange::joint_old`.
+    pub joint_old: Option<Vec<N>>,
 }
 
 /// Reply to [`InstallSnapshotReq`].

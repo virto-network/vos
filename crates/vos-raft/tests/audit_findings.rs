@@ -826,6 +826,8 @@ fn install_snapshot_persists_effective_cfg_after_compaction() {
             offset: 0,
             done: true,
             data: vec![0xCC; 8],
+            members: Vec::new(),
+            joint_old: None,
         },
     ));
     assert_eq!(resp.bytes_received, 8);
@@ -850,5 +852,62 @@ fn install_snapshot_persists_effective_cfg_after_compaction() {
     assert!(
         log.is_empty(),
         "log entries ≤ last_included_index should be compacted away; got {log:?}",
+    );
+}
+
+/// A fresh follower whose first activity is an `InstallSnapshot`
+/// at a high index has no log to scan and no useful prior
+/// `effective_cfg` — it must learn the cluster's current
+/// membership from the leader-supplied `members` field on the
+/// install RPC. Without that path, the follower would keep its
+/// static `cfg.members` and silently disagree with the rest of
+/// the cluster on quorum / heartbeat targets.
+#[test]
+fn install_snapshot_adopts_leader_supplied_membership_on_fresh_follower() {
+    let storage = SharedStorage::new();
+    let storage_handle = storage.clone();
+
+    // cfg.members is a SINGLE-NODE set; the live cluster (per
+    // the leader's view) is 3-node. We expect the follower to
+    // adopt [1,2,3] from the install RPC, not stay on [42].
+    let mut c = vos_raft::Config::new(42u16, vec![42u16], [0u8; 32]);
+    c.election_timeout_ms = (60_000, 120_000);
+    c.heartbeat_interval_ms = 30_000;
+    c.pre_vote = false;
+    let worker = Worker::spawn_with(
+        storage_handle,
+        Arc::new(NoopT),
+        c,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("init succeeds");
+    let h = worker.handler();
+
+    let resp = block_on(h.handle_inbound_install(
+        1u16,
+        InstallSnapshotReq {
+            leader: 1u16,
+            term: 7,
+            last_included_index: 100,
+            last_included_term: 6,
+            offset: 0,
+            done: true,
+            data: vec![0xAB; 16],
+            members: vec![1u16, 2, 3],
+            joint_old: None,
+        },
+    ));
+    assert_eq!(resp.bytes_received, 16);
+
+    worker.shutdown();
+
+    let persisted = storage.read_active_config();
+    assert_eq!(
+        persisted,
+        Some((vec![1u16, 2, 3], None)),
+        "follower must adopt leader-supplied membership, not silently \
+         retain cfg.members; got {persisted:?}",
     );
 }

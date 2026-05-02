@@ -352,6 +352,8 @@ proptest! {
                             offset: 0,
                             done: true,
                             data: vec![0xFF; 4],
+                            members: Vec::new(),
+                            joint_old: None,
                         },
                     ));
                 }

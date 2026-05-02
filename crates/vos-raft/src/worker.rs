@@ -1980,25 +1980,41 @@ where
     state.meta.snap_last_term = req.last_included_term;
     state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
 
-    // Audit-found bug: snapshot installs that compact past the
-    // entry that produced our cached `active_config_index` left
-    // the follower's persisted active_config row in step with
-    // pre-install log history (the old entry was still alive at
-    // the time the row was last written). Once the entry is
-    // compacted away, a future reboot would scan the post-install
-    // log (now empty up through last_included_index) and hit the
-    // `cfg.members` fallback instead of the live in-memory view.
-    // Persist the current `effective_cfg` alongside the snapshot
-    // commit so the on-disk active_config row reflects the
-    // post-compaction state. `active_config_index` is invalidated
-    // if it pointed at a now-compacted entry.
+    // Snapshot installs compact past every log entry up to
+    // `last_included_index`. Two membership concerns need
+    // handling in the same atomic batch as the snap-pointer
+    // advance:
+    //
+    // 1. If the leader supplied `members` (and possibly
+    //    `joint_old`), they ARE the authoritative membership at
+    //    `last_included_index`. Adopt them — this is the only
+    //    path by which a fresh follower whose first activity is
+    //    an InstallSnapshot can learn the cluster's current
+    //    shape. `members.is_empty()` means the leader is from
+    //    an older crate version and didn't supply them; fall
+    //    back to keeping the existing `effective_cfg`.
+    // 2. Persist the resulting `effective_cfg` to the
+    //    `active_config` row so a future reboot whose log scan
+    //    finds nothing (compacted away) can still recover.
+    // 3. `active_config_index` / `pending_joint_entry` pointing
+    //    at a now-compacted entry are invalidated.
+    let mut new_effective_cfg: Option<ActiveConfig<N>> = None;
+    if !req.members.is_empty() {
+        new_effective_cfg = Some(ActiveConfig {
+            current: req.members.clone(),
+            joint_old: req.joint_old.clone(),
+        });
+    }
+    let active_config_for_batch = Some(match &new_effective_cfg {
+        Some(cfg) => (cfg.current.clone(), cfg.joint_old.clone()),
+        None => (
+            state.effective_cfg.current.clone(),
+            state.effective_cfg.joint_old.clone(),
+        ),
+    });
     let snap_invalidates_cfg_idx = state
         .active_config_index
         .is_some_and(|idx| idx <= req.last_included_index);
-    let active_config_for_batch = Some((
-        state.effective_cfg.current.clone(),
-        state.effective_cfg.joint_old.clone(),
-    ));
     if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
@@ -2013,14 +2029,21 @@ where
         state.meta = meta_snapshot;
         return Err(e);
     }
-    if snap_invalidates_cfg_idx {
+    if let Some(cfg) = new_effective_cfg {
+        state.effective_cfg = cfg;
+        // The membership view we just adopted has no anchoring
+        // log entry on this replica (the snapshot subsumed
+        // whatever ConfigChange produced it). Subsequent
+        // truncates can't invalidate it via the live-log path.
         state.active_config_index = None;
-        // The originating ConfigChange is gone from the live log;
-        // a joint-phase auto_finalize would have nothing to anchor
-        // against either. Clear the pending pointer so a stale
-        // index doesn't accidentally satisfy the
-        // `commit_index >= joint_idx` test on a different entry
-        // later. A fresh leader-issued joint will re-prime it.
+        // A joint-phase view recovered via snapshot can't
+        // auto-finalize from this replica either — leader-side
+        // joint_idx isn't known to us, so wait for a leader-
+        // emitted joint-or-final ConfigChange to re-prime.
+        state.pending_joint_entry = None;
+        rebuild_leader_tracking(state);
+    } else if snap_invalidates_cfg_idx {
+        state.active_config_index = None;
         if state
             .pending_joint_entry
             .is_some_and(|idx| idx <= req.last_included_index)
@@ -2815,6 +2838,18 @@ where
                 );
             }
 
+            // Only the final chunk carries membership — the
+            // follower commits the install atomically with the
+            // active_config write, and intermediate chunks would
+            // pay the bandwidth twice for no benefit.
+            let (members, joint_old) = if was_final {
+                (
+                    state.effective_cfg.current.clone(),
+                    state.effective_cfg.joint_old.clone(),
+                )
+            } else {
+                (Vec::new(), None)
+            };
             let req = InstallSnapshotReq {
                 leader: me,
                 term,
@@ -2823,6 +2858,8 @@ where
                 offset: resume_offset,
                 done: was_final,
                 data: chunk,
+                members,
+                joint_old,
             };
             let transport = state.transport.clone();
             let fut: RpcFut<N> = Box::pin(async move {
@@ -2899,23 +2936,23 @@ where
     // capped by the committed prefix because we only compact
     // entries the worker is willing to lose locally — the peer
     // that's behind can request the snapshot.
-    let Some(floor) = state.match_index_majority_floor().await else {
+    let Some(majority_floor) = state.match_index_majority_floor().await else {
         return Ok(());
     };
+    // Defense-in-depth: compaction must NEVER cross
+    // commit_index. With the leader-promotion no-op
+    // (Ongaro §6.4) and the current-term-only commit rule, the
+    // majority-replicated floor and commit_index advance
+    // together, so in practice `majority_floor <=
+    // commit_index`. We hard-cap at `commit_index` instead of
+    // a `debug_assert!` so a future refactor that introduces a
+    // path where the two diverge cannot silently compact past
+    // committed state in release builds.
+    let floor = majority_floor.min(state.meta.commit_index);
     let snap = state.storage.snap_last_index();
     if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());
     }
-    // Sanity: never compact past commit_index. The
-    // majority-floor is bounded by replicated indices, which
-    // for a current-term leader are also committed indices,
-    // but the assertion documents the invariant for future
-    // refactors.
-    debug_assert!(
-        floor <= state.meta.commit_index,
-        "try_compact: floor ({floor}) must not exceed commit_index ({})",
-        state.meta.commit_index,
-    );
     let term_at_floor = match state.storage.term_at(floor).await? {
         Some(t) => t,
         None => return Ok(()),
@@ -3389,6 +3426,8 @@ mod tests {
                 offset: 0,
                 done: true,
                 data: alloc::vec![0xAA; 32],
+                members: Vec::new(),
+                joint_old: None,
             },
         ));
         assert_eq!(resp.term, 5);
@@ -3589,6 +3628,8 @@ mod tests {
             offset: 0,
             done: true,
             data: alloc::vec![0xAA; 16],
+            members: Vec::new(),
+            joint_old: None,
         };
 
         let r1 = block_on(h.handle_inbound_install(0xBBBB, req()));
@@ -3627,6 +3668,8 @@ mod tests {
                 offset: 0,
                 done: true,
                 data: alloc::vec![0xBB; 8],
+                members: Vec::new(),
+                joint_old: None,
             },
         ));
         assert_eq!(r3.term, 7);

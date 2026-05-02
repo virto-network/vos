@@ -354,6 +354,8 @@ impl RaftRpcHandler for WorkerHandle {
             offset: 0,
             done: true,
             data: snapshot,
+            members: Vec::new(),
+            joint_old: None,
         };
         let resp = block_on(self.inner.handle_inbound_install(from_prefix, req));
         RaftInstallSnapshotResult { term: resp.term }
