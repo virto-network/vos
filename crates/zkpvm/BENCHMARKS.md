@@ -1,8 +1,8 @@
 # zkpvm — performance benchmarks
 
-A snapshot of where zkpvm sits at branch tip `e4699f6` (post-
-Phase-55b), measured single-threaded on a desktop CPU.  Numbers
-are reproducible — see "Reproducing" at the bottom.
+A snapshot of where zkpvm sits at branch tip `498733e` (post-
+Phase-54h/i/k + 56-audit), measured single-threaded on a desktop
+CPU.  Numbers are reproducible — see "Reproducing" at the bottom.
 
 The original Phase 50 numbers (one column-fold pass before chip
 restructuring started) are preserved in the historical comparison
@@ -35,21 +35,27 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Current (Phase 55b, median of 3 trials)
+### Current (Phase 54k, median of 5 trials)
 
 | log_size | steps    | trace gen | prove    | verify   | total    | proof size |
 |---       |---       |---        |---       |---       |---       |---         |
-| 10       | 1 024    | 0.27 ms   | 585 ms   | 32 ms    | 0.62 s   | 563 KB     |
-| 12       | 4 096    | 0.51 ms   | 1.84 s   | 76 ms    | 1.92 s   | 561 KB     |
-| 14       | 16 384   | 2.10 ms   | 5.12 s   | 346 ms   | 5.47 s   | 585 KB     |
+| 10       | 1 024    | 0.31 ms   | 579 ms   | 37 ms    | 0.62 s   | 559 KB     |
+| 12       | 4 096    | 0.55 ms   | 1.90 s   | 91 ms    | 1.99 s   | 567 KB     |
+| 14       | 16 384   | 2.24 ms   | 5.40 s   | 292 ms   | 5.69 s   | 564 KB     |
 
 ### Historical
 
-| log_size | Phase 50 | Phase 53f | Phase 54g | Phase 55b | speedup vs P50 |
-|---       |---       |---        |---        |---        |---             |
-| 10       | 963 ms   | 1.18 s    | 729 ms    | 585 ms    | 39% |
-| 12       | 2.70 s   | 3.07 s    | 2.01 s    | 1.84 s    | 32% |
-| 14       | 12.92 s  | 11.37 s   | 7.08 s    | 5.12 s    | **60%** |
+| log_size | Phase 50 | Phase 53f | Phase 54g | Phase 55b | Phase 54k | speedup vs P50 |
+|---       |---       |---        |---        |---        |---        |---             |
+| 10       | 963 ms   | 1.18 s    | 729 ms    | 585 ms    | 579 ms    | 40%            |
+| 12       | 2.70 s   | 3.07 s    | 2.01 s    | 1.84 s    | 1.90 s    | 30%            |
+| 14       | 12.92 s  | 11.37 s   | 7.08 s    | 5.12 s    | 5.40 s    | **58%**        |
+
+Phase 54h/i/k held wall-clock roughly flat vs 55b — the post-55
+extractions were architectural (column moves to narrower chips),
+not perf wins.  Cumulative 60% reduction at log14 vs Phase 50
+holds.  Proof size at log14 dropped 585 → 564 KB (-4%) from the
+54k tuple shrinkage (44 → 40 limbs).
 
 Per-step proving throughput stabilises around **2 200–3 200 PVM
 steps/sec/thread** in the log_size 10–14 range (was 1 000–1 500
@@ -59,25 +65,29 @@ minimum sizes regardless of step count).  Above log_size 14 we
 run out of memory on a 16 GB machine — `bench_prove_log16` is
 `#[ignore]`d for that reason.
 
-### Per-stage breakdown at log_size = 14 (Phase 55b)
+### Per-stage breakdown at log_size = 14 (Phase 54k)
 
 `profile_log14` decomposes the prove call into six stages — see
 the per-stage section in PLAN.md (Phase 51) for the methodology.
 The Phase-54g breakdown (5.63 s total at log_size 14) shifts
-proportionally at Phase 55b: same dominant costs (main commit
-+ FRI prove), now over a smaller ProgramMemoryChip preprocessed
-table.
+proportionally at Phase 54k: same dominant costs (main commit
++ FRI prove).
 
-Trace shape at log_size = 14, post-Phase-55b:
-- 19 chip components (was 18 at Phase 54g), log_sizes include
-  the new ByteToBitsChip (log_size = 8, 256-row table) alongside
-  the existing CpuChip + Blake2b + Memory + boundary chips +
-  lookup tables + Phase 54 narrow chips.
-- ProgramMemoryChip preprocessed shape dropped from 65 → 23
-  columns (48 individual flag cols → 6 packed FlagByte cols);
-  prog_mem lookup tuple from 73 → 31 limbs.
-- CpuChip gains 6 packed FlagByte main columns; balanced by
-  the prog_mem-side savings.
+Trace shape at log_size = 14, post-Phase-54k:
+- 19 chip components (was 18 at Phase 54g, +1 from ByteToBitsChip
+  in 55a), log_sizes include the byte-to-bits 256-row table +
+  CpuChip + Blake2b + Memory + boundary chips + lookup tables +
+  Phase 54 narrow chips.
+- CpuChip dropped 48 cells per row vs 55b: ByteEq[8] +
+  ByteDiffInv[8] from 54h, DivCmpDiff[8] + DivCmpCarry[8] from
+  54i, DivCorrHi[8] + DivCorrCarry[8] from 54k.
+- DivRemChip absorbed Phase 21 (54i: r<d uniqueness chain) and
+  Phase 16/18 (54k: DivS sign correction); LOG_CONSTRAINT_
+  DEGREE_BOUND bumped from 2 → 3.
+- DivRem lookup tuple shape: 43 (54g) → 44 (54i, +is_div_s) →
+  40 (54k, dropped div_corr_hi[8], added 4 sign bits).
+- ProgramMemoryChip preprocessed shape (from 55b): 65 → 23
+  columns; prog_mem lookup tuple 73 → 31 limbs.
 
 ## Real-world workloads
 

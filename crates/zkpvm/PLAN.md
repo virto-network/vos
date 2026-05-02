@@ -378,26 +378,59 @@ shrunk by 160 cells per row; ~38% prove-time reduction at log14.
 See the table at the top of this Phase 54 section for the per-
 sub-phase breakdown.
 
-#### Remaining 54.x extractions (low-priority)
+#### Remaining 54.x extractions — status
 
 The remaining mul/divrem/branch witnesses average ~16 cells each.
-At this point Phase 54f went perf-neutral (the cell drop is offset
-by the extra chip's row commitments at typical workload mix), so
-further extractions are mostly architectural rather than
-performance wins:
+Phase 54f went perf-neutral (cell drop offset by extra chip's row
+commitments at typical workload mix), so further extractions are
+mostly architectural rather than performance wins.
 
-- **54h — `BranchChip`**.  Drops `ByteEq[8] + ByteDiffInv[8] = 16
-  cells`.  Tuple needs to expose `eq_flag` back to CpuChip.
-- **54i — DivCmp uniqueness**.  Drops `DivCmpDiff[8] +
-  DivCmpCarry[8] = 16 cells` (r < d unsigned).
-- **54j — AbsCmp uniqueness**.  Drops `AbsCmpDiff[8] +
-  AbsCmpCarry[8] = 16 cells` (|r| < |d| signed).
-- **54k — DivS sign correction**.  Move Phase 16/18 carry chain
-  to DivRemChip; drops `DivCorrHi[8] + DivCorrCarry[8] = 16 cells`.
+- **54h — drop ByteEq/ByteDiffInv via direct val_b/val_d branch
+  constraint** — DONE (`d748529`).  Originally scoped as a new
+  BranchChip extraction; the simpler reformulation lands the
+  same -16 cells without the per-chip overhead.  BranchEq/BranchNe
+  constraints now read `(val_b[i] - val_d[i])` directly instead
+  of the bound-to-diff `(1 - byte_eq[i])` indicator.  Same degree,
+  same soundness — the loose-corner direction was already
+  documented as intentionally unconstrained.
 
-Apply opportunistically; no urgency.  Future material wins lie
-in Phases 55–56 (ProgramMemoryChip column compaction, Blake2bChip
-review).
+- **54i — DivCmp r<d uniqueness chain → DivRemChip** — DONE
+  (`2a5397d`).  Tuple grew 43 → 44 limbs (added is_div_s).
+  DivRemChip's LookupElements gained Range256LookupElements; chip
+  now witnesses DivCmpDiff/Carry internally and emits per-byte
+  Range256 lookups on its own narrower trace.
+
+- **54j — AbsCmp |r|<|d| uniqueness chain → DivRemChip** —
+  INVESTIGATED, NOT LANDED.  As scoped, the move flowed 16 abs-
+  value limbs (abs_d[8] + abs_r[8]) through the DivRemLookup
+  tuple (44 → 60 limbs).  Wall-clock regression of +14% at log10,
+  +28% at log14 in trial benchmarks: the per-CpuChip-row hash cost
+  on the wider producer tuple outweighed the 16-cell drop.
+  Reverted.  An alternative — moving the FULL Phase 30 chain
+  (AbsD/AbsDCarry/AbsR/AbsRCarry + the comparison chain = 48 cells)
+  + recomputing sign bits via ByteToBitsChip — would avoid the
+  tuple-bloat issue at the cost of a larger refactor.  Filed as
+  **future 54j-redux**; deferred.
+
+- **54k — DivS sign correction (Phase 16/18) → DivRemChip** —
+  DONE (`498733e`).  Net tuple shrinkage 44 → 40 limbs (dropped
+  div_corr_hi[8], added 4 sign bits).  DivCorrHi/DivCorrCarry are
+  now DivRemChip-internal.  DivRemChip's
+  LOG_CONSTRAINT_DEGREE_BOUND bumped 2 → 3 to fit the degree-6
+  chain.  Proof size at log14 dropped 607 → 564 KB (-7%); wall-
+  clock within trial noise.
+
+Lessons learned:
+- Tuple growth on a per-CpuChip-row producer is expensive: each
+  added limb costs O(N_real_rows) field ops in the relation hash.
+  Architectural moves that *grow* the tuple need to drop comparable
+  cells from CpuChip *and* save enough downstream to offset the
+  hashing.
+- Tuple shrinkage (54k pattern) is a clean win — both sides save.
+- LOG_CONSTRAINT_DEGREE_BOUND must be set to the maximum
+  constraint degree on the chip; under-shooting silently breaks
+  proofs (constraint polynomial is non-zero on the eval domain
+  yet stwo only checks it on a smaller domain).
 
 #### Risks / open questions
 
@@ -482,10 +515,85 @@ prove_blake2b_precompile, debug_blake2s_prefix) and
 security_sweep_log12 are pre-existing PcsPolicy floor failures
 unaffected by Phase 55.
 
-### Phase 56 — Blake2bChip review
+### Phase 56 — Blake2bChip review (DONE — analysis-only)
 
-2266 main columns is the largest single chip-column count in
-the codebase.  log_size = 4 keeps committed cells low (≈36K),
-so prove-time impact is small.  Worth reviewing for clarity —
-the chip was an early port and may have inherited columns that
-are now over-decomposed.
+Blake2bChip has 2266 main columns, the largest single chip-column
+count in the codebase.  log_size = 4 keeps committed cells at
+≈36 K (~0.16% of the 23 M total at log14), so prove-time impact
+is small but the chip is hard to read.  Phase 56 audited every
+column group and concluded: **no material fold opportunity**.
+Logging the breakdown here so future readers don't re-do the
+audit unprompted.
+
+#### Column breakdown (single G-row, 96 rows per compression)
+
+| Group                                   | Cells | Why it stays                              |
+|---                                      |---    |---                                        |
+| AIn/BIn/CIn/DIn (G inputs)              | 32    | per-row inputs to the G-function         |
+| Mx/My (per-row message words)           | 16    | selected from M0..M15 by SIGMA selectors |
+| A1/Carry1/And1/C1/Carry2/And2/AOut/      | 80    | G-step intermediates + carries (XOR via   |
+|   Carry3/And3/COut/Carry4/And4           |       | a + b - 2·AND); each step needs a witness |
+| BOut/Rot63Carry/DOut                    | 17    | rot-63 carry + reified d-out              |
+| And{1..4}{A,B,Res}Hi (nibble witnesses) | 96    | required for the bitwise-AND nibble lookup |
+| M0..M15 (replicated message)            | 128   | constant across all 96 rows of a compression |
+| H0..H7 (replicated chain value)         | 64    | constant across all 96 rows               |
+| T (counter, 16 bytes) + THi (16 bytes)  | 32    | t-bytes + nibbles for IV[4]/[5] ^ T pinning |
+| F (final flag) + And{T*,T*Hi} chain     | 33    | 4 nibble-AND witnesses for V[12..14] init |
+| V0..V15 (state snapshot)                | 128   | per-row v[0..16] mid-compression          |
+| Output (claimed digest, 64 bytes)       | 64    | last-row output binding to H ^ V_after    |
+| HHi (H hi-nibbles for And lookup)       | 64    | nibble decomposition of H bytes           |
+| VAfterHi (V_after hi-nibbles)           | 128   | nibble decomposition of derived V_after   |
+| OutAnd1/Hi/OutXor1Hi/OutAnd2/Hi         | 320   | output-derivation AND witnesses           |
+| HPtr/MPtr/CallTs (ECALL pointers + ts)  | 16    | per-compression ECALL inputs              |
+| HRdAddrB0..3 (64 byte-addresses × 4)    | 256   | byte-decomposed address per h-read        |
+| MRdAddrB0..3 (128 × 4)                  | 512   | byte-decomposed address per m-read        |
+| HWrAddrB0..3 (64 × 4)                   | 256   | byte-decomposed address per h-write       |
+| IsReal                                  | 1     | row-validity flag                         |
+| **Total**                               | **2243** (+ 23 misc = 2266 reported)        |
+
+#### Why nothing folds cleanly
+
+- **Address byte-decompositions (1024 cells, 45% of the chip)**.
+  The AIR needs each address byte separately for the memory-access
+  lookup tuple (which is byte-addressed).  Folding requires
+  computing `(HPtr + i)` on-the-fly via a per-byte carry chain —
+  that's `(addr[0] = HPtr[0] + i, carry_0 = ...; addr[1] =
+  HPtr[1] + carry_0, carry_1 = ...; ...)` per memory op × 256 ops
+  per compression.  CpuChip's `add_to_relation_computed` pattern
+  works for single-byte offsets; the 4-byte address case needs
+  carry-chain witnesses anyway (which are roughly the same cell
+  count as the storage we'd remove).  Net: no win.
+
+- **Output-derivation chain (320 cells)**.  Output[i] = H[i] XOR
+  V_after[i] XOR V_after[i+8].  Implemented as two AND-and-add
+  steps to keep degrees down.  The 5-column witness layout
+  (OutAnd1/Hi, OutXor1Hi, OutAnd2/Hi) is exactly the standard
+  nibble-AND XOR pattern shared with the rest of the chip.  No
+  obvious fold.
+
+- **Nibble witnesses (And*Hi, *Hi columns)**.  Each one feeds a
+  single nibble-AND lookup; cannot be removed without a different
+  AND-encoding scheme.  Same story as the Phase 53 audit
+  documented in the CpuChip section above.
+
+- **State snapshots (V0..V15, M0..M15, H0..H7 = 320 cells)**.
+  These are the per-row reified state; the inter-row chaining
+  constraint reads `V_next` from row N+1 to bind row N's update.
+  Cannot be folded without restructuring how state propagates.
+
+#### Decision
+
+Blake2bChip is **left as-is**.  Future material wins lie outside
+the chip — at log14 even halving Blake2bChip's cell count would
+shave ≈18 K cells from a 23 M total (0.08% prove-time saving).
+Phase 56 closes with this audit.
+
+#### Open follow-ups elsewhere (deferred from Phase 54.x)
+
+- **54j-redux**: full Phase 30 chain (AbsD + AbsR + the comparison)
+  → DivRemChip with sign bits derived via ByteToBitsChip.  48
+  cells off CpuChip, no tuple bloat.  ~1-day refactor.
+- **Per-step register-access ledger** (project memory note
+  `project_pvm_register_auth.md`): closes the base-CpuChip
+  soundness gap (ValB/ValD/Phi* authentication).  Higher priority
+  than further cell folds.
