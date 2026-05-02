@@ -306,15 +306,49 @@ closure-based emission; later folds just edit the closure.
 Plan: do folds in batches of 5-10 columns with a sweep after
 each batch.
 
-### Phase 54 — per-opcode-family chip shards
+### Phase 54 — per-opcode-family chip shards (LANDED 54a-g)
 
-Following Phase 47's split, extract each opcode family from
-CpuChip into its own narrow chip with row count = number of
-matching real rows.  Mirrors Nexus's structure.
+Extracted four opcode families from CpuChip into narrow chips
+whose row count = matching real rows.  Mirrors Nexus's structure.
 
-After Phase 53b–f closed the column-fold pass (5 commits, 5
-columns dropped, wall-clock impact within trial noise), this is
-the structural change that can actually close the ~5× Nexus gap.
+#### Status (post-54g)
+
+| Sub-phase | Chip / scope | Cells dropped from CpuChip |
+|-----------|--------------|---------------------------|
+| 54a | MulChip foundation (lookup wiring) | 0 |
+| 54b | Mul schoolbook carry chain | 32 |
+| 54c | Phase 12c MulUpper sign correction | 32 |
+| 54d | Mul result-variant dispatch | 16 |
+| 54e | BitwiseChip (6 op identities + nibble lookups) | 32 |
+| 54f | CompareChip (cmp_carry chain) | 16 |
+| 54g | DivRemChip (schoolbook q·d+r=b chain) | 32 |
+| **Total** | | **160** |
+
+#### Wall-clock results (median of 3, prove only)
+
+| log_size | Phase 53f baseline | Phase 54g | Speedup |
+|----------|-------------------|-----------|---------|
+| 10 | 1.18s | 0.73s | 38% |
+| 12 | 3.07s | 2.01s | 35% |
+| 14 | 11.37s | 7.08s | 38% |
+
+vs Nexus baseline (175ms / 620ms / 2.37s): gap narrowed from
+~5× to ~3× across all sizes.
+
+#### Pattern (now well-validated)
+
+Each extraction defines a `<Family>LookupElements` relation;
+CpuChip emits a paired producer per family-row, the new chip
+witnesses internally + consumes once per real row.  Variable
+log_size scales with family-row count, padded with `IsPadding=1`.
+
+Subtleties baked in:
+- LOG_CONSTRAINT_DEGREE_BOUND = 2 for schoolbook chains
+  (degree-4 from `is_real * is_64bit * is_op * (val_b*val_d − …)`).
+- MIN_LOG_SIZE = 5 floor (stwo MIN_FFT_LOG_SIZE).
+- `finalize_logup_in_pairs` needs paired emissions on both sides.
+- `add_to_relation_computed` on prover side when the multiplicity
+  is a sum expression (`FinalizedColumn` doesn't impl `Add`).
 
 #### Architecture
 
@@ -337,51 +371,33 @@ log14 (~16K rows, so ~800 family rows), the chip's `log_size`
 ≈ 10 vs CpuChip's 14 — a 16× row reduction.  The cells that used
 to be zero on 95% of CpuChip rows are simply not committed.
 
-#### Sub-phase plan
+#### Sub-phase log
 
-Order chosen by isolation + cell footprint:
+Sub-phases 54a–g landed (commits 939e2fd → 3b9742f).  CpuChip
+shrunk by 160 cells per row; ~38% prove-time reduction at log14.
+See the table at the top of this Phase 54 section for the per-
+sub-phase breakdown.
 
-- **54a — `MulChip` foundation (lookup relation + skeleton)**.
-  Define `MultiplicationLookupElements` with tuple
-  `(val_b[8], val_d[8], result_low[8], result_high[8],
-  is_signed_b, is_signed_d, is_32bit)`.  Add `MulChip` as a
-  consumer-only chip that reads its trace from
-  `side_note.mul_entries` (new field) and pads to LOG_N_LANES if
-  empty.  CpuChip becomes a producer.  No constraints moved yet
-  — both sides still have the schoolbook AIR; lookup balance
-  alone is the gate.  Validates wiring.
-- **54b — Move schoolbook mul carry chain into `MulChip`**.
-  Drop the schoolbook carry-chain constraints from CpuChip.
-  Move `MulCarry[16]`, `MulCarryHi[16]` into `MulChip`'s column
-  set.  Same for the sign-correction columns added in Phase 12c.
-  CpuChip keeps `MulHigh[8]` (still pushed to the producer
-  tuple); MulChip witnesses its own carry chains.
-- **54c — Drop `MulHigh[8]` from CpuChip**.  Result high is
-  computed inside MulChip; for `IsMulUpper*` rows the producer
-  tuple's `result_high` slot uses CpuChip's `Result[8]`, for
-  `IsMul*` rows MulChip's internal `mul_high_witness` is used
-  instead.  CpuChip net: -40 cells (`MulHigh` 8 + `MulCarry` 16
-  + `MulCarryHi` 16) ≈ 12% of CpuChip's row width.
-- **54d — Repeat for `BitwiseChip`** (BitwiseAndLookup already
-  models the lookup; this is moving the byte-wise AND wiring).
-  CpuChip drops `AndResult[8] + ValBHiNib[8] + ValDHiNib[8] +
-  AndResultHiNib[8] = 32 cells`.
-- **54e — `CompareChip`**.  Drops `CmpCarry[8] + CmpSubResult[8]
-  + ByteEq[8] + ByteDiffInv[8] = 32 cells`.  Trickier — branch
-  decision still lives on CpuChip, so the relation tuple needs
-  to expose `cmp_lt_flag`, `eq_flag` back to CpuChip.
-- **54f — `DivRemChip`**.  Drops `DivCmpDiff[8] +
-  DivCmpCarry[8] + DivByZero + DivMulCarry + ValRPartialNZ[8] +
-  …` ≈ 30 cells.
+#### Remaining 54.x extractions (low-priority)
 
-Each sub-phase: one commit, runs full sweep + bench, commit
-message documents wall-clock delta vs prior phase.
+The remaining mul/divrem/branch witnesses average ~16 cells each.
+At this point Phase 54f went perf-neutral (the cell drop is offset
+by the extra chip's row commitments at typical workload mix), so
+further extractions are mostly architectural rather than
+performance wins:
 
-Cumulative target: drop CpuChip by ~130 cells (660 → ~530),
-combined with the per-family chips' narrower commitments.  At
-~5% mul / 10% bitwise / 15% compare-or-branch typical workload,
-the cells saved on CpuChip side outweigh the cells added on
-chip side by ~5–8×.
+- **54h — `BranchChip`**.  Drops `ByteEq[8] + ByteDiffInv[8] = 16
+  cells`.  Tuple needs to expose `eq_flag` back to CpuChip.
+- **54i — DivCmp uniqueness**.  Drops `DivCmpDiff[8] +
+  DivCmpCarry[8] = 16 cells` (r < d unsigned).
+- **54j — AbsCmp uniqueness**.  Drops `AbsCmpDiff[8] +
+  AbsCmpCarry[8] = 16 cells` (|r| < |d| signed).
+- **54k — DivS sign correction**.  Move Phase 16/18 carry chain
+  to DivRemChip; drops `DivCorrHi[8] + DivCorrCarry[8] = 16 cells`.
+
+Apply opportunistically; no urgency.  Future material wins lie
+in Phases 55–56 (ProgramMemoryChip column compaction, Blake2bChip
+review).
 
 #### Risks / open questions
 
