@@ -600,6 +600,69 @@ Phase 56 closes with this audit.
   `project_pvm_register_auth.md`): COMPLETE in commits
   2af7a93 → e297fd2 (Phase 9a–9g).  Verified 2026-05-02.
 - No further 54.x leftovers — 54h/i/k/j-redux all landed.
-  Future work would target soundness gaps not in this PLAN
-  (e.g., DivS sign-of-r uniqueness, 32-bit DivS negative-result
-  truncation) or further compaction outside the divrem family.
+
+### Phase 57 — column-folding investigation (CLOSED, no change)
+
+Audited CpuChip's remaining "source-byte multiplexer" columns
+(SignSrcB/D/Q/R = 4 cells × log15 = 131K cells dropped) for an
+inline fold to `(1-Is32Bit)·val_X[7] + Is32Bit·val_X[3]`.
+
+**Result: +9% prove-time regression at log14** (5.40s → 5.91s
+median of 5).  Same failure mode as the original 54j attempt:
+- Saved cells: ~131K committed cells off CpuChip (~1% of total).
+- Cost: per-row degree-2 expression in 8 lookup tuple emissions
+  (4 sign-bit nibble lookups × 2 paired emissions each), with
+  multiplicity = is_real (= every CpuChip row).  The relation
+  hash now does 2 mults per tuple element instead of 1.
+
+The cells saved at log15 don't outweigh the per-row hash cost
+on the wide CpuChip trace.  Reverted.
+
+#### Updated lesson — column folds vs. multiplicity
+
+The Phase 54.x and Phase 57 attempts establish a sharper rule
+than the earlier "tuple growth = bad" lesson:
+
+> **Don't inline expressions into per-row producer tuples
+> whose multiplicity is `is_real` (or any flag set on most
+> rows).**  The `add_to_relation_*` cost scales with
+> `Σ_row mult(row) · cost(tuple_at_row)`.  If multiplicity is
+> non-zero on most rows, growing per-row tuple complexity is
+> a wide multiplier on every CpuChip row.
+
+When inlining IS perf-positive:
+- Multiplicity is 0 on most rows (e.g., `is_jump_ind`, ECALL,
+  Mul/DivRem family flags) — only those few rows pay.
+- The folded expression was already being computed for another
+  reason (free reuse).
+- Multiple folds amortize over a single closure rebuild (rare).
+
+#### Where the perf headroom actually is now
+
+After Phase 50 → 54k (60% cumulative speedup at log14), the
+remaining levers are bigger architectural changes:
+
+1. **Multi-threading the prover via rayon** (highest ROI).
+   Stwo's SimdBackend parallelises within a thread but doesn't
+   spread across cores.  A 4-8× speedup is plausible on a desktop
+   if main_commit + interaction_commit + FRI prove (89% of total
+   time at log14) can be parallelised over chip components or
+   FRI layers.  Multi-day effort; coordinates with upstream stwo.
+
+2. **Reduce log_size on the three log-16 chips**
+   (ProgramMemoryChip / RegisterMemoryChip / MemoryChip).  Each
+   sized to ceil_log2 of producer-row count.  Reducing producer
+   counts (e.g., consolidating reg accesses per step from 3 → 1)
+   could shrink one of them to log15, halving its committed
+   cells.  Each chip is ~5-8% of total cells; a single shrink =
+   ~2-4% prove-time saving.  Multi-day per chip.
+
+3. **Move rare-opcode columns to dedicated narrow chips**
+   (Phase 54 pattern, applied to JumpInd ~32 cells, blake2b
+   ECALL ~40 cells, etc.).  Multiplicity = is_X-flag is 0 on
+   most rows, so the producer cost is nearly free.  Useful but
+   small in absolute terms — these columns are already 1-2% of
+   CpuChip cells.
+
+The path that actually moves the needle is **multi-threading**.
+Suggest opening a Phase 58 with that goal.
