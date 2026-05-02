@@ -550,20 +550,22 @@ mod tests {
 
         let mut s = RaftCommit::from_worker(db.clone(), cfg, worker, apply_rx).unwrap();
 
-        // First propose: state=v1, log=msg1.
+        // First propose: state=v1, log=msg1. Index 1 is the
+        // vos-raft leader-promotion no-op (Ongaro §6.4); the
+        // application propose lands at index 2.
         let log = EffectLog::for_msg(b"first".to_vec());
         s.commit_with_log(b"state-v1", &log).unwrap();
         assert_eq!(s.restore(), Some(b"state-v1".to_vec()));
-        assert_eq!(s.last_applied(), 1);
+        assert_eq!(s.last_applied(), 2);
 
         // Idempotent skip on unchanged state — no new log entry.
         s.commit_with_log(b"state-v1", &log).unwrap();
-        assert_eq!(s.last_applied(), 1);
+        assert_eq!(s.last_applied(), 2);
 
         // Second propose: state=v2.
         s.commit_with_log(b"state-v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
         assert_eq!(s.restore(), Some(b"state-v2".to_vec()));
-        assert_eq!(s.last_applied(), 2);
+        assert_eq!(s.last_applied(), 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }

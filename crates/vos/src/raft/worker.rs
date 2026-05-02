@@ -720,19 +720,26 @@ mod tests {
         let h = worker.handler();
         assert!(wait_for_role(&h, Role::Leader, Duration::from_secs(5)));
 
+        // Index 1 is the vos-raft leader-promotion no-op
+        // (Ongaro §6.4 — see vos_raft::worker::become_leader);
+        // application proposes start at index 2.
         let idx = h.propose(b"first".to_vec()).expect("propose");
-        assert_eq!(idx, 1);
+        assert_eq!(idx, 2);
         let idx2 = h.propose(b"second".to_vec()).expect("propose 2");
-        assert_eq!(idx2, 2);
+        assert_eq!(idx2, 3);
 
         worker.shutdown();
 
         let log = RaftLog::open(db).unwrap();
-        assert_eq!(log.last_index(), 2);
-        let entries = log.entries(1, 2).unwrap();
-        assert_eq!(entries[0].payload, b"first");
-        assert_eq!(entries[1].payload, b"second");
+        assert_eq!(log.last_index(), 3);
+        let entries = log.entries(1, 3).unwrap();
+        // entries[0] = no-op (empty payload), entries[1] = "first",
+        // entries[2] = "second".
+        assert!(entries[0].payload.is_empty(), "entry 1 should be the no-op");
+        assert_eq!(entries[1].payload, b"first");
+        assert_eq!(entries[2].payload, b"second");
         assert_eq!(entries[0].term, entries[1].term);
+        assert_eq!(entries[1].term, entries[2].term);
 
         let _ = std::fs::remove_dir_all(dir);
     }

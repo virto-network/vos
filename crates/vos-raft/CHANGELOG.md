@@ -56,12 +56,10 @@ surface is intentionally small but reserves room to grow via
   (address the leader instead) from `LeaderStepped` (we were
   leader at request time but stepped down before a quorum could
   confirm — retry against the new leader). Solo-cluster
-  shortcut resolves immediately. Caveat: the v0.1 impl skips the
-  Ongaro "no-op-append-on-leader-promotion" guard, so a freshly
-  elected leader that hasn't yet committed any entry in its
-  current term may serve a read from a stale prior-term state
-  — close that window by waiting for any propose to succeed
-  before issuing `read_index`.
+  shortcut resolves immediately. Linearizability is closed
+  by appending a no-op `Data` entry on leader promotion
+  (Ongaro §6.4) so `read_index` can't return a `commit_index`
+  that points only at prior-term state.
 - **Pre-vote** (Ongaro thesis §9.6) — prevents term inflation
   from a flapping partition. New `Role::PreCandidate`, new
   `PreVoteReq`/`PreVoteResp` RPC types, new

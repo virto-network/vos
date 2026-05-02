@@ -354,23 +354,26 @@ fn leader_replicates_proposals_to_followers() {
         .position(|w| w.role() == Role::Leader)
         .unwrap();
     let leader_handle = workers[leader_idx].handler();
+    // Index 1 is the leader-promotion no-op (Ongaro §6.4); the
+    // 3 application proposes land at indices 2..=4.
+    let mut last_idx = 0u64;
     for n in 1..=3u8 {
-        let idx = block_on(leader_handle.propose(vec![n])).expect("propose");
-        assert_eq!(idx, n as u64);
+        last_idx = block_on(leader_handle.propose(vec![n])).expect("propose");
     }
+    assert!(last_idx >= 4, "expected last_idx >= 4 (1 no-op + 3), got {last_idx}");
 
-    // Wait for all replicas to report commit_index ≥ 3.
+    // Wait for all replicas to report commit_index ≥ last_idx.
     wait_until(
         || {
             workers.iter().all(|w| {
                 let h = w.handler();
                 block_on(h.snapshot())
-                    .map(|s| s.commit_index >= 3)
+                    .map(|s| s.commit_index >= last_idx)
                     .unwrap_or(false)
             })
         },
         Duration::from_secs(5),
-        "all replicas reach commit_index ≥ 3",
+        "all replicas reach commit_index ≥ proposed-tail",
     );
 }
 
@@ -859,7 +862,8 @@ fn cluster_converges_under_full_duplication() {
 
     // Propose 5 entries. Every replication AppendEntries gets
     // delivered twice; each follower's log must end up with
-    // exactly 5 entries, not 10.
+    // exactly 6 entries (1 leader-promotion no-op + 5 proposes),
+    // not 10+.
     for n in 1..=5u8 {
         block_on(leader_handle.propose(vec![n])).expect("propose");
     }
@@ -869,20 +873,21 @@ fn cluster_converges_under_full_duplication() {
             members.iter().all(|p| {
                 let h = workers[p].handler();
                 block_on(h.snapshot())
-                    .map(|s| s.commit_index >= 5 && s.last_log_index == 5)
+                    .map(|s| s.commit_index >= 6 && s.last_log_index == 6)
                     .unwrap_or(false)
             })
         },
         Duration::from_secs(5),
-        "all replicas reach commit_index = 5 with last_log_index = 5",
+        "all replicas reach commit_index = 6 with last_log_index = 6",
     );
 
-    // Final sanity: every follower has exactly 5 log entries.
+    // Final sanity: every follower has exactly 6 log entries
+    // (1 leader-promotion no-op + 5 application proposes).
     for p in &members {
         let h = workers[p].handler();
         let s = block_on(h.snapshot()).unwrap();
         assert_eq!(
-            s.last_log_index, 5,
+            s.last_log_index, 6,
             "node {p}: duplicated AppendEntries must not double-append; \
              last_log_index = {}",
             s.last_log_index,

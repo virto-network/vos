@@ -512,15 +512,17 @@ impl<N: NodeId> WorkerHandle<N> {
     ///    resolves the request with `Ok(R)`.
     /// 3. If the worker steps down to Follower before quorum
     ///    confirms, resolves with `Err(LeaderStepped)`.
+    /// 4. If the leader's pending-reads queue is at
+    ///    [`Config::max_pending_reads`], resolves with
+    ///    `Err(Backpressure)`.
     ///
-    /// **Caveat**: this v0.1 impl skips the
-    /// "no-op-append-on-leader-promotion" guard. A freshly
-    /// elected leader that hasn't yet committed any entry in
-    /// its current term may serve a read from a stale prior-term
-    /// state. In practice this only matters for the brief
-    /// window between leader promotion and first commit; if your
-    /// caller waits for any propose to succeed before issuing
-    /// `read_index`, the window is closed.
+    /// Linearizability: a freshly-elected leader appends a
+    /// no-op `Data` entry in its current term as part of
+    /// promotion (Ongaro thesis §6.4); `read_index` therefore
+    /// can't return a `commit_index` pointing only at
+    /// prior-term state.
+    ///
+    /// [`Config::max_pending_reads`]: crate::Config::max_pending_reads
     pub async fn read_index(&self) -> Result<u64, ReadIndexError> {
         let (tx, rx) = oneshot::channel();
         self.inbox
@@ -2198,6 +2200,24 @@ where
     let last = state.storage.last_index();
     let members = state.effective_cfg.all_members();
     state.leader = Some(LeaderState::fresh(&members, state.cfg.me, last));
+    // Ongaro thesis §6.4: a freshly-elected leader must commit
+    // an entry in its current term before serving reads. Without
+    // this no-op, `read_index` could return commit_index that
+    // points at a prior-term entry — and the read would observe
+    // state that a future leader at a higher term might revert.
+    // The no-op is opaque (`EntryKind::Data` with empty payload);
+    // application apply-sinks just see it as a normal data entry
+    // and skip it (or apply it as a no-op).
+    let term = state.meta.current_term;
+    let new_index = last + 1;
+    let no_op = LogEntry::data(new_index, term, Vec::new());
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            appends: alloc::vec![no_op],
+            ..Default::default()
+        })
+        .await?;
     Ok(())
 }
 
@@ -2730,11 +2750,14 @@ mod tests {
         }
 
         let idx = block_on(h.propose(alloc::vec![1, 2, 3])).expect("propose");
-        assert_eq!(idx, 1);
+        // Index 1 is the leader-promotion no-op (Ongaro §6.4 —
+        // see become_leader_no_heartbeat); the application
+        // propose lands at index 2.
+        assert_eq!(idx, 2);
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.role, Role::Leader);
-        assert_eq!(snap.last_log_index, 1);
-        assert_eq!(snap.commit_index, 1);
+        assert_eq!(snap.last_log_index, 2);
+        assert_eq!(snap.commit_index, 2);
 
         worker.shutdown();
     }
