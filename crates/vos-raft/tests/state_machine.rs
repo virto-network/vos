@@ -625,7 +625,7 @@ impl Transport<u16> for BumpTermTransport {
         _peer: u16,
         _req: InstallSnapshotReq<u16>,
     ) -> Result<InstallSnapshotResp, Self::Error> {
-        Ok(InstallSnapshotResp { term: self.bumped_term })
+        Ok(InstallSnapshotResp { term: self.bumped_term, bytes_received: 0 })
     }
     async fn send_prevote(
         &self,
@@ -706,7 +706,7 @@ fn leader_steps_down_on_higher_term_append_response() {
             _peer: u16,
             _req: InstallSnapshotReq<u16>,
         ) -> Result<InstallSnapshotResp, E> {
-            Ok(InstallSnapshotResp { term: self.bumped_term })
+            Ok(InstallSnapshotResp { term: self.bumped_term, bytes_received: 0 })
         }
         async fn send_prevote(
             &self,
@@ -1150,4 +1150,225 @@ fn read_index_returns_leader_stepped_on_partition_step_down() {
         matches!(result, Err(ReadIndexError::LeaderStepped)),
         "expected LeaderStepped after step-down, got {result:?}",
     );
+}
+
+/// A snapshot whose payload exceeds `install_snapshot_chunk_bytes`
+/// is delivered across multiple `InstallSnapshotReq` chunks; the
+/// follower's snap pointer reaches the leader's `last_included_index`
+/// only after the final chunk's `done = true` arrives.
+///
+/// We exercise this directly against the worker's inbound handler
+/// (no transport/peer plumbing): build a chunked stream by hand,
+/// feed the chunks one by one, and assert the snap pointer
+/// only advances on the final chunk.
+#[test]
+fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
+    let storage = MemStorage::<u16>::new();
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let me = 0xAAAAu16;
+    let leader = 0xBBBBu16;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg(me, alloc_members(&[me, leader, 0xCCCC])),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let h = worker.handler();
+
+    // Build a 100 KiB snapshot. With the default chunk size of
+    // 32 KiB we'll need 4 chunks (32 + 32 + 32 + 4 KiB).
+    let total_bytes = 100 * 1024;
+    let snapshot: Vec<u8> = (0..total_bytes)
+        .map(|i| (i & 0xFF) as u8)
+        .collect();
+    let chunk_size = 32 * 1024;
+
+    let mut offset = 0u64;
+    let mut chunks_sent = 0;
+    while (offset as usize) < snapshot.len() {
+        let end = ((offset as usize) + chunk_size).min(snapshot.len());
+        let data = snapshot[offset as usize..end].to_vec();
+        let was_final = end == snapshot.len();
+
+        let resp = block_on(h.handle_inbound_install(
+            leader,
+            InstallSnapshotReq {
+                leader,
+                term: 1,
+                last_included_index: 1_000,
+                last_included_term: 1,
+                offset,
+                done: was_final,
+                data,
+            },
+        ));
+        chunks_sent += 1;
+        assert_eq!(resp.term, 1);
+        assert_eq!(
+            resp.bytes_received as usize,
+            end,
+            "chunk {chunks_sent}: follower must have received {end} bytes",
+        );
+
+        // Snap pointer must NOT advance until the final chunk lands.
+        let snap = block_on(h.snapshot()).unwrap();
+        if !was_final {
+            assert_eq!(
+                snap.snap_last_index, 0,
+                "snap pointer must not advance before final chunk",
+            );
+        } else {
+            assert_eq!(snap.snap_last_index, 1_000);
+            assert_eq!(snap.commit_index, 1_000);
+        }
+
+        offset = end as u64;
+    }
+    assert_eq!(chunks_sent, 4, "expected 4 chunks for 100 KiB / 32 KiB");
+    worker.shutdown();
+}
+
+/// A re-sent chunk (same offset, same identity) is idempotent —
+/// the follower's accumulated bytes don't double up.
+#[test]
+fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
+    let storage = MemStorage::<u16>::new();
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let me = 0xAAAAu16;
+    let leader = 0xBBBBu16;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg(me, alloc_members(&[me, leader, 0xCCCC])),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let h = worker.handler();
+
+    let chunk_a = vec![0xAA; 16];
+    let chunk_b = vec![0xBB; 16];
+
+    // First chunk at offset 0, not final.
+    let r0 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 0,
+            done: false,
+            data: chunk_a.clone(),
+        },
+    ));
+    assert_eq!(r0.bytes_received, 16);
+
+    // Re-send the SAME first chunk. Follower must report
+    // bytes_received = 16 (not 32). Already-have semantics.
+    let r0_dup = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 0,
+            done: false,
+            data: chunk_a.clone(),
+        },
+    ));
+    assert_eq!(r0_dup.bytes_received, 16);
+
+    // Now send the real second chunk at offset 16 with done=true.
+    let r1 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 16,
+            done: true,
+            data: chunk_b,
+        },
+    ));
+    assert_eq!(r1.bytes_received, 32);
+
+    let snap = block_on(h.snapshot()).unwrap();
+    assert_eq!(snap.snap_last_index, 50);
+    worker.shutdown();
+}
+
+/// A chunk that arrives with `offset > current_buffer_len`
+/// (gap) is rejected. The follower reports its current length so
+/// the leader can resume from the right place.
+#[test]
+fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
+    let storage = MemStorage::<u16>::new();
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let me = 0xAAAAu16;
+    let leader = 0xBBBBu16;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        cfg(me, alloc_members(&[me, leader, 0xCCCC])),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let h = worker.handler();
+
+    // First chunk at offset 0 lands fine.
+    let r0 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 0,
+            done: false,
+            data: vec![0xAA; 16],
+        },
+    ));
+    assert_eq!(r0.bytes_received, 16);
+
+    // Skip ahead — offset 100 instead of 16. Follower refuses
+    // and reports current length.
+    let r_gap = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 100,
+            done: false,
+            data: vec![0xCC; 16],
+        },
+    ));
+    assert_eq!(
+        r_gap.bytes_received, 16,
+        "gap must be refused with bytes_received = current length",
+    );
+
+    let snap = block_on(h.snapshot()).unwrap();
+    assert_eq!(
+        snap.snap_last_index, 0,
+        "gap-rejected chunk must not advance snap pointer",
+    );
+    worker.shutdown();
+}
+
+fn alloc_members(m: &[u16]) -> Vec<u16> {
+    m.to_vec()
 }

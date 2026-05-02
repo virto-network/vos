@@ -7,6 +7,22 @@ surface is intentionally small but reserves room to grow via
 ## [Unreleased]
 
 ### Added
+- **Chunked `InstallSnapshot`** — snapshots that exceed the
+  transport's frame budget are now streamed across multiple
+  RPCs. `InstallSnapshotReq` gained `offset: u64`, `done: bool`,
+  and renamed `snapshot: Vec<u8>` → `data: Vec<u8>` (the chunk
+  bytes for *this RPC only*). `InstallSnapshotResp` gained
+  `bytes_received: u64` so the leader can resume after a
+  dropped chunk. The follower assembles chunks under a
+  `(last_included_index, last_included_term)` identity and
+  commits the snapshot atomically when `done = true` lands;
+  duplicate chunks (same offset) and gap chunks
+  (offset > current length) are handled idempotently. New
+  `Config::install_snapshot_chunk_bytes` (default `32 * 1024`,
+  i.e. 32 KiB) caps each chunk; `usize::MAX` disables chunking.
+  **Breaking** schema change for transports — vos's adapter
+  pins the chunk size to `usize::MAX` until libp2p's frame
+  layer learns to ferry chunked offsets.
 - **Linearizable reads via `read_index`** (Ongaro thesis §6.4) —
   new `WorkerHandle::read_index() -> Result<u64, ReadIndexError>`
   returns the leader's `commit_index` only after a fresh
@@ -87,20 +103,19 @@ surface is intentionally small but reserves room to grow via
     snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
   - 2 no_std build smoke tests (skip cleanly when targets aren't
     installed)
-  - 11 integration tests against a `MockTransport` with per-edge
+  - 14 integration tests against a `MockTransport` with per-edge
     partition control (3-node election, replication, partition
     quorum, one-way-partition, leader/candidate step-down on
     higher-term replies, pre-vote term-stability,
-    `read_index` quorum confirmation + leader-stepped-on-partition)
+    `read_index` quorum confirmation + leader-stepped-on-partition,
+    chunked-`InstallSnapshot` assembly + duplicate-idempotence
+    + gap-rejection)
   - 5 fault-injection tests (storage `Err` paths)
   - 1 runnable doctest
 
 ### Known limitations (deferred for future commits)
 - **No joint consensus** — membership changes are not yet
   supported. Use a static `Config::members` list at construction.
-- **Single-shot `InstallSnapshot`** — large snapshots are not
-  chunked. Callers that ship multi-MB state should layer their
-  own chunking on top.
 - **No learner role** — every `Config::members` entry is a full
   voter.
 - **Storage error is "drop and forget"**: when

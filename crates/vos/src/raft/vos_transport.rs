@@ -167,6 +167,16 @@ impl Transport<u16> for VosTransport {
             .network
             .peer_for_prefix(peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
+        // Vos's libp2p frame layer is one-shot today: it ferries
+        // a single snapshot blob, not chunked offset/done streams.
+        // [`WorkerConfig::into_raft`] sets
+        // `install_snapshot_chunk_bytes = usize::MAX` so the
+        // leader produces a single chunk with `offset = 0` and
+        // `done = true` — the request always fits the wire frame
+        // shape. When the libp2p frame layer grows chunked
+        // InstallSnapshot support, plumb `req.offset` / `req.done`
+        // through and start respecting `r.bytes_received`.
+        let total_len = req.data.len() as u64;
         let rx = self.network.send_raft_install_snapshot(
             peer_id,
             self.replication_id,
@@ -174,12 +184,20 @@ impl Transport<u16> for VosTransport {
             req.leader,
             req.last_included_index,
             req.last_included_term,
-            req.snapshot,
+            req.data,
         );
         let r = recv_timeout(rx, RPC_TIMEOUT)
             .await
             .ok_or(VosTransportError::NoReply)?;
-        Ok(InstallSnapshotResp { term: r.term })
+        Ok(InstallSnapshotResp {
+            term: r.term,
+            // Wire reply doesn't carry a real `bytes_received`
+            // yet. Echoing the full chunk length tells the leader
+            // the snapshot landed, which is correct for the
+            // one-shot frame: vos's receiver either accepts the
+            // whole blob or returns the wire-level error.
+            bytes_received: total_len,
+        })
     }
 }
 

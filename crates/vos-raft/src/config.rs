@@ -74,6 +74,22 @@ pub struct Config<N: NodeId> {
     /// to plain Raft. The cluster loses the term-stability
     /// guarantee but remains correct.
     pub pre_vote: bool,
+    /// Maximum bytes per `InstallSnapshot` chunk the leader
+    /// will send. Snapshots larger than this are streamed across
+    /// multiple chunked RPCs (see [`InstallSnapshotReq`]).
+    ///
+    /// Tune to fit comfortably under the transport's per-frame
+    /// budget — libp2p with the default
+    /// `MAX_TRANSMIT_SIZE` ≈ 64 KiB wants this at ~32 KiB to
+    /// leave headroom for protocol envelopes. Embedded radios
+    /// with smaller MTUs (Bluetooth LE GATT, LoRa) want
+    /// proportionally smaller. Set to `usize::MAX` to disable
+    /// chunking (single-shot) when you know snapshots fit.
+    ///
+    /// Default: `32 * 1024` (32 KiB).
+    ///
+    /// [`InstallSnapshotReq`]: crate::InstallSnapshotReq
+    pub install_snapshot_chunk_bytes: usize,
 }
 
 impl<N: NodeId> Config<N> {
@@ -91,6 +107,7 @@ impl<N: NodeId> Config<N> {
             replication_id,
             compact_hysteresis: 16,
             pre_vote: true,
+            install_snapshot_chunk_bytes: 32 * 1024,
         }
     }
 }

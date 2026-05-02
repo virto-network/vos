@@ -32,7 +32,7 @@ joint consensus, no learners, no chunked snapshot streaming yet).
 | Pre-vote (term-stability)         | yes                     | yes (`Config::pre_vote`)            |
 | Linearizable reads (`read_index`) | yes                     | yes (`WorkerHandle::read_index`)    |
 | Joint consensus                   | yes                     | no (planned)                        |
-| Chunked snapshot streaming        | yes                     | no (one-shot only)                  |
+| Chunked snapshot streaming        | yes                     | yes (`Config::install_snapshot_chunk_bytes`) |
 | Production maturity               | high                    | first carve-out                     |
 
 The core worker — `run_worker(...).await` — is one async future with

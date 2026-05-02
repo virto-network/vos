@@ -349,7 +349,9 @@ proptest! {
                         InstallSnapshotReq {
                             leader: from,
                             term, last_included_index, last_included_term,
-                            snapshot: vec![0xFF; 4],
+                            offset: 0,
+                            done: true,
+                            data: vec![0xFF; 4],
                         },
                     ));
                 }

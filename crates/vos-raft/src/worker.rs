@@ -576,9 +576,9 @@ impl<N: NodeId> WorkerHandle<N> {
             .send(RaftMsg::InstallSnapshot { from, req, reply: tx })
             .is_err()
         {
-            return InstallSnapshotResp { term };
+            return InstallSnapshotResp { term, bytes_received: 0 };
         }
-        rx.await.unwrap_or(InstallSnapshotResp { term })
+        rx.await.unwrap_or(InstallSnapshotResp { term, bytes_received: 0 })
     }
 }
 
@@ -589,6 +589,36 @@ impl<N: NodeId> WorkerHandle<N> {
 struct LeaderState<N: NodeId> {
     next_index: BTreeMap<N, u64>,
     match_index: BTreeMap<N, u64>,
+    /// Per-peer in-flight chunked snapshot tracker. Present while
+    /// the leader is streaming chunks of a particular
+    /// `(last_included_index, last_included_term)` identity to
+    /// that peer; cleared on completion or on identity change
+    /// (e.g., if the leader has compacted past the in-flight
+    /// snapshot's index, it abandons the older stream and starts
+    /// a new one). The `offset` field is the byte position of
+    /// the next chunk to send.
+    snapshot_send: BTreeMap<N, SnapshotSendState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotSendState {
+    last_included_index: u64,
+    last_included_term: u64,
+    offset: u64,
+}
+
+/// Follower-side accumulator for a chunked `InstallSnapshot`.
+struct IncomingSnapshot<N: NodeId> {
+    /// Leader from whom the chunks are arriving. A different
+    /// leader's first chunk discards this buffer.
+    leader: N,
+    /// Term of the leader sending the chunks. A higher term in
+    /// any follow-up RPC discards this buffer.
+    term: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    /// Accumulated bytes (offsets `0..buffer.len()`).
+    buffer: alloc::vec::Vec<u8>,
 }
 
 impl<N: NodeId> LeaderState<N> {
@@ -608,6 +638,7 @@ impl<N: NodeId> LeaderState<N> {
         Self {
             next_index,
             match_index,
+            snapshot_send: BTreeMap::new(),
         }
     }
 }
@@ -633,6 +664,16 @@ enum RpcOutcome<N: NodeId> {
         from: N,
         result: Option<InstallSnapshotResp>,
         last_included_index: u64,
+        last_included_term: u64,
+        /// Byte offset of *this* chunk + bytes sent. The leader
+        /// uses the response's `bytes_received` against this to
+        /// decide whether to advance the cursor or back off.
+        chunk_end_offset: u64,
+        /// Whether this chunk was the final one. The response
+        /// handler only treats the install as complete (and
+        /// bumps `match_index` to `last_included_index`) when
+        /// `was_final = true`.
+        was_final: bool,
     },
 }
 
@@ -671,6 +712,13 @@ where
     /// (a quorum has acked at the current term, and that ack
     /// landed at or after the request was queued).
     pending_read_index: Vec<(u64, oneshot::Sender<Result<u64, ReadIndexError>>)>,
+    /// Follower-side accumulator for an in-flight chunked
+    /// `InstallSnapshot`. `None` between snapshot streams; `Some`
+    /// while chunks are arriving for a particular `(last_included_index,
+    /// last_included_term)` identity. A new identity from the
+    /// same leader supersedes the buffer; a stale identity is
+    /// rejected as a no-op.
+    incoming_snapshot: Option<IncomingSnapshot<N>>,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
@@ -792,6 +840,7 @@ where
         last_heartbeat_received: None,
         votes_received: BTreeSet::new(),
         pending_read_index: Vec::new(),
+        incoming_snapshot: None,
         leader: None,
         apply_sink,
         role_atomic,
@@ -992,9 +1041,20 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
             from,
             result: Some(resp),
             last_included_index,
+            last_included_term,
+            chunk_end_offset,
+            was_final,
         } => {
-            let _ =
-                handle_install_snapshot_response(state, from, resp, last_included_index).await;
+            let _ = handle_install_snapshot_response(
+                state,
+                from,
+                resp,
+                last_included_index,
+                last_included_term,
+                chunk_end_offset,
+                was_final,
+            )
+            .await;
         }
         // Transport returned Err — treat as no answer.
         RpcOutcome::Append { .. }
@@ -1229,7 +1289,7 @@ where
 
 async fn handle_install_snapshot<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
-    _from: N,
+    from: N,
     req: InstallSnapshotReq<N>,
 ) -> Result<InstallSnapshotResp, S::Error>
 where
@@ -1240,21 +1300,34 @@ where
     R: Rng,
     A: ApplySink,
 {
+    // Stale-term sender: refuse without touching state.
     if req.term < state.meta.current_term {
         return Ok(InstallSnapshotResp {
             term: state.meta.current_term,
+            bytes_received: 0,
         });
     }
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
+        // Drop any in-flight snapshot from a prior term — its
+        // identity is now stale.
+        state.incoming_snapshot = None;
     }
+    let was_leader = state.role == Role::Leader;
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    if was_leader {
+        drain_pending_reads_on_step_down(state);
+    }
     state.reset_election_timer();
+    state.last_heartbeat_received = Some(state.clock.now());
 
+    // Snapshot already covered by our local snap pointer — no-op.
+    // Drop any in-flight buffer for it too.
     if req.last_included_index <= state.storage.snap_last_index() {
+        state.incoming_snapshot = None;
         state
             .storage
             .commit_batch(WriteBatch {
@@ -1264,8 +1337,70 @@ where
             .await?;
         return Ok(InstallSnapshotResp {
             term: state.meta.current_term,
+            bytes_received: 0,
         });
     }
+
+    // ── Chunk assembly ──
+    //
+    // Reset the buffer if the identity changed (different
+    // leader, different (idx, term), or no buffer yet).
+    let identity_match = state.incoming_snapshot.as_ref().is_some_and(|s| {
+        s.leader == from
+            && s.term == req.term
+            && s.last_included_index == req.last_included_index
+            && s.last_included_term == req.last_included_term
+    });
+    if !identity_match {
+        state.incoming_snapshot = Some(IncomingSnapshot {
+            leader: from,
+            term: req.term,
+            last_included_index: req.last_included_index,
+            last_included_term: req.last_included_term,
+            buffer: Vec::new(),
+        });
+    }
+
+    let buf = state
+        .incoming_snapshot
+        .as_mut()
+        .expect("set above");
+    let current_len = buf.buffer.len() as u64;
+
+    // Out-of-order or duplicate chunk handling:
+    // - offset == current_len  → in-order, append.
+    // - offset <  current_len  → duplicate / overlap; ignore the
+    //   data and report `bytes_received = current_len` so the
+    //   leader can resume.
+    // - offset >  current_len  → gap; refuse and ask the leader
+    //   to resume from `current_len`.
+    if req.offset > current_len {
+        return Ok(InstallSnapshotResp {
+            term: state.meta.current_term,
+            bytes_received: current_len,
+        });
+    }
+    if req.offset == current_len {
+        buf.buffer.extend_from_slice(&req.data);
+    }
+    // (offset < current_len: silently treat as already-have.)
+
+    let new_len = buf.buffer.len() as u64;
+
+    // Not the final chunk — wait for more.
+    if !req.done {
+        return Ok(InstallSnapshotResp {
+            term: state.meta.current_term,
+            bytes_received: new_len,
+        });
+    }
+
+    // Final chunk — commit the assembled snapshot atomically.
+    let snapshot = state
+        .incoming_snapshot
+        .take()
+        .expect("set above")
+        .buffer;
 
     state.meta.snap_last_index = req.last_included_index;
     state.meta.snap_last_term = req.last_included_term;
@@ -1275,7 +1410,7 @@ where
         .storage
         .commit_batch(WriteBatch {
             compact_to: Some((req.last_included_index, req.last_included_term)),
-            state: Some(req.snapshot),
+            state: Some(snapshot),
             meta: Some(state.meta.clone()),
             ..Default::default()
         })
@@ -1284,6 +1419,7 @@ where
     state.fire_apply_notification();
     Ok(InstallSnapshotResp {
         term: state.meta.current_term,
+        bytes_received: new_len,
     })
 }
 
@@ -1338,11 +1474,15 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_install_snapshot_response<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
     from: N,
     resp: InstallSnapshotResp,
     last_included_index: u64,
+    last_included_term: u64,
+    chunk_end_offset: u64,
+    was_final: bool,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -1368,12 +1508,43 @@ where
     if state.role != Role::Leader || resp.term != state.meta.current_term {
         return Ok(());
     }
-    if let Some(leader) = state.leader.as_mut() {
+    let Some(leader) = state.leader.as_mut() else {
+        return Ok(());
+    };
+
+    // Update the per-peer chunk cursor. The follower's
+    // `bytes_received` is authoritative — if it tells us it
+    // has fewer bytes than we sent (lost chunk, identity reset
+    // on its side), we resume from there.
+    let cursor = resp.bytes_received.min(chunk_end_offset);
+    let entry = leader
+        .snapshot_send
+        .entry(from)
+        .or_insert(SnapshotSendState {
+            last_included_index,
+            last_included_term,
+            offset: 0,
+        });
+    if entry.last_included_index == last_included_index
+        && entry.last_included_term == last_included_term
+    {
+        entry.offset = entry.offset.max(cursor);
+    } else {
+        // Identity differs — the leader has compacted past this
+        // stream's index, so start a new tracker on next send.
+        leader.snapshot_send.remove(&from);
+    }
+
+    if was_final && resp.bytes_received >= chunk_end_offset {
+        // Follower acknowledged the full snapshot. Bump match/
+        // next_index and clear the per-peer tracker so the next
+        // heartbeat resumes log-based replication.
         let prev_match = leader.match_index.get(&from).copied().unwrap_or(0);
         if last_included_index > prev_match {
             leader.match_index.insert(from, last_included_index);
         }
         leader.next_index.insert(from, last_included_index + 1);
+        leader.snapshot_send.remove(&from);
     }
     Ok(())
 }
@@ -1692,13 +1863,55 @@ where
         let next_idx = leader.next_index.get(&peer).copied().unwrap_or(1);
 
         if next_idx <= snap_idx && snap_idx > 0 {
+            // Resume from the per-peer cursor if it points at the
+            // current snap identity; otherwise restart from byte 0.
+            let resume_offset = state
+                .leader
+                .as_ref()
+                .and_then(|l| l.snapshot_send.get(&peer).copied())
+                .filter(|s| {
+                    s.last_included_index == snap_idx
+                        && s.last_included_term == snap_term
+                })
+                .map(|s| s.offset)
+                .unwrap_or(0);
+
             let snapshot = state.storage.read_state().await.unwrap_or_default();
+            let total_len = snapshot.len() as u64;
+            // Cap chunk size, but never produce a 0-byte non-final
+            // chunk (would loop forever). For an empty snapshot
+            // we send a single done=true chunk with zero bytes.
+            let chunk_max = state
+                .cfg
+                .install_snapshot_chunk_bytes
+                .max(1);
+            let start = resume_offset.min(total_len) as usize;
+            let end = (start + chunk_max).min(snapshot.len());
+            let chunk: Vec<u8> = snapshot[start..end].to_vec();
+            let chunk_end_offset = end as u64;
+            let was_final = chunk_end_offset >= total_len;
+
+            // Update / install our local cursor BEFORE sending so
+            // a same-tick second peer resume picks the same value.
+            if let Some(leader_mut) = state.leader.as_mut() {
+                leader_mut.snapshot_send.insert(
+                    peer,
+                    SnapshotSendState {
+                        last_included_index: snap_idx,
+                        last_included_term: snap_term,
+                        offset: resume_offset,
+                    },
+                );
+            }
+
             let req = InstallSnapshotReq {
                 leader: me,
                 term,
                 last_included_index: snap_idx,
                 last_included_term: snap_term,
-                snapshot,
+                offset: resume_offset,
+                done: was_final,
+                data: chunk,
             };
             let transport = state.transport.clone();
             let fut: RpcFut<N> = Box::pin(async move {
@@ -1707,6 +1920,9 @@ where
                     from: peer,
                     result,
                     last_included_index: snap_idx,
+                    last_included_term: snap_term,
+                    chunk_end_offset,
+                    was_final,
                 }
             });
             pending.push(fut);
@@ -2176,10 +2392,13 @@ mod tests {
                 term: 5,
                 last_included_index: 100,
                 last_included_term: 4,
-                snapshot: alloc::vec![0xAA; 32],
+                offset: 0,
+                done: true,
+                data: alloc::vec![0xAA; 32],
             },
         ));
         assert_eq!(resp.term, 5);
+        assert_eq!(resp.bytes_received, 32);
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.snap_last_index, 100);
         assert_eq!(snap.commit_index, 100);
@@ -2375,7 +2594,9 @@ mod tests {
             term: 7,
             last_included_index: 50,
             last_included_term: 6,
-            snapshot: alloc::vec![0xAA; 16],
+            offset: 0,
+            done: true,
+            data: alloc::vec![0xAA; 16],
         };
 
         let r1 = block_on(h.handle_inbound_install(0xBBBB, req()));
@@ -2411,7 +2632,9 @@ mod tests {
                 term: 7,
                 last_included_index: 30,
                 last_included_term: 5,
-                snapshot: alloc::vec![0xBB; 8],
+                offset: 0,
+                done: true,
+                data: alloc::vec![0xBB; 8],
             },
         ));
         assert_eq!(r3.term, 7);

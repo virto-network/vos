@@ -100,22 +100,53 @@ pub struct PreVoteResp {
 /// bytes, advances meta to `last_included_*`, and drops any log
 /// entries the snapshot supersedes.
 ///
-/// Single-shot today (snapshot in one RPC); a future revision
-/// will add chunked variants for ultra-constrained or very large
-/// snapshot payloads.
+/// **Chunked**. A snapshot that exceeds the transport's frame
+/// budget is split across multiple `InstallSnapshotReq`s with
+/// the same `(last_included_index, last_included_term)` identity.
+/// Each chunk carries its byte `offset` into the assembled
+/// snapshot; the final chunk sets `done = true`. The follower
+/// buffers chunks under that identity, then atomically commits
+/// the assembled snapshot when `done` arrives.
+///
+/// Re-sent chunks (same offset) are idempotent. A new identity
+/// from the same leader supersedes the in-flight buffer; a stale
+/// identity (`last_included_index <= snap_last_index`) is a
+/// no-op.
+///
+/// Receivers MAY refuse out-of-order chunks (offset != current
+/// buffer length) by returning `bytes_received = current
+/// buffer.len()`; the leader resumes from there. The default
+/// in-crate impl assumes strict in-order delivery and resets if
+/// the offset doesn't match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshotReq<N> {
     pub leader: N,
     pub term: u64,
     pub last_included_index: u64,
     pub last_included_term: u64,
-    /// Opaque snapshot bytes — the application's serialized
-    /// state at `last_included_index`.
-    pub snapshot: Vec<u8>,
+    /// Byte offset of this chunk into the assembled snapshot.
+    /// `0` for the first chunk; subsequent chunks set this to
+    /// the offset returned by the previous response.
+    pub offset: u64,
+    /// `true` for the final chunk. The follower commits the
+    /// assembled snapshot only when it sees `done = true` AND
+    /// the cumulative offset+len matches the leader's intent.
+    pub done: bool,
+    /// Bytes for *this chunk only* (not the whole snapshot).
+    pub data: Vec<u8>,
 }
 
 /// Reply to [`InstallSnapshotReq`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallSnapshotResp {
     pub term: u64,
+    /// How many bytes the follower has accumulated for the
+    /// current `(last_included_index, last_included_term)`
+    /// identity. The leader uses this to set the next chunk's
+    /// `offset` (resuming after a dropped chunk, or skipping
+    /// past chunks the follower already has).
+    ///
+    /// `0` if the follower rejected the request (stale term,
+    /// identity changed, or chunk arrived out of order).
+    pub bytes_received: u64,
 }

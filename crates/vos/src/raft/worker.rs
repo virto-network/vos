@@ -81,6 +81,15 @@ impl WorkerConfig {
         // loses the term-inflation-prevention property until
         // the network is upgraded.
         c.pre_vote = false;
+        // Chunked InstallSnapshot streaming relies on the wire
+        // frame carrying `offset` / `done` / `bytes_received`.
+        // Vos's libp2p frame is one-shot today, so we set the
+        // chunk budget to "never chunk" — a single InstallSnapshot
+        // RPC carries the whole snapshot. Production deployments
+        // that exceed libp2p's MAX_TRANSMIT_SIZE need to land
+        // chunked-frame support before raising real-world
+        // snapshot sizes here.
+        c.install_snapshot_chunk_bytes = usize::MAX;
         c
     }
 }
@@ -332,12 +341,21 @@ impl RaftRpcHandler for WorkerHandle {
         last_included_term: u64,
         snapshot: Vec<u8>,
     ) -> RaftInstallSnapshotResult {
+        // Vos's wire frame is one-shot today: the leader produces
+        // a single InstallSnapshotReq carrying the whole snapshot
+        // (Config::install_snapshot_chunk_bytes = usize::MAX in
+        // [`WorkerConfig::into_raft`]), and the receiver sees one
+        // chunk with `offset = 0` and `done = true`. Once the
+        // libp2p frame layer learns to ferry chunked InstallSnapshot,
+        // change this to forward `offset` / `done` from the wire.
         let req = InstallSnapshotReq {
             leader: from_prefix,
             term,
             last_included_index,
             last_included_term,
-            snapshot,
+            offset: 0,
+            done: true,
+            data: snapshot,
         };
         let resp = block_on(self.inner.handle_inbound_install(from_prefix, req));
         RaftInstallSnapshotResult { term: resp.term }
