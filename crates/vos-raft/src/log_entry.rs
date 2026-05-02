@@ -73,6 +73,27 @@ impl<N: NodeId> LogEntry<N> {
         }
     }
 
+    /// Construct an `EntryKind::ConfigChange` entry. `joint_old`
+    /// = `Some(...)` produces the joint-phase entry; `None`
+    /// produces the final non-joint entry that retires a joint
+    /// phase. Mostly useful in tests; production callers use
+    /// [`WorkerHandle::change_membership`] which constructs
+    /// these internally.
+    ///
+    /// [`WorkerHandle::change_membership`]: crate::worker::WorkerHandle::change_membership
+    pub fn config_change(
+        index: u64,
+        term: u64,
+        joint_old: Option<Vec<N>>,
+        members: Vec<N>,
+    ) -> Self {
+        Self {
+            index,
+            term,
+            kind: EntryKind::ConfigChange { joint_old, members },
+        }
+    }
+
     /// Borrow the entry's data payload, if it's a `Data` entry.
     /// Returns `None` for `ConfigChange` entries — apply sinks
     /// can use this to skip non-data entries cleanly.

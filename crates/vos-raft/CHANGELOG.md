@@ -6,6 +6,59 @@ surface is intentionally small but reserves room to grow via
 
 ## [Unreleased]
 
+### Hardening (post-feature review)
+
+A self-review of the four landed features (pre-vote, read_index,
+chunked snapshots, joint consensus) surfaced a list of gaps;
+this section captures fixes that landed in response.
+
+- **Removed leader steps down**: `auto_finalize_joint_config`
+  now calls `step_down` after writing the final non-joint
+  ConfigChange when the local replica is no longer a voter.
+  Previously the removed leader kept serving indefinitely.
+- **Joint finalization is index-based**, not member-equality
+  based: `WorkerState::pending_joint_entry` tracks the actual
+  joint entry's index, so a stale historical joint entry that
+  happens to target the same member set can't trigger a
+  spurious finalization.
+- **Bounded queues / buffers**:
+  - `Config::max_pending_reads` (default 1024) caps the
+    in-flight `read_index` queue with a new
+    `ReadIndexError::Backpressure` outcome.
+  - `Config::max_snapshot_bytes` (default 512 MiB) caps the
+    follower's chunked-snapshot accumulator. A misbehaving
+    leader streaming chunks without `done = true` can no
+    longer OOM the follower.
+  - `Config::pre_candidate_misses_before_revert` (default 3)
+    flips a stuck PreCandidate back to Follower so external
+    observers see "no election in progress" rather than an
+    indefinite PreCandidate.
+- **Linearizability gate**: `become_leader_no_heartbeat`
+  appends a no-op `Data` entry at the current term (Ongaro
+  §6.4); `read_index` waits for `commit_index >=` that no-op's
+  index before resolving. Closes the "freshly-elected leader
+  serves prior-term state" gap.
+- **Defensive checks**:
+  - Vote / pre-vote responses from outside the active
+    configuration's union are ignored (no contamination of
+    `votes_received` from a recently-removed peer).
+  - Replicas that aren't in their own active configuration
+    don't start elections (avoids a removed-leader-with-orphan-
+    log re-electing itself).
+- **Performance**: `recover_active_config` no longer scans the
+  full live log on every append batch. `WorkerState::active_config_index`
+  caches the index of the entry that produced the active
+  view; only a truncate that drops below this index forces a
+  fresh scan, and a newly-appended ConfigChange is adopted
+  in-place from `req.entries`.
+- **API hygiene**:
+  - `ProposeError` is no longer parameterized over an unused
+    `E` (the worker erases storage errors to `()`).
+  - New `ChangeMembershipError::EmptyConfig` variant — distinct
+    from `InProgress`, returned when `new_members` is empty.
+  - New `LogEntry::config_change(idx, term, joint_old, members)`
+    constructor for symmetry with `LogEntry::data`.
+
 ### Added
 - **Joint-consensus membership change** (Ongaro thesis §4.3) —
   new `WorkerHandle::change_membership(new_members)` API moves
@@ -124,14 +177,17 @@ surface is intentionally small but reserves room to grow via
     snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
   - 2 no_std build smoke tests (skip cleanly when targets aren't
     installed)
-  - 15 integration tests against a `MockTransport` with per-edge
+  - 21 integration tests against a `MockTransport` with per-edge
     partition control (3-node election, replication, partition
     quorum, one-way-partition, leader/candidate step-down on
     higher-term replies, pre-vote term-stability,
-    `read_index` quorum confirmation + leader-stepped-on-partition,
-    chunked-`InstallSnapshot` assembly + duplicate-idempotence
-    + gap-rejection, joint-consensus growth from 3 to 4 nodes
-    with `InProgress` rejection of concurrent changes)
+    `read_index` quorum confirmation, leader-stepped-on-partition,
+    `read_index` backpressure, chunked-`InstallSnapshot`
+    assembly + duplicate-idempotence + gap-rejection +
+    oversized-buffer-rejection, joint-consensus growth from 3
+    to 4 nodes with `InProgress` rejection, leader-removed
+    step-down, `change_membership` `NotLeader` and `EmptyConfig`,
+    PreCandidate fallback to Follower)
   - 5 fault-injection tests (storage `Err` paths)
   - 1 runnable doctest
 

@@ -1791,3 +1791,92 @@ fn change_membership_removing_leader_makes_it_step_down() {
         "new leader emerges from the post-transition set",
     );
 }
+
+/// `change_membership` called against a follower returns
+/// `NotLeader`. The caller is expected to forward the request
+/// to the cluster's current leader.
+#[test]
+fn change_membership_on_follower_returns_not_leader() {
+    use vos_raft::ChangeMembershipError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let follower_id = *members.iter().find(|p| **p != leader_id).unwrap();
+
+    let r = block_on(workers[&follower_id].handler().change_membership(members.clone()));
+    assert!(
+        matches!(r, Err(ChangeMembershipError::NotLeader)),
+        "follower change_membership must return NotLeader, got {r:?}",
+    );
+}
+
+/// An empty `new_members` is rejected with `EmptyConfig`.
+/// A cluster needs at least one voter; an empty configuration
+/// would never be able to elect.
+#[test]
+fn change_membership_with_empty_members_returns_empty_config() {
+    use vos_raft::ChangeMembershipError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+
+    let r = block_on(workers[&leader_id].handler().change_membership(Vec::new()));
+    assert!(
+        matches!(r, Err(ChangeMembershipError::EmptyConfig)),
+        "empty new_members must return EmptyConfig, got {r:?}",
+    );
+}

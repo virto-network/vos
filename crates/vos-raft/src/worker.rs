@@ -2674,6 +2674,16 @@ where
     if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());
     }
+    // Sanity: never compact past commit_index. The
+    // majority-floor is bounded by replicated indices, which
+    // for a current-term leader are also committed indices,
+    // but the assertion documents the invariant for future
+    // refactors.
+    debug_assert!(
+        floor <= state.meta.commit_index,
+        "try_compact: floor ({floor}) must not exceed commit_index ({})",
+        state.meta.commit_index,
+    );
     let term_at_floor = match state.storage.term_at(floor).await? {
         Some(t) => t,
         None => return Ok(()),
