@@ -666,3 +666,119 @@ remaining levers are bigger architectural changes:
 
 The path that actually moves the needle is **multi-threading**.
 Suggest opening a Phase 58 with that goal.
+
+### Phase 58 — multi-threading scoping (research, not implementation)
+
+#### Status check: what parallelism we already have
+
+Stwo's `parallel` Cargo feature has been enabled since the start
+(workspace `Cargo.toml:44, 49`), and stwo internally uses rayon
+for FFT, bit-reverse, Merkle commitment, and quotient evaluation.
+The BENCHMARKS.md "single-threaded" caveat was stale.
+
+Measured at log14 on the 22-core test bench (Intel Core Ultra 7
+155H), single trial:
+
+| Configuration               | Prove time |
+|---                          |---         |
+| `RAYON_NUM_THREADS=1`        | 9.68 s     |
+| Default (rayon picks cores) | 5.54 s     |
+
+**Existing speedup: 1.75×** — far below the 22× theoretical max.
+The remaining headroom comes from two places: (a) Stwo's
+parallelism is intra-component (within a single FFT or Merkle
+tree) and limited by chip log_size; (b) zkpvm's `prove_impl`
+processes components sequentially in `iter().map().collect()`
+loops at trace_gen, interaction_gen, and tree-builder
+extend_evals.
+
+#### Where the wall-clock goes (log14, post-Phase-54k)
+
+| Stage                | Time   | %    | Parallelism status                       |
+|---                   |---     |---   |---                                       |
+| trace_gen            | 0.07 s |  1%  | Serial; CpuChip dominates                |
+| preprocess_commit    | 0.27 s |  5%  | Stwo-internal (rayon FFT + Merkle)       |
+| main_commit          | 1.85 s | 34%  | Stwo-internal; one big tree              |
+| interaction_gen      | 0.32 s |  6%  | Serial in our code                       |
+| interaction_commit   | 0.75 s | 14%  | Stwo-internal; one big tree              |
+| stark_prove (FRI)    | 2.24 s | 41%  | Stwo-internal                            |
+| **Total**            | 5.51 s | 100% |                                          |
+
+Stwo-internal: 89% of time.  Our serial loops: 7%.
+
+#### Realistic upper bound
+
+The workload at log14 commits 22 M cells × blowup 16 = 350 M
+field evaluations.  At 4 B per element: 1.4 GB working set.
+L3 cache on a 22-core desktop CPU is 24 MB.  Beyond ~6-8 cores
+the FFT/Merkle phases hit memory-bandwidth saturation, not
+core saturation.  **Realistic ceiling: 3-4× from current 1.75×,
+not 22×.**  Translates to log14 prove ≈ 1.5-2 s.
+
+That's enough to bring the gap vs Nexus zkVM 2.x (2.37 s at
+log14) within striking distance — Nexus also uses stwo + rayon,
+so this is more about closing the AIR-shape gap from the
+prover-config side.
+
+#### Sub-phase plan
+
+**58a — `par_iter` the trace_gen loop** (`prove.rs:177-180`).
+Most components don't mutate `SideNote`; only CpuChip + the
+producers of the ECALL memory ledger do.  Approach: split into
+two passes — Phase 58a-1 runs `&mut SideNote` consumers serially
+(CpuChip), Phase 58a-2 par_iters the read-only consumers.
+Estimated win: marginal (trace_gen is 1% of total).
+
+**58b — par_iter the interaction_gen loop** (`prove.rs:235-245`).
+`generate_interaction_trace` takes `&SideNote` (immutable) and a
+shared `lookup_elements`.  Outputs are `(eval_vec, claimed_sum)`
+pairs; collect via par_iter then serially `extend_evals` into the
+tree builder.  Estimated win: 4-6% (interaction_gen is 6% of
+total; ~80% parallelisable).
+
+**58c — parallelise CpuChip's per-step main-trace fill**
+(`cpu/trace_fill.rs:38`, the 32K-row loop).  Currently mutates
+shared accumulators (`range_bytes`, `bitwise_and_bytes`,
+`side_note.program_memory_counts`, `side_note.byte_to_bits_counts`,
+`side_note.bitwise_and_counts`).  Approach: thread-local
+accumulators + post-loop reduce; rayon `par_chunks_mut` on the
+trace builder's underlying SoA storage.  Largest single-component
+opportunity.  Effort: 1-2 days.  Estimated win: marginal — even
+removing trace_gen entirely saves only 1% — but it unlocks 58d.
+
+**58d — pre-fold CpuChip's circle-evaluation transform**
+(`tree_builder.extend_evals` in `prove.rs:208-211, 218-222`).
+If CpuChip's `to_circle_evaluation` is the bottleneck within
+main_commit (need to confirm by sub-profiling), running it for
+each component on a thread before extending into the builder
+could amortise.  Stwo handles parallelism inside extend_evals
+already, so this overlaps poorly — needs measurement.
+
+**58e — explore cell-bandwidth optimisation**
+(stwo-internal).  The 1.75× ceiling at 22 cores suggests
+memory-bandwidth saturation.  Mitigations: smaller M31
+representations (already 4 B), better cache locality in
+`extend_evals`, or a different FRI ordering.  This is upstream
+stwo work; not actionable at zkpvm level.
+
+#### Recommended order
+
+1. **58b** first (lowest risk, simple par_iter restructure of
+   `prove_impl`'s interaction-gen loop, highest ROI per LoC).
+2. **58a** second (similar shape, smaller win).
+3. **58c** third (CpuChip main-trace fill parallelisation;
+   bigger refactor, uncertain ROI).
+4. Re-bench at each step; abort if memory-bandwidth saturation
+   hits before 2× total.
+
+#### Realistic target
+
+If 58a+58b+58c land cleanly: log14 prove ≈ 3.5-4 s (current
+5.4 s × 0.7×).  Combined with the cumulative 60% reduction
+since Phase 50, that's ≈ 70-72% total reduction vs Phase 50
+baseline — achievable, not transformative.
+
+Beyond that, the realistic next lever is **batch proving**
+(amortising one prove call over many segments) or a
+**multi-process / multi-machine** setup (one prover per segment),
+both of which sidestep the single-prove memory-bandwidth ceiling.
