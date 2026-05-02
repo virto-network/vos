@@ -1152,6 +1152,98 @@ fn read_index_returns_leader_stepped_on_partition_step_down() {
     );
 }
 
+/// `read_index` returns `Backpressure` when the leader's
+/// pending-reads queue is full. Without this cap, an asymmetric
+/// partition (leader receives but heartbeats can't quorum-confirm)
+/// would silently grow the queue and OOM the worker.
+#[test]
+fn read_index_returns_backpressure_when_queue_full() {
+    use vos_raft::ReadIndexError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        // Tight cap so the test can fill the queue with a
+        // handful of requests rather than thousands.
+        let mut c = cfg(me, members.clone());
+        c.max_pending_reads = 4;
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            c,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+
+    // Isolate the leader so heartbeats never get acked. Now any
+    // read_index queues forever (until step-down or backpressure).
+    transport.isolate(leader_id, &members);
+
+    // Fire enough read_index requests to fill the queue (4) plus
+    // a few more that must surface Backpressure. Run each in a
+    // detached thread because the queued ones won't return until
+    // we force a step-down at the end.
+    let extra = 8;
+    let mut threads = Vec::new();
+    for _ in 0..(4 + extra) {
+        let h = leader_handle.clone();
+        threads.push(std::thread::spawn(move || block_on(h.read_index())));
+    }
+
+    // Give the worker time to enqueue / reject.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Inject a higher-term AppendEntries to force step-down,
+    // which drains the queued requests with LeaderStepped so
+    // their threads can join.
+    let _ = block_on(leader_handle.handle_inbound_append(
+        99,
+        AppendEntriesReq {
+            leader: 99,
+            term: 1_000,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        },
+    ));
+
+    let mut backpressure_seen = 0;
+    let mut leader_stepped_seen = 0;
+    for t in threads {
+        match t.join().expect("thread joined") {
+            Err(ReadIndexError::Backpressure) => backpressure_seen += 1,
+            Err(ReadIndexError::LeaderStepped) => leader_stepped_seen += 1,
+            other => panic!("unexpected read_index outcome: {other:?}"),
+        }
+    }
+    assert!(
+        backpressure_seen >= extra,
+        "expected at least {extra} Backpressure outcomes, got {backpressure_seen} \
+         (LeaderStepped: {leader_stepped_seen})",
+    );
+}
+
 /// A snapshot whose payload exceeds `install_snapshot_chunk_bytes`
 /// is delivered across multiple `InstallSnapshotReq` chunks; the
 /// follower's snap pointer reaches the leader's `last_included_index`

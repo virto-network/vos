@@ -83,6 +83,15 @@ pub enum ReadIndexError {
     /// quorum could confirm. Caller should retry against the new
     /// leader.
     LeaderStepped,
+    /// The leader has too many in-flight read_index requests
+    /// queued (see [`Config::max_pending_reads`]). Caller
+    /// should retry shortly. A persistent stream of this error
+    /// usually indicates an asymmetric partition: the leader
+    /// receives proposes but its heartbeats can't quorum-confirm,
+    /// so the queue grows.
+    ///
+    /// [`Config::max_pending_reads`]: crate::Config::max_pending_reads
+    Backpressure,
 }
 
 /// Reasons a [`WorkerHandle::change_membership`] can fail.
@@ -2092,6 +2101,14 @@ async fn handle_read_index<N, S, T, C, R, A>(
     // the only voter. Resolve immediately.
     if is_solo_cluster(state) {
         let _ = reply.send(Ok(state.meta.commit_index));
+        return;
+    }
+    // Backpressure: refuse new requests if the queue is full.
+    // Without this cap, an asymmetric partition (leader receives
+    // but can't quorum-confirm) silently grows the queue until
+    // the worker exhausts its heap.
+    if state.pending_read_index.len() >= state.cfg.max_pending_reads {
+        let _ = reply.send(Err(ReadIndexError::Backpressure));
         return;
     }
     let r = state.meta.commit_index;

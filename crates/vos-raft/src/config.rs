@@ -90,6 +90,22 @@ pub struct Config<N: NodeId> {
     ///
     /// [`InstallSnapshotReq`]: crate::InstallSnapshotReq
     pub install_snapshot_chunk_bytes: usize,
+    /// Maximum number of pending [`WorkerHandle::read_index`]
+    /// requests the worker will queue while waiting for a
+    /// quorum-confirmation heartbeat to land. Beyond this cap,
+    /// new `read_index` calls receive
+    /// [`ReadIndexError::Backpressure`] instead of being queued.
+    ///
+    /// Without this cap, a partitioned-but-not-stepped-down
+    /// leader (asymmetric partition: receives but can't reply)
+    /// would silently grow the queue until the worker's heap
+    /// is exhausted. Default: `1024` — enough for normal
+    /// burstiness, small enough to surface a stuck leader
+    /// quickly.
+    ///
+    /// [`WorkerHandle::read_index`]: crate::worker::WorkerHandle::read_index
+    /// [`ReadIndexError::Backpressure`]: crate::worker::ReadIndexError
+    pub max_pending_reads: usize,
 }
 
 impl<N: NodeId> Config<N> {
@@ -108,6 +124,7 @@ impl<N: NodeId> Config<N> {
             compact_hysteresis: 16,
             pre_vote: true,
             install_snapshot_chunk_bytes: 32 * 1024,
+            max_pending_reads: 1024,
         }
     }
 }
