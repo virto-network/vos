@@ -283,28 +283,19 @@ fn append_entries_returns_no_reply_on_storage_failure() {
         "follower must not report success when its meta write failed",
     );
 
-    // ----- Caveat on what this test can and can't verify ------
-    //
-    // Even though the storage `commit_batch` returned `Err`, the
-    // worker's IN-MEMORY `state.meta.current_term` was already
-    // mutated to 5 before the call (see `handle_append_entries`
-    // — the term bump happens before the storage call). So
-    // `worker.snapshot().current_term` reads back as 5, not 0.
-    // The disk-side rollback (no META_TERM write to the storage
-    // backend) is what the test is really pinning, but the
-    // public `snapshot()` API surfaces only the in-memory view.
-    //
-    // We therefore can't *strongly* assert "the meta wasn't
-    // persisted" through the public API — but the fact that the
-    // SECOND AppendEntries below (after fault budget exhaustion)
-    // does succeed indicates the worker is in a usable state,
-    // and any hypothetical regression that silently treated the
-    // first call as successful would either deadlock the test
-    // or change the success outcome of the second call.
-    //
-    // This in-memory-vs-disk divergence is itself documented as
-    // a known caveat — see the worker's handler logic and the
-    // CHANGELOG entry on storage-error semantics.
+    // C3/H3 fix verification: the in-memory term is rolled back
+    // to its pre-mutation value (0) when the storage write fails,
+    // so the worker's view stays consistent with disk. Without
+    // the rollback, snapshot would show term=5 while the on-disk
+    // row still has term=0 — and the next inbound RPC would
+    // refuse with the higher in-memory term, blocking forever.
+    let snap = block_on(h.snapshot()).expect("worker alive");
+    assert_eq!(
+        snap.current_term, 0,
+        "in-memory term must roll back when commit_batch returns Err; \
+         got term={} (was 0 before, would-be 5 after the fault)",
+        snap.current_term,
+    );
 
     // Subsequent RPC works after the fault budget is exhausted.
     fail.store(0, Ordering::Relaxed);

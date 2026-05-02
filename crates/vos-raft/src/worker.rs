@@ -1473,6 +1473,13 @@ where
             match_index: 0,
         });
     }
+    // Snapshot meta before any mutation so we can roll back on a
+    // storage failure. Without this, a transient
+    // `commit_batch` Err leaves the in-memory term ahead of the
+    // disk row — the worker would reply with the higher term
+    // while crash recovery would silently come back at the
+    // lower one.
+    let meta_snapshot = state.meta.clone();
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
@@ -1490,16 +1497,26 @@ where
     // the pre-vote leader-check.
     state.last_heartbeat_received = Some(state.clock.now());
 
-    let our_prev_term = state.storage.term_at(req.prev_log_index).await?;
+    let our_prev_term = match state.storage.term_at(req.prev_log_index).await {
+        Ok(t) => t,
+        Err(e) => {
+            state.meta = meta_snapshot;
+            return Err(e);
+        }
+    };
     let consistent = our_prev_term == Some(req.prev_log_term);
     if !consistent {
-        state
+        if let Err(e) = state
             .storage
             .commit_batch(WriteBatch {
                 meta: Some(state.meta.clone()),
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            state.meta = meta_snapshot;
+            return Err(e);
+        }
         return Ok(AppendEntriesResp {
             term: state.meta.current_term,
             success: false,
@@ -1511,7 +1528,14 @@ where
     let mut already_present = 0usize;
     for (i, e) in req.entries.iter().enumerate() {
         let idx = req.prev_log_index + 1 + i as u64;
-        match state.storage.term_at(idx).await? {
+        let t = match state.storage.term_at(idx).await {
+            Ok(t) => t,
+            Err(e) => {
+                state.meta = meta_snapshot;
+                return Err(e);
+            }
+        };
+        match t {
             Some(t) if t == e.term => already_present += 1,
             Some(_) => {
                 conflict_at = Some(idx);
@@ -1546,7 +1570,7 @@ where
     let appended_a_config = appends
         .iter()
         .any(|e| matches!(e.kind, crate::log_entry::EntryKind::ConfigChange { .. }));
-    state
+    if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
             truncate_after,
@@ -1555,7 +1579,11 @@ where
             state: None,
             meta: Some(state.meta.clone()),
         })
-        .await?;
+        .await
+    {
+        state.meta = meta_snapshot;
+        return Err(e);
+    }
 
     if commit_advanced {
         state.fire_apply_notification();
@@ -1648,6 +1676,8 @@ where
             vote_granted: false,
         });
     }
+    // Snapshot meta so a storage failure rolls in-memory back.
+    let meta_snapshot = state.meta.clone();
     let mut meta_changed = false;
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
@@ -1673,13 +1703,17 @@ where
     }
 
     if meta_changed {
-        state
+        if let Err(e) = state
             .storage
             .commit_batch(WriteBatch {
                 meta: Some(state.meta.clone()),
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            state.meta = meta_snapshot;
+            return Err(e);
+        }
     }
 
     Ok(RequestVoteResp {
@@ -1759,6 +1793,8 @@ where
             bytes_received: 0,
         });
     }
+    // Snapshot meta so a storage failure rolls in-memory back.
+    let meta_snapshot = state.meta.clone();
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
@@ -1781,13 +1817,17 @@ where
     // Drop any in-flight buffer for it too.
     if req.last_included_index <= state.storage.snap_last_index() {
         state.incoming_snapshot = None;
-        state
+        if let Err(e) = state
             .storage
             .commit_batch(WriteBatch {
                 meta: Some(state.meta.clone()),
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            state.meta = meta_snapshot;
+            return Err(e);
+        }
         return Ok(InstallSnapshotResp {
             term: state.meta.current_term,
             bytes_received: 0,
@@ -1873,7 +1913,7 @@ where
     state.meta.snap_last_term = req.last_included_term;
     state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
 
-    state
+    if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
             compact_to: Some((req.last_included_index, req.last_included_term)),
@@ -1881,7 +1921,11 @@ where
             meta: Some(state.meta.clone()),
             ..Default::default()
         })
-        .await?;
+        .await
+    {
+        state.meta = meta_snapshot;
+        return Err(e);
+    }
 
     state.fire_apply_notification();
     Ok(InstallSnapshotResp {
@@ -1906,15 +1950,7 @@ where
     A: ApplySink,
 {
     if resp.term > state.meta.current_term {
-        state.meta.current_term = resp.term;
-        state.meta.voted_for = None;
-        state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await?;
+        persist_term_bump(state, resp.term).await?;
         step_down(state);
         return Ok(());
     }
@@ -1960,15 +1996,7 @@ where
     A: ApplySink,
 {
     if resp.term > state.meta.current_term {
-        state.meta.current_term = resp.term;
-        state.meta.voted_for = None;
-        state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await?;
+        persist_term_bump(state, resp.term).await?;
         step_down(state);
         return Ok(());
     }
@@ -2030,15 +2058,7 @@ where
     A: ApplySink,
 {
     if resp.term > state.meta.current_term {
-        state.meta.current_term = resp.term;
-        state.meta.voted_for = None;
-        state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await?;
+        persist_term_bump(state, resp.term).await?;
         step_down(state);
         return Ok(());
     }
@@ -2088,15 +2108,7 @@ where
 {
     // A peer at a strictly higher term tells us we're stale.
     if resp.term > state.meta.current_term {
-        state.meta.current_term = resp.term;
-        state.meta.voted_for = None;
-        state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await?;
+        persist_term_bump(state, resp.term).await?;
         step_down(state);
         return Ok(());
     }
@@ -2436,6 +2448,39 @@ where
     state.reset_election_timer();
 }
 
+/// Bump the persisted term, clearing `voted_for`, and **only**
+/// mutate the in-memory `state.meta` after the storage write
+/// succeeds. Without this commit-then-mutate ordering, a
+/// transient `Storage::commit_batch` failure leaves the
+/// in-memory term ahead of the on-disk term — the worker
+/// would continue replying with the higher term while restart
+/// recovery would silently come back at the lower one.
+async fn persist_term_bump<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    new_term: u64,
+) -> Result<(), S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    let mut next = state.meta.clone();
+    next.current_term = new_term;
+    next.voted_for = None;
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            meta: Some(next.clone()),
+            ..Default::default()
+        })
+        .await?;
+    state.meta = next;
+    Ok(())
+}
+
 async fn try_advance_commit_index<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
@@ -2457,14 +2502,22 @@ where
     if entry_term != Some(state.meta.current_term) {
         return Ok(());
     }
+    let prev_commit = state.meta.commit_index;
     state.meta.commit_index = majority_floor;
-    state
+    if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
             meta: Some(state.meta.clone()),
             ..Default::default()
         })
-        .await?;
+        .await
+    {
+        // Roll back the in-memory commit_index to keep it
+        // consistent with disk after a transient storage
+        // failure.
+        state.meta.commit_index = prev_commit;
+        return Err(e);
+    }
     state.fire_apply_notification();
     // Auto-progress joint → non-joint when the joint
     // ConfigChange entry has committed (Ongaro thesis §4.3).
@@ -2738,16 +2791,23 @@ where
         Some(t) => t,
         None => return Ok(()),
     };
+    let prev_snap_index = state.meta.snap_last_index;
+    let prev_snap_term = state.meta.snap_last_term;
     state.meta.snap_last_index = floor;
     state.meta.snap_last_term = term_at_floor;
-    state
+    if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
             compact_to: Some((floor, term_at_floor)),
             meta: Some(state.meta.clone()),
             ..Default::default()
         })
-        .await?;
+        .await
+    {
+        state.meta.snap_last_index = prev_snap_index;
+        state.meta.snap_last_term = prev_snap_term;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -2845,15 +2905,26 @@ where
         return Ok(());
     }
     state.set_role(Role::Candidate);
+    let prev_term = state.meta.current_term;
+    let prev_voted_for = state.meta.voted_for;
     state.meta.current_term += 1;
     state.meta.voted_for = Some(state.cfg.me);
-    state
+    if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
             meta: Some(state.meta.clone()),
             ..Default::default()
         })
-        .await?;
+        .await
+    {
+        // Roll back: a transient storage failure mid-election
+        // would otherwise leave us with an in-memory term ahead
+        // of disk and a vote we didn't actually persist.
+        state.meta.current_term = prev_term;
+        state.meta.voted_for = prev_voted_for;
+        state.set_role(Role::Follower);
+        return Err(e);
+    }
     state.votes_received.clear();
     state.votes_received.insert(state.cfg.me);
 

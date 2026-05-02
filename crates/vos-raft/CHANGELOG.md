@@ -200,16 +200,13 @@ this section captures fixes that landed in response.
   that need cross-snapshot membership persistence must encode
   the active config into their snapshot bytes; the priming API
   for that path isn't exposed yet.
-- **Storage error is "drop and forget"**: when
-  `Storage::commit_batch` returns `Err`, the worker's
-  in-memory `state.meta` is already mutated (term bump, vote,
-  etc.) but the on-disk row stays at the pre-call value. The
-  worker doesn't retry the specific failed write — the next
-  inbound RPC that touches the same fields recomputes and
-  commits. Single-shot transient errors are tolerated; a
-  persistently-failing storage backend will diverge in-memory
-  from disk indefinitely. Future work: queue failed writes for
-  retry, or drain the in-memory mutation on Err.
+- **Storage error rolls back in-memory meta**: every handler
+  that mutates `state.meta` snapshots the pre-call value before
+  any mutation and restores it on `Storage::commit_batch` Err.
+  The worker stays consistent with disk: the in-memory and
+  on-disk views always agree after any handler returns.
+  Persistently-failing storage backends still wedge the worker
+  (each retry rolls back), but they no longer diverge.
 - *(removed)* `Meta::last_applied` is no longer part of the
   worker's meta — the host tracks its own apply progress.
   See `Meta`'s docs.
