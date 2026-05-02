@@ -1527,17 +1527,12 @@ fn change_membership_removing_leader_makes_it_step_down() {
     let _joint_index = block_on(leader_handle.change_membership(new_members.clone()))
         .expect("change_membership accepted");
 
-    // The leader must step down once the final non-joint entry
-    // commits. Allow generous time — finalization happens after
-    // a quorum from the joint set, then the leader replicates
-    // the final entry.
     wait_until(
         || workers[&leader_id].role() != Role::Leader,
         Duration::from_secs(10),
         "removed leader steps down",
     );
 
-    // The remaining nodes elect a new leader from the new set.
     wait_until(
         || new_members.iter().any(|p| workers[p].role() == Role::Leader),
         Duration::from_secs(10),
