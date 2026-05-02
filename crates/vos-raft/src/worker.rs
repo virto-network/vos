@@ -58,12 +58,16 @@ use crate::transport::Transport;
 /// versions; callers should match with a wildcard.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ProposeError<E> {
+pub enum ProposeError {
     /// This worker is currently `Follower` or `Candidate`. The
     /// caller must retry against the cluster's leader.
     NotLeader,
-    /// Storage write failed on the append.
-    Storage(E),
+    /// Storage write failed on the append. The error payload is
+    /// erased to `()` because the worker doesn't carry the
+    /// storage error type out — match the unit value or use a
+    /// wildcard. (The host's storage layer typically logs the
+    /// underlying error before the worker sees it.)
+    Storage(()),
 }
 
 /// Reasons a [`WorkerHandle::read_index`] can fail.
@@ -112,7 +116,12 @@ pub enum ChangeMembershipError {
     /// for it to commit before issuing another one (Raft
     /// permits at most one config change at a time).
     InProgress,
-    /// Storage append failed.
+    /// `new_members` was empty. A cluster needs at least one
+    /// voter; an empty configuration would never elect.
+    EmptyConfig,
+    /// Storage append failed. The error payload is erased to
+    /// `()` because the worker doesn't carry the storage
+    /// error type out — match `ProposeError::Storage(())`.
     Storage(()),
 }
 
@@ -169,7 +178,7 @@ pub enum RaftMsg<N: NodeId> {
     /// Append a new entry to the leader's log.
     Propose {
         payload: Vec<u8>,
-        reply: oneshot::Sender<Result<u64, ProposeError<()>>>,
+        reply: oneshot::Sender<Result<u64, ProposeError>>,
     },
     /// Linearizable-read index request. Resolves to the leader's
     /// `commit_index` after a heartbeat round to quorum confirms
@@ -488,7 +497,7 @@ impl<N: NodeId> WorkerHandle<N> {
     }
 
     /// Append a new payload to the cluster log.
-    pub async fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError<()>> {
+    pub async fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError> {
         let (tx, rx) = oneshot::channel();
         self.inbox
             .send(RaftMsg::Propose { payload, reply: tx })
@@ -2074,7 +2083,7 @@ where
 async fn handle_propose<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
     payload: Vec<u8>,
-) -> Result<u64, ProposeError<()>>
+) -> Result<u64, ProposeError>
 where
     N: NodeId,
     S: Storage<N>,
@@ -2129,7 +2138,7 @@ where
         return Err(ChangeMembershipError::InProgress);
     }
     if new_members.is_empty() {
-        return Err(ChangeMembershipError::InProgress);
+        return Err(ChangeMembershipError::EmptyConfig);
     }
     let term = state.meta.current_term;
     let new_index = state.storage.last_index() + 1;
@@ -2368,6 +2377,11 @@ where
     state.leader = None;
     state.current_term_first_index = None;
     state.pre_candidate_misses = 0;
+    // Drop any in-flight chunked-snapshot buffer. The new term's
+    // leader will restart the stream from offset 0 with a fresh
+    // identity; holding the buffer between roles wastes memory
+    // and risks accidental re-use under a future identity match.
+    state.incoming_snapshot = None;
     drain_pending_reads_on_step_down(state);
     state.reset_election_timer();
 }
@@ -2472,6 +2486,14 @@ where
     // log-mutation fast path.
     state.active_config_index = Some(new_index);
     rebuild_leader_tracking(state);
+    // (We don't call `try_advance_commit_index` here, even
+    // though the just-written final entry would commit
+    // immediately in a solo cluster: this function is itself
+    // called from try_advance_commit_index, and a direct
+    // recursive call breaks Rust's async-future layout. The
+    // next heartbeat ack will advance commit_index for the
+    // multi-node case; solo finalize-and-commit is one beat
+    // late, which is acceptable.)
     // If the membership change removed us from the new
     // configuration, retire (Ongaro thesis §4.3): the leader
     // keeps serving long enough to replicate the final
@@ -2633,14 +2655,21 @@ where
     R: Rng,
     A: ApplySink,
 {
-    let leader = match state.leader.as_ref() {
-        Some(l) => l,
-        None => return Ok(()),
+    if state.leader.is_none() {
+        return Ok(());
     };
-    let mut floor = state.storage.last_index();
-    for v in leader.match_index.values() {
-        floor = floor.min(*v);
-    }
+    // Compaction floor is the majority-replicated index, not the
+    // min-of-all-peers. Using the min would let a single slow
+    // peer pin the leader's log indefinitely; with the
+    // majority-floor approach, a lagging peer falls behind and
+    // catches up via chunked InstallSnapshot, exactly as Raft's
+    // log-compaction protocol intends. The floor is still
+    // capped by the committed prefix because we only compact
+    // entries the worker is willing to lose locally — the peer
+    // that's behind can request the snapshot.
+    let Some(floor) = state.match_index_majority_floor().await else {
+        return Ok(());
+    };
     let snap = state.storage.snap_last_index();
     if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());

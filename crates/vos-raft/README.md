@@ -92,7 +92,7 @@ pub trait Rng: Send + 'static { fn next_u64(&mut self) -> u64; }
 pub trait ApplySink: Send + 'static { fn notify(&self, commit_index: u64); }
 ```
 
-`Config<N>`, `WorkerSnapshot<N>`, and `ProposeError<E>` are
+`Config<N>`, `WorkerSnapshot<N>`, and `ProposeError` are
 `#[non_exhaustive]` — construct `Config` via `Config::new(me,
 members, replication_id)` and match `ProposeError` with a
 wildcard arm so future variants don't break callers.
