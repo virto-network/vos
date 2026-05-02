@@ -82,6 +82,27 @@ pub const STANDARD_MIN_FRI_QUERIES: usize = 19;
 /// security per query at the cost of larger committed traces.
 pub const STANDARD_MIN_FRI_LOG_BLOWUP: u32 = 4;
 
+// ── Mobile / low-latency policy ────────────────────────────────────
+// Track B (Phase 58 followup): trades proof size for prove speed.
+// Target: low-power devices where the prove-time-vs-proof-size
+// curve favours faster prove.  ~2.5× faster than STANDARD on the
+// reference bench at log14, ~1.4× larger proof.
+
+/// PoW bits floor for the mobile policy (same as STANDARD —
+/// PoW-grind cost is fixed per prove and doesn't help mobile when
+/// raised, so we keep it at the standard 20).
+pub const MOBILE_MIN_POW_BITS: u32 = 20;
+
+/// FRI queries floor for the mobile policy.  At log_blowup=2 we
+/// need 2× the queries of STANDARD (which uses log_blowup=4) to
+/// hit the same security: 20 + 38·2 = 96.
+pub const MOBILE_MIN_FRI_QUERIES: usize = 38;
+
+/// FRI log-blowup floor for the mobile policy.  Halves the
+/// FRI-prove-domain size vs STANDARD (blowup 4 vs 16) at the cost
+/// of 2× more queries.  Net: ~2.5× faster prove on the bench.
+pub const MOBILE_MIN_FRI_LOG_BLOWUP: u32 = 2;
+
 /// PCS-config policy: a deployer-friendly bundle of the three
 /// security knobs the verifier checks against `proof.pcs_config`.
 ///
@@ -108,6 +129,19 @@ impl PcsPolicy {
         min_pow_bits: STANDARD_MIN_POW_BITS,
         min_fri_queries: STANDARD_MIN_FRI_QUERIES,
         min_fri_log_blowup: STANDARD_MIN_FRI_LOG_BLOWUP,
+    };
+
+    /// Mobile / low-latency policy.  Mirrors
+    /// `production_pcs_config_mobile()` — same 96-bit security as
+    /// STANDARD, but at a different point on the prove-time vs
+    /// proof-size curve (~2.5× faster, ~1.4× larger).  Verifiers
+    /// that accept mobile-shape proofs should pass this policy
+    /// (or a stricter custom one) to the `*_with_pcs_policy`
+    /// variants.
+    pub const MOBILE: Self = Self {
+        min_pow_bits: MOBILE_MIN_POW_BITS,
+        min_fri_queries: MOBILE_MIN_FRI_QUERIES,
+        min_fri_log_blowup: MOBILE_MIN_FRI_LOG_BLOWUP,
     };
 }
 

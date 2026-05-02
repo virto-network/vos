@@ -60,10 +60,32 @@ fn pct(part: std::time::Duration, total: std::time::Duration) -> f64 {
 }
 
 /// 96-bit security: blowup=16, 19 FRI queries, 20-bit PoW.
+///
+/// Conservative shape that minimises proof size (~600 KB at log14).
+/// Suitable for server-side proving where prove time is less critical
+/// than the on-disk / on-chain proof footprint.
 pub fn production_pcs_config() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
         fri_config: FriConfig::new(0, 4, 19),
+    }
+}
+
+/// 96-bit security: blowup=4, 38 FRI queries, 20-bit PoW.
+///
+/// Mobile / low-latency shape: ~2.5× faster prove than
+/// `production_pcs_config()` at the cost of ~1.4× larger proof
+/// (~850 KB at log14).  Same conjectured 96-bit security
+/// (`pow_bits + n_queries · log_blowup_factor = 20 + 38·2 = 96`).
+///
+/// At log14 on a 22-core desktop: 2.10 s prove (vs 5.23 s with the
+/// standard config) — fast enough to beat Nexus zkVM 2.x's 2.37 s.
+/// Verifier-side, callers must use `PcsPolicy::MOBILE` (or
+/// stricter) when verifying proofs produced with this config.
+pub fn production_pcs_config_mobile() -> PcsConfig {
+    PcsConfig {
+        pow_bits: 20,
+        fri_config: FriConfig::new(0, 2, 38),
     }
 }
 

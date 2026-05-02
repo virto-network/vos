@@ -35,7 +35,32 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Current (Phase 54k, median of 5 trials)
+### Headline (Track B): mobile config beats Nexus at log14
+
+Switching from `production_pcs_config()` (blowup=16, 19 queries,
+20-bit PoW) to `production_pcs_config_mobile()` (blowup=4, 38
+queries, 20-bit PoW) — **same 96-bit conjectured security** —
+trades proof size for prove speed:
+
+| log_size | STANDARD (blowup=16) | MOBILE (blowup=4) | Speedup | Proof STD → MOBILE |
+|---       |---                   |---                |---      |---                  |
+| 10       | 899 ms               | **337 ms**        | 2.67×   | 562 → 819 KB        |
+| 14       | 5.23 s               | **2.10 s**        | 2.49×   | 604 → 854 KB        |
+
+**zkpvm with MOBILE beats Nexus zkVM 2.x's 2.37 s at log14** —
+the first time in this experiment.  The config is exposed as
+`production_pcs_config_mobile()` + `PcsPolicy::MOBILE` and is the
+recommended shape for low-latency / mobile / interactive proving.
+
+The blowup=2 point (proof ~1.1 MB) is no faster than blowup=4 on
+the test bench — memory bandwidth saturation at higher core counts
+limits the FRI-domain shrink benefit.
+
+Caveat: `pow_bits` is fixed at 20.  Going higher (e.g., pow=32)
+makes prove ~10× slower because the PoW grind step dominates.
+Stwo also rejects pow_bits > 32.
+
+### Current STANDARD (Phase 54k, median of 5 trials)
 
 | log_size | steps    | trace gen | prove    | verify   | total    | proof size |
 |---       |---       |---        |---       |---       |---       |---         |

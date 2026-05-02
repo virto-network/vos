@@ -7,7 +7,7 @@ use javm::interpreter::Interpreter;
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, prove_profiled, prove_with_config, verify, PcsConfig, FriConfig};
+use zkpvm::{prove, prove_profiled, prove_with_config, verify, verify_with_pcs_policy, PcsConfig, FriConfig, PcsPolicy};
 
 /// Generate a program with `n` sequential ADD64 instructions followed by Trap.
 /// Each ADD cycles through registers to avoid data hazards.
@@ -241,6 +241,88 @@ fn bench_prove_log12() {
 #[test]
 fn bench_prove_log14() {
     bench_at_log_size(14);
+}
+
+// ── Track B: PCS config exploration for mobile (Phase 58 / Track B) ──
+//
+// Probes alternative FRI parameters at log14 to evaluate the blowup
+// trade-off.  Verification uses a matching PcsPolicy so the proof is
+// accepted (production STANDARD requires log_blowup ≥ 4).  All configs
+// here target ≥ 96-bit conjectured security.
+//
+// Headline question: at the same log14 cycle count, how much does
+// dropping log_blowup from 4 (blowup=16) to 1 (blowup=2) save?
+
+fn bench_pcs_config(log_size: u32, label: &str, config: PcsConfig) {
+    let n_steps = 1usize << log_size;
+    let (code, bitmask) = generate_add_program(n_steps);
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    let gas = (n_steps as u64 + 100) * 100;
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 64 * 1024], gas, 16,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+
+    let sec_bits = config.security_bits();
+    let policy = PcsPolicy {
+        min_pow_bits: config.pow_bits,
+        min_fri_queries: config.fri_config.n_queries,
+        min_fri_log_blowup: config.fri_config.log_blowup_factor,
+    };
+
+    let t = std::time::Instant::now();
+    let proof = prove_with_config(&mut side_note, config).expect("proving failed");
+    let prove_time = t.elapsed();
+
+    let proof_bytes = bincode::serialize(&proof).unwrap();
+    let proof_kb = proof_bytes.len() as f64 / 1024.0;
+
+    let t = std::time::Instant::now();
+    verify_with_pcs_policy(proof, &side_note, &policy).expect("verification failed");
+    let verify_time = t.elapsed();
+
+    eprintln!(
+        "  {label:<40} | sec={sec_bits:>3} | prove={prove_time:>10.2?} | verify={verify_time:>8.2?} | proof={proof_kb:>7.1} KB"
+    );
+}
+
+#[test]
+fn pcs_config_sweep_log14() {
+    let log = 14;
+    eprintln!("=== PCS config sweep at LogSize={log} (16384 steps) ===");
+    eprintln!("  Format: pow_bits, log_blowup, n_queries");
+    eprintln!();
+    // Baseline: production STANDARD (96 bits, blowup=16)
+    bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19) });
+    // Same blowup, fewer queries (under-secure if pow_bits don't compensate)
+    bench_pcs_config(log, "blowup=2^3, q=20, pow=16 (96 bits)",
+        PcsConfig { pow_bits: 16, fri_config: FriConfig::new(0, 3, 20) });
+    bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+    bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76) });
+    // Same blowup=2, more pow trade.  pow=32 makes prove ~10x slower
+    // (PoW-grind dominates at high pow_bits).  Documented for the
+    // record; not a useful config.
+    // Stwo limit: pow_bits <= 32; pow=48 is rejected upstream.
+}
+
+#[test]
+fn pcs_config_sweep_log10() {
+    let log = 10;
+    eprintln!("=== PCS config sweep at LogSize={log} (1024 steps) ===");
+    bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19) });
+    bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+    bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76) });
 }
 
 // `cargo test --workspace` runs every `#[test]` by default; log16 needs

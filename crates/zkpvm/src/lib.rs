@@ -162,9 +162,13 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
 pub use proof::{
     check_pcs_policy, PcsPolicy, Proof, SegmentState, PROOF_FORMAT_VERSION,
     STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
+    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS,
 };
 #[cfg(feature = "prover")]
-pub use prove::{prove, prove_with_config, prove_profiled, prove_profiled_with_config, ProveProfile, production_pcs_config};
+pub use prove::{
+    prove, prove_with_config, prove_profiled, prove_profiled_with_config,
+    ProveProfile, production_pcs_config, production_pcs_config_mobile,
+};
 #[cfg(feature = "debug-internals")]
 pub use prove::debug_claimed_sums;
 pub use stwo::core::pcs::PcsConfig;
