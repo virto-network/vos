@@ -131,6 +131,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::PowerOfTwoChip,
     &chips::PopcountChip, // Phase 33 — per-byte popcount lookup table
     &chips::BitcountChip, // Phase 34 — per-byte (lz, tz) lookup table
+    &chips::ByteToBitsChip, // Phase 55a — per-byte 8-bit decomposition lookup table (dormant in 55a; consumers added in 55b)
     &chips::MulChip,      // Phase 54a — consumer of MultiplicationLookup
     &chips::BitwiseChip,  // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::CompareChip,  // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
@@ -153,6 +154,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::PowerOfTwoChip,
     &chips::PopcountChip,
     &chips::BitcountChip,
+    &chips::ByteToBitsChip, // Phase 55a
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
 ];

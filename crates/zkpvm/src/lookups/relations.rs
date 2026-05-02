@@ -174,6 +174,19 @@ stwo_constraint_framework::relation!(
     REL_MULTIPLICATION_LOOKUP_SIZE
 );
 
+// Phase 55a — ByteToBits lookup.  256-row preprocessed table proving
+// `(byte, bit0, bit1, bit2, bit3, bit4, bit5, bit6, bit7)` where
+// `byte = sum_{i=0..8} 2^i * bit_i`.  Phase 55b uses this table to
+// bind CpuChip's individual flag columns to the 6 packed flag bytes
+// that flow through the prog_mem tuple.
+//
+// Tuple: (byte, bit0..bit7) — 9 limbs.
+const REL_BYTE_TO_BITS_LOOKUP_SIZE: usize = 1 + 8;
+stwo_constraint_framework::relation!(
+    ByteToBitsLookupElements,
+    REL_BYTE_TO_BITS_LOOKUP_SIZE
+);
+
 // (h_ptr[4], m_ptr[4], t_low[8], f[1], ts[8]) — binds Blake2bChip's HPtr,
 // MPtr, T[0..8], F and CallTs to CpuChip's ECALL-step register snapshot +
 // timestamp so the precompile can't fabricate the pointer / counter /
