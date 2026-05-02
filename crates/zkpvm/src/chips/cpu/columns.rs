@@ -833,6 +833,24 @@ pub enum Column {
     /// inactive when val_b_is_reg=0).
     #[size = 1]
     IsRotateRImmAlt,
+    /// Phase 55b: 6 packed flag bytes mirroring the canonical
+    /// classify_opcode flag bag.  Each byte holds 8 of the 48
+    /// individual flag bits (bit i = flag[8*k + i]).  The byte-to-bits
+    /// lookup per row pins these bits to the matching CpuChip flag
+    /// columns (or sum-of-sub-flags expressions for the 5 folded
+    /// category slots: is_mul_upper, is_bitwise, is_compare,
+    /// is_branch, is_store).  ProgramMemoryChip's preprocessed
+    /// FlagByte0..5 columns hold the canonical values; the prog_mem
+    /// lookup balance pins each FlagByteI on CpuChip to canonical.
+    /// Together these collapse the 48-flag prog_mem region to 6 bytes.
+    /// Layout per byte is documented in `lookups/relations.rs` next
+    /// to `PROG_MEMORY_N_FLAG_BYTES`.
+    #[size = 1] FlagByte0,
+    #[size = 1] FlagByte1,
+    #[size = 1] FlagByte2,
+    #[size = 1] FlagByte3,
+    #[size = 1] FlagByte4,
+    #[size = 1] FlagByte5,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

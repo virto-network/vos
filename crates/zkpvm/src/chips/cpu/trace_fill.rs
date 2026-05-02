@@ -1177,6 +1177,28 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     range_bytes.push(b);
                 }
             }
+
+            // ── Phase 55b: pack the 48 individual flags into 6 bytes ──
+            // The packing matches `program_memory::pack_flags` and the
+            // canonical 48-flag layout in `classify_opcode_for_program_memory`.
+            // Per-row byte-to-bits lookups (in cpu/mod.rs) bind individual
+            // flag columns / sum-of-sub-flags expressions to these bytes.
+            // ProgramMemoryChip's preprocessed FlagByte0..5 columns hold
+            // the canonical packing for each PC; the prog_mem lookup
+            // balance pins each FlagByteI on CpuChip to canonical.
+            let canonical_flags =
+                super::classify::classify_opcode_for_program_memory(step.opcode);
+            let flag_bytes = crate::chips::program_memory::pack_flags(&canonical_flags);
+            trace.fill_columns(row, flag_bytes[0], Column::FlagByte0);
+            trace.fill_columns(row, flag_bytes[1], Column::FlagByte1);
+            trace.fill_columns(row, flag_bytes[2], Column::FlagByte2);
+            trace.fill_columns(row, flag_bytes[3], Column::FlagByte3);
+            trace.fill_columns(row, flag_bytes[4], Column::FlagByte4);
+            trace.fill_columns(row, flag_bytes[5], Column::FlagByte5);
+            // 6 byte-to-bits emissions per real row, one per packed byte.
+            for &fb in &flag_bytes {
+                side_note.byte_to_bits_counts[fb as usize] += 1;
+            }
         }
 
         for &b in &range_bytes {

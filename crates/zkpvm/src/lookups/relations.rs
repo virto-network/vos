@@ -21,37 +21,48 @@ stwo_constraint_framework::relation!(
 );
 
 // (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],
-//  flags[N_FLAGS])  — N_FLAGS = 20 category + sub-category booleans.
+//  flag_bytes[N_FLAG_BYTES], imm_y_canon[4], branch_target_canon[4])
 //
 // Authenticates instruction-fetch tuples: every CpuChip step emits this
 // tuple, and ProgramMemoryChip's preprocessed table holds the canonical
 // decoding at every basic-block-starting PC of `code`.  Phase 13a defined
 // the chip; 13b wired the (pc, opcode, skip_len, regs, imm) consumer; 13c
-// extends the tuple with the category/sub-category flags so a prover
-// can't clear flags to skip per-op constraints — flag values are now
-// pinned to the canonical classify_opcode(opcode) decoding.
+// extended the tuple with category/sub-category flags so a prover can't
+// clear flags to skip per-op constraints.
 //
-// Flag layout in the tuple, in order (Phase 13c → 12c → 16 → 20 → 23 → 24 → 25 → 26 → 27 → 28 → 32 → 33 → 34 → 35 → 36):
-//   is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift, is_compare,
-//   is_move, is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
-//   is_exit, is_neg_add, is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
-//   is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind,
-//   is_mul_upper_uu, is_mul_upper_su, is_mul_upper_ss, is_div_s,
-//   is_load_i8, is_load_i16, is_load_i32,
-//   is_mem_size_1, is_mem_size_2, is_mem_size_4, is_mem_size_8,
-//   is_store_direct, is_load_direct, is_mem_indirect,
-//   is_store_imm_any, is_store_imm_direct, is_store_ind, is_rotate_l64,
-//   is_count_set_bits, is_lzb, is_tzb, is_rotate_r64,
-//   is_rotate_l32, is_rotate_r32, is_rotate_r_imm_alt
+// Phase 55b: the 48 individual flag columns were packed into 6 bytes
+// (`flag_bytes[i] = sum_{j=0..8} 2^j * flag[8*i+j]`) on both sides of
+// the lookup.  CpuChip emits 6 byte-to-bits lookups per row to bind
+// each individual flag column (or its sum-of-sub-flags expression for
+// the 5 folded category slots) back to its packed byte.  The prog_mem
+// tuple shrinks from 73 → 31 limbs.
+//
+// Flag layout per byte (0-indexed within byte; little-endian bits):
+//   byte 0: is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift,
+//           is_compare, is_move
+//   byte 1: is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
+//           is_exit, is_neg_add
+//   byte 2: is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
+//           is_sign_ext_16, is_trap, is_jump_ind, is_load_imm_jump_ind,
+//           is_mul_upper_uu
+//   byte 3: is_mul_upper_su, is_mul_upper_ss, is_div_s, is_load_i8,
+//           is_load_i16, is_load_i32, is_mem_size_1, is_mem_size_2
+//   byte 4: is_mem_size_4, is_mem_size_8, is_store_direct, is_load_direct,
+//           is_mem_indirect, is_store_imm_any, is_store_imm_direct,
+//           is_store_ind
+//   byte 5: is_rotate_l64, is_count_set_bits, is_lzb, is_tzb,
+//           is_rotate_r64, is_rotate_l32, is_rotate_r32,
+//           is_rotate_r_imm_alt
+/// Canonical flag count (kept as a public constant so external readers
+/// — fuzz harnesses, security docs — can refer to the AIR-side count
+/// regardless of the on-tuple packing.  Each FlagByteI on the prog_mem
+/// tuple carries 8 of these.
 pub const PROG_MEMORY_N_FLAGS: usize = 48;
+pub const PROG_MEMORY_N_FLAG_BYTES: usize = PROG_MEMORY_N_FLAGS / 8;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 48 flags + imm_y_canon[4] + branch_target_canon[4] = 73 limbs.
-//   is_rotate_r_imm_alt added in Phase 40 to drive the swapped-source
-//   trace fill (val_b ← imm, val_d ← regs[rb]) for RotR64ImmAlt /
-//   RotR32ImmAlt; the existing rotate-r constraints fire normally
-//   alongside is_rotate_r64 / is_rotate_r32.
+//   + 6 packed flag bytes + imm_y_canon[4] + branch_target_canon[4] = 31 limbs.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
-    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAGS + PC_SIZE + PC_SIZE;
+    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAG_BYTES + PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(
     ProgramMemoryLookupElements,
     REL_PROG_MEMORY_LOOKUP_SIZE

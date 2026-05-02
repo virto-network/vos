@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, CompareLookupElements, DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -66,7 +66,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements, ByteToBitsLookupElements),
     );
 
 
@@ -83,10 +83,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements, ByteToBitsLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup, divrem_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup, divrem_lookup, byte_to_bits_lookup)) = lookup_elements;
         // bitwise_and_lookup is no longer emitted by CpuChip (Phase 54e
         // moved nibble emissions to BitwiseChip).
         let _ = bitwise_and_lookup;
@@ -1980,13 +1980,19 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 13b/c: program-memory consumer (pc + opcode + regs + imm + flags)
+        // Phase 13b/c + 55b: program-memory consumer (pc + opcode + regs + imm
+        //                                              + 6 packed flag bytes
+        //                                              + imm_y + branch_target)
         //
-        // Per real CpuChip step, demand the full instruction tuple +
-        // category-flag bag from ProgramMemoryChip's preprocessed table.
-        // Phase 13b binds (pc, opcode, skip_len, reg_a, reg_b, reg_d, imm);
-        // 13c extends it with 20 category/sub-category flag columns so the
-        // prover can't clear flags to skip per-op constraints.
+        // Per real CpuChip step, demand the full instruction tuple from
+        // ProgramMemoryChip's preprocessed table.  Phase 13b bound
+        // (pc, opcode, skip_len, regs, imm); 13c extended with the 48
+        // category/sub-category flags so a prover can't clear flags to
+        // skip per-op constraints.  Phase 55b packs the 48 flag bits into
+        // 6 bytes on both sides — the prog_mem tuple now sends 6 bytes
+        // instead of 48 bits, and 6 byte-to-bits lookups (next block)
+        // bind individual flag columns / sum-of-sub-flags expressions to
+        // the matching bit slot in each FlagByteI.
         //
         // Pair-parity (CONSTRAINTS.md rule 1): two paired emissions with
         // identical multiplicity and tuple.  ProgramMemoryChip doubles its
@@ -1999,56 +2005,12 @@ impl BuiltInComponent for CpuChip {
             let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
             let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
             let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-            // 13c flags — must match the order of ProgramMemoryChip's
-            // preprocessed columns and `classify_opcode_for_program_memory`.
-            let f_is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
-            let f_is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
-            let f_is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
-            // Phase 53: IsMulUpper is the sum of the three sub-flags.
-            // Phase 53c: IsBitwise as the sum expression (no column).
-            let f_is_shift = crate::trace::trace_eval!(trace_eval, Column::IsShift);
-            // Phase 53d: IsCompare folded — sum expression below.
-            let f_is_move = crate::trace::trace_eval!(trace_eval, Column::IsMove);
-            let f_is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
-            // Phase 53e: IsBranch folded — sum expression below.
-            let f_is_jump = crate::trace::trace_eval!(trace_eval, Column::IsJump);
-            let f_is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
-            let f_is_load = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
-            // Phase 53f: IsStore folded — sum expression below.
-            let f_is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
-            let f_is_neg_add = crate::trace::trace_eval!(trace_eval, Column::IsNegAdd);
-            let f_is_reverse_bytes = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
-            let f_is_zero_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
-            let f_is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
-            let f_is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
-            let f_is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
-            let f_is_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
-            let f_is_load_imm_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
-            let f_is_mul_upper_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
-            let f_is_mul_upper_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
-            let f_is_mul_upper_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
-            let f_is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
-            let f_is_load_i8 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
-            let f_is_load_i16 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
-            let f_is_load_i32 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
-            let f_is_mem_size_1 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
-            let f_is_mem_size_2 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
-            let f_is_mem_size_4 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
-            let f_is_mem_size_8 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
-            let f_is_store_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
-            let f_is_load_direct = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
-            let f_is_mem_indirect = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
-            let f_is_store_imm_any = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
-            let f_is_store_imm_direct = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
-            let f_is_store_ind = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
-            let f_is_rotate_l64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
-            let f_is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
-            let f_is_lzb = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
-            let f_is_tzb = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
-            let f_is_rotate_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
-            let f_is_rotate_l32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
-            let f_is_rotate_r32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            let f_is_rotate_r_imm_alt = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let fb0 = crate::trace::trace_eval!(trace_eval, Column::FlagByte0);
+            let fb1 = crate::trace::trace_eval!(trace_eval, Column::FlagByte1);
+            let fb2 = crate::trace::trace_eval!(trace_eval, Column::FlagByte2);
+            let fb3 = crate::trace::trace_eval!(trace_eval, Column::FlagByte3);
+            let fb4 = crate::trace::trace_eval!(trace_eval, Column::FlagByte4);
+            let fb5 = crate::trace::trace_eval!(trace_eval, Column::FlagByte5);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup = crate::trace::trace_eval!(
                 trace_eval, Column::BranchTarget
@@ -2061,66 +2023,12 @@ impl BuiltInComponent for CpuChip {
             tuple.push(reg_b[0].clone());
             tuple.push(reg_d[0].clone());
             tuple.extend_from_slice(&imm);
-            tuple.push(f_is_add[0].clone());
-            tuple.push(f_is_sub[0].clone());
-            tuple.push(f_is_mul[0].clone());
-            // Phase 53: IsMulUpper as the sum expression.
-            tuple.push(
-                f_is_mul_upper_uu[0].clone()
-                    + f_is_mul_upper_su[0].clone()
-                    + f_is_mul_upper_ss[0].clone(),
-            );
-            // Phase 53c: IsBitwise as the sum expression.
-            tuple.push(
-                is_and_flag[0].clone() + is_or_flag[0].clone() + is_xor_flag[0].clone()
-                    + is_and_inv_flag[0].clone() + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone(),
-            );
-            tuple.push(f_is_shift[0].clone());
-            // Phase 53d: IsCompare as the sum expression.
-            tuple.push(is_compare_e());
-            tuple.push(f_is_move[0].clone());
-            tuple.push(f_is_32bit[0].clone());
-            // Phase 53e: IsBranch as the sum expression.
-            tuple.push(is_branch_e());
-            tuple.push(f_is_jump[0].clone());
-            tuple.push(f_is_div_rem[0].clone());
-            tuple.push(f_is_load[0].clone());
-            // Phase 53f: IsStore as the sum expression.
-            tuple.push(is_store_e());
-            tuple.push(f_is_exit[0].clone());
-            tuple.push(f_is_neg_add[0].clone());
-            tuple.push(f_is_reverse_bytes[0].clone());
-            tuple.push(f_is_zero_ext_16[0].clone());
-            tuple.push(f_is_sign_ext_8[0].clone());
-            tuple.push(f_is_sign_ext_16[0].clone());
-            tuple.push(f_is_trap[0].clone());
-            tuple.push(f_is_jump_ind[0].clone());
-            tuple.push(f_is_load_imm_jump_ind[0].clone());
-            tuple.push(f_is_mul_upper_uu[0].clone());
-            tuple.push(f_is_mul_upper_su[0].clone());
-            tuple.push(f_is_mul_upper_ss[0].clone());
-            tuple.push(f_is_div_s[0].clone());
-            tuple.push(f_is_load_i8[0].clone());
-            tuple.push(f_is_load_i16[0].clone());
-            tuple.push(f_is_load_i32[0].clone());
-            tuple.push(f_is_mem_size_1[0].clone());
-            tuple.push(f_is_mem_size_2[0].clone());
-            tuple.push(f_is_mem_size_4[0].clone());
-            tuple.push(f_is_mem_size_8[0].clone());
-            tuple.push(f_is_store_direct[0].clone());
-            tuple.push(f_is_load_direct[0].clone());
-            tuple.push(f_is_mem_indirect[0].clone());
-            tuple.push(f_is_store_imm_any[0].clone());
-            tuple.push(f_is_store_imm_direct[0].clone());
-            tuple.push(f_is_store_ind[0].clone());
-            tuple.push(f_is_rotate_l64[0].clone());
-            tuple.push(f_is_count_set_bits[0].clone());
-            tuple.push(f_is_lzb[0].clone());
-            tuple.push(f_is_tzb[0].clone());
-            tuple.push(f_is_rotate_r64[0].clone());
-            tuple.push(f_is_rotate_l32[0].clone());
-            tuple.push(f_is_rotate_r32[0].clone());
-            tuple.push(f_is_rotate_r_imm_alt[0].clone());
+            tuple.push(fb0[0].clone());
+            tuple.push(fb1[0].clone());
+            tuple.push(fb2[0].clone());
+            tuple.push(fb3[0].clone());
+            tuple.push(fb4[0].clone());
+            tuple.push(fb5[0].clone());
             // Phase 13d-loadimmjumpind: bind ImmYBytes to canonical imm_y
             // (low 4 bytes) for LoadImmJumpInd; 0 for ops without a second
             // immediate.  Tracer writes 0 to imm_y for those, so balanced.
@@ -2144,6 +2052,147 @@ impl BuiltInComponent for CpuChip {
                 is_real.clone().into(),
                 &tuple,
             ));
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Phase 55b: byte-to-bits decomposition lookups
+        //
+        // Per real CpuChip step, emit 6 lookups against ByteToBitsChip's
+        // 256-row table.  Each tuple is `(FlagByteI, bit0, bit1, ..., bit7)`
+        // where bit_j is either an individual flag column or a sum-of-
+        // sub-flags expression for the 5 folded category slots
+        // (is_mul_upper / is_bitwise / is_compare / is_branch / is_store).
+        // Composed with the prog_mem balance (which pins each FlagByteI to
+        // canonical), this constrains every individual flag column /
+        // sum expression to its canonical value at every real step.
+        //
+        // 6 emissions per row keep `finalize_logup_in_pairs`'s parity
+        // even.  Multiplicity = is_real on every emission.
+        //
+        // Bit layout per byte (matches `pack_flags` in
+        // chips/program_memory.rs and the canonical 48-flag layout in
+        // `classify_opcode_for_program_memory`).
+        {
+            let fb0 = crate::trace::trace_eval!(trace_eval, Column::FlagByte0);
+            let fb1 = crate::trace::trace_eval!(trace_eval, Column::FlagByte1);
+            let fb2 = crate::trace::trace_eval!(trace_eval, Column::FlagByte2);
+            let fb3 = crate::trace::trace_eval!(trace_eval, Column::FlagByte3);
+            let fb4 = crate::trace::trace_eval!(trace_eval, Column::FlagByte4);
+            let fb5 = crate::trace::trace_eval!(trace_eval, Column::FlagByte5);
+            // Reread/define individual-flag bit expressions for each byte.
+            // Most flags live in module-scope `let`s near the top of
+            // add_constraints; the rest are local to this block.
+            let f_is_jump_p55 = crate::trace::trace_eval!(trace_eval, Column::IsJump);
+            let f_is_div_rem_p55 = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
+            let f_is_load_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
+            let f_is_exit_p55 = crate::trace::trace_eval!(trace_eval, Column::IsExit);
+            let f_is_reverse_bytes_p55 = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
+            let f_is_zero_ext_16_p55 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
+            let f_is_sign_ext_8_p55 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
+            let f_is_sign_ext_16_p55 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
+            let f_is_trap_p55 = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
+            let f_is_jump_ind_p55 = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
+            let f_is_load_imm_jump_ind_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let f_is_mul_upper_uu_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
+            let f_is_mul_upper_su_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
+            let f_is_mul_upper_ss_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
+            let f_is_div_s_p55 = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
+            let f_is_load_i8_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
+            let f_is_load_i16_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
+            let f_is_load_i32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
+            let f_is_mem_size_1_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
+            let f_is_mem_size_2_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
+            let f_is_mem_size_4_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
+            let f_is_mem_size_8_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
+            let f_is_load_direct_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
+            let f_is_mem_indirect_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
+            let f_is_store_imm_direct_p55 = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
+            let f_is_rotate_l64_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
+            let f_is_count_set_bits_p55 = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
+            let f_is_lzb_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
+            let f_is_tzb_p55 = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
+            let f_is_rotate_r64_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            let f_is_rotate_l32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
+            let f_is_rotate_r32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+            let f_is_rotate_r_imm_alt_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+
+            // Sum expressions for the 5 folded category slots.
+            let mu_sum_e = f_is_mul_upper_uu_p55[0].clone()
+                + f_is_mul_upper_su_p55[0].clone()
+                + f_is_mul_upper_ss_p55[0].clone();
+            let bw_sum_e = is_and_flag[0].clone() + is_or_flag[0].clone()
+                + is_xor_flag[0].clone() + is_and_inv_flag[0].clone()
+                + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone();
+            let cmp_sum_e = is_compare_e();
+            let br_sum_e = is_branch_e();
+            let st_sum_e = is_store_e();
+
+            // byte 0: (FlagByte0, is_add, is_sub, is_mul, MU_SUM, BW_SUM,
+            //          is_shift, CMP_SUM, is_move)
+            let tuple0: Vec<E::F> = vec![
+                fb0[0].clone(),
+                is_add[0].clone(), is_sub[0].clone(), is_mul[0].clone(),
+                mu_sum_e.clone(), bw_sum_e.clone(),
+                is_shift[0].clone(), cmp_sum_e.clone(), is_move[0].clone(),
+            ];
+            // byte 1: (FlagByte1, is_32bit, BR_SUM, is_jump, is_div_rem,
+            //          is_load, ST_SUM, is_exit, is_neg_add)
+            let tuple1: Vec<E::F> = vec![
+                fb1[0].clone(),
+                is_32bit[0].clone(), br_sum_e.clone(), f_is_jump_p55[0].clone(),
+                f_is_div_rem_p55[0].clone(), f_is_load_p55[0].clone(),
+                st_sum_e.clone(), f_is_exit_p55[0].clone(), is_neg_add[0].clone(),
+            ];
+            // byte 2: (FlagByte2, is_reverse_bytes, is_zero_ext_16,
+            //          is_sign_ext_8, is_sign_ext_16, is_trap, is_jump_ind,
+            //          is_load_imm_jump_ind, is_mul_upper_uu)
+            let tuple2: Vec<E::F> = vec![
+                fb2[0].clone(),
+                f_is_reverse_bytes_p55[0].clone(), f_is_zero_ext_16_p55[0].clone(),
+                f_is_sign_ext_8_p55[0].clone(), f_is_sign_ext_16_p55[0].clone(),
+                f_is_trap_p55[0].clone(), f_is_jump_ind_p55[0].clone(),
+                f_is_load_imm_jump_ind_p55[0].clone(), f_is_mul_upper_uu_p55[0].clone(),
+            ];
+            // byte 3: (FlagByte3, is_mul_upper_su, is_mul_upper_ss, is_div_s,
+            //          is_load_i8, is_load_i16, is_load_i32,
+            //          is_mem_size_1, is_mem_size_2)
+            let tuple3: Vec<E::F> = vec![
+                fb3[0].clone(),
+                f_is_mul_upper_su_p55[0].clone(), f_is_mul_upper_ss_p55[0].clone(),
+                f_is_div_s_p55[0].clone(),
+                f_is_load_i8_p55[0].clone(), f_is_load_i16_p55[0].clone(),
+                f_is_load_i32_p55[0].clone(),
+                f_is_mem_size_1_p55[0].clone(), f_is_mem_size_2_p55[0].clone(),
+            ];
+            // byte 4: (FlagByte4, is_mem_size_4, is_mem_size_8,
+            //          is_store_direct, is_load_direct, is_mem_indirect,
+            //          is_store_imm_any, is_store_imm_direct, is_store_ind)
+            let tuple4: Vec<E::F> = vec![
+                fb4[0].clone(),
+                f_is_mem_size_4_p55[0].clone(), f_is_mem_size_8_p55[0].clone(),
+                is_store_direct_e[0].clone(), f_is_load_direct_p55[0].clone(),
+                f_is_mem_indirect_p55[0].clone(),
+                is_store_imm_any_e[0].clone(), f_is_store_imm_direct_p55[0].clone(),
+                is_store_ind_e[0].clone(),
+            ];
+            // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
+            //          is_lzb, is_tzb, is_rotate_r64, is_rotate_l32,
+            //          is_rotate_r32, is_rotate_r_imm_alt)
+            let tuple5: Vec<E::F> = vec![
+                fb5[0].clone(),
+                f_is_rotate_l64_p55[0].clone(), f_is_count_set_bits_p55[0].clone(),
+                f_is_lzb_p55[0].clone(), f_is_tzb_p55[0].clone(),
+                f_is_rotate_r64_p55[0].clone(), f_is_rotate_l32_p55[0].clone(),
+                f_is_rotate_r32_p55[0].clone(), f_is_rotate_r_imm_alt_p55[0].clone(),
+            ];
+
+            for t in [&tuple0, &tuple1, &tuple2, &tuple3, &tuple4, &tuple5] {
+                eval.add_to_relation(RelationEntry::new(
+                    byte_to_bits_lookup,
+                    is_real.clone().into(),
+                    t,
+                ));
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
