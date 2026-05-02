@@ -997,6 +997,71 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     );
 }
 
+/// A permanently-isolated PreCandidate must revert to Follower
+/// after `pre_candidate_misses_before_revert` consecutive
+/// PreVote-quorum-misses. Without this, external observers
+/// reading `role()` would see PreCandidate indefinitely on a
+/// stuck node.
+#[test]
+fn pre_candidate_reverts_to_follower_after_consecutive_misses() {
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let mut c = cfg(me, members.clone());
+        // Tight cap so the test converges quickly: revert after
+        // 2 PreCandidate timeouts. Default of 3 is safe in
+        // production; 2 is enough to prove the mechanism here.
+        c.pre_candidate_misses_before_revert = 2;
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            c,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges before partition",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+
+    // Isolate a non-leader node. It will time out, enter
+    // PreCandidate, fail to reach quorum (no peer can reply),
+    // time out again, and after 2 consecutive misses revert
+    // to Follower.
+    let isolated = *members.iter().find(|p| **p != leader_id).unwrap();
+    transport.isolate(isolated, &members);
+
+    // Wait long enough for ~3 election timeouts (30-80ms each)
+    // to let the miss counter cross the 2-miss cap and the
+    // revert to fire. Use 500ms for safety margin.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let snap = block_on(workers[&isolated].handler().snapshot())
+        .expect("isolated alive");
+    assert_eq!(
+        snap.role,
+        Role::Follower,
+        "isolated node should revert to Follower after consecutive PreCandidate misses, \
+         got role={:?}",
+        snap.role,
+    );
+}
+
 /// `read_index` on the leader returns an index ≥ commit_index
 /// after a quorum heartbeat round confirms leadership. The
 /// caller can then read state machine state at-or-above that

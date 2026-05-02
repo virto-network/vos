@@ -923,6 +923,13 @@ where
     /// resolve `read_index` against a prior-term `commit_index`,
     /// breaking linearizability.
     current_term_first_index: Option<u64>,
+    /// Number of consecutive PreVote rounds that timed out
+    /// without crossing quorum. After
+    /// `Config::pre_candidate_misses_before_revert` misses,
+    /// the worker reverts to Follower so external observers
+    /// see a clean "no election active" state. Reset whenever
+    /// the worker successfully transitions out of PreCandidate.
+    pre_candidate_misses: u32,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
@@ -1110,6 +1117,7 @@ where
         effective_cfg,
         pending_joint_entry,
         current_term_first_index: None,
+        pre_candidate_misses: 0,
         leader: None,
         apply_sink,
         role_atomic,
@@ -1258,11 +1266,23 @@ async fn on_timer<N, S, T, C, R, A>(
             }
         }
         // PreCandidate whose timer expired: pre-election round
-        // didn't get quorum within the timeout. Reset and try
-        // another pre-vote round (fresh randomized timer
-        // prevents lockstep).
+        // didn't get quorum within the timeout. Bump the miss
+        // counter; if it crosses
+        // `Config::pre_candidate_misses_before_revert`, revert
+        // to Follower so external observers see a clean
+        // "no election in progress" state. Otherwise try another
+        // pre-vote round with a fresh randomized timer.
         Role::PreCandidate => {
-            let _ = start_pre_election(state, pending).await;
+            state.pre_candidate_misses = state.pre_candidate_misses.saturating_add(1);
+            let cap = state.cfg.pre_candidate_misses_before_revert;
+            if cap > 0 && state.pre_candidate_misses >= cap {
+                state.set_role(Role::Follower);
+                state.votes_received.clear();
+                state.pre_candidate_misses = 0;
+                state.reset_election_timer();
+            } else {
+                let _ = start_pre_election(state, pending).await;
+            }
         }
         // Candidate whose timer expired: send the real
         // RequestVote round. Either we're here freshly-promoted
@@ -1966,6 +1986,7 @@ where
             // call `start_election` which bumps the term and
             // sends real RequestVotes.
             state.set_role(Role::Candidate);
+            state.pre_candidate_misses = 0;
             state.election_deadline = state.clock.now();
         }
     }
@@ -2269,6 +2290,7 @@ where
     state.votes_received.clear();
     state.leader = None;
     state.current_term_first_index = None;
+    state.pre_candidate_misses = 0;
     drain_pending_reads_on_step_down(state);
     state.reset_election_timer();
 }

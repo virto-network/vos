@@ -118,6 +118,18 @@ pub struct Config<N: NodeId> {
     /// Default: `512 * 1024 * 1024` (512 MiB). Embedded targets
     /// with tight RAM should set this much lower.
     pub max_snapshot_bytes: usize,
+    /// Number of consecutive PreVote rounds that may time out
+    /// without crossing quorum before the worker reverts from
+    /// PreCandidate to Follower. A permanently-isolated
+    /// PreCandidate would otherwise stay in that role forever,
+    /// hiding the fact that no progress is possible from any
+    /// external observer that reads the worker's role atomic.
+    ///
+    /// Setting this to `0` disables the fallback (PreCandidate
+    /// keeps retrying indefinitely — the legacy behavior).
+    /// Default: `3` — enough to absorb a transient network blip
+    /// but quick enough to surface a stuck node.
+    pub pre_candidate_misses_before_revert: u32,
 }
 
 impl<N: NodeId> Config<N> {
@@ -138,6 +150,7 @@ impl<N: NodeId> Config<N> {
             install_snapshot_chunk_bytes: 32 * 1024,
             max_pending_reads: 1024,
             max_snapshot_bytes: 512 * 1024 * 1024,
+            pre_candidate_misses_before_revert: 3,
         }
     }
 }
