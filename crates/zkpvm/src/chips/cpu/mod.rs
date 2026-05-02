@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, CompareLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, CompareLookupElements, DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -66,7 +66,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements),
     );
 
 
@@ -83,10 +83,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup, divrem_lookup)) = lookup_elements;
         // bitwise_and_lookup is no longer emitted by CpuChip (Phase 54e
         // moved nibble emissions to BitwiseChip).
         let _ = bitwise_and_lookup;
@@ -457,57 +457,21 @@ impl BuiltInComponent for CpuChip {
         let div_rem_op = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
         let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
         let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
-        let div_mul_carry = crate::trace::trace_eval!(trace_eval, Column::DivMulCarry);
-        let div_mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::DivMulCarryHi);
+        // Phase 54g: DivMulCarry + DivMulCarryHi moved to DivRemChip.
         let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
         let div_corr_hi = crate::trace::trace_eval!(trace_eval, Column::DivCorrHi);
 
         // Gate: only constrain when is_div_rem=1 and div_by_zero=0
         let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
-        // Phase 16: full 16-bit per-position carry, reconstructed as
-        // `low + 256·high`.  Mirrors the MulCarry / MulCarryHi pattern.
-        // u8-only (Phase 13-) was a latent bug — at busy middle positions
-        // q·d can carry up to ≈ 2 030, which doesn't fit in a byte.  Hit
-        // for the first time by DivS with both operands negative
-        // (q,d ≈ 0xFF…F2 / 0xFF…F9 in two's complement).
-        let div_full_carry = |k: usize| -> E::F {
-            div_mul_carry[k].clone() + div_mul_carry_hi[k].clone() * f256.clone()
-        };
 
-        // Schoolbook: quotient * divisor + remainder = dividend (mod 2^128)
-        // For 64-bit: 16 positions (q[0..8] * d[0..8] produces 16 output bytes).
-        //   Low 8 bytes (k<8):  expected = val_b[k]  (the dividend bytes).
-        //   High 8 bytes (k≥8): expected = DivCorrHi[k-8].  For DivU rows the
-        //     accompanying constraint forces DivCorrHi = 0 (so this matches
-        //     the original "expected high = 0" behaviour); for DivS rows
-        //     DivCorrHi is bound by a carry chain to the two's-complement
-        //     correction `sq·d_u + sd·q_u + sr − sa  (mod 2^64)`, which is
-        //     the unsigned-schoolbook high produced by signed inputs.
-        //
-        // Phase 16: this fixes #42 (DivS64 with negative dividend rejected).
-        // Without DivCorrHi, the high bytes of `(2^64 − |q|)·d + r` are
-        // non-zero in two's complement, but the AIR demanded zero.
-        for k in 0..16usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..WORD_SIZE {
-                let j = k.wrapping_sub(i);
-                if j < WORD_SIZE {
-                    partial_sum += div_quotient[i].clone() * val_d[j].clone();
-                }
-            }
-            if k < WORD_SIZE {
-                partial_sum += div_remainder[k].clone();
-            }
-            let carry_in = if k == 0 { E::F::zero() } else { div_full_carry(k - 1) };
-            let expected = if k < WORD_SIZE {
-                val_b[k].clone()
-            } else {
-                div_corr_hi[k - WORD_SIZE].clone()
-            };
-            let c = expected + div_full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(div_active.clone() * is_64bit.clone() * c);
-        }
+        // Phase 54g: divrem schoolbook (q·d + r = b) carry chain moved
+        // to DivRemChip.  CpuChip's q/r/div_corr_hi/val_b/val_d/
+        // is_div_rem/div_by_zero/is_32bit values flow through the
+        // DivRemLookup tuple; DivRemChip's AIR pins q·d + r ≡ b mod 2^64
+        // (low byte) and ≡ div_corr_hi mod 2^64 (high byte).  CpuChip
+        // keeps the DivS sign-correction chain (it consumes div_corr_hi
+        // and div_corr_carry directly).
 
         // DivCorrHi must be 0 on non-DivS rows (so the 64-bit schoolbook's
         // high-byte `expected` collapses back to 0 for DivU).  Holds
@@ -615,38 +579,7 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // 32-bit divrem: same but only 8 positions.  Use full 16-bit
-        // carry too (Phase 16) — although 32-bit per-position sums max
-        // out at 4·255² ≈ 260 100 → carry ≈ 1 020, still beyond u8.
-        //
-        // Phase 18: high 4 bytes (k=4..7) now bind to DivCorrHi[k−4]
-        // (sharing the same column with the 64-bit case at indices
-        // 0..3, mutually exclusive via Is32Bit / Is64Bit).  For DivU
-        // rows the existing `(1 − is_div_s) · DivCorrHi[i] = 0`
-        // collapses this to "= 0", matching the original behaviour.
-        // For DivS32 rows DivCorrHi is bound by the new 32-bit
-        // sign-correction carry chain to two's-complement of the
-        // signed correction.
-        for k in 0..8usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..4usize {
-                let j = k.wrapping_sub(i);
-                if j < 4 {
-                    partial_sum += div_quotient[i].clone() * val_d[j].clone();
-                }
-            }
-            if k < 4 {
-                partial_sum += div_remainder[k].clone();
-            }
-            let carry_in = if k == 0 { E::F::zero() } else { div_full_carry(k - 1) };
-            let expected = if k < 4 {
-                val_b[k].clone()
-            } else {
-                div_corr_hi[k - 4].clone()
-            };
-            let c = expected + div_full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(div_active.clone() * is_32bit[0].clone() * c);
-        }
+        // Phase 54g: 32-bit divrem schoolbook moved to DivRemChip.
 
         // For div ops (op 0,1): result = quotient
         // div_rem_op ∈ {0,1} for div. Gate: op*(op-1) = 0 when op=0 or op=1.
@@ -2894,6 +2827,37 @@ impl BuiltInComponent for CpuChip {
                     mul_lookup,
                     f_is_mul_p54[0].clone().into(),
                     &tuple_p54,
+                ));
+            }
+        }
+
+        // ── Phase 54g: DivRemLookup producer ──
+        // Tuple (43 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+        //   div_remainder[8] + div_corr_hi[8] + is_div_rem +
+        //   div_by_zero + is_32bit.  Multiplicity = is_div_rem.
+        {
+            let val_b_p54g = crate::trace::trace_eval!(trace_eval, Column::ValB);
+            let val_d_p54g = crate::trace::trace_eval!(trace_eval, Column::ValD);
+            let dq_p54g = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
+            let dr_p54g = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
+            let dch_p54g = crate::trace::trace_eval!(trace_eval, Column::DivCorrHi);
+            let dbz_p54g = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
+            let is_dr_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
+            let is_32_p54g = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(43);
+            tuple_p54g.extend_from_slice(&val_b_p54g);
+            tuple_p54g.extend_from_slice(&val_d_p54g);
+            tuple_p54g.extend_from_slice(&dq_p54g);
+            tuple_p54g.extend_from_slice(&dr_p54g);
+            tuple_p54g.extend_from_slice(&dch_p54g);
+            tuple_p54g.push(is_dr_p54g[0].clone());
+            tuple_p54g.push(dbz_p54g[0].clone());
+            tuple_p54g.push(is_32_p54g[0].clone());
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    divrem_lookup,
+                    is_dr_p54g[0].clone().into(),
+                    &tuple_p54g,
                 ));
             }
         }

@@ -239,9 +239,8 @@ pub enum Column {
     /// Remainder (8 limbs). For rem ops: remainder = result. For div ops: prover-provided.
     #[size = 8]
     DivRemainder,
-    /// Carry chain for quotient * divisor + remainder = dividend (16 limbs)
-    #[size = 16]
-    DivMulCarry,
+    // Phase 54g: DivMulCarry[16] moved to DivRemChip alongside the
+    // schoolbook q·d + r = b carry chain.
     /// 1 if divisor is zero (special-case handling)
     #[size = 1]
     DivByZero,
@@ -444,16 +443,7 @@ pub enum Column {
     /// discarded (mirrors `% 2^64` at the boundary).
     #[size = 8]
     DivCorrCarry,
-    /// Phase 16: high byte of the divrem schoolbook carry per position;
-    /// pairs with DivMulCarry to represent a 16-bit value (mirrors
-    /// MulCarry / MulCarryHi from the mul schoolbook).  At busy middle
-    /// positions of `q · d` the per-byte sum can reach
-    /// 8·255² + 255 ≈ 520 000 → carry ≈ 2 030, which doesn't fit in a
-    /// single u8.  Pre-existing latent bug in the u8-only chain, hit
-    /// for the first time by DivS rows where both q and d have many
-    /// 0xFF bytes (e.g. -14 × -7 in two's complement).
-    #[size = 16]
-    DivMulCarryHi,
+    // Phase 54g: DivMulCarryHi[16] moved to DivRemChip.
     // ── Phase 17: sign-bit pinning ────────────────────────────────────────
     // Closes the SignBitB / SignBitD / SignBitQ / SignBitR soundness gap
     // shared with Phase 12c.  Each sign bit is now constrained to equal

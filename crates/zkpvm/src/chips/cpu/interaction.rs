@@ -27,6 +27,7 @@ use crate::lookups::{
     AllLookupElements, BitcountLookupElements, BitwiseAndLookupElements,
     BitwiseLookupElements,
     Blake2bCallLookupElements, CompareLookupElements,
+    DivRemLookupElements,
     JumpTableLookupElements, LogupTraceBuilder,
     MemoryAccessLookupElements, MultiplicationLookupElements,
     PopcountLookupElements, PowerOfTwoLookupElements,
@@ -948,6 +949,35 @@ pub(super) fn generate_interaction_trace(
                             t
                         }
                     },
+                );
+            }
+        }
+
+        // ── Phase 54g: DivRemLookup producer (prover-side mirror) ──
+        {
+            let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
+            let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
+            let val_d_p54g = crate::trace::original_base_column!(component_trace, Column::ValD);
+            let dq_p54g = crate::trace::original_base_column!(component_trace, Column::DivQuotient);
+            let dr_p54g = crate::trace::original_base_column!(component_trace, Column::DivRemainder);
+            let dch_p54g = crate::trace::original_base_column!(component_trace, Column::DivCorrHi);
+            let dbz_p54g = crate::trace::original_base_column!(component_trace, Column::DivByZero);
+            let is_dr_p54g = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
+            let is_32_p54g = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
+            let mut tuple_p54g: Vec<_> = val_b_p54g.to_vec();
+            tuple_p54g.extend_from_slice(&val_d_p54g);
+            tuple_p54g.extend_from_slice(&dq_p54g);
+            tuple_p54g.extend_from_slice(&dr_p54g);
+            tuple_p54g.extend_from_slice(&dch_p54g);
+            tuple_p54g.push(is_dr_p54g[0].clone());
+            tuple_p54g.push(dbz_p54g[0].clone());
+            tuple_p54g.push(is_32_p54g[0].clone());
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    divrem_p54g,
+                    [is_dr_p54g[0].clone()],
+                    |[m]| m.into(),
+                    &tuple_p54g,
                 );
             }
         }

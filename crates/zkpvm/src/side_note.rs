@@ -70,6 +70,22 @@ pub struct SideNote {
     /// Phase 54f: per-compare-or-branch-row witness pushed by CpuChip
     /// so CompareChip's AIR can re-prove the unsigned-LT carry chain.
     pub compare_entries: Vec<CompareEntry>,
+    /// Phase 54g: per-divrem-row witness for DivRemChip.
+    pub divrem_entries: Vec<DivRemEntry>,
+}
+
+/// Phase 54g — Single divrem-row witness for the DivRemLookup balance.
+#[derive(Clone, Debug)]
+pub struct DivRemEntry {
+    pub val_b: u64,
+    pub val_d: u64,
+    pub div_quotient: u64,
+    pub div_remainder: u64,
+    pub div_corr_hi: [u8; 8],
+    pub div_mul_carry: [u8; 16],
+    pub div_mul_carry_hi: [u8; 16],
+    pub div_by_zero: bool,
+    pub is_32bit: bool,
 }
 
 /// Phase 54f — Single compare-or-branch-row witness for the
@@ -165,6 +181,7 @@ impl SideNote {
             mul_entries: Vec::new(),
             bitwise_entries: Vec::new(),
             compare_entries: Vec::new(),
+            divrem_entries: Vec::new(),
         }
     }
 

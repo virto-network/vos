@@ -110,6 +110,21 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_STATE_LOOKUP_SIZE
 );
 
+// Phase 54g — DivRem lookup.  CpuChip emits one producer per
+// `is_div_rem` row; DivRemChip consumes once per real (non-padding)
+// row.  Tuple binds val_b/val_d/div_quotient/div_remainder/div_corr_hi
+// + is_div_rem/div_by_zero/is_32bit so DivRemChip's AIR can re-prove
+// the schoolbook identity (q·d + r = b mod 2^128) via the byte-wise
+// carry chain over its narrower trace.
+//
+// Tuple: (val_b[8], val_d[8], div_quotient[8], div_remainder[8],
+//   div_corr_hi[8], is_div_rem, div_by_zero, is_32bit) — 43 limbs.
+const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 5 + 3;
+stwo_constraint_framework::relation!(
+    DivRemLookupElements,
+    REL_DIVREM_LOOKUP_SIZE
+);
+
 // Phase 54f — Compare lookup.  CpuChip emits one producer per
 // `is_compare + is_branch` row; CompareChip consumes once per real
 // (non-padding) row.  Tuple binds val_b/val_d/cmp_lt_flag so
