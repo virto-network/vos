@@ -415,36 +415,25 @@ pub enum Column {
     #[size = 8]
     ImmBytes,
     /// Phase 16: 1 iff this step's opcode is one of DivS32 / DivS64 /
-    /// RemS32 / RemS64.  Drives the divrem schoolbook's high-byte
-    /// sign-correction (without it, signed divrem with any negative
-    /// operand fails proving — see DivCorrHi / DivCorrCarry).
+    /// RemS32 / RemS64.  Drives DivRemChip's signed-correction chain.
     #[size = 1]
     IsDivS,
     /// Phase 16: bit 7 of `div_quotient[7]` (sign of quotient on 64-bit
-    /// signed div/rem).  Prover-witnessed (mirrors SignBitB / SignBitD
-    /// — same trust model as Phase 12c MulUpper).  Used in the
-    /// DivCorrHi carry chain.
+    /// signed div/rem).  Prover-witnessed.  Pinned via a Phase 17/18
+    /// nibble lookup; flowed to DivRemChip via the lookup tuple.
     #[size = 1]
     SignBitQ,
     /// Phase 16: bit 7 of `div_remainder[7]` (sign of remainder on
-    /// 64-bit signed div/rem).  Prover-witnessed.  Used in the
-    /// DivCorrHi carry chain.
+    /// 64-bit signed div/rem).  Prover-witnessed.  Pinned + flowed
+    /// like SignBitQ.
     #[size = 1]
     SignBitR,
-    /// Phase 16: high 8 bytes of the divrem schoolbook's unsigned
-    /// product `q_u·d_u + r_u`.  Replaces the old hard-coded "0" for
-    /// k≥8 in the schoolbook constraint.  For DivU rows: forced to 0,
-    /// so the schoolbook still demands `q·d + r = b` exactly.  For DivS
-    /// rows: bound by a carry chain to `sq·d_u + sd·q_u + sr − sa
-    /// (mod 2^64)`, the unsigned high produced by signed inputs in
-    /// two's complement.
-    #[size = 8]
-    DivCorrHi,
-    /// Phase 16: per-byte carry chain for the DivCorrHi sign-correction
-    /// equation.  Carry-out at byte 7 is the 64-bit overflow,
-    /// discarded (mirrors `% 2^64` at the boundary).
-    #[size = 8]
-    DivCorrCarry,
+    // Phase 16 → 54k: DivCorrHi[8] + DivCorrCarry[8] moved to DivRemChip.
+    //   - DivCorrHi was the high 8 bytes of the schoolbook output, used
+    //     to bind q·d + r ≡ val_b mod 2^128 with sign correction on
+    //     DivS rows.  Now an internal DivRemChip column.
+    //   - DivCorrCarry was the per-byte carry of the Phase 16 sign-
+    //     correction chain.  Internal to DivRemChip.
     // Phase 54g: DivMulCarryHi[16] moved to DivRemChip.
     // ── Phase 17: sign-bit pinning ────────────────────────────────────────
     // Closes the SignBitB / SignBitD / SignBitQ / SignBitR soundness gap

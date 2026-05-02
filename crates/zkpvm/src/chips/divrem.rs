@@ -1,20 +1,24 @@
-//! Phase 54g / 54i — `DivRemChip`: per-divrem-row chip.
+//! Phase 54g / 54i / 54k — `DivRemChip`: per-divrem-row chip.
 //!
 //! CpuChip emits one DivRemLookup producer per `is_div_rem=1` row;
-//! DivRemChip consumes once per real row.  DivRemChip witnesses the
-//! 16-position carry chain for the schoolbook `q·d + r = b` (low 8
-//! bytes) / `q·d + r = div_corr_hi mod 2^64` (high 8 bytes), in both
-//! 64-bit and 32-bit forms.
+//! DivRemChip consumes once per real row.  DivRemChip witnesses
+//! three carry chains internally:
 //!
-//! Phase 54i adds the unsigned r<d uniqueness chain (was on CpuChip
-//! Phase 21) here as well: per-byte `val_d + ~div_remainder + 1`
-//! carry chain whose top carry forces `val_d > div_remainder`,
-//! gated on `is_div_rem · ¬div_by_zero · ¬is_div_s`.  Per-byte
-//! Range256 emissions on `DivCmpDiff` enforce the byte range.
+//!   1. (54g) Schoolbook `q·d + r = b` (low 8 bytes) /
+//!      `q·d + r = div_corr_hi mod 2^64` (high 8 bytes), in both
+//!      64-bit and 32-bit forms.
+//!   2. (54i) Unsigned `r < d` uniqueness on
+//!      `is_div_rem · ¬div_by_zero · ¬is_div_s` rows.
+//!   3. (54k) DivS sign-correction chain pinning DivCorrHi to
+//!      `sq·d + sd·q + sr − sb (mod 2^64)` on
+//!      `is_div_rem · ¬div_by_zero · is_div_s` rows.  64-bit chain
+//!      covers all 8 bytes; 32-bit chain covers low 4.
 //!
-//! Lookup tuple (44 limbs): val_b[8] + val_d[8] + div_quotient[8] +
-//! div_remainder[8] + div_corr_hi[8] + is_div_rem + div_by_zero +
-//! is_32bit + is_div_s.
+//! Per-byte Range256 emissions on DivCmpDiff enforce its byte range.
+//!
+//! Lookup tuple (40 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+//! div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
+//! sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -97,6 +101,20 @@ pub enum Column {
     /// on unsigned div rows.
     #[size = 8]
     DivCmpCarry,
+    /// Phase 54k: per-byte carry of the DivS sign-correction chain.
+    /// Boolean per byte.
+    #[size = 8]
+    DivCorrCarry,
+    /// Phase 54k: 4 sign bits flowed from CpuChip via the lookup
+    /// tuple.  Used by the Phase 16/18 sign-correction chain.
+    #[size = 1]
+    SignBitB,
+    #[size = 1]
+    SignBitD,
+    #[size = 1]
+    SignBitQ,
+    #[size = 1]
+    SignBitR,
     #[size = 1]
     IsPadding,
 }
@@ -106,10 +124,11 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for DivRemChip {
-    /// Schoolbook constraint is degree 4 (`is_real * is_64bit *
-    /// (1 - div_by_zero) * (q*d + r - val_b - ...)`).  Eval domain
-    /// needs log_size + 2.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    /// Phase 54k: bumped from 2 to 3 (max degree 8).  The Phase 54k
+    /// sign-correction chain is degree 6 (`div_s_active * is_64bit *
+    /// (sign_bit_q * val_d[i] + ...)` = 4 * 1 * 2).  Schoolbook chain
+    /// (54g) is degree 4 (was at the prior bound).
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 3;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -135,10 +154,19 @@ impl BuiltInComponent for DivRemChip {
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
         let div_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
         let div_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::DivCmpCarry);
+        let div_corr_carry = crate::trace::trace_eval!(trace_eval, Column::DivCorrCarry);
+        let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+        let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+        let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
+        let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
         // Boolean constraints on flag columns.
-        for flag in [&is_div_rem, &div_by_zero, &is_32bit, &is_div_s, &is_padding] {
+        for flag in [
+            &is_div_rem, &div_by_zero, &is_32bit, &is_div_s,
+            &sign_bit_b, &sign_bit_d, &sign_bit_q, &sign_bit_r,
+            &is_padding,
+        ] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         let is_real = E::F::one() - is_padding[0].clone();
@@ -239,6 +267,68 @@ impl BuiltInComponent for DivRemChip {
         eval.add_constraint(
             div_u_active * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
         );
+
+        // ── Phase 54k: DivS sign-correction chain ──
+        // Was Phase 16/18 on CpuChip.  Pins
+        //   div_corr_hi[i] + div_corr_carry[i]·256 + (i==0 ? sb : 0)
+        //     = sq·val_d[i] + sd·div_quotient[i] + carry_in + (i==0 ? sr : 0)
+        // on `is_real · is_div_rem · ¬div_by_zero · is_div_s` rows.
+        // 64-bit chain over all 8 bytes; 32-bit chain over low 4 bytes.
+        //
+        // No boolean constraint on DivCorrCarry: the trace fill writes
+        // carry values in {-1, 0, 1, 2} (see CpuChip trace_fill.rs's
+        // Phase 16 block, lines 706-712 region), which are not boolean.
+        // The original CpuChip Phase 16/18 had no boolean here either —
+        // div_corr_hi is range-checked implicitly via the schoolbook
+        // chain (its bytes are bytes of high(q·d+r) mod 2^64), and the
+        // prover's freedom in div_corr_carry doesn't enable false
+        // proofs given the schoolbook + chain identities.
+        let div_s_active = is_real.clone() * is_div_rem[0].clone()
+            * (E::F::one() - div_by_zero[0].clone()) * is_div_s[0].clone();
+        // 64-bit chain.
+        for i in 0..WORD_SIZE {
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                div_corr_carry[i - 1].clone()
+            };
+            let extra_lhs = if i == 0 { sign_bit_b[0].clone() } else { E::F::zero() };
+            let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
+            eval.add_constraint(
+                div_s_active.clone() * is_64bit.clone() * (
+                    div_corr_hi[i].clone()
+                        + div_corr_carry[i].clone() * f256.clone()
+                        + extra_lhs
+                        - sign_bit_q[0].clone() * val_d[i].clone()
+                        - sign_bit_d[0].clone() * div_quotient[i].clone()
+                        - carry_in
+                        - extra_rhs
+                )
+            );
+        }
+        // 32-bit chain (low 4 bytes only; high 4 of div_corr_hi are
+        // unconstrained on 32-bit DivS rows but never observed).
+        for i in 0..4 {
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                div_corr_carry[i - 1].clone()
+            };
+            let extra_lhs = if i == 0 { sign_bit_b[0].clone() } else { E::F::zero() };
+            let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
+            eval.add_constraint(
+                div_s_active.clone() * is_32bit[0].clone() * (
+                    div_corr_hi[i].clone()
+                        + div_corr_carry[i].clone() * f256.clone()
+                        + extra_lhs
+                        - sign_bit_q[0].clone() * val_d[i].clone()
+                        - sign_bit_d[0].clone() * div_quotient[i].clone()
+                        - carry_in
+                        - extra_rhs
+                )
+            );
+        }
+
         // Range256 emissions on DivCmpDiff bytes.  8 emissions per real
         // row, gated by is_real, even count (paired with the Phase 54g
         // schoolbook chain's emissions implicitly via finalize_in_pairs).
@@ -251,12 +341,15 @@ impl BuiltInComponent for DivRemChip {
         }
 
         // ── Lookup consumer ──
-        let mut tuple: Vec<E::F> = Vec::with_capacity(44);
+        let mut tuple: Vec<E::F> = Vec::with_capacity(40);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&div_quotient);
         tuple.extend_from_slice(&div_remainder);
-        tuple.extend_from_slice(&div_corr_hi);
+        tuple.push(sign_bit_b[0].clone());
+        tuple.push(sign_bit_d[0].clone());
+        tuple.push(sign_bit_q[0].clone());
+        tuple.push(sign_bit_r[0].clone());
         tuple.push(is_div_rem[0].clone());
         tuple.push(div_by_zero[0].clone());
         tuple.push(is_32bit[0].clone());
@@ -307,6 +400,11 @@ impl BuiltInProverComponent for DivRemChip {
             trace.fill_columns(row, e.is_div_s, Column::IsDivS);
             trace.fill_columns_bytes(row, &e.div_cmp_diff, Column::DivCmpDiff);
             trace.fill_columns_bytes(row, &e.div_cmp_carry, Column::DivCmpCarry);
+            trace.fill_columns_bytes(row, &e.div_corr_carry, Column::DivCorrCarry);
+            trace.fill_columns(row, e.sign_bit_b, Column::SignBitB);
+            trace.fill_columns(row, e.sign_bit_d, Column::SignBitD);
+            trace.fill_columns(row, e.sign_bit_q, Column::SignBitQ);
+            trace.fill_columns(row, e.sign_bit_r, Column::SignBitR);
             trace.fill_columns(row, false, Column::IsPadding);
         }
 
@@ -337,11 +435,14 @@ impl BuiltInProverComponent for DivRemChip {
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let div_quotient = crate::trace::original_base_column!(component_trace, Column::DivQuotient);
         let div_remainder = crate::trace::original_base_column!(component_trace, Column::DivRemainder);
-        let div_corr_hi = crate::trace::original_base_column!(component_trace, Column::DivCorrHi);
         let is_div_rem = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
         let div_by_zero = crate::trace::original_base_column!(component_trace, Column::DivByZero);
         let is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
         let is_div_s = crate::trace::original_base_column!(component_trace, Column::IsDivS);
+        let sign_bit_b = crate::trace::original_base_column!(component_trace, Column::SignBitB);
+        let sign_bit_d = crate::trace::original_base_column!(component_trace, Column::SignBitD);
+        let sign_bit_q = crate::trace::original_base_column!(component_trace, Column::SignBitQ);
+        let sign_bit_r = crate::trace::original_base_column!(component_trace, Column::SignBitR);
         let div_cmp_diff = crate::trace::original_base_column!(component_trace, Column::DivCmpDiff);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
@@ -359,7 +460,10 @@ impl BuiltInProverComponent for DivRemChip {
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&div_quotient);
         tuple.extend_from_slice(&div_remainder);
-        tuple.extend_from_slice(&div_corr_hi);
+        tuple.push(sign_bit_b[0].clone());
+        tuple.push(sign_bit_d[0].clone());
+        tuple.push(sign_bit_q[0].clone());
+        tuple.push(sign_bit_r[0].clone());
         tuple.push(is_div_rem[0].clone());
         tuple.push(div_by_zero[0].clone());
         tuple.push(is_32bit[0].clone());

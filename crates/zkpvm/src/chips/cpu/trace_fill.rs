@@ -754,8 +754,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
             // Phase 54g: DivMulCarry/DivMulCarryHi moved to DivRemChip.
             trace.fill_columns(row, div_by_zero, Column::DivByZero);
-            trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
-            trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
+            // Phase 16 → 54k: DivCorrHi[8] + DivCorrCarry[8] no longer
+            // CpuChip columns.  div_corr_hi / div_corr_carry are
+            // captured in DivRemEntry below and witnessed on DivRemChip.
 
             // Phase 21 → 54i: DivCmpDiff / DivCmpCarry chain witnesses
             // moved to DivRemChip.  Compute them here only on divrem
@@ -780,25 +781,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
             }
 
-            // Phase 54g/54i: capture this row for DivRemChip's main trace.
-            if flags.is_div_rem {
-                let div_quotient_u64 = u64::from_le_bytes(div_quotient);
-                let div_remainder_u64 = u64::from_le_bytes(div_remainder);
-                side_note.divrem_entries.push(crate::side_note::DivRemEntry {
-                    val_b,
-                    val_d,
-                    div_quotient: div_quotient_u64,
-                    div_remainder: div_remainder_u64,
-                    div_corr_hi,
-                    div_mul_carry,
-                    div_mul_carry_hi,
-                    div_by_zero: div_by_zero != 0,
-                    is_32bit: flags.is_32bit,
-                    is_div_s: flags.is_div_s,
-                    div_cmp_diff,
-                    div_cmp_carry,
-                });
-            }
+            // Phase 54g/54i/54k: DivRemEntry push deferred until after
+            // sign_bit_q/r are computed (Phase 17/18 block below) so
+            // they can flow into DivRemChip via the entry.
 
             // Phase 31: byte-wise zero-check for div_remainder
             // (mirrors Phase 29's pattern for val_d).  Drives the
@@ -888,6 +873,35 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, sign_bit_r, Column::SignBitR);
             trace.fill_columns(row, sign_src_q, Column::SignSrcQ);
             trace.fill_columns(row, sign_src_r, Column::SignSrcR);
+
+            // Phase 54g/54i/54k: capture this row for DivRemChip's
+            // main trace.  Pushed here (rather than just after
+            // div_quotient/div_remainder are filled) so all 4 sign
+            // bits are available — DivRemChip's Phase 16/18 sign-
+            // correction chain reads them via the lookup tuple.
+            if flags.is_div_rem {
+                let div_quotient_u64 = u64::from_le_bytes(div_quotient);
+                let div_remainder_u64 = u64::from_le_bytes(div_remainder);
+                side_note.divrem_entries.push(crate::side_note::DivRemEntry {
+                    val_b,
+                    val_d,
+                    div_quotient: div_quotient_u64,
+                    div_remainder: div_remainder_u64,
+                    div_corr_hi,
+                    div_corr_carry,
+                    div_mul_carry,
+                    div_mul_carry_hi,
+                    div_by_zero: div_by_zero != 0,
+                    is_32bit: flags.is_32bit,
+                    is_div_s: flags.is_div_s,
+                    div_cmp_diff,
+                    div_cmp_carry,
+                    sign_bit_b,
+                    sign_bit_d,
+                    sign_bit_q,
+                    sign_bit_r,
+                });
+            }
 
             // Phase 17 / 18: hi nibbles + BitwiseLookupChip charges
             // for the 8 sign-bit pinning lookups emitted on every

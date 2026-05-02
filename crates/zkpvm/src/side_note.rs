@@ -78,17 +78,23 @@ pub struct SideNote {
     pub divrem_entries: Vec<DivRemEntry>,
 }
 
-/// Phase 54g — Single divrem-row witness for the DivRemLookup balance.
-/// Phase 54i extended with `is_div_s` (gates the r<d uniqueness chain to
-/// unsigned div rows) and the `div_cmp_diff/div_cmp_carry` chain bytes
-/// (was on CpuChip; now witnessed by DivRemChip).
+/// Phase 54g/54i/54k — Single divrem-row witness for the DivRemLookup
+/// balance.  div_corr_hi / div_corr_carry are DivRemChip-internal
+/// (Phase 54k); the 4 sign bits flow from CpuChip via the lookup
+/// tuple so DivRemChip can run the Phase 16/18 sign-correction chains.
 #[derive(Clone, Debug)]
 pub struct DivRemEntry {
     pub val_b: u64,
     pub val_d: u64,
     pub div_quotient: u64,
     pub div_remainder: u64,
+    /// Phase 54k: high 8 bytes of the schoolbook output.  Internal to
+    /// DivRemChip — pinned by the schoolbook chain on DivU rows and
+    /// additionally by the sign-correction chain on DivS rows.
     pub div_corr_hi: [u8; 8],
+    /// Phase 54k: per-byte carry of the Phase 16/18 sign-correction
+    /// chain.  Internal witness on DivRemChip.
+    pub div_corr_carry: [u8; 8],
     pub div_mul_carry: [u8; 16],
     pub div_mul_carry_hi: [u8; 16],
     pub div_by_zero: bool,
@@ -100,6 +106,13 @@ pub struct DivRemEntry {
     /// real DivRemChip row.
     pub div_cmp_diff: [u8; 8],
     pub div_cmp_carry: [u8; 8],
+    /// Phase 54k: 4 sign bits flowed from CpuChip.  Bound on CpuChip
+    /// via Phase 17/18 nibble lookups; consumed here for the DivS
+    /// sign-correction chain.
+    pub sign_bit_b: u8,
+    pub sign_bit_d: u8,
+    pub sign_bit_q: u8,
+    pub sign_bit_r: u8,
 }
 
 /// Phase 54f — Single compare-or-branch-row witness for the

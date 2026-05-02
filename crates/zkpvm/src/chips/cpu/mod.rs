@@ -457,127 +457,18 @@ impl BuiltInComponent for CpuChip {
         let div_rem_op = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
         let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
         let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
-        // Phase 54g: DivMulCarry + DivMulCarryHi moved to DivRemChip.
+        // Phase 54g/54k: divrem chains moved to DivRemChip.
+        // - 54g: schoolbook q·d+r=b chain.
+        // - 54i: r<d uniqueness chain.
+        // - 54k: DivS sign-correction chain (was Phase 16/18 here).
+        // CpuChip flows val_b/val_d/q/r + 4 sign bits + flags via the
+        // 40-limb DivRemLookup tuple; DivCorrHi/DivCorrCarry are
+        // DivRemChip-internal and no longer CpuChip columns.
         let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
-        let div_corr_hi = crate::trace::trace_eval!(trace_eval, Column::DivCorrHi);
 
         // Gate: only constrain when is_div_rem=1 and div_by_zero=0
         let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
-
-        // Phase 54g: divrem schoolbook (q·d + r = b) carry chain moved
-        // to DivRemChip.  CpuChip's q/r/div_corr_hi/val_b/val_d/
-        // is_div_rem/div_by_zero/is_32bit values flow through the
-        // DivRemLookup tuple; DivRemChip's AIR pins q·d + r ≡ b mod 2^64
-        // (low byte) and ≡ div_corr_hi mod 2^64 (high byte).  CpuChip
-        // keeps the DivS sign-correction chain (it consumes div_corr_hi
-        // and div_corr_carry directly).
-
-        // DivCorrHi must be 0 on non-DivS rows (so the 64-bit schoolbook's
-        // high-byte `expected` collapses back to 0 for DivU).  Holds
-        // unconditionally — even on padding / non-divrem rows DivCorrHi is
-        // filled to 0 so the constraint is trivially satisfied.
-        for i in 0..WORD_SIZE {
-            eval.add_constraint(
-                (E::F::one() - is_div_s[0].clone()) * div_corr_hi[i].clone()
-            );
-        }
-
-        // Phase 16: DivS sign-correction carry chain.
-        //
-        //   high(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^64)
-        //
-        // where sa = SignBitB (dividend), sd = SignBitD (divisor),
-        //       sq = SignBitQ (quotient), sr = SignBitR (remainder).
-        //
-        // Encoded byte-wise as a non-negative addition (sr/sa are scalar
-        // sign bits contributing only at byte 0):
-        //
-        //   div_corr_hi[i] + div_corr_carry[i]·256 + (i==0 ? sa : 0)
-        //     = sq·val_d[i] + sd·div_quotient[i] + carry_in + (i==0 ? sr : 0)
-        //
-        // Carry-out at byte 7 is the 64-bit overflow, discarded.
-        // Gated on is_div_s · (1 − div_by_zero) · is_64bit; on DivU rows
-        // the constraint is dormant and DivCorrHi=0 is enforced separately.
-        // 32-bit DivS still hits the original "expected high = 0" via the
-        // 32-bit schoolbook below — negative DivS32 / RemS32 remains
-        // unbound and is left for a follow-up.
-        {
-            let div_corr_carry = crate::trace::trace_eval!(trace_eval, Column::DivCorrCarry);
-            let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
-            let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
-            // Reuse SignBitB / SignBitD already declared elsewhere in
-            // add_constraints (also referenced by Phase 12c MulUpper).
-            let sign_bit_b_div = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-            let sign_bit_d_div = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-            let div_s_active = is_div_s[0].clone()
-                * (E::F::one() - div_by_zero[0].clone())
-                * is_64bit.clone();
-            for i in 0..WORD_SIZE {
-                let carry_in = if i == 0 {
-                    E::F::zero()
-                } else {
-                    div_corr_carry[i - 1].clone()
-                };
-                let extra_lhs = if i == 0 { sign_bit_b_div[0].clone() } else { E::F::zero() };
-                let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
-                eval.add_constraint(
-                    div_s_active.clone() * (
-                        div_corr_hi[i].clone()
-                            + div_corr_carry[i].clone() * f256.clone()
-                            + extra_lhs
-                            - sign_bit_q[0].clone() * val_d[i].clone()
-                            - sign_bit_d_div[0].clone() * div_quotient[i].clone()
-                            - carry_in
-                            - extra_rhs
-                    )
-                );
-            }
-        }
-
-        // Phase 18: DivS sign-correction carry chain (32-bit version).
-        //
-        //   high_32(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^32)
-        //
-        // Same shape as the 64-bit chain but over 4 bytes.  Note that
-        // the 32-bit signs sa/sd/sq/sr come from val_b[3] / val_d[3] /
-        // div_quotient[3] / div_remainder[3] respectively — Phase 17
-        // already pinned SignBitB/D via the Is32Bit multiplex; Phase 18
-        // adds the matching multiplex for SignBitQ/R via SignSrcQ /
-        // SignSrcR (so on 32-bit DivS rows SignBitQ correctly tracks
-        // bit 7 of div_quotient[3], not the always-zero byte 7).
-        // Gated on is_div_s · ¬div_by_zero · is_32bit; DivCorrHi[0..4]
-        // and DivCorrCarry[0..4] are the active range here.
-        {
-            let div_corr_carry = crate::trace::trace_eval!(trace_eval, Column::DivCorrCarry);
-            let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
-            let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
-            let sign_bit_b_div = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-            let sign_bit_d_div = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-            let div_s32_active = is_div_s[0].clone()
-                * (E::F::one() - div_by_zero[0].clone())
-                * is_32bit[0].clone();
-            for i in 0..4 {
-                let carry_in = if i == 0 {
-                    E::F::zero()
-                } else {
-                    div_corr_carry[i - 1].clone()
-                };
-                let extra_lhs = if i == 0 { sign_bit_b_div[0].clone() } else { E::F::zero() };
-                let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
-                eval.add_constraint(
-                    div_s32_active.clone() * (
-                        div_corr_hi[i].clone()
-                            + div_corr_carry[i].clone() * f256.clone()
-                            + extra_lhs
-                            - sign_bit_q[0].clone() * val_d[i].clone()
-                            - sign_bit_d_div[0].clone() * div_quotient[i].clone()
-                            - carry_in
-                            - extra_rhs
-                    )
-                );
-            }
-        }
 
         // Phase 54g: 32-bit divrem schoolbook moved to DivRemChip.
 
@@ -2786,28 +2677,35 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // ── Phase 54g/54i: DivRemLookup producer ──
-        // Tuple (44 limbs): val_b[8] + val_d[8] + div_quotient[8] +
-        //   div_remainder[8] + div_corr_hi[8] + is_div_rem +
-        //   div_by_zero + is_32bit + is_div_s.  Multiplicity = is_div_rem.
-        // is_div_s is flowed so DivRemChip can gate the unsigned r<d
-        // chain off on signed-div rows (Phase 54i extraction).
+        // ── Phase 54g/54i/54k: DivRemLookup producer ──
+        // Tuple (40 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+        //   div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
+        //   sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s.
+        // Multiplicity = is_div_rem.
+        // 54k dropped div_corr_hi[8] (now DivRemChip-internal) and added
+        // the 4 sign bits so DivRemChip's sign-correction chain can run.
         {
             let val_b_p54g = crate::trace::trace_eval!(trace_eval, Column::ValB);
             let val_d_p54g = crate::trace::trace_eval!(trace_eval, Column::ValD);
             let dq_p54g = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
             let dr_p54g = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
-            let dch_p54g = crate::trace::trace_eval!(trace_eval, Column::DivCorrHi);
+            let sb_p54k = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sd_p54k = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+            let sq_p54k = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
+            let sr_p54k = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
             let dbz_p54g = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
             let is_dr_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let is_32_p54g = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
             let is_ds_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
-            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(44);
+            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(40);
             tuple_p54g.extend_from_slice(&val_b_p54g);
             tuple_p54g.extend_from_slice(&val_d_p54g);
             tuple_p54g.extend_from_slice(&dq_p54g);
             tuple_p54g.extend_from_slice(&dr_p54g);
-            tuple_p54g.extend_from_slice(&dch_p54g);
+            tuple_p54g.push(sb_p54k[0].clone());
+            tuple_p54g.push(sd_p54k[0].clone());
+            tuple_p54g.push(sq_p54k[0].clone());
+            tuple_p54g.push(sr_p54k[0].clone());
             tuple_p54g.push(is_dr_p54g[0].clone());
             tuple_p54g.push(dbz_p54g[0].clone());
             tuple_p54g.push(is_32_p54g[0].clone());

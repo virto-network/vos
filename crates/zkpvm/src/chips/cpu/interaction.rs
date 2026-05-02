@@ -1051,15 +1051,18 @@ pub(super) fn generate_interaction_trace(
             }
         }
 
-        // ── Phase 54g/54i: DivRemLookup producer (prover-side mirror) ──
-        // 44-limb tuple (added is_div_s in 54i).
+        // ── Phase 54g/54i/54k: DivRemLookup producer (prover-side mirror) ──
+        // 40-limb tuple (54k dropped div_corr_hi, added 4 sign bits).
         {
             let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
             let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
             let val_d_p54g = crate::trace::original_base_column!(component_trace, Column::ValD);
             let dq_p54g = crate::trace::original_base_column!(component_trace, Column::DivQuotient);
             let dr_p54g = crate::trace::original_base_column!(component_trace, Column::DivRemainder);
-            let dch_p54g = crate::trace::original_base_column!(component_trace, Column::DivCorrHi);
+            let sb_p54k = crate::trace::original_base_column!(component_trace, Column::SignBitB);
+            let sd_p54k = crate::trace::original_base_column!(component_trace, Column::SignBitD);
+            let sq_p54k = crate::trace::original_base_column!(component_trace, Column::SignBitQ);
+            let sr_p54k = crate::trace::original_base_column!(component_trace, Column::SignBitR);
             let dbz_p54g = crate::trace::original_base_column!(component_trace, Column::DivByZero);
             let is_dr_p54g = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
             let is_32_p54g = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
@@ -1068,7 +1071,10 @@ pub(super) fn generate_interaction_trace(
             tuple_p54g.extend_from_slice(&val_d_p54g);
             tuple_p54g.extend_from_slice(&dq_p54g);
             tuple_p54g.extend_from_slice(&dr_p54g);
-            tuple_p54g.extend_from_slice(&dch_p54g);
+            tuple_p54g.push(sb_p54k[0].clone());
+            tuple_p54g.push(sd_p54k[0].clone());
+            tuple_p54g.push(sq_p54k[0].clone());
+            tuple_p54g.push(sr_p54k[0].clone());
             tuple_p54g.push(is_dr_p54g[0].clone());
             tuple_p54g.push(dbz_p54g[0].clone());
             tuple_p54g.push(is_32_p54g[0].clone());
