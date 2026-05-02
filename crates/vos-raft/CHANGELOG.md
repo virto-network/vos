@@ -6,6 +6,58 @@ surface is intentionally small but reserves room to grow via
 
 ## [Unreleased]
 
+### Audit fixes (May 2026 protocol-correctness review)
+
+Four safety/liveness bugs surfaced during a protocol audit:
+
+- **Persisted active_config goes stale on truncate** (safety,
+  liveness). `recover_active_config` (boot path) returned the
+  persisted view BEFORE scanning the log, with
+  `active_config_index = None` for non-joint persisted views —
+  so a subsequent truncate that dropped the entry that produced
+  the persisted view did not trigger
+  `truncate_invalidated_cfg` and the persisted row was never
+  rewritten. On reboot the worker re-adopted a stale member set
+  that no longer existed in the log. Fixed by inverting the
+  recover precedence (live-log scan is authoritative; persisted
+  view is the fallback for compacted-past-CC) and by computing
+  the post-truncate active_config and rolling it into the same
+  atomic `WriteBatch` as the truncate. Pinned by
+  `truncate_dropping_originating_config_change_invalidates_persisted_view`.
+- **match_index can regress on out-of-order ack** (liveness).
+  `handle_append_response` did
+  `leader.match_index.insert(from, resp.match_index)`
+  unconditionally, so a stale ack from an earlier heartbeat
+  arriving after a fresh ack from a later one would overwrite
+  the higher value. Per Raft §5.3 `match_index` is monotonic.
+  Fixed by max-clamping against the previous tracked value.
+  Affects `commit_index` advancement cadence and `try_compact`
+  — does NOT roll committed state backwards (the commit
+  advance path itself max-clamps).
+- **No-op append failure during leader promotion** (safety).
+  `become_leader_no_heartbeat` set `role = Leader` and built
+  `LeaderState` BEFORE persisting the linearizability-gate no-op,
+  so a transient `commit_batch` Err left the worker in
+  `Role::Leader` without `current_term_first_index` set —
+  `read_index` would then resolve against a possibly prior-term
+  `commit_index`, breaking Ongaro §6.4. Fixed by persisting the
+  no-op first; a storage Err keeps the worker in Candidate and
+  the next election timer retries. Pinned by
+  `no_op_append_failure_keeps_us_out_of_leader_role`.
+- **Snapshot install loses persisted active_config** (liveness).
+  When `handle_install_snapshot` committed a snapshot whose
+  `last_included_index` crossed the entry that produced the
+  follower's `active_config_index`, the persisted `active_config`
+  row was not refreshed in the same WriteBatch. On the next
+  reboot, recovery would scan the post-install (now empty up
+  through the snap pointer) live log, find no `ConfigChange`,
+  and fall back to `cfg.members` — silently dropping the
+  membership view the worker had been operating with. Fixed by
+  writing `effective_cfg` alongside the snapshot commit and
+  invalidating any `active_config_index` / `pending_joint_entry`
+  that pointed at a now-compacted entry. Pinned by
+  `install_snapshot_persists_effective_cfg_after_compaction`.
+
 ### Hardening (post-feature review)
 
 A self-review of the four landed features (pre-vote, read_index,
