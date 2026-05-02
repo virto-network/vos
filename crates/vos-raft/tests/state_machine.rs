@@ -1461,6 +1461,95 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
     worker.shutdown();
 }
 
+/// A chunk that would push the buffered snapshot past
+/// `Config::max_snapshot_bytes` is rejected, and the partial
+/// buffer is dropped so a misbehaving leader can't sit on
+/// half-buffered state indefinitely. Without this guard, a
+/// leader streaming chunks without ever setting `done = true`
+/// OOMs the follower.
+#[test]
+fn install_snapshot_chunked_rejects_oversized_buffer() {
+    let storage = MemStorage::<u16>::new();
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let me = 0xAAAAu16;
+    let leader = 0xBBBBu16;
+    // Tight cap: 32 bytes.
+    let mut c = cfg(me, alloc_members(&[me, leader, 0xCCCC]));
+    c.max_snapshot_bytes = 32;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        c,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let h = worker.handler();
+
+    // First chunk: 24 bytes — fits.
+    let r0 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 0,
+            done: false,
+            data: vec![0xAA; 24],
+        },
+    ));
+    assert_eq!(r0.bytes_received, 24, "first chunk must accept under cap");
+
+    // Second chunk: 16 bytes at offset 24 — pushes total to 40,
+    // exceeds cap of 32. Must be rejected (bytes_received = 0)
+    // and the partial buffer dropped.
+    let r1 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 24,
+            done: true,
+            data: vec![0xBB; 16],
+        },
+    ));
+    assert_eq!(
+        r1.bytes_received, 0,
+        "oversized chunk must be rejected with bytes_received = 0",
+    );
+
+    // Snap pointer must NOT have advanced.
+    let snap = block_on(h.snapshot()).unwrap();
+    assert_eq!(
+        snap.snap_last_index, 0,
+        "rejected oversized chunk must not commit the snapshot",
+    );
+
+    // A subsequent fresh chunk (offset = 0) must work — the
+    // partial buffer was dropped, identity reset.
+    let r2 = block_on(h.handle_inbound_install(
+        leader,
+        InstallSnapshotReq {
+            leader,
+            term: 1,
+            last_included_index: 50,
+            last_included_term: 1,
+            offset: 0,
+            done: true,
+            data: vec![0xCC; 16],
+        },
+    ));
+    assert_eq!(r2.bytes_received, 16);
+    let snap = block_on(h.snapshot()).unwrap();
+    assert_eq!(snap.snap_last_index, 50);
+    worker.shutdown();
+}
+
 fn alloc_members(m: &[u16]) -> Vec<u16> {
     m.to_vec()
 }

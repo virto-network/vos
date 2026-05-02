@@ -1664,6 +1664,20 @@ where
         });
     }
     if req.offset == current_len {
+        // DoS bound: reject if accepting this chunk would push
+        // the buffer past `Config::max_snapshot_bytes`. Drop the
+        // partial buffer too — a leader that respects the cap
+        // will have to restart the stream after a retry, but a
+        // misbehaving leader can't sit on a half-buffered
+        // snapshot indefinitely.
+        let cap = state.cfg.max_snapshot_bytes;
+        if buf.buffer.len().saturating_add(req.data.len()) > cap {
+            state.incoming_snapshot = None;
+            return Ok(InstallSnapshotResp {
+                term: state.meta.current_term,
+                bytes_received: 0,
+            });
+        }
         buf.buffer.extend_from_slice(&req.data);
     }
     // (offset < current_len: silently treat as already-have.)

@@ -106,6 +106,18 @@ pub struct Config<N: NodeId> {
     /// [`WorkerHandle::read_index`]: crate::worker::WorkerHandle::read_index
     /// [`ReadIndexError::Backpressure`]: crate::worker::ReadIndexError
     pub max_pending_reads: usize,
+    /// Hard cap on the number of bytes a follower will buffer
+    /// while assembling a chunked `InstallSnapshot`. A buggy or
+    /// malicious leader streaming chunks without ever setting
+    /// `done = true` would otherwise OOM the follower. Beyond
+    /// this cap, the offending chunk is rejected (response
+    /// `bytes_received: 0`) and the in-flight buffer is dropped;
+    /// the leader is expected to either retry from the top or
+    /// give up.
+    ///
+    /// Default: `512 * 1024 * 1024` (512 MiB). Embedded targets
+    /// with tight RAM should set this much lower.
+    pub max_snapshot_bytes: usize,
 }
 
 impl<N: NodeId> Config<N> {
@@ -125,6 +137,7 @@ impl<N: NodeId> Config<N> {
             pre_vote: true,
             install_snapshot_chunk_bytes: 32 * 1024,
             max_pending_reads: 1024,
+            max_snapshot_bytes: 512 * 1024 * 1024,
         }
     }
 }
