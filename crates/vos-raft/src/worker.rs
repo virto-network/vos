@@ -1096,14 +1096,60 @@ struct ConfigRecovery<N: NodeId> {
 /// view is a joint phase, the index of that joint entry (so
 /// auto-finalize can fire on commit). Falls back to
 /// `cfg.members` (steady, non-joint) if nothing is found.
+///
+/// **Boot-time path** (when `consult_persisted = true`): also
+/// consults `Storage::active_config()`. A backend that persists
+/// the active config across snapshot boundaries returns the
+/// authoritative view via that method, and we adopt it
+/// regardless of what the log scan would find. This closes the
+/// "leader compacts past last ConfigChange" gap (H2 / L13).
+/// `active_config_index` for that path is set from the joint
+/// entry only if a joint phase is in flight in the live log.
 async fn recover_active_config<N, S>(
     storage: &S,
     cfg: &Config<N>,
+    consult_persisted: bool,
 ) -> Result<ConfigRecovery<N>, S::Error>
 where
     N: NodeId,
     S: Storage<N>,
 {
+    if consult_persisted {
+        if let Some((current, joint_old)) = storage.active_config().await? {
+            let active = ActiveConfig { current, joint_old };
+            // For a joint config recovered from persistence, find
+            // the joint entry's live-log index (if any) so
+            // auto-finalize fires correctly. If the joint entry
+            // has been compacted away and the persisted view
+            // says joint, the worker can't safely auto-finalize
+            // — there's no in-log entry to anchor against. The
+            // safer behavior is to leave pending_joint = None
+            // and require a fresh leader to emit a new joint
+            // entry; in practice persistence and compaction are
+            // ordered so this corner is rare.
+            let last = storage.last_index();
+            let snap = storage.snap_last_index();
+            let mut pending_joint = None;
+            if active.is_joint() && last > snap {
+                let entries = storage.entries(snap + 1, last).await?;
+                for e in entries.iter().rev() {
+                    if let crate::log_entry::EntryKind::ConfigChange {
+                        joint_old: Some(_),
+                        ..
+                    } = &e.kind
+                    {
+                        pending_joint = Some(e.index);
+                        break;
+                    }
+                }
+            }
+            return Ok(ConfigRecovery {
+                active,
+                pending_joint,
+                active_config_index: pending_joint,
+            });
+        }
+    }
     let last = storage.last_index();
     let snap = storage.snap_last_index();
     if last <= snap {
@@ -1195,7 +1241,10 @@ where
     // active config into their snapshot bytes and re-prime via
     // a follow-up call (not yet exposed). For v0.1 the storage
     // window is large enough that this is rare in practice.
-    let recovery = recover_active_config(&storage, &cfg).await?;
+    // On boot, prefer the persisted active config (if the
+    // backend supports it) so a leader that compacted past the
+    // last ConfigChange entry doesn't lose the membership view.
+    let recovery = recover_active_config(&storage, &cfg, true).await?;
     let mut state = WorkerState {
         storage,
         transport,
@@ -1570,6 +1619,20 @@ where
     let appended_a_config = appends
         .iter()
         .any(|e| matches!(e.kind, crate::log_entry::EntryKind::ConfigChange { .. }));
+    // If the batch contains a new ConfigChange, persist its
+    // membership view alongside the entries. Atomic — we adopt
+    // the in-memory view only after the storage write succeeds.
+    let mut active_config_for_batch: Option<(Vec<N>, Option<Vec<N>>)> = None;
+    if appended_a_config {
+        // Walk appends in reverse to find the latest ConfigChange.
+        for e in appends.iter().rev() {
+            if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
+                active_config_for_batch =
+                    Some((members.clone(), joint_old.clone()));
+                break;
+            }
+        }
+    }
     if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
@@ -1578,6 +1641,7 @@ where
             appends,
             state: None,
             meta: Some(state.meta.clone()),
+            active_config: active_config_for_batch,
         })
         .await
     {
@@ -1643,7 +1707,11 @@ where
     } else if truncate_invalidated_cfg {
         // Cached config entry was truncated away. Scan the live
         // log tail for the most recent surviving ConfigChange.
-        let recovery = recover_active_config(&state.storage, &state.cfg).await?;
+        // Mid-run truncation/append: derive purely from the live
+        // log (the persisted view has already been overwritten
+        // by the in-batch updates the worker emits whenever
+        // effective_cfg changes).
+        let recovery = recover_active_config(&state.storage, &state.cfg, false).await?;
         state.effective_cfg = recovery.active;
         state.pending_joint_entry = recovery.pending_joint;
         state.active_config_index = recovery.active_config_index;
@@ -2217,6 +2285,10 @@ where
         .storage
         .commit_batch(WriteBatch {
             appends: alloc::vec![entry],
+            // Persist the joint view alongside the entry so a
+            // restart that compacts past this entry can still
+            // recover the joint state via Storage::active_config.
+            active_config: Some((new_members.clone(), Some(old_members.clone()))),
             ..Default::default()
         })
         .await
@@ -2576,6 +2648,10 @@ where
         .storage
         .commit_batch(WriteBatch {
             appends: alloc::vec![entry],
+            // Persist the steady view so post-compaction recovery
+            // sees the post-transition members rather than the
+            // pre-transition cfg.members fallback.
+            active_config: Some((final_members.clone(), None)),
             ..Default::default()
         })
         .await?;

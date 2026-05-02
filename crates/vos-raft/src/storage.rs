@@ -64,6 +64,21 @@ pub struct WriteBatch<N: NodeId> {
     /// Replace the durable scalars. `None` = leave them in
     /// place.
     pub meta: Option<Meta<N>>,
+    /// Persist the active cluster configuration alongside this
+    /// batch. `Some((current, joint_old))` writes the
+    /// configuration; `None` leaves the persisted view in place.
+    /// Storage backends that don't support cross-snapshot
+    /// membership recovery may ignore this field — the worker
+    /// then falls back to the log-tail scan, which can lose
+    /// the active config when the leader compacts past the
+    /// last `ConfigChange` entry.
+    ///
+    /// The worker writes this whenever it adopts a new
+    /// `effective_cfg` (joint append, joint finalize, follower
+    /// receiving a `ConfigChange` in `AppendEntries`, follower
+    /// installing a snapshot). Backends that do persist it can
+    /// surface the value at restart via [`Storage::active_config`].
+    pub active_config: Option<(Vec<N>, Option<Vec<N>>)>,
 }
 
 // Manual impl so the empty-batch shorthand `..Default::default()`
@@ -77,6 +92,7 @@ impl<N: NodeId> Default for WriteBatch<N> {
             appends: Vec::new(),
             state: None,
             meta: None,
+            active_config: None,
         }
     }
 }
@@ -141,6 +157,30 @@ pub trait Storage<N: NodeId>: Send + 'static {
         &self,
     ) -> impl core::future::Future<Output = Result<Meta<N>, Self::Error>> + Send;
 
+    /// Read the persisted active cluster configuration, if the
+    /// backend supports cross-snapshot membership recovery.
+    /// Returns `Some((current, joint_old))` for the most-recently-
+    /// persisted view; `None` when the backend doesn't support
+    /// this row OR no value has been written.
+    ///
+    /// The worker uses this on startup as the canonical source of
+    /// the active configuration, falling back to a log-tail scan
+    /// (which may miss the latest `ConfigChange` if the leader
+    /// has compacted past it) only when this returns `None`.
+    ///
+    /// **Default impl** returns `Ok(None)`. Storage backends that
+    /// don't support persistence get the previous behavior:
+    /// recovery via log-tail scan, with the well-known caveat
+    /// that compaction past the last `ConfigChange` reverts the
+    /// view to `cfg.members`.
+    fn active_config(
+        &self,
+    ) -> impl core::future::Future<
+        Output = Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error>,
+    > + Send {
+        async { Ok(None) }
+    }
+
     // ── Atomic write (async) ────────────────────────────────
     /// Apply a [`WriteBatch`] atomically, refresh whatever the
     /// implementation needs for its cached `last_*` / `snap_*`
@@ -160,6 +200,10 @@ pub struct MemStorage<N: NodeId> {
     log: alloc::collections::BTreeMap<u64, LogEntry<N>>,
     state: Vec<u8>,
     meta: Meta<N>,
+    /// Persisted active configuration view — mirrors what the
+    /// worker most recently wrote via `WriteBatch::active_config`.
+    /// `None` until a `ConfigChange` has been observed.
+    active_config: Option<(Vec<N>, Option<Vec<N>>)>,
 }
 
 impl<N: NodeId> Default for MemStorage<N> {
@@ -168,6 +212,7 @@ impl<N: NodeId> Default for MemStorage<N> {
             log: alloc::collections::BTreeMap::new(),
             state: Vec::new(),
             meta: Meta::default(),
+            active_config: None,
         }
     }
 }
@@ -238,6 +283,12 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.meta.clone())
     }
 
+    async fn active_config(
+        &self,
+    ) -> Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error> {
+        Ok(self.active_config.clone())
+    }
+
     async fn commit_batch(&mut self, batch: WriteBatch<N>) -> Result<(), Self::Error> {
         if let Some(after) = batch.truncate_after {
             self.log.retain(|k, _| *k <= after);
@@ -259,6 +310,9 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
             // don't enforce that here — production-quality
             // backends should reject the inconsistency.)
             self.meta = meta;
+        }
+        if let Some(cfg) = batch.active_config {
+            self.active_config = Some(cfg);
         }
         Ok(())
     }

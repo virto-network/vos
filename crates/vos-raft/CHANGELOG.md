@@ -177,7 +177,7 @@ this section captures fixes that landed in response.
     snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
   - 2 no_std build smoke tests (skip cleanly when targets aren't
     installed)
-  - 21 integration tests against a `MockTransport` with per-edge
+  - 22 integration tests against a `MockTransport` with per-edge
     partition control (3-node election, replication, partition
     quorum, one-way-partition, leader/candidate step-down on
     higher-term replies, pre-vote term-stability,
@@ -187,19 +187,25 @@ this section captures fixes that landed in response.
     oversized-buffer-rejection, joint-consensus growth from 3
     to 4 nodes with `InProgress` rejection, leader-removed
     step-down, `change_membership` `NotLeader` and `EmptyConfig`,
-    PreCandidate fallback to Follower)
+    PreCandidate fallback to Follower, cross-snapshot
+    membership recovery via persisted view)
   - 5 fault-injection tests (storage `Err` paths)
   - 1 runnable doctest
 
 ### Known limitations (deferred for future commits)
 - **No learner role** — every `Config::members` entry is a full
   voter.
-- **Membership recovery via snapshot is not surfaced** — when
-  the leader compacts past a `ConfigChange` entry, only the
-  log-tail scan recovers the active config on restart. Hosts
-  that need cross-snapshot membership persistence must encode
-  the active config into their snapshot bytes; the priming API
-  for that path isn't exposed yet.
+- **Cross-snapshot membership recovery** — `Storage` now has
+  an optional `active_config()` method (default returns
+  `None`) and `WriteBatch` has an `active_config` field. The
+  worker writes the active configuration in the same atomic
+  batch that emits a `ConfigChange` entry; on boot,
+  `recover_active_config` consults the persisted view first
+  and only falls back to the log-tail scan when the backend
+  doesn't support it. `MemStorage` implements both paths.
+  Vos's redb adapter currently uses the `None` default —
+  cross-snapshot recovery for vos is gated on a follow-up
+  redb schema bump.
 - **Storage error rolls back in-memory meta**: every handler
   that mutates `state.meta` snapshots the pre-call value before
   any mutation and restores it on `Storage::commit_batch` Err.

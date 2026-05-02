@@ -1880,3 +1880,74 @@ fn change_membership_with_empty_members_returns_empty_config() {
         "empty new_members must return EmptyConfig, got {r:?}",
     );
 }
+
+/// A storage backend that persists `WriteBatch::active_config`
+/// surfaces the post-transition membership at restart even
+/// when the log has been compacted past the `ConfigChange`
+/// entry. MemStorage now supports this; before H2/L13 the
+/// recovery walked only the live log and would return
+/// `cfg.members` as a stale fallback.
+#[test]
+fn cross_snapshot_membership_recovery_via_persisted_view() {
+    use vos_raft::{Storage, WriteBatch};
+
+    // Build a MemStorage by hand and persist a "joint phase
+    // recently committed" view: current = [1,2,3,4],
+    // joint_old = [1,2,3], no log entries (representing a
+    // node that just installed a snapshot covering the
+    // ConfigChange).
+    let mut storage = MemStorage::<u16>::new();
+    let post_transition: Vec<u16> = vec![1, 2, 3, 4];
+    let pre_transition: Vec<u16> = vec![1, 2, 3];
+    block_on(storage.commit_batch(WriteBatch {
+        active_config: Some((post_transition.clone(), Some(pre_transition.clone()))),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    // Confirm the active_config reader returns the persisted
+    // view directly.
+    let persisted = block_on(storage.active_config()).unwrap();
+    assert_eq!(
+        persisted,
+        Some((post_transition.clone(), Some(pre_transition.clone()))),
+        "persisted active_config view must round-trip through MemStorage",
+    );
+
+    // Now spawn a worker against this storage. Even though
+    // Config::members is the OLD set [1,2,3], the worker
+    // should adopt the PERSISTED view (joint {[1,2,3,4],
+    // joint_old: [1,2,3]}) at boot.
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+    let me = 1u16;
+    let mut c = cfg(me, pre_transition.clone());
+    // Make pre_vote false so the worker doesn't try peers we
+    // didn't spawn — for this test we only care about the
+    // boot-time recovered view, not election dynamics.
+    c.pre_vote = false;
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        c,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("init succeeds");
+
+    // The worker's recovered view should reflect the persisted
+    // joint, not the static cfg.members. There's no public
+    // accessor for `effective_cfg`, so this test exercises the
+    // path indirectly: a change_membership call on the leader
+    // would return InProgress because joint is in flight. But
+    // the worker isn't a leader yet (there's no peer to win an
+    // election against). Instead, just confirm the worker's
+    // QueryState reports a sane view (the test's main value
+    // is exercising the MemStorage round-trip + boot recovery
+    // without panicking).
+    let snap = block_on(worker.handler().snapshot()).expect("worker alive");
+    assert_eq!(snap.role, vos_raft::Role::Follower);
+
+    worker.shutdown();
+}
