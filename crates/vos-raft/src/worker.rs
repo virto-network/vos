@@ -913,6 +913,16 @@ where
     /// and to avoid re-finalizing on a stale historical joint
     /// entry that happens to target the same member set.
     pending_joint_entry: Option<u64>,
+    /// Index of the leader's first current-term log entry —
+    /// the no-op appended on promotion (Ongaro §6.4). `None`
+    /// for non-leaders, and reset to the new no-op on each
+    /// promotion. `read_index` requests block until
+    /// `commit_index >= current_term_first_index` to guarantee
+    /// at least one current-term entry has committed.
+    /// Without this gate, a freshly-elected leader could
+    /// resolve `read_index` against a prior-term `commit_index`,
+    /// breaking linearizability.
+    current_term_first_index: Option<u64>,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
@@ -1099,6 +1109,7 @@ where
         incoming_snapshot: None,
         effective_cfg,
         pending_joint_entry,
+        current_term_first_index: None,
         leader: None,
         apply_sink,
         role_atomic,
@@ -1356,6 +1367,7 @@ where
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    state.current_term_first_index = None;
     if was_leader {
         drain_pending_reads_on_step_down(state);
     }
@@ -1603,6 +1615,7 @@ where
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    state.current_term_first_index = None;
     if was_leader {
         drain_pending_reads_on_step_down(state);
     }
@@ -2127,7 +2140,19 @@ async fn handle_read_index<N, S, T, C, R, A>(
         let _ = reply.send(Err(ReadIndexError::Backpressure));
         return;
     }
-    let r = state.meta.commit_index;
+    // Capture R = max(commit_index, current_term_first_index).
+    // Bumping R up to the no-op's index ensures we don't resolve
+    // until at least one current-term entry has committed
+    // (Ongaro §6.4 — the linearizability gate). Without this,
+    // a freshly-elected leader could resolve `read_index`
+    // against a prior-term commit_index, returning state from
+    // before its election.
+    let mut r = state.meta.commit_index;
+    if let Some(noop_idx) = state.current_term_first_index {
+        if noop_idx > r {
+            r = noop_idx;
+        }
+    }
     state.pending_read_index.push((r, reply));
     // Trigger a fresh heartbeat round. The round's quorum-success
     // confirms we're still leader at the current term; the
@@ -2218,6 +2243,16 @@ where
             ..Default::default()
         })
         .await?;
+    // Remember the no-op's index so `read_index` blocks until
+    // it commits — proves at least one current-term entry has
+    // achieved quorum before any read can serve.
+    state.current_term_first_index = Some(new_index);
+    // For a solo cluster the leader's match-quorum is met by
+    // self alone, so the no-op is "committed" the moment it's
+    // written. Advance commit_index synchronously so an
+    // immediately-following `read_index` doesn't have to wait
+    // for the next heartbeat tick.
+    let _ = try_advance_commit_index(state).await;
     Ok(())
 }
 
@@ -2233,6 +2268,7 @@ where
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    state.current_term_first_index = None;
     drain_pending_reads_on_step_down(state);
     state.reset_election_timer();
 }
