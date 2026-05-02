@@ -100,6 +100,16 @@ pub enum Column {
     /// Phase 54c: bit 7 of val_d's MSB (sb).
     #[size = 1]
     SignBitD,
+    /// Phase 54d: rotate-class flags driving result-variant dispatch.
+    /// Pinned via the lookup tuple to CpuChip's IsRotate{L,R}{64,32}.
+    #[size = 1]
+    IsRotateL64,
+    #[size = 1]
+    IsRotateR64,
+    #[size = 1]
+    IsRotateL32,
+    #[size = 1]
+    IsRotateR32,
     /// 1 iff this row is a low-output mul variant.
     #[size = 1]
     IsMulLo,
@@ -151,6 +161,10 @@ impl BuiltInComponent for MulChip {
         let corr_carry = crate::trace::trace_eval!(trace_eval, Column::MulCorrCarry);
         let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
         let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+        let is_rot_l64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
+        let is_rot_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+        let is_rot_l32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
+        let is_rot_r32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
         let is_mul_lo = crate::trace::trace_eval!(trace_eval, Column::IsMulLo);
         let is_mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
@@ -254,17 +268,60 @@ impl BuiltInComponent for MulChip {
             );
         }
 
+        // ── Phase 54d: result-variant dispatch (Phase 32/36 binding) ──
+        // For non-rotate is_mul_lo 64-bit: result[i] = upl[i].
+        // For RotL64 / RotR64: result[i] = upl[i] + mul_high[i] (byte-wise
+        //   sum, no carry — bits non-overlapping by construction of rotation).
+        // For non-rotate is_mul_lo 32-bit: result[0..4] = upl[0..4].
+        // For RotL32 / RotR32: result[0..4] = upl[0..4] + mul_high[0..4].
+        // 32-bit upper result limbs (i ∈ 4..8) are pinned by CpuChip's
+        // Phase 19 sign-extension constraint (still on CpuChip side).
+        {
+            let one_minus_rotate_64 = E::F::one()
+                - is_rot_l64[0].clone()
+                - is_rot_r64[0].clone();
+            let is_rotate_64_either = is_rot_l64[0].clone() + is_rot_r64[0].clone();
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    is_real.clone() * is_64bit.clone() * is_mul_lo[0].clone()
+                        * one_minus_rotate_64.clone()
+                        * (result[i].clone() - upl[i].clone())
+                );
+                eval.add_constraint(
+                    is_rotate_64_either.clone()
+                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone())
+                );
+            }
+            let one_minus_rotate_32 = E::F::one()
+                - is_rot_l32[0].clone()
+                - is_rot_r32[0].clone();
+            let is_rotate_32_either = is_rot_l32[0].clone() + is_rot_r32[0].clone();
+            for i in 0..4 {
+                eval.add_constraint(
+                    is_real.clone() * is_32bit[0].clone()
+                        * one_minus_rotate_32.clone()
+                        * (result[i].clone() - upl[i].clone())
+                );
+                eval.add_constraint(
+                    is_rotate_32_either.clone()
+                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone())
+                );
+            }
+        }
+
         // ── Lookup consumer ──
-        // Tuple (47 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
-        //   + upl[8] + sign_bit_b + sign_bit_d + 5 flags.
-        let mut tuple: Vec<E::F> = Vec::with_capacity(47);
+        // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
+        //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(35);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
-        tuple.extend_from_slice(&mul_high);
-        tuple.extend_from_slice(&upl);
         tuple.push(sign_bit_b[0].clone());
         tuple.push(sign_bit_d[0].clone());
+        tuple.push(is_rot_l64[0].clone());
+        tuple.push(is_rot_r64[0].clone());
+        tuple.push(is_rot_l32[0].clone());
+        tuple.push(is_rot_r32[0].clone());
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());
@@ -316,6 +373,10 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns_bytes(row, &e.mul_corr_carry, Column::MulCorrCarry);
             trace.fill_columns(row, e.sign_bit_b, Column::SignBitB);
             trace.fill_columns(row, e.sign_bit_d, Column::SignBitD);
+            trace.fill_columns(row, e.is_rotate_l64, Column::IsRotateL64);
+            trace.fill_columns(row, e.is_rotate_r64, Column::IsRotateR64);
+            trace.fill_columns(row, e.is_rotate_l32, Column::IsRotateL32);
+            trace.fill_columns(row, e.is_rotate_r32, Column::IsRotateR32);
             trace.fill_columns(row, e.is_mul_lo, Column::IsMulLo);
             trace.fill_columns(row, e.is_mul_upper_uu, Column::IsMulUpperUU);
             trace.fill_columns(row, e.is_mul_upper_su, Column::IsMulUpperSU);
@@ -347,10 +408,12 @@ impl BuiltInProverComponent for MulChip {
         let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let result = crate::trace::original_base_column!(component_trace, Column::Result);
-        let mul_high = crate::trace::original_base_column!(component_trace, Column::MulHigh);
-        let upl = crate::trace::original_base_column!(component_trace, Column::UnsignedProductLow);
         let sign_bit_b = crate::trace::original_base_column!(component_trace, Column::SignBitB);
         let sign_bit_d = crate::trace::original_base_column!(component_trace, Column::SignBitD);
+        let is_rot_l64 = crate::trace::original_base_column!(component_trace, Column::IsRotateL64);
+        let is_rot_r64 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
+        let is_rot_l32 = crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
+        let is_rot_r32 = crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
         let is_mul_lo = crate::trace::original_base_column!(component_trace, Column::IsMulLo);
         let is_mu_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
@@ -361,10 +424,12 @@ impl BuiltInProverComponent for MulChip {
         let mut tuple: Vec<_> = val_b.to_vec();
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
-        tuple.extend_from_slice(&mul_high);
-        tuple.extend_from_slice(&upl);
         tuple.push(sign_bit_b[0].clone());
         tuple.push(sign_bit_d[0].clone());
+        tuple.push(is_rot_l64[0].clone());
+        tuple.push(is_rot_r64[0].clone());
+        tuple.push(is_rot_l32[0].clone());
+        tuple.push(is_rot_r32[0].clone());
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());

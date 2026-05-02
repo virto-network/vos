@@ -121,8 +121,8 @@ impl BuiltInComponent for CpuChip {
         let sign_bit_result_p19 = crate::trace::trace_eval!(trace_eval, Column::SignBitResult);
         let f_ff_p19: E::F = E::F::from(BaseField::from(255));
         let carry = crate::trace::trace_eval!(trace_eval, Column::Carry);
-        let mul_high = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
         // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
+        // Phase 54d: MulHigh moved to MulChip.
         let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
         let cmp_carry = crate::trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
@@ -238,92 +238,24 @@ impl BuiltInComponent for CpuChip {
             mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone()
         };
         let is_mul_low = E::F::one() - is_mul_upper_e();
-        // Phase 54c: UnsignedProductHi moved to MulChip.
-        let unsigned_product_low = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
+        // Phase 54c/d: UnsignedProductLow + UnsignedProductHi + MulHigh
+        // moved to MulChip; result-variant binding (Phase 32/36) now
+        // lives there.  CpuChip keeps the 32-bit sign-extension on
+        // result high bytes since it reads only result + sign_bit_result
+        // (both still on CpuChip).
         // 32-bit mul: upper result limbs (i ∈ 4..8) = 0xFF · SignBitResult
-        // (Phase 19 sign-extension).  Applies uniformly to non-rotate Mul32
-        // and RotL32 / RotR32 — sign bit comes from result[3] which is
-        // either UnsignedProductLow[3] (non-rotate) or
-        // UnsignedProductLow[3] + mul_high[3] (rotate).
+        // (Phase 19 sign-extension).
         for i in 4..WORD_SIZE {
             eval.add_constraint(
                 is_mul[0].clone() * is_32bit[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
         }
+        // Suppress unused-warning for is_mul_low / is_64bit until later
+        // mul-related sites need them.
+        let _ = (is_mul_low, &is_64bit);
 
-        // Phase 32: result bindings for the 64-bit schoolbook re-route.
-        //   non-rotate is_mul_low: result = UnsignedProductLow.
-        //   IsRotateL64:           result = UnsignedProductLow + mul_high.
-        //
-        // Decoupled from the schoolbook constraint (which now writes
-        // low-64 to UnsignedProductLow regardless of op), so adding
-        // RotL64 didn't require changing the schoolbook itself.
-        // RotR64 / RotL32 / RotR32 deferred — they need separate
-        // shift-amount conventions or a 32-bit schoolbook re-route.
         {
-            let is_rotate_l64_p32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
-            let is_rotate_r64_p35 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
-            let is_rotate_l32_p36 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
-            let is_rotate_r32_p36 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            // Phase 35: extend "non-rotate" exclusion to also cover
-            // RotR64 rows (which drive is_mul=true via shift_op=4).
-            let one_minus_rotate_64 = E::F::one()
-                - is_rotate_l64_p32[0].clone()
-                - is_rotate_r64_p35[0].clone();
-            // Non-rotate 64-bit is_mul_low rows (Mul64 / MulImm64 / ShloL64 / etc.):
-            //   result[i] = UnsignedProductLow[i].
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone()
-                        * one_minus_rotate_64.clone()
-                        * (result[i].clone() - unsigned_product_low[i].clone())
-                );
-            }
-            // RotL64 / RotR64 rows: result[i] = UnsignedProductLow[i] +
-            // mul_high[i] (byte-wise sum, no carry — bits non-overlapping
-            // by construction of rotation).
-            let is_rotate_64_either = is_rotate_l64_p32[0].clone()
-                + is_rotate_r64_p35[0].clone();
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_rotate_64_either.clone()
-                        * (
-                            result[i].clone()
-                                - unsigned_product_low[i].clone()
-                                - mul_high[i].clone()
-                        )
-                );
-            }
-            // Phase 36: 32-bit equivalents.  The 32-bit schoolbook now
-            // writes low-32 to UnsignedProductLow[0..4] and high-32 to
-            // mul_high[0..4]; result low 4 bytes are bound here, high 4
-            // bytes via the Phase 19 sign-extension constraint above.
-            let one_minus_rotate_32 = E::F::one()
-                - is_rotate_l32_p36[0].clone()
-                - is_rotate_r32_p36[0].clone();
-            // Non-rotate 32-bit Mul rows: result[0..4] = UnsignedProductLow[0..4].
-            for i in 0..4 {
-                eval.add_constraint(
-                    is_mul[0].clone() * is_32bit[0].clone()
-                        * one_minus_rotate_32.clone()
-                        * (result[i].clone() - unsigned_product_low[i].clone())
-                );
-            }
-            // RotL32 / RotR32 rows: result[0..4] = UnsignedProductLow[0..4]
-            // + mul_high[0..4] (byte-wise sum, no carry).
-            let is_rotate_32_either = is_rotate_l32_p36[0].clone()
-                + is_rotate_r32_p36[0].clone();
-            for i in 0..4 {
-                eval.add_constraint(
-                    is_rotate_32_either.clone()
-                        * (
-                            result[i].clone()
-                                - unsigned_product_low[i].clone()
-                                - mul_high[i].clone()
-                        )
-                );
-            }
             // Phase 40: pin val_b ↔ ImmBytes on RotR64ImmAlt /
             // RotR32ImmAlt rows.  These swap the operand convention
             // (immediate is the rotated value, register is the shift
@@ -3046,37 +2978,43 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // ── Phase 54a/b/c: MultiplicationLookup producer ──
-        // Tuple (47 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
-        //   + unsigned_product_low[8] + sign_bit_b + sign_bit_d + 5 flags.
+        // ── Phase 54a/b/c/d: MultiplicationLookup producer ──
+        // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
+        //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
         // MulChip consumes the same tuple per real row.  Moved to MulChip:
         //   - schoolbook carry chain (54b): pins upl/uph/mul_high.
         //   - sign correction (54c): pins result for is_mul_upper rows.
+        //   - result-variant dispatch (54d): pins result for non-upper
+        //     mul rows from upl ± mul_high based on rotate flags.
         {
             let f_is_mul_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMul);
             let f_mu_uu_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
             let f_mu_su_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
             let f_mu_ss_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
             let f_is_32bit_p54 = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+            let f_rot_l64_p54 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
+            let f_rot_r64_p54 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            let f_rot_l32_p54 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
+            let f_rot_r32_p54 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
             let val_b_p54 = crate::trace::trace_eval!(trace_eval, Column::ValB);
             let val_d_p54 = crate::trace::trace_eval!(trace_eval, Column::ValD);
             let result_p54 = crate::trace::trace_eval!(trace_eval, Column::Result);
-            let mul_high_p54 = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
-            let upl_p54 = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
             let sign_bit_b_p54 = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
             let sign_bit_d_p54 = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
             let is_mul_lo_e = f_is_mul_p54[0].clone()
                 - f_mu_uu_p54[0].clone()
                 - f_mu_su_p54[0].clone()
                 - f_mu_ss_p54[0].clone();
-            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(47);
+            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(35);
             tuple_p54.extend_from_slice(&val_b_p54);
             tuple_p54.extend_from_slice(&val_d_p54);
             tuple_p54.extend_from_slice(&result_p54);
-            tuple_p54.extend_from_slice(&mul_high_p54);
-            tuple_p54.extend_from_slice(&upl_p54);
             tuple_p54.push(sign_bit_b_p54[0].clone());
             tuple_p54.push(sign_bit_d_p54[0].clone());
+            tuple_p54.push(f_rot_l64_p54[0].clone());
+            tuple_p54.push(f_rot_r64_p54[0].clone());
+            tuple_p54.push(f_rot_l32_p54[0].clone());
+            tuple_p54.push(f_rot_r32_p54[0].clone());
             tuple_p54.push(is_mul_lo_e);
             tuple_p54.push(f_mu_uu_p54[0].clone());
             tuple_p54.push(f_mu_su_p54[0].clone());

@@ -95,14 +95,11 @@ pub enum Column {
     IsXnor,
     #[size = 1]
     IsNegAdd,
-    // ── Mul auxiliary: high 64 bits of full product ──
-    /// mul_high[0..8]: (val_b * val_d) = result + mul_high * 2^64
-    #[size = 8]
-    MulHigh,
-    // Phase 54b: MulCarry[16] + MulCarryHi[16] moved to MulChip.  The
-    // schoolbook carry chain that pinned them now lives on MulChip;
-    // CpuChip's UnsignedProductLow/Hi/MulHigh values bind to MulChip's
-    // pinned values via the MultiplicationLookup (53-limb tuple).
+    // Phase 54b/c/d: MulHigh[8] + MulCarry[16] + MulCarryHi[16] +
+    // UnsignedProductHi[8] + UnsignedProductLow[8] all moved to MulChip.
+    // The schoolbook + sign-correction + result-variant binding all
+    // live on MulChip's narrower trace.  CpuChip's `result` on mul
+    // rows binds to MulChip's `result` via the 35-limb lookup tuple.
     // Phase 53: IsMulUpper folded into (IsMulUpperUU + IsMulUpperSU
     // + IsMulUpperSS).  Verifier-side reads use the sum expression
     // directly; prover-side prog_mem tuple emission overrides the
@@ -753,16 +750,11 @@ pub enum Column {
     //   non-rotate is_mul_low: result = UnsignedProductLow.
     //   RotL64:                 result = UnsignedProductLow + mul_high.
     /// Phase 32: 1 iff this opcode is `RotL64`.  Drives the rotation
-    /// result binding (result = UnsignedProductLow + mul_high) and
-    /// the mul-schoolbook re-route.
+    /// result binding (now in MulChip after Phase 54d) and the
+    /// mul-schoolbook re-route.
     #[size = 1]
     IsRotateL64,
-    /// Phase 32: low-64 bytes of the unsigned schoolbook product
-    /// `a · val_d` for `is_mul · is_64bit · ¬is_mul_upper` rows.
-    /// Decouples the schoolbook computation from the per-op result
-    /// binding (mirrors Phase 12c's UnsignedProductHi pattern).
-    #[size = 8]
-    UnsignedProductLow,
+    // Phase 54d: UnsignedProductLow[8] moved to MulChip.
     // ── Phase 33: CountSetBits binding via popcount lookup ─────────────────
     /// Phase 33: 1 iff this opcode is `CountSetBits64` or `CountSetBits32`.
     /// Pinned to `classify_opcode(opcode).is_count_set_bits` via

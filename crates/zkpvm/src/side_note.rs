@@ -94,6 +94,11 @@ pub struct MulEntry {
     /// for 32-bit).  Used by Phase 12c sign correction.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,
+    /// Phase 54d: rotate-class flags driving result-variant dispatch.
+    pub is_rotate_l64: bool,
+    pub is_rotate_r64: bool,
+    pub is_rotate_l32: bool,
+    pub is_rotate_r32: bool,
     pub is_mul_lo: bool,
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,

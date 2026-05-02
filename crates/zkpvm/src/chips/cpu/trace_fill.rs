@@ -268,12 +268,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     }
                 }
             }
-            trace.fill_columns_bytes(row, &mul_high, Column::MulHigh);
             // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
             // Phase 54c: UnsignedProductHi + MulCorrTermA/B/Carry moved to MulChip.
-            trace.fill_columns_bytes(row, &unsigned_product_low_bytes, Column::UnsignedProductLow);
+            // Phase 54d: MulHigh + UnsignedProductLow moved to MulChip.
 
-            // Phase 54a/b/c: MulEntry capture moved below — needs
+            // Phase 54a/b/c/d: MulEntry capture moved below — needs
             // sign_bit_b/sign_bit_d which are computed further down.
 
             // ── Bitwise auxiliary ──
@@ -379,6 +378,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     mul_corr_carry,
                     sign_bit_b,
                     sign_bit_d,
+                    is_rotate_l64: flags.is_rotate_l64,
+                    is_rotate_r64: flags.is_rotate_r64,
+                    is_rotate_l32: flags.is_rotate_l32,
+                    is_rotate_r32: flags.is_rotate_r32,
                     is_mul_lo: !flags.is_mul_upper,
                     is_mul_upper_uu: flags.is_mul_upper_uu,
                     is_mul_upper_su: flags.is_mul_upper_su,
