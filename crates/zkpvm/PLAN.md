@@ -400,17 +400,23 @@ mostly architectural rather than performance wins.
   now witnesses DivCmpDiff/Carry internally and emits per-byte
   Range256 lookups on its own narrower trace.
 
-- **54j — AbsCmp |r|<|d| uniqueness chain → DivRemChip** —
-  INVESTIGATED, NOT LANDED.  As scoped, the move flowed 16 abs-
-  value limbs (abs_d[8] + abs_r[8]) through the DivRemLookup
-  tuple (44 → 60 limbs).  Wall-clock regression of +14% at log10,
-  +28% at log14 in trial benchmarks: the per-CpuChip-row hash cost
-  on the wider producer tuple outweighed the 16-cell drop.
-  Reverted.  An alternative — moving the FULL Phase 30 chain
-  (AbsD/AbsDCarry/AbsR/AbsRCarry + the comparison chain = 48 cells)
-  + recomputing sign bits via ByteToBitsChip — would avoid the
-  tuple-bloat issue at the cost of a larger refactor.  Filed as
-  **future 54j-redux**; deferred.
+- **54j — AbsCmp |r|<|d| uniqueness chain → DivRemChip (narrow
+  scope)** — INVESTIGATED, NOT LANDED.  As originally scoped, the
+  move flowed 16 abs-value limbs (abs_d[8] + abs_r[8]) through the
+  DivRemLookup tuple (44 → 60 limbs).  Wall-clock regression of
+  +14% at log10, +28% at log14: the per-CpuChip-row hash cost on
+  the wider producer tuple outweighed the 16-cell drop.  Reverted
+  in favour of 54j-redux below.
+
+- **54j-redux — full Phase 30 chain → DivRemChip** — DONE
+  (`996b025`).  Moves AbsD/AbsDCarry/AbsR/AbsRCarry +
+  AbsCmpDiff/AbsCmpCarry (48 cells) off CpuChip.  Sign bits already
+  flow via the 54k tuple (SignBitD / SignBitR), so the tuple stays
+  at 40 limbs and DivRemChip computes the absolute values + the
+  comparison chain internally.  Net: -48 cells × ~16K rows on the
+  wide trace; DivRemChip gains 6 columns × ~32 rows.  Wall-clock
+  neutral; proof size at log14 grew 564 → 604 KB from the new
+  DivRemChip interaction columns.
 
 - **54k — DivS sign correction (Phase 16/18) → DivRemChip** —
   DONE (`498733e`).  Net tuple shrinkage 44 → 40 limbs (dropped
@@ -588,12 +594,12 @@ the chip — at log14 even halving Blake2bChip's cell count would
 shave ≈18 K cells from a 23 M total (0.08% prove-time saving).
 Phase 56 closes with this audit.
 
-#### Open follow-ups elsewhere (deferred from Phase 54.x)
+#### Open follow-ups elsewhere
 
-- **54j-redux**: full Phase 30 chain (AbsD + AbsR + the comparison)
-  → DivRemChip with sign bits derived via ByteToBitsChip.  48
-  cells off CpuChip, no tuple bloat.  ~1-day refactor.
 - **Per-step register-access ledger** (project memory note
-  `project_pvm_register_auth.md`): closes the base-CpuChip
-  soundness gap (ValB/ValD/Phi* authentication).  Higher priority
-  than further cell folds.
+  `project_pvm_register_auth.md`): COMPLETE in commits
+  2af7a93 → e297fd2 (Phase 9a–9g).  Verified 2026-05-02.
+- No further 54.x leftovers — 54h/i/k/j-redux all landed.
+  Future work would target soundness gaps not in this PLAN
+  (e.g., DivS sign-of-r uniqueness, 32-bit DivS negative-result
+  truncation) or further compaction outside the divrem family.
