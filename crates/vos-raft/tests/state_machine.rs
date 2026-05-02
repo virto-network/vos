@@ -1372,3 +1372,111 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
 fn alloc_members(m: &[u16]) -> Vec<u16> {
     m.to_vec()
 }
+
+/// Joint-consensus happy path: a 3-node cluster grows to 4
+/// nodes via `change_membership`. The leader appends the joint
+/// `ConfigChange`, the cluster commits it under joint quorum,
+/// the leader auto-appends the final non-joint entry, that
+/// commits under the new quorum, and the cluster ends in steady
+/// 4-node operation.
+#[test]
+fn change_membership_grows_cluster_via_joint_consensus() {
+    use vos_raft::ChangeMembershipError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let initial = vec![1u16, 2, 3];
+    let new_member = 4u16;
+    let new_full = vec![1u16, 2, 3, 4];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+
+    // Spin up the original 3 nodes first — and only the
+    // original 3. Starting the new node before a leader emerges
+    // would let it bump terms in pre-vote against members that
+    // don't know it yet, slowing convergence.
+    for me in initial.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, initial.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || initial.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges among initial 3",
+    );
+
+    // Now spin up node 4. Its Config::members lists the
+    // post-transition set so its quorum view sees a 4-node
+    // cluster from boot; the leader will replicate the
+    // joint+final ConfigChange entries to it as part of the
+    // membership change.
+    let storage4 = MemStorage::<u16>::new();
+    let worker4 = Worker::spawn_with(
+        storage4,
+        transport.clone(),
+        cfg(new_member, new_full.clone()),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    routes
+        .lock()
+        .unwrap()
+        .insert(new_member, worker4.handler());
+    workers.insert(new_member, worker4);
+    let leader_id = *initial
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+
+    // Issue the membership change.
+    let joint_index =
+        block_on(leader_handle.change_membership(new_full.clone()))
+            .expect("change_membership accepted");
+
+    // The leader must reject a concurrent change while the
+    // joint phase is in flight.
+    let conflict = block_on(leader_handle.change_membership(new_full.clone()));
+    assert!(
+        matches!(conflict, Err(ChangeMembershipError::InProgress)),
+        "second concurrent change_membership must return InProgress, got {conflict:?}",
+    );
+
+    // Wait for every node (including the new one) to observe
+    // the final non-joint config: each replica's commit_index
+    // should be at or above `joint_index + 1` (joint entry +
+    // final entry).
+    let final_index = joint_index + 1;
+    wait_until(
+        || {
+            new_full.iter().all(|p| {
+                let h = workers[p].handler();
+                block_on(h.snapshot())
+                    .map(|s| s.commit_index >= final_index)
+                    .unwrap_or(false)
+            })
+        },
+        Duration::from_secs(10),
+        "all 4 replicas commit through the final non-joint entry",
+    );
+
+    // Issue a new change_membership to confirm the joint phase
+    // has retired (otherwise we'd get InProgress).
+    let post = block_on(leader_handle.change_membership(initial.clone()));
+    assert!(
+        post.is_ok(),
+        "after joint phase retires, a new change_membership must be accepted, got {post:?}",
+    );
+}

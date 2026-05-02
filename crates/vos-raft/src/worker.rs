@@ -85,6 +85,28 @@ pub enum ReadIndexError {
     LeaderStepped,
 }
 
+/// Reasons a [`WorkerHandle::change_membership`] can fail.
+///
+/// Membership changes follow Ongaro thesis §4.3 (joint
+/// consensus): the leader appends a joint `ConfigChange` entry
+/// (`joint_old = current`, `members = new`); once that entry
+/// commits, the leader auto-appends a final non-joint
+/// `ConfigChange` (`joint_old = None`, `members = new`); once
+/// THAT commits, the new membership is steady-state.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ChangeMembershipError {
+    /// This worker isn't a leader. Forward the request to the
+    /// cluster's leader.
+    NotLeader,
+    /// Another joint config-change is already in flight. Wait
+    /// for it to commit before issuing another one (Raft
+    /// permits at most one config change at a time).
+    InProgress,
+    /// Storage append failed.
+    Storage(()),
+}
+
 /// Diagnostic snapshot of a worker's state.
 ///
 /// `#[non_exhaustive]` because future commits will surface
@@ -145,6 +167,13 @@ pub enum RaftMsg<N: NodeId> {
     /// leadership at the current term.
     ReadIndex {
         reply: oneshot::Sender<Result<u64, ReadIndexError>>,
+    },
+    /// Begin a membership change. Leader appends a joint
+    /// `ConfigChange` entry; once that entry commits, the leader
+    /// appends the final non-joint `ConfigChange` automatically.
+    ChangeMembership {
+        new_members: Vec<N>,
+        reply: oneshot::Sender<Result<u64, ChangeMembershipError>>,
     },
     QueryState {
         reply: oneshot::Sender<WorkerSnapshot<N>>,
@@ -491,6 +520,46 @@ impl<N: NodeId> WorkerHandle<N> {
         rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
     }
 
+    /// Begin a cluster-membership change to `new_members`
+    /// (Ongaro thesis §4.3). Internally:
+    ///
+    /// 1. The leader appends a joint `ConfigChange` entry whose
+    ///    `joint_old` is the current member set and `members` is
+    ///    `new_members`. The leader immediately starts using the
+    ///    joint configuration for quorum decisions.
+    /// 2. Once that entry commits (a quorum from BOTH the old
+    ///    and the new sets), the leader auto-appends a final
+    ///    non-joint `ConfigChange { joint_old: None, members:
+    ///    new_members }`.
+    /// 3. Once that entry commits (quorum from the NEW set),
+    ///    the cluster is on the new configuration; old members
+    ///    that aren't in `new_members` can shut down.
+    ///
+    /// Returns the index of the joint entry on success — the
+    /// caller can poll [`WorkerHandle::snapshot`] for
+    /// `commit_index >= that_index` to know when the joint phase
+    /// has committed.
+    ///
+    /// **Restrictions** (v0.1):
+    /// - One in-flight change at a time. The second concurrent
+    ///   `change_membership` returns `InProgress`.
+    /// - `new_members` must be non-empty and must include `me`
+    ///   if the local replica is meant to remain a voter — Raft
+    ///   tolerates the leader removing itself, but in that case
+    ///   the leader will step down once the final non-joint
+    ///   entry commits and the next leader takes over from the
+    ///   new set.
+    pub async fn change_membership(
+        &self,
+        new_members: Vec<N>,
+    ) -> Result<u64, ChangeMembershipError> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(RaftMsg::ChangeMembership { new_members, reply: tx })
+            .map_err(|_| ChangeMembershipError::NotLeader)?;
+        rx.await.unwrap_or(Err(ChangeMembershipError::NotLeader))
+    }
+
     /// Inbound `AppendEntries` from a peer.
     pub async fn handle_inbound_append(
         &self,
@@ -621,6 +690,100 @@ struct IncomingSnapshot<N: NodeId> {
     buffer: alloc::vec::Vec<u8>,
 }
 
+/// The cluster configuration the worker is currently operating
+/// under. `current` is the active member set; `joint_old`, when
+/// `Some`, marks a joint-consensus phase where quorum requires
+/// majorities from BOTH `joint_old` and `current`.
+#[derive(Debug, Clone)]
+struct ActiveConfig<N: NodeId> {
+    current: Vec<N>,
+    joint_old: Option<Vec<N>>,
+}
+
+impl<N: NodeId> ActiveConfig<N> {
+    fn steady(members: Vec<N>) -> Self {
+        Self { current: members, joint_old: None }
+    }
+
+    fn is_joint(&self) -> bool {
+        self.joint_old.is_some()
+    }
+
+    /// Quorum size for `current` (majority).
+    fn quorum_current(&self) -> usize {
+        self.current.len() / 2 + 1
+    }
+
+    /// Quorum size for `joint_old`, if joint. `0` when not joint.
+    fn quorum_old(&self) -> usize {
+        self.joint_old
+            .as_ref()
+            .map(|m| m.len() / 2 + 1)
+            .unwrap_or(0)
+    }
+
+    /// Iterator over every member in the union of `current` and
+    /// `joint_old` (deduplicated). The leader sends heartbeats
+    /// to every member of this union — old voters that aren't
+    /// in `current` still need to receive entries (joint quorum)
+    /// until the joint phase commits and we move to non-joint.
+    fn all_members(&self) -> Vec<N> {
+        let mut seen: Vec<N> = self.current.clone();
+        if let Some(old) = &self.joint_old {
+            for &m in old {
+                if !seen.contains(&m) {
+                    seen.push(m);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Is the predicate `pred` true for a quorum from BOTH the
+    /// current and (if joint) old configurations? Used by
+    /// `commit_index` advancement and election win checks.
+    fn quorum_holds<F: FnMut(N) -> bool>(&self, mut pred: F) -> bool {
+        let current_yes = self.current.iter().filter(|&&m| pred(m)).count();
+        if current_yes < self.quorum_current() {
+            return false;
+        }
+        if let Some(old) = &self.joint_old {
+            let old_yes = old.iter().filter(|&&m| pred(m)).count();
+            if old_yes < self.quorum_old() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Floor of `score(m)` over a quorum of `current` AND (if
+    /// joint) `old`. Used by `match_index_majority_floor` to
+    /// compute the highest replicated index across both sets.
+    /// Returns `None` if the score function returns `None` for
+    /// any member, or if the active config is empty.
+    fn majority_floor<F: FnMut(N) -> u64>(&self, mut score: F) -> Option<u64> {
+        let mut current_scores: Vec<u64> = self.current.iter().map(|&m| score(m)).collect();
+        current_scores.sort_unstable_by(|a, b| b.cmp(a));
+        let q_cur = self.quorum_current();
+        if q_cur == 0 || q_cur > current_scores.len() {
+            return None;
+        }
+        let mut floor = current_scores[q_cur - 1];
+        if let Some(old) = &self.joint_old {
+            let mut old_scores: Vec<u64> = old.iter().map(|&m| score(m)).collect();
+            old_scores.sort_unstable_by(|a, b| b.cmp(a));
+            let q_old = self.quorum_old();
+            if q_old == 0 || q_old > old_scores.len() {
+                return None;
+            }
+            // Joint commit requires BOTH sets to reach the floor;
+            // the lower of the two governs.
+            floor = floor.min(old_scores[q_old - 1]);
+        }
+        Some(floor)
+    }
+}
+
 impl<N: NodeId> LeaderState<N> {
     fn fresh(members: &[N], me: N, last_log_index: u64) -> Self {
         let next_index = members
@@ -719,6 +882,19 @@ where
     /// same leader supersedes the buffer; a stale identity is
     /// rejected as a no-op.
     incoming_snapshot: Option<IncomingSnapshot<N>>,
+    /// The effective cluster configuration the worker uses for
+    /// quorum decisions, vote counting, heartbeat targets, and
+    /// peer enumeration. Tracks the LATEST `ConfigChange` log
+    /// entry seen — even uncommitted (Ongaro thesis §4.3 — leader
+    /// uses the latest seen, not the latest committed, so it
+    /// stops counting itself in a removal as soon as the entry
+    /// hits the log). Falls back to `cfg.members` when no
+    /// `ConfigChange` has been seen.
+    ///
+    /// `current` is the membership the cluster transitions *to*;
+    /// `joint_old` is `Some(old)` while a joint configuration is
+    /// in flight (quorum requires majority from BOTH sets).
+    effective_cfg: ActiveConfig<N>,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
@@ -780,21 +956,69 @@ where
         self.election_deadline = self.clock.add(self.clock.now(), timeout);
     }
 
-    fn quorum(&self) -> usize {
-        self.cfg.quorum()
+    /// Score for a single member used by quorum / majority-floor
+    /// helpers. The leader scores itself by its `last_index`
+    /// (everything written to its log is implicitly replicated to
+    /// itself); peers score by their tracked `match_index`.
+    fn member_match_score(&self, m: N) -> u64 {
+        if m == self.cfg.me {
+            self.storage.last_index()
+        } else {
+            self.leader
+                .as_ref()
+                .and_then(|l| l.match_index.get(&m).copied())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Did `pred` hold for a quorum of the active config? In
+    /// joint mode a quorum from BOTH sets is required.
+    fn quorum_holds<F: FnMut(N) -> bool>(&self, pred: F) -> bool {
+        self.effective_cfg.quorum_holds(pred)
     }
 
     async fn match_index_majority_floor(&self) -> Option<u64> {
-        let leader = self.leader.as_ref()?;
-        let mut indices: Vec<u64> = leader.match_index.values().copied().collect();
-        indices.push(self.storage.last_index());
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        let q = self.quorum();
-        if q == 0 || q > indices.len() {
+        if self.leader.is_none() {
             return None;
         }
-        Some(indices[q - 1])
+        // Score self by last_index (we replicate-to-self by
+        // virtue of writing the log) and each peer by its
+        // tracked match_index. The active config's
+        // `majority_floor` honors joint mode by intersecting the
+        // current and old majority floors.
+        self.effective_cfg
+            .majority_floor(|m| self.member_match_score(m))
     }
+}
+
+/// Walk the live log tail looking for the most recent
+/// `EntryKind::ConfigChange`; return its membership view as the
+/// recovered effective configuration. Falls back to
+/// `cfg.members` (steady, non-joint) if nothing is found.
+async fn recover_active_config<N, S>(
+    storage: &S,
+    cfg: &Config<N>,
+) -> Result<ActiveConfig<N>, S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+{
+    let last = storage.last_index();
+    let snap = storage.snap_last_index();
+    if last <= snap {
+        return Ok(ActiveConfig::steady(cfg.members.clone()));
+    }
+    let entries = storage.entries(snap + 1, last).await?;
+    // Walk in reverse — first hit wins.
+    for e in entries.iter().rev() {
+        if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
+            return Ok(ActiveConfig {
+                current: members.clone(),
+                joint_old: joint_old.clone(),
+            });
+        }
+    }
+    Ok(ActiveConfig::steady(cfg.members.clone()))
 }
 
 // ── Public driver ───────────────────────────────────────────
@@ -830,6 +1054,15 @@ where
     A: ApplySink,
 {
     let meta = storage.load_meta().await?;
+    // Recover effective configuration by scanning the live log
+    // tail for the latest `ConfigChange` entry. If none is
+    // found, fall back to `cfg.members`. Recently-compacted
+    // ConfigChange entries can't be recovered from the log —
+    // hosts that need that level of persistence must encode the
+    // active config into their snapshot bytes and re-prime via
+    // a follow-up call (not yet exposed). For v0.1 the storage
+    // window is large enough that this is rare in practice.
+    let effective_cfg = recover_active_config(&storage, &cfg).await?;
     let mut state = WorkerState {
         storage,
         transport,
@@ -841,6 +1074,7 @@ where
         votes_received: BTreeSet::new(),
         pending_read_index: Vec::new(),
         incoming_snapshot: None,
+        effective_cfg,
         leader: None,
         apply_sink,
         role_atomic,
@@ -948,6 +1182,10 @@ async fn handle_msg<N, S, T, C, R, A>(
         }
         RaftMsg::ReadIndex { reply } => {
             handle_read_index(state, pending, reply).await;
+        }
+        RaftMsg::ChangeMembership { new_members, reply } => {
+            let r = handle_change_membership(state, new_members).await;
+            let _ = reply.send(r);
         }
         RaftMsg::QueryState { reply } => {
             let _ = reply.send(WorkerSnapshot {
@@ -1155,6 +1393,10 @@ where
         }
     }
 
+    let did_truncate = truncate_after.is_some();
+    let appended_a_config = appends
+        .iter()
+        .any(|e| matches!(e.kind, crate::log_entry::EntryKind::ConfigChange { .. }));
     state
         .storage
         .commit_batch(WriteBatch {
@@ -1168,6 +1410,17 @@ where
 
     if commit_advanced {
         state.fire_apply_notification();
+    }
+
+    // Refresh the effective configuration if the log mutation
+    // could have invalidated it: a `ConfigChange` entry was
+    // appended (adopt it) or entries were truncated (the most
+    // recent `ConfigChange` may have been dropped — fall back to
+    // whatever is now-live in the log).
+    if appended_a_config || did_truncate {
+        state.effective_cfg =
+            recover_active_config(&state.storage, &state.cfg).await?;
+        rebuild_leader_tracking(state);
     }
 
     Ok(AppendEntriesResp {
@@ -1580,7 +1833,8 @@ where
     }
     if resp.vote_granted {
         state.votes_received.insert(from);
-        if state.votes_received.len() >= state.quorum() {
+        let votes = state.votes_received.clone();
+        if state.quorum_holds(|m| votes.contains(&m)) {
             // Become leader. We can't pass `pending` here without
             // major plumbing churn — call become_leader inline,
             // and the next timer tick will fire heartbeats.
@@ -1632,7 +1886,8 @@ where
     }
     if resp.vote_granted {
         state.votes_received.insert(from);
-        if state.votes_received.len() >= state.quorum() {
+        let votes = state.votes_received.clone();
+        if state.quorum_holds(|m| votes.contains(&m)) {
             // Pre-vote quorum reached. Promote to Candidate and
             // collapse the timer; `on_timer`'s next fire will
             // call `start_election` which bumps the term and
@@ -1676,6 +1931,101 @@ where
     Ok(new_index)
 }
 
+/// Handle a `RaftMsg::ChangeMembership` request. The leader
+/// appends a joint `ConfigChange` entry to its log; the joint
+/// configuration takes effect immediately (Ongaro thesis §4.3 —
+/// even before the entry commits) and quorum decisions now
+/// require majorities from BOTH sets.
+///
+/// Auto-progression to non-joint happens later, when
+/// `try_advance_commit_index` observes that the joint entry has
+/// committed.
+async fn handle_change_membership<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    new_members: Vec<N>,
+) -> Result<u64, ChangeMembershipError>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if state.role != Role::Leader {
+        return Err(ChangeMembershipError::NotLeader);
+    }
+    if state.effective_cfg.is_joint() {
+        return Err(ChangeMembershipError::InProgress);
+    }
+    if new_members.is_empty() {
+        return Err(ChangeMembershipError::InProgress);
+    }
+    let term = state.meta.current_term;
+    let new_index = state.storage.last_index() + 1;
+    let old_members = state.effective_cfg.current.clone();
+    let entry = LogEntry {
+        index: new_index,
+        term,
+        kind: crate::log_entry::EntryKind::ConfigChange {
+            joint_old: Some(old_members.clone()),
+            members: new_members.clone(),
+        },
+    };
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            appends: alloc::vec![entry],
+            ..Default::default()
+        })
+        .await
+        .map_err(|_| ChangeMembershipError::Storage(()))?;
+    // Adopt the joint configuration immediately — the leader
+    // starts demanding joint quorum even before the entry
+    // commits.
+    state.effective_cfg = ActiveConfig {
+        current: new_members,
+        joint_old: Some(old_members),
+    };
+    rebuild_leader_tracking(state);
+    let _ = try_advance_commit_index(state).await;
+    Ok(new_index)
+}
+
+/// After the active configuration changes (joint entry
+/// adopted, joint entry truncated, or auto-progression to
+/// non-joint), refresh `LeaderState`'s per-peer maps so newly
+/// added members get tracked and removed members are dropped.
+fn rebuild_leader_tracking<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    let last = state.storage.last_index();
+    let me = state.cfg.me;
+    let Some(leader) = state.leader.as_mut() else {
+        return;
+    };
+    let members = state.effective_cfg.all_members();
+    // Add tracking for any newly-known peer.
+    for m in &members {
+        if *m == me {
+            continue;
+        }
+        leader.next_index.entry(*m).or_insert(last + 1);
+        leader.match_index.entry(*m).or_insert(0);
+    }
+    // Drop tracking for peers that left the active configuration
+    // entirely.
+    leader.next_index.retain(|m, _| members.contains(m));
+    leader.match_index.retain(|m, _| members.contains(m));
+    leader.snapshot_send.retain(|m, _| members.contains(m));
+}
+
 /// Handle a `RaftMsg::ReadIndex` request. Captures the leader's
 /// current `commit_index`, queues the request on
 /// `pending_read_index`, and triggers an immediate heartbeat
@@ -1700,7 +2050,7 @@ async fn handle_read_index<N, S, T, C, R, A>(
     }
     // Solo cluster: no peers to confirm with, but the leader IS
     // the only voter. Resolve immediately.
-    if state.cfg.members.len() <= 1 {
+    if is_solo_cluster(state) {
         let _ = reply.send(Ok(state.meta.commit_index));
         return;
     }
@@ -1775,7 +2125,8 @@ where
     state.set_role(Role::Leader);
     state.votes_received.clear();
     let last = state.storage.last_index();
-    state.leader = Some(LeaderState::fresh(&state.cfg.members, state.cfg.me, last));
+    let members = state.effective_cfg.all_members();
+    state.leader = Some(LeaderState::fresh(&members, state.cfg.me, last));
     Ok(())
 }
 
@@ -1825,6 +2176,83 @@ where
         })
         .await?;
     state.fire_apply_notification();
+    // Auto-progress joint → non-joint when the joint
+    // ConfigChange entry has committed (Ongaro thesis §4.3).
+    // Append the final non-joint ConfigChange entry; leader
+    // stays leader through the transition.
+    auto_finalize_joint_config(state).await?;
+    Ok(())
+}
+
+/// If the leader is in a joint configuration AND a
+/// `ConfigChange` entry committing the joint config sits at or
+/// below `commit_index`, append the final non-joint
+/// `ConfigChange` entry to retire the joint phase. The leader
+/// uses `commit_index` to decide because Ongaro's protocol
+/// requires the joint config to be committed (durable across
+/// crashes of any single replica) before issuing the final.
+async fn auto_finalize_joint_config<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+) -> Result<(), S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if state.role != Role::Leader || !state.effective_cfg.is_joint() {
+        return Ok(());
+    }
+    // Search the committed prefix for a joint ConfigChange entry.
+    // If we find one, the joint config is durable; we can issue
+    // the final.
+    let snap = state.storage.snap_last_index();
+    let from = snap + 1;
+    let to = state.meta.commit_index;
+    if to < from {
+        return Ok(());
+    }
+    let entries = state.storage.entries(from, to).await?;
+    let mut joint_committed = false;
+    for e in &entries {
+        if let crate::log_entry::EntryKind::ConfigChange {
+            joint_old: Some(_),
+            members,
+        } = &e.kind
+        {
+            if *members == state.effective_cfg.current {
+                joint_committed = true;
+                break;
+            }
+        }
+    }
+    if !joint_committed {
+        return Ok(());
+    }
+
+    // Append the final non-joint entry.
+    let term = state.meta.current_term;
+    let new_index = state.storage.last_index() + 1;
+    let final_members = state.effective_cfg.current.clone();
+    let entry = LogEntry {
+        index: new_index,
+        term,
+        kind: crate::log_entry::EntryKind::ConfigChange {
+            joint_old: None,
+            members: final_members.clone(),
+        },
+    };
+    state
+        .storage
+        .commit_batch(WriteBatch {
+            appends: alloc::vec![entry],
+            ..Default::default()
+        })
+        .await?;
+    state.effective_cfg = ActiveConfig::steady(final_members);
+    rebuild_leader_tracking(state);
     Ok(())
 }
 
@@ -1852,7 +2280,11 @@ where
         None => return Ok(()),
     };
 
-    for peer in state.cfg.members.iter().copied() {
+    // Heartbeat to every member of the active configuration —
+    // joint mode includes both old and new sets so quorum from
+    // BOTH can advance commit_index during the transition.
+    let peers = state.effective_cfg.all_members();
+    for peer in peers {
         if peer == me {
             continue;
         }
@@ -2022,7 +2454,7 @@ where
     R: Rng,
     A: ApplySink,
 {
-    if state.cfg.members.len() <= 1 {
+    if is_solo_cluster(state) {
         return start_election(state, pending).await;
     }
     state.set_role(Role::PreCandidate);
@@ -2034,7 +2466,7 @@ where
     let last_log_index = state.storage.last_index();
     let last_log_term = state.storage.last_term();
 
-    for peer in state.cfg.members.iter().copied() {
+    for peer in state.effective_cfg.all_members() {
         if peer == me {
             continue;
         }
@@ -2090,7 +2522,7 @@ where
     let last_log_index = state.storage.last_index();
     let last_log_term = state.storage.last_term();
 
-    for peer in state.cfg.members.iter().copied() {
+    for peer in state.effective_cfg.all_members() {
         if peer == me {
             continue;
         }
@@ -2108,7 +2540,8 @@ where
         pending.push(fut);
     }
 
-    if state.votes_received.len() >= state.quorum() {
+    let votes = state.votes_received.clone();
+    if state.quorum_holds(|m| votes.contains(&m)) {
         become_leader_no_heartbeat(state).await?;
         // Next loop iteration's timer fires immediately.
         state.election_deadline = state.clock.now();
@@ -2116,6 +2549,28 @@ where
         state.reset_election_timer();
     }
     Ok(())
+}
+
+/// True when the active configuration has only this replica as a
+/// voter (in either current or — if joint — old set). Solo
+/// clusters bypass the heartbeat round in `read_index` and the
+/// pre-vote phase, since there's nothing to confirm.
+fn is_solo_cluster<N, S, T, C, R, A>(state: &WorkerState<N, S, T, C, R, A>) -> bool
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    let only_me_in = |set: &Vec<N>| set.iter().all(|m| *m == state.cfg.me);
+    only_me_in(&state.effective_cfg.current)
+        && state
+            .effective_cfg
+            .joint_old
+            .as_ref()
+            .map_or(true, |old| only_me_in(old))
 }
 
 #[cfg(test)]

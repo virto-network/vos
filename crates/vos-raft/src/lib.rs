@@ -96,7 +96,7 @@ pub use clock::{StdClock, StdRng};
 #[cfg(feature = "tokio")]
 pub use clock::TokioClock;
 pub use config::{Config, NodeId};
-pub use log_entry::LogEntry;
+pub use log_entry::{EntryKind, LogEntry};
 pub use meta::Meta;
 pub use role::Role;
 pub use rpc::{
@@ -107,4 +107,7 @@ pub use storage::{MemStorage, Storage, WriteBatch};
 pub use transport::Transport;
 
 #[cfg(feature = "std")]
-pub use worker::{ProposeError, RaftMsg, ReadIndexError, Worker, WorkerHandle, WorkerSnapshot};
+pub use worker::{
+    ChangeMembershipError, ProposeError, RaftMsg, ReadIndexError, Worker, WorkerHandle,
+    WorkerSnapshot,
+};

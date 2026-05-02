@@ -7,6 +7,29 @@ surface is intentionally small but reserves room to grow via
 ## [Unreleased]
 
 ### Added
+- **Joint-consensus membership change** (Ongaro thesis §4.3) —
+  new `WorkerHandle::change_membership(new_members)` API moves
+  the cluster to a new voter set without downtime. The leader
+  appends a joint `EntryKind::ConfigChange { joint_old:
+  Some(old), members: new }` entry; the joint configuration
+  takes effect immediately for quorum decisions (heartbeat
+  targets, vote counting, commit-index advancement) and quorum
+  now requires majorities from BOTH the old AND new sets.
+  Once the joint entry commits the leader auto-appends the
+  final non-joint entry (`joint_old: None, members: new`);
+  once that commits the cluster is on the new membership.
+  New `ChangeMembershipError` enum (`NotLeader`, `InProgress`,
+  `Storage`). Concurrent change requests during a joint phase
+  return `InProgress` — Raft permits at most one membership
+  change in flight at a time. `LogEntry` is now parameterized
+  over `N: NodeId` so config-change entries can carry typed
+  `Vec<N>` member sets; pure-data callers use the new
+  `LogEntry::data(idx, term, payload)` constructor and
+  `entry.payload()` accessor.
+  **Wire compatibility**: vos's libp2p frame layer doesn't yet
+  ferry the `ConfigChange` variant — vos's transport adapters
+  panic with a clear message if a `ConfigChange` entry ever
+  reaches them. Vos workers don't emit them today.
 - **Chunked `InstallSnapshot`** — snapshots that exceed the
   transport's frame budget are now streamed across multiple
   RPCs. `InstallSnapshotReq` gained `offset: u64`, `done: bool`,
@@ -103,21 +126,30 @@ surface is intentionally small but reserves room to grow via
     snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
   - 2 no_std build smoke tests (skip cleanly when targets aren't
     installed)
-  - 14 integration tests against a `MockTransport` with per-edge
+  - 15 integration tests against a `MockTransport` with per-edge
     partition control (3-node election, replication, partition
     quorum, one-way-partition, leader/candidate step-down on
     higher-term replies, pre-vote term-stability,
     `read_index` quorum confirmation + leader-stepped-on-partition,
     chunked-`InstallSnapshot` assembly + duplicate-idempotence
-    + gap-rejection)
+    + gap-rejection, joint-consensus growth from 3 to 4 nodes
+    with `InProgress` rejection of concurrent changes)
   - 5 fault-injection tests (storage `Err` paths)
   - 1 runnable doctest
 
 ### Known limitations (deferred for future commits)
-- **No joint consensus** — membership changes are not yet
-  supported. Use a static `Config::members` list at construction.
 - **No learner role** — every `Config::members` entry is a full
   voter.
+- **No leader-removed retirement** — when a `change_membership`
+  removes the current leader, the leader keeps serving until
+  the final non-joint ConfigChange entry replicates. It does
+  not preemptively step down on commit of the joint entry.
+- **Membership recovery via snapshot is not surfaced** — when
+  the leader compacts past a `ConfigChange` entry, only the
+  log-tail scan recovers the active config on restart. Hosts
+  that need cross-snapshot membership persistence must encode
+  the active config into their snapshot bytes; the priming API
+  for that path isn't exposed yet.
 - **Storage error is "drop and forget"**: when
   `Storage::commit_batch` returns `Err`, the worker's
   in-memory `state.meta` is already mutated (term bump, vote,

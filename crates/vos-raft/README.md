@@ -31,7 +31,7 @@ joint consensus, no learners, no chunked snapshot streaming yet).
 | Required deps (no_std mode)       | n/a                     | core + alloc only                   |
 | Pre-vote (term-stability)         | yes                     | yes (`Config::pre_vote`)            |
 | Linearizable reads (`read_index`) | yes                     | yes (`WorkerHandle::read_index`)    |
-| Joint consensus                   | yes                     | no (planned)                        |
+| Joint consensus                   | yes                     | yes (`WorkerHandle::change_membership`) |
 | Chunked snapshot streaming        | yes                     | yes (`Config::install_snapshot_chunk_bytes`) |
 | Production maturity               | high                    | first carve-out                     |
 
