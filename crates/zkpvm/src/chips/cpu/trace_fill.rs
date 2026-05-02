@@ -412,24 +412,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
             let eq_flag: u8 = if val_b == val_d { 1 } else { 0 };
             trace.fill_columns(row, eq_flag, Column::EqFlag);
-            // Per-byte equality flags (for branch eq/ne)
-            let mut byte_eq = [0u8; 8];
-            let mut byte_diff_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
-            if flags.is_branch {
-                for i in 0..8 {
-                    if val_b_bytes[i] == val_d_bytes[i] {
-                        byte_eq[i] = 1;
-                    } else {
-                        // Compute in M31 field directly to match constraint arithmetic
-                        let b = stwo::core::fields::m31::BaseField::from(val_b_bytes[i] as u32);
-                        let d = stwo::core::fields::m31::BaseField::from(val_d_bytes[i] as u32);
-                        let diff_field = b - d;
-                        byte_diff_inv[i] = diff_field.inverse();
-                    }
-                }
-            }
-            trace.fill_columns_bytes(row, &byte_eq, Column::ByteEq);
-            trace.fill_columns_base_field(row, &byte_diff_inv, Column::ByteDiffInv);
+            // Phase 54h: ByteEq[8] + ByteDiffInv[8] dropped — branch
+            // constraints now read `val_b[i] - val_d[i]` directly.
             trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
             trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
             trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);

@@ -1287,42 +1287,13 @@ impl BuiltInComponent for CpuChip {
         );
 
         // ── Branch condition constraints ──
-        // Phase 53e: branch sub-flag bindings moved up to function
-        // scope (line ~134) so `is_branch_e()` is reachable from
-        // earlier sites (line ~620 cmp+branch range gate).
-        let byte_eq_cols = crate::trace::trace_eval!(trace_eval, Column::ByteEq);
-        let byte_diff_inv = crate::trace::trace_eval!(trace_eval, Column::ByteDiffInv);
-
-        // TEST 3: full byte_eq constraint
-        for i in 0..WORD_SIZE {
-            let diff = val_b[i].clone() - val_d[i].clone();
-            eval.add_constraint(
-                is_branch_e() * byte_eq_cols[i].clone()
-                * (E::F::one() - byte_eq_cols[i].clone())
-            );
-            eval.add_constraint(
-                is_branch_e() * byte_eq_cols[i].clone() * diff.clone()
-            );
-            eval.add_constraint(
-                is_branch_e() * (E::F::one() - byte_eq_cols[i].clone())
-                * (diff * byte_diff_inv[i].clone() - E::F::one())
-            );
-        }
-
-        // Equality: EqFlag = AND of all byte_eq[i]. Expressed as:
-        //   EqFlag = byte_eq[0] * byte_eq[1] * ... * byte_eq[7]  (degree 8, too high)
-        // Instead, use: eq_flag = 1 iff sum of (1 - byte_eq[i]) = 0
-        // Since each (1 - byte_eq[i]) ∈ {0,1}, the sum is 0 iff all byte_eq[i]=1.
-        // sum ∈ [0,8]. Use an eq_flag witness + sum*inv constraint similar to byte_eq.
-        // For simplicity, constrain BranchEq/BranchNe using the bytewise eq flags directly:
-        //   BranchEq taken ⇔ all byte_eq[i] = 1
-        //   This is equivalent to: branch_taken * (1 - byte_eq[i]) = 0 for all i (if taken, all must be equal)
-        //   AND: (1 - branch_taken) * (sum (1 - byte_eq[i])) = (1 - branch_taken) * (something nonzero)
-        // Simpler: introduce EqFlag column... but we don't have one.
-        //
-        // Per-byte constraints for eq/ne:
-        //   is_br_eq * branch_taken * (1 - byte_eq[i]) = 0 (if eq branch taken, all bytes equal)
-        //   is_br_ne * (1 - branch_taken) * (1 - byte_eq[i]) = 0 (if ne branch NOT taken, all bytes equal)
+        // Phase 54h: dropped ByteEq[8] + ByteDiffInv[8].  Branch eq/ne
+        // constraints read `(val_b[i] - val_d[i])` directly — same
+        // soundness, lower column count.  The constraint shape:
+        //   is_br_eq · branch_taken · (val_b[i] - val_d[i]) = 0
+        //     ⇒ if BranchEq is taken, val_b[i] = val_d[i] for every byte.
+        //   is_br_ne · (1 - branch_taken) · (val_b[i] - val_d[i]) = 0
+        //     ⇒ if BranchNe is NOT taken, val_b[i] = val_d[i] for every byte.
         // The converse (val_b == val_d ⇒ branch_taken_eq = 1) is benign in
         // PVM semantics: branch_taken is the prover's witness for "PC took
         // the offset path", not "the comparison succeeded".  When target ==
@@ -1331,13 +1302,12 @@ impl BuiltInComponent for CpuChip {
         // the trace is unaffected.  See the loose-corner test in
         // tests/control_flow_negative.rs.
         for i in 0..WORD_SIZE {
+            let diff = val_b[i].clone() - val_d[i].clone();
             eval.add_constraint(
-                is_br_eq[0].clone() * branch_taken[0].clone()
-                * (E::F::one() - byte_eq_cols[i].clone())
+                is_br_eq[0].clone() * branch_taken[0].clone() * diff.clone()
             );
             eval.add_constraint(
-                is_br_ne[0].clone() * (E::F::one() - branch_taken[0].clone())
-                * (E::F::one() - byte_eq_cols[i].clone())
+                is_br_ne[0].clone() * (E::F::one() - branch_taken[0].clone()) * diff
             );
         }
 

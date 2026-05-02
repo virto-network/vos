@@ -148,16 +148,18 @@ pub enum Column {
     // AIR pins it via the val_b + ~val_d + 1 carry chain and emits
     // the per-byte Range256 lookup.
     /// 1 iff val_b == val_d (all bytes equal). Used for Le/Gt branches.
-    /// Constrained via: eq_flag=1 ⇒ all byte_eq[i]=1 AND eq_flag=0 ⇒ NOT all equal
+    /// Constrained one-directionally: `eq_flag=1 ⇒ val_b[i] = val_d[i]` for
+    /// every byte i, gated on `is_cmp_or_branch`.  The converse is benign in
+    /// PVM semantics — the prover would have to produce the wrong next_pc to
+    /// undermark eq_flag, which is bound by ProgramMemoryChip.
     #[size = 1]
     EqFlag,
-    /// Per-byte equality flag: 1 if val_b[i] == val_d[i]
-    #[size = 8]
-    ByteEq,
-    /// Per-byte diff inverse: val_b[i] != val_d[i] → (val_b[i]-val_d[i])*ByteDiffInv[i] = 1
-    ///                         val_b[i] == val_d[i] → ByteDiffInv[i] can be 0 (unused)
-    #[size = 8]
-    ByteDiffInv,
+    // Phase 54h: ByteEq[8] + ByteDiffInv[8] dropped.  BranchEq / BranchNe
+    // constraints now read `val_b[i] - val_d[i]` directly:
+    //   is_br_eq · branch_taken · (val_b[i] - val_d[i]) = 0
+    //   is_br_ne · (1 - branch_taken) · (val_b[i] - val_d[i]) = 0
+    // Same degree, same soundness as the prior `(1 - byte_eq[i])` form
+    // since byte_eq was bound to the diff-is-zero indicator.
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
