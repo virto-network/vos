@@ -238,7 +238,7 @@ impl BuiltInComponent for CpuChip {
             mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone()
         };
         let is_mul_low = E::F::one() - is_mul_upper_e();
-        let unsigned_product_hi = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
+        // Phase 54c: UnsignedProductHi moved to MulChip.
         let unsigned_product_low = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
         // 32-bit mul: upper result limbs (i ∈ 4..8) = 0xFF · SignBitResult
         // (Phase 19 sign-extension).  Applies uniformly to non-rotate Mul32
@@ -388,90 +388,14 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 12c: MulUpper SS / SU sign-correction
-        //
-        //   high(a_s × b_s) ≡ high(a_u × b_u) − sa·b_u − sb·a_u  (mod 2^64)
-        //
-        // For UU: result = unsigned_product_hi (no correction).
-        // For SU: result = unsigned_product_hi − sa·val_d.
-        // For SS: result = unsigned_product_hi − sa·val_d − sb·val_b.
-        //
-        // Materialised via two sign-correction term columns (TermA = sa·val_d
-        // for SU/SS, 0 for UU; TermB = sb·val_b for SS, 0 elsewhere) and a
-        // 64-bit add-with-carry chain encoding
-        //   result + TermA + TermB ≡ unsigned_product_hi  (mod 2^64).
-        // For UU rows TermA = TermB = 0, so the chain collapses to
-        // `result = unsigned_product_hi` (which replaces the old direct
-        // schoolbook-into-result constraint for is_mul_upper).
-        {
-            let term_a = crate::trace::trace_eval!(trace_eval, Column::MulCorrTermA);
-            let term_b = crate::trace::trace_eval!(trace_eval, Column::MulCorrTermB);
-            let corr_carry = crate::trace::trace_eval!(trace_eval, Column::MulCorrCarry);
-            let mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
-            let mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
-            let mu_ss = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
-            let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-            let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-
-            // Boolean witnesses.
-            for f in [&mu_uu, &mu_su, &mu_ss] {
-                eval.add_constraint(f[0].clone() * (E::F::one() - f[0].clone()));
-            }
-            // Phase 53: with IsMulUpper folded into the
-            // (mu_uu + mu_su + mu_ss) expression there's no
-            // standalone column to pin against the partition identity
-            // — the expression IS the column by definition.
-
-            // Term definitions (degree 3 each — flag · sign_bit · operand byte).
-            //
-            // TermA[i]:
-            //   UU: 0
-            //   SU/SS: sa · val_d[i]   where sa = sign_bit_b
-            // TermB[i]:
-            //   UU/SU: 0
-            //   SS: sb · val_b[i]      where sb = sign_bit_d
-            //
-            // Encoded as paired constraints per byte: one forces the
-            // active variant's correct value; the other forces 0 on
-            // the inactive variants.
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    (mu_su[0].clone() + mu_ss[0].clone())
-                        * (term_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone())
-                );
-                eval.add_constraint(mu_uu[0].clone() * term_a[i].clone());
-                eval.add_constraint(
-                    mu_ss[0].clone()
-                        * (term_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone())
-                );
-                eval.add_constraint((mu_uu[0].clone() + mu_su[0].clone()) * term_b[i].clone());
-            }
-
-            // Result-binding sum with byte-level carry chain.
-            // Convention (matches the existing add/sub chain shape):
-            //   unsigned_hi[i] + carry_out[i]·256 = result[i] + TermA[i] + TermB[i] + carry_in[i]
-            // gated on is_mul_upper.  For UU: TermA=TermB=0 → unsigned_hi
-            // = result everywhere.  For SU/SS: unsigned_hi = result + corr
-            // (mod 2^64); the carry-out at byte 7 is the 64-bit overflow,
-            // discarded.
-            for i in 0..WORD_SIZE {
-                let carry_in: E::F = if i == 0 {
-                    E::F::zero()
-                } else {
-                    corr_carry[i - 1].clone()
-                };
-                eval.add_constraint(
-                    is_mul_upper_e() * (
-                        unsigned_product_hi[i].clone()
-                            + corr_carry[i].clone() * f256.clone()
-                            - result[i].clone()
-                            - term_a[i].clone()
-                            - term_b[i].clone()
-                            - carry_in
-                    )
-                );
-            }
-        }
+        // Phase 54c: Phase 12c MulUpper SS/SU sign-correction moved to
+        // MulChip.  CpuChip's mu_uu/mu_su/mu_ss flags + sign_bit_b/d
+        // values are sent through the MultiplicationLookup tuple so
+        // MulChip's relocated constraint binds against them.  CpuChip's
+        // result on `is_mul_upper` rows is consumed by MulChip's sign-
+        // correction chain (which proves it equals unsigned_product_hi
+        // − sa·val_d − sb·val_b mod 2^64).
+        // ════════════════════════════════════════════════════════════════════
 
         // ════════════════════════════════════════════════════════════════════
         // BITWISE: constrain via AND result + algebraic identity
@@ -3122,12 +3046,12 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // ── Phase 54a/b: MultiplicationLookup producer ──
-        // Tuple (53 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
-        //   + unsigned_product_low[8] + unsigned_product_hi[8] + 5 flags.
-        // MulChip consumes the same tuple per real row.  The schoolbook
-        // carry-chain constraint that pins UnsignedProductLow/Hi/MulHigh
-        // to val_b * val_d lives on MulChip (Phase 54b).
+        // ── Phase 54a/b/c: MultiplicationLookup producer ──
+        // Tuple (47 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
+        //   + unsigned_product_low[8] + sign_bit_b + sign_bit_d + 5 flags.
+        // MulChip consumes the same tuple per real row.  Moved to MulChip:
+        //   - schoolbook carry chain (54b): pins upl/uph/mul_high.
+        //   - sign correction (54c): pins result for is_mul_upper rows.
         {
             let f_is_mul_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMul);
             let f_mu_uu_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
@@ -3139,18 +3063,20 @@ impl BuiltInComponent for CpuChip {
             let result_p54 = crate::trace::trace_eval!(trace_eval, Column::Result);
             let mul_high_p54 = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
             let upl_p54 = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
-            let uph_p54 = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
+            let sign_bit_b_p54 = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sign_bit_d_p54 = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
             let is_mul_lo_e = f_is_mul_p54[0].clone()
                 - f_mu_uu_p54[0].clone()
                 - f_mu_su_p54[0].clone()
                 - f_mu_ss_p54[0].clone();
-            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(53);
+            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(47);
             tuple_p54.extend_from_slice(&val_b_p54);
             tuple_p54.extend_from_slice(&val_d_p54);
             tuple_p54.extend_from_slice(&result_p54);
             tuple_p54.extend_from_slice(&mul_high_p54);
             tuple_p54.extend_from_slice(&upl_p54);
-            tuple_p54.extend_from_slice(&uph_p54);
+            tuple_p54.push(sign_bit_b_p54[0].clone());
+            tuple_p54.push(sign_bit_d_p54[0].clone());
             tuple_p54.push(is_mul_lo_e);
             tuple_p54.push(f_mu_uu_p54[0].clone());
             tuple_p54.push(f_mu_su_p54[0].clone());

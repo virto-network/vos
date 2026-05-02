@@ -82,6 +82,18 @@ pub struct MulEntry {
     /// carry; busiest at position k=3 for 0xFFFF_FFFF² ≈ 0x3FB.
     pub mul_carry: [u8; 16],
     pub mul_carry_hi: [u8; 16],
+    /// Phase 54c: Phase 12c sign-correction terms.
+    /// `term_a` = sa·val_d for SU/SS, 0 for UU.
+    /// `term_b` = sb·val_b for SS, 0 elsewhere.
+    pub mul_corr_term_a: [u8; 8],
+    pub mul_corr_term_b: [u8; 8],
+    /// Per-byte carry chain for `result + term_a + term_b ≡
+    /// unsigned_product_hi (mod 2^64)` on is_mul_upper rows.
+    pub mul_corr_carry: [u8; 8],
+    /// Phase 54c: bit 7 of val_b's MSB (val_b[7] for 64-bit, val_b[3]
+    /// for 32-bit).  Used by Phase 12c sign correction.
+    pub sign_bit_b: u8,
+    pub sign_bit_d: u8,
     pub is_mul_lo: bool,
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,

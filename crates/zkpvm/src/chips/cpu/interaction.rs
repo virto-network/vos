@@ -955,9 +955,9 @@ pub(super) fn generate_interaction_trace(
             }
         }
 
-        // ── Phase 54a/b: MultiplicationLookup producer (prover-side mirror) ──
-        // Tuple (53 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
-        //   + unsigned_product_low[8] + unsigned_product_hi[8] + 5 flags.
+        // ── Phase 54a/b/c: MultiplicationLookup producer (prover-side mirror) ──
+        // Tuple (47 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
+        //   + unsigned_product_low[8] + sign_bit_b + sign_bit_d + 5 flags.
         {
             let mul_p54: &MultiplicationLookupElements = lookup_elements.as_ref();
             let f_is_mul_p54 = crate::trace::original_base_column!(component_trace, Column::IsMul);
@@ -970,17 +970,19 @@ pub(super) fn generate_interaction_trace(
             let result_p54 = crate::trace::original_base_column!(component_trace, Column::Result);
             let mul_high_p54 = crate::trace::original_base_column!(component_trace, Column::MulHigh);
             let upl_p54 = crate::trace::original_base_column!(component_trace, Column::UnsignedProductLow);
-            let uph_p54 = crate::trace::original_base_column!(component_trace, Column::UnsignedProductHi);
+            let sign_bit_b_p54 = crate::trace::original_base_column!(component_trace, Column::SignBitB);
+            let sign_bit_d_p54 = crate::trace::original_base_column!(component_trace, Column::SignBitD);
 
-            // Slot 48 (= 6*8) is IsMulLo; override via the closure.
-            const IS_MUL_LO_SLOT: usize = 48;
-            let mut tuple_p54: Vec<_> = Vec::with_capacity(53);
+            // Slot 42 (= 5*8 + 2) is IsMulLo; override via the closure.
+            const IS_MUL_LO_SLOT: usize = 42;
+            let mut tuple_p54: Vec<_> = Vec::with_capacity(47);
             tuple_p54.extend_from_slice(&val_b_p54);
             tuple_p54.extend_from_slice(&val_d_p54);
             tuple_p54.extend_from_slice(&result_p54);
             tuple_p54.extend_from_slice(&mul_high_p54);
             tuple_p54.extend_from_slice(&upl_p54);
-            tuple_p54.extend_from_slice(&uph_p54);
+            tuple_p54.push(sign_bit_b_p54[0].clone());
+            tuple_p54.push(sign_bit_d_p54[0].clone());
             tuple_p54.push(crate::trace::component::FinalizedColumn::Constant(BaseField::from(0)));
             tuple_p54.push(f_mu_uu_p54[0].clone());
             tuple_p54.push(f_mu_su_p54[0].clone());
@@ -996,7 +998,7 @@ pub(super) fn generate_interaction_trace(
                     mul_p54,
                     [f_is_mul_p54[0].clone()],
                     |[m]| m.into(),
-                    53,
+                    47,
                     {
                         let tuple_clone: Vec<_> = tuple_p54.clone();
                         move |i| {

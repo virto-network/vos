@@ -270,37 +270,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
             trace.fill_columns_bytes(row, &mul_high, Column::MulHigh);
             // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
-            trace.fill_columns_bytes(row, &unsigned_product_hi_bytes, Column::UnsignedProductHi);
+            // Phase 54c: UnsignedProductHi + MulCorrTermA/B/Carry moved to MulChip.
             trace.fill_columns_bytes(row, &unsigned_product_low_bytes, Column::UnsignedProductLow);
-            trace.fill_columns_bytes(row, &mul_corr_term_a, Column::MulCorrTermA);
-            trace.fill_columns_bytes(row, &mul_corr_term_b, Column::MulCorrTermB);
-            trace.fill_columns_bytes(row, &mul_corr_carry, Column::MulCorrCarry);
 
-            // Phase 54a/b: capture this mul row for MulChip's main trace.
-            // Must mirror exactly the val_b / val_d / Result / MulHigh /
-            // UnsignedProductLow / UnsignedProductHi / MulCarry /
-            // MulCarryHi values written above (post-pow2-replacement,
-            // post-32-bit truncation, signedness-adjusted result).
-            if flags.is_mul {
-                let mul_high_u64 = u64::from_le_bytes(mul_high);
-                let unsigned_product_low_u64 = u64::from_le_bytes(unsigned_product_low_bytes);
-                let unsigned_product_hi_u64 = u64::from_le_bytes(unsigned_product_hi_bytes);
-                side_note.mul_entries.push(crate::side_note::MulEntry {
-                    val_b,
-                    val_d,
-                    result,
-                    mul_high: mul_high_u64,
-                    unsigned_product_low: unsigned_product_low_u64,
-                    unsigned_product_hi: unsigned_product_hi_u64,
-                    mul_carry,
-                    mul_carry_hi,
-                    is_mul_lo: !flags.is_mul_upper,
-                    is_mul_upper_uu: flags.is_mul_upper_uu,
-                    is_mul_upper_su: flags.is_mul_upper_su,
-                    is_mul_upper_ss: flags.is_mul_upper_ss,
-                    is_32bit: flags.is_32bit,
-                });
-            }
+            // Phase 54a/b/c: MulEntry capture moved below — needs
+            // sign_bit_b/sign_bit_d which are computed further down.
 
             // ── Bitwise auxiliary ──
             let mut and_result = [0u8; WORD_SIZE];
@@ -384,6 +358,34 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, sign_bit_d, Column::SignBitD);
             trace.fill_columns(row, sign_src_b, Column::SignSrcB);
             trace.fill_columns(row, sign_src_d, Column::SignSrcD);
+
+            // Phase 54a/b/c: capture this mul row for MulChip's main trace.
+            // Placed after sign_bit_b/d so MulEntry can carry them too.
+            if flags.is_mul {
+                let mul_high_u64 = u64::from_le_bytes(mul_high);
+                let unsigned_product_low_u64 = u64::from_le_bytes(unsigned_product_low_bytes);
+                let unsigned_product_hi_u64 = u64::from_le_bytes(unsigned_product_hi_bytes);
+                side_note.mul_entries.push(crate::side_note::MulEntry {
+                    val_b,
+                    val_d,
+                    result,
+                    mul_high: mul_high_u64,
+                    unsigned_product_low: unsigned_product_low_u64,
+                    unsigned_product_hi: unsigned_product_hi_u64,
+                    mul_carry,
+                    mul_carry_hi,
+                    mul_corr_term_a,
+                    mul_corr_term_b,
+                    mul_corr_carry,
+                    sign_bit_b,
+                    sign_bit_d,
+                    is_mul_lo: !flags.is_mul_upper,
+                    is_mul_upper_uu: flags.is_mul_upper_uu,
+                    is_mul_upper_su: flags.is_mul_upper_su,
+                    is_mul_upper_ss: flags.is_mul_upper_ss,
+                    is_32bit: flags.is_32bit,
+                });
+            }
             // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
             let cmp_lt_s_flag: u8 = if sign_bit_b != sign_bit_d {
                 sign_bit_b // b is negative (sign=1) → b < d
