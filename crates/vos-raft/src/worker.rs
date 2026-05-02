@@ -1832,6 +1832,14 @@ where
         return Ok(());
     }
     if resp.vote_granted {
+        // Only count grants from members of the active
+        // configuration. A late-arriving grant from a peer
+        // we just removed via change_membership shouldn't
+        // help us cross quorum, and a forged response from a
+        // non-member must not corrupt votes_received.
+        if !state.effective_cfg.all_members().contains(&from) {
+            return Ok(());
+        }
         state.votes_received.insert(from);
         let votes = state.votes_received.clone();
         if state.quorum_holds(|m| votes.contains(&m)) {
@@ -1885,6 +1893,12 @@ where
         return Ok(());
     }
     if resp.vote_granted {
+        // Same active-config gate as `handle_vote_response`: a
+        // pre-vote grant from a non-member must not influence
+        // promotion to Candidate.
+        if !state.effective_cfg.all_members().contains(&from) {
+            return Ok(());
+        }
         state.votes_received.insert(from);
         let votes = state.votes_received.clone();
         if state.quorum_holds(|m| votes.contains(&m)) {
