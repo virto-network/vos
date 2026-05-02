@@ -101,15 +101,11 @@ impl Storage<u16> for RedbStorage {
         self.log.term_at(index)
     }
 
-    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
         let raw = self.log.entries(start, end)?;
         Ok(raw
             .into_iter()
-            .map(|e| LogEntry {
-                index: e.index,
-                term: e.term,
-                payload: e.payload,
-            })
+            .map(|e| LogEntry::data(e.index, e.term, e.payload))
             .collect())
     }
 
@@ -173,8 +169,17 @@ impl Storage<u16> for RedbStorage {
                 // append at the next slot, so the indices match
                 // — but assert to catch a future caller passing
                 // something inconsistent.
-                let assigned =
-                    self.log.append_in_txn(&txn, entry.term, &entry.payload)?;
+                //
+                // Vos's redb log only stores `Data` payload bytes
+                // today. The vos-raft worker doesn't yet emit
+                // `ConfigChange` entries (joint consensus isn't
+                // wired here yet); when it does, this layer will
+                // need to serialize the EntryKind discriminant
+                // alongside the bytes.
+                let payload = entry.payload().expect(
+                    "redb_storage: ConfigChange entries not yet supported on the vos wire",
+                );
+                let assigned = self.log.append_in_txn(&txn, entry.term, payload)?;
                 debug_assert_eq!(
                     assigned, entry.index,
                     "RedbStorage: append index drift (entry={}, assigned={})",
@@ -289,12 +294,8 @@ mod tests {
         (db, dir)
     }
 
-    fn entry(idx: u64, term: u64, p: &[u8]) -> LogEntry {
-        LogEntry {
-            index: idx,
-            term,
-            payload: p.to_vec(),
-        }
+    fn entry(idx: u64, term: u64, p: &[u8]) -> LogEntry<u16> {
+        LogEntry::data(idx, term, p.to_vec())
     }
 
     fn block_on<F: core::future::Future>(f: F) -> F::Output {
@@ -332,7 +333,7 @@ mod tests {
         assert_eq!(s.last_term(), 2);
         let raw = block_on(s.entries(1, 3)).unwrap();
         assert_eq!(raw.len(), 3);
-        assert_eq!(raw[0].payload, b"a".to_vec());
+        assert_eq!(raw[0].payload(), Some(b"a".as_ref()));
         drop(s);
         let s2 = RedbStorage::open(db).unwrap();
         assert_eq!(s2.last_index(), 3);

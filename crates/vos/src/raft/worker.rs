@@ -291,16 +291,14 @@ impl RaftRpcHandler for WorkerHandle {
             leader_commit,
             entries: entries
                 .into_iter()
-                .map(|e| vos_raft::LogEntry {
-                    // Index is decided by the worker's log
-                    // consistency check; the wire format doesn't
-                    // carry it because indices are contiguous from
-                    // `prev_log_index + 1`. Fill with 0 here — the
-                    // worker assigns the right index before append.
-                    index: 0,
-                    term: e.term,
-                    payload: e.payload,
-                })
+                // Index is decided by the worker's log consistency
+                // check; the wire format doesn't carry it because
+                // indices are contiguous from `prev_log_index + 1`.
+                // We fill `index = 0` here — the worker assigns
+                // the right index before append. Wire entries are
+                // always `Data` today (vos doesn't ferry the
+                // `ConfigChange` variant yet).
+                .map(|e| vos_raft::LogEntry::data(0, e.term, e.payload))
                 .collect(),
         };
         let resp = block_on(self.inner.handle_inbound_append(from_prefix, req));

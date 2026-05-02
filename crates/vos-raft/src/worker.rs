@@ -1133,7 +1133,7 @@ where
         }
     }
     let truncate_after = conflict_at.map(|idx| idx - 1);
-    let appends: Vec<LogEntry> = req
+    let appends: Vec<LogEntry<N>> = req
         .entries
         .iter()
         .enumerate()
@@ -1141,7 +1141,7 @@ where
         .map(|(i, e)| LogEntry {
             index: req.prev_log_index + 1 + i as u64,
             term: e.term,
-            payload: e.payload.clone(),
+            kind: e.kind.clone(),
         })
         .collect();
 
@@ -1663,11 +1663,7 @@ where
     }
     let term = state.meta.current_term;
     let new_index = state.storage.last_index() + 1;
-    let entry = LogEntry {
-        index: new_index,
-        term,
-        payload,
-    };
+    let entry = LogEntry::data(new_index, term, payload);
     state
         .storage
         .commit_batch(WriteBatch {
@@ -2330,9 +2326,9 @@ mod tests {
                 prev_log_term: 0,
                 leader_commit: 0,
                 entries: alloc::vec![
-                    LogEntry { index: 1, term: 1, payload: alloc::vec![1] },
-                    LogEntry { index: 2, term: 1, payload: alloc::vec![1] },
-                    LogEntry { index: 3, term: 1, payload: alloc::vec![1] },
+                    LogEntry::data(1, 1, alloc::vec![1]),
+                    LogEntry::data(2, 1, alloc::vec![1]),
+                    LogEntry::data(3, 1, alloc::vec![1]),
                 ],
             },
         ));
@@ -2352,9 +2348,9 @@ mod tests {
                 prev_log_term: 0,
                 leader_commit: 0,
                 entries: alloc::vec![
-                    LogEntry { index: 1, term: 2, payload: alloc::vec![2] },
-                    LogEntry { index: 2, term: 2, payload: alloc::vec![2] },
-                    LogEntry { index: 3, term: 2, payload: alloc::vec![2] },
+                    LogEntry::data(1, 2, alloc::vec![2]),
+                    LogEntry::data(2, 2, alloc::vec![2]),
+                    LogEntry::data(3, 2, alloc::vec![2]),
                 ],
             },
         ));
@@ -2435,9 +2431,7 @@ mod tests {
                 prev_log_index: 0,
                 prev_log_term: 0,
                 leader_commit: 0,
-                entries: alloc::vec![LogEntry {
-                    index: 1, term: 5, payload: alloc::vec![1],
-                }],
+                entries: alloc::vec![LogEntry::data(1, 5, alloc::vec![1])],
             },
         ));
         assert!(r.success);

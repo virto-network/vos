@@ -56,7 +56,7 @@ pub struct WriteBatch<N: NodeId> {
     /// Append at the end. Indices must be contiguous starting
     /// at `last_index + 1` (or the truncated tail's tail index
     /// + 1, when both `truncate_after` and `appends` are set).
-    pub appends: Vec<LogEntry>,
+    pub appends: Vec<LogEntry<N>>,
     /// Replace the snapshot row with these bytes. `None` =
     /// leave the existing snapshot row in place. Empty `Vec`
     /// = explicitly clear the row.
@@ -127,7 +127,7 @@ pub trait Storage<N: NodeId>: Send + 'static {
         &self,
         start: u64,
         end: u64,
-    ) -> impl core::future::Future<Output = Result<Vec<LogEntry>, Self::Error>> + Send;
+    ) -> impl core::future::Future<Output = Result<Vec<LogEntry<N>>, Self::Error>> + Send;
 
     /// Read the snapshot row. Empty `Vec` when no snapshot has
     /// been installed.
@@ -157,7 +157,7 @@ pub trait Storage<N: NodeId>: Send + 'static {
 /// persist anything — drop the `MemStorage` and the cluster's
 /// state vanishes — but matches the trait semantics exactly.
 pub struct MemStorage<N: NodeId> {
-    log: alloc::collections::BTreeMap<u64, LogEntry>,
+    log: alloc::collections::BTreeMap<u64, LogEntry<N>>,
     state: Vec<u8>,
     meta: Meta<N>,
 }
@@ -218,7 +218,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.log.get(&index).map(|e| e.term))
     }
 
-    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<N>>, Self::Error> {
         if start > end {
             return Ok(Vec::new());
         }
@@ -272,12 +272,8 @@ mod tests {
 
     type Mem = MemStorage<u16>;
 
-    fn entry(idx: u64, term: u64) -> LogEntry {
-        LogEntry {
-            index: idx,
-            term,
-            payload: vec![idx as u8],
-        }
+    fn entry(idx: u64, term: u64) -> LogEntry<u16> {
+        LogEntry::data(idx, term, vec![idx as u8])
     }
 
     #[test]

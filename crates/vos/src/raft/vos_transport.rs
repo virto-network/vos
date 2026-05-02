@@ -99,12 +99,21 @@ impl Transport<u16> for VosTransport {
             .network
             .peer_for_prefix(peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
+        // Vos's wire `RaftEntry` carries `payload: Vec<u8>` —
+        // the libp2p frame layer doesn't yet ferry the
+        // `ConfigChange` variant of `EntryKind`. The vos-raft
+        // worker doesn't emit `ConfigChange` entries yet, so this
+        // is safe today; upgrading the wire layer is paired with
+        // joint-consensus rollout.
         let entries = req
             .entries
             .into_iter()
-            .map(|e| RaftEntry {
-                term: e.term,
-                payload: e.payload,
+            .map(|e| {
+                let payload = e
+                    .payload()
+                    .expect("vos_transport: ConfigChange entries not yet supported on the wire")
+                    .to_vec();
+                RaftEntry { term: e.term, payload }
             })
             .collect();
         let rx = self.network.send_raft_append(

@@ -9,6 +9,7 @@
 
 use alloc::vec::Vec;
 
+use crate::config::NodeId;
 use crate::log_entry::LogEntry;
 
 /// Raft `AppendEntries` from leader → follower. Empty `entries`
@@ -18,13 +19,13 @@ use crate::log_entry::LogEntry;
 /// `prev_log_term`, otherwise the request is refused and the
 /// leader retries with a smaller `prev_log_index`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendEntriesReq<N> {
+pub struct AppendEntriesReq<N: NodeId> {
     pub leader: N,
     pub term: u64,
     pub prev_log_index: u64,
     pub prev_log_term: u64,
     pub leader_commit: u64,
-    pub entries: Vec<LogEntry>,
+    pub entries: Vec<LogEntry<N>>,
 }
 
 /// Reply to [`AppendEntriesReq`].

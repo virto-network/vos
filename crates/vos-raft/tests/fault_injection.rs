@@ -127,7 +127,7 @@ impl<S: Storage<u16> + Sync> Storage<u16> for FaultStorage<S> {
         }
         self.inner.term_at(index).await.map_err(map_err)
     }
-    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
         if take_fault_budget(&self.fail_entries) {
             return Err(FaultErr);
         }

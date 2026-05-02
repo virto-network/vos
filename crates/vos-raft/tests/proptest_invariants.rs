@@ -128,7 +128,7 @@ impl vos_raft::Rng for SeededRng {
 /// exposing internals through the public API.
 #[derive(Default)]
 struct StorageMirror {
-    entries: std::collections::BTreeMap<u64, LogEntry>,
+    entries: std::collections::BTreeMap<u64, LogEntry<u16>>,
     state: Vec<u8>,
     meta: Meta<u16>,
 }
@@ -179,7 +179,7 @@ impl Storage<u16> for SharedStorage {
         }
         Ok(m.entries.get(&index).map(|e| e.term))
     }
-    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
         let m = self.mirror.lock().unwrap();
         if start > end {
             return Ok(Vec::new());
@@ -322,12 +322,12 @@ proptest! {
                 Op::Append {
                     from, term, prev_log_index, prev_log_term, leader_commit, n_entries,
                 } => {
-                    let entries: Vec<LogEntry> = (0..n_entries)
-                        .map(|i| LogEntry {
-                            index: prev_log_index + 1 + u64::from(i),
+                    let entries: Vec<LogEntry<u16>> = (0..n_entries)
+                        .map(|i| LogEntry::data(
+                            prev_log_index + 1 + u64::from(i),
                             term,
-                            payload: vec![i],
-                        })
+                            vec![i],
+                        ))
                         .collect();
                     let _ = block_on(h.handle_inbound_append(
                         from,
