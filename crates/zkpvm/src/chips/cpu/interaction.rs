@@ -967,23 +967,8 @@ pub(super) fn generate_interaction_trace(
 
         }
 
-        // Phase 21: range-check DivCmpDiff bytes via Range256.
-        {
-            let range256_p21: &Range256LookupElements = lookup_elements.as_ref();
-            let is_pad_col_p21 = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-            let div_cmp_diff_cols = crate::trace::original_base_column!(component_trace, Column::DivCmpDiff);
-            for col in &div_cmp_diff_cols {
-                logup.add_to_relation_with(
-                    range256_p21,
-                    [is_pad_col_p21[0].clone()],
-                    |[pad]| {
-                        use stwo::prover::backend::simd::m31::PackedBaseField;
-                        (PackedBaseField::one() - pad).into()
-                    },
-                    &[col.clone()],
-                );
-            }
-        }
+        // Phase 21 → 54i: DivCmpDiff Range256 emissions moved to
+        // DivRemChip (witnesses + range-checks on its own trace).
 
         // Phase 30: range-check AbsCmpDiff bytes via Range256.
         {
@@ -1066,7 +1051,8 @@ pub(super) fn generate_interaction_trace(
             }
         }
 
-        // ── Phase 54g: DivRemLookup producer (prover-side mirror) ──
+        // ── Phase 54g/54i: DivRemLookup producer (prover-side mirror) ──
+        // 44-limb tuple (added is_div_s in 54i).
         {
             let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
             let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
@@ -1077,6 +1063,7 @@ pub(super) fn generate_interaction_trace(
             let dbz_p54g = crate::trace::original_base_column!(component_trace, Column::DivByZero);
             let is_dr_p54g = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
             let is_32_p54g = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
+            let is_ds_p54g = crate::trace::original_base_column!(component_trace, Column::IsDivS);
             let mut tuple_p54g: Vec<_> = val_b_p54g.to_vec();
             tuple_p54g.extend_from_slice(&val_d_p54g);
             tuple_p54g.extend_from_slice(&dq_p54g);
@@ -1085,6 +1072,7 @@ pub(super) fn generate_interaction_trace(
             tuple_p54g.push(is_dr_p54g[0].clone());
             tuple_p54g.push(dbz_p54g[0].clone());
             tuple_p54g.push(is_32_p54g[0].clone());
+            tuple_p54g.push(is_ds_p54g[0].clone());
             for _ in 0..2 {
                 logup.add_to_relation_with(
                     divrem_p54g,

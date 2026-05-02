@@ -610,62 +610,11 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 21: DivU quotient-uniqueness (r < d)
-        //
-        // Without this, the schoolbook `q·d + r = b` alone is satisfied
-        // by (q, r), (q−1, r+d), (q−2, r+2d), …  A malicious prover
-        // could write `q' = q − 1`, `r' = r + d` and the AIR would
-        // accept — the wrong quotient ends up in the destination
-        // register.  Adding `r < d` (equivalently `val_d > div_remainder`)
-        // forces the unique Euclidean pair.
-        //
-        // Encoded as the carry chain for `val_d − 1 − div_remainder`
-        // (= `val_d + ~div_remainder` with carry_in[0] = 0).  The top
-        // carry is 1 iff `val_d > div_remainder`.  Range-check on
-        // DivCmpDiff bytes (via BitwiseAnd `(diff, 0xFF, diff)`) is
-        // emitted alongside the Phase 17/19/20 sign-bit nibble lookup
-        // block.  DivCmpCarry boolean-constrained on every real row.
-        //
-        // Gate: `is_div_rem · ¬div_by_zero · ¬is_div_s`.  DivS r<d
-        // uniqueness needs |r| < |d| with sign analysis; deferred.
-        {
-            let div_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
-            let div_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::DivCmpCarry);
-            // Boolean carry on every real row (so the range is forced
-            // even on non-divrem rows where DivCmpCarry is unused).
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone() * div_cmp_carry[i].clone()
-                        * (E::F::one() - div_cmp_carry[i].clone())
-                );
-            }
-            // Carry chain (gated on divrem-no-divzero-no-divs).
-            let div_u_active = is_div_rem[0].clone()
-                * (E::F::one() - div_by_zero[0].clone())
-                * (E::F::one() - is_div_s[0].clone());
-            let f_255_p21: E::F = E::F::from(BaseField::from(255));
-            for i in 0..WORD_SIZE {
-                let carry_in = if i == 0 {
-                    E::F::zero()
-                } else {
-                    div_cmp_carry[i - 1].clone()
-                };
-                eval.add_constraint(
-                    div_u_active.clone() * (
-                        div_cmp_diff[i].clone()
-                            + div_cmp_carry[i].clone() * f256.clone()
-                            - val_d[i].clone()
-                            - f_255_p21.clone()
-                            + div_remainder[i].clone()
-                            - carry_in
-                    )
-                );
-            }
-            // Top carry must be 1 (val_d > div_remainder, i.e. r < d).
-            eval.add_constraint(
-                div_u_active * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
-            );
-        }
+        // Phase 21 → 54i: DivU r<d uniqueness chain moved to DivRemChip.
+        // The DivRemLookup tuple now flows is_div_s alongside the existing
+        // is_div_rem/div_by_zero/is_32bit; DivRemChip witnesses
+        // DivCmpDiff[8]/DivCmpCarry[8] internally and emits the Range256
+        // lookups on its own (narrower) trace.
 
         // ════════════════════════════════════════════════════════════════════
         // Phase 29: byte-wise val_d zero-check + DivByZero result binding
@@ -2770,21 +2719,8 @@ impl BuiltInComponent for CpuChip {
             let _ = sixteen_p17; // already consumed via lo_load
         }
 
-        // Phase 21: range-check DivCmpDiff bytes via Range256 (the
-        // BitwiseLookupChip handles only nibbles, so byte-range needs
-        // the dedicated 256-entry table).  Placed at end before the
-        // sign-bit nibble lookups would otherwise have ended.  8
-        // emissions per real row, gated by is_real, even count.
-        {
-            let div_cmp_diff_p21 = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
-            for i in 0..WORD_SIZE {
-                eval.add_to_relation(RelationEntry::new(
-                    range256_lookup,
-                    is_real.clone().into(),
-                    &[div_cmp_diff_p21[i].clone()],
-                ));
-            }
-        }
+        // Phase 21 → 54i: DivCmpDiff Range256 emissions moved to
+        // DivRemChip (now witnesses + range-checks on its own trace).
 
         // Phase 30: range-check AbsCmpDiff bytes via Range256.  Same
         // pattern as Phase 21 — 8 emissions per real row, even count.
@@ -2850,10 +2786,12 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // ── Phase 54g: DivRemLookup producer ──
-        // Tuple (43 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+        // ── Phase 54g/54i: DivRemLookup producer ──
+        // Tuple (44 limbs): val_b[8] + val_d[8] + div_quotient[8] +
         //   div_remainder[8] + div_corr_hi[8] + is_div_rem +
-        //   div_by_zero + is_32bit.  Multiplicity = is_div_rem.
+        //   div_by_zero + is_32bit + is_div_s.  Multiplicity = is_div_rem.
+        // is_div_s is flowed so DivRemChip can gate the unsigned r<d
+        // chain off on signed-div rows (Phase 54i extraction).
         {
             let val_b_p54g = crate::trace::trace_eval!(trace_eval, Column::ValB);
             let val_d_p54g = crate::trace::trace_eval!(trace_eval, Column::ValD);
@@ -2863,7 +2801,8 @@ impl BuiltInComponent for CpuChip {
             let dbz_p54g = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
             let is_dr_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let is_32_p54g = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
-            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(43);
+            let is_ds_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
+            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(44);
             tuple_p54g.extend_from_slice(&val_b_p54g);
             tuple_p54g.extend_from_slice(&val_d_p54g);
             tuple_p54g.extend_from_slice(&dq_p54g);
@@ -2872,6 +2811,7 @@ impl BuiltInComponent for CpuChip {
             tuple_p54g.push(is_dr_p54g[0].clone());
             tuple_p54g.push(dbz_p54g[0].clone());
             tuple_p54g.push(is_32_p54g[0].clone());
+            tuple_p54g.push(is_ds_p54g[0].clone());
             for _ in 0..2 {
                 eval.add_to_relation(RelationEntry::new(
                     divrem_lookup,

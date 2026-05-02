@@ -1,4 +1,4 @@
-//! Phase 54g — `DivRemChip`: per-divrem-row chip.
+//! Phase 54g / 54i — `DivRemChip`: per-divrem-row chip.
 //!
 //! CpuChip emits one DivRemLookup producer per `is_div_rem=1` row;
 //! DivRemChip consumes once per real row.  DivRemChip witnesses the
@@ -6,9 +6,15 @@
 //! bytes) / `q·d + r = div_corr_hi mod 2^64` (high 8 bytes), in both
 //! 64-bit and 32-bit forms.
 //!
-//! Lookup tuple (43 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+//! Phase 54i adds the unsigned r<d uniqueness chain (was on CpuChip
+//! Phase 21) here as well: per-byte `val_d + ~div_remainder + 1`
+//! carry chain whose top carry forces `val_d > div_remainder`,
+//! gated on `is_div_rem · ¬div_by_zero · ¬is_div_s`.  Per-byte
+//! Range256 emissions on `DivCmpDiff` enforce the byte range.
+//!
+//! Lookup tuple (44 limbs): val_b[8] + val_d[8] + div_quotient[8] +
 //! div_remainder[8] + div_corr_hi[8] + is_div_rem + div_by_zero +
-//! is_32bit.
+//! is_32bit + is_div_s.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -38,7 +44,7 @@ use crate::trace::{
 
 use crate::{
     framework::BuiltInComponent,
-    lookups::DivRemLookupElements,
+    lookups::{DivRemLookupElements, Range256LookupElements},
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -76,6 +82,21 @@ pub enum Column {
     DivByZero,
     #[size = 1]
     Is32Bit,
+    /// Phase 54i: signed-div flag (flowed via the lookup tuple).  Gates
+    /// the unsigned r<d uniqueness chain off so DivS rows aren't forced
+    /// through the unsigned predicate (DivS uses |r|<|d| separately —
+    /// Phase 30 / 54j).
+    #[size = 1]
+    IsDivS,
+    /// Phase 54i: per-byte `val_d + ~div_remainder + 1` chain witness
+    /// (used on unsigned div rows to pin r < d).  Range-checked via
+    /// Range256 on every real row.
+    #[size = 8]
+    DivCmpDiff,
+    /// Phase 54i: per-byte boolean carry of the chain.  Top carry = 1
+    /// on unsigned div rows.
+    #[size = 8]
+    DivCmpCarry,
     #[size = 1]
     IsPadding,
 }
@@ -92,14 +113,15 @@ impl BuiltInComponent for DivRemChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = DivRemLookupElements;
+    type LookupElements = (DivRemLookupElements, Range256LookupElements);
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &DivRemLookupElements,
+        lookup_elements: &(DivRemLookupElements, Range256LookupElements),
     ) {
+        let (divrem_lookup, range256_lookup) = lookup_elements;
         let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
         let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
         let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
@@ -110,10 +132,13 @@ impl BuiltInComponent for DivRemChip {
         let is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
         let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
         let is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
+        let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
+        let div_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::DivCmpDiff);
+        let div_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::DivCmpCarry);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
         // Boolean constraints on flag columns.
-        for flag in [&is_div_rem, &div_by_zero, &is_32bit, &is_padding] {
+        for flag in [&is_div_rem, &div_by_zero, &is_32bit, &is_div_s, &is_padding] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         let is_real = E::F::one() - is_padding[0].clone();
@@ -174,8 +199,59 @@ impl BuiltInComponent for DivRemChip {
             );
         }
 
+        // ── Phase 54i: r < d uniqueness chain (unsigned div rows) ──
+        // Encoded as the carry chain for `val_d - 1 - div_remainder`
+        // (= `val_d + ~div_remainder` with carry_in[0] = 0).  The top
+        // carry is 1 iff `val_d > div_remainder`.  Without this, the
+        // schoolbook q·d+r=b alone admits (q-1, r+d) as another valid
+        // pair — see CpuChip's prior comment block at the same spot.
+        // Boolean carry on every real row so the column can't drift
+        // even when div_u_active=0.
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_real.clone() * div_cmp_carry[i].clone()
+                    * (E::F::one() - div_cmp_carry[i].clone())
+            );
+        }
+        // Carry chain (gated on `is_real · is_div_rem · ¬div_by_zero · ¬is_div_s`).
+        let div_u_active = is_real.clone() * is_div_rem[0].clone()
+            * (E::F::one() - div_by_zero[0].clone())
+            * (E::F::one() - is_div_s[0].clone());
+        let f_255: E::F = E::F::from(BaseField::from(255));
+        for i in 0..WORD_SIZE {
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                div_cmp_carry[i - 1].clone()
+            };
+            eval.add_constraint(
+                div_u_active.clone() * (
+                    div_cmp_diff[i].clone()
+                        + div_cmp_carry[i].clone() * f256.clone()
+                        - val_d[i].clone()
+                        - f_255.clone()
+                        + div_remainder[i].clone()
+                        - carry_in
+                )
+            );
+        }
+        // Top carry must be 1 (val_d > div_remainder ⇔ r < d).
+        eval.add_constraint(
+            div_u_active * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
+        );
+        // Range256 emissions on DivCmpDiff bytes.  8 emissions per real
+        // row, gated by is_real, even count (paired with the Phase 54g
+        // schoolbook chain's emissions implicitly via finalize_in_pairs).
+        for i in 0..WORD_SIZE {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_real.clone().into(),
+                &[div_cmp_diff[i].clone()],
+            ));
+        }
+
         // ── Lookup consumer ──
-        let mut tuple: Vec<E::F> = Vec::with_capacity(43);
+        let mut tuple: Vec<E::F> = Vec::with_capacity(44);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&div_quotient);
@@ -184,10 +260,11 @@ impl BuiltInComponent for DivRemChip {
         tuple.push(is_div_rem[0].clone());
         tuple.push(div_by_zero[0].clone());
         tuple.push(is_32bit[0].clone());
+        tuple.push(is_div_s[0].clone());
 
         for _ in 0..2 {
             eval.add_to_relation(RelationEntry::new(
-                lookup_elements,
+                divrem_lookup,
                 (-is_real.clone()).into(),
                 &tuple,
             ));
@@ -227,6 +304,9 @@ impl BuiltInProverComponent for DivRemChip {
             trace.fill_columns(row, true, Column::IsDivRem);
             trace.fill_columns(row, e.div_by_zero, Column::DivByZero);
             trace.fill_columns(row, e.is_32bit, Column::Is32Bit);
+            trace.fill_columns(row, e.is_div_s, Column::IsDivS);
+            trace.fill_columns_bytes(row, &e.div_cmp_diff, Column::DivCmpDiff);
+            trace.fill_columns_bytes(row, &e.div_cmp_carry, Column::DivCmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
         }
 
@@ -252,6 +332,7 @@ impl BuiltInProverComponent for DivRemChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let divrem: &DivRemLookupElements = lookup_elements.as_ref();
+        let range256: &Range256LookupElements = lookup_elements.as_ref();
         let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let div_quotient = crate::trace::original_base_column!(component_trace, Column::DivQuotient);
@@ -260,7 +341,19 @@ impl BuiltInProverComponent for DivRemChip {
         let is_div_rem = crate::trace::original_base_column!(component_trace, Column::IsDivRem);
         let div_by_zero = crate::trace::original_base_column!(component_trace, Column::DivByZero);
         let is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
+        let is_div_s = crate::trace::original_base_column!(component_trace, Column::IsDivS);
+        let div_cmp_diff = crate::trace::original_base_column!(component_trace, Column::DivCmpDiff);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+
+        // Range256 emissions for DivCmpDiff bytes (8 per row, gated by is_real).
+        for col in &div_cmp_diff {
+            logup.add_to_relation_with(
+                range256,
+                [is_padding[0].clone()],
+                |[pad]| (PackedBaseField::one() - pad).into(),
+                &[col.clone()],
+            );
+        }
 
         let mut tuple: Vec<_> = val_b.to_vec();
         tuple.extend_from_slice(&val_d);
@@ -270,6 +363,7 @@ impl BuiltInProverComponent for DivRemChip {
         tuple.push(is_div_rem[0].clone());
         tuple.push(div_by_zero[0].clone());
         tuple.push(is_32bit[0].clone());
+        tuple.push(is_div_s[0].clone());
 
         for _ in 0..2 {
             logup.add_to_relation_with(

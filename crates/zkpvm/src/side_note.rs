@@ -79,6 +79,9 @@ pub struct SideNote {
 }
 
 /// Phase 54g — Single divrem-row witness for the DivRemLookup balance.
+/// Phase 54i extended with `is_div_s` (gates the r<d uniqueness chain to
+/// unsigned div rows) and the `div_cmp_diff/div_cmp_carry` chain bytes
+/// (was on CpuChip; now witnessed by DivRemChip).
 #[derive(Clone, Debug)]
 pub struct DivRemEntry {
     pub val_b: u64,
@@ -90,6 +93,13 @@ pub struct DivRemEntry {
     pub div_mul_carry_hi: [u8; 16],
     pub div_by_zero: bool,
     pub is_32bit: bool,
+    pub is_div_s: bool,
+    /// `val_d - 1 - div_remainder` chain (val_d + ~div_remainder + 1 in
+    /// two's complement); fired only on unsigned div rows.  Filled
+    /// uniformly so the per-byte Range256 emission balances on every
+    /// real DivRemChip row.
+    pub div_cmp_diff: [u8; 8],
+    pub div_cmp_carry: [u8; 8],
 }
 
 /// Phase 54f — Single compare-or-branch-row witness for the

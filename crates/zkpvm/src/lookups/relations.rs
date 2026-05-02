@@ -124,13 +124,16 @@ stwo_constraint_framework::relation!(
 // Phase 54g — DivRem lookup.  CpuChip emits one producer per
 // `is_div_rem` row; DivRemChip consumes once per real (non-padding)
 // row.  Tuple binds val_b/val_d/div_quotient/div_remainder/div_corr_hi
-// + is_div_rem/div_by_zero/is_32bit so DivRemChip's AIR can re-prove
-// the schoolbook identity (q·d + r = b mod 2^128) via the byte-wise
-// carry chain over its narrower trace.
+// + is_div_rem/div_by_zero/is_32bit/is_div_s so DivRemChip's AIR can
+// re-prove the schoolbook identity (q·d + r = b mod 2^128) AND the
+// Phase 21 r < d uniqueness chain (gated on
+// is_div_rem · ¬div_by_zero · ¬is_div_s) over its narrower trace.
 //
 // Tuple: (val_b[8], val_d[8], div_quotient[8], div_remainder[8],
-//   div_corr_hi[8], is_div_rem, div_by_zero, is_32bit) — 43 limbs.
-const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 5 + 3;
+//   div_corr_hi[8], is_div_rem, div_by_zero, is_32bit, is_div_s) —
+// 44 limbs.  Phase 54i bumped the count from 43 → 44 to flow is_div_s
+// through so the unsigned r < d chain can gate on it.
+const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 5 + 4;
 stwo_constraint_framework::relation!(
     DivRemLookupElements,
     REL_DIVREM_LOOKUP_SIZE

@@ -757,7 +757,30 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_bytes(row, &div_corr_hi, Column::DivCorrHi);
             trace.fill_columns_bytes(row, &div_corr_carry, Column::DivCorrCarry);
 
-            // Phase 54g: capture this row for DivRemChip's main trace.
+            // Phase 21 → 54i: DivCmpDiff / DivCmpCarry chain witnesses
+            // moved to DivRemChip.  Compute them here only on divrem
+            // rows so they can flow into the DivRemEntry below; non-divrem
+            // rows skip the work entirely.
+            let mut div_cmp_diff = [0u8; WORD_SIZE];
+            let mut div_cmp_carry = [0u8; WORD_SIZE];
+            if flags.is_div_rem {
+                let mut c: u16 = 0;
+                for i in 0..WORD_SIZE {
+                    let s = val_d_bytes[i] as u16
+                        + (255u16 - div_remainder[i] as u16)
+                        + c;
+                    div_cmp_diff[i] = (s & 0xFF) as u8;
+                    c = s >> 8;
+                    div_cmp_carry[i] = c as u8;
+                }
+                // 8 Range256 charges per divrem row (matches DivRemChip's
+                // 8 emissions on each real row of its narrower trace).
+                for &b in &div_cmp_diff {
+                    range_bytes.push(b);
+                }
+            }
+
+            // Phase 54g/54i: capture this row for DivRemChip's main trace.
             if flags.is_div_rem {
                 let div_quotient_u64 = u64::from_le_bytes(div_quotient);
                 let div_remainder_u64 = u64::from_le_bytes(div_remainder);
@@ -771,6 +794,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     div_mul_carry_hi,
                     div_by_zero: div_by_zero != 0,
                     is_32bit: flags.is_32bit,
+                    is_div_s: flags.is_div_s,
+                    div_cmp_diff,
+                    div_cmp_carry,
                 });
             }
 
@@ -790,36 +816,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
             trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
             trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
-
-            // Phase 21: DivCmpDiff / DivCmpCarry chain — pins r < d
-            // on DivU rows.  Computed on every real row (carry chain
-            // for `val_d − 1 − div_remainder = val_d + ~div_remainder`);
-            // gating on `is_div_rem · ¬div_by_zero · ¬is_div_s` happens
-            // at the AIR level, so on non-DivU rows the chain is just
-            // unused but range/boolean constrained for parity.
-            let mut div_cmp_diff = [0u8; WORD_SIZE];
-            let mut div_cmp_carry = [0u8; WORD_SIZE];
-            {
-                let mut c: u16 = 0;
-                for i in 0..WORD_SIZE {
-                    let s = val_d_bytes[i] as u16
-                        + (255u16 - div_remainder[i] as u16)
-                        + c;
-                    div_cmp_diff[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    div_cmp_carry[i] = c as u8;
-                }
-            }
-            trace.fill_columns_bytes(row, &div_cmp_diff, Column::DivCmpDiff);
-            trace.fill_columns_bytes(row, &div_cmp_carry, Column::DivCmpCarry);
-            // 8 Range256 charges for the per-byte range-checks emitted
-            // on every real row.  Collected here, charged after the loop
-            // (mirrors the existing result/cmp_sub range_bytes pattern;
-            // can't call side_note.add_range256 inline because the loop
-            // already holds an immutable borrow of side_note.steps).
-            for &b in &div_cmp_diff {
-                range_bytes.push(b);
-            }
 
             // Phase 30: |val_d| / |div_remainder| via two's-complement
             // conditional negation, then `|val_d| > |div_remainder|`
