@@ -1,8 +1,12 @@
 # zkpvm — performance benchmarks
 
-A snapshot of where zkpvm sits at branch tip `1e6b59f` (post-
-Phase-50), measured single-threaded on a desktop CPU.  Numbers
+A snapshot of where zkpvm sits at branch tip `3b9742f` (post-
+Phase-54g), measured single-threaded on a desktop CPU.  Numbers
 are reproducible — see "Reproducing" at the bottom.
+
+The original Phase 50 numbers (one column-fold pass before chip
+restructuring started) are preserved in the historical comparison
+table below.
 
 This page exists because the original motivation for forking
 Nexus zkVM was performance: PVM bytecode is more expressive than
@@ -31,46 +35,59 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
+### Current (Phase 54g, median of 3 trials)
+
 | log_size | steps    | trace gen | prove    | verify   | total    | proof size |
 |---       |---       |---        |---       |---       |---       |---         |
-| 10       | 1 024    | 0.41 ms   | 963 ms   | 68 ms    | 1.03 s   | 499 KB     |
-| 12       | 4 096    | 0.57 ms   | 2.70 s   | 264 ms   | 2.96 s   | 547 KB     |
-| 14       | 16 384   | 3.10 ms   | 12.92 s  | 1.29 s   | 14.21 s  | 576 KB     |
+| 10       | 1 024    | 0.30 ms   | 729 ms   | 62 ms    | 0.79 s   | 564 KB     |
+| 12       | 4 096    | 0.62 ms   | 2.01 s   | 224 ms   | 2.23 s   | 582 KB     |
+| 14       | 16 384   | 2.07 ms   | 7.08 s   | 800 ms   | 7.88 s   | 606 KB     |
 
-Per-step proving throughput stabilises around **1 000–1 500 PVM
-steps/sec/thread** in the log_size 10–14 range.  Below log_size
+### Historical (pre-Phase-54)
+
+| log_size | Phase 50 | Phase 53f | Phase 54g | speedup vs P50 |
+|---       |---       |---        |---        |---             |
+| 10       | 963 ms   | 1.18 s    | 729 ms    | 24% |
+| 12       | 2.70 s   | 3.07 s    | 2.01 s    | 26% |
+| 14       | 12.92 s  | 11.37 s   | 7.08 s    | **45%** |
+
+Per-step proving throughput stabilises around **2 000–2 300 PVM
+steps/sec/thread** in the log_size 10–14 range (was 1 000–1 500
+pre-Phase-54).  Below log_size
 10 per-chip fixed overhead dominates (the lookup-table chips
 have minimum sizes regardless of step count).  Above log_size
 14 we run out of memory on a 16 GB machine — `bench_prove_log16`
 is `#[ignore]`d for that reason.
 
-### Per-stage breakdown at log_size = 14
+### Per-stage breakdown at log_size = 14 (Phase 54g)
 
-`prove_profiled` decomposes the prove call into six stages.
-At 16 384 steps:
+`profile_log14` decomposes the prove call into six stages.
+At 16 384 steps (single trial):
 
 | Stage              | Time     | Share |
 |---                 |---       |---    |
-| trace_gen          | 191 ms   | 1%    |
-| preprocess_commit  | 1.16 s   | 9%    |
-| main_commit        | 4.72 s   | 35%   |
-| interaction_gen    | 620 ms   | 5%    |
-| interaction_commit | 1.70 s   | 13%   |
-| stark_prove (FRI)  | 4.92 s   | 37%   |
-| **total**          | 13.31 s  | 100%  |
+| trace_gen          | 82 ms    | 1%    |
+| preprocess_commit  | 566 ms   | 10%   |
+| main_commit        | 2.11 s   | 37%   |
+| interaction_gen    | 288 ms   | 5%    |
+| interaction_commit | 729 ms   | 13%   |
+| stark_prove (FRI)  | 1.86 s   | 33%   |
+| **total**          | 5.63 s   | 100%  |
 
 The two big costs (main commit + FRI prove) are stwo's, not
 zkpvm's — proving cost scales directly with the committed-trace
-size.  Trace generation is <1% of the total: zkpvm's per-step
-witness fill is essentially free relative to the cryptography.
+size.  Trace generation is <1% of the total.
 
-Trace shape at log_size = 14:
-- 14 chip components, log_sizes
-  `[15, 4, 4, 4, 16, 4, 4, 16, 4, 8, 8, 6, 8, 8]`
-  (CpuChip + Blake2b + Memory + boundary chips + lookup tables).
-- 3 034 main-trace columns, 1 564 interaction-trace columns
-  (≈9.3 columns per active per-row constraint, similar to
-  Nexus's RISC-V CpuChip column count).
+Trace shape at log_size = 14, post-Phase-54g:
+- 18 chip components (was 14 pre-Phase-54), log_sizes
+  `[15, 4, 4, 4, 16, 4, 4, 16, 4, 8, 8, 6, 8, 8, 5, 5, 5, 5]`
+  (CpuChip + Blake2b + Memory + boundary chips + lookup tables
+  + Phase 54 narrow chips: Mul, Bitwise, Compare, DivRem).
+- 3 158 main-trace columns, 1 596 interaction-trace columns.
+  Pre-Phase-54: 3 034 main, 1 564 interaction.  Net +124 main
+  cols from the four narrow chips, but each log_size=5 for an
+  add-only workload, so ~32 rows × 124 cols ≈ 4 K extra cells
+  vs 6 M+ saved on CpuChip (which dropped from 660 cols to ~500).
 
 ## Real-world workloads
 
@@ -133,46 +150,54 @@ proved single-threaded under each prover's default config.
 
 ### Measured numbers
 
-| log_size | Nexus prove | zkpvm prove | ratio (zkpvm/nexus) |
-|---       |---          |---          |---                  |
-| 10       | **175 ms**  | 963 ms      | **5.5×**            |
-| 12       | **620 ms**  | 2.70 s      | **4.4×**            |
-| 14       | **2.37 s**  | 12.92 s    | **5.4×**            |
+| log_size | Nexus prove | zkpvm prove (P54g) | ratio (zkpvm/nexus) |
+|---       |---          |---                 |---                  |
+| 10       | **175 ms**  | 729 ms             | **4.2×**            |
+| 12       | **620 ms**  | 2.01 s             | **3.2×**            |
+| 14       | **2.37 s**  | 7.08 s             | **3.0×**            |
 
 The gap stays roughly constant across log_size — it's per-cell,
 not per-row, so we're not hitting an O(N²) bug.
+
+**Phase 54 progress:** at branch tip `1e6b59f` the gap was ~5×
+across all sizes; Phase 54a–g (chip extraction: Mul/Bitwise/
+Compare/DivRem moved to narrow chips) brought it to ~3×.  The
+remaining gap is mostly ProgramMemoryChip + residual CpuChip
+witness columns.
 
 ### Where the gap comes from — measured
 
 Total committed cells = Σ chip_cols × 2^chip_log_size:
 
-#### Per-chip cells at zkpvm @ log14
+#### Per-chip cells at zkpvm @ log14 (Phase 54g)
 
 | Chip                    | Cols  | log_size | Cells   | Share |
 |---                      |---    |---       |---      |---    |
-| **CpuChip**             | 662   | 15       | 21.7 M  | 76%   |
-| **ProgramMemoryChip**   | 74    | 16       | 4.85 M  | 17%   |
-| **RegisterMemoryChip**  | 28    | 16       | 1.83 M  | 6%    |
+| **CpuChip**             | ~500  | 15       | 16.4 M  | 70%   |
+| **ProgramMemoryChip**   | 74    | 16       | 4.85 M  | 21%   |
+| **RegisterMemoryChip**  | 28    | 16       | 1.83 M  | 8%    |
+| MemoryChip              | 17    | 16       | 1.11 M  | (subset of RegisterMemory share) |
 | Blake2bChip             | 2 266 | 4        | 36 K    | <1%   |
-| MemoryChip              | 17    | 16       | 1.11 M  | (folded into RegisterMemory share) |
+| MulChip                 | 84    | 5        | 2.7 K   | <1%   |
+| BitwiseChip             | 62    | 5        | 2.0 K   | <1%   |
+| CompareChip             | 33    | 5        | 1.1 K   | <1%   |
+| DivRemChip              | 84    | 5        | 2.7 K   | <1%   |
 | (rest combined)         |       |          | <10 K   | <1%   |
-| **Total**               |       |          | ≈28.4 M | 100%  |
+| **Total**               |       |          | ≈23 M   | 100%  |
 
-Compare to Nexus's per-step CpuChip column count:
+Compare to Nexus's per-step CpuChip column count (estimated):
 
-| Component              | zkpvm | Nexus | Ratio  |
-|---                     |---    |---    |---     |
-| Per-step `Column` cells| 662   | 374   | **1.77×** |
-| Number of chip components | 14 | 30    | **0.47×** |
+| Component              | zkpvm (P54g) | Nexus | Ratio  |
+|---                     |---           |---    |---     |
+| Per-step `Column` cells| ~500         | 374   | **1.34×** |
+| Number of chip components | 18        | 30    | **0.6×** |
 
-**The bottleneck is CpuChip width**, not chip count.  Nexus has
-*more* chips (30 vs. our 14) but each is narrower because they
-split per-instruction semantics across many small chips
-(`AddChip`, `SubChip`, `JalrChip`, `BneChip`, …) — each one
-constrains its own opcode in its own narrow row.  zkpvm
-currently stuffs all per-opcode constraints into one wide
-CpuChip (every row carries 662 columns regardless of which
-opcode is being proven).
+**The bottleneck is shifting from CpuChip width to ProgramMemoryChip
+preprocessed columns.**  Pre-Phase-54 CpuChip carried 662 cols × 32K
+rows = 21.7M cells (76% of total).  After Phase 54a-g (mul/bitwise/
+compare/divrem extracted) CpuChip is ~500 cols × 32K = 16.4M (70%).
+ProgramMemoryChip's 74 preprocessed cols × 65K rows = 4.85M
+(now ~21% of total) becomes the next material lever — Phase 55.
 
 ### Cells per second (the cells/sec/thread metric is ≈ same)
 
@@ -182,62 +207,46 @@ cells/sec/thread once cache effects are similar:
 
 | Prover | log14 cells | log14 prove | cells/sec/thread |
 |---     |---          |---          |---               |
-| zkpvm  | 28.4 M      | 12.92 s     | ≈2.2 M           |
-| Nexus  | (estimated 5-10 M) | 2.37 s | ≈2-4 M       |
+| zkpvm (P54g) | ≈23 M | 7.08 s      | ≈3.2 M           |
+| zkpvm (P50)  | 28.4 M | 12.92 s    | ≈2.2 M           |
+| Nexus        | (estimated 5-10 M) | 2.37 s | ≈2-4 M  |
 
-So we're **NOT slower per cell** — we just commit roughly **3-5×
-more cells**.  The fix is to commit fewer cells (narrower CpuChip),
-not to make the prover faster.
+So we're **NOT slower per cell** — we just commit roughly **3×
+more cells** post-Phase-54 (was 4-5× pre-Phase-54).  The fix is to
+commit fewer cells, not to make the prover faster.
 
-### Concrete improvement targets
+### Improvement targets — status
 
-In priority order:
+1. **CpuChip column reduction (Phase 53 — DONE).**  Five sum-
+   of-flags columns folded (IsMulUpper, IsBitwise, IsCompare,
+   IsBranch, IsStore).  Wall-clock impact within trial noise;
+   strictly stronger soundness via direct sub-flag pinning.
 
-1. **CpuChip column reduction (highest impact).**  Audit the 662
-   per-row cells for:
-   - Compute-once-use-once values that could fold into
-     expression-level operations (`val_b[i] * is_add` doesn't
-     need its own column if it appears in only one constraint).
-   - Paired flag columns that could collapse.  Examples: each
-     branch type currently has its own `IsBrEq / IsBrNe / …`
-     flag; if no constraint reads them outside the branch
-     dispatch, fold into a single multiplexer expression.
-   - Boolean sub-flags reachable from `IsCompare` etc. that
-     could derive from `(opcode, sub_op)` instead of being
-     materialised.
-   Target: **−200 columns** brings cell count to ≈21.8 M, prove
-   time to ≈10 s at log14.
+2. **Per-step semantics → per-instruction shards (Phase 54 —
+   PARTIAL).**  Four families extracted (Mul/Bitwise/Compare/
+   DivRem), CpuChip dropped 160 cells per row.  Wall-clock at
+   log14 went from 11.37 s → 7.08 s (38% faster).  Remaining
+   ≤16-cell extractions (BranchChip, DivCmp/AbsCmp uniqueness,
+   DivS sign correction) listed in PLAN.md but went perf-
+   neutral starting at 54f — diminishing returns.
 
-2. **Per-step semantics → per-instruction shards (the Nexus
-   way).**  Following Phase 47's split, lift each opcode family
-   into its own narrow chip with row-count = number of opcode-
-   matching real rows.  Concretely:
-   - `is_add`-gated rows go in `AddChip` (rows = sum of is_add
-     across the trace).
-   - `is_sub`-gated rows in `SubChip`, etc.
-   The CpuChip becomes a per-step skeleton (PC, ts, regs, opcode,
-   shared flag fan-out) and the per-opcode logic moves out.
-   This is structurally what Nexus does and the reason their
-   gaps add up correctly.  ~2-3× reduction in committed cells
-   plausible.
+3. **ProgramMemoryChip column count (Phase 55 — pending).**
+   74 cols per row × 65K rows = 4.85 M cells, ~17% of total
+   committed at log14.  Most columns are flag bits that could
+   share a single packed column with bit-decomposition lookups
+   against a 256-row "byte → 8 bits" table.  Affects both the
+   prog_mem chip and the CpuChip-side flag witnesses, so it's
+   a multi-commit refactor.  Plausible 30–50% reduction in
+   prog_mem cells.
 
-3. **ProgramMemoryChip column count.**  74 cols per row × 65K
-   rows = 4.85 M cells, 17% of total.  Most of those columns
-   are flag bits that could share a single packed column with
-   bit-decomposition lookups, similar to what Range256 does.
-   Plausible 50% reduction.
+4. **Blake2bChip review (Phase 56 — pending).**  2 266 main
+   columns; small committed-cell count due to log_size=4 but
+   worth reviewing for clarity / over-decomposition.
 
-4. **Blake2bChip width**.  2 266 main columns is a lot for a
-   chip that mostly compresses one block per ECALL.  The
-   committed cell count is small (log_size = 4) so this is
-   low-priority for pure throughput, but it's the largest
-   single column count in the codebase and worth reviewing for
-   correctness clarity.
-
-The estimated headroom is **2-3× faster proving** without
-touching soundness, which would close the gap to ≈2× of Nexus
-— acceptable for production deployment given PVM's higher
-per-instruction richness.
+The remaining headroom from 3+4 is plausibly another ~1.5×,
+which would bring zkpvm to ~2× of Nexus — acceptable for
+production given PVM's higher per-instruction richness vs
+RISC-V.
 
 ## Memory cost
 
