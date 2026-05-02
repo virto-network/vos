@@ -63,6 +63,28 @@ pub struct SideNote {
     /// exactly.  Must match the column values CpuChip writes — see
     /// chips/mul.rs's collect path.
     pub mul_entries: Vec<MulEntry>,
+    /// Phase 54e: per-bitwise-row witness pushed by CpuChip's trace_fill
+    /// so BitwiseChip's main trace mirrors CpuChip's val_b/val_d/result
+    /// + and_result + nibble decompositions exactly.
+    pub bitwise_entries: Vec<BitwiseEntry>,
+}
+
+/// Phase 54e — Single bitwise-row witness for the BitwiseLookup balance.
+#[derive(Clone, Debug)]
+pub struct BitwiseEntry {
+    pub val_b: u64,
+    pub val_d: u64,
+    pub result: u64,
+    pub and_result: [u8; 8],
+    pub val_b_hi_nib: [u8; 8],
+    pub val_d_hi_nib: [u8; 8],
+    pub and_result_hi_nib: [u8; 8],
+    pub is_and: bool,
+    pub is_or: bool,
+    pub is_xor: bool,
+    pub is_and_inv: bool,
+    pub is_or_inv: bool,
+    pub is_xnor: bool,
 }
 
 /// Single mul-row witness for the MultiplicationLookup balance.
@@ -126,6 +148,7 @@ impl SideNote {
             jump_table: Vec::new(),
             jump_table_counts: Vec::new(),
             mul_entries: Vec::new(),
+            bitwise_entries: Vec::new(),
         }
     }
 

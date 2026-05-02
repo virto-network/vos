@@ -275,29 +275,36 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             // Phase 54a/b/c/d: MulEntry capture moved below — needs
             // sign_bit_b/sign_bit_d which are computed further down.
 
-            // ── Bitwise auxiliary ──
+            // ── Bitwise auxiliary (Phase 54e: BitwiseChip witnesses
+            //   AndResult/ValBHiNib/ValDHiNib/AndResultHiNib now) ──
             let mut and_result = [0u8; WORD_SIZE];
-            if flags.is_bitwise {
-                for i in 0..WORD_SIZE {
-                    and_result[i] = val_b_bytes[i] & val_d_bytes[i];
-                    bitwise_and_bytes.push((val_b_bytes[i], val_d_bytes[i]));
-                }
-            }
-            trace.fill_columns_bytes(row, &and_result, Column::AndResult);
-            // High nibbles for nibble-level AND lookup
             let mut val_b_hi_nib = [0u8; WORD_SIZE];
             let mut val_d_hi_nib = [0u8; WORD_SIZE];
             let mut and_result_hi_nib = [0u8; WORD_SIZE];
             if flags.is_bitwise {
                 for i in 0..WORD_SIZE {
+                    and_result[i] = val_b_bytes[i] & val_d_bytes[i];
+                    bitwise_and_bytes.push((val_b_bytes[i], val_d_bytes[i]));
                     val_b_hi_nib[i] = val_b_bytes[i] >> 4;
                     val_d_hi_nib[i] = val_d_bytes[i] >> 4;
                     and_result_hi_nib[i] = and_result[i] >> 4;
                 }
+                side_note.bitwise_entries.push(crate::side_note::BitwiseEntry {
+                    val_b,
+                    val_d,
+                    result,
+                    and_result,
+                    val_b_hi_nib,
+                    val_d_hi_nib,
+                    and_result_hi_nib,
+                    is_and: flags.is_and,
+                    is_or: flags.is_or,
+                    is_xor: flags.is_xor,
+                    is_and_inv: flags.is_and_inv,
+                    is_or_inv: flags.is_or_inv,
+                    is_xnor: flags.is_xnor,
+                });
             }
-            trace.fill_columns_bytes(row, &val_b_hi_nib, Column::ValBHiNib);
-            trace.fill_columns_bytes(row, &val_d_hi_nib, Column::ValDHiNib);
-            trace.fill_columns_bytes(row, &and_result_hi_nib, Column::AndResultHiNib);
 
             // ── Compare auxiliary (populated for is_compare OR is_branch) ──
             let mut cmp_carry = [0u8; WORD_SIZE];

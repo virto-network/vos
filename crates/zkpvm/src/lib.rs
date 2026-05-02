@@ -132,6 +132,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::PopcountChip, // Phase 33 — per-byte popcount lookup table
     &chips::BitcountChip, // Phase 34 — per-byte (lz, tz) lookup table
     &chips::MulChip,      // Phase 54a — consumer of MultiplicationLookup
+    &chips::BitwiseChip,  // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -151,6 +152,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::PopcountChip,
     &chips::BitcountChip,
     &chips::MulChip,
+    &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
 ];
 
 pub use proof::{

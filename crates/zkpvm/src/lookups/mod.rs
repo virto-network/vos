@@ -15,7 +15,8 @@ pub use self::{
     range_check::Range256LookupElements,
     relations::{
         BitcountLookupElements,
-        BitwiseAndLookupElements, Blake2bCallLookupElements,
+        BitwiseAndLookupElements, BitwiseLookupElements,
+        Blake2bCallLookupElements,
         Blake2bStateLookupElements, JumpTableLookupElements,
         MemoryAccessLookupElements,
         MultiplicationLookupElements,
@@ -41,6 +42,7 @@ macros::register_relation! {
         Blake2bStateLookupElements,
         Blake2bCallLookupElements,
         MultiplicationLookupElements,
+        BitwiseLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

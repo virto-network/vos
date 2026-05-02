@@ -104,19 +104,12 @@ pub enum Column {
     // + IsMulUpperSS).  Verifier-side reads use the sum expression
     // directly; prover-side prog_mem tuple emission overrides the
     // sum slot in its closure (see cpu/interaction.rs).
-    // ── Bitwise auxiliary: per-byte AND result ──
-    /// and_result[i] = val_b[i] AND val_d[i] (8 bytes)
-    #[size = 8]
-    AndResult,
-    /// High nibble of val_b[i] (val_b[i] >> 4), for nibble-level AND lookup
-    #[size = 8]
-    ValBHiNib,
-    /// High nibble of val_d[i] (val_d[i] >> 4), for nibble-level AND lookup
-    #[size = 8]
-    ValDHiNib,
-    /// High nibble of and_result[i] (and_result[i] >> 4), for nibble-level AND lookup
-    #[size = 8]
-    AndResultHiNib,
+    // Phase 54e: AndResult[8] + ValBHiNib[8] + ValDHiNib[8] +
+    // AndResultHiNib[8] all moved to BitwiseChip.  CpuChip's `result`
+    // on bitwise rows binds to BitwiseChip's `result` via the
+    // BitwiseLookup tuple (30 limbs); BitwiseChip's AIR proves the
+    // per-op result identity (AND/OR/XOR/AndInv/OrInv/Xnor) and
+    // emits the 16 nibble-AND lookups against BitwiseLookupChip.
     // ── Compare auxiliary ──
     /// Subtraction carry for comparison (8 limbs, reuses sub logic)
     #[size = 8]

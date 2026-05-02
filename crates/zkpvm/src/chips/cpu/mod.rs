@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -66,7 +66,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements),
     );
 
 
@@ -83,10 +83,13 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup)) = lookup_elements;
+        // bitwise_and_lookup is no longer emitted by CpuChip (Phase 54e
+        // moved nibble emissions to BitwiseChip).
+        let _ = bitwise_and_lookup;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
@@ -123,7 +126,7 @@ impl BuiltInComponent for CpuChip {
         let carry = crate::trace::trace_eval!(trace_eval, Column::Carry);
         // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
         // Phase 54d: MulHigh moved to MulChip.
-        let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
+        // Phase 54e: AndResult moved to BitwiseChip.
         let cmp_carry = crate::trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
         let cmp_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
@@ -330,99 +333,12 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
 
         // ════════════════════════════════════════════════════════════════════
-        // BITWISE: constrain via AND result + algebraic identity
-        // AND(a,b) is provided as auxiliary. Then:
-        //   OR(a,b)  = a + b - AND(a,b)
-        //   XOR(a,b) = a + b - 2*AND(a,b)
-        //   AndInv(a,b) = a - AND(a,b)        (a & !b = a & ~b = a - (a&b))
-        //   OrInv(a,b)  = a + (255-b) - AND(a, 255-b)  ... complex, use direct
-        //   Xnor(a,b) = 255 - (a + b - 2*AND(a,b))     = 255 - XOR(a,b)
-        //
-        // For AND (op=0): result[i] = and_result[i]
-        // For OR  (op=1): result[i] = val_b[i] + val_d[i] - and_result[i]
-        // For XOR (op=2): result[i] = val_b[i] + val_d[i] - 2*and_result[i]
-        // For AndInv (op=3): and_result[i] = val_b[i] & val_d[i], result[i] = val_b[i] - and_result[i]
-        //   But wait: AndInv(a,b) = a & !b. and_result = a & b. result = a - (a & b). ✓
-        // For OrInv  (op=4): OrInv(a,b) = !a | b = !(a & !b) = 255 - (a - (a&b))
-        //   ... nope. OrInv = !a | b per PVM spec? Let me check.
-        //   Actually in PVM: OrInv = φ[ra] | !φ[rb]. So OrInv(a,b) = a | !b.
-        //   a | !b = a | (255 - b) = a + (255-b) - AND(a, 255-b)
-        //   This is harder since we'd need AND(a, 255-b) not AND(a,b).
-        //   Simpler: a | !b = !((!a) & b) = 255 - (b - AND(a,b))
-        //   Hmm: !a & b = b - AND(a,b). So !((!a)&b) = 255 - (b - AND(a,b)) = 255 - b + AND(a,b).
-        //   So OrInv(a,b) = 255 - b + AND(a,b). ✓
-        // For Xnor (op=5): Xnor(a,b) = !(a^b) = 255 - XOR(a,b) = 255 - a - b + 2*AND(a,b)
-        //
-        // and_result = val_b & val_d is ALWAYS the bitwise AND of the two inputs.
-        // The prover fills it; we constrain:
-        //   1. and_result[i] is in [0,255] (range check)
-        //   2. Algebraic identity for the selected op
-        //   3. AND correctness: and_result[i] = val_b[i] & val_d[i]
-        //      This requires a bitwise lookup table. For now we constrain:
-        //      and_result[i] * (val_b[i] - and_result[i]) ... no, can't express AND algebraically.
-        //      We need: and_result[i] <= val_b[i] AND and_result[i] <= val_d[i] as necessary conditions.
-        //      Full AND soundness requires a 256×256 lookup table (Phase 3).
-        //      For now: we constrain the algebraic relationship between result and and_result,
-        //      and range-check and_result bytes. This prevents arbitrary result values but
-        //      doesn't fully prove AND correctness without the lookup.
+        // Phase 54e: BITWISE result-binding moved to BitwiseChip.
+        // CpuChip's `result` on bitwise rows is bound via the
+        // BitwiseLookup tuple (val_b, val_d, result + 6 sub-flags) to
+        // BitwiseChip's `result`, which is pinned by BitwiseChip's
+        // per-op identity + the 16 nibble-AND lookups.
         // ════════════════════════════════════════════════════════════════════
-        let f2 = E::F::from(BaseField::from(2u32));
-        for i in 0..WORD_SIZE {
-            let a = &val_b[i];
-            let b = &val_d[i];
-            let ar = &and_result[i];
-            let r = &result[i];
-
-            // op=0 (AND):    r = ar
-            let c_and = r.clone() - ar.clone();
-            // op=1 (OR):     r = a + b - ar
-            let c_or = r.clone() - a.clone() - b.clone() + ar.clone();
-            // op=2 (XOR):    r = a + b - 2*ar
-            let c_xor = r.clone() - a.clone() - b.clone() + f2.clone() * ar.clone();
-            // op=3 (AndInv): r = a - ar       (a & !b)
-            let c_andinv = r.clone() - a.clone() + ar.clone();
-            // op=4 (OrInv):  r = 255 - b + ar (a | !b)
-            let c_orinv = r.clone() - f255.clone() + b.clone() - ar.clone();
-            // op=5 (Xnor):   r = 255 - a - b + 2*ar
-            let c_xnor = r.clone() - f255.clone() + a.clone() + b.clone() - f2.clone() * ar.clone();
-
-            // Degree: 1 + 5 + 1 = 7 ≤ 8. ✓
-            // But 6 constraints × 8 limbs = 48 constraints. That's a lot but fine.
-            //
-            // Actually even simpler: just constrain is_bitwise * (result - expected(op)) = 0
-            // where expected(op) is a single expression that selects the right formula.
-            // We can build this as a degree-5 polynomial in op. Let me just use direct formulas
-            // for each pair. The bitwise ops 0-5 can be expressed as:
-            //   result = α*ar + β*a + γ*b + δ*255
-            // where α,β,γ,δ depend on op. This is linear in the trace columns!
-            // Just need α(op), β(op), γ(op), δ(op) as polynomials in op.
-            //
-            // op | α    | β  | γ  | δ
-            // 0  |  1   | 0  | 0  | 0    (AND)
-            // 1  | -1   | 1  | 1  | 0    (OR)
-            // 2  | -2   | 1  | 1  | 0    (XOR)
-            // 3  | -1   | 1  | 0  | 0    (AndInv)
-            // 4  |  1   | 0  | -1 | 1    (OrInv)
-            // 5  |  2   | -1 | -1 | 1    (Xnor)
-            //
-            // These are simple enough to interpolate. But with 6 points and degree-5 polys,
-            // the constraint becomes degree 6 (5 from poly + 1 from is_bitwise). Still fits.
-            //
-            // For simplicity, let me just use the direct approach with one constraint:
-            // Compute expected = match_and*ar + match_or*(a+b-ar) + ... where match_k = δ(op,k).
-            // Using Kronecker delta via product: match_k = Π_{j≠k}(op-j) / Π_{j≠k}(k-j)
-            // This is degree 5 per match term. Total: is_bitwise * (result - sum_k match_k * val_k) = 0.
-            // Degree = 1 + max(5, 1) = 6 with the product terms. Still fine.
-            //
-            // Let me just hardcode the 6 Lagrange basis values:
-            // Each bitwise op has its own flag column (degree-2 constraints)
-            eval.add_constraint(is_and_flag[0].clone() * c_and);
-            eval.add_constraint(is_or_flag[0].clone() * c_or);
-            eval.add_constraint(is_xor_flag[0].clone() * c_xor);
-            eval.add_constraint(is_and_inv_flag[0].clone() * c_andinv);
-            eval.add_constraint(is_or_inv_flag[0].clone() * c_orinv);
-            eval.add_constraint(is_xnor_flag[0].clone() * c_xnor);
-        }
 
         // ════════════════════════════════════════════════════════════════════
         // COMPARE: SetLtU via subtraction carry analysis
@@ -1751,36 +1667,9 @@ impl BuiltInComponent for CpuChip {
             ));
         }
 
-        // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
-        {
-            let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
-            // Phase 53c: IsBitwise = sum of per-op sub-flags.
-            let is_bitwise_e = || -> E::F {
-                is_and_flag[0].clone() + is_or_flag[0].clone() + is_xor_flag[0].clone()
-                    + is_and_inv_flag[0].clone() + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone()
-            };
-            let val_b_hi_nib = crate::trace::trace_eval!(trace_eval, Column::ValBHiNib);
-            let val_d_hi_nib = crate::trace::trace_eval!(trace_eval, Column::ValDHiNib);
-            let and_result_hi_nib = crate::trace::trace_eval!(trace_eval, Column::AndResultHiNib);
-            let sixteen: E::F = E::F::from(BaseField::from(16));
-            for i in 0..WORD_SIZE {
-                // High nibble lookup
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_and_lookup,
-                    is_bitwise_e().into(),
-                    &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
-                ));
-                // Low nibble lookup: lo = byte - hi * 16
-                let b_lo = val_b[i].clone() - val_b_hi_nib[i].clone() * sixteen.clone();
-                let d_lo = val_d[i].clone() - val_d_hi_nib[i].clone() * sixteen.clone();
-                let and_lo = and_result[i].clone() - and_result_hi_nib[i].clone() * sixteen.clone();
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_and_lookup,
-                    is_bitwise_e().into(),
-                    &[b_lo, d_lo, and_lo],
-                ));
-            }
-        }
+        // Phase 54e: BitwiseAndLookup nibble emissions moved to
+        // BitwiseChip.  CpuChip emits the BitwiseLookup producer
+        // (paired) just before finalize_logup_in_pairs.
 
         // Power-of-two lookup: proves val_d = 2^shift_amount for constrained shifts.
         //
@@ -3025,6 +2914,41 @@ impl BuiltInComponent for CpuChip {
                     mul_lookup,
                     f_is_mul_p54[0].clone().into(),
                     &tuple_p54,
+                ));
+            }
+        }
+
+        // ── Phase 54e: BitwiseLookup producer ──
+        // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
+        // Multiplicity = is_bitwise_e (sum of 6 sub-flags).  Two paired
+        // emissions for finalize_logup_in_pairs.
+        {
+            let val_b_p54e = crate::trace::trace_eval!(trace_eval, Column::ValB);
+            let val_d_p54e = crate::trace::trace_eval!(trace_eval, Column::ValD);
+            let result_p54e = crate::trace::trace_eval!(trace_eval, Column::Result);
+            let f_and = crate::trace::trace_eval!(trace_eval, Column::IsAnd);
+            let f_or = crate::trace::trace_eval!(trace_eval, Column::IsOr);
+            let f_xor = crate::trace::trace_eval!(trace_eval, Column::IsXor);
+            let f_andinv = crate::trace::trace_eval!(trace_eval, Column::IsAndInv);
+            let f_orinv = crate::trace::trace_eval!(trace_eval, Column::IsOrInv);
+            let f_xnor = crate::trace::trace_eval!(trace_eval, Column::IsXnor);
+            let is_bitwise_p54e = f_and[0].clone() + f_or[0].clone() + f_xor[0].clone()
+                + f_andinv[0].clone() + f_orinv[0].clone() + f_xnor[0].clone();
+            let mut tuple_p54e: Vec<E::F> = Vec::with_capacity(30);
+            tuple_p54e.extend_from_slice(&val_b_p54e);
+            tuple_p54e.extend_from_slice(&val_d_p54e);
+            tuple_p54e.extend_from_slice(&result_p54e);
+            tuple_p54e.push(f_and[0].clone());
+            tuple_p54e.push(f_or[0].clone());
+            tuple_p54e.push(f_xor[0].clone());
+            tuple_p54e.push(f_andinv[0].clone());
+            tuple_p54e.push(f_orinv[0].clone());
+            tuple_p54e.push(f_xnor[0].clone());
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    bitwise_lookup,
+                    is_bitwise_p54e.clone().into(),
+                    &tuple_p54e,
                 ));
             }
         }

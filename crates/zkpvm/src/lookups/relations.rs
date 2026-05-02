@@ -110,6 +110,20 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_STATE_LOOKUP_SIZE
 );
 
+// Phase 54e — Bitwise lookup.  CpuChip emits one producer per
+// `is_bitwise` row (sum of 6 sub-flags); BitwiseChip consumes once
+// per real (non-padding) row.  Tuple binds val_b/val_d/result + 6
+// sub-flags so BitwiseChip's AIR can prove the per-op result-binding
+// identities (AND/OR/XOR/AndInv/OrInv/Xnor) over its narrower trace.
+//
+// Tuple: (val_b[8], val_d[8], result[8], is_and, is_or, is_xor,
+//   is_and_inv, is_or_inv, is_xnor) — 30 limbs.
+const REL_BITWISE_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 6;
+stwo_constraint_framework::relation!(
+    BitwiseLookupElements,
+    REL_BITWISE_LOOKUP_SIZE
+);
+
 // Phase 54a/b/c/d — Multiplication lookup.  CpuChip emits one producer
 // per `is_mul + is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss`
 // row; MulChip consumes once per real (non-padding) row.  Tuple binds

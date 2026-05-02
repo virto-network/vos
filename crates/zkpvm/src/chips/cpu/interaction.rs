@@ -25,6 +25,7 @@ use stwo::{
 use crate::core::step::WORD_SIZE;
 use crate::lookups::{
     AllLookupElements, BitcountLookupElements, BitwiseAndLookupElements,
+    BitwiseLookupElements,
     Blake2bCallLookupElements, JumpTableLookupElements, LogupTraceBuilder,
     MemoryAccessLookupElements, MultiplicationLookupElements,
     PopcountLookupElements, PowerOfTwoLookupElements,
@@ -182,59 +183,13 @@ pub(super) fn generate_interaction_trace(
             );
         }
 
-        // Bitwise AND lookup: nibble-level (16 lookups per bitwise op)
-        // For each byte i: lookup (hi_nib_b, hi_nib_d, hi_nib_and) and (lo_nib_b, lo_nib_d, lo_nib_and)
+        // Phase 54e: bitwise-op nibble emissions moved to BitwiseChip.
+        // CpuChip still emits Phase 17 sign-bit nibble pinning lookups
+        // (and paired range checks) against BitwiseAndLookup further
+        // below — keep the binding + the sixteen constant so those
+        // sites resolve.
         let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
-        // Phase 53c: IsBitwise = sum of 6 sub-flags.  Pass them as
-        // 6-column multiplicity to add_to_relation_with's array.
-        let is_and_c = crate::trace::original_base_column!(component_trace, Column::IsAnd);
-        let is_or_c = crate::trace::original_base_column!(component_trace, Column::IsOr);
-        let is_xor_c = crate::trace::original_base_column!(component_trace, Column::IsXor);
-        let is_andinv_c = crate::trace::original_base_column!(component_trace, Column::IsAndInv);
-        let is_orinv_c = crate::trace::original_base_column!(component_trace, Column::IsOrInv);
-        let is_xnor_c = crate::trace::original_base_column!(component_trace, Column::IsXnor);
-        let val_b_cols = crate::trace::original_base_column!(component_trace, Column::ValB);
-        let val_d_cols = crate::trace::original_base_column!(component_trace, Column::ValD);
-        let and_result_cols = crate::trace::original_base_column!(component_trace, Column::AndResult);
-        let val_b_hi_nib = crate::trace::original_base_column!(component_trace, Column::ValBHiNib);
-        let val_d_hi_nib = crate::trace::original_base_column!(component_trace, Column::ValDHiNib);
-        let and_result_hi_nib = crate::trace::original_base_column!(component_trace, Column::AndResultHiNib);
         let sixteen = PackedBaseField::broadcast(BaseField::from(16));
-        for i in 0..WORD_SIZE {
-            // High nibble lookup: (val_b_hi[i], val_d_hi[i], and_result_hi[i])
-            logup.add_to_relation_with(
-                bitwise_and,
-                [
-                    is_and_c[0].clone(), is_or_c[0].clone(), is_xor_c[0].clone(),
-                    is_andinv_c[0].clone(), is_orinv_c[0].clone(), is_xnor_c[0].clone(),
-                ],
-                |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
-                &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
-            );
-            // Low nibble lookup: (val_b_lo[i], val_d_lo[i], and_result_lo[i])
-            // lo = byte - hi * 16
-            let val_b_col_i = val_b_cols[i].clone();
-            let val_d_col_i = val_d_cols[i].clone();
-            let and_result_col_i = and_result_cols[i].clone();
-            let val_b_hi_i = val_b_hi_nib[i].clone();
-            let val_d_hi_i = val_d_hi_nib[i].clone();
-            let and_hi_i = and_result_hi_nib[i].clone();
-            logup.add_to_relation_computed(
-                bitwise_and,
-                [
-                    is_and_c[0].clone(), is_or_c[0].clone(), is_xor_c[0].clone(),
-                    is_andinv_c[0].clone(), is_orinv_c[0].clone(), is_xnor_c[0].clone(),
-                ],
-                |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
-                3,
-                |vec_idx| {
-                    let b_lo = val_b_col_i.at(vec_idx) - val_b_hi_i.at(vec_idx) * sixteen;
-                    let d_lo = val_d_col_i.at(vec_idx) - val_d_hi_i.at(vec_idx) * sixteen;
-                    let and_lo = and_result_col_i.at(vec_idx) - and_hi_i.at(vec_idx) * sixteen;
-                    vec![b_lo, d_lo, and_lo]
-                },
-            );
-        }
 
         // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained.
         // Phase 35 / 36 split: classic emission keyed on ShiftAmount with
@@ -1014,6 +969,41 @@ pub(super) fn generate_interaction_trace(
                             t
                         }
                     },
+                );
+            }
+        }
+
+        // ── Phase 54e: BitwiseLookup producer (prover-side mirror) ──
+        // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
+        {
+            let bitwise_p54e: &BitwiseLookupElements = lookup_elements.as_ref();
+            let val_b_p54e = crate::trace::original_base_column!(component_trace, Column::ValB);
+            let val_d_p54e = crate::trace::original_base_column!(component_trace, Column::ValD);
+            let result_p54e = crate::trace::original_base_column!(component_trace, Column::Result);
+            let f_and = crate::trace::original_base_column!(component_trace, Column::IsAnd);
+            let f_or = crate::trace::original_base_column!(component_trace, Column::IsOr);
+            let f_xor = crate::trace::original_base_column!(component_trace, Column::IsXor);
+            let f_andinv = crate::trace::original_base_column!(component_trace, Column::IsAndInv);
+            let f_orinv = crate::trace::original_base_column!(component_trace, Column::IsOrInv);
+            let f_xnor = crate::trace::original_base_column!(component_trace, Column::IsXnor);
+            let mut tuple_p54e: Vec<_> = val_b_p54e.to_vec();
+            tuple_p54e.extend_from_slice(&val_d_p54e);
+            tuple_p54e.extend_from_slice(&result_p54e);
+            tuple_p54e.push(f_and[0].clone());
+            tuple_p54e.push(f_or[0].clone());
+            tuple_p54e.push(f_xor[0].clone());
+            tuple_p54e.push(f_andinv[0].clone());
+            tuple_p54e.push(f_orinv[0].clone());
+            tuple_p54e.push(f_xnor[0].clone());
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    bitwise_p54e,
+                    [
+                        f_and[0].clone(), f_or[0].clone(), f_xor[0].clone(),
+                        f_andinv[0].clone(), f_orinv[0].clone(), f_xnor[0].clone(),
+                    ],
+                    |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
+                    &tuple_p54e,
                 );
             }
         }
