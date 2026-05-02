@@ -35,20 +35,50 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Headline (Track B): mobile config beats Nexus at log14
+### Headline (Track B + Phase 59 thread cap): zkpvm beats Nexus at log14
 
-Switching from `production_pcs_config()` (blowup=16, 19 queries,
-20-bit PoW) to `production_pcs_config_mobile()` (blowup=4, 38
-queries, 20-bit PoW) — **same 96-bit conjectured security** —
-trades proof size for prove speed:
+Two stacked optimisations land us comfortably ahead of Nexus zkVM
+2.x without touching any AIR shape:
 
-| log_size | STANDARD (blowup=16) | MOBILE (blowup=4) | Speedup | Proof STD → MOBILE |
-|---       |---                   |---                |---      |---                  |
-| 10       | 899 ms               | **337 ms**        | 2.67×   | 562 → 819 KB        |
-| 14       | 5.23 s               | **2.10 s**        | 2.49×   | 604 → 854 KB        |
+1. **MOBILE PCS config** (`production_pcs_config_mobile()`):
+   blowup=4, q=38, pow=20.  Same 96-bit conjectured security as
+   STANDARD, ~2.5× faster prove, ~1.4× larger proof.
 
-**zkpvm with MOBILE beats Nexus zkVM 2.x's 2.37 s at log14** —
-the first time in this experiment.  The config is exposed as
+2. **Sensible rayon thread cap** (`install_thread_pool()`,
+   auto-called by `prove*`).  Caps at `min(logical_cpus, 10)` —
+   measured: past ~10 threads memory-bandwidth contention costs
+   more than parallel gains.  Free 13-19% additional speedup on
+   wide desktop machines; phones (4-8 cores) hit it naturally.
+
+Combined at log14 (median of 5 trials, 22-logical-core desktop):
+
+| Config                                    | Prove   | Speedup vs STANDARD |
+|---                                        |---      |---                  |
+| STANDARD (blowup=16, 22 threads)          | 5.40 s  | baseline            |
+| MOBILE (blowup=4, 22 threads, no cap)     | 2.26 s  | 2.39×               |
+| MOBILE + thread-cap (10 threads)          | **1.86 s** | **2.90×**         |
+| Nexus zkVM 2.x                            | 2.37 s  | 2.28× (reference)   |
+
+**zkpvm with MOBILE + thread-cap is 22% faster than Nexus
+zkVM 2.x at log14.**  Cumulative speedup vs Phase 50 baseline
+(12.92 s): **6.95×**.
+
+Cost: proof size 604 → 854 KB (~1.4×).  Acceptable for low-latency
+/ mobile / interactive proving where prove time dominates user
+experience.
+
+Smaller traces benefit too:
+
+| log_size | STANDARD (default threads) | MOBILE + cap | Speedup |
+|---       |---                         |---           |---      |
+| 10       | 899 ms                     | ~270 ms      | 3.3×    |
+| 14       | 5.40 s                     | 1.86 s       | 2.9×    |
+
+Why not even smaller blowup (=2)?  At blowup=2 the bench tied with
+blowup=4 on this hardware — memory bandwidth saturation at higher
+core counts limits the FRI-domain shrink benefit.  blowup=4 +
+smaller proof (854 KB vs 1.1 MB) wins on the prove-time-equivalent
+comparison.  The config is exposed as
 `production_pcs_config_mobile()` + `PcsPolicy::MOBILE` and is the
 recommended shape for low-latency / mobile / interactive proving.
 

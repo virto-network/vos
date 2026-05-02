@@ -129,6 +129,37 @@ fn profile_log10() { profile_at_log_size(10); }
 #[test]
 fn profile_log14() { profile_at_log_size(14); }
 
+#[test]
+fn debug_thread_pool() {
+    let n = zkpvm::install_thread_pool();
+    eprintln!("install_thread_pool() returned {n} (rayon::current_num_threads = {})", rayon::current_num_threads());
+}
+
+#[test]
+fn profile_log14_mobile() {
+    let n_steps = 1usize << 14;
+    let (code, bitmask) = generate_add_program(n_steps);
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    let gas = (n_steps as u64 + 100) * 100;
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 64 * 1024], gas, 16,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let mobile = zkpvm::production_pcs_config_mobile();
+    eprintln!("=== LogSize=14 MOBILE config (blowup=4, q=38, pow=20) ===");
+    let (proof, _) = zkpvm::prove_profiled_with_config(&mut side_note, mobile)
+        .expect("proving failed");
+    let proof_bytes = bincode::serialize(&proof).unwrap();
+    eprintln!("Proof size: {} KB", proof_bytes.len() / 1024);
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
+        .expect("verification failed");
+}
+
 /// Sweep log_sizes with test-config (8-bit security) to find the scale breaking point.
 #[test]
 fn scale_sweep() {
@@ -311,6 +342,24 @@ fn pcs_config_sweep_log14() {
     // (PoW-grind dominates at high pow_bits).  Documented for the
     // record; not a useful config.
     // Stwo limit: pow_bits <= 32; pow=48 is rejected upstream.
+}
+
+#[test]
+fn pcs_config_sweep_log14_security_levels() {
+    let log = 14;
+    eprintln!("=== Security level sweep at LogSize={log} (blowup=4) ===");
+    eprintln!("(blowup=4 is the MOBILE-class shape; varying queries × pow trades security for prove time)");
+    eprintln!();
+    bench_pcs_config(log, "MOBILE-96bit:  pow=20, q=38",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+    bench_pcs_config(log, "MOBILE-80bit:  pow=20, q=30",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 30) });
+    bench_pcs_config(log, "MOBILE-64bit:  pow=20, q=22",
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 22) });
+    eprintln!();
+    eprintln!("(blowup=4 with raised pow_bits — cheaper FRI but PoW grind cost)");
+    bench_pcs_config(log, "pow=24, q=36 (96 bits)",
+        PcsConfig { pow_bits: 24, fri_config: FriConfig::new(0, 2, 36) });
 }
 
 #[test]

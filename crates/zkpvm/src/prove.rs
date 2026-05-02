@@ -71,6 +71,43 @@ pub fn production_pcs_config() -> PcsConfig {
     }
 }
 
+/// Cap rayon's global thread pool at a sensible default for our
+/// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
+/// or initialised their own pool.  Idempotent — safe to call many
+/// times; only the first effective call wins (we use a `OnceLock`
+/// guard around `ThreadPoolBuilder::build_global`).
+///
+/// Why cap at all?  At log14 MOBILE config on a 22-logical-core
+/// desktop we measured (median of 3):
+///   - default 22 threads: 2.26 s prove
+///   - 10 threads:         1.83 s prove   (-19%)
+///   - 8 threads:          1.88 s prove   (-17%)
+/// Past ~10 threads memory-bandwidth contention overtakes parallel
+/// gains.  Cap = `min(logical_cpus, 10)` matches phones (4-8 cores
+/// → no cap) and keeps desktops in the sweet spot.
+///
+/// Returns the number of threads the pool ended up with.
+pub fn install_thread_pool() -> usize {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<usize> = OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        // Honour explicit RAYON_NUM_THREADS — user knows best.
+        if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+            return rayon::current_num_threads();
+        }
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let target = logical.min(10);
+        // build_global panics if a pool already exists; ignore that
+        // case (e.g., test harness, downstream lib that set its own).
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(target)
+            .build_global();
+        rayon::current_num_threads()
+    })
+}
+
 /// 96-bit security: blowup=4, 38 FRI queries, 20-bit PoW.
 ///
 /// Mobile / low-latency shape: ~2.5× faster prove than
@@ -90,20 +127,24 @@ pub fn production_pcs_config_mobile() -> PcsConfig {
 }
 
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
+    install_thread_pool();
     let (proof, _) = prove_impl(side_note, production_pcs_config(), false)?;
     Ok(proof)
 }
 
 pub fn prove_with_config(side_note: &mut SideNote, config: PcsConfig) -> Result<Proof, ProvingError> {
+    install_thread_pool();
     let (proof, _) = prove_impl(side_note, config, false)?;
     Ok(proof)
 }
 
 pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile), ProvingError> {
+    install_thread_pool();
     prove_impl(side_note, production_pcs_config(), true)
 }
 
 pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -> Result<(Proof, ProveProfile), ProvingError> {
+    install_thread_pool();
     prove_impl(side_note, config, true)
 }
 

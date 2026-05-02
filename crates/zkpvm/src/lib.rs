@@ -168,6 +168,7 @@ pub use proof::{
 pub use prove::{
     prove, prove_with_config, prove_profiled, prove_profiled_with_config,
     ProveProfile, production_pcs_config, production_pcs_config_mobile,
+    install_thread_pool,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::debug_claimed_sums;
