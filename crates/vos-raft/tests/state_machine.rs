@@ -1046,19 +1046,20 @@ fn pre_candidate_reverts_to_follower_after_consecutive_misses() {
     let isolated = *members.iter().find(|p| **p != leader_id).unwrap();
     transport.isolate(isolated, &members);
 
-    // Wait long enough for ~3 election timeouts (30-80ms each)
-    // to let the miss counter cross the 2-miss cap and the
-    // revert to fire. Use 500ms for safety margin.
-    std::thread::sleep(Duration::from_millis(500));
-
-    let snap = block_on(workers[&isolated].handler().snapshot())
-        .expect("isolated alive");
-    assert_eq!(
-        snap.role,
-        Role::Follower,
-        "isolated node should revert to Follower after consecutive PreCandidate misses, \
-         got role={:?}",
-        snap.role,
+    // Wait for the isolated node's role to be observed as
+    // Follower at some point. The worker oscillates between
+    // PreCandidate (during a round) and Follower (briefly,
+    // after the cap-revert before the next election timer
+    // fires), so a snapshot-at-a-fixed-time would be racy.
+    // wait_until samples until it sees Follower.
+    wait_until(
+        || {
+            block_on(workers[&isolated].handler().snapshot())
+                .map(|s| s.role == Role::Follower)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(2),
+        "isolated node reverts to Follower after PreCandidate misses",
     );
 }
 

@@ -913,6 +913,13 @@ where
     /// and to avoid re-finalizing on a stale historical joint
     /// entry that happens to target the same member set.
     pending_joint_entry: Option<u64>,
+    /// Index of the log entry that produced `effective_cfg`.
+    /// `None` when `effective_cfg` comes from the static
+    /// `Config::members` fallback. Lets log-mutation paths
+    /// skip re-scanning the entire live log on every truncate
+    /// — only a truncate that drops below this index actually
+    /// invalidates the cached active config.
+    active_config_index: Option<u64>,
     /// Index of the leader's first current-term log entry —
     /// the no-op appended on promotion (Ongaro §6.4). `None`
     /// for non-leaders, and reset to the new no-op on each
@@ -1026,6 +1033,22 @@ where
     }
 }
 
+/// Result of scanning the live log for the most recent
+/// `ConfigChange`. `active_config_index` is the index of the
+/// scanned `ConfigChange` entry (None when the fallback to
+/// `cfg.members` is in effect), used by callers to decide
+/// whether a future log mutation requires a fresh scan.
+struct ConfigRecovery<N: NodeId> {
+    active: ActiveConfig<N>,
+    /// Index of the joint `ConfigChange` entry, when joint
+    /// finalization is pending.
+    pending_joint: Option<u64>,
+    /// Index of the entry that produced `active`. None when
+    /// `active` came from the static `cfg.members` fallback
+    /// (no `ConfigChange` exists in the live log).
+    active_config_index: Option<u64>,
+}
+
 /// Walk the live log tail looking for the most recent
 /// `EntryKind::ConfigChange`; return its membership view as the
 /// recovered effective configuration AND, when the recovered
@@ -1035,7 +1058,7 @@ where
 async fn recover_active_config<N, S>(
     storage: &S,
     cfg: &Config<N>,
-) -> Result<(ActiveConfig<N>, Option<u64>), S::Error>
+) -> Result<ConfigRecovery<N>, S::Error>
 where
     N: NodeId,
     S: Storage<N>,
@@ -1043,7 +1066,11 @@ where
     let last = storage.last_index();
     let snap = storage.snap_last_index();
     if last <= snap {
-        return Ok((ActiveConfig::steady(cfg.members.clone()), None));
+        return Ok(ConfigRecovery {
+            active: ActiveConfig::steady(cfg.members.clone()),
+            pending_joint: None,
+            active_config_index: None,
+        });
     }
     let entries = storage.entries(snap + 1, last).await?;
     // Walk in reverse — first hit wins.
@@ -1053,11 +1080,19 @@ where
                 current: members.clone(),
                 joint_old: joint_old.clone(),
             };
-            let pending = if active.is_joint() { Some(e.index) } else { None };
-            return Ok((active, pending));
+            let pending_joint = if active.is_joint() { Some(e.index) } else { None };
+            return Ok(ConfigRecovery {
+                active,
+                pending_joint,
+                active_config_index: Some(e.index),
+            });
         }
     }
-    Ok((ActiveConfig::steady(cfg.members.clone()), None))
+    Ok(ConfigRecovery {
+        active: ActiveConfig::steady(cfg.members.clone()),
+        pending_joint: None,
+        active_config_index: None,
+    })
 }
 
 // ── Public driver ───────────────────────────────────────────
@@ -1101,8 +1136,7 @@ where
     // active config into their snapshot bytes and re-prime via
     // a follow-up call (not yet exposed). For v0.1 the storage
     // window is large enough that this is rare in practice.
-    let (effective_cfg, pending_joint_entry) =
-        recover_active_config(&storage, &cfg).await?;
+    let recovery = recover_active_config(&storage, &cfg).await?;
     let mut state = WorkerState {
         storage,
         transport,
@@ -1114,8 +1148,9 @@ where
         votes_received: BTreeSet::new(),
         pending_read_index: Vec::new(),
         incoming_snapshot: None,
-        effective_cfg,
-        pending_joint_entry,
+        effective_cfg: recovery.active,
+        pending_joint_entry: recovery.pending_joint,
+        active_config_index: recovery.active_config_index,
         current_term_first_index: None,
         pre_candidate_misses: 0,
         leader: None,
@@ -1449,7 +1484,6 @@ where
         }
     }
 
-    let did_truncate = truncate_after.is_some();
     let appended_a_config = appends
         .iter()
         .any(|e| matches!(e.kind, crate::log_entry::EntryKind::ConfigChange { .. }));
@@ -1473,17 +1507,59 @@ where
     // appended (adopt it) or entries were truncated (the most
     // recent `ConfigChange` may have been dropped — fall back to
     // whatever is now-live in the log).
-    if appended_a_config || did_truncate {
-        // Re-derive both the active config and the pending
-        // joint-entry index from the live log tail. A truncate
-        // that drops the previously-known joint entry must
-        // also clear `pending_joint_entry` so a future
-        // promotion-to-leader doesn't try to finalize against
-        // a stale index.
-        let (cfg_view, pending_joint) =
-            recover_active_config(&state.storage, &state.cfg).await?;
-        state.effective_cfg = cfg_view;
-        state.pending_joint_entry = pending_joint;
+    // Refresh `effective_cfg` only when the log mutation could
+    // have changed it. Two cases that warrant work:
+    //
+    // 1. The leader appended a new ConfigChange entry. We can
+    //    adopt that one directly without re-reading storage —
+    //    it's already in `req.entries`.
+    //
+    // 2. A truncate dropped the entry that produced our cached
+    //    `active_config_index`. Only then do we need a full
+    //    log-tail scan to find the most recent surviving
+    //    ConfigChange (or fall back to `cfg.members`).
+    //
+    // Truncates that don't reach back to our cached config
+    // entry are a no-op for the active config — skipping the
+    // scan keeps a chatty leader from re-reading the entire
+    // live log on every append batch.
+    let truncate_invalidated_cfg = match (truncate_after, state.active_config_index) {
+        (Some(ta), Some(idx)) => ta < idx,
+        // No cached index → fallback config is `cfg.members`,
+        // which a truncate can never invalidate.
+        (Some(_), None) => false,
+        (None, _) => false,
+    };
+    let mut new_active_idx = state.active_config_index;
+    if appended_a_config {
+        // Walk req.entries in reverse to find the latest
+        // ConfigChange and adopt it. The entries' final indices
+        // are `prev_log_index + 1 + i`.
+        for (i, e) in req.entries.iter().enumerate().rev() {
+            if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
+                let entry_index = req.prev_log_index + 1 + i as u64;
+                state.effective_cfg = ActiveConfig {
+                    current: members.clone(),
+                    joint_old: joint_old.clone(),
+                };
+                state.pending_joint_entry = if state.effective_cfg.is_joint() {
+                    Some(entry_index)
+                } else {
+                    None
+                };
+                new_active_idx = Some(entry_index);
+                break;
+            }
+        }
+        state.active_config_index = new_active_idx;
+        rebuild_leader_tracking(state);
+    } else if truncate_invalidated_cfg {
+        // Cached config entry was truncated away. Scan the live
+        // log tail for the most recent surviving ConfigChange.
+        let recovery = recover_active_config(&state.storage, &state.cfg).await?;
+        state.effective_cfg = recovery.active;
+        state.pending_joint_entry = recovery.pending_joint;
+        state.active_config_index = recovery.active_config_index;
         rebuild_leader_tracking(state);
     }
 
@@ -2086,6 +2162,7 @@ where
     // any historical joint entry that happens to target the same
     // member set.
     state.pending_joint_entry = Some(new_index);
+    state.active_config_index = Some(new_index);
     rebuild_leader_tracking(state);
     let _ = try_advance_commit_index(state).await;
     Ok(new_index)
@@ -2391,6 +2468,9 @@ where
     // Joint phase retired — clear the pending index so a
     // subsequent change_membership starts fresh.
     state.pending_joint_entry = None;
+    // Cache the new active-config-entry index for the H1
+    // log-mutation fast path.
+    state.active_config_index = Some(new_index);
     rebuild_leader_tracking(state);
     // If the membership change removed us from the new
     // configuration, retire (Ongaro thesis §4.3): the leader
