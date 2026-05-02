@@ -418,12 +418,69 @@ review).
   balance fails.  Standard pattern: gate consumer multiplicity
   on `(1 - is_padding)`.
 
-### Phase 55 — ProgramMemoryChip column compaction
+### Phase 55 — ProgramMemoryChip column compaction (LANDED 55a-b)
 
-74 cols x 65K rows = 4.85M cells, 17% of committed total.  Most
-of those cols are flag bits that could share a single packed
-column with bit-decomposition lookups (similar to the existing
-Range256 pattern).  Plausible 50% reduction = 2.4M fewer cells.
+Original goal: pack the 48 individual flag bits in
+`program_memory.rs` PreprocessedColumn into 6 bytes on BOTH the
+prog_mem preprocessed table AND CpuChip's main-trace flag
+witnesses.  Add a 256-row "byte → 8 bits" decomposition lookup
+table.  Lookup tuple shrinks 73 → 31 limbs.
+
+Sub-phases landed:
+- **55a** (`001ff22`): ByteToBitsChip foundation — 256-row
+  preprocessed table providing `(byte, bit0..bit7)` with a
+  Multiplicity main column.  Wired into BASE_COMPONENTS but
+  dormant (no consumers in 55a).  Pattern mirrors BitcountChip /
+  PopcountChip.
+- **55b** (`e4699f6`): Pack 48 prog_mem flags into 6 bytes.
+  ProgramMemoryChip drops 48 individual IsX preprocessed cols,
+  gains 6 FlagByte cols.  CpuChip gains 6 FlagByte main cols
+  (filled from `pack_flags(classify_opcode_for_program_memory(opcode))`).
+  CpuChip emits 6 byte-to-bits lookups per real row binding
+  individual flag columns / sum-of-sub-flags expressions to the
+  matching bit slot in each FlagByteI.  prog_mem consumer
+  switches to the 6-byte tuple (drops 60+ lines + 5 closure
+  overrides).
+
+#### Cell drop and tuple shape
+
+| Item                                | Before (54g)      | After (55b)       |
+|---                                  |---                |---                |
+| prog_mem tuple limbs                | 73                | 31                |
+| ProgramMemoryChip preprocessed cols | 65                | 23                |
+| CpuChip flag-related main cols      | 48 (individual)   | 48 + 6 (packed)   |
+| Components                          | 18                | 19                |
+
+#### Wall-clock impact
+
+Bench at log10/12/14 (median of 3, prove only):
+- Phase 54g baseline: 0.73s / 2.01s / 7.08s
+- Phase 55b:          0.59s / 1.84s / 5.12s
+
+Improvements: ~20% / 8% / 28%.  Cumulative speedup vs Phase 50:
+39% / 32% / **60%** at log_size 10 / 12 / 14.  vs Nexus
+(175 ms / 620 ms / 2.37s) — gap shrinks from ~3× (post-54g) to
+roughly 2.2× at log_size 14.
+
+#### Soundness
+
+- Each FlagByteI on CpuChip is bound to canonical packed byte
+  via the prog_mem lookup balance.
+- The byte-to-bits lookup forces every emitted bit expression
+  to be 0 or 1 AND that the byte equals their weighted sum;
+  256 distinct rows cover all valid decompositions, so
+  FlagByteI = canonical_packed ⇒ each emitted bit_j_expr =
+  canonical_bit_j.
+- Same chain as Phase 13c, just routed through 6 packed bytes
+  + 1 decomposition table instead of 48 individual tuple slots.
+
+#### Tests
+
+Pre-existing 239 functional + 100 negative tests pass.  Three
+prove_vos_actor failures (prove_blake2b_via_ecall,
+prove_blake2b_precompile, debug_blake2s_prefix) and
+security_sweep_log12 are pre-existing PcsPolicy floor failures
+unaffected by Phase 55.
 
 ### Phase 56 — Blake2bChip review
 

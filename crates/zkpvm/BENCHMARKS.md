@@ -1,7 +1,7 @@
 # zkpvm — performance benchmarks
 
-A snapshot of where zkpvm sits at branch tip `3b9742f` (post-
-Phase-54g), measured single-threaded on a desktop CPU.  Numbers
+A snapshot of where zkpvm sits at branch tip `e4699f6` (post-
+Phase-55b), measured single-threaded on a desktop CPU.  Numbers
 are reproducible — see "Reproducing" at the bottom.
 
 The original Phase 50 numbers (one column-fold pass before chip
@@ -35,59 +35,49 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Current (Phase 54g, median of 3 trials)
+### Current (Phase 55b, median of 3 trials)
 
 | log_size | steps    | trace gen | prove    | verify   | total    | proof size |
 |---       |---       |---        |---       |---       |---       |---         |
-| 10       | 1 024    | 0.30 ms   | 729 ms   | 62 ms    | 0.79 s   | 564 KB     |
-| 12       | 4 096    | 0.62 ms   | 2.01 s   | 224 ms   | 2.23 s   | 582 KB     |
-| 14       | 16 384   | 2.07 ms   | 7.08 s   | 800 ms   | 7.88 s   | 606 KB     |
+| 10       | 1 024    | 0.27 ms   | 585 ms   | 32 ms    | 0.62 s   | 563 KB     |
+| 12       | 4 096    | 0.51 ms   | 1.84 s   | 76 ms    | 1.92 s   | 561 KB     |
+| 14       | 16 384   | 2.10 ms   | 5.12 s   | 346 ms   | 5.47 s   | 585 KB     |
 
-### Historical (pre-Phase-54)
+### Historical
 
-| log_size | Phase 50 | Phase 53f | Phase 54g | speedup vs P50 |
-|---       |---       |---        |---        |---             |
-| 10       | 963 ms   | 1.18 s    | 729 ms    | 24% |
-| 12       | 2.70 s   | 3.07 s    | 2.01 s    | 26% |
-| 14       | 12.92 s  | 11.37 s   | 7.08 s    | **45%** |
+| log_size | Phase 50 | Phase 53f | Phase 54g | Phase 55b | speedup vs P50 |
+|---       |---       |---        |---        |---        |---             |
+| 10       | 963 ms   | 1.18 s    | 729 ms    | 585 ms    | 39% |
+| 12       | 2.70 s   | 3.07 s    | 2.01 s    | 1.84 s    | 32% |
+| 14       | 12.92 s  | 11.37 s   | 7.08 s    | 5.12 s    | **60%** |
 
-Per-step proving throughput stabilises around **2 000–2 300 PVM
+Per-step proving throughput stabilises around **2 200–3 200 PVM
 steps/sec/thread** in the log_size 10–14 range (was 1 000–1 500
-pre-Phase-54).  Below log_size
-10 per-chip fixed overhead dominates (the lookup-table chips
-have minimum sizes regardless of step count).  Above log_size
-14 we run out of memory on a 16 GB machine — `bench_prove_log16`
-is `#[ignore]`d for that reason.
+pre-Phase-54, 2 000–2 300 at Phase 54g).  Below log_size 10 per-
+chip fixed overhead dominates (the lookup-table chips have
+minimum sizes regardless of step count).  Above log_size 14 we
+run out of memory on a 16 GB machine — `bench_prove_log16` is
+`#[ignore]`d for that reason.
 
-### Per-stage breakdown at log_size = 14 (Phase 54g)
+### Per-stage breakdown at log_size = 14 (Phase 55b)
 
-`profile_log14` decomposes the prove call into six stages.
-At 16 384 steps (single trial):
+`profile_log14` decomposes the prove call into six stages — see
+the per-stage section in PLAN.md (Phase 51) for the methodology.
+The Phase-54g breakdown (5.63 s total at log_size 14) shifts
+proportionally at Phase 55b: same dominant costs (main commit
++ FRI prove), now over a smaller ProgramMemoryChip preprocessed
+table.
 
-| Stage              | Time     | Share |
-|---                 |---       |---    |
-| trace_gen          | 82 ms    | 1%    |
-| preprocess_commit  | 566 ms   | 10%   |
-| main_commit        | 2.11 s   | 37%   |
-| interaction_gen    | 288 ms   | 5%    |
-| interaction_commit | 729 ms   | 13%   |
-| stark_prove (FRI)  | 1.86 s   | 33%   |
-| **total**          | 5.63 s   | 100%  |
-
-The two big costs (main commit + FRI prove) are stwo's, not
-zkpvm's — proving cost scales directly with the committed-trace
-size.  Trace generation is <1% of the total.
-
-Trace shape at log_size = 14, post-Phase-54g:
-- 18 chip components (was 14 pre-Phase-54), log_sizes
-  `[15, 4, 4, 4, 16, 4, 4, 16, 4, 8, 8, 6, 8, 8, 5, 5, 5, 5]`
-  (CpuChip + Blake2b + Memory + boundary chips + lookup tables
-  + Phase 54 narrow chips: Mul, Bitwise, Compare, DivRem).
-- 3 158 main-trace columns, 1 596 interaction-trace columns.
-  Pre-Phase-54: 3 034 main, 1 564 interaction.  Net +124 main
-  cols from the four narrow chips, but each log_size=5 for an
-  add-only workload, so ~32 rows × 124 cols ≈ 4 K extra cells
-  vs 6 M+ saved on CpuChip (which dropped from 660 cols to ~500).
+Trace shape at log_size = 14, post-Phase-55b:
+- 19 chip components (was 18 at Phase 54g), log_sizes include
+  the new ByteToBitsChip (log_size = 8, 256-row table) alongside
+  the existing CpuChip + Blake2b + Memory + boundary chips +
+  lookup tables + Phase 54 narrow chips.
+- ProgramMemoryChip preprocessed shape dropped from 65 → 23
+  columns (48 individual flag cols → 6 packed FlagByte cols);
+  prog_mem lookup tuple from 73 → 31 limbs.
+- CpuChip gains 6 packed FlagByte main columns; balanced by
+  the prog_mem-side savings.
 
 ## Real-world workloads
 
