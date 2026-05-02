@@ -107,4 +107,4 @@ pub use storage::{MemStorage, Storage, WriteBatch};
 pub use transport::Transport;
 
 #[cfg(feature = "std")]
-pub use worker::{ProposeError, RaftMsg, Worker, WorkerHandle, WorkerSnapshot};
+pub use worker::{ProposeError, RaftMsg, ReadIndexError, Worker, WorkerHandle, WorkerSnapshot};

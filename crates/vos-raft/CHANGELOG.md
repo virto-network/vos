@@ -7,6 +7,22 @@ surface is intentionally small but reserves room to grow via
 ## [Unreleased]
 
 ### Added
+- **Linearizable reads via `read_index`** (Ongaro thesis §6.4) —
+  new `WorkerHandle::read_index() -> Result<u64, ReadIndexError>`
+  returns the leader's `commit_index` only after a fresh
+  heartbeat round confirms quorum-leadership at the current
+  term. Callers wait for their apply progress to reach the
+  returned index, then read state-machine state without going
+  through the log. `ReadIndexError` distinguishes `NotLeader`
+  (address the leader instead) from `LeaderStepped` (we were
+  leader at request time but stepped down before a quorum could
+  confirm — retry against the new leader). Solo-cluster
+  shortcut resolves immediately. Caveat: the v0.1 impl skips the
+  Ongaro "no-op-append-on-leader-promotion" guard, so a freshly
+  elected leader that hasn't yet committed any entry in its
+  current term may serve a read from a stale prior-term state
+  — close that window by waiting for any propose to succeed
+  before issuing `read_index`.
 - **Pre-vote** (Ongaro thesis §9.6) — prevents term inflation
   from a flapping partition. New `Role::PreCandidate`, new
   `PreVoteReq`/`PreVoteResp` RPC types, new
@@ -66,15 +82,17 @@ surface is intentionally small but reserves room to grow via
   Zero non-stdlib deps in that mode (the `std` feature pulls
   in `futures-channel`, `futures-util`, `futures-executor`).
 - Test coverage:
-  - 16 worker unit tests (handler-level state transitions)
+  - 18 worker unit tests (handler-level state transitions)
   - 2 proptest properties × 256 cases each (term / commit /
     snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
   - 2 no_std build smoke tests (skip cleanly when targets aren't
     installed)
-  - 7 integration tests against a `MockTransport` with per-edge
+  - 11 integration tests against a `MockTransport` with per-edge
     partition control (3-node election, replication, partition
     quorum, one-way-partition, leader/candidate step-down on
-    higher-term replies)
+    higher-term replies, pre-vote term-stability,
+    `read_index` quorum confirmation + leader-stepped-on-partition)
+  - 5 fault-injection tests (storage `Err` paths)
   - 1 runnable doctest
 
 ### Known limitations (deferred for future commits)

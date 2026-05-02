@@ -29,6 +29,8 @@ joint consensus, no learners, no chunked snapshot streaming yet).
 | Pluggable apply-notification sink | various                 | yes (`ApplySink` trait)             |
 | Storage trait shape               | many small methods      | atomic `WriteBatch`                 |
 | Required deps (no_std mode)       | n/a                     | core + alloc only                   |
+| Pre-vote (term-stability)         | yes                     | yes (`Config::pre_vote`)            |
+| Linearizable reads (`read_index`) | yes                     | yes (`WorkerHandle::read_index`)    |
 | Joint consensus                   | yes                     | no (planned)                        |
 | Chunked snapshot streaming        | yes                     | no (one-shot only)                  |
 | Production maturity               | high                    | first carve-out                     |

@@ -991,3 +991,163 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
         "leader must still be leader after the partition",
     );
 }
+
+/// `read_index` on the leader returns an index ≥ commit_index
+/// after a quorum heartbeat round confirms leadership. The
+/// caller can then read state machine state at-or-above that
+/// index for a linearizable result.
+#[test]
+fn read_index_resolves_after_quorum_confirmation() {
+    use vos_raft::ReadIndexError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+
+    // Propose a few entries so commit_index advances above 0.
+    for n in 1..=3u8 {
+        block_on(leader_handle.propose(vec![n])).expect("propose");
+    }
+
+    // Wait for all replicas to converge so the leader's
+    // match_index for each follower reflects them as caught up
+    // — necessary for read_index to resolve quickly.
+    wait_until(
+        || {
+            members.iter().all(|p| {
+                let h = workers[p].handler();
+                block_on(h.snapshot())
+                    .map(|s| s.commit_index >= 3)
+                    .unwrap_or(false)
+            })
+        },
+        Duration::from_secs(5),
+        "all replicas reach commit_index ≥ 3",
+    );
+
+    // read_index on the leader returns Ok(R), R ≥ 3.
+    let r = block_on(leader_handle.read_index()).expect("read_index resolves");
+    assert!(r >= 3, "read_index = {r} should be ≥ committed index 3");
+
+    // read_index on a follower returns NotLeader.
+    let follower_id = *members.iter().find(|p| **p != leader_id).unwrap();
+    let follower_handle = workers[&follower_id].handler();
+    let r = block_on(follower_handle.read_index());
+    assert!(
+        matches!(r, Err(ReadIndexError::NotLeader)),
+        "follower read_index must return NotLeader, got {r:?}",
+    );
+}
+
+/// `read_index` on a partitioned leader stalls until the
+/// partition heals OR step_down drains pending requests with
+/// LeaderStepped.
+#[test]
+fn read_index_returns_leader_stepped_on_partition_step_down() {
+    use vos_raft::ReadIndexError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let members = vec![1u16, 2, 3];
+    let mut workers: std::collections::BTreeMap<u16, Worker<u16>> =
+        std::collections::BTreeMap::new();
+    for me in members.iter().copied() {
+        let storage = MemStorage::<u16>::new();
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            cfg(me, members.clone()),
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || members.iter().any(|p| workers[p].role() == Role::Leader),
+        Duration::from_secs(5),
+        "leader emerges",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|p| workers[p].role() == Role::Leader)
+        .expect("leader exists");
+    let leader_handle = workers[&leader_id].handler();
+    let leader_handle_for_call = leader_handle.clone();
+
+    // Wait for any propose so commit_index > 0.
+    block_on(leader_handle.propose(vec![1])).expect("propose");
+
+    // Partition the leader OUT before issuing read_index. The
+    // request will queue; without a quorum it can't resolve.
+    transport.isolate(leader_id, &members);
+
+    // Issue read_index in a separate thread. Without partition
+    // healing, it should eventually receive LeaderStepped when
+    // the leader's heartbeat-failure path causes a re-election
+    // and step-down.
+    //
+    // BUT: with the leader isolated, it can't observe a
+    // higher-term reply because no peer can reach it. So the
+    // current step-down path won't fire. The pending request
+    // will hang indefinitely — which IS the correct behavior
+    // for an isolated leader (it can't safely serve reads
+    // because it might be stale).
+    //
+    // To exercise the LeaderStepped path, we instead inject a
+    // higher-term AppendEntries to the leader from outside,
+    // which forces step-down via handle_append_entries.
+    let result_thread = std::thread::spawn(move || {
+        block_on(leader_handle_for_call.read_index())
+    });
+    // Give the thread a moment to enqueue.
+    std::thread::sleep(Duration::from_millis(50));
+    // Inject a higher-term heartbeat that forces step-down.
+    let _ = block_on(leader_handle.handle_inbound_append(
+        99,
+        AppendEntriesReq {
+            leader: 99,
+            term: 1_000,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        },
+    ));
+    // The pending read_index must now resolve with LeaderStepped.
+    let result = result_thread.join().expect("thread joined");
+    assert!(
+        matches!(result, Err(ReadIndexError::LeaderStepped)),
+        "expected LeaderStepped after step-down, got {result:?}",
+    );
+}

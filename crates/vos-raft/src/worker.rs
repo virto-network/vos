@@ -66,6 +66,25 @@ pub enum ProposeError<E> {
     Storage(E),
 }
 
+/// Reasons a [`WorkerHandle::read_index`] can fail.
+///
+/// `read_index` is the leader's linearizable-read primitive: it
+/// returns the leader's `commit_index` once a quorum of
+/// followers has confirmed leadership at the current term. The
+/// caller then waits for its own apply progress to reach that
+/// index before serving the read.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReadIndexError {
+    /// This worker isn't a leader. Address the cluster's leader
+    /// instead.
+    NotLeader,
+    /// We were leader at request time but stepped down before a
+    /// quorum could confirm. Caller should retry against the new
+    /// leader.
+    LeaderStepped,
+}
+
 /// Diagnostic snapshot of a worker's state.
 ///
 /// `#[non_exhaustive]` because future commits will surface
@@ -120,6 +139,12 @@ pub enum RaftMsg<N: NodeId> {
     Propose {
         payload: Vec<u8>,
         reply: oneshot::Sender<Result<u64, ProposeError<()>>>,
+    },
+    /// Linearizable-read index request. Resolves to the leader's
+    /// `commit_index` after a heartbeat round to quorum confirms
+    /// leadership at the current term.
+    ReadIndex {
+        reply: oneshot::Sender<Result<u64, ReadIndexError>>,
     },
     QueryState {
         reply: oneshot::Sender<WorkerSnapshot<N>>,
@@ -433,6 +458,39 @@ impl<N: NodeId> WorkerHandle<N> {
         rx.await.unwrap_or(Err(ProposeError::NotLeader))
     }
 
+    /// Request a linearizable-read index from the leader.
+    ///
+    /// On success, returns an index `R` such that any read of
+    /// the state machine at or above `last_applied >= R` is
+    /// linearizable: reflects every write committed before this
+    /// call was issued, and never sees data from a future
+    /// term's leader.
+    ///
+    /// Protocol (Ongaro thesis §6.4):
+    /// 1. Worker captures `R = commit_index` at request entry.
+    /// 2. Worker triggers a heartbeat round. Once a quorum of
+    ///    followers ACKs at the current term — observable as
+    ///    `match_index_majority_floor >= R` — the worker
+    ///    resolves the request with `Ok(R)`.
+    /// 3. If the worker steps down to Follower before quorum
+    ///    confirms, resolves with `Err(LeaderStepped)`.
+    ///
+    /// **Caveat**: this v0.1 impl skips the
+    /// "no-op-append-on-leader-promotion" guard. A freshly
+    /// elected leader that hasn't yet committed any entry in
+    /// its current term may serve a read from a stale prior-term
+    /// state. In practice this only matters for the brief
+    /// window between leader promotion and first commit; if your
+    /// caller waits for any propose to succeed before issuing
+    /// `read_index`, the window is closed.
+    pub async fn read_index(&self) -> Result<u64, ReadIndexError> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(RaftMsg::ReadIndex { reply: tx })
+            .map_err(|_| ReadIndexError::NotLeader)?;
+        rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
+    }
+
     /// Inbound `AppendEntries` from a peer.
     pub async fn handle_inbound_append(
         &self,
@@ -606,6 +664,13 @@ where
     last_heartbeat_received: Option<C::Instant>,
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
+    /// In-flight `read_index` requests waiting for a quorum
+    /// confirmation. Each entry is `(read_index_at_request, reply)`
+    /// — the index becomes resolvable once
+    /// `match_index_majority_floor >= read_index_at_request`
+    /// (a quorum has acked at the current term, and that ack
+    /// landed at or after the request was queued).
+    pending_read_index: Vec<(u64, oneshot::Sender<Result<u64, ReadIndexError>>)>,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
     clock: C,
@@ -726,6 +791,7 @@ where
         election_deadline: clock.now(),
         last_heartbeat_received: None,
         votes_received: BTreeSet::new(),
+        pending_read_index: Vec::new(),
         leader: None,
         apply_sink,
         role_atomic,
@@ -762,7 +828,7 @@ where
                 msg = next_inbox => {
                     match msg {
                         Some(RaftMsg::Shutdown) => break,
-                        Some(other) => handle_msg(&mut state, other).await,
+                        Some(other) => handle_msg(&mut state, &mut pending, other).await,
                         None => break,
                     }
                 }
@@ -777,7 +843,7 @@ where
                 msg = next_inbox => {
                     match msg {
                         Some(RaftMsg::Shutdown) => break,
-                        Some(other) => handle_msg(&mut state, other).await,
+                        Some(other) => handle_msg(&mut state, &mut pending, other).await,
                         None => break,
                     }
                 }
@@ -797,6 +863,7 @@ where
 
 async fn handle_msg<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
     msg: RaftMsg<N>,
 ) where
     N: NodeId,
@@ -829,6 +896,9 @@ async fn handle_msg<N, S, T, C, R, A>(
         RaftMsg::Propose { payload, reply } => {
             let r = handle_propose(state, payload).await;
             let _ = reply.send(r);
+        }
+        RaftMsg::ReadIndex { reply } => {
+            handle_read_index(state, pending, reply).await;
         }
         RaftMsg::QueryState { reply } => {
             let _ = reply.send(WorkerSnapshot {
@@ -960,9 +1030,13 @@ where
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
     }
+    let was_leader = state.role == Role::Leader;
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    if was_leader {
+        drain_pending_reads_on_step_down(state);
+    }
     state.reset_election_timer();
     // We've heard from a current-term leader — record it for
     // the pre-vote leader-check.
@@ -1252,6 +1326,10 @@ where
         leader.match_index.insert(from, resp.match_index);
         leader.next_index.insert(from, resp.match_index + 1);
         try_advance_commit_index(state).await?;
+        // Quorum match-index may have advanced past the captured
+        // commit_index of one or more pending read_index
+        // requests. Resolve any that meet the threshold.
+        try_resolve_pending_reads(state).await;
     } else {
         let cur = leader.next_index.get(&from).copied().unwrap_or(1);
         let new_next = cur.saturating_sub(1).max(1);
@@ -1431,6 +1509,91 @@ where
     Ok(new_index)
 }
 
+/// Handle a `RaftMsg::ReadIndex` request. Captures the leader's
+/// current `commit_index`, queues the request on
+/// `pending_read_index`, and triggers an immediate heartbeat
+/// round so a fresh quorum confirmation arrives soon. The
+/// request resolves once `match_index_majority_floor` reaches
+/// the captured commit_index.
+async fn handle_read_index<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+    reply: oneshot::Sender<Result<u64, ReadIndexError>>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if state.role != Role::Leader {
+        let _ = reply.send(Err(ReadIndexError::NotLeader));
+        return;
+    }
+    // Solo cluster: no peers to confirm with, but the leader IS
+    // the only voter. Resolve immediately.
+    if state.cfg.members.len() <= 1 {
+        let _ = reply.send(Ok(state.meta.commit_index));
+        return;
+    }
+    let r = state.meta.commit_index;
+    state.pending_read_index.push((r, reply));
+    // Trigger a fresh heartbeat round. The round's quorum-success
+    // confirms we're still leader at the current term; the
+    // resulting match_index advance fires
+    // `try_resolve_pending_reads` which drains the queue.
+    let _ = send_heartbeats(state, pending).await;
+}
+
+/// Drain `pending_read_index` entries whose captured commit
+/// index is now ≤ `match_index_majority_floor`. Each drained
+/// entry is replied with `Ok(R)`.
+async fn try_resolve_pending_reads<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    if state.pending_read_index.is_empty() {
+        return;
+    }
+    let Some(mf) = state.match_index_majority_floor().await else {
+        return;
+    };
+    // Partition pending into resolvable + still-waiting.
+    let mut still_waiting = Vec::new();
+    for (r, reply) in core::mem::take(&mut state.pending_read_index) {
+        if r <= mf {
+            let _ = reply.send(Ok(r));
+        } else {
+            still_waiting.push((r, reply));
+        }
+    }
+    state.pending_read_index = still_waiting;
+}
+
+/// Drain every pending read-index entry with a `LeaderStepped`
+/// error. Called by `step_down`.
+fn drain_pending_reads_on_step_down<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    for (_r, reply) in core::mem::take(&mut state.pending_read_index) {
+        let _ = reply.send(Err(ReadIndexError::LeaderStepped));
+    }
+}
+
 async fn become_leader_no_heartbeat<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
@@ -1461,6 +1624,7 @@ where
     state.set_role(Role::Follower);
     state.votes_received.clear();
     state.leader = None;
+    drain_pending_reads_on_step_down(state);
     state.reset_election_timer();
 }
 
