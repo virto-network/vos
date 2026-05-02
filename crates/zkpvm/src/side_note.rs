@@ -72,6 +72,16 @@ pub struct MulEntry {
     pub val_d: u64,
     pub result: u64,
     pub mul_high: u64,
+    /// Phase 54b: schoolbook low/high outputs (separate from `result`,
+    /// which differs per variant — see CpuChip's result-binding logic
+    /// for non-rotate Mul64 / RotL64 / MulUpper variants).
+    pub unsigned_product_low: u64,
+    pub unsigned_product_hi: u64,
+    /// Phase 54b: per-position carry of the schoolbook chain (16 bytes).
+    /// `mul_carry + 256·mul_carry_hi` reconstructs the full ≤16-bit
+    /// carry; busiest at position k=3 for 0xFFFF_FFFF² ≈ 0x3FB.
+    pub mul_carry: [u8; 16],
+    pub mul_carry_hi: [u8; 16],
     pub is_mul_lo: bool,
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,

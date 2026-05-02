@@ -269,25 +269,31 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
             }
             trace.fill_columns_bytes(row, &mul_high, Column::MulHigh);
-            trace.fill_columns_bytes(row, &mul_carry, Column::MulCarry);
-            trace.fill_columns_bytes(row, &mul_carry_hi, Column::MulCarryHi);
+            // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
             trace.fill_columns_bytes(row, &unsigned_product_hi_bytes, Column::UnsignedProductHi);
             trace.fill_columns_bytes(row, &unsigned_product_low_bytes, Column::UnsignedProductLow);
             trace.fill_columns_bytes(row, &mul_corr_term_a, Column::MulCorrTermA);
             trace.fill_columns_bytes(row, &mul_corr_term_b, Column::MulCorrTermB);
             trace.fill_columns_bytes(row, &mul_corr_carry, Column::MulCorrCarry);
 
-            // Phase 54a: capture this mul row for MulChip's main trace.
-            // Must mirror exactly the val_b / val_d / Result / MulHigh
-            // values written above (post-pow2-replacement, post-32-bit
-            // truncation, signedness-adjusted result).
+            // Phase 54a/b: capture this mul row for MulChip's main trace.
+            // Must mirror exactly the val_b / val_d / Result / MulHigh /
+            // UnsignedProductLow / UnsignedProductHi / MulCarry /
+            // MulCarryHi values written above (post-pow2-replacement,
+            // post-32-bit truncation, signedness-adjusted result).
             if flags.is_mul {
                 let mul_high_u64 = u64::from_le_bytes(mul_high);
+                let unsigned_product_low_u64 = u64::from_le_bytes(unsigned_product_low_bytes);
+                let unsigned_product_hi_u64 = u64::from_le_bytes(unsigned_product_hi_bytes);
                 side_note.mul_entries.push(crate::side_note::MulEntry {
                     val_b,
                     val_d,
                     result,
                     mul_high: mul_high_u64,
+                    unsigned_product_low: unsigned_product_low_u64,
+                    unsigned_product_hi: unsigned_product_hi_u64,
+                    mul_carry,
+                    mul_carry_hi,
                     is_mul_lo: !flags.is_mul_upper,
                     is_mul_upper_uu: flags.is_mul_upper_uu,
                     is_mul_upper_su: flags.is_mul_upper_su,

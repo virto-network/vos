@@ -122,7 +122,7 @@ impl BuiltInComponent for CpuChip {
         let f_ff_p19: E::F = E::F::from(BaseField::from(255));
         let carry = crate::trace::trace_eval!(trace_eval, Column::Carry);
         let mul_high = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
-        let mul_carry = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
+        // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
         let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
         let cmp_carry = crate::trace::trace_eval!(trace_eval, Column::CmpCarry);
         let cmp_lt_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
@@ -226,11 +226,11 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // MUL: schoolbook byte-level multiplication
-        // 64-bit: val_b[0..8] * val_d[0..8] = result[0..8] + mul_high[0..8] * 2^64 (16 positions)
-        // 32-bit: val_b[0..4] * val_d[0..4] = result[0..4] + mul_high[0..4] * 2^32 (8 positions)
+        // MUL: schoolbook carry chain — Phase 54b: moved to MulChip.
+        // CpuChip still witnesses UnsignedProductLow/Hi/MulHigh (used by
+        // result-variant binding below); their values are pinned by
+        // lookup balance to MulChip's carry-chain-pinned witnesses.
         // ════════════════════════════════════════════════════════════════════
-        // Phase 53: IsMulUpper folded into the sum expression.
         let mu_uu_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let mu_su_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
         let mu_ss_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
@@ -238,76 +238,8 @@ impl BuiltInComponent for CpuChip {
             mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone()
         };
         let is_mul_low = E::F::one() - is_mul_upper_e();
-        let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
         let unsigned_product_hi = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
-        // Helper: full 16-bit carry value at position k.
-        let full_carry = |k: usize| -> E::F {
-            mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
-        };
-        // 64-bit mul constraint (positions 0..15).  Carries can reach up to
-        // ~16 bits at busy middle positions (e.g. 0xFFFFFFFF² produces
-        // 0x3FB at position k=3), so the carry is reconstructed as
-        // mul_carry[k] + 256·mul_carry_hi[k].
-        //
-        // Phase 12c: the schoolbook output for `is_mul_upper` (positions
-        // 8..15) now lands in `unsigned_product_hi[k-8]` instead of
-        // `result[k-8]`.  This decouples the schoolbook from per-variant
-        // result binding: UU/SU/SS all share the same unsigned-product
-        // computation, but `result` is derived differently per variant
-        // (UU = unsigned_product_hi; SU/SS subtract a sign correction).
-        // Phase 32: low-64 schoolbook output now lands in
-        // UnsignedProductLow (was: result).  Decouples the schoolbook
-        // computation from the per-op result binding, mirroring the
-        // Phase 12c pattern for is_mul_upper rows.  Result is bound
-        // separately below:
-        //   non-rotate is_mul_low: result = UnsignedProductLow.
-        //   RotL64:                 result = UnsignedProductLow + mul_high.
         let unsigned_product_low = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
-        for k in 0..16usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..WORD_SIZE {
-                let j = k.wrapping_sub(i);
-                if j < WORD_SIZE {
-                    partial_sum += val_b[i].clone() * val_d[j].clone();
-                }
-            }
-            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let out_normal = if k < 8 { unsigned_product_low[k].clone() } else { mul_high[k - 8].clone() };
-            let out_upper = if k < 8 { mul_high[k].clone() } else { unsigned_product_hi[k - 8].clone() };
-            let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
-            let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_low.clone() * c_normal);
-            eval.add_constraint(is_mul[0].clone() * is_64bit.clone() * is_mul_upper_e() * c_upper);
-        }
-        // 32-bit mul constraint (positions 0..7, using low 4 limbs).  The
-        // 32-bit case never produces carries > 8 bits (max partial = 4·0xFE01
-        // = 0x3F804 ≈ 18 bits, so carry ≤ 10 bits), but using the same
-        // 16-bit carry representation keeps the constraint shape uniform.
-        //
-        // Phase 36: re-route the low-32 schoolbook output from `result[k]`
-        // to `UnsignedProductLow[k]` (k<4), mirroring Phase 32's 64-bit
-        // re-route.  Decouples the schoolbook from the per-op result
-        // binding so RotL32 / RotR32 can sum low + high in `result`
-        // while non-rotate Mul32 still gets `result = UnsignedProductLow`
-        // (in a separate binding below).  High-32 stays in
-        // `mul_high[k-4]` for k ≥ 4, same as before.
-        for k in 0..8usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..4usize {
-                let j = k.wrapping_sub(i);
-                if j < 4 {
-                    partial_sum += val_b[i].clone() * val_d[j].clone();
-                }
-            }
-            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let out_byte = if k < 4 {
-                unsigned_product_low[k].clone()
-            } else {
-                mul_high[k - 4].clone()
-            };
-            let c = out_byte + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(is_mul[0].clone() * is_32bit[0].clone() * c);
-        }
         // 32-bit mul: upper result limbs (i ∈ 4..8) = 0xFF · SignBitResult
         // (Phase 19 sign-extension).  Applies uniformly to non-rotate Mul32
         // and RotL32 / RotR32 — sign bit comes from result[3] which is
@@ -3190,9 +3122,12 @@ impl BuiltInComponent for CpuChip {
             }
         }
 
-        // ── Phase 54a: MultiplicationLookup producer ──
-        // Two paired emissions per row.  MulChip consumes the same
-        // tuple per real (non-padding) row.
+        // ── Phase 54a/b: MultiplicationLookup producer ──
+        // Tuple (53 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
+        //   + unsigned_product_low[8] + unsigned_product_hi[8] + 5 flags.
+        // MulChip consumes the same tuple per real row.  The schoolbook
+        // carry-chain constraint that pins UnsignedProductLow/Hi/MulHigh
+        // to val_b * val_d lives on MulChip (Phase 54b).
         {
             let f_is_mul_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMul);
             let f_mu_uu_p54 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
@@ -3203,15 +3138,19 @@ impl BuiltInComponent for CpuChip {
             let val_d_p54 = crate::trace::trace_eval!(trace_eval, Column::ValD);
             let result_p54 = crate::trace::trace_eval!(trace_eval, Column::Result);
             let mul_high_p54 = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
+            let upl_p54 = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
+            let uph_p54 = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
             let is_mul_lo_e = f_is_mul_p54[0].clone()
                 - f_mu_uu_p54[0].clone()
                 - f_mu_su_p54[0].clone()
                 - f_mu_ss_p54[0].clone();
-            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(37);
+            let mut tuple_p54: Vec<E::F> = Vec::with_capacity(53);
             tuple_p54.extend_from_slice(&val_b_p54);
             tuple_p54.extend_from_slice(&val_d_p54);
             tuple_p54.extend_from_slice(&result_p54);
             tuple_p54.extend_from_slice(&mul_high_p54);
+            tuple_p54.extend_from_slice(&upl_p54);
+            tuple_p54.extend_from_slice(&uph_p54);
             tuple_p54.push(is_mul_lo_e);
             tuple_p54.push(f_mu_uu_p54[0].clone());
             tuple_p54.push(f_mu_su_p54[0].clone());

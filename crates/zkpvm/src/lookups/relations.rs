@@ -110,20 +110,21 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_STATE_LOOKUP_SIZE
 );
 
-// Phase 54a — Multiplication lookup.  CpuChip emits one producer per
+// Phase 54a/b — Multiplication lookup.  CpuChip emits one producer per
 // `is_mul + is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss` row;
 // MulChip consumes once per real (non-padding) row.  Tuple binds the
-// per-row mul I/O state so MulChip's AIR can re-prove the schoolbook
-// identity over its narrower trace in a future sub-phase.
+// per-row mul I/O state so MulChip's AIR proves the schoolbook
+// identity over its narrower trace.
 //
-// Tuple: (val_b[8], val_d[8], result[8], mul_high[8], is_mul_lo[1],
-//         is_mul_upper_uu[1], is_mul_upper_su[1], is_mul_upper_ss[1],
-//         is_32bit[1]) — 37 limbs.  `is_mul_lo` is CpuChip's original
-// IsMul flag (low 64 bits of product written to result).  The four
-// variant flags partition mul rows so MulChip can dispatch the
-// appropriate sign-correction logic per row.
+// Tuple (Phase 54b): (val_b[8], val_d[8], result[8], mul_high[8],
+//   unsigned_product_low[8], unsigned_product_hi[8], is_mul_lo[1],
+//   is_mul_upper_uu[1], is_mul_upper_su[1], is_mul_upper_ss[1],
+//   is_32bit[1]) — 53 limbs.  unsigned_product_low/hi are the raw
+// schoolbook outputs; CpuChip witnesses them but the carry-chain
+// constraint that pins them lives on MulChip.  Lookup balance forces
+// CpuChip's witnesses to equal MulChip's pinned values.
 const REL_MULTIPLICATION_LOOKUP_SIZE: usize =
-    WORD_SIZE + WORD_SIZE + WORD_SIZE + WORD_SIZE + 5;
+    WORD_SIZE * 6 + 5;
 stwo_constraint_framework::relation!(
     MultiplicationLookupElements,
     REL_MULTIPLICATION_LOOKUP_SIZE

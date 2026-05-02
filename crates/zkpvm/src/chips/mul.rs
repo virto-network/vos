@@ -1,25 +1,26 @@
-//! Phase 54a — `MulChip`: per-multiplication-row consumer chip.
+//! Phase 54a/b — `MulChip`: per-multiplication-row chip.
 //!
-//! Foundation for the structural Phase 54 chip-extraction.  CpuChip's
-//! schoolbook multiplication AIR fires on every `flags.is_mul=1` row
-//! (true muls + left shifts + 64/32-bit rotates that route through the
-//! schoolbook).  This chip mirrors those rows on its own narrower trace
-//! so a future sub-phase can move the schoolbook constraints here and
-//! drop the corresponding columns from CpuChip.
+//! Phase 54a established the lookup wiring (CpuChip ↔ MulChip producer/
+//! consumer balance over a 53-limb tuple).  Phase 54b moves the
+//! schoolbook byte-level carry-chain constraint here, dropping
+//! MulCarry[16] + MulCarryHi[16] from CpuChip.  CpuChip's
+//! UnsignedProductLow/Hi/MulHigh witnesses are bound to MulChip's
+//! pinned values via the lookup tuple.
 //!
-//! Phase 54a scope: chip + lookup wiring only.  No AIR constraints
-//! beyond consuming the lookup tuple — both sides (CpuChip and MulChip)
-//! still hold the full schoolbook AIR; the lookup balance forces the
-//! per-row I/O state to agree.  This validates the wiring before any
-//! cells are dropped from CpuChip.
+//! The schoolbook AIR has two arms:
+//!   - 64-bit (16 positions): val_b[0..8] * val_d[0..8] = low[0..8]
+//!     + mul_high[0..8] · 2^64 + (for is_mul_upper) unsigned_product_hi[0..8] · 2^128.
+//!   - 32-bit (8 positions, low 4 input limbs):
+//!     val_b[0..4] * val_d[0..4] = low[0..4] + mul_high[0..4] · 2^32.
+//! Both share the same MulCarry / MulCarryHi 16-position carry chain
+//! (each position can carry up to ~16 bits at busy middle positions).
 //!
-//! Phase 54b will move the schoolbook carry-chain constraints from
-//! CpuChip to MulChip; Phase 54c will drop `MulHigh / MulCarry /
-//! MulCarryHi` etc. from CpuChip.
+//! Phase 54c will move sign correction (Phase 12c) + result-variant
+//! dispatch and finally drop UnsignedProductLow/Hi/MulHigh from CpuChip.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use num_traits::One;
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
@@ -35,6 +36,7 @@ use stwo::{
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::core::step::WORD_SIZE;
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
 use crate::trace::{
@@ -63,12 +65,28 @@ pub enum Column {
     /// Operand d (8 bytes, low-endian).
     #[size = 8]
     ValD,
-    /// Low 64 bits of the schoolbook product (8 bytes).
+    /// Per-row result column (post-variant-dispatch).  Bound on CpuChip
+    /// side; mirrored here through the lookup tuple.
     #[size = 8]
     Result,
-    /// High 64 bits of the schoolbook product (8 bytes).
+    /// High 64 bits of the mul output (post-variant-dispatch).
     #[size = 8]
     MulHigh,
+    /// Phase 54b: low 64 bits of the unsigned schoolbook product.
+    #[size = 8]
+    UnsignedProductLow,
+    /// Phase 54b: high 64 bits of the unsigned schoolbook product
+    /// (positions 8..15 from the 16-position chain).  Used by
+    /// MulUpper variants.
+    #[size = 8]
+    UnsignedProductHi,
+    /// Phase 54b: per-position low byte of the schoolbook carry.  16
+    /// positions; reconstructed full carry = MulCarry + 256·MulCarryHi.
+    #[size = 16]
+    MulCarry,
+    /// Phase 54b: per-position high byte of the schoolbook carry.
+    #[size = 16]
+    MulCarryHi,
     /// 1 iff this row is a low-output mul variant (Mul / ShloL / RotL/R).
     /// `IsMulLo + IsMulUpperUU + IsMulUpperSU + IsMulUpperSS` partitions
     /// the multiplication-row population.
@@ -80,7 +98,7 @@ pub enum Column {
     IsMulUpperSU,
     #[size = 1]
     IsMulUpperSS,
-    /// 1 iff the operation operates on the low 32 bits (and zero-extends).
+    /// 1 iff the operation operates on the low 32 bits.
     #[size = 1]
     Is32Bit,
     /// 1 iff this is a padding row (no real multiplication entry).
@@ -93,6 +111,11 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for MulChip {
+    // Schoolbook constraint is degree 4 (`is_real * is_64bit *
+    // is_mul_low * (val_b*val_d - ... )`), so eval domain needs
+    // log_size + 2.
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = MultiplicationLookupElements;
@@ -107,6 +130,10 @@ impl BuiltInComponent for MulChip {
         let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
         let result = crate::trace::trace_eval!(trace_eval, Column::Result);
         let mul_high = crate::trace::trace_eval!(trace_eval, Column::MulHigh);
+        let upl = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductLow);
+        let uph = crate::trace::trace_eval!(trace_eval, Column::UnsignedProductHi);
+        let mul_carry = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
+        let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
         let is_mul_lo = crate::trace::trace_eval!(trace_eval, Column::IsMulLo);
         let is_mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
@@ -119,8 +146,11 @@ impl BuiltInComponent for MulChip {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
 
-        // Partition: on a real (non-padding) row, exactly one variant flag is 1.
         let is_real = E::F::one() - is_padding[0].clone();
+        let is_mul_upper_e = is_mu_uu[0].clone() + is_mu_su[0].clone() + is_mu_ss[0].clone();
+        let is_64bit = E::F::one() - is_32bit[0].clone();
+
+        // Partition: on a real (non-padding) row, exactly one variant flag is 1.
         let variant_sum = is_mul_lo[0].clone()
             + is_mu_uu[0].clone()
             + is_mu_su[0].clone()
@@ -129,22 +159,65 @@ impl BuiltInComponent for MulChip {
         // On padding rows all variant flags are 0 (lookup multiplicity = 0).
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
-        // Consume the multiplication lookup.  Tuple = (val_b[8], val_d[8],
-        // result[8], mul_high[8], is_mul_lo, is_mu_uu, is_mu_su, is_mu_ss,
-        // is_32bit) = 37 limbs.  Multiplicity = -(1 - is_padding).
-        let mut tuple: Vec<E::F> = Vec::with_capacity(37);
+        // ── Phase 54b: schoolbook byte-level carry chain ──
+        // 64-bit: val_b[0..8] * val_d[0..8] = upl[0..8] + ... · 2^64.
+        // 32-bit: val_b[0..4] * val_d[0..4] = upl[0..4] + mul_high[0..4] · 2^32.
+        let f256: E::F = E::F::from(BaseField::from(256));
+        let full_carry = |k: usize| -> E::F {
+            mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
+        };
+        // 64-bit chain (16 positions).  Output mapping:
+        //   Mul-lo (non-rotate): k<8 → upl[k], k≥8 → mul_high[k-8].
+        //   MulUpper:            k<8 → mul_high[k] (= unsigned-low),
+        //                        k≥8 → uph[k-8] (= unsigned-high).
+        for k in 0..16usize {
+            let mut partial_sum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let j = k.wrapping_sub(i);
+                if j < WORD_SIZE {
+                    partial_sum += val_b[i].clone() * val_d[j].clone();
+                }
+            }
+            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
+            let out_normal = if k < 8 { upl[k].clone() } else { mul_high[k - 8].clone() };
+            let out_upper = if k < 8 { mul_high[k].clone() } else { uph[k - 8].clone() };
+            let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
+            let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
+            eval.add_constraint(is_real.clone() * is_64bit.clone() * is_mul_lo[0].clone() * c_normal);
+            eval.add_constraint(is_real.clone() * is_64bit.clone() * is_mul_upper_e.clone() * c_upper);
+        }
+        // 32-bit chain (8 positions, low 4 input limbs).  Same output
+        // mapping: k<4 → upl[k], k≥4 → mul_high[k-4].
+        for k in 0..8usize {
+            let mut partial_sum = E::F::zero();
+            for i in 0..4usize {
+                let j = k.wrapping_sub(i);
+                if j < 4 {
+                    partial_sum += val_b[i].clone() * val_d[j].clone();
+                }
+            }
+            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
+            let out_byte = if k < 4 { upl[k].clone() } else { mul_high[k - 4].clone() };
+            let c = out_byte + full_carry(k) * f256.clone() - partial_sum - carry_in;
+            eval.add_constraint(is_real.clone() * is_32bit[0].clone() * c);
+        }
+
+        // ── Lookup consumer ──
+        // Tuple (53 limbs): val_b[8] + val_d[8] + result[8] + mul_high[8]
+        //   + upl[8] + uph[8] + 5 flags.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(53);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
         tuple.extend_from_slice(&mul_high);
+        tuple.extend_from_slice(&upl);
+        tuple.extend_from_slice(&uph);
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());
         tuple.push(is_mu_ss[0].clone());
         tuple.push(is_32bit[0].clone());
 
-        // Two paired emissions to keep finalize_logup_in_pairs happy
-        // (CpuChip's producer side also emits in pairs).
         for _ in 0..2 {
             eval.add_to_relation(RelationEntry::new(
                 lookup_elements,
@@ -161,9 +234,11 @@ impl BuiltInComponent for MulChip {
 impl BuiltInProverComponent for MulChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
         let entries = &side_note.mul_entries;
-        // stwo's FFT path needs domain >= MIN_FFT_LOG_SIZE (5), and the
-        // eval domain = log_size + LOG_CONSTRAINT_DEGREE_BOUND.  Ensure
-        // a minimum log_size of 5 so even an empty mul trace works.
+        // stwo's FFT path needs domain >= MIN_FFT_LOG_SIZE (5).  Eval
+        // domain = log_size + LOG_CONSTRAINT_DEGREE_BOUND (= 2 here),
+        // so log_size ≥ 4 would suffice, but the LogupTraceBuilder
+        // requires `log_size >= LOG_N_LANES` (= 4) and we add a small
+        // safety floor at 5 to keep the FFT path warm.
         const MIN_LOG_SIZE: u32 = 5;
 
         if entries.is_empty() {
@@ -184,6 +259,10 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns_bytes(row, &e.val_d.to_le_bytes(), Column::ValD);
             trace.fill_columns_bytes(row, &e.result.to_le_bytes(), Column::Result);
             trace.fill_columns_bytes(row, &e.mul_high.to_le_bytes(), Column::MulHigh);
+            trace.fill_columns_bytes(row, &e.unsigned_product_low.to_le_bytes(), Column::UnsignedProductLow);
+            trace.fill_columns_bytes(row, &e.unsigned_product_hi.to_le_bytes(), Column::UnsignedProductHi);
+            trace.fill_columns_bytes(row, &e.mul_carry, Column::MulCarry);
+            trace.fill_columns_bytes(row, &e.mul_carry_hi, Column::MulCarryHi);
             trace.fill_columns(row, e.is_mul_lo, Column::IsMulLo);
             trace.fill_columns(row, e.is_mul_upper_uu, Column::IsMulUpperUU);
             trace.fill_columns(row, e.is_mul_upper_su, Column::IsMulUpperSU);
@@ -216,6 +295,8 @@ impl BuiltInProverComponent for MulChip {
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let result = crate::trace::original_base_column!(component_trace, Column::Result);
         let mul_high = crate::trace::original_base_column!(component_trace, Column::MulHigh);
+        let upl = crate::trace::original_base_column!(component_trace, Column::UnsignedProductLow);
+        let uph = crate::trace::original_base_column!(component_trace, Column::UnsignedProductHi);
         let is_mul_lo = crate::trace::original_base_column!(component_trace, Column::IsMulLo);
         let is_mu_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
@@ -227,14 +308,14 @@ impl BuiltInProverComponent for MulChip {
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
         tuple.extend_from_slice(&mul_high);
+        tuple.extend_from_slice(&upl);
+        tuple.extend_from_slice(&uph);
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());
         tuple.push(is_mu_ss[0].clone());
         tuple.push(is_32bit[0].clone());
 
-        // Consumer side: multiplicity = -(1 - is_padding).  Emit twice
-        // to mirror the verifier-side paired emissions.
         for _ in 0..2 {
             logup.add_to_relation_with(
                 mul,
@@ -250,4 +331,3 @@ impl BuiltInProverComponent for MulChip {
         logup.finalize()
     }
 }
-
