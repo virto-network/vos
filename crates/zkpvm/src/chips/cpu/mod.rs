@@ -25,7 +25,7 @@ use crate::trace::{
 
 use crate::{
     framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
+    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, CompareLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -66,7 +66,7 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements),
+        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements),
     );
 
 
@@ -83,10 +83,10 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements),
+            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup)) = lookup_elements;
+        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup)) = lookup_elements;
         // bitwise_and_lookup is no longer emitted by CpuChip (Phase 54e
         // moved nibble emissions to BitwiseChip).
         let _ = bitwise_and_lookup;
@@ -127,7 +127,7 @@ impl BuiltInComponent for CpuChip {
         // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
         // Phase 54d: MulHigh moved to MulChip.
         // Phase 54e: AndResult moved to BitwiseChip.
-        let cmp_carry = crate::trace::trace_eval!(trace_eval, Column::CmpCarry);
+        // Phase 54f: CmpCarry moved to CompareChip.
         let cmp_lt_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
         let cmp_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
         // Phase 53e: IsBranch folded — sum of the 10 IsBr* sub-flags.
@@ -349,25 +349,9 @@ impl BuiltInComponent for CpuChip {
         // For CmovIz/Nz, Min/Max: prover-trusted (constrained result via execution semantics)
         // ════════════════════════════════════════════════════════════════════
         let is_cmp_or_branch = is_compare_e() + is_branch_e();
-        // Constrain the cmp_carry chain: val_b + ~val_d + 1 (two's complement subtraction)
-        // sub_result[i] + carry[i]*256 = val_b[i] + 255 - val_d[i] + carry_in
-        // sub_result[i] is range-checked via Range256 lookup below.
-        let cmp_sub_result = crate::trace::trace_eval!(trace_eval, Column::CmpSubResult);
-        for i in 0..WORD_SIZE {
-            let carry_in = if i == 0 { E::F::one() } else { cmp_carry[i - 1].clone() };
-            eval.add_constraint(
-                is_cmp_or_branch.clone() * (
-                    cmp_sub_result[i].clone() + cmp_carry[i].clone() * f256.clone()
-                    - val_b[i].clone() - f255.clone() + val_d[i].clone() - carry_in
-                )
-            );
-        }
-        // NOTE: Range-check of cmp_sub_result bytes is done later (after result range256)
-        // to match the interaction trace logup entry ORDER.
-        // Constrain cmp_lt_flag = 1 - cmp_carry[7] for compare AND branch
-        eval.add_constraint(
-            is_cmp_or_branch.clone() * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
-        );
+        // Phase 54f: cmp_carry chain + cmp_lt_flag derivation moved to
+        // CompareChip.  CpuChip's cmp_lt_flag is bound via the
+        // CompareLookup tuple to CompareChip's pinned value.
         // Constrain cmp_lt_s_flag via sign-bit analysis (also for branches)
         {
             let sign_b_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
@@ -1446,10 +1430,14 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(
             is_cmp_or_branch.clone() * eq_flag[0].clone() * (E::F::one() - eq_flag[0].clone())
         );
-        // eq_flag=1 ⇒ all sub_result bytes = 0 (val_b == val_d)
+        // Phase 54f: eq_flag=1 ⇒ val_b[i] = val_d[i] (byte-wise).
+        // Reformulated to read val_b/val_d directly so cmp_sub_result
+        // can live on CompareChip.  Equivalent soundness — both arms
+        // pin "val_b == val_d byte-wise" iff eq_flag=1.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_cmp_or_branch.clone() * eq_flag[0].clone() * cmp_sub_result[i].clone()
+                is_cmp_or_branch.clone() * eq_flag[0].clone()
+                    * (val_b[i].clone() - val_d[i].clone())
             );
         }
         // eq_flag=0 ⇒ cmp_lt_flag or NOT equal. Constrain: eq_flag + cmp_lt_flag <= 1 wouldn't work.
@@ -1532,15 +1520,7 @@ impl BuiltInComponent for CpuChip {
             ));
         }
 
-        // Range256 checks for cmp_sub_result bytes (carry chain soundness)
-        // Must be AFTER result range256 to match interaction trace entry order.
-        for i in 0..WORD_SIZE {
-            eval.add_to_relation(RelationEntry::new(
-                range256_lookup,
-                is_cmp_or_branch.clone().into(),
-                &[cmp_sub_result[i].clone()],
-            ));
-        }
+        // Phase 54f: Range256 checks for cmp_sub_result moved to CompareChip.
 
         // ════════════════════════════════════════════════════════════════════
         // Memory access lookup (producer side)
@@ -2914,6 +2894,26 @@ impl BuiltInComponent for CpuChip {
                     mul_lookup,
                     f_is_mul_p54[0].clone().into(),
                     &tuple_p54,
+                ));
+            }
+        }
+
+        // ── Phase 54f: CompareLookup producer ──
+        // Tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
+        // Multiplicity = is_compare + is_branch.  Two paired emissions.
+        {
+            let val_b_p54f = crate::trace::trace_eval!(trace_eval, Column::ValB);
+            let val_d_p54f = crate::trace::trace_eval!(trace_eval, Column::ValD);
+            let cmp_lt_p54f = crate::trace::trace_eval!(trace_eval, Column::CmpLtFlag);
+            let mut tuple_p54f: Vec<E::F> = Vec::with_capacity(17);
+            tuple_p54f.extend_from_slice(&val_b_p54f);
+            tuple_p54f.extend_from_slice(&val_d_p54f);
+            tuple_p54f.push(cmp_lt_p54f[0].clone());
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    compare_lookup,
+                    is_cmp_or_branch.clone().into(),
+                    &tuple_p54f,
                 ));
             }
         }

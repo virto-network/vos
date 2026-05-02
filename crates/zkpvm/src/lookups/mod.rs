@@ -17,7 +17,9 @@ pub use self::{
         BitcountLookupElements,
         BitwiseAndLookupElements, BitwiseLookupElements,
         Blake2bCallLookupElements,
-        Blake2bStateLookupElements, JumpTableLookupElements,
+        Blake2bStateLookupElements,
+        CompareLookupElements,
+        JumpTableLookupElements,
         MemoryAccessLookupElements,
         MultiplicationLookupElements,
         PopcountLookupElements,
@@ -43,6 +45,7 @@ macros::register_relation! {
         Blake2bCallLookupElements,
         MultiplicationLookupElements,
         BitwiseLookupElements,
+        CompareLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

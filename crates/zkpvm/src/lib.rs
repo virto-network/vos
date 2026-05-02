@@ -133,6 +133,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::BitcountChip, // Phase 34 — per-byte (lz, tz) lookup table
     &chips::MulChip,      // Phase 54a — consumer of MultiplicationLookup
     &chips::BitwiseChip,  // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip,  // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
 ];
 
 #[cfg(not(feature = "prover"))]

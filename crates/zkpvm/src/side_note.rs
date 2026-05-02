@@ -67,6 +67,21 @@ pub struct SideNote {
     /// so BitwiseChip's main trace mirrors CpuChip's val_b/val_d/result
     /// + and_result + nibble decompositions exactly.
     pub bitwise_entries: Vec<BitwiseEntry>,
+    /// Phase 54f: per-compare-or-branch-row witness pushed by CpuChip
+    /// so CompareChip's AIR can re-prove the unsigned-LT carry chain.
+    pub compare_entries: Vec<CompareEntry>,
+}
+
+/// Phase 54f — Single compare-or-branch-row witness for the
+/// CompareLookup balance.
+#[derive(Clone, Debug)]
+pub struct CompareEntry {
+    pub val_b: u64,
+    pub val_d: u64,
+    pub cmp_lt_flag: u8,
+    /// Per-byte witness for the val_b + ~val_d + 1 chain.
+    pub cmp_sub_result: [u8; 8],
+    pub cmp_carry: [u8; 8],
 }
 
 /// Phase 54e — Single bitwise-row witness for the BitwiseLookup balance.
@@ -149,6 +164,7 @@ impl SideNote {
             jump_table_counts: Vec::new(),
             mul_entries: Vec::new(),
             bitwise_entries: Vec::new(),
+            compare_entries: Vec::new(),
         }
     }
 

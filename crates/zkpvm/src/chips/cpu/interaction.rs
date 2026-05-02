@@ -26,7 +26,8 @@ use crate::core::step::WORD_SIZE;
 use crate::lookups::{
     AllLookupElements, BitcountLookupElements, BitwiseAndLookupElements,
     BitwiseLookupElements,
-    Blake2bCallLookupElements, JumpTableLookupElements, LogupTraceBuilder,
+    Blake2bCallLookupElements, CompareLookupElements,
+    JumpTableLookupElements, LogupTraceBuilder,
     MemoryAccessLookupElements, MultiplicationLookupElements,
     PopcountLookupElements, PowerOfTwoLookupElements,
     ProgramExecutionLookupElements, ProgramMemoryLookupElements,
@@ -62,10 +63,10 @@ pub(super) fn generate_interaction_trace(
             );
         }
 
-        // Range256 lookups for cmp_sub_result bytes (carry chain soundness)
-        // Phase 53d/53e: IsCompare = sum of 8 compare sub-flags, IsBranch
-        // = sum of 10 branch sub-flags.  The multiplicity for this lookup
-        // is `is_compare + is_branch` which expands to all 18 sub-flags.
+        // Phase 54f: cmp_sub_result Range256 lookup moved to CompareChip.
+        // Bind the per-op flag columns here — referenced by the
+        // ProgramMemory consumer's closure-based slot overrides
+        // (Phase 53d/53e folds) further below.
         let is_setltu_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtU);
         let is_setlts_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtS);
         let is_cmoviz_col = crate::trace::original_base_column!(component_trace, Column::IsCmovIz);
@@ -84,28 +85,6 @@ pub(super) fn generate_interaction_trace(
         let is_br_ge_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrGeS);
         let is_br_le_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrLeS);
         let is_br_gt_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrGtS);
-        let cmp_sub_result = crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
-        for col in &cmp_sub_result {
-            logup.add_to_relation_with(
-                range256,
-                [
-                    is_setltu_col[0].clone(), is_setlts_col[0].clone(),
-                    is_cmoviz_col[0].clone(), is_cmovnz_col[0].clone(),
-                    is_mins_col[0].clone(),   is_minu_col[0].clone(),
-                    is_maxs_col[0].clone(),   is_maxu_col[0].clone(),
-                    is_br_eq_col[0].clone(),  is_br_ne_col[0].clone(),
-                    is_br_lt_u_col[0].clone(), is_br_ge_u_col[0].clone(),
-                    is_br_le_u_col[0].clone(), is_br_gt_u_col[0].clone(),
-                    is_br_lt_s_col[0].clone(), is_br_ge_s_col[0].clone(),
-                    is_br_le_s_col[0].clone(), is_br_gt_s_col[0].clone(),
-                ],
-                |[a, b, c, d, e, f, g, h, br_eq, br_ne, br_lt_u, br_ge_u, br_le_u, br_gt_u, br_lt_s, br_ge_s, br_le_s, br_gt_s]|
-                    (a + b + c + d + e + f + g + h
-                        + br_eq + br_ne + br_lt_u + br_ge_u + br_le_u + br_gt_u
-                        + br_lt_s + br_ge_s + br_le_s + br_gt_s).into(),
-                &[col.clone()],
-            );
-        }
 
         // Memory access lookups — byte-level (up to 8 entries per memory op)
         // Phase 53f: IsStore folded — `is_write` is the sum of the 3
@@ -969,6 +948,58 @@ pub(super) fn generate_interaction_trace(
                             t
                         }
                     },
+                );
+            }
+        }
+
+        // ── Phase 54f: CompareLookup producer (prover-side mirror) ──
+        // Tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
+        // Multiplicity = is_compare + is_branch (= sum of 18 sub-flags).
+        {
+            let compare_p54f: &CompareLookupElements = lookup_elements.as_ref();
+            let val_b_p54f = crate::trace::original_base_column!(component_trace, Column::ValB);
+            let val_d_p54f = crate::trace::original_base_column!(component_trace, Column::ValD);
+            let cmp_lt_p54f = crate::trace::original_base_column!(component_trace, Column::CmpLtFlag);
+            let is_setltu = crate::trace::original_base_column!(component_trace, Column::IsSetLtU);
+            let is_setlts = crate::trace::original_base_column!(component_trace, Column::IsSetLtS);
+            let is_cmoviz = crate::trace::original_base_column!(component_trace, Column::IsCmovIz);
+            let is_cmovnz = crate::trace::original_base_column!(component_trace, Column::IsCmovNz);
+            let is_mins = crate::trace::original_base_column!(component_trace, Column::IsMinS);
+            let is_minu = crate::trace::original_base_column!(component_trace, Column::IsMinU);
+            let is_maxs = crate::trace::original_base_column!(component_trace, Column::IsMaxS);
+            let is_maxu = crate::trace::original_base_column!(component_trace, Column::IsMaxU);
+            let is_br_eq = crate::trace::original_base_column!(component_trace, Column::IsBrEq);
+            let is_br_ne = crate::trace::original_base_column!(component_trace, Column::IsBrNe);
+            let is_br_lt_u = crate::trace::original_base_column!(component_trace, Column::IsBrLtU);
+            let is_br_ge_u = crate::trace::original_base_column!(component_trace, Column::IsBrGeU);
+            let is_br_le_u = crate::trace::original_base_column!(component_trace, Column::IsBrLeU);
+            let is_br_gt_u = crate::trace::original_base_column!(component_trace, Column::IsBrGtU);
+            let is_br_lt_s = crate::trace::original_base_column!(component_trace, Column::IsBrLtS);
+            let is_br_ge_s = crate::trace::original_base_column!(component_trace, Column::IsBrGeS);
+            let is_br_le_s = crate::trace::original_base_column!(component_trace, Column::IsBrLeS);
+            let is_br_gt_s = crate::trace::original_base_column!(component_trace, Column::IsBrGtS);
+            let mut tuple_p54f: Vec<_> = val_b_p54f.to_vec();
+            tuple_p54f.extend_from_slice(&val_d_p54f);
+            tuple_p54f.push(cmp_lt_p54f[0].clone());
+            for _ in 0..2 {
+                logup.add_to_relation_with(
+                    compare_p54f,
+                    [
+                        is_setltu[0].clone(), is_setlts[0].clone(),
+                        is_cmoviz[0].clone(), is_cmovnz[0].clone(),
+                        is_mins[0].clone(), is_minu[0].clone(),
+                        is_maxs[0].clone(), is_maxu[0].clone(),
+                        is_br_eq[0].clone(), is_br_ne[0].clone(),
+                        is_br_lt_u[0].clone(), is_br_ge_u[0].clone(),
+                        is_br_le_u[0].clone(), is_br_gt_u[0].clone(),
+                        is_br_lt_s[0].clone(), is_br_ge_s[0].clone(),
+                        is_br_le_s[0].clone(), is_br_gt_s[0].clone(),
+                    ],
+                    |[a, b, c, d, e, f, g, h, br_eq, br_ne, br_lt_u, br_ge_u, br_le_u, br_gt_u, br_lt_s, br_ge_s, br_le_s, br_gt_s]|
+                        (a + b + c + d + e + f + g + h
+                            + br_eq + br_ne + br_lt_u + br_ge_u + br_le_u + br_gt_u
+                            + br_lt_s + br_ge_s + br_le_s + br_gt_s).into(),
+                    &tuple_p54f,
                 );
             }
         }

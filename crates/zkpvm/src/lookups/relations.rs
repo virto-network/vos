@@ -110,6 +110,19 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_STATE_LOOKUP_SIZE
 );
 
+// Phase 54f — Compare lookup.  CpuChip emits one producer per
+// `is_compare + is_branch` row; CompareChip consumes once per real
+// (non-padding) row.  Tuple binds val_b/val_d/cmp_lt_flag so
+// CompareChip's AIR can re-prove the unsigned-LT result over its
+// narrower trace via the byte-wise subtraction carry chain.
+//
+// Tuple: (val_b[8], val_d[8], cmp_lt_flag) — 17 limbs.
+const REL_COMPARE_LOOKUP_SIZE: usize = WORD_SIZE * 2 + 1;
+stwo_constraint_framework::relation!(
+    CompareLookupElements,
+    REL_COMPARE_LOOKUP_SIZE
+);
+
 // Phase 54e — Bitwise lookup.  CpuChip emits one producer per
 // `is_bitwise` row (sum of 6 sub-flags); BitwiseChip consumes once
 // per real (non-padding) row.  Tuple binds val_b/val_d/result + 6

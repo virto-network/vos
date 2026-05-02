@@ -307,6 +307,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
 
             // ── Compare auxiliary (populated for is_compare OR is_branch) ──
+            // Phase 54f: CmpCarry + CmpSubResult moved to CompareChip;
+            // CompareChip mirrors via side_note.compare_entries.
             let mut cmp_carry = [0u8; WORD_SIZE];
             let mut cmp_sub_result = [0u8; WORD_SIZE];
             let mut cmp_lt_flag: u8 = 0;
@@ -321,9 +323,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
                 // a - b via a + ~b + 1: carry_out=1 means a>=b, carry_out=0 means a<b
                 cmp_lt_flag = 1 - cmp_carry[WORD_SIZE - 1];
+                side_note.compare_entries.push(crate::side_note::CompareEntry {
+                    val_b,
+                    val_d,
+                    cmp_lt_flag,
+                    cmp_sub_result,
+                    cmp_carry,
+                });
             }
-            trace.fill_columns_bytes(row, &cmp_carry, Column::CmpCarry);
-            trace.fill_columns_bytes(row, &cmp_sub_result, Column::CmpSubResult);
             trace.fill_columns(row, cmp_lt_flag, Column::CmpLtFlag);
             let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
             trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);

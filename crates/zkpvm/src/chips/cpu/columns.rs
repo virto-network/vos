@@ -111,9 +111,7 @@ pub enum Column {
     // per-op result identity (AND/OR/XOR/AndInv/OrInv/Xnor) and
     // emits the 16 nibble-AND lookups against BitwiseLookupChip.
     // ── Compare auxiliary ──
-    /// Subtraction carry for comparison (8 limbs, reuses sub logic)
-    #[size = 8]
-    CmpCarry,
+    // Phase 54f: CmpCarry[8] moved to CompareChip.
     /// Compare sub-op flags (exactly one is 1 when IsCompare=1)
     #[size = 1]
     IsSetLtU,
@@ -146,10 +144,9 @@ pub enum Column {
     /// Signed less-than flag: 1 if val_b < val_d (signed).
     #[size = 1]
     CmpLtSFlag,
-    /// Subtraction result bytes: (val_b[i] + 255 - val_d[i] + carry_in) mod 256
-    /// Range-checked to prove carry chain correctness.
-    #[size = 8]
-    CmpSubResult,
+    // Phase 54f: CmpSubResult[8] moved to CompareChip.  CompareChip's
+    // AIR pins it via the val_b + ~val_d + 1 carry chain and emits
+    // the per-byte Range256 lookup.
     /// 1 iff val_b == val_d (all bytes equal). Used for Le/Gt branches.
     /// Constrained via: eq_flag=1 ⇒ all byte_eq[i]=1 AND eq_flag=0 ⇒ NOT all equal
     #[size = 1]
