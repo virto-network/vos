@@ -68,6 +68,7 @@
 //! vos_raft::worker::run_worker(
 //!     storage, transport, cfg, inbox_rx, apply_sink,
 //!     clock, rng, role,
+//!     |_init_ok| {}, // ignore init signal — embedded hosts log their own
 //! ).await;
 //! ```
 

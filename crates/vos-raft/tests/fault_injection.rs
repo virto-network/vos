@@ -406,23 +406,24 @@ fn worker_signals_init_failure_on_load_meta_error() {
         StdRng::from_entropy(),
     );
 
-    // The worker thread exits promptly on the load_meta error.
-    // Give it a moment to set the flag.
-    std::thread::sleep(Duration::from_millis(50));
-
-    // STRONG signal: init_failed reports true. This is the new
-    // observability surface — pre-RD3 the host could only infer
-    // failure from snapshot() returning None, which is ambiguous
-    // (could mean the worker is busy, the channel is full, etc).
+    // wait_init is synchronous — no sleep, no polling: it
+    // blocks until the worker has signaled either success
+    // or failure.
+    let r = worker.wait_init();
+    assert!(
+        matches!(r, Err(())),
+        "wait_init must return Err after load_meta returns Err, got {r:?}",
+    );
+    // Backwards-compat: the legacy init_failed() peek also
+    // reflects the failure now.
     assert!(
         worker.init_failed(),
-        "init failure flag must be set after load_meta returns Err",
+        "init_failed peek must agree with wait_init",
     );
 
-    // Happy-path complement: with no fault, init_failed stays
-    // false. Ship this assertion alongside the failure case so
-    // a regression that defaults the flag to true would be
-    // caught.
+    // Happy-path complement: with no fault, wait_init returns
+    // Ok and init_failed stays false. Catches a regression that
+    // defaulted the flag to true.
     {
         let healthy_storage = FaultStorage::new(MemStorage::<u16>::new());
         let healthy_worker = Worker::spawn_with(
@@ -433,7 +434,11 @@ fn worker_signals_init_failure_on_load_meta_error() {
             StdClock,
             StdRng::from_entropy(),
         );
-        std::thread::sleep(Duration::from_millis(50));
+        let ok = healthy_worker.wait_init();
+        assert!(
+            matches!(ok, Ok(())),
+            "wait_init must return Ok when load_meta succeeded, got {ok:?}",
+        );
         assert!(
             !healthy_worker.init_failed(),
             "init_failed must be false when init succeeded",

@@ -244,14 +244,15 @@ pub struct Worker<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
     join: Option<std::thread::JoinHandle<()>>,
-    /// Set to `true` by the worker thread if `run_worker`
-    /// returned `Err` (which today means
-    /// `Storage::load_meta` failed at init). Read via
-    /// [`Worker::init_failed`] — gives the host a yes/no
-    /// signal that init succeeded; the `Err`'s payload isn't
-    /// surfaced (would require carrying `S::Error` in the
-    /// `Worker` type parameter).
-    init_failed: Arc<core::sync::atomic::AtomicBool>,
+    /// Init signal: `None` while the worker is still trying to
+    /// load its persisted meta; `Some(true)` once
+    /// `Storage::load_meta` returned `Ok`; `Some(false)` if it
+    /// returned `Err` (the worker thread exits without joining
+    /// the cluster). Hosts wait on this via
+    /// [`Worker::wait_init`] — synchronous, no polling. The
+    /// `Err`'s payload isn't surfaced (carrying it would force
+    /// `S::Error` into `Worker`'s type parameters).
+    init: Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
 }
 
 #[cfg(feature = "std")]
@@ -331,12 +332,20 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
-        let init_failed = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let init_failed_for_thread = init_failed.clone();
+        let init = Arc::new((
+            std::sync::Mutex::new(None::<bool>),
+            std::sync::Condvar::new(),
+        ));
+        let init_for_thread = init.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
-                let res = futures_executor::block_on(run_worker(
+                let init_signal = move |ok: bool| {
+                    let mut g = init_for_thread.0.lock().unwrap();
+                    *g = Some(ok);
+                    init_for_thread.1.notify_all();
+                };
+                let _ = futures_executor::block_on(run_worker(
                     storage,
                     transport,
                     cfg,
@@ -345,18 +354,15 @@ impl<N: NodeId> Worker<N> {
                     clock,
                     rng,
                     role_for_thread,
+                    init_signal,
                 ));
-                if res.is_err() {
-                    init_failed_for_thread
-                        .store(true, core::sync::atomic::Ordering::Release);
-                }
             })
             .expect("spawn raft worker");
         Self {
             inbox: Inbox { inner: tx },
             role,
             join: Some(join),
-            init_failed,
+            init,
         }
     }
 
@@ -388,16 +394,24 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
-        let init_failed = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let init_failed_for_thread = init_failed.clone();
+        let init = Arc::new((
+            std::sync::Mutex::new(None::<bool>),
+            std::sync::Condvar::new(),
+        ));
+        let init_for_thread = init.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
+                let init_signal = move |ok: bool| {
+                    let mut g = init_for_thread.0.lock().unwrap();
+                    *g = Some(ok);
+                    init_for_thread.1.notify_all();
+                };
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
                     .expect("build tokio current-thread runtime for raft worker");
-                let res = rt.block_on(run_worker(
+                let _ = rt.block_on(run_worker(
                     storage,
                     transport,
                     cfg,
@@ -406,34 +420,52 @@ impl<N: NodeId> Worker<N> {
                     clock,
                     rng,
                     role_for_thread,
+                    init_signal,
                 ));
-                if res.is_err() {
-                    init_failed_for_thread
-                        .store(true, core::sync::atomic::Ordering::Release);
-                }
             })
             .expect("spawn raft worker");
         Self {
             inbox: Inbox { inner: tx },
             role,
             join: Some(join),
-            init_failed,
+            init,
         }
     }
 
-    /// `true` if the worker thread exited with an init failure
-    /// (today: `Storage::load_meta` returned `Err`). Lock-free
-    /// atomic read; reading after a brief idle window is the
-    /// reliable check.
+    /// Block until the worker has finished its persisted-meta
+    /// load attempt. Returns `Ok(())` if `Storage::load_meta`
+    /// succeeded (the worker is now running), `Err(())` if it
+    /// failed (the worker thread has exited; `S::Error` was
+    /// dropped — host-side logging captures the underlying
+    /// cause).
     ///
-    /// `false` either means init succeeded OR the worker is
-    /// still running. To distinguish, also check
-    /// [`Worker::role`] or `snapshot()` — a successfully-started
-    /// worker reports a real role; a never-started one returns
-    /// `Follower` from the atomic mirror but its inbox is dead.
+    /// This is the recommended replacement for the older
+    /// [`Worker::init_failed`] polling API. A typical pattern:
+    ///
+    /// ```ignore
+    /// let worker = Worker::spawn(storage, transport, cfg, None);
+    /// worker.wait_init().expect("raft init failed");
+    /// // ...the worker is now serving...
+    /// ```
+    pub fn wait_init(&self) -> Result<(), ()> {
+        let mut g = self.init.0.lock().unwrap();
+        while g.is_none() {
+            g = self.init.1.wait(g).unwrap();
+        }
+        match *g {
+            Some(true) => Ok(()),
+            Some(false) => Err(()),
+            None => unreachable!("loop guarantees Some"),
+        }
+    }
+
+    /// `true` if the worker thread exited with an init failure.
+    /// Non-blocking peek; `false` either means init succeeded
+    /// OR the worker is still trying. Prefer
+    /// [`Worker::wait_init`] which blocks until the result is
+    /// known.
     pub fn init_failed(&self) -> bool {
-        self.init_failed
-            .load(core::sync::atomic::Ordering::Acquire)
+        matches!(*self.init.0.lock().unwrap(), Some(false))
     }
 
     /// Cheap clone-able handle.
@@ -1113,12 +1145,19 @@ where
 /// the initial `Storage::load_meta` call fails — the worker
 /// can't safely start without its persisted meta state. Hosts
 /// using [`Worker::spawn`] / [`Worker::spawn_with_tokio_runtime`]
-/// can read the result via [`Worker::join_result`].
+/// can read the result via [`Worker::wait_init`].
+///
+/// `init_done` is invoked exactly once after `Storage::load_meta`
+/// resolves — `true` on success, `false` on failure. The
+/// std-feature spawn helpers use this to signal the host
+/// synchronously rather than forcing a polling loop on the
+/// init-state atomic. Embedded hosts that don't need the
+/// signal can pass `|_| {}`.
 ///
 /// Embedded hosts call this directly inside their executor.
 /// Std hosts typically use [`Worker::spawn`].
 #[allow(clippy::too_many_arguments)]
-pub async fn run_worker<N, S, T, C, R, A>(
+pub async fn run_worker<N, S, T, C, R, A, F>(
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
@@ -1127,6 +1166,7 @@ pub async fn run_worker<N, S, T, C, R, A>(
     clock: C,
     rng: R,
     role_atomic: Arc<AtomicU8>,
+    init_done: F,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -1135,8 +1175,18 @@ where
     C: Clock,
     R: Rng,
     A: ApplySink,
+    F: FnOnce(bool),
 {
-    let meta = storage.load_meta().await?;
+    let meta = match storage.load_meta().await {
+        Ok(m) => {
+            init_done(true);
+            m
+        }
+        Err(e) => {
+            init_done(false);
+            return Err(e);
+        }
+    };
     // Recover effective configuration by scanning the live log
     // tail for the latest `ConfigChange` entry. If none is
     // found, fall back to `cfg.members`. Recently-compacted
