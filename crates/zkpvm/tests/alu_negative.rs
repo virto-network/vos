@@ -374,17 +374,12 @@ fn div_s64_negative_forged_off_by_one_rejected() {
 // DivS rows (Phase 17 alone pinned them to byte 7, which is always
 // zero on 32-bit DivS).
 //
-// Coverage caveat — the AIR's pre-existing 32-bit ALU constraint
-// `result[4..8] = 0` (mod.rs:758, shared with all 32-bit ALU ops)
-// is incompatible with the interpreter's sign-extension of negative
-// 32-bit results to 64-bit (`q as i64 as u64` in javm/src/vm.rs).
-// Same gap as documented in the Add32 comment at the top of this
-// file.  Tests here are restricted to cases where the 32-bit *result*
-// is non-negative (no sign-extension), even though either operand
-// (and the schoolbook's high bytes) may be negative — which is
-// exactly the path Phase 18's chain corrects.  Negative-result
-// DivS32 / RemS32 needs a follow-up that loosens the result-
-// truncation constraint to permit sign-extension; deferred.
+// Negative-result DivS32 / RemS32 is now bound: the result-binding
+// `result[i] = 0xFF · SignBitResult` for i ∈ 4..8 (Phase 19,
+// gated on is_div_rem · is_32bit at cpu/mod.rs:495-501) sign-extends
+// the low-32 result up to 64 bits, matching the interpreter's
+// `q as i64 as u64`.  The smoke + forge tests below cover the
+// negative-result paths.
 
 #[test]
 fn div_s32_both_negative_smoke() {
@@ -426,6 +421,86 @@ fn div_s32_both_negative_forged_off_by_one_rejected() {
         (-100i32) as u32 as u64,
         (-7i32) as u32 as u64,
         /*forged*/ 13,
+    );
+}
+
+#[test]
+fn div_s32_negative_result_smoke() {
+    // 100 / -7 = -14 (negative 32-bit result).  Exercises the
+    // sign-extension path: result low 4 bytes = 0xFFFF_FFF2,
+    // result high 4 bytes = 0xFFFF_FFFF (= 0xFF · SignBitResult=1).
+    // Pre-Phase-19-on-divrem the AIR rejected this because it
+    // required result[4..8] = 0.
+    prove_three_reg(
+        Opcode::DivS32, 2, 0, 1,
+        100,
+        (-7i32) as u32 as u64,
+        (-14i32) as i64 as u64, // sign-extended to 64-bit
+    );
+}
+
+#[test]
+fn rem_s32_negative_result_smoke() {
+    // -100 % 7 = -2 (negative 32-bit remainder, sign-of-dividend
+    // rule).  Result column has sign-extension on high bytes.
+    prove_three_reg(
+        Opcode::RemS32, 2, 0, 1,
+        (-100i32) as u32 as u64,
+        7,
+        (-2i32) as i64 as u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn div_s32_negative_result_forged_high_bytes_rejected() {
+    // -14 sign-extends to 0xFFFFFFFFFFFFFFF2.  Forge the upper
+    // 32 bits to 0 — the AIR's sign-extension constraint (Phase 19
+    // on divrem rows) demands result[4..8] = 0xFF · SignBitResult,
+    // and SignBitResult = bit 7 of result[3] = 1, so high bytes
+    // must all be 0xFF.  Forging to 0 should be rejected.
+    forge_three_reg_result(
+        Opcode::DivS32, 2, 0, 1,
+        100,
+        (-7i32) as u32 as u64,
+        /*forged*/ 0xFFFFFFF2u64, // honest = sign-ext, this truncates
+    );
+}
+
+// ── Phase 31: DivS sign-of-r uniqueness ──────────────────────────────────
+//
+// `sign(r) = sign(b)` when r ≠ 0 (PVM round-toward-zero rule).  Phase 31
+// pins this via `is_div_s · ¬div_by_zero · ValRPartialNZ[7] ·
+// (SignBitR − SignBitB) = 0`.  Without it, prover could swap the
+// honest (q, r) pair for (q − 1, r + d) when sign(r) and sign(d)
+// disagree AND |r + d| < |d|.
+
+#[test]
+fn div_s64_negative_dividend_positive_divisor_smoke() {
+    // -100 / 7 = -14 r -2.  sign(r) = sign(b) = 1 ✓.  Honest path.
+    prove_three_reg(
+        Opcode::DivS64, 2, 0, 1,
+        (-100i64) as u64,
+        7,
+        (-14i64) as u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn rem_s64_forged_sign_flip_rejected() {
+    // -100 % 7 = -2 (honest).  The off-by-(d) attack swaps to
+    // (q' = q - 1, r' = r + d) = (-15, +5).  This satisfies the
+    // schoolbook q'*d + r' = -15*7 + 5 = -100 = val_b ✓ AND
+    // |r'|=5 < |d|=7 ✓.  Phase 30's |r|<|d| alone accepts both
+    // pairs!  The Phase 31 sign(r)=sign(b) constraint is what
+    // rejects it: r' = +5 has sign 0 ≠ sign(b) = 1.  Forge the
+    // result to +5 (the bad remainder) and confirm rejection.
+    forge_three_reg_result(
+        Opcode::RemS64, 2, 0, 1,
+        (-100i64) as u64,
+        7,
+        /*forged*/ 5,
     );
 }
 
