@@ -113,6 +113,15 @@ pub struct DivRemEntry {
     pub sign_bit_d: u8,
     pub sign_bit_q: u8,
     pub sign_bit_r: u8,
+    /// Phase 54j-redux: |val_d| / |div_remainder| via two's-complement
+    /// conditional negation + comparison chain.  All six arrays are
+    /// DivRemChip-internal; gated on sign_bit_d/sign_bit_r.
+    pub abs_d: [u8; 8],
+    pub abs_d_carry: [u8; 8],
+    pub abs_r: [u8; 8],
+    pub abs_r_carry: [u8; 8],
+    pub abs_cmp_diff: [u8; 8],
+    pub abs_cmp_carry: [u8; 8],
 }
 
 /// Phase 54f — Single compare-or-branch-row witness for the

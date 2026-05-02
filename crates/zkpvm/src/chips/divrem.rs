@@ -1,4 +1,4 @@
-//! Phase 54g / 54i / 54k — `DivRemChip`: per-divrem-row chip.
+//! Phase 54g / 54i / 54k / 54j-redux — `DivRemChip`: per-divrem-row chip.
 //!
 //! CpuChip emits one DivRemLookup producer per `is_div_rem=1` row;
 //! DivRemChip consumes once per real row.  DivRemChip witnesses
@@ -14,7 +14,13 @@
 //!      `is_div_rem · ¬div_by_zero · is_div_s` rows.  64-bit chain
 //!      covers all 8 bytes; 32-bit chain covers low 4.
 //!
-//! Per-byte Range256 emissions on DivCmpDiff enforce its byte range.
+//! Phase 54j-redux adds the full Phase 30 |val_d|<|div_remainder|
+//! chain (was on CpuChip).  The two's-complement conditional
+//! negation chains compute AbsD/AbsR from val_d/div_remainder
+//! gated on sign_bit_d/sign_bit_r (flowed from CpuChip via the
+//! lookup tuple); the AbsCmp chain pins |val_d|>|div_remainder|
+//! on signed-div rows.  Per-byte Range256 emissions on DivCmpDiff
+//! and AbsCmpDiff enforce byte range.
 //!
 //! Lookup tuple (40 limbs): val_b[8] + val_d[8] + div_quotient[8] +
 //! div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
@@ -106,7 +112,8 @@ pub enum Column {
     #[size = 8]
     DivCorrCarry,
     /// Phase 54k: 4 sign bits flowed from CpuChip via the lookup
-    /// tuple.  Used by the Phase 16/18 sign-correction chain.
+    /// tuple.  Used by the Phase 16/18 sign-correction chain (54k)
+    /// and the Phase 30 conditional-negation chain (54j-redux).
     #[size = 1]
     SignBitB,
     #[size = 1]
@@ -115,6 +122,25 @@ pub enum Column {
     SignBitQ,
     #[size = 1]
     SignBitR,
+    /// Phase 54j-redux: |val_d| via two's-complement negation gated
+    /// on sign_bit_d.  Internal witness; not flowed.
+    #[size = 8]
+    AbsD,
+    #[size = 8]
+    AbsDCarry,
+    /// Phase 54j-redux: |div_remainder| via two's-complement negation
+    /// gated on sign_bit_r.
+    #[size = 8]
+    AbsR,
+    #[size = 8]
+    AbsRCarry,
+    /// Phase 54j-redux: per-byte `abs_d + ~abs_r + 1` chain witness.
+    /// Range-checked via Range256.  Top carry forced to 1 on signed
+    /// div rows (`is_div_rem · ¬div_by_zero · is_div_s`).
+    #[size = 8]
+    AbsCmpDiff,
+    #[size = 8]
+    AbsCmpCarry,
     #[size = 1]
     IsPadding,
 }
@@ -159,6 +185,12 @@ impl BuiltInComponent for DivRemChip {
         let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
         let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
         let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
+        let abs_d = crate::trace::trace_eval!(trace_eval, Column::AbsD);
+        let abs_d_carry = crate::trace::trace_eval!(trace_eval, Column::AbsDCarry);
+        let abs_r = crate::trace::trace_eval!(trace_eval, Column::AbsR);
+        let abs_r_carry = crate::trace::trace_eval!(trace_eval, Column::AbsRCarry);
+        let abs_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::AbsCmpDiff);
+        let abs_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::AbsCmpCarry);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
         // Boolean constraints on flag columns.
@@ -329,14 +361,116 @@ impl BuiltInComponent for DivRemChip {
             );
         }
 
+        // ── Phase 54j-redux: |val_d| / |div_remainder| via two's-
+        // complement conditional negation + |val_d|>|div_remainder|
+        // comparison chain (was Phase 30 on CpuChip) ──
+        //
+        // Conditional negation per value X (one of val_d, div_remainder):
+        //   sign(X) = 0: Abs[i] = X[i],  AbsCarry[i] = 0
+        //   sign(X) = 1: Abs[i] + AbsCarry[i]·256 = (255 − X[i]) + carry_in
+        //                 with carry_in[0] = 1 (the +1 of two's complement).
+        let f_255: E::F = E::F::from(BaseField::from(255));
+        // AbsD chain.
+        for i in 0..WORD_SIZE {
+            // sign_bit_d = 0 ⇒ AbsD[i] = val_d[i], AbsDCarry[i] = 0.
+            eval.add_constraint(
+                is_real.clone()
+                    * (E::F::one() - sign_bit_d[0].clone())
+                    * (abs_d[i].clone() - val_d[i].clone())
+            );
+            eval.add_constraint(
+                is_real.clone()
+                    * (E::F::one() - sign_bit_d[0].clone())
+                    * abs_d_carry[i].clone()
+            );
+            // sign_bit_d = 1 ⇒ chain.
+            let neg_carry_in = if i == 0 {
+                E::F::one()
+            } else {
+                abs_d_carry[i - 1].clone()
+            };
+            eval.add_constraint(
+                is_real.clone()
+                    * sign_bit_d[0].clone()
+                    * (
+                        abs_d[i].clone()
+                            + abs_d_carry[i].clone() * f256.clone()
+                            - f_255.clone()
+                            + val_d[i].clone()
+                            - neg_carry_in
+                    )
+            );
+        }
+        // AbsR chain (same shape on div_remainder).
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                is_real.clone()
+                    * (E::F::one() - sign_bit_r[0].clone())
+                    * (abs_r[i].clone() - div_remainder[i].clone())
+            );
+            eval.add_constraint(
+                is_real.clone()
+                    * (E::F::one() - sign_bit_r[0].clone())
+                    * abs_r_carry[i].clone()
+            );
+            let neg_carry_in = if i == 0 {
+                E::F::one()
+            } else {
+                abs_r_carry[i - 1].clone()
+            };
+            eval.add_constraint(
+                is_real.clone()
+                    * sign_bit_r[0].clone()
+                    * (
+                        abs_r[i].clone()
+                            + abs_r_carry[i].clone() * f256.clone()
+                            - f_255.clone()
+                            + div_remainder[i].clone()
+                            - neg_carry_in
+                    )
+            );
+        }
+        // AbsCmp chain: |val_d| > |div_remainder| iff (AbsD − 1 − AbsR) ≥ 0.
+        // Encoded as `AbsD + ~AbsR` (carry_in[0] = 0); top carry = 1
+        // forced on `is_div_rem · ¬div_by_zero · is_div_s` rows.
+        for i in 0..WORD_SIZE {
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                abs_cmp_carry[i - 1].clone()
+            };
+            eval.add_constraint(
+                is_real.clone() * (
+                    abs_cmp_diff[i].clone()
+                        + abs_cmp_carry[i].clone() * f256.clone()
+                        - abs_d[i].clone()
+                        - f_255.clone()
+                        + abs_r[i].clone()
+                        - carry_in
+                )
+            );
+        }
+        // Top carry = 1 on signed-div rows.
+        eval.add_constraint(
+            div_s_active.clone() * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone())
+        );
+
         // Range256 emissions on DivCmpDiff bytes.  8 emissions per real
-        // row, gated by is_real, even count (paired with the Phase 54g
-        // schoolbook chain's emissions implicitly via finalize_in_pairs).
+        // row, gated by is_real (paired with AbsCmpDiff below for the
+        // even-count requirement of finalize_logup_in_pairs).
         for i in 0..WORD_SIZE {
             eval.add_to_relation(RelationEntry::new(
                 range256_lookup,
                 is_real.clone().into(),
                 &[div_cmp_diff[i].clone()],
+            ));
+        }
+        // Range256 emissions on AbsCmpDiff bytes (8 per real row).
+        for i in 0..WORD_SIZE {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_real.clone().into(),
+                &[abs_cmp_diff[i].clone()],
             ));
         }
 
@@ -405,6 +539,12 @@ impl BuiltInProverComponent for DivRemChip {
             trace.fill_columns(row, e.sign_bit_d, Column::SignBitD);
             trace.fill_columns(row, e.sign_bit_q, Column::SignBitQ);
             trace.fill_columns(row, e.sign_bit_r, Column::SignBitR);
+            trace.fill_columns_bytes(row, &e.abs_d, Column::AbsD);
+            trace.fill_columns_bytes(row, &e.abs_d_carry, Column::AbsDCarry);
+            trace.fill_columns_bytes(row, &e.abs_r, Column::AbsR);
+            trace.fill_columns_bytes(row, &e.abs_r_carry, Column::AbsRCarry);
+            trace.fill_columns_bytes(row, &e.abs_cmp_diff, Column::AbsCmpDiff);
+            trace.fill_columns_bytes(row, &e.abs_cmp_carry, Column::AbsCmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
         }
 
@@ -444,10 +584,20 @@ impl BuiltInProverComponent for DivRemChip {
         let sign_bit_q = crate::trace::original_base_column!(component_trace, Column::SignBitQ);
         let sign_bit_r = crate::trace::original_base_column!(component_trace, Column::SignBitR);
         let div_cmp_diff = crate::trace::original_base_column!(component_trace, Column::DivCmpDiff);
+        let abs_cmp_diff = crate::trace::original_base_column!(component_trace, Column::AbsCmpDiff);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
         // Range256 emissions for DivCmpDiff bytes (8 per row, gated by is_real).
         for col in &div_cmp_diff {
+            logup.add_to_relation_with(
+                range256,
+                [is_padding[0].clone()],
+                |[pad]| (PackedBaseField::one() - pad).into(),
+                &[col.clone()],
+            );
+        }
+        // Range256 emissions for AbsCmpDiff bytes (8 per row, gated by is_real).
+        for col in &abs_cmp_diff {
             logup.add_to_relation_with(
                 range256,
                 [is_padding[0].clone()],

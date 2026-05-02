@@ -614,148 +614,10 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Phase 30: DivS |r| < |d| uniqueness
-        //
-        // Phase 21 closed `r < d` for DivU; signed div needs the
-        // analogous `|r| < |d|` (the magnitude half of PVM's signed
-        // Euclidean uniqueness).  Mechanism: two's-complement
-        // conditional negation chains compute |val_d| and
-        // |div_remainder| into AbsD / AbsR (active when SignBit = 1),
-        // then a Phase-21-style `(AbsD − 1 − AbsR) ≥ 0` chain pins
-        // `|val_d| > |div_remainder|`.
-        //
-        // Conditional negation per value X (one of val_d, div_remainder):
-        //   SignBitX = 0: Abs[i] = X[i],  AbsCarry[i] = 0.
-        //   SignBitX = 1: Abs[i] + AbsCarry[i]·256 = (255 − X[i]) + carry_in
-        //                 with carry_in[0] = 1, carry_in[i>0] = AbsCarry[i-1].
-        //
-        // Out of scope (deferred): `sign(r) = sign(b)` (or r = 0) — the
-        // other half of signed Euclidean uniqueness.  Without it a
-        // prover could swap (q, r) for (q − 1, r + d) when sign(r)
-        // and sign(d) differ AND |r + d| < |d|; closing it requires a
-        // byte-wise zero-check on div_remainder analogous to Phase
-        // 29's val_d zero-check.
-        {
-            let sign_bit_d_p30 = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-            let sign_bit_r_p30 = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
-            let abs_d = crate::trace::trace_eval!(trace_eval, Column::AbsD);
-            let abs_d_carry = crate::trace::trace_eval!(trace_eval, Column::AbsDCarry);
-            let abs_r = crate::trace::trace_eval!(trace_eval, Column::AbsR);
-            let abs_r_carry = crate::trace::trace_eval!(trace_eval, Column::AbsRCarry);
-            let abs_cmp_diff = crate::trace::trace_eval!(trace_eval, Column::AbsCmpDiff);
-            let abs_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::AbsCmpCarry);
-
-            // Booleans (gated is_real so range is forced even on
-            // non-DivS rows where the chains are dormant).
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone() * abs_d_carry[i].clone()
-                        * (E::F::one() - abs_d_carry[i].clone())
-                );
-                eval.add_constraint(
-                    is_real.clone() * abs_r_carry[i].clone()
-                        * (E::F::one() - abs_r_carry[i].clone())
-                );
-                eval.add_constraint(
-                    is_real.clone() * abs_cmp_carry[i].clone()
-                        * (E::F::one() - abs_cmp_carry[i].clone())
-                );
-            }
-
-            // Conditional negation for AbsD.
-            //   Positive (SignBitD = 0): AbsD = val_d, AbsDCarry = 0.
-            //   Negative (SignBitD = 1):
-            //     AbsD[i] + AbsDCarry[i]·256 = (255 − val_d[i]) + carry_in
-            //     with carry_in[0] = 1.
-            let f_255_p30: E::F = E::F::from(BaseField::from(255));
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone()
-                        * (E::F::one() - sign_bit_d_p30[0].clone())
-                        * (abs_d[i].clone() - val_d[i].clone())
-                );
-                eval.add_constraint(
-                    is_real.clone()
-                        * (E::F::one() - sign_bit_d_p30[0].clone())
-                        * abs_d_carry[i].clone()
-                );
-                let neg_carry_in = if i == 0 {
-                    E::F::one()
-                } else {
-                    abs_d_carry[i - 1].clone()
-                };
-                eval.add_constraint(
-                    is_real.clone()
-                        * sign_bit_d_p30[0].clone()
-                        * (
-                            abs_d[i].clone()
-                                + abs_d_carry[i].clone() * f256.clone()
-                                - f_255_p30.clone()
-                                + val_d[i].clone()
-                                - neg_carry_in
-                        )
-                );
-            }
-
-            // Same shape for AbsR.
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone()
-                        * (E::F::one() - sign_bit_r_p30[0].clone())
-                        * (abs_r[i].clone() - div_remainder[i].clone())
-                );
-                eval.add_constraint(
-                    is_real.clone()
-                        * (E::F::one() - sign_bit_r_p30[0].clone())
-                        * abs_r_carry[i].clone()
-                );
-                let neg_carry_in = if i == 0 {
-                    E::F::one()
-                } else {
-                    abs_r_carry[i - 1].clone()
-                };
-                eval.add_constraint(
-                    is_real.clone()
-                        * sign_bit_r_p30[0].clone()
-                        * (
-                            abs_r[i].clone()
-                                + abs_r_carry[i].clone() * f256.clone()
-                                - f_255_p30.clone()
-                                + div_remainder[i].clone()
-                                - neg_carry_in
-                        )
-                );
-            }
-
-            // Comparison chain: AbsD > AbsR  iff  (AbsD − 1 − AbsR) ≥ 0.
-            // Encoded as `AbsD + ~AbsR` (carry_in[0] = 0); top carry = 1
-            // on |val_d| > |div_remainder| rows.  Mirrors Phase 21.
-            for i in 0..WORD_SIZE {
-                let carry_in = if i == 0 {
-                    E::F::zero()
-                } else {
-                    abs_cmp_carry[i - 1].clone()
-                };
-                eval.add_constraint(
-                    is_real.clone() * (
-                        abs_cmp_diff[i].clone()
-                            + abs_cmp_carry[i].clone() * f256.clone()
-                            - abs_d[i].clone()
-                            - f_255_p30.clone()
-                            + abs_r[i].clone()
-                            - carry_in
-                    )
-                );
-            }
-
-            // Top carry forced to 1 on `is_div_s · ¬div_by_zero` rows.
-            let div_s_active_p30 = is_div_s[0].clone()
-                * (E::F::one() - div_by_zero[0].clone());
-            eval.add_constraint(
-                div_s_active_p30
-                    * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone())
-            );
-        }
+        // Phase 30 → 54j-redux: full DivS |r|<|d| chain moved to DivRemChip.
+        // AbsD/AbsDCarry/AbsR/AbsRCarry + AbsCmpDiff/AbsCmpCarry are now
+        // DivRemChip-internal columns; the chains run on the narrower
+        // trace using sign_bit_d / sign_bit_r flowed via the 54k tuple.
 
         // ════════════════════════════════════════════════════════════════════
         // Phase 31: DivS sign-of-r uniqueness (`sign(r) = sign(b)` when r ≠ 0)
@@ -2613,18 +2475,8 @@ impl BuiltInComponent for CpuChip {
         // Phase 21 → 54i: DivCmpDiff Range256 emissions moved to
         // DivRemChip (now witnesses + range-checks on its own trace).
 
-        // Phase 30: range-check AbsCmpDiff bytes via Range256.  Same
-        // pattern as Phase 21 — 8 emissions per real row, even count.
-        {
-            let abs_cmp_diff_p30 = crate::trace::trace_eval!(trace_eval, Column::AbsCmpDiff);
-            for i in 0..WORD_SIZE {
-                eval.add_to_relation(RelationEntry::new(
-                    range256_lookup,
-                    is_real.clone().into(),
-                    &[abs_cmp_diff_p30[i].clone()],
-                ));
-            }
-        }
+        // Phase 30 → 54j-redux: AbsCmpDiff Range256 emissions moved to
+        // DivRemChip (now witnesses + range-checks on its own trace).
 
         // ── Phase 54a/b/c/d: MultiplicationLookup producer ──
         // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +

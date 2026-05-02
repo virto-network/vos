@@ -970,23 +970,8 @@ pub(super) fn generate_interaction_trace(
         // Phase 21 → 54i: DivCmpDiff Range256 emissions moved to
         // DivRemChip (witnesses + range-checks on its own trace).
 
-        // Phase 30: range-check AbsCmpDiff bytes via Range256.
-        {
-            let range256_p30: &Range256LookupElements = lookup_elements.as_ref();
-            let is_pad_col_p30 = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-            let abs_cmp_diff_cols = crate::trace::original_base_column!(component_trace, Column::AbsCmpDiff);
-            for col in &abs_cmp_diff_cols {
-                logup.add_to_relation_with(
-                    range256_p30,
-                    [is_pad_col_p30[0].clone()],
-                    |[pad]| {
-                        use stwo::prover::backend::simd::m31::PackedBaseField;
-                        (PackedBaseField::one() - pad).into()
-                    },
-                    &[col.clone()],
-                );
-            }
-        }
+        // Phase 30 → 54j-redux: AbsCmpDiff Range256 emissions moved
+        // to DivRemChip.
 
         // ── Phase 54a/b/c/d: MultiplicationLookup producer (prover-side mirror) ──
         // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +

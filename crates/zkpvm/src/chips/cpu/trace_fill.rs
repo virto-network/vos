@@ -802,46 +802,42 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
             trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
 
-            // Phase 30: |val_d| / |div_remainder| via two's-complement
-            // conditional negation, then `|val_d| > |div_remainder|`
-            // via Phase-21-shaped chain.  Active on every real row
-            // (chain forced via boolean carries to be valid even on
-            // non-DivS rows where the top-carry constraint is dormant).
+            // Phase 30 → 54j-redux: |val_d| / |div_remainder| chains
+            // and the AbsCmp comparison chain moved to DivRemChip.
+            // We still compute the bytes here so the DivRemEntry can
+            // ship them; only divrem rows allocate, and on those rows
+            // the AbsCmpDiff bytes feed the Range256 multiplicity.
             let mut abs_d = [0u8; WORD_SIZE];
             let mut abs_d_carry = [0u8; WORD_SIZE];
             let mut abs_r = [0u8; WORD_SIZE];
             let mut abs_r_carry = [0u8; WORD_SIZE];
-            let sign_d_p30: u8 = if flags.is_32bit { (val_d_bytes[3] >> 7) & 1 } else { (val_d_bytes[7] >> 7) & 1 };
-            let sign_r_p30: u8 = if flags.is_32bit { (div_remainder[3] >> 7) & 1 } else { (div_remainder[7] >> 7) & 1 };
-            // AbsD chain.
-            if sign_d_p30 == 0 {
-                abs_d.copy_from_slice(&val_d_bytes);
-            } else {
-                let mut c: u16 = 1; // +1 of two's complement
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - val_d_bytes[i] as u16) + c;
-                    abs_d[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_d_carry[i] = c as u8;
-                }
-            }
-            // AbsR chain.
-            if sign_r_p30 == 0 {
-                abs_r.copy_from_slice(&div_remainder);
-            } else {
-                let mut c: u16 = 1;
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - div_remainder[i] as u16) + c;
-                    abs_r[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_r_carry[i] = c as u8;
-                }
-            }
-            // Comparison chain: `AbsD > AbsR` via `(AbsD + ~AbsR)` with
-            // carry_in[0] = 0; top carry = 1 iff AbsD > AbsR.
             let mut abs_cmp_diff = [0u8; WORD_SIZE];
             let mut abs_cmp_carry = [0u8; WORD_SIZE];
-            {
+            if flags.is_div_rem {
+                let sign_d_p30: u8 = if flags.is_32bit { (val_d_bytes[3] >> 7) & 1 } else { (val_d_bytes[7] >> 7) & 1 };
+                let sign_r_p30: u8 = if flags.is_32bit { (div_remainder[3] >> 7) & 1 } else { (div_remainder[7] >> 7) & 1 };
+                if sign_d_p30 == 0 {
+                    abs_d.copy_from_slice(&val_d_bytes);
+                } else {
+                    let mut c: u16 = 1; // +1 of two's complement
+                    for i in 0..WORD_SIZE {
+                        let s = (255u16 - val_d_bytes[i] as u16) + c;
+                        abs_d[i] = (s & 0xFF) as u8;
+                        c = s >> 8;
+                        abs_d_carry[i] = c as u8;
+                    }
+                }
+                if sign_r_p30 == 0 {
+                    abs_r.copy_from_slice(&div_remainder);
+                } else {
+                    let mut c: u16 = 1;
+                    for i in 0..WORD_SIZE {
+                        let s = (255u16 - div_remainder[i] as u16) + c;
+                        abs_r[i] = (s & 0xFF) as u8;
+                        c = s >> 8;
+                        abs_r_carry[i] = c as u8;
+                    }
+                }
                 let mut c: u16 = 0;
                 for i in 0..WORD_SIZE {
                     let s = abs_d[i] as u16 + (255u16 - abs_r[i] as u16) + c;
@@ -849,15 +845,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     c = s >> 8;
                     abs_cmp_carry[i] = c as u8;
                 }
-            }
-            trace.fill_columns_bytes(row, &abs_d, Column::AbsD);
-            trace.fill_columns_bytes(row, &abs_d_carry, Column::AbsDCarry);
-            trace.fill_columns_bytes(row, &abs_r, Column::AbsR);
-            trace.fill_columns_bytes(row, &abs_r_carry, Column::AbsRCarry);
-            trace.fill_columns_bytes(row, &abs_cmp_diff, Column::AbsCmpDiff);
-            trace.fill_columns_bytes(row, &abs_cmp_carry, Column::AbsCmpCarry);
-            for &b in &abs_cmp_diff {
-                range_bytes.push(b);
+                // 8 Range256 charges per divrem row (matches DivRemChip's
+                // 8 emissions on each real row of its narrower trace).
+                for &b in &abs_cmp_diff {
+                    range_bytes.push(b);
+                }
             }
             // Phase 17 / 18: SignBitQ / SignBitR are pinned to bit 7
             // of the multiplexed source byte (div_quotient[7] in
@@ -900,6 +892,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     sign_bit_d,
                     sign_bit_q,
                     sign_bit_r,
+                    abs_d,
+                    abs_d_carry,
+                    abs_r,
+                    abs_r_carry,
+                    abs_cmp_diff,
+                    abs_cmp_carry,
                 });
             }
 
