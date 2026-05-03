@@ -240,7 +240,7 @@ fn profile_actor(name: &str, gas: u64) {
         }
     }
     let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
-    let (interp, _flat_mem) = interpreter_from_blob(&blob, gas);
+    let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
 
     let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
@@ -269,7 +269,9 @@ fn profile_actor(name: &str, gas: u64) {
 
     let mut side_note = zkpvm::SideNote::new(
         steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    ).with_jump_table(code_blob.jump_table.to_vec());
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
 
     eprintln!("\nProve (96-bit security):");
     let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
@@ -288,14 +290,6 @@ fn profile_hasher_actor() {
 }
 
 #[test]
-#[ignore = "real-workload validation: triggers a pre-existing constraint \
-            failure on memory accesses against .rodata static data \
-            (LoadIndU64 from rodata).  Tracing + interpretation work \
-            fine; only the AIR's load constraint rejects.  Needs \
-            investigation independent of the Phase 58–61 perf push.  \
-            Verified that disabling Phase 60 dynamic component \
-            selection does NOT change the failure — issue is \
-            pre-existing in the load chain."]
 fn profile_cipher_clerk_bench() {
     // Real-workload validation: cipher-clerk's kernel types compiled
     // for riscv64em-javm.  Exercises Account / AuthKey / id types
@@ -303,9 +297,9 @@ fn profile_cipher_clerk_bench() {
     profile_actor("cipher-clerk-bench", 10_000_000);
 }
 
-/// Trace-only variant: exercises the cipher-clerk types path and
-/// reports opcode mix, without attempting to prove.  Validates that
-/// the actor builds + runs in the PVM interpreter.
+/// Trace-only variant of cipher-clerk-bench: validates the actor
+/// builds + runs in the PVM interpreter.  Trace-only because the
+/// full prove path also runs as `profile_cipher_clerk_bench`.
 #[test]
 fn trace_cipher_clerk_bench() {
     let blob = load_actor_blob("cipher-clerk-bench");
@@ -313,17 +307,7 @@ fn trace_cipher_clerk_bench() {
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run();
     let steps = tracing.into_trace();
-    eprintln!("=== cipher-clerk-bench trace ===");
-    eprintln!("PVM: {} steps, exit={exit:?}", steps.len());
-    let mut counts = std::collections::HashMap::new();
-    for s in &steps {
-        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
-    }
-    let mut sorted: Vec<_> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    for (op, count) in sorted.iter().take(10) {
-        eprintln!("  {op}: {count}");
-    }
+    eprintln!("cipher-clerk-bench: {} PVM steps, exit={exit:?}", steps.len());
     assert_eq!(exit, javm::ExitReason::Trap);
 }
 
