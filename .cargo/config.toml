@@ -1,0 +1,15 @@
+# Phase 61: target-cpu=native is a 20% prove-time win on the zkpvm
+# bench (log14 MOBILE: 1.90 s → 1.52 s on the reference Intel Core
+# Ultra 7 155H).  Stwo's SimdBackend benefits massively from AVX2 +
+# AES-NI + SHA-NI codegen vs the generic baseline.
+#
+# Risk: native-codegen binaries are NOT portable.  A binary built on
+# CPU A may segfault on CPU B that lacks the same instruction set.
+# This is fine for users who build from source on their own machine
+# (the standard zkpvm workflow); not fine for distributing binaries.
+#
+# To opt out (for distributable builds):
+#   - Comment out the rustflags below, or
+#   - Override on the command line: RUSTFLAGS="" cargo build --release
+[build]
+rustflags = ["-C", "target-cpu=native"]
