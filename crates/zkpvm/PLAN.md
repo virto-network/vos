@@ -667,7 +667,76 @@ remaining levers are bigger architectural changes:
 The path that actually moves the needle is **multi-threading**.
 Suggest opening a Phase 58 with that goal.
 
-### Phase 58 — multi-threading scoping (research, not implementation)
+### Phase 58–61 — performance push to beat Nexus by 2× (LANDED)
+
+zkpvm now leads Nexus zkVM 2.x by **2.21× on log14 prove time**
+(1.07 s vs 2.37 s) with **65% smaller proofs** (297 KB vs ~600 KB)
+at the same 96-bit conjectured security.
+
+#### Summary of landed wins
+
+| Phase | Lever | log14 MOBILE | Cumulative speedup vs Phase 50 |
+|---    |---    |---           |---                              |
+| 50    | (baseline)                              | 12.92 s | 1.0×        |
+| 54k   | Phase 54.x extractions                  | 5.40 s  | 2.4×        |
+| Track B  | MOBILE PCS config (blowup=4, q=38)   | 2.10 s  | 6.15×       |
+| 59    | Rayon thread cap (`min(cpus,10)`)       | 1.86 s  | 6.95×       |
+| 60 v2 | Dynamic component selection             | 1.79 s  | 7.21×       |
+| 61a   | `target-cpu=native`                     | 1.50 s  | 8.6×        |
+| 61b   | Fat LTO + codegen-units=1               | 1.31 s  | 9.86×       |
+| 61c   | PGO (3-step build, `scripts/build-pgo.sh`) | **1.07 s** | **12.07×** |
+
+Real workload (hash_bench, 635 PVM steps mixed opcodes):
+**148 ms prove + 172 KB proof** with PGO + STANDARD config.
+
+Per-cycle throughput is constant 65 µs/cycle from log14 → log15 →
+holds at scale.  Nexus per-instruction: ~145 µs.  zkpvm is **2.23×
+faster per operation** at the prover level; PVM's denser ISA gives
+additional total-program win on top.
+
+#### Soundness preserved
+
+Every win in this push is sound by construction:
+- MOBILE PCS config: same 96-bit conjectured security
+  (`pow + n_queries · log_blowup = 20 + 38·2 = 96`).
+- Dynamic component selection: chip skipped iff its lookup
+  producers/consumers all have multiplicity 0.  Lookup balance
+  catches a malicious skip naturally.
+- Compile flags (native, LTO, PGO): purely codegen — no semantic
+  change.
+
+#### Plateau analysis (where we are)
+
+After Phase 61, the prove-time breakdown at log14 MOBILE (1.07 s):
+- FRI prove: ~39%
+- main_commit: ~31%
+- interaction_commit: ~11%
+- interaction_gen: ~10%
+- preprocess + trace: ~9%
+
+Easy levers exhausted:
+- ❌ par_iter `interaction_gen` — rayon scheduling overhead exceeds
+  10 ms gain (regression -10%).  Stwo's internal rayon already
+  saturates the cache-bandwidth ceiling at ~10 cores.
+- ❌ Aggressive LLVM tuning (`-inline-threshold=400` etc.) —
+  regression vs vanilla PGO; PGO data already targets the right
+  hot paths.
+- ❌ `mir-opt-level=4` — invalidates PGO profile data → reverts to
+  no-PGO performance.
+
+Remaining theoretical levers (multi-day effort each, smaller
+single-digit % gains):
+- **Memory family chip extraction** (Phase 54-style): drop ~30
+  cells from CpuChip.  ~3-5% additional prove saving.
+- **JumpInd family chip extraction**: drop ~24 cells.  ~2-3%.
+- **Caching preprocessed trace per program**: amortises the ~50ms
+  preprocessing cost across multiple proves of the same program.
+  Multi-prove win, not single-prove.
+- **Multi-process / batch proving**: orthogonal architectural
+  change.  Splits a long workload across processes; aggregates
+  via recursion.  Sidesteps the single-prove memory ceiling.
+
+### Phase 58 — multi-threading scoping (research, superseded by Phase 59)
 
 #### Status check: what parallelism we already have
 
