@@ -136,6 +136,32 @@ fn debug_thread_pool() {
 }
 
 #[test]
+#[ignore]
+fn profile_log15_mobile() {
+    let n_steps = 1usize << 15;
+    let (code, bitmask) = generate_add_program(n_steps);
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    let gas = (n_steps as u64 + 100) * 100;
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 64 * 1024], gas, 16,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _exit = tracing.run();
+    let steps = tracing.into_trace();
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let mobile = zkpvm::production_pcs_config_mobile();
+    eprintln!("=== LogSize=15 MOBILE config ===");
+    let (proof, _) = zkpvm::prove_profiled_with_config(&mut side_note, mobile)
+        .expect("proving failed");
+    let proof_bytes = bincode::serialize(&proof).unwrap();
+    eprintln!("Proof size: {} KB", proof_bytes.len() / 1024);
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
+        .expect("verification failed");
+}
+
+#[test]
 fn profile_log14_mobile() {
     let n_steps = 1usize << 14;
     let (code, bitmask) = generate_add_program(n_steps);
