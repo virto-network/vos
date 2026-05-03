@@ -384,12 +384,17 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
         }
     };
 
+    // Phase 60: encode the active-chip set as a bitmask so the standalone
+    // verifier (no SideNote) can reconstruct exactly which chips ran.
+    let component_mask = super::active_component_mask(side_note);
+
     Ok((Proof {
         format_version: PROOF_FORMAT_VERSION,
         stark_proof: proof,
         claimed_sums,
         num_components,
         log_sizes,
+        component_mask,
         pcs_config: config,
         initial_state,
         final_state,

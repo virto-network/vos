@@ -163,6 +163,7 @@ pub fn verify_standalone_with_options(
         claimed_sums,
         log_sizes: claimed_log_sizes,
         num_components,
+        component_mask,
         pcs_config,
         ..
     } = proof;
@@ -200,7 +201,7 @@ pub fn verify_standalone_with_options(
 
     // Commit preprocessed and original traces
     let (trace_sizes, preprocessed_sizes) =
-        create_verifier_components::trace_and_preprocessed_sizes(&claimed_log_sizes);
+        create_verifier_components::trace_and_preprocessed_sizes(&claimed_log_sizes, component_mask);
     let mut log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
     log_sizes[0] = preprocessed_sizes; // PREPROCESSED_TRACE_IDX
 
@@ -214,7 +215,7 @@ pub fn verify_standalone_with_options(
     }
 
     let mut lookup_elements = AllLookupElements::default();
-    draw_all_lookup_elements(&mut lookup_elements, verifier_channel, claimed_log_sizes.len());
+    draw_all_lookup_elements(&mut lookup_elements, verifier_channel, component_mask);
 
     // Verify logup sum = 0
     if claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
@@ -230,6 +231,7 @@ pub fn verify_standalone_with_options(
             &lookup_elements,
             &claimed_log_sizes,
             &claimed_sums,
+            component_mask,
         );
     let components_ref: Vec<&dyn Component> = verifier_components.iter().map(|c| &**c).collect();
 

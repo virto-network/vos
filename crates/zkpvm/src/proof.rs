@@ -48,6 +48,14 @@ pub struct Proof {
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
     pub num_components: usize,
+    /// Phase 60: bit i set ⇔ chip i in BASE_COMPONENTS was active for
+    /// this proof.  Allows the standalone verifier (no SideNote) to
+    /// reconstruct the exact active-chip selection the prover used.
+    /// Defaults to `0` for back-compat with older proofs (the verifier
+    /// then falls back to count-based inference: full set if count =
+    /// BASE_COMPONENTS.len(), Blake2b-skipped if count = len-1).
+    #[serde(default)]
+    pub component_mask: u32,
     pub pcs_config: PcsConfig,
     /// State at segment start (publicly committed)
     pub initial_state: SegmentState,

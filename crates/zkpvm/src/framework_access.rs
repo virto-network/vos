@@ -19,37 +19,27 @@ pub use crate::lookups::AllLookupElements;
 
 use crate::BASE_COMPONENTS;
 
-/// Phase 60: BASE_COMPONENTS index of Blake2bChip — the only conditional
-/// chip today.  Mirrors `lib.rs::active_components`.
-const BLAKE2B_IDX: usize = 1;
-
-/// Phase 60: infer the active-component selection from the proof's
-/// `claimed_log_sizes` length.  Used by the standalone verifier where
-/// SideNote isn't available.
+/// Phase 60: select the active-chip indices from the proof's
+/// `component_mask`.  Bit i set ⇔ chip i was active.
 ///
-/// - `len == BASE_COMPONENTS.len()`: all chips active (legacy / hash workloads).
-/// - `len == BASE_COMPONENTS.len() - 1`: Blake2bChip skipped (Add-only / no-hash workloads).
-/// - other: malformed proof.
-fn active_indices(num_in_proof: usize) -> Result<alloc::vec::Vec<usize>, &'static str> {
+/// Back-compat: `mask == 0` (default for older proofs) falls back to
+/// "all chips active" — older proofs predate dynamic selection.
+fn active_indices_from_mask(mask: u32) -> alloc::vec::Vec<usize> {
     let n = BASE_COMPONENTS.len();
-    if num_in_proof == n {
-        Ok((0..n).collect())
-    } else if num_in_proof == n - 1 {
-        Ok((0..n).filter(|&i| i != BLAKE2B_IDX).collect())
+    if mask == 0 {
+        (0..n).collect()
     } else {
-        Err("proof component count doesn't match any known active set")
+        (0..n).filter(|&i| mask & (1 << i) != 0).collect()
     }
 }
 
 /// Draw all lookup elements from the channel (same order as prover).
-/// `num_components` is the active count from `proof.claimed_log_sizes.len()`.
 pub fn draw_all_lookup_elements(
     lookup_elements: &mut AllLookupElements,
     channel: &mut Blake2sChannel,
-    num_components: usize,
+    component_mask: u32,
 ) {
-    let indices = active_indices(num_components)
-        .expect("proof's component count doesn't match any known set; verifier rejects");
+    let indices = active_indices_from_mask(component_mask);
     for &i in &indices {
         BASE_COMPONENTS[i].draw_lookup_elements(lookup_elements, channel);
     }
@@ -59,14 +49,12 @@ pub fn draw_all_lookup_elements(
 pub mod create_verifier_components {
     use super::*;
 
-    /// Get trace sizes and preprocessed sizes for all components.
-    /// `log_sizes.len()` determines which chips were active; mirrors Phase 60
-    /// dynamic component selection.
+    /// Get trace sizes and preprocessed sizes for active components.
     pub fn trace_and_preprocessed_sizes(
         log_sizes: &[u32],
+        component_mask: u32,
     ) -> (Vec<TreeVec<Vec<u32>>>, Vec<u32>) {
-        let indices = active_indices(log_sizes.len())
-            .expect("proof's component count doesn't match any known set");
+        let indices = active_indices_from_mask(component_mask);
         let trace_sizes: Vec<TreeVec<Vec<u32>>> = indices
             .iter()
             .zip(log_sizes)
@@ -81,15 +69,14 @@ pub mod create_verifier_components {
     }
 
     /// Create verifier components (Box<dyn Component>) from proof data.
-    /// Active-chip selection inferred from `log_sizes.len()`.
     pub fn components<'a>(
         tree_span_provider: &mut TraceLocationAllocator,
         lookup_elements: &AllLookupElements,
         log_sizes: &[u32],
         claimed_sums: &[SecureField],
+        component_mask: u32,
     ) -> Vec<Box<dyn Component + 'a>> {
-        let indices = active_indices(log_sizes.len())
-            .expect("proof's component count doesn't match any known set");
+        let indices = active_indices_from_mask(component_mask);
         indices
             .iter()
             .zip(claimed_sums)

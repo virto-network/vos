@@ -183,15 +183,95 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
 pub(crate) fn active_components(side_note: &side_note::SideNote)
     -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent>
 {
-    const BLAKE2B_IDX: usize = 1;
-    let blake2b_active = !side_note.blake2b_calls.is_empty();
+    let a = activity_from_steps(side_note);
     BASE_COMPONENTS
         .iter()
         .enumerate()
-        .filter_map(|(i, &c)| {
-            if i == BLAKE2B_IDX && !blake2b_active { None } else { Some(c) }
-        })
+        .filter_map(|(i, &c)| if a.is_active(i) { Some(c) } else { None })
         .collect()
+}
+
+/// Phase 60: per-chip activity flags inferred from `side_note.steps`
+/// alone (no entries-vec dependency), so the predicate can run BEFORE
+/// CpuChip's trace_fill populates side_note's per-family entries.
+///
+/// Each flag: "is there ≥ 1 step with a corresponding opcode in the
+/// trace?".  Uses `classify_opcode` for opcode-class detection plus
+/// direct `(opcode, imm)` matching for the blake2b ECALL.
+#[cfg(feature = "prover")]
+fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
+    use crate::chips::cpu::classify::classify_opcode as classify;
+    use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+    use crate::core::opcode::Opcode;
+    let mut a = ChipActivity::default();
+    for step in &side_note.steps {
+        // Blake2b ECALL detection via opcode + imm match (mirrors
+        // trace_fill.rs's IsBlakeEcall fill at ~line 1075).
+        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
+            && step.imm == ECALL_BLAKE2B_COMPRESS as u64
+        {
+            a.blake2b = true;
+        }
+        let f = classify(step.opcode);
+        if f.is_jump_ind || f.is_load_imm_jump_ind { a.jump_table = true; }
+        if f.is_count_set_bits { a.popcount = true; }
+        if f.is_lzb || f.is_tzb { a.bitcount = true; }
+        if f.is_mul || f.is_mul_upper_uu || f.is_mul_upper_su || f.is_mul_upper_ss
+            || f.is_rotate_l64 || f.is_rotate_r64 || f.is_rotate_l32 || f.is_rotate_r32
+        { a.mul = true; }
+        if f.is_and || f.is_or || f.is_xor || f.is_and_inv || f.is_or_inv || f.is_xnor
+        { a.bitwise = true; }
+        // Compare = SetLt*/Cmov*/Min/Max + branches.
+        if f.is_set_lt_u || f.is_set_lt_s || f.is_cmov_iz || f.is_cmov_nz
+            || f.is_min_s || f.is_min_u || f.is_max_s || f.is_max_u
+            || f.is_branch
+        { a.compare = true; }
+        if f.is_div_rem { a.divrem = true; }
+    }
+    a
+}
+
+#[cfg(feature = "prover")]
+#[derive(Default, Clone, Copy)]
+struct ChipActivity {
+    blake2b: bool,
+    jump_table: bool,
+    popcount: bool,
+    bitcount: bool,
+    mul: bool,
+    bitwise: bool,
+    compare: bool,
+    divrem: bool,
+}
+
+#[cfg(feature = "prover")]
+impl ChipActivity {
+    fn is_active(&self, idx: usize) -> bool {
+        match idx {
+            1 => self.blake2b,
+            8 => self.jump_table,
+            12 => self.popcount,
+            13 => self.bitcount,
+            15 => self.mul,
+            16 => self.bitwise,
+            17 => self.compare,
+            18 => self.divrem,
+            _ => true,
+        }
+    }
+}
+
+/// Phase 60: bitmask of active chips (bit i ⇔ BASE_COMPONENTS[i] is
+/// included).  Embedded in `Proof::component_mask` so the standalone
+/// verifier can reconstruct the active set without a SideNote.
+#[cfg(feature = "prover")]
+pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
+    let a = activity_from_steps(side_note);
+    let mut mask = 0u32;
+    for i in 0..BASE_COMPONENTS.len() {
+        if a.is_active(i) { mask |= 1 << i; }
+    }
+    mask
 }
 
 /// Phase 60: verifier-side mirror of `active_components`, returning the
@@ -200,16 +280,15 @@ pub(crate) fn active_components(side_note: &side_note::SideNote)
 pub(crate) fn active_components_verifier(side_note: &side_note::SideNote)
     -> alloc::vec::Vec<&'static dyn framework::MachineComponent>
 {
-    const BLAKE2B_IDX: usize = 1;
-    let blake2b_active = !side_note.blake2b_calls.is_empty();
+    let a = activity_from_steps(side_note);
     BASE_COMPONENTS
         .iter()
         .enumerate()
         .filter_map(|(i, &c)| {
-            if i == BLAKE2B_IDX && !blake2b_active {
-                None
-            } else {
+            if a.is_active(i) {
                 Some(c as &dyn framework::MachineComponent)
+            } else {
+                None
             }
         })
         .collect()
