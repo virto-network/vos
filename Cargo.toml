@@ -30,6 +30,23 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+# Phase 61: fat LTO + single codegen unit for maximum cross-crate
+# inlining of stwo's hot SIMD paths.  Measured at log14 MOBILE on
+# the reference Intel Core Ultra 7 155H (median of 5 trials):
+#
+#   | Profile         | Prove   | Build time |
+#   |-----------------|---------|------------|
+#   | no LTO, codegen-units default | 1.50 s | ~20 s |
+#   | thin LTO        | 1.39 s  | ~3.5 min   |
+#   | fat LTO         | 1.31 s  | ~3.5 min   |  ← keep
+#
+# Build time is much slower; for fast iteration, override with
+# `cargo build --release --config 'profile.release.lto="off"'` or
+# work in dev profile.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.dependencies]
 # Internal crates
 zkpvm = { path = "crates/zkpvm" }
