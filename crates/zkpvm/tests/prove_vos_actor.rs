@@ -288,6 +288,46 @@ fn profile_hasher_actor() {
 }
 
 #[test]
+#[ignore = "real-workload validation: triggers a pre-existing constraint \
+            failure on memory accesses against .rodata static data \
+            (LoadIndU64 from rodata).  Tracing + interpretation work \
+            fine; only the AIR's load constraint rejects.  Needs \
+            investigation independent of the Phase 58–61 perf push.  \
+            Verified that disabling Phase 60 dynamic component \
+            selection does NOT change the failure — issue is \
+            pre-existing in the load chain."]
+fn profile_cipher_clerk_bench() {
+    // Real-workload validation: cipher-clerk's kernel types compiled
+    // for riscv64em-javm.  Exercises Account / AuthKey / id types
+    // construction + arithmetic.
+    profile_actor("cipher-clerk-bench", 10_000_000);
+}
+
+/// Trace-only variant: exercises the cipher-clerk types path and
+/// reports opcode mix, without attempting to prove.  Validates that
+/// the actor builds + runs in the PVM interpreter.
+#[test]
+fn trace_cipher_clerk_bench() {
+    let blob = load_actor_blob("cipher-clerk-bench");
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("=== cipher-clerk-bench trace ===");
+    eprintln!("PVM: {} steps, exit={exit:?}", steps.len());
+    let mut counts = std::collections::HashMap::new();
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+    }
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, count) in sorted.iter().take(10) {
+        eprintln!("  {op}: {count}");
+    }
+    assert_eq!(exit, javm::ExitReason::Trap);
+}
+
+#[test]
 fn profile_hash_bench() {
     let blob = load_actor_blob("hash-bench");
     let parsed = program::parse_blob(&blob).expect("parse blob");
