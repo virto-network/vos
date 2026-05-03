@@ -35,7 +35,40 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Headline (Track B + Phase 59 thread cap + Phase 60 dynamic chips): zkpvm leads Nexus by 24% at log14
+### Headline (Phase 61 codegen + PGO): zkpvm 2.21× faster than Nexus at log14
+
+Stacking the build-time and runtime optimisations lands log14
+MOBILE at **1.07 s prove + 297 KB proof** on the reference Intel
+Core Ultra 7 155H (median of 5 trials).  Nexus zkVM 2.x: 2.37 s.
+
+#### Build-time codegen optimisations
+
+| Layer                                                   | log14 prove |
+|---                                                      |---          |
+| Default codegen (release, lto = false)                  | 1.79 s      |
+| `+ target-cpu=native` (.cargo/config.toml)              | 1.50 s      |  -16%
+| `+ fat LTO + codegen-units=1` (Cargo.toml [profile])    | 1.31 s      |  -13%
+| `+ PGO` (scripts/build-pgo.sh, 3-step build)            | **1.07 s**  |  -18%
+
+PGO win comes from having the profile data drive inlining /
+register allocation / branch hints in stwo's hot SIMD paths
+(FRI fold, Merkle hash, FFT layer transitions).
+
+Cumulative speedup vs Phase 50 baseline (12.92 s): **12.07×**.
+
+#### Build cost trade-offs
+
+| Optimisation         | Build time      | Notes                              |
+|---                   |---              |---                                  |
+| target-cpu=native    | unchanged       | binaries non-portable across CPUs   |
+| fat LTO              | ~3.5 min       | vs ~20 s default                    |
+| PGO                  | ~3 build cycles | run `scripts/build-pgo.sh`          |
+
+For interactive iteration, fall back to `cargo build --release`
+(no LTO, no PGO).  For production / distributed binaries, run
+`scripts/build-pgo.sh`.
+
+#### MOBILE config win (still applies, separately)
 
 Phase 60 (dynamic component selection) layered on top of Track B
 + Phase 59 puts MOBILE log14 at **1.79 s prove + 297 KB proof**
@@ -80,12 +113,15 @@ Combined at log14 (median of 5 trials, 22-logical-core desktop):
 | STANDARD (Phase 60 v2, dormant chips skipped)     | 4.65 s  | 191 KB  | 1.16×               |
 | MOBILE (blowup=4, 22 threads, no cap)             | 2.26 s  | 854 KB  | 2.39×               |
 | MOBILE + thread-cap (10 threads)                  | 1.86 s  | 854 KB  | 2.90×               |
-| MOBILE + thread-cap + Phase 60 v2                 | **1.79 s** | **297 KB** | **3.02×**     |
+| MOBILE + thread-cap + Phase 60 v2                 | 1.79 s  | 297 KB  | 3.02×               |
+| ↑ + target-cpu=native                             | 1.50 s  | 297 KB  | 3.60×               |
+| ↑ + fat LTO                                       | 1.31 s  | 297 KB  | 4.12×               |
+| ↑ + PGO                                           | **1.07 s** | **297 KB** | **5.04×**     |
 | Nexus zkVM 2.x                                    | 2.37 s  | —       | 2.28× (reference)   |
 
-**zkpvm with MOBILE + thread-cap + dynamic-chips beats Nexus
-zkVM 2.x by 24% at log14**, with 65% smaller proofs.  Cumulative
-speedup vs Phase 50 baseline (12.92 s): **7.21×**.
+**zkpvm with the full codegen stack beats Nexus zkVM 2.x by 121%
+(2.21× faster) at log14**, with 65% smaller proofs.  Cumulative
+speedup vs Phase 50 baseline (12.92 s): **12.07×**.
 
 Cost: proof size 604 → 854 KB (~1.4×).  Acceptable for low-latency
 / mobile / interactive proving where prove time dominates user
