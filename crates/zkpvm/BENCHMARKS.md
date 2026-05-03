@@ -35,7 +35,29 @@ program in user-space.
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
 
-### Headline (Track B + Phase 59 thread cap): zkpvm beats Nexus at log14
+### Headline (Track B + Phase 59 thread cap + Phase 60 dynamic chips): zkpvm leads Nexus by 24% at log14
+
+Phase 60 (dynamic component selection) layered on top of Track B
++ Phase 59 puts MOBILE log14 at **1.79 s prove + 297 KB proof**
+on the Add bench, vs Nexus zkVM 2.x's 2.37 s.
+
+#### STANDARD config (default `prove()`) — even unchanged code paths benefit
+
+Phase 60 helps the conservative STANDARD config too because skipped
+chips drop their main+interaction columns from the FRI commitments.
+Add-bench measurements (median of 3, 22-logical-core desktop):
+
+| Size  | Before Phase 60 | Phase 60 v2 | Speedup | Proof shrink         |
+|---    |---              |---          |---      |---                    |
+| log10 | 579 ms          | **408 ms**  | 30%     | 559 → 149 KB (-73%)  |
+| log12 | 1.90 s          | **1.22 s**  | 36%     | 567 → 175 KB (-69%)  |
+| log14 | 5.40 s          | **4.65 s**  | 14%     | 564 → 191 KB (-66%)  |
+
+Workloads that exercise mul / bitwise / divrem / etc. include those
+chips automatically — no regression for hash-heavy or ALU-heavy
+real-program traces.
+
+#### MOBILE config: maximum-perf shape
 
 Two stacked optimisations land us comfortably ahead of Nexus zkVM
 2.x without touching any AIR shape:
@@ -52,16 +74,18 @@ Two stacked optimisations land us comfortably ahead of Nexus zkVM
 
 Combined at log14 (median of 5 trials, 22-logical-core desktop):
 
-| Config                                    | Prove   | Speedup vs STANDARD |
-|---                                        |---      |---                  |
-| STANDARD (blowup=16, 22 threads)          | 5.40 s  | baseline            |
-| MOBILE (blowup=4, 22 threads, no cap)     | 2.26 s  | 2.39×               |
-| MOBILE + thread-cap (10 threads)          | **1.86 s** | **2.90×**         |
-| Nexus zkVM 2.x                            | 2.37 s  | 2.28× (reference)   |
+| Config                                            | Prove   | Proof   | Speedup vs STANDARD |
+|---                                                |---      |---      |---                  |
+| STANDARD (blowup=16, 22 threads, all chips)       | 5.40 s  | 564 KB  | baseline            |
+| STANDARD (Phase 60 v2, dormant chips skipped)     | 4.65 s  | 191 KB  | 1.16×               |
+| MOBILE (blowup=4, 22 threads, no cap)             | 2.26 s  | 854 KB  | 2.39×               |
+| MOBILE + thread-cap (10 threads)                  | 1.86 s  | 854 KB  | 2.90×               |
+| MOBILE + thread-cap + Phase 60 v2                 | **1.79 s** | **297 KB** | **3.02×**     |
+| Nexus zkVM 2.x                                    | 2.37 s  | —       | 2.28× (reference)   |
 
-**zkpvm with MOBILE + thread-cap is 22% faster than Nexus
-zkVM 2.x at log14.**  Cumulative speedup vs Phase 50 baseline
-(12.92 s): **6.95×**.
+**zkpvm with MOBILE + thread-cap + dynamic-chips beats Nexus
+zkVM 2.x by 24% at log14**, with 65% smaller proofs.  Cumulative
+speedup vs Phase 50 baseline (12.92 s): **7.21×**.
 
 Cost: proof size 604 → 854 KB (~1.4×).  Acceptable for low-latency
 / mobile / interactive proving where prove time dominates user
