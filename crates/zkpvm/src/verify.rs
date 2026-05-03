@@ -17,7 +17,7 @@ use stwo_constraint_framework::TraceLocationAllocator;
 
 use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
 
-use super::{Proof, BASE_COMPONENTS};
+use super::Proof;
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 /// Verify a chain of segment proofs. Each segment's final state must match
@@ -88,7 +88,10 @@ pub fn verify_with_options(
     max_log_size: u32,
     policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
-    let components = BASE_COMPONENTS;
+    // Phase 60: select active components from side_note (same predicate
+    // the prover used).  See `active_components_verifier` doc-comment.
+    let components_owned = super::active_components_verifier(side_note);
+    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
     // chip list / column counts / lookup-tuple shape changes in a way
@@ -196,7 +199,12 @@ fn verify_preprocessed_trace(
     log_sizes: &[u32],
     config: &PcsConfig,
 ) -> Result<(), VerificationError> {
-    let components = BASE_COMPONENTS;
+    // Phase 60: same active-component filter the prover used.  This
+    // helper actually re-runs prover-side preprocessing-trace
+    // generation to re-commit, so it needs the prover trait, not
+    // the verifier-side MachineComponent.
+    let components_owned = super::active_components(side_note);
+    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let max_constraint_log_degree_bound = components
         .iter()
         .zip(log_sizes)

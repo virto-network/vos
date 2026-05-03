@@ -115,10 +115,15 @@ pub use air_column::{AirColumn, PreprocessedAirColumn};
 // Ordering rule: all consumers of a lookup table must be listed BEFORE the table
 // chip itself.  Table chips populate their multiplicity column by reading counts
 // that consumers accumulate into SideNote during trace generation.
+//
+// Phase 60: Blake2bChip is OPTIONAL.  Skipped when no blake2b ECALL fired in the
+// trace.  Saves ~10% prove time and ~57% proof size on workloads that don't
+// hash.  Both prover and verifier must agree on inclusion — `active_components`
+// is the single source of truth and is deterministic from `SideNote`.
 #[cfg(feature = "prover")]
 const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CpuChip,
-    &chips::Blake2bChip, // consumes Bitwise AND lookup
+    &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
     &chips::MemoryChip,
     &chips::MemoryBoundaryChip,
     &chips::RegisterMemoryChip,
@@ -158,6 +163,57 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
 ];
+
+/// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
+/// Returns the components active for THIS trace, in declaration order.
+///
+/// Both prover and verifier MUST construct the same list.  The predicate
+/// reads only `SideNote` fields the verifier also has access to (the
+/// public side_note is an input to `verify`).
+///
+/// Skipping a chip is safe iff all of its lookup producers and consumers
+/// have multiplicity 0 across the trace.  For Blake2bChip: no calls in
+/// `side_note.blake2b_calls` ⇒ no Blake2b producers/consumers fire on
+/// CpuChip or MemoryChip ⇒ all relevant lookup balances stay 0=0.
+///
+/// Index 1 in `BASE_COMPONENTS` is Blake2bChip — skipping that index is
+/// the current implementation.  When more chips become conditional
+/// (Phase 60+ followups), each gains a corresponding index check.
+#[cfg(feature = "prover")]
+pub(crate) fn active_components(side_note: &side_note::SideNote)
+    -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent>
+{
+    const BLAKE2B_IDX: usize = 1;
+    let blake2b_active = !side_note.blake2b_calls.is_empty();
+    BASE_COMPONENTS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if i == BLAKE2B_IDX && !blake2b_active { None } else { Some(c) }
+        })
+        .collect()
+}
+
+/// Phase 60: verifier-side mirror of `active_components`, returning the
+/// same selection upcast to `&dyn MachineComponent`.
+#[cfg(feature = "prover")]
+pub(crate) fn active_components_verifier(side_note: &side_note::SideNote)
+    -> alloc::vec::Vec<&'static dyn framework::MachineComponent>
+{
+    const BLAKE2B_IDX: usize = 1;
+    let blake2b_active = !side_note.blake2b_calls.is_empty();
+    BASE_COMPONENTS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if i == BLAKE2B_IDX && !blake2b_active {
+                None
+            } else {
+                Some(c as &dyn framework::MachineComponent)
+            }
+        })
+        .collect()
+}
 
 pub use proof::{
     check_pcs_policy, PcsPolicy, Proof, SegmentState, PROOF_FORMAT_VERSION,

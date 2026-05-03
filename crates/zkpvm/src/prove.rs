@@ -19,7 +19,8 @@ use crate::trace::{
     eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX},
 };
 
-use super::BASE_COMPONENTS;
+// Phase 60: prove_impl uses super::active_components(side_note) instead
+// of the static BASE_COMPONENTS list to skip dormant chips.
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 pub use crate::proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
@@ -222,7 +223,10 @@ fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::
 
 fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
-    let components = BASE_COMPONENTS;
+    // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
+    // Verifier reconstructs the same list via active_components_verifier().
+    let components_owned = super::active_components(side_note);
+    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
 
     // Phase 9a: backfill initial_regs from the first step's regs_before if the
     // caller left it at the default all-zero but the tracer recorded non-zero
@@ -338,7 +342,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
     )?;
     let stark_prove = t.elapsed();
 
-    let num_components = BASE_COMPONENTS.len();
+    let num_components = components.len();
     let prof = ProveProfile {
         trace_gen, preprocess_commit, main_commit,
         interaction_gen, interaction_commit, stark_prove,

@@ -214,7 +214,7 @@ pub fn verify_standalone_with_options(
     }
 
     let mut lookup_elements = AllLookupElements::default();
-    draw_all_lookup_elements(&mut lookup_elements, verifier_channel);
+    draw_all_lookup_elements(&mut lookup_elements, verifier_channel, claimed_log_sizes.len());
 
     // Verify logup sum = 0
     if claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {

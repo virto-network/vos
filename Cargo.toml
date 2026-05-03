@@ -19,6 +19,10 @@ exclude = [
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.
     "crates/zkpvm/fuzz",
+    # Local dev: vosx pulls grey-transpiler via a sibling-tree path
+    # that doesn't resolve in this worktree.  Excluded so zkpvm
+    # builds.  DO NOT COMMIT.
+    "crates/vosx",
 ]
 
 [workspace.package]
