@@ -35,6 +35,8 @@ use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 pub mod field;
 #[cfg(feature = "prover")]
 pub mod witness;
+#[cfg(feature = "prover")]
+pub mod point;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
