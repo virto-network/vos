@@ -30,6 +30,9 @@ use stwo::{
 };
 use stwo_constraint_framework::EvalAtRow;
 
+#[cfg(feature = "prover")]
+pub mod field;
+
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
