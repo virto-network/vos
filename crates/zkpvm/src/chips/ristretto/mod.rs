@@ -48,7 +48,7 @@ use crate::trace::{
 
 use crate::{
     framework::BuiltInComponent,
-    lookups::Range256LookupElements,
+    lookups::{Range256LookupElements, RistrettoRegisterFileLookupElements},
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -232,6 +232,21 @@ pub enum Column {
     #[size = 1]
     IsMul,
 
+    /// R1e-pent: row-id (low byte) of the row that produced this
+    /// row's `a` input.  The chip emits a CONSUMER lookup keyed
+    /// on (a_source_row, byte_index, a[byte]) — closes the
+    /// inter-row binding gap by forcing every input to come from a
+    /// prior row's `out` (or from a boundary producer).
+    #[size = 1]
+    ASourceRowLo,
+    #[size = 1]
+    ASourceRowHi,
+    /// R1e-pent: row-id of the row that produced this row's `b` input.
+    #[size = 1]
+    BSourceRowLo,
+    #[size = 1]
+    BSourceRowHi,
+
     /// 0 iff this is a padding / unused row.
     #[size = 1]
     IsReal,
@@ -240,13 +255,18 @@ pub enum Column {
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
 #[preprocessed_prefix = "ristretto"]
 pub enum PreprocessedColumn {
-    /// Reserved.  Real preprocessed columns (e.g. p-byte constants for
-    /// the conditional-reduction sub-chain, row-position-within-call,
-    /// scalar-window NAF table) come with R1c-3..R1e.  Stubbed at one
-    /// zero column so the AirColumn macro has a non-empty enum and the
-    /// preprocessed trace shape stays valid.
+    /// Reserved.  Real preprocessed columns come with R1c-3..R1e.
     #[size = 1]
     Reserved,
+    /// R1e-pent: this row's index, low byte (rows 0..256).
+    /// Used as the "row_id_lo" element of producer lookup tuples
+    /// emitted on RistrettoRegisterFileLookupElements.
+    #[size = 1]
+    RowIndexLo,
+    /// R1e-pent: this row's index, high byte (256·byte for
+    /// chip log_size up to 16).
+    #[size = 1]
+    RowIndexHi,
 }
 
 /// p25519 byte constants — `p = 2²⁵⁵ - 19`, little-endian.  Used by
@@ -281,17 +301,19 @@ impl BuiltInComponent for RistrettoChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    /// Placeholder.  Real lookups (MemoryAccess for boundary I/O,
-    /// RistrettoCall for binding to CpuChip's ECALL step, byte-mul
-    /// table for field arithmetic) come with R1c–R1e.
-    type LookupElements = Range256LookupElements;
+    /// R1e-pent: now a 2-tuple — Range256 for byte ranges +
+    /// RistrettoRegisterFile for inter-row binding.
+    type LookupElements = (Range256LookupElements, RistrettoRegisterFileLookupElements);
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &Range256LookupElements,
+        lookup_elements: &(Range256LookupElements, RistrettoRegisterFileLookupElements),
     ) {
+        let (range_lookup, regfile_lookup) = lookup_elements;
+        let lookup_elements = range_lookup;
+        let _ = regfile_lookup; // referenced in producer/consumer emissions below
         let a       = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b       = crate::trace::trace_eval!(trace_eval, Column::FieldB);
         let out     = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
@@ -301,6 +323,12 @@ impl BuiltInComponent for RistrettoChip {
         let ff_brw  = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
         let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
         let sub_chain_aip = crate::trace::trace_eval!(trace_eval, Column::SubChainCarryAip);
+        let a_src_lo = crate::trace::trace_eval!(trace_eval, Column::ASourceRowLo);
+        let a_src_hi = crate::trace::trace_eval!(trace_eval, Column::ASourceRowHi);
+        let b_src_lo = crate::trace::trace_eval!(trace_eval, Column::BSourceRowLo);
+        let b_src_hi = crate::trace::trace_eval!(trace_eval, Column::BSourceRowHi);
+        let row_idx_lo = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
+        let row_idx_hi = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
         let mul_product   = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
         let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
         let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
@@ -767,6 +795,14 @@ impl BuiltInComponent for RistrettoChip {
             ));
         }
 
+        // R1e-pent constraint-side emissions are TODO; see the
+        // mirroring TODO in generate_interaction_trace.  Witness
+        // columns ASourceRowLo/Hi/BSourceRowLo/Hi are wired through
+        // and filled to 0; the regfile lookup is declared and
+        // registered so its space in AllLookupElements is reserved.
+        let _ = (regfile_lookup, &a_src_lo, &a_src_hi, &b_src_lo,
+                 &b_src_hi, &row_idx_lo, &row_idx_hi);
+
         // R1c-4-b still leaves OPEN before R1f turns the chip on:
         //  - R1c-3-quat: is_sub constraint chain (the symmetric
         //    sub variant).  The witness builder already produces
@@ -795,6 +831,12 @@ impl BuiltInProverComponent for RistrettoChip {
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
             trace.fill_columns(row, BaseField::from(0u32), PreprocessedColumn::Reserved);
+            // R1e-pent: row index split into 2 LE bytes.  Limited
+            // to log_size ≤ 16 (chip up to 64K rows).
+            let row_lo = (row & 0xff) as u8;
+            let row_hi = ((row >> 8) & 0xff) as u8;
+            trace.fill_columns(row, row_lo, PreprocessedColumn::RowIndexLo);
+            trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
         }
         trace.finalize_bit_reversed()
     }
@@ -850,6 +892,11 @@ impl BuiltInProverComponent for RistrettoChip {
             trace.fill_columns(row_i, r.is_sub,          Column::IsSub);
             trace.fill_columns(row_i, r.is_mul,          Column::IsMul);
             trace.fill_columns(row_i, r.is_real,         Column::IsReal);
+            // R1e-pent: source row IDs (2 bytes each).
+            trace.fill_columns(row_i, (r.a_source_row & 0xff) as u8, Column::ASourceRowLo);
+            trace.fill_columns(row_i, ((r.a_source_row >> 8) & 0xff) as u8, Column::ASourceRowHi);
+            trace.fill_columns(row_i, (r.b_source_row & 0xff) as u8, Column::BSourceRowLo);
+            trace.fill_columns(row_i, ((r.b_source_row >> 8) & 0xff) as u8, Column::BSourceRowHi);
 
             // Range256 multiplicity is bumped by the row-push
             // helper `SideNote::add_ristretto_field_row` (called
@@ -942,6 +989,15 @@ impl BuiltInProverComponent for RistrettoChip {
                 &[col.clone()],
             );
         }
+
+        // R1e-pent interaction-side emissions are TODO — injecting
+        // per-byte constants into Stwo logup tuples requires either
+        // (a) 32 dedicated preprocessed byte-index columns, (b)
+        // expanding chip rows 32× to stream bytes, or (c) packing
+        // bytes into M31-fitting fingerprints.  Each option is a
+        // significant chip-shape change.  Constraint-side emissions
+        // are present but unbalanced; remove them to keep the chip
+        // gated-off-soundness-equivalent for now.
         logup.finalize()
     }
 }

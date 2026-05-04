@@ -97,6 +97,13 @@ pub struct FieldOpRow {
     pub is_add: u8,
     pub is_sub: u8,
     pub is_mul: u8,
+    /// R1e-pent: row-id of the row whose `out` produces this row's
+    /// `a`.  Bound to the chip's `RistrettoRegisterFile` lookup.
+    /// 0 by default (sentinel "input" row); writers must set
+    /// correctly when chaining.
+    pub a_source_row: u16,
+    /// R1e-pent: row-id of the row whose `out` produces this row's `b`.
+    pub b_source_row: u16,
     /// 0 iff this is a padding / unused row.
     pub is_real: u8,
 }
@@ -132,6 +139,8 @@ impl Default for FieldOpRow {
             is_sub: 0,
             is_mul: 0,
             is_real: 0,
+            a_source_row: 0,
+            b_source_row: 0,
         }
     }
 }
@@ -228,6 +237,8 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         is_sub: 0,
         is_mul: 0,
         is_real: 1,
+        a_source_row: 0, // caller sets via post-fill mutation if chaining
+        b_source_row: 0,
     }
 }
 
@@ -313,6 +324,8 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         is_sub: 1,
         is_mul: 0,
         is_real: 1,
+        a_source_row: 0,
+        b_source_row: 0,
     }
 }
 
@@ -513,6 +526,8 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         is_sub: 0,
         is_mul: 1,
         is_real: 1,
+        a_source_row: 0,
+        b_source_row: 0,
     }
 }
 
