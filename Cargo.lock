@@ -4951,6 +4951,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "curve25519-dalek",
  "grey-transpiler",
  "impl-trait-for-tuples",
  "javm",

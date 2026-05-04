@@ -6,7 +6,7 @@ use javm::PVM_REGISTER_COUNT;
 
 use crate::core::step::{MemAccess, PvmStep};
 
-pub use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+pub use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT};
 
 /// A recorded blake2b call for the precompile chip.
 #[derive(Clone, Debug)]
@@ -38,11 +38,46 @@ pub struct Blake2bMemOp {
     pub out_bytes: [u8; 64],
 }
 
+/// A recorded Ristretto255 scalar-mult call for the precompile chip.
+/// Captures the canonical 32-byte scalar, 32-byte compressed input
+/// point, and 32-byte compressed output point — exactly the bytes the
+/// chip's boundary lookup will commit to.
+#[derive(Clone, Debug)]
+pub struct RistrettoRecord {
+    pub scalar: [u8; 32],
+    pub point: [u8; 32],
+    pub output: [u8; 32],
+}
+
+/// Per-byte memory operations for a single ristretto_scalar_mult ECALL.
+/// 32 scalar reads + 32 point reads + 32 output writes, all sharing the
+/// ECALL step's timestamp.  Insertion order in the MemoryChip ledger
+/// keeps reads before writes at tie-break.
+#[derive(Clone, Debug)]
+pub struct RistrettoMemOp {
+    /// Pointer register φ[10] — base of the 32-byte scalar buffer.
+    pub scalar_ptr: u32,
+    /// Pointer register φ[11] — base of the 32-byte input compressed point.
+    pub point_ptr: u32,
+    /// Pointer register φ[12] — base of the 32-byte output compressed point.
+    pub output_ptr: u32,
+    /// Timestamp of the ECALL step that triggered the precompile.
+    pub ts: u64,
+    /// 32 scalar bytes read at (scalar_ptr + i, ts).
+    pub scalar_bytes: [u8; 32],
+    /// 32 point bytes read at (point_ptr + i, ts).
+    pub point_bytes: [u8; 32],
+    /// 32 output bytes written at (output_ptr + i, ts).
+    pub out_bytes: [u8; 32],
+}
+
 pub struct TracingPvm {
     pub pvm: Interpreter,
     pub steps: Vec<PvmStep>,
     pub blake2b_records: Vec<Blake2bRecord>,
     pub blake2b_mem_ops: Vec<Blake2bMemOp>,
+    pub ristretto_records: Vec<RistrettoRecord>,
+    pub ristretto_mem_ops: Vec<RistrettoMemOp>,
     timestamp: u64,
 }
 
@@ -53,6 +88,8 @@ impl TracingPvm {
             steps: Vec::new(),
             blake2b_records: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            ristretto_records: Vec::new(),
+            ristretto_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
     }
@@ -145,14 +182,17 @@ impl TracingPvm {
 
     /// Run with precompile support. Blake2b ecalls are intercepted,
     /// executed natively, and recorded for the Blake2bChip.
+    /// Ristretto255 scalar-mult ecalls are similarly intercepted and
+    /// recorded for the (in-progress) RistrettoChip.
     pub fn run_with_precompiles(&mut self) -> ExitReason {
         loop {
             if let Some(exit) = self.step() {
                 match exit {
                     ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
                         self.handle_blake2b_ecall();
-                        // Continue execution — advance PC past the ecall
-                        // The PVM already recorded the step; we just resume
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
+                        self.handle_ristretto_scalar_mult_ecall();
                     }
                     other => return other,
                 }
@@ -255,6 +295,50 @@ impl TracingPvm {
         });
     }
 
+    /// Read 32 scalar bytes + 32 compressed-point bytes from flat_mem,
+    /// run the host-side `dalek` scalar mult, write 32 compressed
+    /// output bytes back, and capture the call for the (in-progress)
+    /// RistrettoChip.  Buffers out of bounds are handled by writing
+    /// the canonical compressed-identity sentinel (`[0u8; 32]`) — the
+    /// chip will accept this output as the malformed-input branch.
+    fn handle_ristretto_scalar_mult_ecall(&mut self) {
+        let scalar_ptr_u = self.pvm.registers[10] as usize;
+        let point_ptr_u  = self.pvm.registers[11] as usize;
+        let output_ptr_u = self.pvm.registers[12] as usize;
+        let scalar_ptr = self.pvm.registers[10] as u32;
+        let point_ptr  = self.pvm.registers[11] as u32;
+        let output_ptr = self.pvm.registers[12] as u32;
+
+        let mut scalar_bytes = [0u8; 32];
+        let mut point_bytes  = [0u8; 32];
+        let mem_len = self.pvm.flat_mem.len();
+        let buffers_in_bounds = scalar_ptr_u.saturating_add(32) <= mem_len
+            && point_ptr_u.saturating_add(32) <= mem_len
+            && output_ptr_u.saturating_add(32) <= mem_len;
+        if buffers_in_bounds {
+            scalar_bytes.copy_from_slice(&self.pvm.flat_mem[scalar_ptr_u..scalar_ptr_u + 32]);
+            point_bytes.copy_from_slice(&self.pvm.flat_mem[point_ptr_u..point_ptr_u + 32]);
+        }
+
+        let out_bytes = ristretto_scalar_mult_sw(&scalar_bytes, &point_bytes);
+
+        if buffers_in_bounds {
+            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+        }
+
+        let ts = self.timestamp - 1;
+
+        self.ristretto_records.push(RistrettoRecord {
+            scalar: scalar_bytes,
+            point: point_bytes,
+            output: out_bytes,
+        });
+        self.ristretto_mem_ops.push(RistrettoMemOp {
+            scalar_ptr, point_ptr, output_ptr, ts,
+            scalar_bytes, point_bytes, out_bytes,
+        });
+    }
+
     /// Consume and return the recorded trace.
     pub fn into_trace(self) -> Vec<PvmStep> {
         self.steps
@@ -263,6 +347,11 @@ impl TracingPvm {
     /// Return recorded blake2b calls for the precompile chip.
     pub fn blake2b_calls(&self) -> &[Blake2bRecord] {
         &self.blake2b_records
+    }
+
+    /// Return recorded Ristretto255 scalar-mult calls for the precompile chip.
+    pub fn ristretto_calls(&self) -> &[RistrettoRecord] {
+        &self.ristretto_records
     }
 }
 
@@ -324,6 +413,34 @@ fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: 
     v[d] = (v[d] ^ v[a]).rotate_right(16);
     v[c] = v[c].wrapping_add(v[d]);
     v[b] = (v[b] ^ v[c]).rotate_right(63);
+}
+
+// ── Software Ristretto255 scalar mult for the precompile ─────────
+//
+// Host-side reference using `curve25519-dalek`.  Returns the
+// canonical compressed Ristretto encoding of `k * P`, or `[0u8; 32]`
+// (compressed identity) on either non-canonical scalar bytes or an
+// invalid input point encoding.  This is exactly the function the
+// RistrettoChip will be constrained to compute — by going through the
+// same crate cipher-clerk uses, the precompile's input/output
+// agreement with cipher-clerk's own crypto is by construction.
+
+fn ristretto_scalar_mult_sw(scalar_bytes: &[u8; 32], point_bytes: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::scalar::Scalar;
+
+    let scalar = match Scalar::from_canonical_bytes(*scalar_bytes).into_option() {
+        Some(s) => s,
+        None => return [0u8; 32],
+    };
+    let point = match CompressedRistretto::from_slice(point_bytes)
+        .ok()
+        .and_then(|c| c.decompress())
+    {
+        Some(p) => p,
+        None => return [0u8; 32],
+    };
+    (scalar * point).compress().to_bytes()
 }
 
 /// Compute skip(i) — distance to next instruction minus 1.

@@ -9,7 +9,7 @@ default = ["prover"]
 # Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
 # and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
 # no_std-friendly).
-prover = ["dep:rayon", "dep:blake3"]
+prover = ["dep:rayon", "dep:blake3", "dep:curve25519-dalek"]
 # Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
 # logup imbalances.  Off by default so the production prover surface
 # stays clean; turn on with `--features debug-internals` to bisect
@@ -27,11 +27,18 @@ num-traits = { workspace = true }
 impl-trait-for-tuples = { workspace = true }
 rayon = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true }
+# Host-side reference implementation of Ristretto scalar mult, used by
+# the TracingPvm precompile capture path so the prover can record the
+# canonical output bytes alongside the call.  Same crate cipher-clerk
+# uses for its on-chain math, so the precompile boundary is by-
+# construction agreement with cipher-clerk's own crypto.
+curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 
 [dev-dependencies]
 grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 bincode = "1"
 zkpvm-verifier = { workspace = true }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
 
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }

@@ -692,6 +692,91 @@ fn prove_blake2b_precompile() {
     eprintln!("Blake2b precompile: PROVED!");
 }
 
+/// R1a smoke test: hand-craft an `ecalli 200` program, set up
+/// φ[10]/φ[11]/φ[12] to point at scalar/input-point/output-point
+/// buffers in flat_mem, run TracingPvm with precompile dispatch, and
+/// confirm the captured `RistrettoRecord` + the bytes written to
+/// `output_ptr` match a host-side dalek computation.  No chip /
+/// proving yet — that's R1b onwards.
+#[test]
+fn ristretto_scalar_mult_via_ecall_tracing() {
+    use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
+
+    // Lay out memory: scalar at 0x1000 (32 B), point at 0x1020 (32 B),
+    // output at 0x1040 (32 B).  Scalar is `2`, point is the canonical
+    // basepoint compressed encoding so the expected output is `2*G`.
+    let scalar_addr: u64 = 0x1000;
+    let point_addr:  u64 = 0x1020;
+    let output_addr: u64 = 0x1040;
+
+    let scalar_bytes: [u8; 32] = {
+        let mut s = [0u8; 32];
+        s[0] = 2;
+        s
+    };
+    let point_bytes: [u8; 32] = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+
+    let mut flat_mem = vec![0u8; 0x2000];
+    flat_mem[scalar_addr as usize .. scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
+    flat_mem[point_addr  as usize .. point_addr  as usize + 32].copy_from_slice(&point_bytes);
+
+    // ecalli 200, then trap.  Ecalli is a 5-byte instruction
+    // (opcode + 4-byte little-endian immediate).
+    let imm = ECALL_RISTRETTO_SCALAR_MULT;
+    let code = vec![
+        javm::instruction::Opcode::Ecalli as u8,
+        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        javm::instruction::Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[10] = scalar_addr;
+    regs[11] = point_addr;
+    regs[12] = output_addr;
+
+    let pvm = javm::interpreter::Interpreter::new(
+        code, bitmask, vec![], regs, flat_mem, 10_000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run_with_precompiles();
+    eprintln!("Exit: {exit:?}, steps: {}, ristretto_calls: {}",
+        tracing.steps.len(), tracing.ristretto_records.len());
+
+    assert_eq!(tracing.ristretto_records.len(), 1, "expected 1 Ristretto ECALL");
+    assert_eq!(tracing.ristretto_mem_ops.len(), 1);
+
+    // Expected: 2 * G, computed independently via dalek.
+    let expected_out: [u8; 32] = {
+        let scalar = curve25519_dalek::scalar::Scalar::from_canonical_bytes(scalar_bytes)
+            .into_option().expect("scalar canonical");
+        let point  = curve25519_dalek::ristretto::CompressedRistretto::from_slice(&point_bytes)
+            .ok().and_then(|c| c.decompress()).expect("point decompresses");
+        (scalar * point).compress().to_bytes()
+    };
+
+    let rec = &tracing.ristretto_records[0];
+    assert_eq!(rec.scalar, scalar_bytes);
+    assert_eq!(rec.point,  point_bytes);
+    assert_eq!(rec.output, expected_out, "RistrettoRecord.output mismatch");
+
+    let mem_op = &tracing.ristretto_mem_ops[0];
+    assert_eq!(mem_op.scalar_ptr, scalar_addr as u32);
+    assert_eq!(mem_op.point_ptr,  point_addr  as u32);
+    assert_eq!(mem_op.output_ptr, output_addr as u32);
+    assert_eq!(mem_op.scalar_bytes, scalar_bytes);
+    assert_eq!(mem_op.point_bytes,  point_bytes);
+    assert_eq!(mem_op.out_bytes,    expected_out);
+
+    // Confirm the precompile actually wrote the result back into flat_mem
+    // (so a follow-up PVM instruction could read it).
+    let written = &tracing.pvm.flat_mem[output_addr as usize .. output_addr as usize + 32];
+    assert_eq!(written, &expected_out[..], "flat_mem write mismatch");
+
+    eprintln!("Ristretto scalar mult via ECALL: TRACED ({} bytes output)", expected_out.len());
+}
+
 #[test]
 fn prove_blake2b_via_ecall() {
     use zkpvm::core::tracing::ECALL_BLAKE2B_COMPRESS;
