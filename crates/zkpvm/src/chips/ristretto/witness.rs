@@ -51,10 +51,14 @@ pub struct FieldOpRow {
     /// check.  Final entry must be 0 (the chip's constraint enforces
     /// this).  Each entry is 0 or 1.
     pub final_form_borrow: [u8; 32],
-    /// Per-position borrow chain for the is_sub constraint chain
-    /// `out + b ≡ a (mod p)`.  Final entry must be 0 (closure
-    /// enforced by the chip).  Zero throughout on is_add rows.
+    /// Per-position carry chain for `out + b` on is_sub rows.
+    /// Closure: equals `sub_chain_carry_aip[31]`.
+    /// Zero throughout on is_add / is_mul rows.
     pub sub_chain_borrow: [u8; 32],
+    /// R1f-fix: per-position carry chain for `a + is_underflow·p`
+    /// on is_sub rows.  Closure: equals `sub_chain_borrow[31]`.
+    /// Zero throughout on is_add / is_mul rows.
+    pub sub_chain_carry_aip: [u8; 32],
     /// R1c-4: unreduced 64-byte schoolbook product `a · b` for
     /// is_mul rows.  Bytes 0..32 are the low half; 32..64 the high
     /// half.  Zero throughout on is_add / is_sub rows.
@@ -109,6 +113,7 @@ impl Default for FieldOpRow {
             sub_borrow: [0u8; 32],
             final_form_borrow: [0u8; 32],
             sub_chain_borrow: [0u8; 32],
+            sub_chain_carry_aip: [0u8; 32],
             mul_product: [0u8; 64],
             mul_carry: [0u8; 64],
             mul_carry_mid: [0u8; 64],
@@ -204,6 +209,7 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         sub_borrow,
         final_form_borrow,
         sub_chain_borrow: [0u8; 32], // unused on is_add rows
+        sub_chain_carry_aip: [0u8; 32], // unused
         mul_product: [0u8; 64],      // unused on is_add rows
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
@@ -237,29 +243,34 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
     let out = field::sub(&a, &b);
     let is_underflow: u8 = if !ge_bytes(&a, &b) { 1 } else { 0 };
 
-    // Borrow chain witnessing `a[i] + is_underflow·p[i]
-    //   + 256·brw[i] − out[i] − b[i] − brw[i−1] = 0`.
+    // R1f-fix: two-sided carry chains witnessing the byte-wise
+    // equality `out + b == a + is_underflow·p`.  Each side has its
+    // own forward-carry chain in {0, 1}; closure asserts the final
+    // carries are equal (i.e. both sides reach the same total).
     //
-    // Equivalently `(out + b) − (a + is_underflow·p)` is balanced
-    // byte-wise with brw[i] tracking the carry-out into the next
-    // position.  Since the integer equality holds (and operands are
-    // all < p < 2²⁵⁵), the final brw[31] is 0.
-    let mut sub_chain_borrow = [0u8; 32];
-    let mut brw_in: i32 = 0;
+    // Out-side: out[i] + b[i] + cy_obb[i-1] = byte[i] + 256·cy_obb[i].
+    // Aip-side: a[i] + is_uf·p[i] + cy_aip[i-1] = byte[i] + 256·cy_aip[i].
+    let mut sub_chain_borrow = [0u8; 32];   // cy_obb (out + b carry)
+    let mut sub_chain_carry_aip = [0u8; 32]; // cy_aip (a + is_uf·p carry)
+    let mut cy_obb: u32 = 0;
+    let mut cy_aip: u32 = 0;
     for i in 0..32 {
-        let lhs = (a[i] as i32) + (is_underflow as i32) * (field::P_BYTES[i] as i32) - brw_in;
-        let rhs = (out[i] as i32) + (b[i] as i32);
-        // brw_out picks the right multiple of 256 to make lhs + 256·brw_out = rhs.
-        // I.e. brw_out = (rhs − lhs) / 256 ∈ {0, 1} when operands are well-formed.
-        let diff = rhs - lhs;
-        let brw_out = if diff < 0 { 0 } else { diff / 256 };
-        debug_assert!((0..=1).contains(&brw_out),
-            "sub_chain_borrow out of {{0,1}} at position {i}: diff={diff}");
-        sub_chain_borrow[i] = brw_out as u8;
-        brw_in = brw_out;
+        let v_obb = (out[i] as u32) + (b[i] as u32) + cy_obb;
+        cy_obb = v_obb >> 8;
+        sub_chain_borrow[i] = cy_obb as u8;
+
+        let v_aip = (a[i] as u32) + (is_underflow as u32) * (field::P_BYTES[i] as u32) + cy_aip;
+        cy_aip = v_aip >> 8;
+        sub_chain_carry_aip[i] = cy_aip as u8;
+
+        // Per-position byte equality (the implicit `byte[i]`):
+        debug_assert_eq!(v_obb & 0xff, v_aip & 0xff,
+            "sub byte mismatch at position {i}: obb={} aip={}",
+            v_obb & 0xff, v_aip & 0xff);
     }
-    debug_assert_eq!(sub_chain_borrow[31], 0,
-        "sub_chain_borrow chain didn't close at position 31");
+    debug_assert_eq!(sub_chain_borrow[31], sub_chain_carry_aip[31],
+        "sub-chain carries didn't agree at position 31: obb={} aip={}",
+        sub_chain_borrow[31], sub_chain_carry_aip[31]);
 
     // Final-form chain (out < p) — same as fill_add, since out is
     // shared.
@@ -283,6 +294,7 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         is_overflow: is_underflow,
         final_form_borrow,
         sub_chain_borrow,
+        sub_chain_carry_aip,
         mul_product: [0u8; 64],      // unused on is_sub rows
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
@@ -479,7 +491,8 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         is_overflow,
         sub_borrow,
         final_form_borrow,
-        sub_chain_borrow: [0u8; 32], // unused
+        sub_chain_borrow: [0u8; 32], // unused on is_mul rows
+        sub_chain_carry_aip: [0u8; 32], // unused on is_mul rows
         // Schoolbook witnesses (R1c-4).
         mul_product,
         mul_carry,

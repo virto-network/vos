@@ -289,6 +289,7 @@ impl SideNote {
                 self.add_range256(row.pass2_carry[k]);
                 self.add_range256(row.after_top_bit[k]);
                 self.add_range256(row.after_top_carry[k]);
+                self.add_range256(row.sub_chain_carry_aip[k]);
             }
             for k in 0..64 {
                 self.add_range256(row.mul_product[k]);

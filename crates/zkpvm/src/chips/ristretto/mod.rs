@@ -124,13 +124,16 @@ pub enum Column {
     #[size = 32]
     FinalFormBorrow,
 
-    /// Per-position borrow chain for the is_sub constraint
-    /// `out + b ≡ a (mod p)`, witnessing the byte-by-byte balance
-    /// `a[i] + is_underflow · p[i] + 256·sub_chain_borrow[i] −
-    ///  out[i] − b[i] − sub_chain_borrow[i−1] = 0`.  Final borrow
-    /// (position 31) is constrained to 0 since the integer equality
-    /// `out + b = a + is_underflow · p` holds without overflow when
-    /// `a, b, out < p`.  Each entry is 0 or 1.
+    /// Per-position carry chain for `out + b` on is_sub rows.
+    /// Witnesses the byte-wise sum chain
+    /// `out[i] + b[i] + sub_chain_borrow[i−1] = "lhs_byte[i]" +
+    ///  256 · sub_chain_borrow[i]`, where `lhs_byte[i]` is the
+    /// implicit byte that also equals `a[i] + is_underflow·p[i] +
+    /// sub_chain_carry_aip[i−1] − 256·sub_chain_carry_aip[i]`.
+    /// Each entry is 0 or 1.  Closure: `sub_chain_borrow[31] =
+    /// sub_chain_carry_aip[31]` (both sides have the same final
+    /// carry-out, guaranteeing the integer equality `out + b =
+    /// a + is_underflow·p`).
     ///
     /// On is_sub rows, `IsOverflow` is reinterpreted as
     /// `is_underflow` (1 iff `a < b`); the column is the same wire
@@ -138,6 +141,13 @@ pub enum Column {
     /// flag.
     #[size = 32]
     SubChainBorrow,
+    /// R1f-fix: per-position carry chain for `a + is_underflow·p`
+    /// on is_sub rows.  Together with `SubChainBorrow` (carry of
+    /// `out + b`), they witness `out + b ≡ a + is_underflow·p`
+    /// byte-wise without requiring a {-1, 0, +1} signed witness.
+    /// Each entry is 0 or 1.  Closure: equals `SubChainBorrow[31]`.
+    #[size = 32]
+    SubChainCarryAip,
 
     /// R1c-4: 64-byte unreduced schoolbook product `a · b` for is_mul
     /// rows.  Position k holds the canonical byte
@@ -290,6 +300,7 @@ impl BuiltInComponent for RistrettoChip {
         let borrow  = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
         let ff_brw  = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
         let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
+        let sub_chain_aip = crate::trace::trace_eval!(trace_eval, Column::SubChainCarryAip);
         let mul_product   = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
         let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
         let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
@@ -327,6 +338,9 @@ impl BuiltInComponent for RistrettoChip {
             eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
         }
         for c in sub_chain_brw.iter() {
+            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+        }
+        for c in sub_chain_aip.iter() {
             eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
         }
 
@@ -461,20 +475,38 @@ impl BuiltInComponent for RistrettoChip {
         // value, different role per op flag.  Closure: final borrow
         // = 0 since the integer equation holds without 2²⁵⁶ overflow
         // when all operands are < p.
+        // R1f-fix: prove `out + b == a + is_underflow·p` via two
+        // synchronous forward-carry chains (cy_obb on the
+        // out+b side, cy_aip on the a+is_uf·p side).  Each chain
+        // produces an implicit "byte[i]" at every position; we
+        // assert byte_obb[i] == byte_aip[i] per byte, and assert
+        // the two chains end with equal carries.  This handles
+        // both directions (`out+b > a+p` and vice versa) with
+        // simple {0,1} witnesses.
+        //
+        // Per-byte (gated by is_real · is_sub):
+        //   out[i] + b[i] + cy_obb[i-1] − 256·cy_obb[i]
+        //     = a[i] + is_uf·p[i] + cy_aip[i-1] − 256·cy_aip[i]
         let real_sub = is_real[0].clone() * is_sub[0].clone();
         for i in 0..32 {
             let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
-            let borrow_in = if i == 0 { E::F::zero() } else { sub_chain_brw[i - 1].clone() };
-            let constraint = a[i].clone()
-                + is_ovf[0].clone() * p_i
-                + sub_chain_brw[i].clone() * f256.clone()
-                - out[i].clone()
-                - b[i].clone()
-                - borrow_in;
+            let cy_obb_in = if i == 0 { E::F::zero() } else { sub_chain_brw[i - 1].clone() };
+            let cy_aip_in = if i == 0 { E::F::zero() } else { sub_chain_aip[i - 1].clone() };
+            let constraint = out[i].clone()
+                + b[i].clone()
+                + cy_obb_in
+                - sub_chain_brw[i].clone() * f256.clone()
+                - a[i].clone()
+                - is_ovf[0].clone() * p_i
+                - cy_aip_in
+                + sub_chain_aip[i].clone() * f256.clone();
             eval.add_constraint(real_sub.clone() * constraint);
         }
-        // Closure: integer equality holds without overflow.
-        eval.add_constraint(real_sub.clone() * sub_chain_brw[31].clone());
+        // Closure: cy_obb[31] == cy_aip[31] (both sides produce the
+        // same total: integer equality `out + b = a + is_uf·p`).
+        eval.add_constraint(
+            real_sub.clone() * (sub_chain_brw[31].clone() - sub_chain_aip[31].clone())
+        );
 
         // ── R1c-4-b: schoolbook field multiplication chain ──
         //
@@ -711,11 +743,12 @@ impl BuiltInComponent for RistrettoChip {
                 ));
             }
         }
-        // Loop 3: 32-byte reduction cols — 224.
+        // Loop 3: 32-byte reduction + sub-aux cols — 256.
         for cells_32 in [
             &pass1_lo, &pass1_carry, &pass1_carry_mid,
             &pass2_lo, &pass2_carry,
             &after_top_bit, &after_top_carry,
+            &sub_chain_aip,
         ] {
             for byte in cells_32.iter() {
                 eval.add_to_relation(RelationEntry::new(
@@ -791,6 +824,7 @@ impl BuiltInProverComponent for RistrettoChip {
             trace.fill_columns_bytes(row_i, &r.sub_borrow,         Column::SubBorrow);
             trace.fill_columns_bytes(row_i, &r.final_form_borrow,  Column::FinalFormBorrow);
             trace.fill_columns_bytes(row_i, &r.sub_chain_borrow,   Column::SubChainBorrow);
+            trace.fill_columns_bytes(row_i, &r.sub_chain_carry_aip, Column::SubChainCarryAip);
             trace.fill_columns_bytes(row_i, &r.pass1_lo,           Column::Pass1Lo);
             trace.fill_columns_bytes(row_i, &r.pass1_carry,        Column::Pass1Carry);
             trace.fill_columns_bytes(row_i, &r.pass1_carry_mid,    Column::Pass1CarryMid);
@@ -859,6 +893,7 @@ impl BuiltInProverComponent for RistrettoChip {
         let p2_c    = crate::trace::original_base_column!(component_trace, Column::Pass2Carry);
         let atb     = crate::trace::original_base_column!(component_trace, Column::AfterTopBit);
         let atc     = crate::trace::original_base_column!(component_trace, Column::AfterTopCarry);
+        let scaip   = crate::trace::original_base_column!(component_trace, Column::SubChainCarryAip);
 
         // EMISSION ORDER MUST MATCH `add_constraints` exactly —
         // finalize_logup_in_pairs pairs adjacent emissions (see
@@ -884,11 +919,12 @@ impl BuiltInProverComponent for RistrettoChip {
                 );
             }
         }
-        // Loop 3: 32-byte reduction cols.
+        // Loop 3: 32-byte reduction + sub-aux cols.
         for cells in [
             &p1_lo, &p1_c, &p1_cm,
             &p2_lo, &p2_c,
             &atb, &atc,
+            &scaip,
         ] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
