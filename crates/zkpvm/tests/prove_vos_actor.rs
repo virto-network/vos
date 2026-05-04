@@ -244,7 +244,11 @@ fn profile_actor(name: &str, gas: u64) {
 
     let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
-    let exit = tracing.run();
+    // run_with_vos_stubs gracefully drives lifecycle hostcalls
+    // (INFO/STORAGE_R/FETCH/OUTPUT/...) so vos-style actors complete
+    // their on_start handler under the bare interpreter.  Pure-compute
+    // actors with no hostcalls behave the same as `run()`.
+    let exit = tracing.run_with_vos_stubs();
     let steps = tracing.into_trace();
     let trace_time = t0.elapsed();
 
@@ -289,24 +293,28 @@ fn profile_hasher_actor() {
     profile_actor("hasher", 10_000_000);
 }
 
-// Prove benches for clerk-refine-bench are deferred until the
-// zkpvm test harness gains a vos-aware invocation path (or
-// VosRuntime exposes a tracing hook).  The actor is now
-// vos-macro-styled (consistent with greeter/math/etc.); driving
-// it from the bare `interpreter_from_blob` path doesn't work
-// because vos actors expect a FETCH-delivered refine payload.
-//
-// The previous bare-_start version of this actor produced the
-// throughput numbers documented in BENCHMARKS.md — those still
-// stand for the rkyv-archive hot path the actor exercises.
-//
-// Proper proof of cipher-clerk semantics (apply_batch end-to-end
-// with signed transfers, oracle witness data, ledger state)
-// belongs in the planned crates/actors/clerk-l0/ actor — see
-// commit history for the design discussion.
+/// Real-workload prove: clerk-refine-bench (vos macro style, see
+/// examples/actors/clerk-refine-bench).  vos-macros special-case a
+/// method named `start` as the on_start lifecycle hook, so the
+/// bare interpreter_from_blob path drives the workload via cold
+/// start without needing a FETCH-delivered invocation.
+#[test]
+fn profile_clerk_refine_bench() {
+    profile_actor("clerk-refine-bench", 100_000_000);
+}
 
-// trace_clerk_refine_bench removed in the same change that
-// vos-styled the actor — see comment above profile_clerk_refine_bench.
+/// Trace-only variant of clerk-refine-bench: validates the actor
+/// builds + runs.  Trace-only because profile_clerk_refine_bench
+/// also runs the full prove path.
+#[test]
+fn trace_clerk_refine_bench() {
+    let blob = load_actor_blob("clerk-refine-bench");
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run_with_vos_stubs();
+    let steps = tracing.into_trace();
+    eprintln!("clerk-refine-bench: {} PVM steps, exit={exit:?}", steps.len());
+}
 
 #[test]
 fn profile_hash_bench() {
@@ -667,7 +675,7 @@ fn prove_blake2b_precompile() {
 
 #[test]
 fn prove_blake2b_via_ecall() {
-    use zkpvm::core::tracing::{ECALL_BLAKE2B_COMPRESS, Blake2bRecord};
+    use zkpvm::core::tracing::ECALL_BLAKE2B_COMPRESS;
 
     // Build a PVM program that stores h and m in memory, calls ecall, reads result
     // For simplicity: manually set up interpreter with h/m in memory and call ecall

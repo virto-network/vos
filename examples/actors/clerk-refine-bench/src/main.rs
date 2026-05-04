@@ -9,6 +9,7 @@
 //! per-privacy-level clerk-l0/l1/l2/l3 actors under crates/actors/.
 
 use vos::{actor, messages};
+vos::pvm_main!(crate::ClerkRefineBench);
 use cipher_clerk::ids::{AccountId, JournalId, TransferId, TxTemplateId, EntryId};
 use cipher_clerk::types::{Account, Transfer};
 use cipher_clerk::types::flags::{Direction, Layer};
@@ -27,11 +28,13 @@ impl ClerkRefineBench {
         ClerkRefineBench
     }
 
-    /// Run one refine-shape batch: 4 accounts + 10 transfers ×
-    /// 4 entries each, signing-payload archive + rolling hash.
-    /// Returns the digest so the caller can spot non-determinism.
+    /// Auto-invoked by vos's on_start hook on cold start (see
+    /// vos-macros: methods named `start` are wired as the
+    /// lifecycle on_start handler).  Runs one refine-shape batch:
+    /// 4 accounts + 10 transfers × 4 entries each, signing-payload
+    /// archive + rolling hash.
     #[msg]
-    async fn refine(&self, _ctx: &mut Context<Self>) -> u64 {
+    async fn start(&self, _ctx: &mut Context<Self>) -> u64 {
         let journal_id = JournalId([7u8; 16]);
 
         let accounts: [Account; 4] = [

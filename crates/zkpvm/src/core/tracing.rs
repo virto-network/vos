@@ -160,6 +160,40 @@ impl TracingPvm {
         }
     }
 
+    /// Run with stub handlers for the JAM/VOS lifecycle hostcalls so a
+    /// vos-style actor can be driven cold-start by a bare interpreter.
+    /// Stubbed: `INFO=6`, `STORAGE_R=4`, `FETCH=2`, `OUTPUT=26`,
+    /// `DEBUG_WRITE=11`, `STORAGE_W=5`, `GAS=1` — all return 0 in φ[7].
+    /// `ExitReason::Ecall` (the no-immediate halt with `t0=0`) is treated
+    /// as a clean termination.  Blake2b ecalls are still intercepted and
+    /// executed natively.  Unknown hostcall IDs propagate as-is.
+    pub fn run_with_vos_stubs(&mut self) -> ExitReason {
+        loop {
+            if let Some(exit) = self.step() {
+                match exit {
+                    ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
+                        self.handle_blake2b_ecall();
+                    }
+                    ExitReason::HostCall(id) => match id {
+                        // imm=0 is the IPC/REPLY slot — `halt_with_output`
+                        // emits `ecalli 0` with `t0=0`, the clean-termination
+                        // sentinel.  Treat as halt.
+                        0 => return ExitReason::HostCall(0),
+                        // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
+                        // DEBUG_WRITE, OUTPUT — return 0 in φ[7] (=a0)
+                        1 | 2 | 4 | 5 | 6 | 11 | 26 => {
+                            self.pvm.registers[10] = 0;
+                        }
+                        _ => return ExitReason::HostCall(id),
+                    },
+                    // Plain Ecall (no immediate) is also a halt sentinel.
+                    ExitReason::Ecall => return ExitReason::Ecall,
+                    other => return other,
+                }
+            }
+        }
+    }
+
     fn handle_blake2b_ecall(&mut self) {
         // Read h (64 bytes) from memory at address in φ[10]
         let h_ptr_u = self.pvm.registers[10] as usize;
