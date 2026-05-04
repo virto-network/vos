@@ -30,7 +30,7 @@ use vos_raft::{
     RequestVoteReq, RequestVoteResp, Transport,
 };
 
-use crate::network::{Network, RaftEntry};
+use crate::network::{Network, RaftEntry, RaftEntryKind};
 
 /// Per-RPC timeout for the libp2p reply channel. Long enough that a
 /// healthy peer always answers in time, short enough that a hung
@@ -99,21 +99,29 @@ impl Transport<u16> for VosTransport {
             .network
             .peer_for_prefix(peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
-        // Vos's wire `RaftEntry` carries `payload: Vec<u8>` —
-        // the libp2p frame layer doesn't yet ferry the
-        // `ConfigChange` variant of `EntryKind`. The vos-raft
-        // worker doesn't emit `ConfigChange` entries yet, so this
-        // is safe today; upgrading the wire layer is paired with
-        // joint-consensus rollout.
+        // Convert each `vos_raft::LogEntry` to the wire form,
+        // preserving the `EntryKind` variant. `Data` entries
+        // ferry the raw payload bytes; `ConfigChange` entries
+        // ferry the membership lists so the receiver's worker
+        // can update its quorum view on apply.
         let entries = req
             .entries
             .into_iter()
-            .map(|e| {
-                let payload = e
-                    .payload()
-                    .expect("vos_transport: ConfigChange entries not yet supported on the wire")
-                    .to_vec();
-                RaftEntry { term: e.term, payload }
+            .map(|e| match e.kind {
+                vos_raft::EntryKind::Data { payload } => {
+                    RaftEntry { term: e.term, kind: RaftEntryKind::Data { payload } }
+                }
+                vos_raft::EntryKind::ConfigChange { joint_old, members } => {
+                    RaftEntry {
+                        term: e.term,
+                        kind: RaftEntryKind::ConfigChange { joint_old, members },
+                    }
+                }
+                // Future EntryKind variants — degrade to an empty
+                // `Data` blob on the wire so older peers don't
+                // choke on a tag they can't parse. The receiver's
+                // host apply-path skips empty payloads anyway.
+                _ => RaftEntry { term: e.term, kind: RaftEntryKind::Data { payload: alloc::vec![] } },
             })
             .collect();
         let rx = self.network.send_raft_append(

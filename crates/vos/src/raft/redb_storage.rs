@@ -26,11 +26,134 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use redb::Database;
-use vos_raft::{LogEntry, Meta, Storage, WriteBatch};
+use vos_raft::{EntryKind, LogEntry, Meta, Storage, WriteBatch};
 
 use crate::commit::{CommitError, STATE_KEY, STATE_TABLE};
 
 use super::log::{RaftLog, RaftMeta};
+
+/// On-disk discriminant for the kind of payload a `raft_log` row
+/// carries. Stored as the first byte of the row's value (after
+/// the `[term: u64 LE]` prefix `RaftLog::append_in_txn` adds).
+/// Mirrors the wire-side `RAFT_ENTRY_KIND_*` constants in
+/// `crate::network::wire`. Cleanly separates application data
+/// from membership transitions so the apply path can skip the
+/// latter without parsing them as `EffectLog` blobs.
+pub(crate) const ENTRY_KIND_DATA: u8 = 0;
+pub(crate) const ENTRY_KIND_CONFIG_CHANGE: u8 = 1;
+
+/// Encode a `vos_raft::EntryKind<u16>` to its on-disk byte
+/// sequence. The leading byte is the kind tag; the rest is
+/// variant-specific. Mirrors the wire format in
+/// `crate::network::wire`.
+pub(crate) fn encode_entry_kind(kind: &EntryKind<u16>) -> Vec<u8> {
+    match kind {
+        EntryKind::Data { payload } => {
+            let mut buf = Vec::with_capacity(1 + payload.len());
+            buf.push(ENTRY_KIND_DATA);
+            buf.extend_from_slice(payload);
+            buf
+        }
+        EntryKind::ConfigChange { joint_old, members } => {
+            let cap = 1 + 1
+                + joint_old.as_ref().map_or(0, |v| 2 + 2 * v.len())
+                + 2 + 2 * members.len();
+            let mut buf = Vec::with_capacity(cap);
+            buf.push(ENTRY_KIND_CONFIG_CHANGE);
+            match joint_old {
+                Some(prev) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&(prev.len() as u16).to_le_bytes());
+                    for n in prev {
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+                None => buf.push(0),
+            }
+            buf.extend_from_slice(&(members.len() as u16).to_le_bytes());
+            for n in members {
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            buf
+        }
+        // Future variants land here as the consensus core grows.
+        // Mark the byte sequence empty + a `Data { payload: [] }`
+        // shape so older replicas reading the row don't choke;
+        // the worker will reject the unknown kind tag if/when it
+        // matters.
+        _ => alloc::vec![ENTRY_KIND_DATA],
+    }
+}
+
+/// Decode a `vos_raft::EntryKind<u16>` from its on-disk byte
+/// sequence. Returns `Err` if the tag is unknown or the body
+/// is malformed — the caller treats those as storage corruption.
+pub(crate) fn decode_entry_kind(bytes: &[u8]) -> Result<EntryKind<u16>, CommitError> {
+    let (tag, rest) = bytes.split_first().ok_or_else(|| {
+        CommitError::Config("raft_log entry: empty payload (missing kind tag)".into())
+    })?;
+    match *tag {
+        ENTRY_KIND_DATA => Ok(EntryKind::Data { payload: rest.to_vec() }),
+        ENTRY_KIND_CONFIG_CHANGE => {
+            let mut pos = 0;
+            let joint_old_present = *rest.get(pos).ok_or_else(|| {
+                CommitError::Config("raft_log ConfigChange: missing joint_old flag".into())
+            })?;
+            pos += 1;
+            let joint_old = match joint_old_present {
+                0 => None,
+                1 => {
+                    let len_bytes = rest.get(pos..pos + 2).ok_or_else(|| {
+                        CommitError::Config("raft_log ConfigChange: truncated joint_old len".into())
+                    })?;
+                    pos += 2;
+                    let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                    let mut v = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let b = rest.get(pos..pos + 2).ok_or_else(|| {
+                            CommitError::Config(
+                                "raft_log ConfigChange: truncated joint_old prefix".into(),
+                            )
+                        })?;
+                        pos += 2;
+                        v.push(u16::from_le_bytes([b[0], b[1]]));
+                    }
+                    Some(v)
+                }
+                other => {
+                    return Err(CommitError::Config(alloc::format!(
+                        "raft_log ConfigChange: invalid joint_old flag {other}",
+                    )))
+                }
+            };
+            let len_bytes = rest.get(pos..pos + 2).ok_or_else(|| {
+                CommitError::Config("raft_log ConfigChange: truncated members len".into())
+            })?;
+            pos += 2;
+            let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+            let mut members = Vec::with_capacity(len);
+            for _ in 0..len {
+                let b = rest.get(pos..pos + 2).ok_or_else(|| {
+                    CommitError::Config(
+                        "raft_log ConfigChange: truncated members prefix".into(),
+                    )
+                })?;
+                pos += 2;
+                members.push(u16::from_le_bytes([b[0], b[1]]));
+            }
+            if pos != rest.len() {
+                return Err(CommitError::Config(alloc::format!(
+                    "raft_log ConfigChange: {} trailing bytes",
+                    rest.len() - pos,
+                )));
+            }
+            Ok(EntryKind::ConfigChange { joint_old, members })
+        }
+        other => Err(CommitError::Config(alloc::format!(
+            "raft_log entry: unknown kind tag {other}",
+        ))),
+    }
+}
 
 /// `vos_raft::Storage<u16>` impl on top of a shared
 /// `Arc<redb::Database>`. Caches the log tail + snap pointer + meta
@@ -103,10 +226,12 @@ impl Storage<u16> for RedbStorage {
 
     async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
         let raw = self.log.entries(start, end)?;
-        Ok(raw
-            .into_iter()
-            .map(|e| LogEntry::data(e.index, e.term, e.payload))
-            .collect())
+        let mut out = Vec::with_capacity(raw.len());
+        for e in raw {
+            let kind = decode_entry_kind(&e.payload)?;
+            out.push(LogEntry { index: e.index, term: e.term, kind });
+        }
+        Ok(out)
     }
 
     async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
@@ -163,23 +288,19 @@ impl Storage<u16> for RedbStorage {
                 self.log.compact_to_in_txn(&txn, idx, term)?;
             }
             for entry in &batch.appends {
-                // RaftLog::append_in_txn assigns the index from
+                // `RaftLog::append_in_txn` assigns the index from
                 // its cached tail rather than honoring
                 // `entry.index`. The worker only ever asks us to
                 // append at the next slot, so the indices match
-                // — but assert to catch a future caller passing
-                // something inconsistent.
+                // — but `debug_assert_eq` catches a future caller
+                // passing something inconsistent.
                 //
-                // Vos's redb log only stores `Data` payload bytes
-                // today. The vos-raft worker doesn't yet emit
-                // `ConfigChange` entries (joint consensus isn't
-                // wired here yet); when it does, this layer will
-                // need to serialize the EntryKind discriminant
-                // alongside the bytes.
-                let payload = entry.payload().expect(
-                    "redb_storage: ConfigChange entries not yet supported on the vos wire",
-                );
-                let assigned = self.log.append_in_txn(&txn, entry.term, payload)?;
+                // The on-disk format prefixes a one-byte kind tag
+                // (see `encode_entry_kind`) so a follower's apply
+                // path can distinguish application data from
+                // membership transitions and skip the latter.
+                let on_disk = encode_entry_kind(&entry.kind);
+                let assigned = self.log.append_in_txn(&txn, entry.term, &on_disk)?;
                 debug_assert_eq!(
                     assigned, entry.index,
                     "RedbStorage: append index drift (entry={}, assigned={})",

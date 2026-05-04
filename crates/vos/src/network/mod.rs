@@ -32,9 +32,12 @@
 mod codec;
 mod wire;
 
-pub use wire::{Frame, FrameError, RaftEntry, MAX_FRAME_BYTES};
+pub use wire::{
+    Frame, FrameError, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
+    MAX_FRAME_BYTES,
+};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -127,6 +130,108 @@ pub struct RaftInstallSnapshotResult {
     pub term: u64,
 }
 
+/// Reply to a [`RaftStatusReq`](Frame::RaftStatusReq) — a peer's
+/// view of one Raft replication group. Mirrors
+/// `vos_raft::WorkerSnapshot` minus the storage cursor that
+/// only matters internally. `present = false` means the peer
+/// isn't running the requested group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftStatusReply {
+    pub present: bool,
+    pub role: RaftRole,
+    pub current_term: u64,
+    pub commit_index: u64,
+    pub last_log_index: u64,
+    pub members: Vec<u16>,
+    pub leader_hint: Option<u16>,
+}
+
+/// Wire-stable Raft role. Distinct from `vos_raft::Role` so we
+/// can grow the consensus core (e.g. add a learner / observer
+/// variant) without flipping the wire encoding. `Unknown(u8)`
+/// catches future variants reported by a newer peer — the
+/// current operator can still parse the rest of the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftRole {
+    Follower,
+    PreCandidate,
+    Candidate,
+    Leader,
+    /// Future variant a newer peer used. Operators see this as
+    /// `?` in `vosx ps`; the bootnode and joiner code treat it
+    /// the same as Follower for routing purposes.
+    Unknown(u8),
+}
+
+impl RaftRole {
+    /// Encode to the on-wire byte. Layout chosen to match
+    /// `vos_raft::Role as u8` for the four real variants so a
+    /// receiver decoding straight from a `WorkerSnapshot`
+    /// produces the same bytes as one going through this enum.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Follower => 0,
+            Self::PreCandidate => 1,
+            Self::Candidate => 2,
+            Self::Leader => 3,
+            Self::Unknown(b) => b,
+        }
+    }
+
+    /// Decode from the on-wire byte. Unknown values become
+    /// `RaftRole::Unknown(b)` rather than failing — forward-
+    /// compatible with newer peers reporting future roles.
+    pub fn from_wire(b: u8) -> Self {
+        match b {
+            0 => Self::Follower,
+            1 => Self::PreCandidate,
+            2 => Self::Candidate,
+            3 => Self::Leader,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Human-readable label for `vosx ps`-style output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Follower => "Follower",
+            Self::PreCandidate => "PreCand.",
+            Self::Candidate => "Candidate",
+            Self::Leader => "Leader",
+            Self::Unknown(_) => "?",
+        }
+    }
+}
+
+impl RaftStatusReply {
+    /// Construct a "no, I don't host this group" reply.
+    pub fn absent() -> Self {
+        Self {
+            present: false,
+            role: RaftRole::Follower,
+            current_term: 0,
+            commit_index: 0,
+            last_log_index: 0,
+            members: Vec::new(),
+            leader_hint: None,
+        }
+    }
+}
+
+/// Local provider for the bootnode's manifest. Implemented by
+/// `vosx` so a fresh `vosx join <bootnode>` can fetch the
+/// space.toml + actor blobs without the operator pre-distributing
+/// the manifest. Returns `None` for nodes that don't expose a
+/// manifest (transient peers, manifest-less raw `vosx run`).
+pub trait ManifestProvider: Send + Sync {
+    /// `(toml_bytes, blobs)` — the raw `space.toml` content and a
+    /// list of every actor blob the manifest references, keyed
+    /// by name. The joiner writes the blobs into a local cache
+    /// keyed by the same name so its replication_id derivation
+    /// (`blake2b(name || 0 || blob)`) lines up with the bootnode's.
+    fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)>;
+}
+
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncProvider`]'s
 /// shape: the swarm thread invokes the trait methods on its current-
 /// thread runtime, so implementations must be fast. Any redb writes
@@ -179,6 +284,30 @@ pub trait RaftRpcHandler: Send + Sync {
     ) -> RaftInstallSnapshotResult {
         RaftInstallSnapshotResult { term }
     }
+
+    /// Inbound `RaftJoinReq` from a fresh node that wants to
+    /// become a voter in this replication group. Default impl
+    /// returns `NotLeader { leader_hint: None }` — handlers
+    /// representing real workers override this to: (a) check
+    /// they're the leader, (b) compute `new_members = current ∪
+    /// {joiner}`, and (c) call `change_membership(...)`. On
+    /// success, return `Accepted { joint_index }` so the joiner
+    /// can poll for `commit_index >= joint_index + 1`.
+    fn handle_join(
+        &self,
+        _replication_id: &[u8; 32],
+        _joiner_prefix: u16,
+    ) -> RaftJoinResult {
+        RaftJoinResult::NotLeader { leader_hint: None }
+    }
+
+    /// Inbound `RaftStatusReq` — answer "what's your view of
+    /// replication group X?" from a vosx-ps observer. Default
+    /// impl returns [`RaftStatusReply::absent`]; concrete
+    /// handlers override to translate their `WorkerSnapshot`.
+    fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+        RaftStatusReply::absent()
+    }
 }
 
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
@@ -186,6 +315,15 @@ pub trait RaftRpcHandler: Send + Sync {
 /// thread and any [`Network`] callers that want to look up a
 /// peer by prefix.
 type PrefixMap = Arc<Mutex<HashMap<u16, PeerId>>>;
+
+/// Map: replication-group id → handler. Each Raft group running
+/// on this node registers itself via
+/// [`Network::register_raft_handler`]; the swarm thread routes
+/// inbound Raft RPCs to the handler whose `replication_id`
+/// matches the frame's. Pre-multi-group code stored a single
+/// `Option<Arc<...>>`; multi-group dispatch (one Raft cluster per
+/// `[[agent]] consistency = "raft"`) needs the map.
+type RaftHandlerMap = Arc<Mutex<BTreeMap<[u8; 32], Arc<dyn RaftRpcHandler>>>>;
 
 /// Multiaddrs the local swarm has actually bound to. Populated
 /// from `SwarmEvent::NewListenAddr`. Useful for tests that bind
@@ -209,11 +347,19 @@ pub struct Network {
     /// Read by the swarm thread on every inbound `FetchHeads` /
     /// `FetchNode` to look up the local replica.
     sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
-    /// Set via [`set_raft_handler`](Self::set_raft_handler).
-    /// Read by the swarm thread on every inbound
-    /// `RaftAppendReq` / `RaftVoteReq` to dispatch into the
-    /// local Raft state machine.
-    raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
+    /// Per-replication-group inbound Raft handler map. Populated
+    /// via [`register_raft_handler`](Self::register_raft_handler);
+    /// read by the swarm thread on every inbound
+    /// `RaftAppendReq` / `RaftVoteReq` / `RaftInstallSnapshotReq`
+    /// to route the call to the right group's state machine.
+    /// Frames carrying a `replication_id` with no entry surface to
+    /// the peer as the default empty / current-term answer.
+    raft_handlers: RaftHandlerMap,
+    /// Set via [`set_manifest_provider`](Self::set_manifest_provider).
+    /// Read by the swarm thread on inbound `ManifestReq` frames
+    /// so a fresh `vosx join` can fetch the bootnode's space.toml
+    /// + actor blobs.
+    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -316,6 +462,28 @@ enum NetworkCmd {
         snapshot: Vec<u8>,
         reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
     },
+    /// Send a [`Frame::RaftJoinReq`] to a peer to add the local
+    /// replica as a voter in their replication group. Reply
+    /// yields the join outcome.
+    SendRaftJoin {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        joiner_prefix: u16,
+        reply: std_mpsc::Sender<RaftJoinResult>,
+    },
+    /// Send a [`Frame::ManifestReq`] to a bootnode. Reply yields
+    /// the bootnode's space.toml + actor blobs.
+    SendManifestReq {
+        target_peer: PeerId,
+        reply: std_mpsc::Sender<(Vec<u8>, Vec<ManifestBlob>)>,
+    },
+    /// Send a [`Frame::RaftStatusReq`] for one replication
+    /// group. Reply yields the peer's view of the group.
+    SendRaftStatus {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        reply: std_mpsc::Sender<RaftStatusReply>,
+    },
     Shutdown,
 }
 
@@ -327,6 +495,9 @@ enum OutboundReply {
     RaftAppend(std_mpsc::Sender<RaftAppendResult>),
     RaftVote(std_mpsc::Sender<RaftVoteResult>),
     RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
+    RaftJoin(std_mpsc::Sender<RaftJoinResult>),
+    Manifest(std_mpsc::Sender<(Vec<u8>, Vec<ManifestBlob>)>),
+    RaftStatus(std_mpsc::Sender<RaftStatusReply>),
 }
 
 impl Network {
@@ -340,7 +511,8 @@ impl Network {
             Arc::new(Mutex::new(None));
         let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> =
             Arc::new(Mutex::new(None));
-        let raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>> =
+        let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
+        let manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>> =
             Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
@@ -349,7 +521,8 @@ impl Network {
         let listen_addrs_for_thread = listen_addrs.clone();
         let invoke_dispatcher_for_thread = invoke_dispatcher.clone();
         let sync_provider_for_thread = sync_provider.clone();
-        let raft_handler_for_thread = raft_handler.clone();
+        let raft_handlers_for_thread = raft_handlers.clone();
+        let manifest_provider_for_thread = manifest_provider.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -369,7 +542,8 @@ impl Network {
                 inbox_tx,
                 invoke_dispatcher_for_thread,
                 sync_provider_for_thread,
-                raft_handler_for_thread,
+                raft_handlers_for_thread,
+                manifest_provider_for_thread,
             ));
         });
 
@@ -382,7 +556,8 @@ impl Network {
             inbox_rx: Mutex::new(Some(inbox_rx)),
             invoke_dispatcher,
             sync_provider,
-            raft_handler,
+            raft_handlers,
+            manifest_provider,
             join: Some(join),
         }
     }
@@ -406,15 +581,109 @@ impl Network {
         }
     }
 
-    /// Install the handler used to answer inbound `RaftAppendReq` /
-    /// `RaftVoteReq` frames against the local Raft state machine.
-    /// Without it, peers asking us to append entries or vote get
-    /// no reply (the channel times out or surfaces as a transport
-    /// error to the caller).
-    pub fn set_raft_handler(&self, handler: Arc<dyn RaftRpcHandler>) {
-        if let Ok(mut g) = self.raft_handler.lock() {
-            *g = Some(handler);
+    /// Register a handler for one Raft replication group.
+    /// Multiple groups can coexist on a single node — one
+    /// `[[agent]] consistency = "raft"` per group — and the swarm
+    /// thread routes inbound `RaftAppendReq` / `RaftVoteReq` /
+    /// `RaftInstallSnapshotReq` to the handler whose
+    /// `replication_id` matches the frame's. Inserting the same
+    /// `replication_id` twice replaces the existing handler.
+    pub fn register_raft_handler(
+        &self,
+        replication_id: [u8; 32],
+        handler: Arc<dyn RaftRpcHandler>,
+    ) {
+        if let Ok(mut g) = self.raft_handlers.lock() {
+            g.insert(replication_id, handler);
         }
+    }
+
+    /// Drop the handler for `replication_id`. Inbound RPCs for
+    /// that group will surface to the peer as the
+    /// no-handler default (current-term answer with `success =
+    /// false`). Used when a replica leaves the cluster, or in
+    /// tests that want to simulate a partition.
+    pub fn unregister_raft_handler(&self, replication_id: &[u8; 32]) {
+        if let Ok(mut g) = self.raft_handlers.lock() {
+            g.remove(replication_id);
+        }
+    }
+
+    /// Snapshot of every replication group with a registered
+    /// handler. Returned in deterministic order (BTreeMap
+    /// iteration). Used by the manifest-fetch / join paths to
+    /// answer "what Raft groups is this node hosting?".
+    pub fn registered_raft_groups(&self) -> Vec<[u8; 32]> {
+        self.raft_handlers
+            .lock()
+            .map(|g| g.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Install the provider used to answer inbound `ManifestReq`
+    /// frames so a fresh `vosx join` can fetch the bootnode's
+    /// space.toml + actor blobs. Without it, peers asking us
+    /// for the manifest get an empty reply.
+    pub fn set_manifest_provider(&self, provider: Arc<dyn ManifestProvider>) {
+        if let Ok(mut g) = self.manifest_provider.lock() {
+            *g = Some(provider);
+        }
+    }
+
+    /// Send a [`Frame::RaftJoinReq`] to a bootnode. The receiver
+    /// either calls `change_membership` (returning
+    /// [`RaftJoinResult::Accepted`]) or redirects with
+    /// [`RaftJoinResult::NotLeader`] + a leader hint. The reply
+    /// channel yields exactly once; on transport failure the
+    /// Sender is dropped (`recv` yields `Disconnected`).
+    pub fn send_raft_join_req(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        joiner_prefix: u16,
+    ) -> std_mpsc::Receiver<RaftJoinResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftJoin {
+            target_peer,
+            replication_id,
+            joiner_prefix,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a [`Frame::ManifestReq`] to a bootnode. The reply is
+    /// `(toml_bytes, blobs)`; on transport failure the Sender is
+    /// dropped. Used by `vosx join` when the operator hasn't
+    /// supplied `--manifest`.
+    pub fn send_manifest_req(
+        &self,
+        target_peer: PeerId,
+    ) -> std_mpsc::Receiver<(Vec<u8>, Vec<ManifestBlob>)> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendManifestReq {
+            target_peer,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a [`Frame::RaftStatusReq`] for one replication
+    /// group. The reply describes that peer's view of the
+    /// group. `vosx ps` fans this out across every connected
+    /// peer to assemble the cluster snapshot.
+    pub fn send_raft_status_req(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+    ) -> std_mpsc::Receiver<RaftStatusReply> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftStatus {
+            target_peer,
+            replication_id,
+            reply: tx,
+        });
+        rx
     }
 
     /// Send a Raft `AppendEntries` RPC to a specific peer. Receiver
@@ -699,7 +968,8 @@ async fn network_main(
     inbox_tx: std_mpsc::Sender<InboundTell>,
     invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
-    raft_handler: Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
+    raft_handlers: RaftHandlerMap,
+    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -761,7 +1031,8 @@ async fn network_main(
                     &mut outbound_replies,
                     &invoke_dispatcher,
                     &sync_provider,
-                    &raft_handler,
+                    &raft_handlers,
+                    &manifest_provider,
                     &response_tx,
                     &hint_senders,
                 );
@@ -931,6 +1202,46 @@ async fn network_main(
                         debug!(%target_peer, term, last_included_index,
                             "network: sent RaftInstallSnapshot");
                     }
+                    Some(NetworkCmd::SendRaftJoin {
+                        target_peer,
+                        replication_id,
+                        joiner_prefix,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftJoinReq {
+                            replication_id,
+                            joiner_prefix,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftJoin(reply));
+                        debug!(%target_peer, joiner_prefix, "network: sent RaftJoinReq");
+                    }
+                    Some(NetworkCmd::SendManifestReq { target_peer, reply }) => {
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, Frame::ManifestReq);
+                        outbound_replies.insert(req_id, OutboundReply::Manifest(reply));
+                        debug!(%target_peer, "network: sent ManifestReq");
+                    }
+                    Some(NetworkCmd::SendRaftStatus {
+                        target_peer,
+                        replication_id,
+                        reply,
+                    }) => {
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(
+                                &target_peer,
+                                Frame::RaftStatusReq { replication_id },
+                            );
+                        outbound_replies.insert(req_id, OutboundReply::RaftStatus(reply));
+                        debug!(%target_peer, "network: sent RaftStatusReq");
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
@@ -1018,7 +1329,8 @@ fn handle_swarm_event(
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
-    raft_handler: &Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
+    raft_handlers: &RaftHandlerMap,
+    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
@@ -1069,7 +1381,7 @@ fn handle_swarm_event(
             handle_req_resp(
                 swarm, rr_event, local_prefix, prefix_map, inbox,
                 outbound_replies, invoke_dispatcher, sync_provider,
-                raft_handler, response_tx,
+                raft_handlers, manifest_provider, response_tx,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {
@@ -1088,7 +1400,8 @@ fn handle_req_resp(
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
     sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
-    raft_handler: &Arc<Mutex<Option<Arc<dyn RaftRpcHandler>>>>,
+    raft_handlers: &RaftHandlerMap,
+    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -1173,8 +1486,14 @@ fn handle_req_resp(
                         // do redb writes (append entries, advance
                         // last_applied), which would park the
                         // current_thread runtime if awaited inline.
-                        // Same shape used by InvokeRequest above.
-                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        // Routing is per-replication-group: we look
+                        // up the handler keyed by `replication_id`
+                        // so multiple Raft clusters can coexist on
+                        // one node.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let resp = match handler {
@@ -1190,8 +1509,9 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         leader_prefix,
-                                        "network: inbound RaftAppendReq with no handler; \
-                                         replying with success=false",
+                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        "network: inbound RaftAppendReq for unknown \
+                                         replication group; replying success=false",
                                     );
                                     RaftAppendResult {
                                         term,
@@ -1219,7 +1539,11 @@ fn handle_req_resp(
                     } => {
                         // Vote logic touches redb (writes voted_for /
                         // current_term), so dispatch on a blocking task.
-                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        // Routed by `replication_id` like AppendEntries.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let resp = match handler {
@@ -1233,8 +1557,9 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         candidate_prefix,
-                                        "network: inbound RaftVoteReq with no handler; \
-                                         replying vote_granted=false",
+                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        "network: inbound RaftVoteReq for unknown \
+                                         replication group; vote_granted=false",
                                     );
                                     RaftVoteResult {
                                         term,
@@ -1261,8 +1586,13 @@ fn handle_req_resp(
                     } => {
                         // Install logic writes redb (state row +
                         // raft_meta + raft_log truncate), so a
-                        // blocking task is the right shape.
-                        let handler = raft_handler.lock().ok().and_then(|g| g.clone());
+                        // blocking task is the right shape. Routed
+                        // by `replication_id` like the other Raft
+                        // RPCs.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let resp = match handler {
@@ -1277,8 +1607,9 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         leader_prefix,
-                                        "network: inbound RaftInstallSnapshotReq with no \
-                                         handler; replying with our term",
+                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        "network: inbound RaftInstallSnapshotReq for unknown \
+                                         replication group; replying with our term",
                                     );
                                     RaftInstallSnapshotResult { term }
                                 }
@@ -1286,6 +1617,69 @@ fn handle_req_resp(
                             let _ = response_tx.send((
                                 channel,
                                 Frame::RaftInstallSnapshotResp { term: resp.term },
+                            ));
+                        });
+                    }
+                    Frame::RaftJoinReq { replication_id, joiner_prefix } => {
+                        // Join requests can call `change_membership`,
+                        // which writes the joint-config redb row. Off
+                        // the swarm thread.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = match handler {
+                                Some(h) => h.handle_join(&replication_id, joiner_prefix),
+                                None => RaftJoinResult::UnknownGroup,
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftJoinResp { result },
+                            ));
+                        });
+                    }
+                    Frame::ManifestReq => {
+                        // Manifest provider just reads in-memory
+                        // bytes; serve inline.
+                        let provider = manifest_provider
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone());
+                        let (toml_bytes, blobs) = provider
+                            .and_then(|p| p.manifest())
+                            .unwrap_or_default();
+                        let _ = swarm.behaviour_mut().req_resp.send_response(
+                            channel,
+                            Frame::ManifestResp { toml_bytes, blobs },
+                        );
+                    }
+                    Frame::RaftStatusReq { replication_id } => {
+                        // Status query needs a snapshot from the
+                        // worker — that round-trips through its
+                        // inbox, so dispatch on a blocking task.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let reply = match handler {
+                                Some(h) => h.handle_status(&replication_id),
+                                None => RaftStatusReply::absent(),
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftStatusResp {
+                                    present: reply.present,
+                                    role: reply.role.to_wire(),
+                                    current_term: reply.current_term,
+                                    commit_index: reply.commit_index,
+                                    last_log_index: reply.last_log_index,
+                                    members: reply.members,
+                                    leader_hint: reply.leader_hint,
+                                },
                             ));
                         });
                     }
@@ -1337,6 +1731,35 @@ fn handle_req_resp(
                         Some(OutboundReply::RaftInstallSnapshot(tx)),
                     ) => {
                         let _ = tx.send(RaftInstallSnapshotResult { term });
+                    }
+                    (
+                        Frame::RaftJoinResp { result },
+                        Some(OutboundReply::RaftJoin(tx)),
+                    ) => {
+                        let _ = tx.send(result);
+                    }
+                    (
+                        Frame::ManifestResp { toml_bytes, blobs },
+                        Some(OutboundReply::Manifest(tx)),
+                    ) => {
+                        let _ = tx.send((toml_bytes, blobs));
+                    }
+                    (
+                        Frame::RaftStatusResp {
+                            present, role, current_term, commit_index,
+                            last_log_index, members, leader_hint,
+                        },
+                        Some(OutboundReply::RaftStatus(tx)),
+                    ) => {
+                        let _ = tx.send(RaftStatusReply {
+                            present,
+                            role: RaftRole::from_wire(role),
+                            current_term,
+                            commit_index,
+                            last_log_index,
+                            members,
+                            leader_hint,
+                        });
                     }
                     (other, _) => {
                         warn!(%peer, ?other, "network: response shape mismatched pending request");
@@ -2416,8 +2839,9 @@ mod tests {
         });
 
         // Install the stub on B — A is the leader-side caller.
+        let rep_id = [0xC0u8; 32];
         let handler = Arc::new(StubHandler::new(7));
-        net_b.set_raft_handler(handler.clone());
+        net_b.register_raft_handler(rep_id, handler.clone());
 
         // Wait for the Hello handshake so A has a PeerId for B.
         wait_for(|| {
@@ -2426,12 +2850,11 @@ mod tests {
         }, Duration::from_secs(10))
         .expect("Hello completes");
         let target_b = net_a.peer_for_prefix(prefix_b).unwrap();
-        let rep_id = [0xC0u8; 32];
 
         // ── AppendEntries: send two entries from term 8. ──────
         let entries = vec![
-            RaftEntry { term: 8, payload: b"first".to_vec() },
-            RaftEntry { term: 8, payload: b"second".to_vec() },
+            RaftEntry::data(8, b"first".to_vec()),
+            RaftEntry::data(8, b"second".to_vec()),
         ];
         let rx = net_a.send_raft_append(
             target_b, rep_id,
@@ -2591,9 +3014,10 @@ mod tests {
         let w_a = mk_worker(prefix_a, net_a.clone(), "a.redb");
         let w_b = mk_worker(prefix_b, net_b.clone(), "b.redb");
         let w_c = mk_worker(prefix_c, net_c.clone(), "c.redb");
-        net_a.set_raft_handler(Arc::new(w_a.handler()));
-        net_b.set_raft_handler(Arc::new(w_b.handler()));
-        net_c.set_raft_handler(Arc::new(w_c.handler()));
+        let rep_id = [0xC1u8; 32];
+        net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
+        net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
+        net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
 
         // Phase 3.3: heartbeats keep followers' timers reset, so
         // leadership is *stable* — once a Leader emerges it stays
@@ -2682,8 +3106,10 @@ mod tests {
     /// Phase-4.3 boundary: 3-node cluster, elect a leader, propose
     /// three entries via the leader's `WorkerHandle::propose`, and
     /// wait for both followers to replicate them. Direct redb
-    /// introspection asserts every replica has the same three
-    /// rows in `raft_log` and `last_applied == 3`.
+    /// introspection asserts every replica has four rows in
+    /// `raft_log` (the leader-promotion no-op at index 1 plus the
+    /// three application proposes at indices 2..=4) and
+    /// `commit_index == 4`.
     #[test]
     fn three_node_cluster_replicates_proposed_entries() {
         use crate::raft::{RaftMeta, RaftWorker, Role, WorkerConfig, RAFT_LOG};
@@ -2767,9 +3193,10 @@ mod tests {
         let (path_a, w_a) = mk_worker(prefix_a, net_a.clone(), "a.redb");
         let (path_b, w_b) = mk_worker(prefix_b, net_b.clone(), "b.redb");
         let (path_c, w_c) = mk_worker(prefix_c, net_c.clone(), "c.redb");
-        net_a.set_raft_handler(Arc::new(w_a.handler()));
-        net_b.set_raft_handler(Arc::new(w_b.handler()));
-        net_c.set_raft_handler(Arc::new(w_c.handler()));
+        let rep_id = [0xC2u8; 32];
+        net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
+        net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
+        net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
 
         // ── Wait for a leader. ────────────────────────────────
         let until = StdInstant::now() + Duration::from_secs(5);
@@ -2805,27 +3232,15 @@ mod tests {
             assert!(idx >= 1);
         }
 
-        // ── Wait for all replicas to commit_index ≥ 3. ────────
-        // Phase 4.2's commit-advance fires when a follower's
-        // match_index reaches 3 → leader's commit_index = 3 →
-        // next heartbeat propagates leader_commit to followers →
-        // their commit_index = 3 too. So followers see the new
-        // commit one heartbeat *after* the leader does. Probe
-        // commit_index, not last_log_index, so the test is only
-        // green once the propagation completes. Snapshot also
-        // exposes last_log_index for diagnostics on failure.
-        //
-        // The snapshot doesn't expose commit_index directly — read
-        // it via redb at probe time using a non-blocking write
-        // txn. Since the worker holds the only Database handle
-        // for its file, we instead query commit_index through a
-        // synthetic AppendEntries (a zero-entry heartbeat from
-        // peer prefix 0, term 0 — refused, but the response
-        // exposes the worker's current term, not commit_index).
-        // Simpler: extend WorkerSnapshot with commit_index.
-        // Generous deadline because libp2p loopback latency under
-        // heavy `cargo test` parallelism can balloon when the
-        // tokio blocking pool is saturated by other tests.
+        // ── Wait for all replicas to commit_index ≥ 4. ────────
+        // The leader appends a no-op entry on promotion (Ongaro
+        // §6.4) at index 1; the three application proposes land
+        // at indices 2..=4. Quorum-commit fires when followers'
+        // match_index reaches 4 → leader's commit_index = 4 →
+        // next heartbeat propagates leader_commit to followers.
+        // Probe commit_index via the snapshot — the worker holds
+        // the exclusive redb file lock, so direct introspection
+        // is deferred until shutdown below.
         let until = StdInstant::now() + Duration::from_secs(10);
         loop {
             let snaps = [
@@ -2834,12 +3249,12 @@ mod tests {
                 (prefix_c, w_c.handler().snapshot()),
             ];
             let all_committed = snaps.iter().all(|(_, s)| {
-                s.as_ref().is_some_and(|x| x.commit_index >= 3)
+                s.as_ref().is_some_and(|x| x.commit_index >= 4)
             });
             if all_committed { break; }
             if StdInstant::now() >= until {
                 panic!(
-                    "all replicas did not reach commit_index ≥ 3 within \
+                    "all replicas did not reach commit_index ≥ 4 within \
                      deadline; snaps: {snaps:?}",
                 );
             }
@@ -2860,19 +3275,19 @@ mod tests {
             let log_table = txn.open_table(RAFT_LOG).expect("raft_log");
             let n_rows = log_table.len().expect("len");
             assert_eq!(
-                n_rows, 3,
-                "replica {label} should have exactly 3 raft_log rows; \
+                n_rows, 4,
+                "replica {label} should have exactly 4 raft_log rows \
+                 (leader-promotion no-op + 3 application proposes); \
                  got {n_rows}",
             );
             let meta = RaftMeta::load(&db).expect("meta");
-            // Phase 4 stubs `last_applied` to track `commit_index`,
-            // and `commit_index` advances to 3 once the majority
-            // matches the leader. The leader sees this directly;
-            // the follower sees it the next heartbeat after the
-            // leader's commit advance.
+            // The leader appends a no-op on promotion (idx 1) and
+            // the three application proposes land at idx 2..=4.
+            // commit_index advances to 4 once a majority matches
+            // the leader; followers see it on the next heartbeat.
             assert_eq!(
-                meta.commit_index, 3,
-                "replica {label} commit_index should advance to 3",
+                meta.commit_index, 4,
+                "replica {label} commit_index should advance to 4",
             );
             // `last_applied` is now the host's responsibility
             // (vos_raft::Meta no longer tracks it). On the leader

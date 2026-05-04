@@ -2420,7 +2420,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
     std::fs::create_dir_all(&dir).unwrap();
 
     // Same replication_id derivation cmd_start uses, so this
-    // mirrors what a real `vosx start` would produce.
+    // mirrors what a real `vosx up` would produce.
     let rep_id: [u8; 32] = {
         let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
         h.update(b"counter");
@@ -4425,3 +4425,431 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     );
     assert_eq!(rt.panics, 0, "no service should have panicked");
 }
+
+
+#[test]
+#[cfg(feature = "network")]
+fn raft_dynamic_join_grows_single_node_cluster_to_three() {
+    // Phase B boundary: a fresh node joins a running Raft cluster
+    // at runtime via `WorkerHandle::change_membership` (Ongaro
+    // §4.3 joint consensus).
+    //
+    // Flow:
+    //   1. Node A boots solo (`members = [A]`), self-elects, runs
+    //      a few application proposes — the cluster works.
+    //   2. Node B boots with `members = [B]` (its own initial
+    //      view), dials A, completes the Hello handshake.
+    //   3. Test orchestrator calls `change_membership([A, B])`
+    //      on A's worker → joint-consensus joint entry commits →
+    //      vos-raft auto-emits the retire entry → B is now a
+    //      voter.
+    //   4. Repeat for node C → cluster is {A, B, C}, quorum = 2.
+    //   5. Drive proposes from A; assert all three replicas
+    //      converge on the same commit_index.
+    //
+    // The test wires libp2p, vos's RaftWorker, and vos's
+    // `change_membership` together — same plumbing `vosx` would
+    // use for an auto-join CLI on top of this API.
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::raft::{RaftWorker, Role, WorkerConfig};
+
+    fn wait_for_role_at(
+        h: &vos::raft::WorkerHandle,
+        want: Role,
+        max: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + max;
+        while Instant::now() < deadline {
+            if h.role() == want { return true; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_raft_join_{}_{}", std::process::id(), stamp,
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    let dir_c = dir_root.join("c");
+    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let kp_c = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let prefix_c = derive_node_prefix(&libp2p::PeerId::from(kp_c.public()));
+    if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    // ── Node A — solo cluster, listening for joiners. ─────────
+    let net_a = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    }));
+    let a_addr = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let db_a = Arc::new(redb::Database::create(dir_a.join("raft.redb")).unwrap());
+    let rep_id = [0xC3u8; 32];
+    let worker_a = RaftWorker::spawn(
+        db_a.clone(),
+        WorkerConfig {
+            me: prefix_a,
+            members: vec![prefix_a],
+            replication_id: rep_id,
+            election_timeout_ms: (50, 150),
+            heartbeat_interval_ms: 20,
+        },
+        Some(net_a.clone()),
+        None,
+    );
+    net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
+    let h_a = worker_a.handler();
+    assert!(wait_for_role_at(&h_a, Role::Leader, Duration::from_secs(5)),
+        "solo node A self-elects");
+
+    // ── Node B — joins via A. ─────────────────────────────────
+    let net_b = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+    }));
+    let b_addr = wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_b binds");
+    let b_dial: libp2p::Multiaddr = b_addr
+        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+    // Wait for the Hello handshake so A's VosTransport can route
+    // AppendEntries to B once the membership change commits.
+    wait_for(|| (
+        net_a.peer_for_prefix(prefix_b).is_some()
+        && net_b.peer_for_prefix(prefix_a).is_some()
+    ).then_some(()), Duration::from_secs(15)).expect("A↔B Hello");
+
+    let db_b = Arc::new(redb::Database::create(dir_b.join("raft.redb")).unwrap());
+    let worker_b = RaftWorker::spawn(
+        db_b.clone(),
+        WorkerConfig {
+            me: prefix_b,
+            // B starts knowing only itself — it's a Follower until
+            // A's ConfigChange teaches it about the wider cluster.
+            members: vec![prefix_b],
+            replication_id: rep_id,
+            // Long timeout so B doesn't self-elect before joining.
+            election_timeout_ms: (5_000, 10_000),
+            heartbeat_interval_ms: 1_000,
+        },
+        Some(net_b.clone()),
+        None,
+    );
+    net_b.register_raft_handler(rep_id, Arc::new(worker_b.handler()));
+
+    // A: change_membership([A, B]) — joint-consensus joint entry
+    // commits via {A}'s self-quorum, then the retire entry needs
+    // {A, B} quorum and replicates to B.
+    let join_idx = h_a.change_membership(vec![prefix_a, prefix_b])
+        .expect("A: change_membership([A, B])");
+    assert!(join_idx >= 1, "joint entry must have a real index");
+
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(snap_b) = worker_b.handler().snapshot() {
+            if snap_b.commit_index >= join_idx + 1 { break; }
+        }
+        assert!(Instant::now() < until,
+            "B did not catch up to commit_index >= {} within 15s",
+            join_idx + 1);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ── Node C — joins via A and B. ───────────────────────────
+    let net_c = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_c, local_prefix: prefix_c,
+        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+    }));
+    wait_for(|| (
+        net_a.peer_for_prefix(prefix_c).is_some()
+        && net_c.peer_for_prefix(prefix_a).is_some()
+        && net_b.peer_for_prefix(prefix_c).is_some()
+        && net_c.peer_for_prefix(prefix_b).is_some()
+    ).then_some(()), Duration::from_secs(15)).expect("A↔C, B↔C Hello");
+
+    let db_c = Arc::new(redb::Database::create(dir_c.join("raft.redb")).unwrap());
+    let worker_c = RaftWorker::spawn(
+        db_c.clone(),
+        WorkerConfig {
+            me: prefix_c,
+            members: vec![prefix_c],
+            replication_id: rep_id,
+            election_timeout_ms: (5_000, 10_000),
+            heartbeat_interval_ms: 1_000,
+        },
+        Some(net_c.clone()),
+        None,
+    );
+    net_c.register_raft_handler(rep_id, Arc::new(worker_c.handler()));
+
+    let join_idx2 = h_a.change_membership(vec![prefix_a, prefix_b, prefix_c])
+        .expect("A: change_membership([A, B, C])");
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snap_c = worker_c.handler().snapshot();
+        if snap_c.as_ref().is_some_and(|s| s.commit_index >= join_idx2 + 1) {
+            break;
+        }
+        assert!(Instant::now() < until,
+            "C did not catch up to commit_index >= {} within 15s",
+            join_idx2 + 1);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ── Drive a few application proposes via A; all three
+    //    replicas must converge on the same commit_index. ─────
+    let p1 = h_a.propose(b"hello".to_vec()).expect("propose 1");
+    let p2 = h_a.propose(b"world".to_vec()).expect("propose 2");
+    assert!(p2 > p1);
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s_a = worker_a.handler().snapshot();
+        let s_b = worker_b.handler().snapshot();
+        let s_c = worker_c.handler().snapshot();
+        if let (Some(a), Some(b), Some(c)) = (s_a, s_b, s_c) {
+            if a.commit_index >= p2
+                && b.commit_index >= p2
+                && c.commit_index >= p2 {
+                break;
+            }
+        }
+        assert!(Instant::now() < until,
+            "post-join replicas didn't converge on commit_index >= {p2}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    worker_a.shutdown();
+    worker_b.shutdown();
+    worker_c.shutdown();
+    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
+#[test]
+#[cfg(feature = "network")]
+fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
+    // End-to-end test of the `Frame::RaftJoinReq` wire path.
+    //
+    // Direct API path is already covered by
+    // `raft_dynamic_join_grows_single_node_cluster_to_three`.
+    // This test covers the libp2p RPC: B sends an actual
+    // `RaftJoinReq` frame to A, A's `handle_join` impl runs
+    // change_membership, B becomes a voter.
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vos::network::{derive_node_prefix, Network, NetworkConfig, RaftJoinResult};
+    use vos::raft::{RaftWorker, Role, WorkerConfig};
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_raft_join_wire_{}_{}", std::process::id(), stamp,
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rep_id = [0xC4u8; 32];
+
+    // ── Node A (solo bootstrap, leader). ──────────────────────
+    let net_a = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    }));
+    let a_addr = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let db_a = Arc::new(redb::Database::create(dir.join("a.redb")).unwrap());
+    let worker_a = RaftWorker::spawn(
+        db_a, WorkerConfig {
+            me: prefix_a, members: vec![prefix_a],
+            replication_id: rep_id,
+            election_timeout_ms: (50, 150),
+            heartbeat_interval_ms: 20,
+        },
+        Some(net_a.clone()), None,
+    );
+    net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
+    let h_a = worker_a.handler();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && h_a.role() != Role::Leader {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(h_a.role(), Role::Leader, "A should self-elect");
+
+    // ── Node B (joiner). ──────────────────────────────────────
+    let net_b = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    }));
+    wait_for(|| (
+        net_a.peer_for_prefix(prefix_b).is_some()
+        && net_b.peer_for_prefix(prefix_a).is_some()
+    ).then_some(()), Duration::from_secs(15)).expect("Hello");
+
+    // ── Send the join request OVER THE WIRE. ──────────────────
+    // This is the critical bit — exercises Network's
+    // SendRaftJoin command, the swarm-thread routing, A's
+    // dispatch through `handle_join`, and the Accepted response.
+    let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+    let rx = net_b.send_raft_join_req(target_a, rep_id, prefix_b);
+    let result = rx.recv_timeout(Duration::from_secs(5))
+        .expect("join RPC reply");
+    let joint_index = match result {
+        RaftJoinResult::Accepted { joint_index } => {
+            assert!(joint_index >= 1, "joint entry has a real index");
+            joint_index
+        }
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+
+    // ── Spawn B's worker with the (post-join) member set. ────
+    let db_b = Arc::new(redb::Database::create(dir.join("b.redb")).unwrap());
+    let worker_b = RaftWorker::spawn(
+        db_b, WorkerConfig {
+            me: prefix_b, members: vec![prefix_a, prefix_b],
+            replication_id: rep_id,
+            election_timeout_ms: (5_000, 10_000),
+            heartbeat_interval_ms: 1_000,
+        },
+        Some(net_b.clone()), None,
+    );
+    net_b.register_raft_handler(rep_id, Arc::new(worker_b.handler()));
+
+    // ── B should see commit_index >= joint_index + 1. ────────
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(snap) = worker_b.handler().snapshot() {
+            if snap.commit_index >= joint_index + 1 { break; }
+        }
+        assert!(Instant::now() < until,
+            "B didn't reach commit_index >= {} within 15s", joint_index + 1);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ── Status RPC over the wire reports the same state. ────
+    let rx = net_b.send_raft_status_req(target_a, rep_id);
+    let status = rx.recv_timeout(Duration::from_secs(2))
+        .expect("status RPC reply");
+    assert!(status.present, "A hosts the group");
+    assert_eq!(status.role, vos::network::RaftRole::Leader);
+    assert!(status.members.contains(&prefix_a) && status.members.contains(&prefix_b),
+        "post-join member set should contain both replicas; got {:?}", status.members);
+
+    worker_a.shutdown();
+    worker_b.shutdown();
+    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "network")]
+fn raft_status_req_returns_absent_for_unknown_group() {
+    // `vosx ps` queries every connected peer for every Raft
+    // group in the manifest. Peers that don't host a particular
+    // group must reply `present = false` so the client can
+    // skip them cleanly. This test forces that path.
+    use std::sync::Arc;
+    use std::time::Duration;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::raft::{RaftWorker, WorkerConfig};
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_raft_status_{}_{}", std::process::id(), stamp,
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let net_a = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    }));
+    let a_addr = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    // A hosts group X; B doesn't host any group.
+    let group_x = [0xAAu8; 32];
+    let db_a = Arc::new(redb::Database::create(dir.join("a.redb")).unwrap());
+    let worker_a = RaftWorker::spawn(
+        db_a, WorkerConfig {
+            me: prefix_a, members: vec![prefix_a],
+            replication_id: group_x,
+            election_timeout_ms: (5_000, 10_000),
+            heartbeat_interval_ms: 1_000,
+        },
+        Some(net_a.clone()), None,
+    );
+    net_a.register_raft_handler(group_x, Arc::new(worker_a.handler()));
+
+    let net_b = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    }));
+    wait_for(|| net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
+        Duration::from_secs(15)).expect("Hello");
+    let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+
+    // Group A hosts → present = true.
+    let rx = net_b.send_raft_status_req(target_a, group_x);
+    let status = rx.recv_timeout(Duration::from_secs(2)).expect("status");
+    assert!(status.present, "A should report present for group X");
+    assert_eq!(status.members, vec![prefix_a]);
+
+    // Group A doesn't host → present = false, leader_hint=None.
+    let group_y = [0xBBu8; 32];
+    let rx = net_b.send_raft_status_req(target_a, group_y);
+    let status = rx.recv_timeout(Duration::from_secs(2)).expect("status");
+    assert!(!status.present, "A shouldn't report present for unknown group");
+    assert!(status.leader_hint.is_none());
+
+    worker_a.shutdown();
+    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

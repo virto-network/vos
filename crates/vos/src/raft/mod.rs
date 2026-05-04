@@ -44,4 +44,4 @@ pub use strategy::{RaftCommit, RaftConfig};
 #[cfg(all(feature = "storage", feature = "network"))]
 pub use vos_transport::{VosTransport, VosTransportError};
 #[cfg(all(feature = "storage", feature = "network"))]
-pub use worker::{RaftWorker, Role, WorkerConfig, WorkerHandle};
+pub use worker::{ChangeMembershipError, RaftWorker, Role, WorkerConfig, WorkerHandle};

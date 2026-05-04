@@ -141,6 +141,20 @@ pub struct WorkerSnapshot<N: NodeId> {
     /// Highest log index that has been compacted into the
     /// snapshot. `0` when no compaction has happened yet.
     pub snap_last_index: u64,
+    /// The active member set this replica is operating against.
+    /// During a joint-consensus phase this is the *new* set
+    /// (`joint_old` carries the prior one); during steady state
+    /// this is the only set.
+    pub members: Vec<N>,
+    /// Joint-consensus indicator. `Some(prev_members)` while a
+    /// configuration change is in flight; `None` in steady state.
+    pub joint_old: Option<Vec<N>>,
+    /// Best-effort hint at who the current leader is. Updated
+    /// from observed `AppendEntries` (leader self-identifies).
+    /// `None` when the replica hasn't seen a leader since the
+    /// last term change. Followers use this to redirect clients
+    /// addressing them by mistake.
+    pub leader_hint: Option<N>,
 }
 
 /// Inbound message processed by the worker loop.
@@ -971,6 +985,14 @@ where
     /// resolve `read_index` against a prior-term `commit_index`,
     /// breaking linearizability.
     current_term_first_index: Option<u64>,
+    /// Best-effort cache of the current leader's id. Updated
+    /// from successful inbound `AppendEntries` (the leader
+    /// self-identifies in `req.leader`). Surfaced through
+    /// [`WorkerSnapshot::leader_hint`] so a follower receiving a
+    /// client-side request that requires the leader can redirect
+    /// the caller without round-tripping. Cleared when our term
+    /// advances so a stale cross-term hint never leaks.
+    seen_leader: Option<N>,
     /// Number of consecutive PreVote rounds that timed out
     /// without crossing quorum. After
     /// `Config::pre_candidate_misses_before_revert` misses,
@@ -1241,6 +1263,7 @@ where
         pending_joint_entry: recovery.pending_joint,
         active_config_index: recovery.active_config_index,
         current_term_first_index: None,
+        seen_leader: None,
         pre_candidate_misses: 0,
         leader: None,
         apply_sink,
@@ -1358,10 +1381,13 @@ async fn handle_msg<N, S, T, C, R, A>(
             let _ = reply.send(WorkerSnapshot {
                 role: state.role,
                 current_term: state.meta.current_term,
-                voted_for: state.meta.voted_for,
+                voted_for: state.meta.voted_for.clone(),
                 last_log_index: state.storage.last_index(),
                 commit_index: state.meta.commit_index,
                 snap_last_index: state.storage.snap_last_index(),
+                members: state.effective_cfg.current.clone(),
+                joint_old: state.effective_cfg.joint_old.clone(),
+                leader_hint: state.seen_leader.clone(),
             });
         }
         RaftMsg::Shutdown => unreachable!("handled in run_worker"),
@@ -1513,6 +1539,10 @@ where
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
+        // New term: any cached leader hint refers to the prior
+        // term and is no longer valid. Repopulated below from
+        // `req.leader` for the term we're now observing.
+        state.seen_leader = None;
     }
     let was_leader = state.role == Role::Leader;
     state.set_role(Role::Follower);
@@ -1526,6 +1556,9 @@ where
     // We've heard from a current-term leader — record it for
     // the pre-vote leader-check.
     state.last_heartbeat_received = Some(state.clock.now());
+    // Cache the leader for this term so a follower can redirect
+    // misaddressed client requests via `WorkerSnapshot::leader_hint`.
+    state.seen_leader = Some(req.leader.clone());
 
     let our_prev_term = match state.storage.term_at(req.prev_log_index).await {
         Ok(t) => t,
@@ -1739,6 +1772,7 @@ where
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
+        state.seen_leader = None;
         step_down(state);
         meta_changed = true;
     }
@@ -1865,6 +1899,7 @@ where
     if req.term > state.meta.current_term {
         state.meta.current_term = req.term;
         state.meta.voted_for = None;
+        state.seen_leader = None;
         // Drop any in-flight snapshot from a prior term — its
         // identity is now stale.
         state.incoming_snapshot = None;
@@ -1879,6 +1914,9 @@ where
     }
     state.reset_election_timer();
     state.last_heartbeat_received = Some(state.clock.now());
+    // Treat the snapshot leader the same as an AppendEntries
+    // sender — they're a current-term leader that just contacted us.
+    state.seen_leader = Some(req.leader.clone());
 
     // Snapshot already covered by our local snap pointer — no-op.
     // Drop any in-flight buffer for it too.
@@ -2560,6 +2598,10 @@ where
     state.votes_received.clear();
     let members = state.effective_cfg.all_members();
     state.leader = Some(LeaderState::fresh(&members, state.cfg.me, last));
+    // Self-as-leader: surface through `WorkerSnapshot::leader_hint`
+    // so `vosx ps` and join-RPC handlers can answer "the leader
+    // is us" without inspecting `role` separately.
+    state.seen_leader = Some(state.cfg.me.clone());
     // Remember the no-op's index so `read_index` blocks until
     // it commits — proves at least one current-term entry has
     // achieved quorum before any read can serve.

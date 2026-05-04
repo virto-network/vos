@@ -31,8 +31,8 @@ use redb::Database;
 
 use crate::commit::CommitError;
 use crate::network::{
-    Network, RaftAppendResult, RaftEntry, RaftInstallSnapshotResult, RaftRpcHandler,
-    RaftVoteResult,
+    Network, RaftAppendResult, RaftEntry, RaftEntryKind, RaftInstallSnapshotResult,
+    RaftJoinResult, RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
 };
 
 use super::redb_storage::RedbStorage;
@@ -116,6 +116,38 @@ impl core::fmt::Display for ProposeError {
 }
 impl std::error::Error for ProposeError {}
 
+/// Reasons a [`WorkerHandle::change_membership`] can fail.
+/// Mirrors `vos_raft::ChangeMembershipError` with vos's
+/// concrete [`CommitError`] storage type. New variants land
+/// here when vos-raft adds them; the type is `#[non_exhaustive]`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ChangeMembershipError {
+    /// This worker is currently `Follower` or `Candidate`.
+    /// Forward the request to the cluster's leader.
+    NotLeader,
+    /// Another joint-consensus change is in flight; Raft
+    /// permits at most one at a time.
+    InProgress,
+    /// `new_members` was empty — a cluster needs at least one
+    /// voter to elect.
+    EmptyConfig,
+    /// redb write failed on the joint-config append.
+    Storage(CommitError),
+}
+
+impl core::fmt::Display for ChangeMembershipError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLeader => write!(f, "change_membership: not leader"),
+            Self::InProgress => write!(f, "change_membership: another change is in flight"),
+            Self::EmptyConfig => write!(f, "change_membership: new_members must not be empty"),
+            Self::Storage(e) => write!(f, "change_membership: storage: {e}"),
+        }
+    }
+}
+impl std::error::Error for ChangeMembershipError {}
+
 /// Diagnostic snapshot of a worker's state. Returned by
 /// [`WorkerHandle::snapshot`].
 ///
@@ -131,6 +163,20 @@ pub struct WorkerSnapshot {
     pub last_log_index: u64,
     pub commit_index: u64,
     pub snap_last_index: u64,
+    /// Active member set this replica is operating against. New
+    /// in the multi-group / dynamic-join refactor — surfaced so
+    /// `vosx join` and the leader-side `RaftJoin` handler can
+    /// compute `new_members = current ∪ {joiner}` without
+    /// re-scanning the log.
+    pub members: Vec<u16>,
+    /// Joint-consensus indicator. `Some(prev_members)` while a
+    /// configuration change is in flight; `None` in steady state.
+    pub joint_old: Option<Vec<u16>>,
+    /// Best-effort leader hint. `Some(prefix)` once we've seen a
+    /// current-term `AppendEntries` (or self if we are leader).
+    /// `None` between elections. Followers use it to redirect
+    /// misaddressed client / join requests.
+    pub leader_hint: Option<u16>,
 }
 
 impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
@@ -142,6 +188,9 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
             last_log_index: s.last_log_index,
             commit_index: s.commit_index,
             snap_last_index: s.snap_last_index,
+            members: s.members,
+            joint_old: s.joint_old,
+            leader_hint: s.leader_hint,
         }
     }
 }
@@ -248,6 +297,35 @@ impl WorkerHandle {
             ))),
         }
     }
+
+    /// Issue a Raft membership change (Ongaro thesis §4.3 joint
+    /// consensus). Must be addressed to the current leader;
+    /// followers / candidates return
+    /// [`ChangeMembershipError::NotLeader`]. Returns the index
+    /// of the joint-phase entry on success — caller can poll
+    /// [`Self::snapshot`] for `commit_index >= idx` to know the
+    /// joint phase has committed (the worker auto-emits the
+    /// retire entry; full steady-state arrives one round later).
+    ///
+    /// `new_members` is the configuration the cluster is
+    /// transitioning *to*. To keep the local node as a voter,
+    /// include its `node_prefix` in the list. To remove it,
+    /// omit it — the leader will step down once the final
+    /// non-joint entry commits.
+    pub fn change_membership(
+        &self,
+        new_members: Vec<u16>,
+    ) -> Result<u64, ChangeMembershipError> {
+        match block_on(self.inner.change_membership(new_members)) {
+            Ok(idx) => Ok(idx),
+            Err(vos_raft::ChangeMembershipError::NotLeader) => Err(ChangeMembershipError::NotLeader),
+            Err(vos_raft::ChangeMembershipError::InProgress) => Err(ChangeMembershipError::InProgress),
+            Err(vos_raft::ChangeMembershipError::EmptyConfig) => Err(ChangeMembershipError::EmptyConfig),
+            Err(_) => Err(ChangeMembershipError::Storage(CommitError::Config(
+                "raft change_membership: storage write failed".into(),
+            ))),
+        }
+    }
 }
 
 /// `RaftRpcHandler` impl for [`WorkerHandle`].
@@ -295,10 +373,15 @@ impl RaftRpcHandler for WorkerHandle {
                 // check; the wire format doesn't carry it because
                 // indices are contiguous from `prev_log_index + 1`.
                 // We fill `index = 0` here — the worker assigns
-                // the right index before append. Wire entries are
-                // always `Data` today (vos doesn't ferry the
-                // `ConfigChange` variant yet).
-                .map(|e| vos_raft::LogEntry::data(0, e.term, e.payload))
+                // the right index before append.
+                .map(|e| match e.kind {
+                    RaftEntryKind::Data { payload } => {
+                        vos_raft::LogEntry::data(0, e.term, payload)
+                    }
+                    RaftEntryKind::ConfigChange { joint_old, members } => {
+                        vos_raft::LogEntry::config_change(0, e.term, joint_old, members)
+                    }
+                })
                 .collect(),
         };
         let resp = block_on(self.inner.handle_inbound_append(from_prefix, req));
@@ -327,6 +410,76 @@ impl RaftRpcHandler for WorkerHandle {
         RaftVoteResult {
             term: resp.term,
             vote_granted: resp.vote_granted,
+        }
+    }
+
+    fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+        let snap = match block_on(self.inner.snapshot()) {
+            Some(s) => s,
+            None => return RaftStatusReply::absent(),
+        };
+        // Explicit match — keeps us honest if vos-raft adds a
+        // new Role variant (the compiler will complain rather
+        // than silently bit-cast it as `Unknown(?)`).
+        let role = match snap.role {
+            vos_raft::Role::Follower => RaftRole::Follower,
+            vos_raft::Role::PreCandidate => RaftRole::PreCandidate,
+            vos_raft::Role::Candidate => RaftRole::Candidate,
+            vos_raft::Role::Leader => RaftRole::Leader,
+        };
+        RaftStatusReply {
+            present: true,
+            role,
+            current_term: snap.current_term,
+            commit_index: snap.commit_index,
+            last_log_index: snap.last_log_index,
+            members: snap.members,
+            leader_hint: snap.leader_hint,
+        }
+    }
+
+    fn handle_join(
+        &self,
+        _replication_id: &[u8; 32],
+        joiner_prefix: u16,
+    ) -> RaftJoinResult {
+        // Snapshot the worker's current state — gives us the
+        // active member list AND the leader hint we redirect
+        // followers with. Snapshot is cheap (one round-trip
+        // through the worker inbox).
+        let snap = match block_on(self.inner.snapshot()) {
+            Some(s) => s,
+            None => return RaftJoinResult::NotLeader { leader_hint: None },
+        };
+        if snap.role != vos_raft::Role::Leader {
+            return RaftJoinResult::NotLeader {
+                leader_hint: snap.leader_hint,
+            };
+        }
+        if snap.members.iter().any(|p| *p == joiner_prefix) {
+            // Already a voter — nothing to do; report the most
+            // recent change as accepted with index 0 so the
+            // caller doesn't loop. (`Accepted { joint_index = 0 }`
+            // is harmless: the joiner will see commit_index >= 1
+            // immediately on its first AppendEntries.)
+            return RaftJoinResult::Accepted { joint_index: 0 };
+        }
+        let mut new_members = snap.members.clone();
+        new_members.push(joiner_prefix);
+        new_members.sort_unstable();
+        new_members.dedup();
+        match block_on(self.inner.change_membership(new_members)) {
+            Ok(joint_index) => RaftJoinResult::Accepted { joint_index },
+            Err(vos_raft::ChangeMembershipError::NotLeader) => {
+                // We thought we were the leader but lost it
+                // mid-call — fall through to NotLeader with the
+                // most recent hint we have.
+                RaftJoinResult::NotLeader {
+                    leader_hint: snap.leader_hint,
+                }
+            }
+            Err(vos_raft::ChangeMembershipError::InProgress) => RaftJoinResult::Busy,
+            Err(_) => RaftJoinResult::Busy,
         }
     }
 
@@ -487,8 +640,8 @@ mod tests {
         // Append two entries at indices 1, 2 (term 3) with
         // leader_commit=2.
         let entries = alloc::vec![
-            RaftEntry { term: 3, payload: b"a".to_vec() },
-            RaftEntry { term: 3, payload: b"b".to_vec() },
+            RaftEntry::data(3, b"a".to_vec()),
+            RaftEntry::data(3, b"b".to_vec()),
         ];
         let resp = h.append_entries(&[0xC0; 32], 0xBBBB, 3, 0, 0, 2, entries);
         assert!(resp.success);
@@ -497,8 +650,11 @@ mod tests {
         let log = RaftLog::open(db.clone()).unwrap();
         assert_eq!(log.last_index(), 2);
         let stored = log.entries(1, 2).unwrap();
-        assert_eq!(stored[0].payload, b"a");
-        assert_eq!(stored[1].payload, b"b");
+        // Each row carries a leading kind byte (0 = Data) before
+        // the application payload. RaftCommit's apply path strips
+        // it; raw RaftLog readers see it.
+        assert_eq!(stored[0].payload, [&[0u8][..], b"a"].concat());
+        assert_eq!(stored[1].payload, [&[0u8][..], b"b"].concat());
         let meta = RaftMeta::load(&db).unwrap();
         assert_eq!(meta.commit_index, 2);
         let _ = std::fs::remove_dir_all(dir);
@@ -513,7 +669,7 @@ mod tests {
         // our log is empty. Refuse.
         let resp = h.append_entries(
             &[0xC0; 32], 0xBBBB, 3, 5, 3, 0,
-            alloc::vec![RaftEntry { term: 3, payload: b"x".to_vec() }],
+            alloc::vec![RaftEntry::data(3, b"x".to_vec())],
         );
         assert!(!resp.success);
         worker.shutdown();
@@ -525,12 +681,20 @@ mod tests {
     #[test]
     fn follower_truncates_conflicting_tail_then_appends() {
         let (db, dir) = temp_db();
-        // Pre-seed two entries at term 1.
+        // Pre-seed two entries at term 1. The kind byte must be
+        // included so the worker's storage adapter can decode
+        // them via `decode_entry_kind`.
+        let kind_data = |bytes: &[u8]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(1 + bytes.len());
+            v.push(0); // ENTRY_KIND_DATA
+            v.extend_from_slice(bytes);
+            v
+        };
         {
             let mut log = RaftLog::open(db.clone()).unwrap();
             for _ in 0..2 {
                 let txn = db.begin_write().unwrap();
-                log.append_in_txn(&txn, 1, b"old").unwrap();
+                log.append_in_txn(&txn, 1, &kind_data(b"old")).unwrap();
                 txn.commit().unwrap();
             }
         }
@@ -540,8 +704,8 @@ mod tests {
         // appends index 2 at term 2 (conflicts with our index 2
         // which is at term 1). We truncate, then write 2 + 3.
         let entries = alloc::vec![
-            RaftEntry { term: 2, payload: b"new-2".to_vec() },
-            RaftEntry { term: 2, payload: b"new-3".to_vec() },
+            RaftEntry::data(2, b"new-2".to_vec()),
+            RaftEntry::data(2, b"new-3".to_vec()),
         ];
         let resp = h.append_entries(&[0xC0; 32], 0xBBBB, 2, 1, 1, 0, entries);
         assert!(resp.success);
@@ -549,8 +713,8 @@ mod tests {
         let log = RaftLog::open(db).unwrap();
         let entries = log.entries(1, 5).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[1].payload, b"new-2");
-        assert_eq!(entries[2].payload, b"new-3");
+        assert_eq!(entries[1].payload, kind_data(b"new-2"));
+        assert_eq!(entries[2].payload, kind_data(b"new-3"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -559,7 +723,7 @@ mod tests {
         let (db, dir) = temp_db();
         let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
-        let payload = alloc::vec![RaftEntry { term: 1, payload: b"x".to_vec() }];
+        let payload = alloc::vec![RaftEntry::data(1, b"x".to_vec())];
         // First call: appends entry at index 1.
         let r1 = h.append_entries(&[0xC0; 32], 0xBBBB, 1, 0, 0, 1, payload.clone());
         assert!(r1.success);
@@ -640,12 +804,13 @@ mod tests {
         use crate::commit::{STATE_KEY, STATE_TABLE};
         let (db, dir) = temp_db();
         // Pre-populate some old log entries that the snapshot
-        // will supersede.
+        // will supersede. Kind byte (0 = Data) is required so the
+        // worker's storage adapter can decode them on read.
         {
             let mut log = RaftLog::open(db.clone()).unwrap();
             for _ in 0..5 {
                 let txn = db.begin_write().unwrap();
-                log.append_in_txn(&txn, 1, b"old").unwrap();
+                log.append_in_txn(&txn, 1, &[0u8, b'o', b'l', b'd']).unwrap();
                 txn.commit().unwrap();
             }
         }
@@ -735,11 +900,14 @@ mod tests {
         let log = RaftLog::open(db).unwrap();
         assert_eq!(log.last_index(), 3);
         let entries = log.entries(1, 3).unwrap();
-        // entries[0] = no-op (empty payload), entries[1] = "first",
-        // entries[2] = "second".
-        assert!(entries[0].payload.is_empty(), "entry 1 should be the no-op");
-        assert_eq!(entries[1].payload, b"first");
-        assert_eq!(entries[2].payload, b"second");
+        // Each on-disk row is `[kind: u8][body...]`. entry 1 is
+        // the leader-promotion no-op (kind=Data, empty body =
+        // single 0 byte); entries 2 and 3 carry "first" / "second"
+        // as the kind-prefixed body.
+        assert_eq!(entries[0].payload, [0u8],
+            "entry 1 should be the no-op (kind=Data + empty body)");
+        assert_eq!(entries[1].payload, [&[0u8][..], b"first"].concat());
+        assert_eq!(entries[2].payload, [&[0u8][..], b"second"].concat());
         assert_eq!(entries[0].term, entries[1].term);
         assert_eq!(entries[1].term, entries[2].term);
 

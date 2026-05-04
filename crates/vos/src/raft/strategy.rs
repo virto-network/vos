@@ -200,7 +200,7 @@ impl RaftCommit {
 
     /// Append a new log entry, advance `commit_index` and
     /// `last_applied`, and persist the supplied post-apply state —
-    /// all in one redb txn. Single-node only; phase 3 routes
+    /// all in one redb txn. Single-node only; multi-mode routes
     /// through the cluster worker before reaching this point.
     fn append_and_apply_single_node(
         &mut self,
@@ -209,7 +209,13 @@ impl RaftCommit {
     ) -> Result<(), CommitError> {
         let term = self.meta.current_term;
         let txn = self.db.begin_write()?;
-        let new_index = self.log.append_in_txn(&txn, term, payload)?;
+        // Wrap the application payload as `EntryKind::Data` so the
+        // single-node and multi-node on-disk formats agree —
+        // `RaftCommit::replay_logs` decodes the same kind-tag
+        // shape on both paths.
+        let kind = vos_raft::EntryKind::Data { payload: payload.to_vec() };
+        let on_disk = super::redb_storage::encode_entry_kind(&kind);
+        let new_index = self.log.append_in_txn(&txn, term, &on_disk)?;
         self.meta.commit_index = new_index;
         self.meta.last_applied = new_index;
         self.meta.write_in_txn(&txn)?;
@@ -369,7 +375,28 @@ impl CommitStrategy for RaftCommit {
         let entries = self.log.entries(start, end)?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
-            let eff = EffectLog::from_bytes(&e.payload).ok_or_else(|| {
+            // Each row carries a leading kind byte that distinguishes
+            // application data from membership transitions. The
+            // host's apply path is only interested in `Data`
+            // entries; `ConfigChange` entries are consumed by the
+            // worker's quorum logic and surface to the host as
+            // commit_index advances without a corresponding dispatch.
+            let body = match super::redb_storage::decode_entry_kind(&e.payload) {
+                Ok(vos_raft::EntryKind::Data { payload }) => payload,
+                Ok(vos_raft::EntryKind::ConfigChange { .. }) => continue,
+                Ok(_) => continue, // future kinds — host can't apply
+                Err(e) => return Err(e),
+            };
+            // The vos-raft worker appends an empty-payload `Data`
+            // entry on leader promotion (Ongaro §6.4) so a new
+            // leader's term has at least one entry to commit
+            // before any read_index can resolve. The host has no
+            // dispatch to replay for it — skip cleanly instead of
+            // failing on `EffectLog::from_bytes(&[])`.
+            if body.is_empty() {
+                continue;
+            }
+            let eff = EffectLog::from_bytes(&body).ok_or_else(|| {
                 CommitError::Config(alloc::format!(
                     "raft entry {} has malformed EffectLog payload",
                     e.index,
