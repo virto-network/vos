@@ -941,6 +941,77 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     eprintln!("final-form, partition, and closure constraints.");
 }
 
+/// R1f-soundness: validate the cipher-clerk per-payment row sequence
+/// COMPOSES correctly via the host-side compose validator.  Catches
+/// any bug in the point-op generators (point_double_rows /
+/// point_add_rows / scalar_mult_rows) that would produce
+/// inconsistent intermediate values.
+#[test]
+fn ristretto_chip_per_payment_row_sequence_composes() {
+    use zkpvm::chips::ristretto::point::{
+        scalar_mult_rows, point_add_rows, point_identity, ExtendedPoint,
+        ED25519_TWO_D,
+    };
+    use zkpvm::chips::ristretto::witness::{validate_row_sequence_composes, FieldOpRow};
+
+    let scalar_v: [u8; 32] = {
+        let mut s = [0u8; 32]; s[0] = 50; s
+    };
+    let scalar_b: [u8; 32] = {
+        let mut s = [0u8; 32];
+        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
+        s[31] &= 0x7f; s
+    };
+    let id = point_identity();
+
+    // Boundary inputs: scalars + identity coords (X=0, Y=1, Z=1, T=0).
+    // Plus zero (which fill_add(0,0), fill_mul(0,0) etc. produce — used
+    // for setup) and one (the "1" field element constant).  These are
+    // the values rows can legitimately consume from "outside".
+    let zero = [0u8; 32];
+    let mut one = [0u8; 32]; one[0] = 1;
+    let boundary_inputs = vec![
+        zero,
+        one,
+        scalar_v, scalar_b,
+        id.x, id.y, id.z, id.t,
+        // Curve constant 2·d used inside point_add_rows.
+        ED25519_TWO_D,
+    ];
+
+    let mut rows: Vec<FieldOpRow> = Vec::new();
+    let (vg_rows, vg_pt) = scalar_mult_rows(&scalar_v, &id);
+    rows.extend(vg_rows);
+    let (bh_rows, bh_pt) = scalar_mult_rows(&scalar_b, &id);
+    rows.extend(bh_rows);
+    let (add_rows, _) = point_add_rows(&vg_pt, &bh_pt);
+    rows.extend(add_rows);
+    let (kg_rows, _) = scalar_mult_rows(&scalar_v, &id);
+    rows.extend(kg_rows);
+    let (skg_rows, _) = scalar_mult_rows(&scalar_b, &id);
+    rows.extend(skg_rows);
+
+    // For this validator to succeed against a long chain, every row's
+    // input must appear in `seen_outs` from a prior row.  Some
+    // non-trivial rows in the point op generators may legitimately
+    // re-use boundary constants (zero, one) or earlier outputs.
+    validate_row_sequence_composes(&rows, &boundary_inputs)
+        .expect("per-payment row sequence must compose");
+    eprintln!("Per-payment row sequence COMPOSES correctly ({} rows).",
+        rows.len());
+
+    // Negative case: replace one row's `a` with a sentinel value
+    // that's NOT in seen_outs — must reject.  (Tampering by a single
+    // byte can coincidentally match the boundary inputs `zero`/`one`,
+    // so we use an unmistakably-foreign value.)
+    let mut bad_rows = rows.clone();
+    bad_rows[100].a = [0xab; 32];
+    assert!(validate_row_sequence_composes(&bad_rows, &boundary_inputs).is_err(),
+        "tampered row's input must be flagged");
+    eprintln!("Tampered row sequence correctly REJECTED by composer.");
+    let _ = ExtendedPoint { x: zero, y: one, z: one, t: zero };
+}
+
 /// R1e-pent diagnostic: confirm the inter-row binding soundness gap.
 /// Push 100 unrelated is_add rows (each computing a different
 /// `1 + N = 1+N`).  Each row is internally correct; the chip

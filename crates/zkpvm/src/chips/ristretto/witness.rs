@@ -522,6 +522,35 @@ pub fn fill_padding() -> FieldOpRow {
     FieldOpRow::default()
 }
 
+/// R1f-soundness: host-side row-sequence composition validator.
+/// Confirms every real row's `a` and `b` either match a prior real
+/// row's `out` (composed), or appear in `boundary_inputs` (chip
+/// inputs from outside, e.g. ECALL scalar / point bytes).  Returns
+/// `Err(reason)` for any unattested input.
+///
+/// Provides soundness assurance for trusted witness builders
+/// (catches bugs in the point-op generators) until R1e-pent's
+/// register-file lookup lands the same check at the chip-constraint
+/// level.
+pub fn validate_row_sequence_composes(
+    rows: &[FieldOpRow],
+    boundary_inputs: &[Bytes],
+) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    let mut seen_outs: alloc::vec::Vec<Bytes> = boundary_inputs.to_vec();
+    for (i, row) in rows.iter().enumerate() {
+        if row.is_real == 0 { continue; }
+        if !seen_outs.contains(&row.a) {
+            return Err(format!("row {i}: a not produced by any prior row or boundary"));
+        }
+        if !seen_outs.contains(&row.b) {
+            return Err(format!("row {i}: b not produced by any prior row or boundary"));
+        }
+        seen_outs.push(row.out);
+    }
+    Ok(())
+}
+
 /// R1c-6: square-and-multiply ladder rows for `base^exp mod p`.
 ///
 /// Emits a sequence of is_mul `FieldOpRow`s that, when chained
