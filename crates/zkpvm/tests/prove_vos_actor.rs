@@ -795,6 +795,40 @@ fn debug_fill_mul_one_times_one() {
         r.is_add, r.is_sub, r.is_mul, r.is_real);
 }
 
+/// R1e-pent diagnostic: confirm the inter-row binding soundness gap.
+/// Push 100 unrelated is_add rows (each computing a different
+/// `1 + N = 1+N`).  Each row is internally correct; the chip
+/// currently has no constraint linking row N's input to row M's
+/// output, so this should prove fine — confirming we need R1e-pent
+/// before turning the chip on for actor traces (where a prover
+/// could otherwise stitch together arbitrary "valid" rows that
+/// don't actually compose into a scalar mult).
+#[test]
+fn ristretto_chip_unrelated_rows_prove_attestation() {
+    use zkpvm::chips::ristretto::witness::fill_add;
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    for n in 0..100u8 {
+        let mut a = [0u8; 32]; a[0] = 1;
+        let mut b = [0u8; 32]; b[0] = n;
+        side_note.add_ristretto_field_row(fill_add(a, b));
+    }
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("100 unrelated rows should prove (each individually valid)");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("verify failed");
+    eprintln!("100 unrelated rows: PROVED + VERIFIED (confirming");
+    eprintln!("inter-row binding soundness gap — R1e-pent TODO).");
+}
+
 /// R1f-bug-bisect: scalar_mult_rows([N, 0, ...], id) bug — bisect by
 /// the position of the first set bit (MSB-first iteration) where
 /// the add fires.

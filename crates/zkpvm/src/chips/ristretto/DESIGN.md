@@ -73,6 +73,48 @@ gated OFF in `active_components` so existing proofs are unaffected.
   triggers on non-zero values when is_mul=1.  Bisect flag
   scaffolding kept in place for the follow-up.
 
+## R1e-pent: inter-row binding (the remaining soundness gap)
+
+**Status**: confirmed exploitable, design proposed, implementation
+deferred.
+
+Each FieldOpRow today proves "I correctly computed `out = a OP b
+mod p`" for whatever a, b, out values are in the row's columns.
+But the chip emits NO constraint linking row N's `a` / `b` to any
+prior row's `out`.  A malicious prover could emit any sequence of
+self-consistent rows — confirmed by
+`ristretto_chip_unrelated_rows_prove_attestation`, which proves a
+trace of 100 unrelated `1 + N = 1+N` rows.
+
+The fix needs a register-file lookup relation:
+
+  RistrettoRegisterFile tuple: (row_id, byte_index, byte_value)
+
+  Per real row:
+    PRODUCER:  32 tuples (row_id, 0..31, out[0..31])
+    CONSUMER:  32 tuples (a_source_row_id, 0..31, a[0..31])
+                 + 32 tuples (b_source_row_id, 0..31, b[0..31])
+
+  a_source_row_id and b_source_row_id are witnessed columns
+  (not constrained — the verifier just checks the lookup balances).
+
+  Special handling for row 0's inputs (and the chip's overall
+  inputs from the ECALL boundary): an INPUT producer emits the
+  scalar/point bytes, identified by a sentinel row_id.
+
+Cost: 96 register-file lookup emissions per real row.  At 21K rows
+per payment, that's ~2M emissions — a significant chip-cost
+increase.  Optimization: group bytes into wider tuples (e.g.
+4-byte u32 per tuple element ⇒ 8 tuples per slot instead of 32).
+
+Until R1e-pent lands, the chip is sound only for ECALL boundary
+flows that constrain BOTH the first row's input AND the final
+row's output, AND the chip's intermediate rows form a known-
+schedule DAG that the constraint chain can verify by adjacent-row
+or preprocessed equalities.  For the cipher-clerk benchmark in
+R1f, this means the chip-on path is a "performance preview" not
+a soundness-complete proof.
+
 ## Remaining work before chip-on
 
 Not delivered in the initial run; each is a focused dedicated session:
