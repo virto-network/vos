@@ -1,6 +1,68 @@
 # RistrettoChip — Curve25519 / Ristretto255 scalar mult precompile
 
-**Status**: design proposal, no code yet.
+**Status**: in-progress implementation.  R1a–R1c-3-bis landed; chip
+gated OFF in `active_components` so existing proofs are unaffected.
+
+## Implementation log
+
+- **R1a** (`c31417b`) — ECALL ID 200, `RistrettoRecord` /
+  `RistrettoMemOp`, `handle_ristretto_scalar_mult_ecall` in
+  TracingPvm, smoke test (2*G via ecalli matches dalek).
+- **R1b** (`ed669f8`) — Empty `RistrettoChip` stub at
+  `BASE_COMPONENTS[19]`, `ChipActivity.ristretto`,
+  `activity_from_steps` detection.  Existing benches byte-identical.
+- **R1c-1** (`e0f1060`) — Pure-Rust 𝔽_p reference (`field.rs`):
+  add/sub/mul/inv/pow/reduce.  8 tests pass; cross-checked against
+  dalek `Scalar` ring on small inputs.
+- **R1c-2** (`aad499f`) — Field-op column shape (FieldA/B/Out + carry
+  + borrow + overflow + classifier) and witness fill (`witness.rs`)
+  for add/sub.  5 tests pass.
+- **R1c-3** (`c4b7e7e`) — Add-chain constraints (sum chain + reduction
+  sub-chain + boolean checks + real-row partition).
+- **R1c-3-bis** (`f0a6dff`) — Final-form `out < p` check via
+  `(p − out − 1)` borrow chain whose closure constraint pins
+  `is_overflow` witness-determinism.
+
+## Remaining work before chip-on
+
+Not delivered in the initial run; each is a focused dedicated session:
+
+- **R1c-3-ter** — Range256 byte-range checks on FieldA/B/Out/AddIntermediate.
+  Per-row 128 lookups against the existing `Range256LookupElements`
+  consumer chain.  Closes the per-byte soundness pin on the
+  final-form chain.
+- **R1c-3-quat** — Mirror of R1c-3 / R1c-3-bis for the is_sub op
+  flavor.  The witness builder already produces a sub row via the
+  `(a + (p−b))` trick, but the chip currently has no sub-specific
+  constraint chain.
+- **R1c-4** — Schoolbook field multiplication.  64 partial-product
+  positions × byte-level carry chain.  This is the bulk of the chip
+  (~700 cells × 312 ops/scalar mult → most of the per-call cell
+  count).
+- **R1c-5** — Reduction `mod 2²⁵⁵ - 19` for mult outputs.  Uses
+  `2²⁵⁵ ≡ 19 (mod p)` to fold the 512-bit unreduced product back
+  into 256 bits (two passes).
+- **R1c-6** — Field inversion via Fermat's little theorem (`a^(p-2)`
+  square-and-multiply ladder).  Composed of R1c-4 mults + R1c-5
+  reductions; no new primitive.
+- **R1d** — Edwards point doubling/addition formulas in extended
+  coordinates.  Each composes ~9 R1c-4 field mults.
+- **R1e** — Signed-4-bit-window NAF main loop, scalar decomposition,
+  boundary memory lookups (32 reads + 32 reads + 32 writes per
+  ECALL).  RistrettoCallLookup binds CpuChip's ECALL step to the
+  chip's first/last row.
+- **R1f** — Patch cipher-clerk's `Amount::commit` / `Note::commitment`
+  / `sign` through a `pvm-precompile` feature.  Re-run
+  clerk-private-pay-bench; measure prove time, compare to estimate.
+
+Soundness gates each subsequent phase must hold:
+- Every column committed on a real row must be byte-bounded (R1c-3-
+  ter pin); the algebraic chain alone is insufficient.
+- Every chain closure must be explicitly constrained (R1c-3-bis
+  pattern) — implicit byte-arithmetic doesn't enforce closure.
+- Every operation classifier must partition real rows exactly once.
+
+
 **Goal**: bring per-scalar-mult cost from ~14 M PVM steps (software dalek
 inside the VM) down to a precompile-shaped fraction so `cipher-clerk`
 private payments can be proven on-device in seconds rather than tens of
