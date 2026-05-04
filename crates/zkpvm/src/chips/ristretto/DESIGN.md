@@ -22,26 +22,34 @@ gated OFF in `active_components` so existing proofs are unaffected.
 - **R1c-3-bis** (`f0a6dff`) — Final-form `out < p` check via
   `(p − out − 1)` borrow chain whose closure constraint pins
   `is_overflow` witness-determinism.
+- **R1c-3-ter** (`b2bcf82`) — Per-byte Range256 lookups on
+  FieldA/B/Out/AddIntermediate (128 emissions per real row).
+  Chip's first real lookup binding; closes the per-byte soundness
+  pin on the algebraic chains.
+- **R1c-3-quat** (`a0baad3`) — is_sub constraint chain
+  (`out + b ≡ a + is_underflow·p` byte-borrow chain + closure).
+  IsOverflow column reinterpreted as is_underflow on is_sub rows.
+- **R1c-4-a** (`0b13af9`) — Schoolbook mul column scaffolding
+  (MulProduct[64], MulCarry[64], MulCarryMid[64], MulCarryHi[64],
+  IsMul) + fill_mul witness builder + 3-way real-row partition.
+- **R1c-4-b** (`f557f67`) — Schoolbook field-mul constraint chain
+  (`Σ a[i]·b[j] + carry_in = product + 256·full_carry`) +
+  closure (full_carry[63] = 0) + Range256 pin on all 256 is_mul
+  witness bytes per row.
 
 ## Remaining work before chip-on
 
 Not delivered in the initial run; each is a focused dedicated session:
 
-- **R1c-3-ter** — Range256 byte-range checks on FieldA/B/Out/AddIntermediate.
-  Per-row 128 lookups against the existing `Range256LookupElements`
-  consumer chain.  Closes the per-byte soundness pin on the
-  final-form chain.
-- **R1c-3-quat** — Mirror of R1c-3 / R1c-3-bis for the is_sub op
-  flavor.  The witness builder already produces a sub row via the
-  `(a + (p−b))` trick, but the chip currently has no sub-specific
-  constraint chain.
-- **R1c-4** — Schoolbook field multiplication.  64 partial-product
-  positions × byte-level carry chain.  This is the bulk of the chip
-  (~700 cells × 312 ops/scalar mult → most of the per-call cell
-  count).
 - **R1c-5** — Reduction `mod 2²⁵⁵ - 19` for mult outputs.  Uses
   `2²⁵⁵ ≡ 19 (mod p)` to fold the 512-bit unreduced product back
-  into 256 bits (two passes).
+  into 256 bits (two passes).  Strategy choice (open):
+    a. Multi-row: separate is_reduce_round1, is_reduce_round2,
+       is_final_form rows.  ~4 rows per mul, cleaner column shape.
+    b. Single-row: extra columns on the is_mul row.  Fewer rows,
+       wider AIR.  Probably the right call for prove-time.
+  The is_mul row's FieldOut should hold the canonical (a·b) mod p
+  after this lands, not the LOW 32 of the unreduced product.
 - **R1c-6** — Field inversion via Fermat's little theorem (`a^(p-2)`
   square-and-multiply ladder).  Composed of R1c-4 mults + R1c-5
   reductions; no new primitive.
