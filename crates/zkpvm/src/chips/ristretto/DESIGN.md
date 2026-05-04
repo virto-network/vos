@@ -505,6 +505,48 @@ point ops + their carry-chain witnesses).
   with a precomputed table chip; defer to Phase R2 unless
   measurements show it's the difference between 1.2 s and 0.8 s.
 
+## 10c. ACTUAL prove-time measurement (R1f-combined)
+
+`bench_ristretto_chip_combined_with_cpu_baseline` — full per-payment
+proof: clerk-private-pay-bench (37K PVM steps, log17) + one
+RistrettoChip payment (21K rows, log15) in a single combined proof.
+
+| Phase | Time | % |
+|---|---:|---:|
+| trace_gen | 218 ms | 1% |
+| preprocess_commit | 193 ms | 1% |
+| main_commit | 5.04 s | 29% |
+| interaction_gen | 991 ms | 6% |
+| interaction_commit | 4.44 s | 26% |
+| stark_prove (FRI) | 6.53 s | 37% |
+| **Total** | **17.42 s** | |
+| Verify | 237 ms | |
+| Proof size | 453 KB | |
+
+Trace shape after R1e-quat:
+- main_cols: 1655 (878 baseline + 777 RistrettoChip)
+- interaction_cols: 1588 (304 baseline + 1284 RistrettoChip)
+- log_size: 17
+
+The 1284 extra interaction_cols come from the chip's ~642 Range256
+emissions per real row; finalize_logup_in_pairs() pairs adjacent
+emissions ⇒ ~2 interaction cols per emission.
+
+Sub-second analysis with the measured baseline:
+
+| Optimization layer | Cumulative time |
+|---|---:|
+| CPU baseline (this measurement) | 17.4 s |
+| + GPU/SIMD (3×) | 5.8 s |
+| + NAF-w4 (−30% chip rows) | 4.5 s |
+| + lower security (80-bit, halves FRI queries) | 2.5 s |
+| + tighter chip cells (R1c-7 carry-chain refactor) | 1.5 s |
+
+**Realistic floor without chip refactor: ~3-5 s** on high-end
+mobile.  Sub-second requires (a) significantly tighter chip
+(~50% cell reduction), and/or (b) aggressive batch proving
+(multiple payments amortized), and/or (c) different curve choice.
+
 ## 10b. Measured row projection (R1e)
 
 The R1e double-and-add composition gives concrete row counts per
