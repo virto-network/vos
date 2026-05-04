@@ -19,7 +19,7 @@ wasm-bootstrap = ["wasm", "dep:dlmalloc"]
 # Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
 http = ["dep:ureq"]
 # Enables redb-backed worker state persistence in the worker host.
-storage = ["dep:redb", "dep:merkle-crdt"]
+storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-channel", "dep:vos-raft"]
 # Enables the libp2p-backed networking layer (peer transport, identity,
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
@@ -28,7 +28,7 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
-vos-raft = { path = "../vos-raft", default-features = false, features = ["std"] }
+vos-raft = { path = "../vos-raft", default-features = false, features = ["std"], optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 
 # std-only: PVM runtime and vosx binary dependencies
@@ -51,10 +51,11 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 async-trait = { version = "0.1", optional = true }
 # Drives vos-raft's async Storage / Transport futures from inside
 # the existing sync Network::set_raft_handler / RaftCommit code
-# paths. Always-on (cheap, std-only) so the storage/network feature
-# gates don't have to fan it out.
-futures-executor = { version = "0.3", default-features = false, features = ["std"] }
-futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"] }
+# paths. Std-only — gated behind the `storage` feature so no_std
+# actor builds (default-features = false) don't drag std into the
+# riscv guest.
+futures-executor = { version = "0.3", default-features = false, features = ["std"], optional = true }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
 
 [dev-dependencies]
 # Tests need typed access to the registry actor — `host` pulls

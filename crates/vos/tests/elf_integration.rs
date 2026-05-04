@@ -4275,3 +4275,75 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
 
     let _ = std::fs::remove_dir_all(&dir_root);
 }
+
+
+#[test]
+fn invoked_child_storage_isolated_from_parent_journal() {
+    // Regression: `RefineJournal::writes` used to be a flat
+    // `(key, value)` list with no service-id scoping. The parent
+    // service's STATE_KEY entry then shadowed an INVOKEd child's
+    // STORAGE_R for the same key (STATE_KEY is the same constant
+    // for every actor), so children loaded the parent's encoded
+    // state instead of their own.
+    //
+    // Concrete fingerprint with the scheduler agent driving the
+    // counter: counter prints `count = 1, 2, 2, 2, 2, ...` —
+    // counter receives the parent's 56-byte agent-state envelope
+    // each time it tries to read its own 4-byte state, and rkyv's
+    // try_decode succeeds against arbitrary trailing bytes,
+    // returning `count = 1` regardless of what the agent passed
+    // in via prev_state.
+    //
+    // After the fix the journal is per-service: the agent's
+    // STATE_KEY journal entries don't shadow the counter's reads,
+    // and the counter's STATE_KEY (written directly by
+    // handle_invoke before the child runs) is what STORAGE_R
+    // returns. Counter then progresses normally: 1, 2, 3, 4, ...
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+    };
+
+    let counter_elf = example_elf("counter");
+    let agent_blob = transpile_actor(&agent_data);
+    let counter_blob = transpile_actor(&counter_elf);
+
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, agent_blob);
+    let counter_id = register_svc(&mut rt, counter_blob);
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![counter_id.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(agent_id, Vec::new());
+
+    // A few runtime ticks are enough — the scheduler self-tells
+    // `tick` and re-enters up to MAX_REFINE_ITERATIONS times per
+    // outer tick, so each call to `tick_blocking` advances the
+    // counter many times.
+    for _ in 0..3 {
+        if !rt.has_work() { break; }
+        rt.tick_blocking();
+    }
+
+    // Counter encodes `count: u32` as a 4-byte rkyv payload.
+    let raw = rt.storage
+        .read(counter_id, vos::lifecycle::STATE_KEY_BYTES)
+        .expect("counter STATE_KEY persisted")
+        .to_vec();
+    assert_eq!(raw.len(), 4, "counter state should be a 4-byte u32 (rkyv)");
+    let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    assert!(
+        count > 5,
+        "scheduler-driven counter is stuck at {count}; parent's STATE_KEY is \
+         shadowing counter's STORAGE_R again"
+    );
+    assert_eq!(rt.panics, 0, "no service should have panicked");
+}

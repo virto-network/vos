@@ -140,10 +140,19 @@ fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
 }
 
 // --- Per-service refine journal ---
+//
+// One journal spans a top-level service's tick. It accumulates effects
+// from the service itself **and** from any children it INVOKEs — JAM
+// semantics make every effect produced under one refine a structural
+// part of that refine's commit. The journal still tracks *which*
+// service each entry belongs to so they land on the right storage row
+// at commit time and `journaled_read` can serve read-your-own-writes
+// without a parent's writes shadowing a child's lookup.
 
 #[derive(Default)]
 struct RefineJournal {
-    writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Pending writes, scoped per service: `(svc_id, key, value)`.
+    writes: Vec<(u32, Vec<u8>, Vec<u8>)>,
     transfers: Vec<(ServiceId, Vec<u8>)>,
     preimages: Vec<([u8; 32], Vec<u8>)>,
     self_messages: Vec<Vec<u8>>,
@@ -153,20 +162,24 @@ struct RefineJournal {
 }
 
 impl RefineJournal {
-    /// Read-your-own-writes: latest journaled value for `key`, if any.
-    fn journaled_read(&self, key: &[u8]) -> Option<&[u8]> {
+    /// Read-your-own-writes for `svc_id`: latest journaled value for
+    /// `key` written by *this* service, if any. Other services' writes
+    /// to the same key are intentionally ignored — STATE_KEY collides
+    /// across services and would otherwise let a parent's encoded
+    /// state shadow a child's STORAGE_R during a nested INVOKE.
+    fn journaled_read(&self, svc_id: u32, key: &[u8]) -> Option<&[u8]> {
         self.writes
             .iter()
             .rev()
-            .find(|(k, _)| k.as_slice() == key)
-            .map(|(_, v)| v.as_slice())
+            .find(|(s, k, _)| *s == svc_id && k.as_slice() == key)
+            .map(|(_, _, v)| v.as_slice())
     }
 
     fn absorb_effects(&mut self, effects: Vec<Effect>, self_id: u32) {
         for eff in effects {
             match eff {
                 Effect::Write { key, value } => {
-                    self.writes.push((key, value));
+                    self.writes.push((self_id, key, value));
                 }
                 Effect::Transfer { target, memo } => {
                     if target == self_id {
@@ -605,6 +618,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     // dispatch. Empty state means nothing changed.
                     if !actor_state.is_empty() {
                         journal.writes.push((
+                            svc_id,
                             crate::lifecycle::STATE_KEY_BYTES.to_vec(),
                             actor_state,
                         ));
@@ -612,7 +626,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
-                        save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
+                        save_continuation(svc_id, flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
                         // Spill any self-directed transfers from the
                         // payload's effects as pending transfers for next
                         // tick. On a JAM host, accumulate would replay
@@ -657,7 +671,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     // for the next tick. Capture a continuation so the
                     // service warm-restarts with its current heap/actor.
                     let (flat_mem, heap_base, heap_top) = captured;
-                    save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
+                    save_continuation(svc_id, flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
                     // Re-queue leftover self-messages for next tick.
                     for msg in items.drain(..) {
                         new_transfers.push((ServiceId(svc_id), msg));
@@ -668,8 +682,12 @@ impl<D: DataLayer> VosRuntime<D> {
             }
 
             // Commit the journal (accumulate as a direct replay).
-            for (key, value) in journal.writes.drain(..) {
-                storage.write(ServiceId(svc_id), &key, &value);
+            // Each entry carries its origin service_id — children
+            // INVOKEd inside this refine produced their own writes,
+            // and they need to land on the child's storage row, not
+            // the dispatching service's.
+            for (write_svc_id, key, value) in journal.writes.drain(..) {
+                storage.write(ServiceId(write_svc_id), &key, &value);
             }
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);
@@ -832,7 +850,7 @@ fn handle_refine_hostcall(
         hostcall::INFO => (svc_id as u64, 0),
         hostcall::STORAGE_R => {
             let key = kread(kernel, a0 as u32, a1 as usize);
-            let journaled = journal.journaled_read(&key).map(|v| v.to_vec());
+            let journaled = journal.journaled_read(svc_id, &key).map(|v| v.to_vec());
             let value = journaled.or_else(|| storage.read(id, &key).map(|v| v.to_vec()));
             match value {
                 Some(v) => {
@@ -849,7 +867,7 @@ fn handle_refine_hostcall(
         hostcall::STORAGE_W => {
             let key = kread(kernel, a0 as u32, a1 as usize);
             let value = kread(kernel, a2 as u32, a3 as usize);
-            journal.writes.push((key, value));
+            journal.writes.push((svc_id, key, value));
             (error::HOST_OK, 0)
         }
         hostcall::TRANSFER => {
@@ -1237,6 +1255,7 @@ fn handle_invoke(
 /// Capture a continuation: hash flat_mem, store in the data layer,
 /// and push a ContinuationHeader to the journal.
 fn save_continuation<D: crate::data_layer::DataLayer>(
+    svc_id: u32,
     flat_mem: Vec<u8>,
     heap_base: u32,
     heap_top: u32,
@@ -1257,6 +1276,7 @@ fn save_continuation<D: crate::data_layer::DataLayer>(
         registers: [0; 13],
     };
     journal.writes.push((
+        svc_id,
         crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
         header.encode(),
     ));
@@ -1298,10 +1318,12 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
         pollster::block_on(data.remove(&header.commitment));
     }
     journal.writes.push((
+        svc_id,
         crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
         vec![],
     ));
     journal.writes.push((
+        svc_id,
         crate::lifecycle::STATE_KEY_BYTES.to_vec(),
         vec![],
     ));
