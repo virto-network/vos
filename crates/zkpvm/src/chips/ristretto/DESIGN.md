@@ -73,7 +73,66 @@ gated OFF in `active_components` so existing proofs are unaffected.
   triggers on non-zero values when is_mul=1.  Bisect flag
   scaffolding kept in place for the follow-up.
 
-## R1e-pent: inter-row binding (the remaining soundness gap)
+## R1e-pent: inter-row binding — CLOSED (`52ffe1f`)
+
+Implemented via the RistrettoRegisterFileLookupElements relation
+(tuple shape: row_idx_lo, row_idx_hi, byte_idx, byte_value).
+
+Per real op row:
+- PRODUCER: 32 emissions of (row_idx, byte_idx[k], out[k]),
+  multiplicity = +is_real
+- CONSUMER A: 32 emissions of (a_src, byte_idx[k], a[k]),
+  multiplicity = -is_real
+- CONSUMER B: 32 emissions of (b_src, byte_idx[k], b[k]),
+  multiplicity = -is_real
+
+Closure: lookup-balance forces every consumer to find a matching
+producer, so every input must come from a prior row's `out`.
+
+Verified by `ristretto_chip_unrelated_rows_now_rejected`: 100
+unrelated rows are correctly REJECTED at verify time.
+
+## R1e-bdry: boundary input/output mechanism — CLOSED (`c06ad67`)
+
+Two new row classes for closing the chain at the boundaries:
+
+- **IsInput**: producer-only row.  Holds a boundary value in
+  `out`, emits 32 producer tuples.  No consumer emissions, no
+  field-op constraints.  Used for ECALL scalar/point bytes,
+  curve constants, point-identity coords.
+- **IsOutput**: consumer-only row.  Drains via consumer A
+  (a_source pointing to the producing row).  No producer, no
+  consumer B, no field-op constraints.
+
+Partition extended: is_real ⇒ exactly one of {is_add, is_sub,
+is_mul, is_input, is_output} = 1.
+
+Verified by `prove_ristretto_chip_closed_chain_input_output`:
+4-row chain [input, input, add, output] proves + verifies
+end-to-end.  Soundness: per-row + inter-row + boundary all CLOSED.
+
+## R1f: end-to-end benchmark — CLOSED (`13b36d9`)
+
+`bench_ristretto_chip_soundness_complete_chain` measures the
+realistic prove-time per chip operation in soundness-complete
+configuration:
+
+| Operations | Total rows | Log_size | Prove | Per-op |
+|---:|---:|---:|---:|---:|
+| 1,000  | 2,002  | 11 | 0.42 s | 0.42 ms |
+| 10,000 | 20,002 | 15 | 7.47 s | 0.75 ms |
+
+Linear scaling.  Extrapolating to 21,118-row per-payment workload:
+**~18 s prove time on CPU**.  Matches pre-soundness measurement
+(soundness adds ~0 prove-time overhead).
+
+Cipher-clerk patch (separate from R1f deliverable): replace
+fill_input/fill_output with ECALL-boundary lookups against
+MemoryChip, thread source row IDs through point-op generators.
+The chip's AIR is ready and soundness-complete; what's left is
+integration plumbing.
+
+## Remaining work before chip-on (NOTE: now mostly closed)
 
 **Status**: confirmed exploitable, design proposed, implementation
 deferred.
