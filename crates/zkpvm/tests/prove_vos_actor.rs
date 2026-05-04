@@ -316,6 +316,25 @@ fn trace_clerk_refine_bench() {
     eprintln!("clerk-refine-bench: {} PVM steps, exit={exit:?}", steps.len());
 }
 
+/// Real-workload prove: clerk-private-pay-bench — the on-device
+/// computation a user runs for one tap-and-pay (L2 graph privacy).
+/// Pedersen amount commit + Schnorr-on-Ristretto sign + note
+/// commitment + rkyv signing payload, no host-side oracle/ledger.
+#[test]
+fn profile_clerk_private_pay_bench() {
+    profile_actor("clerk-private-pay-bench", 100_000_000);
+}
+
+#[test]
+fn trace_clerk_private_pay_bench() {
+    let blob = load_actor_blob("clerk-private-pay-bench");
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 500_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run_with_vos_stubs();
+    let steps = tracing.into_trace();
+    eprintln!("clerk-private-pay-bench: {} PVM steps, exit={exit:?}", steps.len());
+}
+
 #[test]
 fn profile_hash_bench() {
     let blob = load_actor_blob("hash-bench");

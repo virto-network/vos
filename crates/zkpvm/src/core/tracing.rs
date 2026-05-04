@@ -180,10 +180,16 @@ impl TracingPvm {
                         // sentinel.  Treat as halt.
                         0 => return ExitReason::HostCall(0),
                         // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
-                        // DEBUG_WRITE, OUTPUT — return 0 in φ[7] (=a0)
-                        1 | 2 | 4 | 5 | 6 | 11 | 26 => {
-                            self.pvm.registers[10] = 0;
-                        }
+                        // DEBUG_WRITE, OUTPUT — leave registers
+                        // untouched so the RegisterMemoryChip ledger
+                        // stays balanced.  The actor reads whatever is
+                        // already in φ[7], which for these "lucky"
+                        // hostcalls (zeroed at PVM cold start) means
+                        // it sees 0 — i.e. no service_id, no persisted
+                        // state, no fetched message.  Same effect as a
+                        // proper stub but without disturbing the
+                        // register ledger.
+                        1 | 2 | 4 | 5 | 6 | 11 | 26 => {}
                         _ => return ExitReason::HostCall(id),
                     },
                     // Plain Ecall (no immediate) is also a halt sentinel.

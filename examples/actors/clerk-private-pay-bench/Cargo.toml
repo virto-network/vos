@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "clerk-private-pay-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "notes"] }
+# cipher-clerk's `signing` feature pulls in rand_core/getrandom for OsRng;
+# we never actually invoke OsRng (we use a deterministic seeded RNG) but
+# need a custom backend so getrandom links on the riscv64em-javm target.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+rand_core = { version = "0.6", default-features = false }
+blake2 = { version = "0.10", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
