@@ -47,6 +47,10 @@ pub struct FieldOpRow {
     /// is_overflow * p` step.  Each entry is 0 or 1.  Zero throughout
     /// when `is_overflow = 0`.
     pub sub_borrow: [u8; 32],
+    /// Per-position borrow chain for the final-form `p − out − 1 ≥ 0`
+    /// check.  Final entry must be 0 (the chip's constraint enforces
+    /// this).  Each entry is 0 or 1.
+    pub final_form_borrow: [u8; 32],
     /// Operation classifier — exactly one of these is 1 on a real row.
     pub is_add: u8,
     pub is_sub: u8,
@@ -64,6 +68,7 @@ impl Default for FieldOpRow {
             add_carry: [0u8; 32],
             is_overflow: 0,
             sub_borrow: [0u8; 32],
+            final_form_borrow: [0u8; 32],
             is_add: 0,
             is_sub: 0,
             is_real: 0,
@@ -118,12 +123,31 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert_eq!(out, field::add(&a, &b),
         "witness fill diverged from field::add reference");
 
+    // Final-form check witness: byte-wise compute `p − out − 1` with a
+    // borrow chain.  If `out < p` the result is non-negative and the
+    // final borrow is 0.  If `out ≥ p` the final borrow is 1, which
+    // the chip's constraint will reject.
+    let mut final_form_borrow = [0u8; 32];
+    let mut bw: i16 = 1; // start with -1 to compute p - out - 1
+    for i in 0..32 {
+        let v = field::P_BYTES[i] as i16 - out[i] as i16 - bw;
+        if v < 0 {
+            bw = 1;
+        } else {
+            bw = 0;
+        }
+        final_form_borrow[i] = bw as u8;
+    }
+    debug_assert_eq!(final_form_borrow[31], 0,
+        "final-form borrow chain ends with borrow=1, witness output ≥ p");
+
     FieldOpRow {
         a, b, out,
         add_intermediate: intermediate,
         add_carry: carry,
         is_overflow,
         sub_borrow,
+        final_form_borrow,
         is_add: 1,
         is_sub: 0,
         is_real: 1,
