@@ -29,7 +29,7 @@ use stwo::{
     },
 };
 use num_traits::{One, Zero};
-use stwo_constraint_framework::EvalAtRow;
+use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 #[cfg(feature = "prover")]
 pub mod field;
@@ -174,7 +174,7 @@ impl BuiltInComponent for RistrettoChip {
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        _lookup_elements: &Range256LookupElements,
+        lookup_elements: &Range256LookupElements,
     ) {
         let a       = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b       = crate::trace::trace_eval!(trace_eval, Column::FieldB);
@@ -315,22 +315,43 @@ impl BuiltInComponent for RistrettoChip {
         // produced a non-negative result, i.e. out < p).
         eval.add_constraint(is_real[0].clone() * ff_brw[31].clone());
 
-        // R1c-3-bis closes the WORST gap (out ≥ p).  Still OPEN before
-        // R1f turns the chip on:
+        // ── R1c-3-ter: per-byte Range256 lookups ──
         //
-        //  - R1c-3-ter: byte-range checks on FieldA/B/Out/Interm
-        //    + per-position pin of the final-form borrow chain via
-        //    Range256 consumer lookups.  The chain-closure constraint
-        //    above is necessary but not sufficient soundness: a
-        //    malicious prover could fabricate per-byte witnesses that
-        //    individually violate the [0,256) byte property as long
-        //    as the algebraic sum balances; Range256 lookups close
-        //    that.
-        //  - is_sub constraint chain (the symmetric sub variant).
+        // Pin every committed byte cell on real rows to lie in [0, 256).
+        // Without these, the algebraic chains above are sound only if
+        // every cell is *separately* known to be a valid byte; a
+        // malicious prover could otherwise spread the equality across
+        // cells whose individual values escape [0, 256).  Producer
+        // (positive) multiplicity = is_real, balanced against
+        // RangeMultiplicity256's preprocessed consumer side.
         //
-        // Both land before R1f; chip is gated off until then.
+        // 32 + 32 + 32 + 32 = 128 emissions per real row.  Padding
+        // rows contribute zero (multiplicity = 0).  Even count, so
+        // finalize_logup_in_pairs() closes the chip's lookup
+        // bookkeeping below.
+        for cells in [&a, &b, &out, &interm] {
+            for byte in cells.iter() {
+                eval.add_to_relation(RelationEntry::new(
+                    lookup_elements,
+                    is_real[0].clone().into(),
+                    &[byte.clone()],
+                ));
+            }
+        }
 
-        eval.finalize_logup();
+        // R1c-3-ter still leaves OPEN before R1f turns the chip on:
+        //  - R1c-3-quat: is_sub constraint chain (the symmetric
+        //    sub variant).  The witness builder already produces
+        //    is_sub rows but the chip emits no constraints binding
+        //    them to a − b mod p.
+        //  - Per-position byte pin on the SubBorrow / FinalFormBorrow
+        //    chains.  Today they are constrained to {0,1} only;
+        //    individual byte arithmetic on `intermediate − is_overflow·p`
+        //    or `p − out − 1` still relies on the per-byte values
+        //    being u8.  R1c-3-quat lands these via a Range256 emission
+        //    on the implicit byte expressions.
+
+        eval.finalize_logup_in_pairs();
     }
 }
 
@@ -372,15 +393,34 @@ impl BuiltInProverComponent for RistrettoChip {
         &self,
         component_trace: ComponentTrace,
         _side_note: &SideNote,
-        _lookup_elements: &AllLookupElements,
+        lookup_elements: &AllLookupElements,
     ) -> (
         ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
         SecureField,
     ) {
         let log_size = component_trace.log_size();
-        let logup = LogupTraceBuilder::new(log_size);
-        // No relation entries — the chip emits and consumes nothing
-        // until R1c–R1e wire in real lookups.
+        let mut logup = LogupTraceBuilder::new(log_size);
+
+        // Emit the matching positive-multiplicity contribution for
+        // the 128 per-row Range256 emissions in `add_constraints`.
+        // Multiplicity = is_real (so padding rows contribute 0).
+        let range256: &Range256LookupElements = lookup_elements.as_ref();
+        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
+        let field_a = crate::trace::original_base_column!(component_trace, Column::FieldA);
+        let field_b = crate::trace::original_base_column!(component_trace, Column::FieldB);
+        let field_out = crate::trace::original_base_column!(component_trace, Column::FieldOut);
+        let interm = crate::trace::original_base_column!(component_trace, Column::AddIntermediate);
+
+        for cells in [&field_a, &field_b, &field_out, &interm] {
+            for col in cells.iter() {
+                logup.add_to_relation_with(
+                    range256,
+                    [is_real[0].clone()],
+                    |[real]| real.into(),
+                    &[col.clone()],
+                );
+            }
+        }
         logup.finalize()
     }
 }
