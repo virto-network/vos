@@ -215,3 +215,20 @@ stwo_constraint_framework::relation!(
     Blake2bCallLookupElements,
     REL_BLAKE2B_CALL_LOOKUP_SIZE
 );
+
+// R1e-pent: RistrettoChip register-file lookup.  Each row's `out`
+// bytes are PRODUCERS keyed by (row_index, byte_index, byte_value);
+// each row's `a` and `b` input bytes are CONSUMERS keyed by
+// (a_source_row, byte_index, byte_value) and (b_source_row, ...).
+// The lookup polynomial balance forces every consumer to find a
+// matching producer — closing the inter-row binding soundness gap.
+//
+// row_index is split into 2 LE bytes (sufficient for chips up to
+// log_size 16 = 65K rows).  byte_index ∈ [0, 32).
+//
+// Tuple: (row_idx_lo, row_idx_hi, byte_index, byte_value) — 4 limbs.
+const REL_RISTRETTO_REGISTER_FILE_LOOKUP_SIZE: usize = 4;
+stwo_constraint_framework::relation!(
+    RistrettoRegisterFileLookupElements,
+    REL_RISTRETTO_REGISTER_FILE_LOOKUP_SIZE
+);

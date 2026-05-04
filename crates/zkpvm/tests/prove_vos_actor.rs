@@ -795,6 +795,101 @@ fn debug_fill_mul_one_times_one() {
         r.is_add, r.is_sub, r.is_mul, r.is_real);
 }
 
+/// R1f-soundness: negative tests confirming the chip's per-row
+/// constraints reject malformed witnesses.  Runs prove with invalid
+/// witnesses; each MUST fail.  This is the audit evidence that
+/// within-row soundness is intact (the inter-row gap is separate —
+/// see ristretto_chip_unrelated_rows_prove_attestation).
+#[test]
+fn ristretto_chip_negative_per_row_soundness_audit() {
+    use zkpvm::chips::ristretto::witness::{fill_add, fill_mul, fill_sub, FieldOpRow};
+
+    fn try_prove(row: FieldOpRow) -> bool {
+        let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
+        side_note.add_ristretto_field_row(row);
+        let config = zkpvm::PcsConfig {
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        };
+        zkpvm::prove_with_config(&mut side_note, config).is_ok()
+    }
+
+    let mut a_small = [0u8; 32]; a_small[0] = 5;
+    let mut b_small = [0u8; 32]; b_small[0] = 3;
+
+    // Baseline: honest add witness proves.
+    assert!(try_prove(fill_add(a_small, b_small)),
+        "honest add witness must prove");
+
+    // Tamper #1: flip out byte → fail (sum chain rejects).
+    let mut bad = fill_add(a_small, b_small);
+    bad.out[0] = bad.out[0].wrapping_add(1);
+    assert!(!try_prove(bad), "tampered out[0] must fail");
+
+    // Tamper #2: flip is_overflow → fail (final-form chain rejects).
+    let mut bad = fill_add(a_small, b_small);
+    bad.is_overflow = 1 - bad.is_overflow;
+    assert!(!try_prove(bad), "tampered is_overflow must fail");
+
+    // Tamper #3: flip add_carry bit → fail (boolean / sum chain rejects).
+    let mut bad = fill_add(a_small, b_small);
+    bad.add_carry[0] = 1 - bad.add_carry[0];
+    assert!(!try_prove(bad), "tampered add_carry[0] must fail");
+
+    // Tamper #4: is_sub witness with wrong is_underflow.
+    let mut bad = fill_sub([0u8; 32], a_small);  // 0 - 5 (underflows)
+    bad.is_overflow = 0;  // claim no underflow — wrong
+    assert!(!try_prove(bad), "tampered is_underflow on is_sub must fail");
+
+    // Tamper #5: mul row with wrong mul_product byte.
+    let mut a = [0u8; 32]; a[0] = 7;
+    let mut b = [0u8; 32]; b[0] = 11;
+    let mut bad = fill_mul(a, b);
+    bad.mul_product[0] = bad.mul_product[0].wrapping_add(1);
+    assert!(!try_prove(bad), "tampered mul_product[0] must fail");
+
+    // Tamper #6: mul row with wrong out byte (post-reduction value).
+    let mut bad = fill_mul(a, b);
+    bad.out[0] = bad.out[0].wrapping_add(1);
+    assert!(!try_prove(bad), "tampered mul out[0] must fail");
+
+    // Tamper #7: claim is_mul = is_add = 1 (partition violation).
+    let mut bad = fill_add(a_small, b_small);
+    bad.is_mul = 1;
+    assert!(!try_prove(bad), "double op-flag must fail (partition)");
+
+    eprintln!("All 7 negative-witness cases correctly REJECTED.");
+
+    // Tamper #8: is_sub two-sided chain — flip a sub_chain_borrow bit.
+    let mut a = [0u8; 32]; a[0] = 0x10; a[1] = 0xd1; a[2] = 0x1f;
+    let mut b = [0u8; 32]; b[0] = 0x20; b[1] = 0xa2; b[2] = 0x3f;
+    let mut bad = fill_sub(a, b);
+    bad.sub_chain_borrow[1] = 1 - bad.sub_chain_borrow[1];
+    assert!(!try_prove(bad), "tampered sub_chain_borrow must fail");
+
+    // Tamper #9: is_sub two-sided chain — flip sub_chain_carry_aip bit.
+    let mut bad = fill_sub(a, b);
+    bad.sub_chain_carry_aip[1] = 1 - bad.sub_chain_carry_aip[1];
+    assert!(!try_prove(bad), "tampered sub_chain_carry_aip must fail");
+
+    // Tamper #10: is_mul reduction — flip pass1_lo byte.
+    let mut a_big = [0u8; 32];
+    let mut b_big = [0u8; 32];
+    for i in 0..32 { a_big[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
+    for i in 0..32 { b_big[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
+    a_big[31] &= 0x7f; b_big[31] &= 0x7f;
+    let mut bad = fill_mul(a_big, b_big);
+    bad.pass1_lo[5] = bad.pass1_lo[5].wrapping_add(1);
+    assert!(!try_prove(bad), "tampered pass1_lo must fail");
+
+    // Tamper #11: is_mul reduction — flip pass2_top_bit.
+    let mut bad = fill_mul(a_big, b_big);
+    bad.pass2_top_bit = 1 - bad.pass2_top_bit;
+    assert!(!try_prove(bad), "tampered pass2_top_bit must fail");
+
+    eprintln!("All 11 negative-witness cases correctly REJECTED.");
+    eprintln!("Per-row soundness: AUDITED across add, sub, and mul paths.");
+}
+
 /// R1e-pent diagnostic: confirm the inter-row binding soundness gap.
 /// Push 100 unrelated is_add rows (each computing a different
 /// `1 + N = 1+N`).  Each row is internally correct; the chip
