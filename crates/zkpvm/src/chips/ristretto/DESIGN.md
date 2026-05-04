@@ -36,6 +36,42 @@ gated OFF in `active_components` so existing proofs are unaffected.
   (`Σ a[i]·b[j] + carry_in = product + 256·full_carry`) +
   closure (full_carry[63] = 0) + Range256 pin on all 256 is_mul
   witness bytes per row.
+- **R1c-5-a** (`02ebf3e`) — Reduction-mod-p column scaffolding
+  (Pass1Lo/Hi, Pass1Carry+Mid, Pass2Lo/CarryOut/Carry,
+  Pass2TopBit, AfterTopBit/Carry) + canonical fill_mul that
+  returns (a·b) mod p in FieldOut.
+- **R1c-5-b** (`91520ae`) — Reduction constraint chains: pass-1
+  fold (lo + 38·hi), pass-2 fold (pass1_lo + 38·pass1_hi),
+  top-bit fold + 19/38 add, final FieldOut = after_top − is_ovf·p.
+- **R1c-6** (`92f800a`) — Inversion driver (Fermat ladder) — pure
+  host-side row composition emitting is_mul rows.
+- **R1d** (`94a259c`) — Edwards point doubling + addition, host-
+  side composition over extended (X, Y, Z, T) coords.  16 rows
+  per double, 18 per add.
+- **R1e** (`bbda933`) — Scalar-mult double-and-add main loop.
+  Composes R1d ops over 256 scalar bits.  ~6500 rows per scalar mult.
+- **R1e-quat** (`b2504c2`) — Chip-on integration:
+  `SideNote.ristretto_field_rows` + `add_ristretto_field_row`
+  helper that pre-bumps Range256 multiplicities (since
+  RangeMultiplicity256 component runs before RistrettoChip);
+  `generate_main_trace` lays each FieldOpRow into its column
+  slots; activity gating includes `!ristretto_field_rows.is_empty()`
+  so chip-level tests turn on without ECALLs.
+  - **First end-to-end RistrettoChip proof** passes:
+    `prove_ristretto_chip_field_add` (1 + 2 = 3, gen 16-row trace,
+    chip ON, verifier reconstructs same active set).
+  - **`prove_ristretto_chip_field_mul_zero` passes**: 0·0=0
+    exercises the full is_mul row constraint set with all-zero
+    witness; demonstrates is_mul integration plumbing is sound.
+- **R1e-quat bisect** (`4b52c05`) — Bisected the field-mul
+  ConstraintsNotSatisfied via per-chain `ENABLE_*` flags.  Finding:
+  even with ALL is_mul-gated chains disabled, the trivial 1·1=1
+  is_mul row fails — but 0·0=0 passes.  The bug is in some
+  always-fires constraint (boolean checks, real-row partition,
+  ff_brw closure, sub_chain_brw closure, or pass2_carry_out /
+  pass2_top_bit booleans) that's silent for all-zero witness but
+  triggers on non-zero values when is_mul=1.  Bisect flag
+  scaffolding kept in place for the follow-up.
 
 ## Remaining work before chip-on
 
