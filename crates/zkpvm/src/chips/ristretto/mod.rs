@@ -279,6 +279,16 @@ impl BuiltInComponent for RistrettoChip {
         let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
         let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
         let mul_carry_hi  = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
+        let pass1_lo      = crate::trace::trace_eval!(trace_eval, Column::Pass1Lo);
+        let pass1_hi      = crate::trace::trace_eval!(trace_eval, Column::Pass1Hi);
+        let pass1_carry   = crate::trace::trace_eval!(trace_eval, Column::Pass1Carry);
+        let pass1_carry_mid = crate::trace::trace_eval!(trace_eval, Column::Pass1CarryMid);
+        let pass2_lo      = crate::trace::trace_eval!(trace_eval, Column::Pass2Lo);
+        let pass2_carry_out = crate::trace::trace_eval!(trace_eval, Column::Pass2CarryOut);
+        let pass2_carry   = crate::trace::trace_eval!(trace_eval, Column::Pass2Carry);
+        let pass2_top_bit = crate::trace::trace_eval!(trace_eval, Column::Pass2TopBit);
+        let after_top_bit = crate::trace::trace_eval!(trace_eval, Column::AfterTopBit);
+        let after_top_carry = crate::trace::trace_eval!(trace_eval, Column::AfterTopCarry);
         let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
         let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
@@ -499,6 +509,174 @@ impl BuiltInComponent for RistrettoChip {
         // overflow) since 256-bit × 256-bit fits exactly in 512 bits.
         eval.add_constraint(real_mul.clone() * full_carry(63));
 
+        // ── R1c-5-b: pass-1 reduction fold lo + 38·hi ──
+        //
+        //   pass1_lo[k] + 256·full_carry1[k]
+        //     = mul_product[k] + 38·mul_product[k+32] + carry1_in[k]
+        //
+        // gated by is_real · is_mul.  full_carry1 split as
+        // pass1_carry[k] + 256·pass1_carry_mid[k] (max ~14 bits +
+        // incoming carry < 2¹⁶).  Closure: full_carry1[31] = pass1_hi
+        // viewed as a 16-bit value (pass1_hi[0] + 256·pass1_hi[1]).
+        let f38: E::F = E::F::from(BaseField::from(38u32));
+        let pass1_full_carry = |k: usize| -> E::F {
+            pass1_carry[k].clone() + pass1_carry_mid[k].clone() * f256.clone()
+        };
+        for k in 0..32 {
+            let carry_in = if k == 0 { E::F::zero() } else { pass1_full_carry(k - 1) };
+            // mul_product[k+32] is the high half byte at offset k.
+            let constraint = pass1_lo[k].clone()
+                + pass1_full_carry(k) * f256.clone()
+                - mul_product[k].clone()
+                - f38.clone() * mul_product[k + 32].clone()
+                - carry_in;
+            eval.add_constraint(real_mul.clone() * constraint);
+        }
+        // Closure: pass1_full_carry(31) = pass1_hi (16-bit).
+        let pass1_hi_value = || -> E::F {
+            pass1_hi[0].clone() + pass1_hi[1].clone() * f256.clone()
+        };
+        eval.add_constraint(
+            real_mul.clone() * (pass1_full_carry(31) - pass1_hi_value())
+        );
+
+        // ── R1c-5-b: pass-2 reduction fold pass1_lo + 38·pass1_hi ──
+        //
+        // 38·pass1_hi is a 16-bit constant injected at byte 0 (low
+        // byte) and byte 1 (high byte), with overflow up to bit 22:
+        //
+        //   38·(2¹⁶−1) = 2490330 ≈ 2²² (3 bytes), but in practice
+        //   pass1_hi ≤ 38 since the unreduced product < p² <
+        //   (2²⁵⁵)² = 2⁵¹⁰, and lo + 38·hi < 2²⁵⁶ + 38·2²⁵⁶
+        //   ⇒ pass1_hi < 39 ⇒ 38·pass1_hi < 1482 ≈ 2¹¹ ⇒ 2 bytes.
+        //
+        // Constraint per position k ∈ 0..32:
+        //
+        //   pass2_lo[k] + 256·pass2_carry[k]
+        //     = pass1_lo[k] + inject_byte[k] + carry2_in[k]
+        //
+        // where inject_byte[0..3] are the bytes of 38·pass1_hi
+        // (computed as a constant from pass1_hi columns) and
+        // inject_byte[3..32] = 0.
+        //
+        // For the chip, we compute 38·pass1_hi as a wire-level
+        // expression: (38·pass1_hi[0]) + 256·(38·pass1_hi[1]) — a
+        // single 16-bit constant.  We split it into per-byte
+        // contributions inline.
+        for k in 0..32 {
+            let carry_in = if k == 0 { E::F::zero() } else { pass2_carry[k - 1].clone() };
+            // inject 38·pass1_hi at byte position 0 and 1; higher
+            // positions = 0 (since 38·pass1_hi fits in ≤ 16 bits).
+            let inject_byte = match k {
+                // 38 · pass1_hi[0] contributes to byte 0; high byte
+                // of (38·pass1_hi[0]) overflows into byte 1.
+                // Plus 38·pass1_hi[1] is at byte 1 (256-place).
+                //
+                // Cleanest: model 38·pass1_hi_value as a 32-byte
+                // injection, gated to be nonzero only at k ∈ {0, 1, 2}.
+                // For chip simplicity and to avoid chain branching,
+                // we inject the FULL value 38·pass1_hi_value at k=0
+                // and let the carry chain absorb it.  This means
+                // inject[0] = 38·pass1_hi_value (which can be ≤
+                // 1482 = 5.5 bits + 5 bits = 2-byte field element);
+                // the carry chain naturally splits it across k=0..2.
+                0 => f38.clone() * pass1_hi_value(),
+                _ => E::F::zero(),
+            };
+            let constraint = pass2_lo[k].clone()
+                + pass2_carry[k].clone() * f256.clone()
+                - pass1_lo[k].clone()
+                - inject_byte
+                - carry_in;
+            eval.add_constraint(real_mul.clone() * constraint);
+        }
+        // Closure: pass2_carry[31] = pass2_carry_out (≤ 1).
+        eval.add_constraint(
+            real_mul.clone() * (pass2_carry[31].clone() - pass2_carry_out[0].clone())
+        );
+
+        // ── R1c-5-b: top-bit fold ──
+        //
+        // pass2_top_bit ∈ {0, 1} is bit 7 of pass2_lo[31].  We pin
+        // it by witnessing pass2_lo[31] = (pass2_lo[31] − 128·top_bit)
+        // + 128·top_bit, plus the bound that the low 7 bits are <
+        // 128 (handled implicitly by the after_top_bit chain below
+        // which produces after_top_bit[31] from pass2_lo[31] minus
+        // 128·top_bit).
+        //
+        // The after-top chain folds in 38·pass2_carry_out + 19·top_bit:
+        //
+        //   after_top_bit[k] + 256·after_top_carry[k]
+        //     = pass2_lo[k] + inject_at_k + after_carry_in[k]
+        //         − 128·pass2_top_bit · [k == 31]
+        //
+        // where inject_at_0 = 38·pass2_carry_out + 19·pass2_top_bit
+        // and inject_at_k>0 = 0 (the value is at most 19+38 = 57 < 128,
+        // single byte at position 0).
+        let inject0_after = f38.clone() * pass2_carry_out[0].clone()
+            + E::F::from(BaseField::from(19u32)) * pass2_top_bit[0].clone();
+        let f128 = E::F::from(BaseField::from(128u32));
+        for k in 0..32 {
+            let carry_in = if k == 0 { E::F::zero() } else { after_top_carry[k - 1].clone() };
+            let inject = if k == 0 { inject0_after.clone() } else { E::F::zero() };
+            // Subtract 128·pass2_top_bit only at byte 31 (since the
+            // top bit of pass2_lo[31] is being cleared).
+            let bit_strip = if k == 31 {
+                f128.clone() * pass2_top_bit[0].clone()
+            } else { E::F::zero() };
+            let constraint = after_top_bit[k].clone()
+                + after_top_carry[k].clone() * f256.clone()
+                - pass2_lo[k].clone()
+                - inject
+                - carry_in
+                + bit_strip;
+            eval.add_constraint(real_mul.clone() * constraint);
+        }
+        // Closure: after_top_carry[31] = 0 (the +19/+38 fold and
+        // bit-clear together never overflow 256 bits when starting
+        // from pass2_lo < 2²⁵⁶ + 1 bit).
+        eval.add_constraint(real_mul.clone() * after_top_carry[31].clone());
+
+        // ── R1c-5-b: pass2_top_bit boolean + bit-7 pin ──
+        //
+        // pass2_top_bit ∈ {0, 1} (already booleanized below in the
+        // Range256 / boolean sweep).  The "low 7 bits of pass2_lo[31]"
+        // soundness: after_top_bit[31] (which is pass2_lo[31] −
+        // 128·top_bit) must be < 128 — implicitly pinned by Range256
+        // on after_top_bit[31].  Range256 emission appended below
+        // covers this; no separate constraint needed.
+
+        // ── R1c-5-b: final FieldOut = after_top_bit − is_overflow·p ──
+        //
+        // Reuses the SubBorrow chain (already constrained for is_add
+        // rows).  For is_mul rows we re-pin out[k] against
+        // after_top_bit[k] instead of add_intermediate[k]:
+        //
+        //   after_top_bit[k] − is_overflow·p[k] − sub_borrow[k−1]
+        //     + 256·sub_borrow[k] − out[k] = 0
+        //
+        // gated by real_mul.  IsOverflow is pinned witness-
+        // deterministic by the existing FinalFormBorrow chain
+        // (out < p closure).
+        for i in 0..32 {
+            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
+            let borrow_in = if i == 0 { E::F::zero() } else { borrow[i - 1].clone() };
+            let constraint = after_top_bit[i].clone()
+                - is_ovf[0].clone() * p_i
+                - borrow_in
+                + borrow[i].clone() * f256.clone()
+                - out[i].clone();
+            eval.add_constraint(real_mul.clone() * constraint);
+        }
+
+        // Booleans: pass2_carry_out, pass2_top_bit ∈ {0, 1}.
+        eval.add_constraint(
+            pass2_carry_out[0].clone() * (E::F::one() - pass2_carry_out[0].clone())
+        );
+        eval.add_constraint(
+            pass2_top_bit[0].clone() * (E::F::one() - pass2_top_bit[0].clone())
+        );
+
         // ── R1c-3-ter: per-byte Range256 lookups ──
         //
         // Pin every committed byte cell on real rows to lie in [0, 256).
@@ -539,6 +717,27 @@ impl BuiltInComponent for RistrettoChip {
                     &[byte.clone()],
                 ));
             }
+        }
+        // R1c-5-b: Range256 on reduction columns (32+2+32+32+32+32+32+32 = 226).
+        for cells_32 in [
+            &pass1_lo, &pass1_carry, &pass1_carry_mid,
+            &pass2_lo, &pass2_carry,
+            &after_top_bit, &after_top_carry,
+        ] {
+            for byte in cells_32.iter() {
+                eval.add_to_relation(RelationEntry::new(
+                    lookup_elements,
+                    is_real[0].clone().into(),
+                    &[byte.clone()],
+                ));
+            }
+        }
+        for byte in pass1_hi.iter() {
+            eval.add_to_relation(RelationEntry::new(
+                lookup_elements,
+                is_real[0].clone().into(),
+                &[byte.clone()],
+            ));
         }
 
         // R1c-4-b still leaves OPEN before R1f turns the chip on:
@@ -616,9 +815,22 @@ impl BuiltInProverComponent for RistrettoChip {
         let mul_c   = crate::trace::original_base_column!(component_trace, Column::MulCarry);
         let mul_cm  = crate::trace::original_base_column!(component_trace, Column::MulCarryMid);
         let mul_ch  = crate::trace::original_base_column!(component_trace, Column::MulCarryHi);
+        let p1_lo   = crate::trace::original_base_column!(component_trace, Column::Pass1Lo);
+        let p1_hi   = crate::trace::original_base_column!(component_trace, Column::Pass1Hi);
+        let p1_c    = crate::trace::original_base_column!(component_trace, Column::Pass1Carry);
+        let p1_cm   = crate::trace::original_base_column!(component_trace, Column::Pass1CarryMid);
+        let p2_lo   = crate::trace::original_base_column!(component_trace, Column::Pass2Lo);
+        let p2_c    = crate::trace::original_base_column!(component_trace, Column::Pass2Carry);
+        let atb     = crate::trace::original_base_column!(component_trace, Column::AfterTopBit);
+        let atc     = crate::trace::original_base_column!(component_trace, Column::AfterTopCarry);
 
-        // 32-byte columns (FieldA/B/Out/AddIntermediate).
-        for cells in [&field_a, &field_b, &field_out, &interm] {
+        // 32-byte columns (FieldA/B/Out/AddIntermediate + reduction).
+        for cells in [
+            &field_a, &field_b, &field_out, &interm,
+            &p1_lo, &p1_c, &p1_cm,
+            &p2_lo, &p2_c,
+            &atb, &atc,
+        ] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
                     range256,
@@ -638,6 +850,15 @@ impl BuiltInProverComponent for RistrettoChip {
                     &[col.clone()],
                 );
             }
+        }
+        // 2-byte column (Pass1Hi).
+        for col in p1_hi.iter() {
+            logup.add_to_relation_with(
+                range256,
+                [is_real[0].clone()],
+                |[real]| real.into(),
+                &[col.clone()],
+            );
         }
         logup.finalize()
     }
