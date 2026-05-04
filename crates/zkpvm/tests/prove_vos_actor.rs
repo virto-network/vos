@@ -844,6 +844,72 @@ fn debug_fill_mul_one_times_one() {
         r.is_add, r.is_sub, r.is_mul, r.is_real);
 }
 
+/// R1e projection: count the host-side row sequence for one full
+/// cipher-clerk "tap-and-pay" cryptographic core (one Pedersen
+/// amount commit + one Schnorr-on-Ristretto sign), and report the
+/// expected RistrettoChip log_size.  This estimates the chip's
+/// prove-time cost IF the constraint-debug bug were resolved.
+#[test]
+fn project_ristretto_chip_size_for_one_payment() {
+    use zkpvm::chips::ristretto::point::{
+        scalar_mult_rows, point_add_rows, point_identity, ED25519_TWO_D,
+    };
+
+    // One Pedersen amount commit needs 2 scalar mults + 1 point add:
+    //   v · G + b · H  (where v is the value, b the blinding)
+    let scalar_v: [u8; 32] = {
+        let mut s = [0u8; 32]; s[0] = 50; s
+    };
+    let scalar_b: [u8; 32] = {
+        let mut s = [0u8; 32];
+        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
+        s[31] &= 0x7f; s
+    };
+    let id = point_identity();
+    let (rows_vg, _vg_pt) = scalar_mult_rows(&scalar_v, &id);
+    let (rows_bh, _bh_pt) = scalar_mult_rows(&scalar_b, &id);
+    let (rows_add, _) = point_add_rows(&_vg_pt, &_bh_pt);
+
+    // One Schnorr sign needs 2 scalar mults (k·G nonce, sk·G pubkey)
+    // — same shape as Pedersen.
+    let (rows_kg, _) = scalar_mult_rows(&scalar_v, &id);
+    let (rows_skg, _) = scalar_mult_rows(&scalar_b, &id);
+
+    let total_rows = rows_vg.len() + rows_bh.len() + rows_add.len()
+                   + rows_kg.len() + rows_skg.len();
+    let log_n = 32 - (total_rows as u32).saturating_sub(1).leading_zeros();
+    eprintln!("=== Per-payment RistrettoChip row projection ===");
+    eprintln!("Pedersen v·G:    {} rows", rows_vg.len());
+    eprintln!("Pedersen b·H:    {} rows", rows_bh.len());
+    eprintln!("Pedersen +:      {} rows", rows_add.len());
+    eprintln!("Schnorr k·G:     {} rows", rows_kg.len());
+    eprintln!("Schnorr sk·G:    {} rows", rows_skg.len());
+    eprintln!("Total per pay:   {} rows", total_rows);
+    eprintln!("Chip log_size:   {}", log_n);
+    let _ = ED25519_TWO_D;
+
+    // Realistic prove-time projection.
+    //
+    // clerk-private-pay-bench today: ~37K PVM steps, log17 trace,
+    // 878 main cols, ~6.5s prove.  Total committed cells:
+    // 878 × 2^17 ≈ 115M.  Throughput: 115M / 6.5s ≈ 17.7M cells/s.
+    //
+    // RistrettoChip cells: 700 cols × 2^log_n.
+    let chip_cells = 700u64 * (1u64 << log_n);
+    let baseline_cells: u64 = 878 * (1u64 << 17);
+    let baseline_secs: f64 = 6.5;
+    let throughput: f64 = baseline_cells as f64 / baseline_secs; // cells / second
+    let total_cells = baseline_cells + chip_cells;
+    let projected_secs = total_cells as f64 / throughput;
+    eprintln!();
+    eprintln!("Cells:  baseline {} M + chip {} M = total {} M",
+        baseline_cells / 1_000_000, chip_cells / 1_000_000, total_cells / 1_000_000);
+    eprintln!("Throughput: {:.1} M cells/s", throughput / 1e6);
+    eprintln!("Projected total prove: ~{:.1}s on CPU", projected_secs);
+    eprintln!("With GPU (3×):  ~{:.1}s", projected_secs / 3.0);
+    eprintln!("With NAF-w4 (-30% rows) + GPU: ~{:.1}s", projected_secs * 0.7 / 3.0);
+}
+
 /// R1e-quat diagnostic: 17 rows of 0·0=0 (forces log_size > LOG_N_LANES).
 /// If this passes, multiple is_mul rows compose; the failure on
 /// 1·1=1 is row-content-specific, not a row-count issue.
