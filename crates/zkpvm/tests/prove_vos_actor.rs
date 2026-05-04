@@ -1191,6 +1191,80 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     eprintln!("Soundness chain: per-row + inter-row + boundary all CLOSED.");
 }
 
+/// R1f: end-to-end SOUNDNESS-COMPLETE prove-time benchmark.
+/// Builds a 1000-deep linear add chain (each step adds a fresh
+/// constant to the running accumulator) using INPUT/OUTPUT
+/// boundary rows.  Every produced byte is consumed exactly once;
+/// the chip's lookup is fully balanced.
+///
+/// This is the "what does soundness-complete prove time look like
+/// per N row chip operations" measurement that R1f answers.
+#[test]
+fn bench_ristretto_chip_soundness_complete_chain() {
+    use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
+    use std::time::Instant;
+
+    let n_ops: usize = 10000;
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+
+    // Row 0: initial accumulator value.
+    let mut acc = [0u8; 32]; acc[0] = 1;
+    side_note.add_ristretto_field_row(fill_input(acc));
+    let mut row_idx: u16 = 1;
+
+    let t0 = Instant::now();
+    for i in 0..n_ops {
+        // Row K: input fresh constant c_i.
+        let mut c = [0u8; 32];
+        c[0] = (i as u8) ^ 0x37;
+        side_note.add_ristretto_field_row(fill_input(c));
+        let c_row = row_idx;
+        row_idx += 1;
+
+        // Row K+1: add(acc, c) consuming the previous acc and the fresh c.
+        let prev_acc_row = if i == 0 { 0 } else { row_idx - 2 };
+        let mut row = fill_add(acc, c);
+        row.a_source_row = prev_acc_row;
+        row.b_source_row = c_row;
+        acc = row.out;
+        side_note.add_ristretto_field_row(row);
+        row_idx += 1;
+    }
+
+    // Final output row: drains the last acc.
+    let final_acc_row = row_idx - 1;
+    side_note.add_ristretto_field_row(fill_output(acc, final_acc_row));
+    let _row_idx = row_idx + 1;
+    eprintln!("Composed {n_ops} ops + boundary rows in {:?}", t0.elapsed());
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let t = Instant::now();
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("soundness-complete chain prove failed");
+    let prove_time = t.elapsed();
+
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    let t = Instant::now();
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("soundness-complete chain verify failed");
+    let verify_time = t.elapsed();
+
+    eprintln!();
+    eprintln!("=== R1f: SOUNDNESS-COMPLETE chip prove-time benchmark ===");
+    eprintln!("Operations: {n_ops}");
+    eprintln!("Total chip rows: {} (1 init + n_ops·2 + 1 output)", 1 + n_ops * 2 + 1);
+    eprintln!("Prove:  {:>6.2} s", prove_time.as_secs_f64());
+    eprintln!("Verify: {:?}", verify_time);
+    eprintln!();
+    eprintln!("Per-op cost: {:.2} ms", prove_time.as_secs_f64() * 1000.0 / n_ops as f64);
+}
+
 /// R1f-bug-bisect: scalar_mult_rows([N, 0, ...], id) bug — bisect by
 /// the position of the first set bit (MSB-first iteration) where
 /// the add fires.
