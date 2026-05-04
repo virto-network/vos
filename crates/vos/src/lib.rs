@@ -178,6 +178,14 @@ pub mod __worker {
     pub use crate::actors::run::noop_waker;
 }
 
+/// Re-export of `alloc` for use by the `#[messages]` macro — actor
+/// crates don't need to declare `extern crate alloc` themselves to
+/// access `Box::pin`.
+#[doc(hidden)]
+pub mod __alloc {
+    pub use alloc::boxed;
+}
+
 // ── Role-glue decl macros ────────────────────────────────────────────
 //
 // These three macros are called unconditionally by the

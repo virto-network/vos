@@ -113,9 +113,17 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 msg: Self::Message,
                 ctx: &mut vos::Context<Self>,
             ) -> vos::RunResult<bool> {
-                vos::try_poll(async {
-                    msg.deliver(self, ctx).await
-                })
+                // Pass `deliver`'s future to `try_poll` directly. Wrapping
+                // it in an `async {}` block compiles to a second state
+                // machine that holds `deliver`'s state machine plus its
+                // own resume slot — doubling the on-stack frame for no
+                // semantic gain. Actors with large async handlers
+                // (branchy `match` or `if/else if` chains) overflow the
+                // PVM's 64 KiB stack on warm-restart specifically because
+                // the warm path already adds two more frames beyond the
+                // cold-start `on_start` path; this redundancy is what
+                // pushes them over the edge.
+                vos::try_poll(msg.deliver(self, ctx))
             }
         }
     };
@@ -507,10 +515,29 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #enum_name {
             /// Dispatch this message to the actor. Returns `true` if the actor
             /// should stop processing further messages (i.e. `on_error` returned `true`).
-            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) -> bool {
-                match self {
-                    #( #deliver_arms )*
-                }
+            ///
+            /// The return is a heap-boxed `Pin<Box<dyn Future>>` rather than
+            /// a bare `async fn` future. The bare form's auto-generated state
+            /// machine is sized to fit the **largest** arm (so it can hold any
+            /// handler's future across an await), which on warm-restart stacks
+            /// alongside `dispatch`'s own future and the caller's frame —
+            /// large branchy handlers (e.g. `if/else if/else` chains) overflow
+            /// the PVM's 64 KiB stack at frame allocation, faulting at
+            /// `0xfffffff8`. Boxing moves the per-arm future onto the heap
+            /// so only a fat pointer rides the stack; one extra alloc per
+            /// dispatch is cheap relative to the failure mode.
+            pub fn deliver<'a>(
+                self,
+                actor: &'a mut #actor_name,
+                ctx: &'a mut vos::Context<#actor_name>,
+            ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
+                dyn ::core::future::Future<Output = bool> + 'a,
+            >> {
+                vos::__alloc::boxed::Box::pin(async move {
+                    match self {
+                        #( #deliver_arms )*
+                    }
+                })
             }
 
             pub fn is_query(&self) -> bool {
