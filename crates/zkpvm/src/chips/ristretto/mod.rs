@@ -32,6 +32,8 @@ use stwo_constraint_framework::EvalAtRow;
 
 #[cfg(feature = "prover")]
 pub mod field;
+#[cfg(feature = "prover")]
+pub mod witness;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
@@ -58,23 +60,69 @@ pub struct RistrettoChip;
 /// Real chip will switch to a per-call sizing once R1c–R1e land.
 const RISTRETTO_LOG_SIZE: u32 = LOG_N_LANES;
 
+/// Per-row column layout for the field-arithmetic phase of the chip.
+///
+/// One row witnesses ONE p25519 field operation (add/sub today;
+/// mul/inv come with R1c-3..R1c-5).  Edwards point ops (R1d) compose
+/// multiple field-op rows; the scalar-mult main loop (R1e) schedules
+/// rows + boundary lookup cells around them.
+///
+/// Bytes are little-endian throughout (matches `field::Bytes` and the
+/// ECALL boundary wire format).  Carry/borrow cells are 0/1 only.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Placeholder.  Replaced by the real per-row witness layout
-    /// (point coords, scalar nibbles, field-mult intermediates,
-    /// boundary cells) when R1c–R1e land.  Holds zero on every row of
-    /// the empty stub.
+    /// Operand a, 32 LE bytes.
+    #[size = 32]
+    FieldA,
+    /// Operand b, 32 LE bytes.
+    #[size = 32]
+    FieldB,
+    /// Output: a OP b (mod p), 32 LE bytes.
+    #[size = 32]
+    FieldOut,
+
+    /// For is_add rows: byte-wise sum a+b before the conditional `-p`
+    /// reduction step.  Lives in [0, 2²⁵⁶) so always fits 32 bytes.
+    /// For other op flavors this column is unused (zero).
+    #[size = 32]
+    AddIntermediate,
+    /// For is_add rows: per-position carry-out chain of `a + b`.
+    /// Each entry is 0 or 1.  R1c-3 will pin via the per-byte sum
+    /// constraint chain.
+    #[size = 32]
+    AddCarry,
+    /// 1 iff the unreduced sum was ≥ p (so out = intermediate − p);
+    /// 0 if out = intermediate directly.  R1c-3 will additionally
+    /// pin determinism (output < p) via a finalize chain.
     #[size = 1]
-    Placeholder,
+    IsOverflow,
+    /// Per-position borrow chain for the conditional reduction
+    /// `out = intermediate − is_overflow · p`.  Each entry is 0 or 1.
+    #[size = 32]
+    SubBorrow,
+
+    /// Operation classifier flags — exactly one is 1 on a real row.
+    /// R1c-3+ adds is_mul and is_inv to this set.
+    #[size = 1]
+    IsAdd,
+    #[size = 1]
+    IsSub,
+
+    /// 0 iff this is a padding / unused row.
+    #[size = 1]
+    IsReal,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
 #[preprocessed_prefix = "ristretto"]
 pub enum PreprocessedColumn {
-    /// Placeholder.  Real preprocessed columns (operation classifier,
-    /// row-position-within-call, etc.) come with R1e.
+    /// Reserved.  Real preprocessed columns (e.g. p-byte constants for
+    /// the conditional-reduction sub-chain, row-position-within-call,
+    /// scalar-window NAF table) come with R1c-3..R1e.  Stubbed at one
+    /// zero column so the AirColumn macro has a non-empty enum and the
+    /// preprocessed trace shape stays valid.
     #[size = 1]
-    Placeholder,
+    Reserved,
 }
 
 impl BuiltInComponent for RistrettoChip {
@@ -108,16 +156,26 @@ impl BuiltInProverComponent for RistrettoChip {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(RISTRETTO_LOG_SIZE);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
-            trace.fill_columns(row, BaseField::from(0u32), PreprocessedColumn::Placeholder);
+            trace.fill_columns(row, BaseField::from(0u32), PreprocessedColumn::Reserved);
         }
         trace.finalize_bit_reversed()
     }
 
     fn generate_main_trace(&self, _side_note: &mut SideNote) -> FinalizedTrace {
+        // R1c-2: trace is still all-zero rows.  Real per-call rows
+        // come from `side_note.ristretto_field_rows` once R1e schedules
+        // them through the chip; for now the chip is gated off in
+        // active_components anyway, so num_rows worth of padding is
+        // sufficient for the framework's commitment shape.
         let mut trace = TraceBuilder::<Column>::new(RISTRETTO_LOG_SIZE);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
-            trace.fill_columns(row, BaseField::from(0u32), Column::Placeholder);
+            // Padding row: is_real = 0, all other cells = 0.
+            // Layout exists in `Column` enum so future commits can
+            // light it up row-by-row without re-touching the chip's
+            // shape (which would bump PROOF_FORMAT_VERSION).
+            trace.fill_columns(row, BaseField::from(0u32), Column::IsReal);
+            let _ = row; // silence unused on the padding-only path
         }
         trace.finalize_bit_reversed()
     }
