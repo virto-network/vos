@@ -464,7 +464,12 @@ impl InvokeHandle {
         let tx = tx?;
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(InvokeRequest { msg, reply_tx, chain: Vec::new() }).ok()?;
-        reply_rx.recv_timeout(timeout).ok()
+        // Strip the cross-thread invoke envelope down to reply
+        // bytes for host-side callers — see `VosNode::invoke`.
+        reply_rx
+            .recv_timeout(timeout)
+            .ok()
+            .and_then(|env| unwrap_invoke_envelope(&env))
     }
 
     /// `true` once the owning [`VosNode`] has been told to shut
@@ -821,8 +826,14 @@ impl crate::network::InvokeDispatcher for LocalInvokeDispatcher {
         {
             return Vec::new();
         }
+        // The receiver replies with the full invoke envelope; the
+        // libp2p protocol still ships only reply bytes, so unwrap
+        // here. A future protocol bump can carry the envelope so
+        // remote yielded children become drivable cross-node.
         reply_rx
             .recv_timeout(Duration::from_secs(10))
+            .ok()
+            .and_then(|env| unwrap_invoke_envelope(&env))
             .unwrap_or_default()
     }
 }
@@ -1032,7 +1043,7 @@ impl VosNode {
                         Some(worker_tx),
                     );
                     if let Some(net) = network.as_ref() {
-                        net.set_raft_handler(Arc::new(worker.handler()));
+                        net.register_raft_handler(rep_id, Arc::new(worker.handler()));
                     }
                     // Relay: each commit advance fans out to both
                     // the strategy's apply_rx and the agent's
@@ -1293,7 +1304,13 @@ impl VosNode {
         thread::spawn(move || {
             for req in rx {
                 let reply = handler(req.msg);
-                let _ = req.reply_tx.send(reply);
+                // Test responders never yield — pack as DONE so
+                // the reply parses as `InvokeResult::Done` on the
+                // caller side, matching real worker/agent shape.
+                let envelope = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE, &[], &reply,
+                );
+                let _ = req.reply_tx.send(envelope);
             }
         });
         id
@@ -1345,7 +1362,14 @@ impl VosNode {
                 chain: Vec::new(),
             })
             .ok()?;
-            return reply_rx.recv_timeout(timeout).ok();
+            // Cross-thread channel now carries the full invoke
+            // envelope (status + state + reply); host callers
+            // don't care about YIELDED/DONE so unwrap to just
+            // reply bytes.
+            return reply_rx
+                .recv_timeout(timeout)
+                .ok()
+                .and_then(|env| unwrap_invoke_envelope(&env));
         }
 
         // 2. Cross-node fallback.
@@ -1543,14 +1567,27 @@ fn agent_thread(
                 chain: chain_snapshot,
             })
             .ok()?;
-            return reply_rx
+            // The receiver replies with the full invoke envelope;
+            // unpack it back to (status, state, reply) so the
+            // runtime can repack into the local invoke wire format
+            // — preserving STATUS_YIELDED across the thread
+            // boundary so the calling actor can keep driving a
+            // yielded child.
+            let envelope = reply_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
-                .ok();
+                .ok()?;
+            return decode_invoke_envelope(&envelope);
         }
 
         // 2. Cross-node invoke — target on a different node and we
         //    have a `Network` attached. Reuses the chain so the
         //    far side detects cycles that span multiple hosts.
+        //
+        // The libp2p protocol still ships only reply bytes (no
+        // YIELDED/state plumbing across the wire yet), so we wrap
+        // them in a DONE envelope here. A future protocol bump
+        // can carry the full envelope so cross-node yielded
+        // children are drivable too.
         #[cfg(feature = "network")]
         {
             if !target.is_on_node(local_prefix) && !target.is_local() {
@@ -1570,7 +1607,8 @@ fn agent_thread(
                         );
                         return reply_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
-                            .ok();
+                            .ok()
+                            .map(crate::runtime::ExternalInvokeReply::Done);
                     }
                 }
             }
@@ -1784,10 +1822,16 @@ fn agent_thread(
             // Fresh inbox-style dispatch; chain starts at us.
             *current_chain.lock().unwrap() = vec![id.0];
             m
-        } else if runtime.has_work() || runtime.is_suspended(svc_id) {
+        } else if runtime.has_work() {
             bump();
-            // Residual work — keep the chain set by the dispatch
-            // that produced it.
+            // Residual work — pending self-messages or transfers
+            // queued by the previous dispatch. A merely suspended
+            // service (continuation saved, no pending message)
+            // no longer counts as residual: under the dumb-host
+            // model it sleeps until a parent agent invokes it
+            // again. Including `is_suspended` here would busy-spin
+            // on yielded children.
+            // Keep the chain set by the dispatch that produced it.
             if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
                 strategy.as_mut(), recording_enabled) {
                 // On a Raft follower the commit can return
@@ -1936,19 +1980,89 @@ fn handle_invoke_request(
         return Ok(());
     }
 
-    // Commit succeeded. Send the raw reply, or signal a panic
-    // by dropping `reply_tx` so the caller's `recv_timeout`
-    // returns `Err(Disconnected)` (mapped to `None` at the
-    // boundary and surfaced as `ClientError::Unreachable` /
-    // `InvokeError::Panicked` upstream). The runtime
-    // distinguishes "handler ran to completion and returned `()`"
-    // from "handler panicked" by whether `take_last_reply`
-    // returns `Some(_)` (possibly empty) vs `None` (panic).
-    match runtime.take_last_reply(svc_id) {
-        Some(bytes) => send_reply_capped(req.reply_tx, bytes, svc_id),
-        None => drop(req.reply_tx),
-    }
+    // Commit succeeded. Pack the reply as the full invoke wire
+    // envelope `[status][state_len:u32][state][reply]` so the
+    // caller's PVM sees the same shape it would for a local
+    // INVOKE. `is_suspended` after `run_blocking` tells us the
+    // handler yielded with a continuation still alive — STATUS_YIELDED
+    // surfaces upstream so a parent agent can keep driving us tick
+    // by tick. Without this distinction every cross-thread invoke
+    // looks like STATUS_DONE and the caller drops yielded children
+    // from its run queue.
+    //
+    // `take_last_reply` returns `None` only when the handler
+    // panicked; we signal that to the caller by dropping
+    // `reply_tx`, which surfaces upstream as `InvokeError::Panicked`.
+    let reply = match runtime.take_last_reply(svc_id) {
+        Some(bytes) => bytes,
+        None => { drop(req.reply_tx); return Ok(()); }
+    };
+    let status = if runtime.is_suspended(svc_id) {
+        crate::actors::run::STATUS_YIELDED
+    } else {
+        crate::actors::run::STATUS_DONE
+    };
+    let envelope = encode_invoke_envelope(status, &state, &reply);
+    send_reply_capped(req.reply_tx, envelope, svc_id);
     Ok(())
+}
+
+/// Encode the invoke wire envelope `[status][state_len:u32 LE][state][reply]`
+/// — the same format `runtime::handle_invoke` writes for a same-runtime
+/// INVOKE. Used by the cross-thread invoke path so a yielded child on
+/// another agent thread surfaces as `STATUS_YIELDED` (with its post-
+/// dispatch state) to the calling actor's `lifecycle::invoke_raw`,
+/// not as `STATUS_DONE`.
+fn encode_invoke_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + state.len() + reply.len());
+    out.push(status);
+    out.extend_from_slice(&(state.len() as u32).to_le_bytes());
+    out.extend_from_slice(state);
+    out.extend_from_slice(reply);
+    out
+}
+
+/// Strip the invoke envelope back to just the rkyv-encoded reply
+/// bytes for host-side callers (`VosNode::invoke`, peer invoke
+/// forwarding) who don't care about YIELDED/DONE — they only want
+/// the handler's return value. A short envelope (just a status byte
+/// from `STATUS_NOT_FOUND` / `STATUS_PANICKED`) decodes as `None`.
+fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
+    if envelope.len() < 5 { return None; }
+    let state_len = u32::from_le_bytes([
+        envelope[1], envelope[2], envelope[3], envelope[4],
+    ]) as usize;
+    let reply_start = 5 + state_len;
+    if reply_start > envelope.len() { return None; }
+    Some(envelope[reply_start..].to_vec())
+}
+
+/// Decode a cross-thread invoke envelope back into the
+/// [`runtime::ExternalInvokeReply`] enum the runtime's
+/// `external_invoke` callback expects, so a yielded child on one
+/// agent thread surfaces as [`runtime::ExternalInvokeReply::Yielded`]
+/// to the calling actor's PVM.
+///
+/// A short envelope (just a status byte — `STATUS_NOT_FOUND` /
+/// `STATUS_PANICKED`) returns `None`; the runtime then falls
+/// through to its own NOT_FOUND path.
+fn decode_invoke_envelope(envelope: &[u8]) -> Option<crate::runtime::ExternalInvokeReply> {
+    use crate::actors::run::{STATUS_DONE, STATUS_YIELDED};
+    use crate::runtime::ExternalInvokeReply;
+    if envelope.len() < 5 { return None; }
+    let status = envelope[0];
+    let state_len = u32::from_le_bytes([
+        envelope[1], envelope[2], envelope[3], envelope[4],
+    ]) as usize;
+    let state_end = 5 + state_len;
+    if state_end > envelope.len() { return None; }
+    let state = envelope[5..state_end].to_vec();
+    let reply = envelope[state_end..].to_vec();
+    match status {
+        STATUS_YIELDED => Some(ExternalInvokeReply::Yielded { state, reply }),
+        STATUS_DONE => Some(ExternalInvokeReply::Done(reply)),
+        _ => None,
+    }
 }
 
 /// Run one dispatch cycle: optionally begin recording, deliver the
@@ -2137,7 +2251,13 @@ fn worker_thread(
                 Ok(req) => {
                     bump();
                     let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
-                    send_reply_capped(req.reply_tx, reply, id);
+                    // Workers don't yield — pack as DONE with no
+                    // state so the caller's invoke_raw decodes
+                    // `InvokeResult::Done { state: empty, reply }`.
+                    let envelope = encode_invoke_envelope(
+                        crate::actors::run::STATUS_DONE, &[], &reply,
+                    );
+                    send_reply_capped(req.reply_tx, envelope, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,

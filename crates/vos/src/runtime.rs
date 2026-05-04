@@ -231,14 +231,37 @@ struct ServiceInfo {
     alive: bool,
 }
 
+/// Reply from an external invoke handler.
+///
+/// `Done` covers the common case (workers, completed agent dispatches):
+/// just reply bytes. `Yielded` carries the post-dispatch state + reply
+/// so the calling actor's `lifecycle::invoke_raw` decodes it as
+/// `InvokeResult::Yielded { state, reply }` and can keep driving the
+/// yielded child on subsequent ticks. The runtime packs whichever
+/// variant the handler returns into the same wire envelope a
+/// same-runtime INVOKE would produce.
+#[derive(Debug, Clone)]
+pub enum ExternalInvokeReply {
+    Done(Vec<u8>),
+    Yielded { state: Vec<u8>, reply: Vec<u8> },
+}
+
+impl ExternalInvokeReply {
+    /// Common case: a non-yielding reply. Equivalent to
+    /// `ExternalInvokeReply::Done(reply)`.
+    pub fn done(reply: Vec<u8>) -> Self {
+        ExternalInvokeReply::Done(reply)
+    }
+}
+
 /// Callback for handling INVOKE hostcalls to services not in this runtime.
 ///
-/// Receives `(target_service_id, message_bytes)`. Returns `Some(reply_bytes)`
-/// if the target is handled externally (e.g. a worker), or `None` to fall
-/// through to STATUS_NOT_FOUND.
-///
-/// The reply bytes are rkyv-encoded Value (same format as `ctx.take_reply_bytes()`).
-pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<Vec<u8>> + Send>;
+/// Receives `(target_service_id, message_bytes)`. Returns
+/// `Some(ExternalInvokeReply)` when the external target serviced the
+/// request, or `None` to fall through to `STATUS_NOT_FOUND`. Workers
+/// and one-shot handlers return `Done(reply)`; agents that propagate
+/// yields across thread boundaries return `Yielded { state, reply }`.
+pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<ExternalInvokeReply> + Send>;
 
 pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
@@ -634,10 +657,14 @@ impl<D: DataLayer> VosRuntime<D> {
                         for msg in journal.self_messages.drain(..) {
                             new_transfers.push((ServiceId(svc_id), msg));
                         }
-                        // Enqueue a wake-up transfer so the service is
-                        // re-ticked next round (continuation resumes it
-                        // with warm memory).
-                        new_transfers.push((ServiceId(svc_id), Vec::new()));
+                        // No automatic wake-up: a yielded service that
+                        // produced no self-message has nothing more to
+                        // do under its own steam. The continuation is
+                        // saved so a future external message
+                        // (typically an INVOKE from a parent agent
+                        // that owns the dispatch loop) can resume it.
+                        // The host is intentionally dumb — orchestration
+                        // is the caller's responsibility.
                         break;
                     }
 
@@ -1102,7 +1129,12 @@ fn handle_invoke(
         match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
             None => {
-                // Target not in this runtime — try external invoke (e.g. worker)
+                // Target not in this runtime — try external invoke
+                // (worker on another thread, agent on another thread,
+                // or peer over the network). The handler reports
+                // whether the target yielded so the caller's PVM
+                // sees the same status it would for a same-runtime
+                // INVOKE; the runtime packs the wire envelope here.
                 if let Some(handler) = external_invoke {
                     let input = kread(caller, input_ptr, input_len);
                     // Extract message from invoke input: [state_len:u32][state][msg]
@@ -1116,11 +1148,17 @@ fn handle_invoke(
                         input
                     };
                     if let Some(reply) = handler(target_svc_id, &msg) {
-                        // Pack as invoke output: [STATUS_DONE][state_len=0:u32][reply]
-                        let mut output = Vec::with_capacity(5 + reply.len());
-                        output.push(crate::actors::run::STATUS_DONE);
-                        output.extend_from_slice(&0u32.to_le_bytes());
-                        output.extend_from_slice(&reply);
+                        let (status, state, reply_bytes) = match reply {
+                            ExternalInvokeReply::Done(r) =>
+                                (crate::actors::run::STATUS_DONE, Vec::new(), r),
+                            ExternalInvokeReply::Yielded { state, reply } =>
+                                (crate::actors::run::STATUS_YIELDED, state, reply),
+                        };
+                        let mut output = Vec::with_capacity(5 + state.len() + reply_bytes.len());
+                        output.push(status);
+                        output.extend_from_slice(&(state.len() as u32).to_le_bytes());
+                        output.extend_from_slice(&state);
+                        output.extend_from_slice(&reply_bytes);
                         return record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode);
                     }
                 }

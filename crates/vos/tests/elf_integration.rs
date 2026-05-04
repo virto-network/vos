@@ -373,8 +373,8 @@ fn pvm_agent_invokes_worker_via_external_handler() {
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
-            Ok(reply) => Some(reply),
-            Err(_) => Some(Vec::new()),
+            Ok(reply) => Some(vos::runtime::ExternalInvokeReply::done(reply)),
+            Err(_) => Some(vos::runtime::ExternalInvokeReply::done(Vec::new())),
         }
     }));
 
@@ -442,8 +442,8 @@ fn recording_session_captures_invoke_replies() {
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
-            Ok(reply) => Some(reply),
-            Err(_) => Some(Vec::new()),
+            Ok(reply) => Some(vos::runtime::ExternalInvokeReply::done(reply)),
+            Err(_) => Some(vos::runtime::ExternalInvokeReply::done(Vec::new())),
         }
     }));
 
@@ -542,8 +542,8 @@ fn replay_session_short_circuits_external_invoke() {
             count_rec_clone.fetch_add(1, Ordering::Relaxed);
             let mut inst = instance_rec.lock().unwrap();
             match inst.dispatch_raw(msg) {
-                Ok(reply) => Some(reply),
-                Err(_) => Some(Vec::new()),
+                Ok(reply) => Some(vos::runtime::ExternalInvokeReply::done(reply)),
+                Err(_) => Some(vos::runtime::ExternalInvokeReply::done(Vec::new())),
             }
         }));
 
@@ -579,7 +579,7 @@ fn replay_session_short_circuits_external_invoke() {
         count_rep_clone.fetch_add(1, Ordering::Relaxed);
         // Return something obviously wrong so that if the test
         // accidentally hits this path, the assertions below will fail.
-        Some(alloc_bogus_reply())
+        Some(vos::runtime::ExternalInvokeReply::done(alloc_bogus_reply()))
     }));
 
     let args = vos::init::InitArgs::new()
@@ -950,8 +950,8 @@ fn recording_cap_truncates_oversized_invoke_output() {
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
-            Ok(reply) => Some(reply),
-            Err(_) => Some(Vec::new()),
+            Ok(reply) => Some(vos::runtime::ExternalInvokeReply::done(reply)),
+            Err(_) => Some(vos::runtime::ExternalInvokeReply::done(Vec::new())),
         }
     }));
 
@@ -2695,7 +2695,7 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     rt.set_external_invoke(Box::new(move |target, _msg| {
         if target != oversized_target { return None; }
         invokes_clone.fetch_add(1, Ordering::Relaxed);
-        Some(vec![0u8; 5_000])
+        Some(vos::runtime::ExternalInvokeReply::done(vec![0u8; 5_000]))
     }));
 
     let args = vos::init::InitArgs::new()
@@ -3354,12 +3354,14 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
             t if t == good_a => {
                 ia.fetch_add(1, Ordering::Relaxed);
                 let mut inst = instance.lock().unwrap();
-                inst.dispatch_raw(msg).ok().or(Some(Vec::new()))
+                inst.dispatch_raw(msg).map(vos::runtime::ExternalInvokeReply::done).ok()
+                    .or(Some(vos::runtime::ExternalInvokeReply::done(Vec::new())))
             }
             t if t == good_b => {
                 ib.fetch_add(1, Ordering::Relaxed);
                 let mut inst = instance.lock().unwrap();
-                inst.dispatch_raw(msg).ok().or(Some(Vec::new()))
+                inst.dispatch_raw(msg).map(vos::runtime::ExternalInvokeReply::done).ok()
+                    .or(Some(vos::runtime::ExternalInvokeReply::done(Vec::new())))
             }
             t if t == missing => {
                 im.fetch_add(1, Ordering::Relaxed);
@@ -4276,6 +4278,82 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     let _ = std::fs::remove_dir_all(&dir_root);
 }
 
+
+#[test]
+fn external_invoke_yielded_surfaces_as_invoke_yielded() {
+    // Regression: under `vosx up` each [[agent]] / actor entry
+    // gets its own VosNode agent thread, each with its own
+    // VosRuntime. A scheduler agent's INVOKE of a yielded child
+    // travels through the cross-thread path (`external_invoke`
+    // → mpsc → callee's `handle_invoke_request`). That channel
+    // used to carry only reply bytes; the runtime hard-coded
+    // STATUS_DONE so every cross-agent yielded child surfaced
+    // as `InvokeResult::Done` to the parent — the scheduler
+    // dropped them from its run queue and the cooperative loop
+    // died after one round.
+    //
+    // The fix introduces `ExternalInvokeReply::Yielded { state,
+    // reply }`. This test pins the runtime side of that
+    // contract: with a synthetic external_invoke that returns
+    // Yielded, the scheduler's `lifecycle::invoke` must observe
+    // STATUS_YIELDED and re-queue the child rather than
+    // dropping it.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+    };
+
+    let blob = transpile_actor(&agent_data);
+    let mut rt = VosRuntime::new();
+    let agent_id = register_svc(&mut rt, blob);
+
+    let synthetic_target = vos::abi::service::ServiceId(99);
+    let invokes = std::sync::Arc::new(AtomicU32::new(0));
+    let invokes_clone = invokes.clone();
+
+    rt.set_external_invoke(Box::new(move |target, _msg| {
+        if target != synthetic_target { return None; }
+        invokes_clone.fetch_add(1, Ordering::Relaxed);
+        // Pretend the target yielded with a 4-byte u32 state,
+        // matching counter's wire shape. As long as STATUS_YIELDED
+        // surfaces, the scheduler will re-queue this id and
+        // invoke it again next tick.
+        Some(vos::runtime::ExternalInvokeReply::Yielded {
+            state: 1u32.to_le_bytes().to_vec(),
+            reply: Vec::new(),
+        })
+    }));
+
+    let args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(vec![synthetic_target.0]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(agent_id, Vec::new());
+    // A small handful of outer ticks suffices: the scheduler
+    // self-tells `tick` and re-enters MAX_REFINE_ITERATIONS=64
+    // times per outer tick, each one producing one invoke of
+    // the synthetic target.
+    for _ in 0..3 {
+        if !rt.has_work() { break; }
+        rt.tick_blocking();
+    }
+
+    let n = invokes.load(Ordering::Relaxed);
+    assert!(
+        n > 5,
+        "scheduler invoked the synthetic yielded target only {n} time(s); \
+         STATUS_YIELDED isn't surfacing through the external_invoke path"
+    );
+    assert_eq!(rt.panics, 0, "scheduler panicked");
+}
 
 #[test]
 fn invoked_child_storage_isolated_from_parent_journal() {
