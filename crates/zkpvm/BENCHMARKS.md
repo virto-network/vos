@@ -84,6 +84,34 @@ prove on the reference desktop puts mobile prove time well within
 1–2 second range — the original "PVM beats RISC-V on phones" pitch
 is now real.
 
+#### Real-world workload (cipher-clerk refine, 136 K PVM steps)
+
+A representative slice of cipher-clerk's "ledger sub-actor" CPU
+hot path: build 4 Account values, then build 10 Transfer values
+(4 entries each on a single-currency journal — the typical 2-leg
+debit/credit + reciprocal pattern), and compute each transfer's
+`signing_payload` (rkyv archive of the stripped TransferSigningView,
+the canonical Merkle-leaf input + proof-binding source).  The
+linker keeps cipher-clerk's curve25519-dalek + rkyv code paths
+in the binary even though signature verification isn't called,
+exercising real type machinery.  Opcode mix (top): Add64 (9 K),
+StoreIndU64 (8.7 K), BranchNeImm (8.5 K), LoadIndU64 (8.1 K),
+StoreIndU8 (7.2 K), Or (7 K), …
+
+| Config           | Prove   | Per-step | Proof size |
+|---               |---      |---       |---         |
+| STANDARD         | 13.05 s | 96 µs    | 283 KB     |
+| **MOBILE**       | **6.43 s** | **47 µs** | 447 KB |
+
+Per-step 47 µs at MOBILE config is consistent with the synthetic
+log14/log15 numbers (65 µs/cycle) — slightly *faster* per step on
+the real workload because cipher-clerk's opcode mix is denser
+(more branches and store-classes) so CpuChip's per-row work
+amortizes better.  Compare to Nexus zkVM 2.x's ~145 µs per
+RISC-V instruction: zkpvm proves cipher-clerk's representative
+batch **3× faster per operation** on the same hardware, with
+PVM's denser ISA giving additional total-program speedup on top.
+
 #### Build cost trade-offs
 
 | Optimisation         | Build time      | Notes                              |

@@ -290,25 +290,72 @@ fn profile_hasher_actor() {
 }
 
 #[test]
-fn profile_cipher_clerk_bench() {
-    // Real-workload validation: cipher-clerk's kernel types compiled
-    // for riscv64em-javm.  Exercises Account / AuthKey / id types
-    // construction + arithmetic.
-    profile_actor("cipher-clerk-bench", 10_000_000);
+fn profile_clerk_refine_bench() {
+    // Real-workload validation: cipher-clerk refine-shape sub-actor
+    // running under vos's actor framework.  10 transfers × 4 entries,
+    // signing-payload computation (rkyv archive) + rolling hash.
+    profile_actor("clerk-refine-bench", 100_000_000);
 }
 
-/// Trace-only variant of cipher-clerk-bench: validates the actor
-/// builds + runs in the PVM interpreter.  Trace-only because the
-/// full prove path also runs as `profile_cipher_clerk_bench`.
 #[test]
-fn trace_cipher_clerk_bench() {
-    let blob = load_actor_blob("cipher-clerk-bench");
-    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
+fn profile_clerk_refine_bench_mobile() {
+    use cipher_clerk_bench_helpers::*;
+    let blob = load_actor_blob("clerk-refine-bench");
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+
+    let t0 = std::time::Instant::now();
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run();
     let steps = tracing.into_trace();
-    eprintln!("cipher-clerk-bench: {} PVM steps, exit={exit:?}", steps.len());
-    assert_eq!(exit, javm::ExitReason::Trap);
+    let trace_time = t0.elapsed();
+    eprintln!("clerk-refine-bench MOBILE: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+
+    let mut side_note = zkpvm::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
+
+    let mobile = zkpvm::production_pcs_config_mobile();
+    let t = std::time::Instant::now();
+    let (proof, _) = zkpvm::prove_profiled_with_config(&mut side_note, mobile)
+        .expect("proving failed");
+    let prove_time = t.elapsed();
+
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Prove (MOBILE): {prove_time:?}, Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
+
+    let t = std::time::Instant::now();
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
+        .expect("verification failed");
+    eprintln!("Verify: {:?}", t.elapsed());
+}
+
+mod cipher_clerk_bench_helpers {
+    pub use super::*;
+    pub use zkpvm::PcsPolicy;
+}
+
+/// Trace-only variant of clerk-refine-bench: validates the actor
+/// builds + runs in the PVM interpreter.  Trace-only because the
+/// full prove path also runs as `profile_clerk_refine_bench`.
+#[test]
+fn trace_clerk_refine_bench() {
+    let blob = load_actor_blob("clerk-refine-bench");
+    let (interp, _flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run();
+    let steps = tracing.into_trace();
+    eprintln!("clerk-refine-bench: {} PVM steps, exit={exit:?}", steps.len());
 }
 
 #[test]

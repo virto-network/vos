@@ -60,7 +60,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cipher-clerk-bench"
+name = "clerk-refine-bench"
 version = "0.1.0"
 dependencies = [
  "cipher-clerk",
