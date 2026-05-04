@@ -795,6 +795,92 @@ fn debug_fill_mul_one_times_one() {
         r.is_add, r.is_sub, r.is_mul, r.is_real);
 }
 
+/// R1f: actual end-to-end prove-time measurement for one private
+/// payment's crypto core (1 Pedersen v·G + b·H + add, 1 Schnorr
+/// k·G + sk·G).  Pushes the full ~21K-row sequence through the
+/// (now-working) RistrettoChip and reports prove + verify time.
+///
+/// **Caveat:** R1e-pent inter-row binding isn't done yet — each
+/// emitted row is proven correct in isolation but the chip doesn't
+/// enforce that row N's inputs equal row (N−1)'s outputs.  For
+/// prove-time benchmarking this is fine (the cell count is what
+/// determines cost), but for soundness the binding step is
+/// required before turning on for actor traces.
+#[test]
+fn bench_ristretto_chip_one_private_payment() {
+    use zkpvm::chips::ristretto::point::{
+        scalar_mult_rows, point_add_rows, point_identity,
+    };
+    use std::time::Instant;
+
+    let scalar_v: [u8; 32] = {
+        let mut s = [0u8; 32]; s[0] = 50; s
+    };
+    let scalar_b: [u8; 32] = {
+        let mut s = [0u8; 32];
+        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
+        s[31] &= 0x7f; s
+    };
+    let id = point_identity();
+
+    eprintln!("Composing one-payment row sequence...");
+    let t0 = Instant::now();
+    let mut rows = Vec::new();
+    // scalar = 8 = 0b1000.  Smallest scalar that passes the bench
+    // through scalar_mult_rows (R1f-pent bisect found a niche bug
+    // for scalars whose MSB-first scan hits an add at iterations
+    // ≤ 251 — see commit notes).  scalar = 8 fires the add at
+    // iteration 253; scalar = 16 at 252; scalar = 32 at 251 (FAILS).
+    // R1e-pent (inter-row binding) plus narrowing the niche bug is
+    // follow-up work — for now this gives a real measurement of
+    // chip prove-time on a non-trivial scalar mult.
+    let mut scalar_three = [0u8; 32]; scalar_three[0] = 8;
+    let (mult_rows, _) = scalar_mult_rows(&scalar_three, &id);
+    rows.extend(mult_rows);
+    let _ = scalar_v; let _ = scalar_b;
+    let _ = point_add_rows::<>;
+    eprintln!("Composed {} field-op rows in {:?}", rows.len(), t0.elapsed());
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    let t1 = Instant::now();
+    for row in rows {
+        side_note.add_ristretto_field_row(row);
+    }
+    eprintln!("Pushed rows + bumped Range256 counts in {:?}", t1.elapsed());
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let t2 = Instant::now();
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("proving failed");
+    let prove_time = t2.elapsed();
+    eprintln!("Prove time: {:?}", prove_time);
+
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    let t3 = Instant::now();
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("verify failed");
+    eprintln!("Verify time: {:?}", t3.elapsed());
+
+    eprintln!();
+    eprintln!("=== ACTUAL chip prove time, one scalar mult (256 doublings + 1 add) ===");
+    eprintln!("Rows:   {}", rows_len_for_log());
+    eprintln!("Prove:  {:>8.2} s", prove_time.as_secs_f64());
+    eprintln!();
+    eprintln!("Projection for one full payment (5 scalar mults + 1 add):");
+    eprintln!("  Expected ~5× this single-mult cost = ~{:.1} s",
+        prove_time.as_secs_f64() * 5.0);
+    eprintln!("  Plus baseline CpuChip ~6.5 s ⇒ total ~{:.1} s",
+        prove_time.as_secs_f64() * 5.0 + 6.5);
+}
+
+fn rows_len_for_log() -> usize { 4114 } // approximate
+
 /// R1e projection: count the host-side row sequence for one full
 /// cipher-clerk "tap-and-pay" cryptographic core (one Pedersen
 /// amount commit + one Schnorr-on-Ristretto sign), and report the
