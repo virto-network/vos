@@ -111,6 +111,21 @@ pub enum Column {
     #[size = 32]
     FinalFormBorrow,
 
+    /// Per-position borrow chain for the is_sub constraint
+    /// `out + b ≡ a (mod p)`, witnessing the byte-by-byte balance
+    /// `a[i] + is_underflow · p[i] + 256·sub_chain_borrow[i] −
+    ///  out[i] − b[i] − sub_chain_borrow[i−1] = 0`.  Final borrow
+    /// (position 31) is constrained to 0 since the integer equality
+    /// `out + b = a + is_underflow · p` holds without overflow when
+    /// `a, b, out < p`.  Each entry is 0 or 1.
+    ///
+    /// On is_sub rows, `IsOverflow` is reinterpreted as
+    /// `is_underflow` (1 iff `a < b`); the column is the same wire
+    /// witness, the constraint chain just changes role per the op
+    /// flag.
+    #[size = 32]
+    SubChainBorrow,
+
     /// Operation classifier flags — exactly one is 1 on a real row.
     /// R1c-3+ adds is_mul and is_inv to this set.
     #[size = 1]
@@ -183,6 +198,7 @@ impl BuiltInComponent for RistrettoChip {
         let carry   = crate::trace::trace_eval!(trace_eval, Column::AddCarry);
         let borrow  = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
         let ff_brw  = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
+        let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
         let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
         let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
@@ -202,6 +218,9 @@ impl BuiltInComponent for RistrettoChip {
             eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
         }
         for c in ff_brw.iter() {
+            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+        }
+        for c in sub_chain_brw.iter() {
             eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
         }
 
@@ -314,6 +333,42 @@ impl BuiltInComponent for RistrettoChip {
         // Chain closure: final borrow must be 0 (i.e. `p − out − 1`
         // produced a non-negative result, i.e. out < p).
         eval.add_constraint(is_real[0].clone() * ff_brw[31].clone());
+
+        // ── R1c-3-quat: is_sub constraint chain ──
+        //
+        // For is_sub rows we need `out ≡ a − b (mod p)`, i.e.
+        // `out + b ≡ a (mod p)`, with no integer overflow when
+        // `a, b, out < p`.  Two cases collapse into a single
+        // formulation by choosing the right is_underflow witness:
+        //
+        //   is_underflow = 1 iff a < b  ⇒  out = a − b + p
+        //   is_underflow = 0 otherwise  ⇒  out = a − b
+        //
+        // In both cases `out + b = a + is_underflow · p` exactly
+        // (over ℤ).  Byte-wise borrow chain:
+        //
+        //   a[i] + is_underflow · p[i] + 256·sub_chain_brw[i]
+        //     − out[i] − b[i] − sub_chain_brw[i−1] = 0
+        //
+        // gated by is_real · is_sub.  IsOverflow (witness column) is
+        // reinterpreted as is_underflow on these rows; same wire
+        // value, different role per op flag.  Closure: final borrow
+        // = 0 since the integer equation holds without 2²⁵⁶ overflow
+        // when all operands are < p.
+        let real_sub = is_real[0].clone() * is_sub[0].clone();
+        for i in 0..32 {
+            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
+            let borrow_in = if i == 0 { E::F::zero() } else { sub_chain_brw[i - 1].clone() };
+            let constraint = a[i].clone()
+                + is_ovf[0].clone() * p_i
+                + sub_chain_brw[i].clone() * f256.clone()
+                - out[i].clone()
+                - b[i].clone()
+                - borrow_in;
+            eval.add_constraint(real_sub.clone() * constraint);
+        }
+        // Closure: integer equality holds without overflow.
+        eval.add_constraint(real_sub.clone() * sub_chain_brw[31].clone());
 
         // ── R1c-3-ter: per-byte Range256 lookups ──
         //

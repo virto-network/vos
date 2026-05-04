@@ -51,6 +51,10 @@ pub struct FieldOpRow {
     /// check.  Final entry must be 0 (the chip's constraint enforces
     /// this).  Each entry is 0 or 1.
     pub final_form_borrow: [u8; 32],
+    /// Per-position borrow chain for the is_sub constraint chain
+    /// `out + b ≡ a (mod p)`.  Final entry must be 0 (closure
+    /// enforced by the chip).  Zero throughout on is_add rows.
+    pub sub_chain_borrow: [u8; 32],
     /// Operation classifier — exactly one of these is 1 on a real row.
     pub is_add: u8,
     pub is_sub: u8,
@@ -69,6 +73,7 @@ impl Default for FieldOpRow {
             is_overflow: 0,
             sub_borrow: [0u8; 32],
             final_form_borrow: [0u8; 32],
+            sub_chain_borrow: [0u8; 32],
             is_add: 0,
             is_sub: 0,
             is_real: 0,
@@ -148,39 +153,87 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         is_overflow,
         sub_borrow,
         final_form_borrow,
+        sub_chain_borrow: [0u8; 32], // unused on is_add rows
         is_add: 1,
         is_sub: 0,
         is_real: 1,
     }
 }
 
-/// Build a witness row for `out = (a - b) mod p`.  Mirror of
-/// `fill_add` for completeness; constraint pinning lands in R1c-3.
+/// Build a witness row for `out = (a − b) mod p`.  Drives the chip's
+/// `is_sub` constraint chain directly: `out + b ≡ a + is_underflow·p`
+/// with a per-position borrow chain witnessing the byte arithmetic.
+/// `is_underflow` rides on the same wire column the chip names
+/// `IsOverflow` (reinterpreted per op flag).
 pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert!(less_than_p(&a));
     debug_assert!(less_than_p(&b));
 
-    // Implementation: out = a + (p - b) (mod p), so we can re-use the
-    // adder chain and witness shape.  The chip will instead constrain
-    // `out + b ≡ a (mod p)` directly via a sub carry chain, but the
-    // host fill can take the lazy path because it just needs to
-    // produce values consistent with `field::sub`.
-    let p_minus_b = {
-        let mut t = [0u8; 32];
-        let mut bw: i16 = 0;
-        for i in 0..32 {
-            let v = field::P_BYTES[i] as i16 - b[i] as i16 - bw;
-            if v < 0 { t[i] = (v + 256) as u8; bw = 1; }
-            else     { t[i] = v as u8; bw = 0; }
+    let out = field::sub(&a, &b);
+    let is_underflow: u8 = if !ge_bytes(&a, &b) { 1 } else { 0 };
+
+    // Borrow chain witnessing `a[i] + is_underflow·p[i]
+    //   + 256·brw[i] − out[i] − b[i] − brw[i−1] = 0`.
+    //
+    // Equivalently `(out + b) − (a + is_underflow·p)` is balanced
+    // byte-wise with brw[i] tracking the carry-out into the next
+    // position.  Since the integer equality holds (and operands are
+    // all < p < 2²⁵⁵), the final brw[31] is 0.
+    let mut sub_chain_borrow = [0u8; 32];
+    let mut brw_in: i32 = 0;
+    for i in 0..32 {
+        let lhs = (a[i] as i32) + (is_underflow as i32) * (field::P_BYTES[i] as i32) - brw_in;
+        let rhs = (out[i] as i32) + (b[i] as i32);
+        // brw_out picks the right multiple of 256 to make lhs + 256·brw_out = rhs.
+        // I.e. brw_out = (rhs − lhs) / 256 ∈ {0, 1} when operands are well-formed.
+        let diff = rhs - lhs;
+        let brw_out = if diff < 0 { 0 } else { diff / 256 };
+        debug_assert!((0..=1).contains(&brw_out),
+            "sub_chain_borrow out of {{0,1}} at position {i}: diff={diff}");
+        sub_chain_borrow[i] = brw_out as u8;
+        brw_in = brw_out;
+    }
+    debug_assert_eq!(sub_chain_borrow[31], 0,
+        "sub_chain_borrow chain didn't close at position 31");
+
+    // Final-form chain (out < p) — same as fill_add, since out is
+    // shared.
+    let mut final_form_borrow = [0u8; 32];
+    let mut bw: i16 = 1;
+    for i in 0..32 {
+        let v = field::P_BYTES[i] as i16 - out[i] as i16 - bw;
+        bw = if v < 0 { 1 } else { 0 };
+        final_form_borrow[i] = bw as u8;
+    }
+    debug_assert_eq!(final_form_borrow[31], 0);
+
+    debug_assert_eq!(out, field::sub(&a, &b));
+
+    FieldOpRow {
+        a, b, out,
+        // is_add columns left zero on is_sub rows.
+        add_intermediate: [0u8; 32],
+        add_carry: [0u8; 32],
+        sub_borrow: [0u8; 32],
+        is_overflow: is_underflow,
+        final_form_borrow,
+        sub_chain_borrow,
+        is_add: 0,
+        is_sub: 1,
+        is_real: 1,
+    }
+}
+
+/// True iff `a >= b` (both 32-byte LE).
+fn ge_bytes(a: &Bytes, b: &Bytes) -> bool {
+    for i in (0..32).rev() {
+        match a[i].cmp(&b[i]) {
+            core::cmp::Ordering::Greater => return true,
+            core::cmp::Ordering::Less => return false,
+            core::cmp::Ordering::Equal => continue,
         }
-        t
-    };
-    let mut row = fill_add(a, p_minus_b);
-    row.is_add = 0;
-    row.is_sub = 1;
-    debug_assert_eq!(row.out, field::sub(&a, &b),
-        "witness fill_sub diverged from field::sub reference");
-    row
+    }
+    true
 }
 
 /// Padding row (all zeros, `is_real = 0`).  Constraint blocks gate
