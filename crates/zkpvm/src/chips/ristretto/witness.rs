@@ -67,6 +67,28 @@ pub struct FieldOpRow {
     pub mul_carry: [u8; 64],
     pub mul_carry_mid: [u8; 64],
     pub mul_carry_hi: [u8; 64],
+    /// R1c-5-a: pass-1 reduction fold `lo + 38·hi` low 32 bytes.
+    pub pass1_lo: [u8; 32],
+    /// R1c-5-a: pass-1 overflow head (≤ 38, fits in 2 bytes).
+    pub pass1_hi: [u8; 2],
+    /// R1c-5-a: pass-1 carry chain split as low + mid bytes.
+    pub pass1_carry: [u8; 32],
+    pub pass1_carry_mid: [u8; 32],
+    /// R1c-5-a: pass-2 fold `pass1_lo + 38·pass1_hi` low 32 bytes.
+    pub pass2_lo: [u8; 32],
+    /// R1c-5-a: pass-2 carry-out (single bit).
+    pub pass2_carry_out: u8,
+    /// R1c-5-a: per-position pass-2 carry chain.
+    pub pass2_carry: [u8; 32],
+    /// R1c-5-a: top bit of pass2_lo[31] before the +19 step.
+    pub pass2_top_bit: u8,
+    /// R1c-5-a: pass-2 result with bit 255 cleared and +19 folded
+    /// in if pass2_carry_out + pass2_top_bit indicates the value
+    /// crossed 2²⁵⁵.  This is the value that goes through
+    /// final-form `< p` check on the way to FieldOut.
+    pub after_top_bit: [u8; 32],
+    /// R1c-5-a: per-position +19 step carry chain.
+    pub after_top_carry: [u8; 32],
     /// Operation classifier — exactly one of these is 1 on a real row.
     pub is_add: u8,
     pub is_sub: u8,
@@ -91,6 +113,16 @@ impl Default for FieldOpRow {
             mul_carry: [0u8; 64],
             mul_carry_mid: [0u8; 64],
             mul_carry_hi: [0u8; 64],
+            pass1_lo: [0u8; 32],
+            pass1_hi: [0u8; 2],
+            pass1_carry: [0u8; 32],
+            pass1_carry_mid: [0u8; 32],
+            pass2_lo: [0u8; 32],
+            pass2_carry_out: 0,
+            pass2_carry: [0u8; 32],
+            pass2_top_bit: 0,
+            after_top_bit: [0u8; 32],
+            after_top_carry: [0u8; 32],
             is_add: 0,
             is_sub: 0,
             is_mul: 0,
@@ -176,6 +208,16 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
         mul_carry_hi: [0u8; 64],
+        pass1_lo: [0u8; 32],
+        pass1_hi: [0u8; 2],
+        pass1_carry: [0u8; 32],
+        pass1_carry_mid: [0u8; 32],
+        pass2_lo: [0u8; 32],
+        pass2_carry_out: 0,
+        pass2_carry: [0u8; 32],
+        pass2_top_bit: 0,
+        after_top_bit: [0u8; 32],
+        after_top_carry: [0u8; 32],
         is_add: 1,
         is_sub: 0,
         is_mul: 0,
@@ -245,6 +287,16 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
         mul_carry_hi: [0u8; 64],
+        pass1_lo: [0u8; 32],
+        pass1_hi: [0u8; 2],
+        pass1_carry: [0u8; 32],
+        pass1_carry_mid: [0u8; 32],
+        pass2_lo: [0u8; 32],
+        pass2_carry_out: 0,
+        pass2_carry: [0u8; 32],
+        pass2_top_bit: 0,
+        after_top_bit: [0u8; 32],
+        after_top_carry: [0u8; 32],
         is_add: 0,
         is_sub: 1,
         is_mul: 0,
@@ -264,34 +316,29 @@ fn ge_bytes(a: &Bytes, b: &Bytes) -> bool {
     true
 }
 
-/// Build a witness row for `out = (a · b)` (UN-reduced — the post-
-/// reduction `(a · b) mod p` lands in a R1c-5 row).
+/// Build a witness row for `out = (a · b) mod p`.  Inline reduces
+/// the 64-byte unreduced schoolbook product to the canonical 32-byte
+/// field element via the `2²⁵⁵ ≡ 19 (mod p)` fold (two passes + a
+/// top-bit step + a final < p check).
 ///
-/// The output stored in `FieldOpRow.out` is the LOW 32 bytes of the
-/// unreduced product, but soundness only enforces correctness against
-/// the full 64-byte `mul_product` chain.  R1c-5 reduces those 64
-/// bytes to a canonical 32-byte field element via the `2²⁵⁵ ≡ 19`
-/// fold, after which `field::mul(&a, &b)` is the right cross-check.
-///
-/// The schoolbook carry is split into 3 bytes (lo, mid, hi) per
-/// position; we precompute and emit all three so the chip's
-/// constraint chain can re-witness the per-position partial-product
-/// sum.
+/// Carry chains are split per-position into bytes sized to fit the
+/// max accumulator at that step:
+///   * Schoolbook chain: 3 bytes (~21 bits) per position.
+///   * Pass-1 chain (lo + 38·hi): 2 bytes (~16 bits) per position.
+///   * Pass-2 chain (pass1_lo + 38·pass1_hi): 1 byte (≤ 9 bits + 1
+///     overflow bit per position is enough since 38·38 < 2¹¹).
+///   * After-top chain (+19): 1 byte per position.
 pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert!(less_than_p(&a));
     debug_assert!(less_than_p(&b));
 
-    // Schoolbook over u32 partial sums (each position accumulates
-    // up to 32 byte-products, so up to ~32 · 65025 ≈ 2M ≈ 21 bits;
-    // u32 has plenty of headroom).
+    // ── Schoolbook (R1c-4) ──
     let mut prod = [0u32; 64];
     for i in 0..32 {
         for j in 0..32 {
             prod[i + j] += (a[i] as u32) * (b[j] as u32);
         }
     }
-
-    // Carry-propagate so each output byte fits in [0, 256).
     let mut mul_product = [0u8; 64];
     let mut mul_carry = [0u8; 64];
     let mut mul_carry_mid = [0u8; 64];
@@ -306,24 +353,142 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         mul_carry_hi[k]  = ((new_carry >> 16) & 0xff) as u8;
         full_carry = new_carry;
     }
-    debug_assert_eq!(full_carry, 0, "schoolbook chain didn't close at position 63");
+    debug_assert_eq!(full_carry, 0);
 
+    // ── Pass 1: lo + 38·hi, with hi = mul_product[32..64] ──
+    //
+    // Compute byte-by-byte: pass1_v[k] = mul_product[k] + 38·mul_product[k+32]
+    // + carry_in[k], with pass1_lo[k] = pass1_v[k] & 0xff and
+    // carry_out[k] = pass1_v[k] >> 8.  Carry is split lo + 256·mid.
+    let mut pass1_lo = [0u8; 32];
+    let mut pass1_carry = [0u8; 32];
+    let mut pass1_carry_mid = [0u8; 32];
+    let mut full_carry: u32 = 0;
+    for k in 0..32 {
+        // 38·byte[k+32] up to 38·255 = 9690 ≈ 14 bits.  Plus byte[k]
+        // (≤ 255) and incoming carry (≤ 38·255 ≈ 14 bits).  Worst
+        // case fits in u32 with room.
+        let v = (mul_product[k] as u32)
+            + 38 * (mul_product[k + 32] as u32)
+            + full_carry;
+        pass1_lo[k] = (v & 0xff) as u8;
+        let nc = v >> 8;
+        pass1_carry[k]     = (nc & 0xff) as u8;
+        pass1_carry_mid[k] = ((nc >> 8) & 0xff) as u8;
+        full_carry = nc;
+    }
+    let mut pass1_hi = [0u8; 2];
+    pass1_hi[0] = (full_carry & 0xff) as u8;
+    pass1_hi[1] = ((full_carry >> 8) & 0xff) as u8;
+    debug_assert!(full_carry < (1u32 << 16),
+        "pass1_hi overflowed 16 bits");
+
+    // ── Pass 2: pass1_lo + 38·pass1_hi ──
+    //
+    // 38·pass1_hi ≤ 38·(2¹⁶ − 1) ≈ 2²² but in practice pass1_hi is
+    // ≤ 38·39 / 256 = ~6 (so 38·pass1_hi ≤ ~228).  We add it to
+    // pass1_lo's bytes; carry is small (≤ 1 per position).  Stored
+    // as a single byte per position.
+    let pass1_hi_value: u32 = (pass1_hi[0] as u32) | ((pass1_hi[1] as u32) << 8);
+    let mut to_add: u32 = 38 * pass1_hi_value; // injected at byte 0
+    let mut pass2_lo = [0u8; 32];
+    let mut pass2_carry = [0u8; 32];
+    let mut full_carry: u32 = 0;
+    for k in 0..32 {
+        let v = (pass1_lo[k] as u32) + (to_add & 0xff) + full_carry;
+        pass2_lo[k] = (v & 0xff) as u8;
+        let nc = v >> 8;
+        pass2_carry[k] = nc as u8;
+        full_carry = nc;
+        to_add >>= 8;
+    }
+    // Either to_add still has bits or full_carry is 1: those flow
+    // into pass2_carry_out.  In our regime to_add becomes 0 within
+    // a few bytes and full_carry ∈ {0, 1}.
+    debug_assert!(to_add <= 1, "pass2 to_add residual > 1");
+    let pass2_carry_out: u8 = (full_carry as u8) | (to_add as u8);
+    debug_assert!(pass2_carry_out <= 1);
+
+    // ── Top-bit fold + +19 step ──
+    let pass2_top_bit: u8 = pass2_lo[31] >> 7;
+    // value to fold = pass2_carry_out (= 1 means "+2²⁵⁶ ≡ 38") +
+    //                  pass2_top_bit (= 1 means "+2²⁵⁵ ≡ 19")
+    // Combined we add `pass2_carry_out * 38 + pass2_top_bit * 19`.
+    let mut after_top_bit = pass2_lo;
+    after_top_bit[31] &= 0x7f; // clear bit 255
+    let inject: u32 = (pass2_carry_out as u32) * 38 + (pass2_top_bit as u32) * 19;
+    let mut to_add: u32 = inject;
+    let mut after_top_carry = [0u8; 32];
+    let mut full_carry: u32 = 0;
+    for k in 0..32 {
+        let v = (after_top_bit[k] as u32) + (to_add & 0xff) + full_carry;
+        after_top_bit[k] = (v & 0xff) as u8;
+        let nc = v >> 8;
+        after_top_carry[k] = nc as u8;
+        full_carry = nc;
+        to_add >>= 8;
+    }
+    debug_assert_eq!(full_carry + to_add, 0,
+        "after_top chain didn't close (residual carry {full_carry}, to_add {to_add})");
+
+    // ── Final < p reduction (reuses is_overflow + sub_borrow) ──
+    let needs_p_sub = !less_than_p(&after_top_bit);
+    let is_overflow: u8 = if needs_p_sub { 1 } else { 0 };
     let mut out = [0u8; 32];
-    out.copy_from_slice(&mul_product[..32]);
+    let mut sub_borrow = [0u8; 32];
+    let mut bw: i16 = 0;
+    for i in 0..32 {
+        let p_i = field::P_BYTES[i] as i16 * is_overflow as i16;
+        let v = after_top_bit[i] as i16 - p_i - bw;
+        if v < 0 {
+            out[i] = (v + 256) as u8;
+            bw = 1;
+        } else {
+            out[i] = v as u8;
+            bw = 0;
+        }
+        sub_borrow[i] = bw as u8;
+    }
+
+    debug_assert_eq!(out, field::mul(&a, &b),
+        "is_mul witness fill diverged from field::mul reference");
+
+    // Final-form chain (out < p) — same as fill_add.
+    let mut final_form_borrow = [0u8; 32];
+    let mut bw: i16 = 1;
+    for i in 0..32 {
+        let v = field::P_BYTES[i] as i16 - out[i] as i16 - bw;
+        bw = if v < 0 { 1 } else { 0 };
+        final_form_borrow[i] = bw as u8;
+    }
+    debug_assert_eq!(final_form_borrow[31], 0);
 
     FieldOpRow {
         a, b, out,
-        // is_add / is_sub witness fields zero on is_mul rows.
+        // is_add chain unused on is_mul rows.
         add_intermediate: [0u8; 32],
         add_carry: [0u8; 32],
-        is_overflow: 0,
-        sub_borrow: [0u8; 32],
-        final_form_borrow: [0u8; 32],
-        sub_chain_borrow: [0u8; 32],
+        // Reused: is_overflow + sub_borrow drive the final < p step.
+        is_overflow,
+        sub_borrow,
+        final_form_borrow,
+        sub_chain_borrow: [0u8; 32], // unused
+        // Schoolbook witnesses (R1c-4).
         mul_product,
         mul_carry,
         mul_carry_mid,
         mul_carry_hi,
+        // Reduction witnesses (R1c-5).
+        pass1_lo,
+        pass1_hi,
+        pass1_carry,
+        pass1_carry_mid,
+        pass2_lo,
+        pass2_carry_out,
+        pass2_carry,
+        pass2_top_bit,
+        after_top_bit,
+        after_top_carry,
         is_add: 0,
         is_sub: 0,
         is_mul: 1,
@@ -423,14 +588,32 @@ mod tests {
     }
 
     #[test]
-    fn fill_mul_small_produces_unreduced_product() {
+    fn fill_mul_small_produces_unreduced_product_and_canonical_out() {
         // 7 · 13 = 91; low byte of mul_product should be 91, all
-        // higher bytes 0.
+        // higher bytes 0.  out = 91 (already < p).
         let row = fill_mul(small(7), small(13));
         assert_eq!(row.is_mul, 1);
         assert_eq!(row.mul_product[0], 91);
         for i in 1..64 { assert_eq!(row.mul_product[i], 0); }
+        assert_eq!(row.out, field::mul(&small(7), &small(13)));
         assert_eq!(row.out[0], 91);
+    }
+
+    #[test]
+    fn fill_mul_canonical_out_matches_field_reference() {
+        // Mid-range bytes that exercise the reduction path: the
+        // unreduced product is in [2²⁵⁶, ...], so pass-1 is
+        // required to bring it back below p.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
+        for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
+        a[31] &= 0x7f; b[31] &= 0x7f;
+        let row = fill_mul(a, b);
+        assert_eq!(row.out, field::mul(&a, &b),
+            "is_mul row's canonical out must match field::mul reference");
+        // Confirm out < p.
+        assert!(less_than_p(&row.out), "fill_mul produced non-canonical out");
     }
 
     #[test]

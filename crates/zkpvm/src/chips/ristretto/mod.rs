@@ -149,6 +149,53 @@ pub enum Column {
     #[size = 64]
     MulCarryHi,
 
+    /// R1c-5-a: pass-1 reduction fold `lo + 38·hi` (mod p), where
+    /// `lo = mul_product[..32]` and `hi = mul_product[32..]`.  Stored
+    /// as 32 low bytes (Pass1Lo) plus a 2-byte overflow head
+    /// (Pass1Hi).  After this fold the residual value sits in
+    /// `[0, 2²⁵⁶ + 38·(2²⁵⁶−1)) ⊂ [0, 39·2²⁵⁶)`.
+    #[size = 32]
+    Pass1Lo,
+    /// R1c-5-a: pass-1 overflow into bytes 32..34 (≤ 38, so 2 bytes
+    /// is plenty).
+    #[size = 2]
+    Pass1Hi,
+    /// R1c-5-a: per-position carry-byte chain (lo + mid bytes per
+    /// position, since 38·byte + byte fits in ≤ 16 bits).
+    #[size = 32]
+    Pass1Carry,
+    #[size = 32]
+    Pass1CarryMid,
+
+    /// R1c-5-a: pass-2 fold `pass1_lo + 38·pass1_hi`.  Since
+    /// pass1_hi ≤ 38 and 38·38 = 1444 < 2¹¹, this fold can produce
+    /// at most a 1-bit overflow into bit 256.  Stored as 32 low
+    /// bytes + a 1-bit `pass2_carry_out` (folded via 2²⁵⁶ ≡ 38
+    /// equivalence).
+    #[size = 32]
+    Pass2Lo,
+    #[size = 1]
+    Pass2CarryOut,
+    /// R1c-5-a: per-position carry chain for the pass-2 fold.
+    #[size = 32]
+    Pass2Carry,
+
+    /// R1c-5-a: top bit of pass2_lo[31] (= bit 255 of the value).
+    /// If set, the value is in `[2²⁵⁵, 2²⁵⁶)` and reduces by adding
+    /// 19 after clearing bit 255.
+    #[size = 1]
+    Pass2TopBit,
+    /// R1c-5-a: pass2 with bit 255 cleared and +19 added if either
+    /// pass2_carry_out or pass2_top_bit is set (both encode the
+    /// "+19 mod p" reduction).  This is the value that flows into
+    /// the final-form `< p` check, after which it lands in
+    /// FieldOut.
+    #[size = 32]
+    AfterTopBit,
+    /// R1c-5-a: per-position carry chain for the +19 step.
+    #[size = 32]
+    AfterTopCarry,
+
     /// Operation classifier flags — exactly one is 1 on a real row.
     /// R1c-3+ adds is_mul; is_inv composes mul rows + a Fermat
     /// ladder driver, no separate row class.
