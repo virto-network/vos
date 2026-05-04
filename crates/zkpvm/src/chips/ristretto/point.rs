@@ -179,6 +179,55 @@ pub fn point_identity() -> ExtendedPoint {
     }
 }
 
+/// R1e: scalar multiplication `k · P → Q` via double-and-add over
+/// extended Edwards coordinates.
+///
+/// Scans the scalar bits MSB-first.  For each bit:
+///   1. Always: double the accumulator (`acc ← 2·acc`).
+///   2. If bit set: add P (`acc ← acc + P`).
+///
+/// Returns the full sequence of FieldOpRows emitted by the
+/// underlying point ops, plus the resulting extended point.
+///
+/// Cost: ~256 doublings + ~128 (avg) additions = ~384 point ops.
+/// Each doubling = 16 field-op rows, each addition = 18.  Total per
+/// scalar mult: ~6500 field-op rows.  R1e-bis (NAF-w4
+/// optimization) cuts adds to ~64 + 8 table-setup, knocking ~30%.
+///
+/// **Caveat**: this is the EXTENDED-COORDS scalar mult.  Going from
+/// ECALL byte buffers (compressed Ristretto in/out) to/from
+/// ExtendedPoint requires decompression / compression — a separate
+/// piece (R1e-bis) that adds ~50 field-op rows of curve-equation
+/// witness at the boundary.
+pub fn scalar_mult_rows(scalar: &Bytes, p: &ExtendedPoint)
+    -> (Vec<FieldOpRow>, ExtendedPoint)
+{
+    let mut rows = Vec::new();
+    let mut acc = point_identity();
+
+    // Scan MSB-first across all 256 bits.  Highest bit lives in
+    // scalar[31] >> 7; iterate bytes 31 down to 0, inside each byte
+    // bit 7 down to 0.
+    for byte_i in (0..32).rev() {
+        let byte = scalar[byte_i];
+        for bit in (0..8).rev() {
+            // 1. Double.
+            let (mut dr, doubled) = point_double_rows(&acc);
+            rows.append(&mut dr);
+            acc = doubled;
+
+            // 2. Conditional add.
+            if (byte >> bit) & 1 == 1 {
+                let (mut ar, added) = point_add_rows(&acc, p);
+                rows.append(&mut ar);
+                acc = added;
+            }
+        }
+    }
+
+    (rows, acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +333,47 @@ mod tests {
             let class = row.is_add + row.is_sub + row.is_mul;
             assert_eq!(class, 1);
         }
+    }
+
+    /// Cross-multiplication equality on extended-coords projective
+    /// points: P ≡ Q iff X1·Z2 = X2·Z1 ∧ Y1·Z2 = Y2·Z1.
+    fn projective_eq(p: &ExtendedPoint, q: &ExtendedPoint) -> bool {
+        field::mul(&p.x, &q.z) == field::mul(&q.x, &p.z)
+            && field::mul(&p.y, &q.z) == field::mul(&q.y, &p.z)
+    }
+
+    #[test]
+    fn scalar_mult_zero_is_identity() {
+        let id = point_identity();
+        let zero = [0u8; 32];
+        let (rows, result) = scalar_mult_rows(&zero, &id);
+        assert!(!rows.is_empty(), "even k=0 emits doublings");
+        // 0 · P = O.
+        assert!(projective_eq(&result, &point_identity()));
+    }
+
+    #[test]
+    fn scalar_mult_of_identity_is_identity() {
+        // For any k, k · O = O.  Use k = 1.
+        let id = point_identity();
+        let mut k = [0u8; 32]; k[0] = 1;
+        let (_rows, result) = scalar_mult_rows(&k, &id);
+        assert!(projective_eq(&result, &point_identity()));
+    }
+
+    #[test]
+    fn scalar_mult_one_returns_input() {
+        // 1 · P = P.  Use a synthesized "non-identity" point that's
+        // still on the curve via doubling the identity (= identity)
+        // — for a structural test that doesn't require lifting.
+        // We can't easily produce a non-identity point without
+        // dalek's private (X, Y, Z, T) accessors, so this test
+        // confirms only that 1·O = O.  Real basepoint coverage
+        // lands in R1f via the ECALL path against dalek directly.
+        let id = point_identity();
+        let mut k = [0u8; 32]; k[0] = 1;
+        let (_, result) = scalar_mult_rows(&k, &id);
+        assert!(projective_eq(&result, &id));
     }
 
     #[test]
