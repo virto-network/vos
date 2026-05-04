@@ -1,4 +1,4 @@
-//! Transient ephemeral node — used by `vosx invoke` (and any
+//! Transient ephemeral node — used by `vosx call` (and any
 //! future read-only commands) to dial into a hyperspace,
 //! sync the registry, run a single closure against the node,
 //! then tear down.

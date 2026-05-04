@@ -58,7 +58,7 @@ re-invokes any that yielded so cooperative loops can make progress.
 ### Execution flow
 
 ```
-vosx start space.toml
+vosx up space.toml
   └─ load manifest, transpile ELFs to PVM blobs
   └─ register workers, then each [[agent]]'s child actors,
      then the agent itself, on the multi-threaded VosNode
@@ -110,7 +110,7 @@ just build
 cargo run -p vos --bin vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.elf
 ```
 
-The `space.toml` manifest is the structural unit: one `vosx start` =
+The `space.toml` manifest is the structural unit: one `vosx up` =
 one space. See `space.toml` itself for the full schema (agents,
 nested actors, workers, `provides` roles, optional `[node]` block).
 

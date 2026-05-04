@@ -3,8 +3,9 @@
 //! shape; `main` dispatches to them.
 
 pub mod invoke;
+pub mod join;
 pub mod list;
-pub mod node;
+pub mod new;
 pub mod run;
 pub mod start;
 pub mod status;

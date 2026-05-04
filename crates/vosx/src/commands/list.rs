@@ -1,4 +1,4 @@
-//! `vosx list [<manifest>]` — print the space's actors,
+//! `vosx ls [<manifest>]` — print the space's actors,
 //! workers, and their declared messages. No execution; pure
 //! introspection over the manifest + each entry's `.vos_meta`
 //! ELF section.

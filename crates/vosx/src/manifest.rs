@@ -122,11 +122,6 @@ pub struct AgentDef {
     ///     degenerates to single-node mode)
     #[serde(default)]
     pub replication_id: Option<String>,
-    /// Static cluster membership for `consistency = "raft"`.
-    /// Each entry is a 4-char hex `node_prefix`. Every replica's
-    /// manifest must list the same set in the same order.
-    #[serde(default)]
-    pub members: Vec<String>,
     /// Messages to send to this agent immediately after startup.
     /// Each entry is encoded as a TAG_DYNAMIC + rkyv(Msg) payload
     /// and queued via `AgentConfig::init_payloads`. Useful for
@@ -175,10 +170,11 @@ pub enum ConsistencyDef {
     Ephemeral,
     Local,
     Crdt,
-    /// Raft consensus. Requires a non-empty `members` list (every
-    /// participating replica's `node_prefix` as a 4-char hex
-    /// string). Strict consistency: state mutations block until
-    /// a majority of members has the new entry.
+    /// Raft consensus. Cluster membership is auto-derived from
+    /// `--connect` bootnodes at startup (the local node plus
+    /// every peer that has completed the Hello handshake within
+    /// the join window). Strict consistency: state mutations block
+    /// until a majority of members has the new entry.
     Raft,
 }
 
@@ -232,6 +228,21 @@ pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
     let path = path.unwrap_or_else(|| "space.toml".into());
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| die(&format!("reading {}: {e}", path.display())));
+    // Tripwire for the dropped `members` field. serde silently
+    // ignores unknown fields, so a stale `members = [...]` would
+    // otherwise pass parse and operators wouldn't notice the
+    // bootstrap model changed. Warn loudly instead.
+    if content.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("members") && t.split_once('=').is_some()
+    }) {
+        eprintln!(
+            "vosx: warning — `members = [...]` is no longer used. \
+             Raft membership auto-discovers from --connect bootnodes; \
+             remove the field from {}.",
+            path.display(),
+        );
+    }
     let mut manifest: Manifest = toml::from_str(&content)
         .unwrap_or_else(|e| die(&format!("parsing {}: {e}", path.display())));
 
@@ -327,24 +338,6 @@ pub fn resolve_replication_id(name: &str, spec: Option<&str>, blob: &[u8]) -> Op
             )),
         },
     }
-}
-
-/// Parse a manifest's `members = ["abcd", "ef01", ...]` into the
-/// node-prefix list `vos::raft` expects. Each entry is exactly
-/// 4 hex chars (a u16). Errors out on anything malformed —
-/// silently dropping a member would leave an asymmetric Raft
-/// cluster, which is far worse than a startup failure.
-pub fn parse_members(spec: &[String]) -> Vec<u16> {
-    spec.iter()
-        .map(|s| {
-            let s = s.trim().trim_start_matches("0x");
-            u16::from_str_radix(s, 16).unwrap_or_else(|_| {
-                die(&format!(
-                    "raft member must be a 4-char hex node_prefix; got {s:?}",
-                ))
-            })
-        })
-        .collect()
 }
 
 fn auto_replication_id(name: &str, blob: &[u8]) -> [u8; 32] {
@@ -567,16 +560,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_members_decodes_4char_hex() {
-        let m = parse_members(&[
-            "abcd".into(),
-            "0xEF01".into(),
-            "  0042  ".into(),
-        ]);
-        assert_eq!(m, vec![0xABCD, 0xEF01, 0x0042]);
-    }
-
-    #[test]
     fn raft_consistency_round_trips_through_toml() {
         let toml = r#"
 space = "demo"
@@ -589,16 +572,30 @@ listen = ["/ip4/127.0.0.1/tcp/0"]
 name = "ledger"
 path = "/dev/null"
 consistency = "raft"
-members = ["abcd", "ef01"]
 replication_id = "auto"
 "#;
         let parsed: Manifest = toml::from_str(toml).expect("parse manifest");
         assert_eq!(parsed.agent.len(), 1);
         assert_eq!(parsed.agent[0].consistency, ConsistencyDef::Raft);
-        assert_eq!(parsed.agent[0].members, vec![
-            "abcd".to_string(),
-            "ef01".to_string(),
-        ]);
-        assert_eq!(parse_members(&parsed.agent[0].members), vec![0xABCD, 0xEF01]);
+    }
+
+    #[test]
+    fn raft_manifest_with_legacy_members_field_parses_and_ignores_it() {
+        // The `members` field has been removed — auto-discovery via
+        // --connect bootnodes replaces it. Old manifests carrying
+        // the field still parse (serde silently drops unknown
+        // fields by default); the manifest loader emits a warning
+        // when it sees one so operators notice the change.
+        let toml = r#"
+space = "demo"
+
+[[agent]]
+name = "ledger"
+path = "/dev/null"
+consistency = "raft"
+members = ["abcd"]
+"#;
+        let parsed: Manifest = toml::from_str(toml).expect("parse with legacy field");
+        assert_eq!(parsed.agent[0].consistency, ConsistencyDef::Raft);
     }
 }

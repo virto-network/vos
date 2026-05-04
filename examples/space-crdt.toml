@@ -7,12 +7,12 @@
 # and a cycle-4 mid-flight soft restart on the other.
 #
 #   # terminal A
-#   vosx start examples/space-crdt.toml \
+#   vosx up examples/space-crdt.toml \
 #     --data-dir /tmp/vosx-a \
 #     --listen /ip4/127.0.0.1/tcp/4811
 #
 #   # terminal B
-#   vosx start examples/space-crdt.toml \
+#   vosx up examples/space-crdt.toml \
 #     --data-dir /tmp/vosx-b \
 #     --connect /ip4/127.0.0.1/tcp/4811
 #

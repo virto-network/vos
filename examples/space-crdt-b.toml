@@ -1,7 +1,7 @@
 # Cross-node CRDT demo, host B. See space-crdt-a.toml for context.
 #
 # Run (after starting host A):
-#   vosx start examples/space-crdt-b.toml \
+#   vosx up examples/space-crdt-b.toml \
 #     --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811
 
 space = "crdt-demo"

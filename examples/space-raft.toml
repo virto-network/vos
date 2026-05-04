@@ -8,60 +8,38 @@
 # target the leader); CRDT is still the right pick when reads from
 # any replica are needed.
 #
-# Each replica runs the SAME manifest with a different
-# `[node].identity` file + `[node].listen` port. The `members`
-# list is the static cluster membership: every node's
-# `node_prefix` (the upper 16 bits of its libp2p PeerId, derived
-# from the keypair).
+# ## Bootstrap
 #
-# ## Bootstrapping the prefixes
+# One node bootstraps solo with `vosx up`; the others join with
+# `vosx join <bootnode>`. Membership is tracked dynamically via
+# joint consensus — no manual `node_prefix` harvesting.
 #
-# Each member's prefix is derived deterministically from its
-# libp2p keypair. The simplest bootstrap:
+#   # Bootstrap node:
+#   vosx up examples/space-raft.toml \
+#       --data-dir /tmp/raft-a \
+#       --listen /ip4/127.0.0.1/tcp/4811 &
 #
-#   1. Pre-generate three keypair files:
+#   # Note the printed bootnode multiaddr from the startup log
+#   # (looks like /ip4/127.0.0.1/tcp/4811/p2p/12D3...).
 #
-#        for i in a b c; do
-#          mkdir -p /tmp/raft-$i
-#          # First run prints the assigned prefix:
-#          ./target/release/vosx start examples/space-raft.toml \
-#              --data-dir /tmp/raft-$i \
-#              --listen /ip4/127.0.0.1/tcp/$((4810 + RANDOM % 100)) \
-#              2>&1 | head -5
-#          # Ctrl-C — we just wanted the auto-generated identity.
-#        done
+#   # Joiner B:
+#   vosx join /ip4/127.0.0.1/tcp/4811/p2p/<bootnode-peer-id> \
+#       --data-dir /tmp/raft-b \
+#       --listen /ip4/127.0.0.1/tcp/4812 &
 #
-#   2. Read each prefix from the startup log line:
+#   # Joiner C:
+#   vosx join /ip4/127.0.0.1/tcp/4811/p2p/<bootnode-peer-id> \
+#       --data-dir /tmp/raft-c \
+#       --listen /ip4/127.0.0.1/tcp/4813 &
 #
-#        "vosx: ServiceId prefix = 0xABCD"
+#   # Drive the actor from any replica's `vosx call` — only the
+#   # leader will accept writes; followers reply with
+#   # `Unreachable` until they're elected.
+#   vosx call ledger.inc 1
 #
-#   3. Substitute the three prefixes into the `members` list
-#      below (4 hex chars each, no `0x`).
-#
-#   4. Re-launch each node with the populated manifest:
-#
-#        ./target/release/vosx start examples/space-raft.toml \
-#            --data-dir /tmp/raft-a \
-#            --listen /ip4/127.0.0.1/tcp/4811 &
-#
-#        ./target/release/vosx start examples/space-raft.toml \
-#            --data-dir /tmp/raft-b \
-#            --connect /ip4/127.0.0.1/tcp/4811 \
-#            --listen /ip4/127.0.0.1/tcp/4812 &
-#
-#        ./target/release/vosx start examples/space-raft.toml \
-#            --data-dir /tmp/raft-c \
-#            --connect /ip4/127.0.0.1/tcp/4811 \
-#            --connect /ip4/127.0.0.1/tcp/4812 \
-#            --listen /ip4/127.0.0.1/tcp/4813
-#
-#   5. Drive the actor from any replica's `vosx invoke` — only
-#      the leader will accept writes; followers reply with
-#      `Unreachable` until they're elected.
-#
-# A future `vosx raft init <space.toml>` recipe will pre-generate
-# the keypairs, harvest the prefixes, and emit a populated
-# manifest in one shot.
+# Each node logs its discovered membership on startup; once
+# `vosx join` returns, the cluster is up to N voters and a
+# subsequent `vosx ps` shows everyone connected.
 
 space = "raft-demo"
 version = "0.1.0"
@@ -70,10 +48,7 @@ version = "0.1.0"
 name = "ledger"
 path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
 consistency = "raft"
-# Replace with the three actual node_prefixes (4 hex chars each).
-# Same list, same order, on every replica's manifest.
-members = ["abcd", "ef01", "0042"]
 # `replication_id` defaults to "auto" =
 # `blake2b(name || 0 || blob)` — every replica that names this
 # actor "ledger" with the same actor binary auto-shares a Raft
-# group, regardless of what's in `members`.
+# group, regardless of which addresses they dialed.

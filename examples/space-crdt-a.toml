@@ -7,7 +7,7 @@
 # the replicas appear pre-converged at count=1).
 #
 # Run:
-#   vosx start examples/space-crdt-a.toml \
+#   vosx up examples/space-crdt-a.toml \
 #     --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811
 #
 # `replication_id` defaults to "auto" =

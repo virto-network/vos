@@ -98,7 +98,7 @@ The `vosx` CLI is the operator-facing entry point. Recipes are in
 # Run the example space (scheduler + greeter + counter + fizzbuzz)
 just run-manifest
 
-# Live cross-node CRDT convergence demo. Two `vosx start` processes
+# Live cross-node CRDT convergence demo. Two `vosx up` processes
 # join the same hyperspace, each fires `inc()` on its local replica,
 # both converge to count=2 within a couple of sync ticks.
 just demo-crdt-procs
@@ -142,7 +142,7 @@ cargo test --all -- --test-threads=1
 
 `vosx status [<manifest>] --connect <multiaddr>` joins a running
 hyperspace as a transient peer and prints the local identity, connected
-peers, and the registry's contents. `vosx invoke <name> <msg>
+peers, and the registry's contents. `vosx call <name> <msg>
 [--arg k=v]` sends a typed message to any actor by name.
 
 ### Writing an actor
@@ -172,7 +172,7 @@ vos::pvm_main!(Counter);  // emits PVM `_start` / `accumulate`
 
 Compile with the riscv64em-javm target (see
 `examples/actors/crdt-counter/.cargo/config.toml`), declare in a
-manifest, and `vosx start space.toml`. Hosts get a typed
+manifest, and `vosx up space.toml`. Hosts get a typed
 `CounterClient` for free via `#[messages]`:
 
 ```rust

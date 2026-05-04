@@ -62,7 +62,63 @@ impl From<ConsistencyArg> for vos::node::Consistency {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a PVM/ELF program.
+    /// Scaffold a new space — creates `<name>/space.toml` and a
+    /// starter actor crate so you can `cd <name> && vosx up` to
+    /// see something working.
+    New {
+        /// Directory name for the new space.
+        name: String,
+    },
+    /// Boot the space defined by `space.toml` (default).
+    /// With no path, looks for `space.toml` in the current
+    /// directory. Runs until Ctrl-C; pass `--once` for the
+    /// "exit when actors go idle" smoke-test mode.
+    Up {
+        manifest: Option<PathBuf>,
+        /// Override the data directory (default: `data`).
+        #[arg(long, value_name = "DIR", default_value = "data")]
+        data_dir: Option<PathBuf>,
+        /// Disable state persistence entirely (overrides --data-dir).
+        #[arg(long)]
+        no_persist: bool,
+        /// libp2p multiaddr to listen on.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        /// Joins existing Raft groups via auto-discovery once
+        /// the bootnodes complete the Hello handshake.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+        /// Exit once every actor has been idle for ~2s instead
+        /// of running until Ctrl-C. For tests and smoke checks.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Join an existing cluster as a fresh node. Dials the
+    /// bootnode, fetches its `space.toml` + actor blobs (unless
+    /// `--manifest` is given), then sends a `RaftJoin` request
+    /// for every Raft agent the manifest declares. The local
+    /// node attaches as a voter and runs forever.
+    Join {
+        /// Bootnode multiaddr (e.g.
+        /// `/ip4/192.0.2.10/tcp/4811/p2p/12D3...`).
+        bootnode: String,
+        /// Use a local `space.toml` instead of fetching from the
+        /// bootnode. Required if the bootnode doesn't expose its
+        /// manifest.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<PathBuf>,
+        /// Override the data directory (default: `data`).
+        #[arg(long, value_name = "DIR", default_value = "data")]
+        data_dir: Option<PathBuf>,
+        /// Disable state persistence entirely (overrides --data-dir).
+        #[arg(long)]
+        no_persist: bool,
+        /// libp2p multiaddr to listen on. Empty → ephemeral.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+    },
+    /// Run a single PVM/ELF program with no manifest (one-shot).
     Run {
         program: PathBuf,
         /// Deliver file contents as a FETCH work item (repeatable).
@@ -75,53 +131,13 @@ enum Command {
         #[arg(long, default_value_t = 100_000_000)]
         gas: u64,
     },
-    /// Run multiple agents concurrently.
-    Node {
-        programs: Vec<PathBuf>,
-        /// Load a registry service at ServiceId(0).
-        #[arg(long, value_name = "FILE")]
-        registry: Option<PathBuf>,
-        /// Load native worker plugins. Optional init args after a colon:
-        ///   --worker libfoo.so
-        ///   --worker libfoo.so:key=hello,n=42
-        #[arg(long, value_name = "FILE[:KEY=VAL,...]")]
-        worker: Vec<String>,
-        /// Data directory for state persistence. Workers are stored in
-        /// `{data_dir}/workers/{name}.redb`. Default: no persistence.
-        #[arg(long, value_name = "DIR", default_value = "data")]
-        data_dir: Option<PathBuf>,
-        /// Disable state persistence (overrides --data-dir).
-        #[arg(long)]
-        no_persist: bool,
-        /// Replication / persistence semantics for the PVM agents.
-        #[arg(long, value_name = "MODE", default_value = "ephemeral")]
-        consistency: ConsistencyArg,
-    },
-    /// Start the space defined by a manifest. With no path, looks
-    /// for `space.toml` in the current directory.
-    Start {
-        manifest: Option<PathBuf>,
-        /// Override the data directory (default: `data`).
-        #[arg(long, value_name = "DIR", default_value = "data")]
-        data_dir: Option<PathBuf>,
-        /// Disable state persistence entirely (overrides --data-dir).
-        #[arg(long)]
-        no_persist: bool,
-        /// libp2p multiaddr to listen on.
-        #[arg(long, value_name = "MULTIADDR")]
-        listen: Vec<String>,
-        /// libp2p multiaddr to dial at startup. Repeatable.
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-    },
-    /// List actors in a manifest.
-    List {
+    /// List actors declared in a manifest.
+    Ls {
         manifest: Option<PathBuf>,
     },
-    /// Snapshot of a hyperspace: local identity, connected
-    /// peers, and the registry's contents. Joins the manifest's
-    /// hyperspace as a transient peer (same model as `invoke`).
-    Status {
+    /// Live cluster status — one row per service: name, role
+    /// (leader/follower/...), term, last_applied, peer count.
+    Ps {
         manifest: Option<PathBuf>,
         /// libp2p multiaddr to dial at startup. Repeatable.
         #[arg(long, value_name = "MULTIADDR")]
@@ -130,27 +146,26 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sync_timeout: u64,
     },
-    /// Resolve a service name (or accept a `0x…` ServiceId) and
-    /// invoke a typed message on it. Joins the manifest's
-    /// hyperspace as a transient peer, looks the name up via
-    /// the registry actor, then forwards the call.
-    Invoke {
-        /// Service name (looked up in registry) or a literal
-        /// `0xHEX` ServiceId.
+    /// Invoke a typed message on a service:
+    ///   `vosx call counter.inc 5`
+    /// Resolves the target via the manifest's registry, types
+    /// the positional args from the actor's `Message::META`.
+    Call {
+        /// `<agent>.<msg>` — e.g. `counter.inc`. Plain
+        /// `0xHEX.msg` also accepted when bypassing the registry.
         target: String,
-        /// Message name (e.g. `inc`, `get`, `lookup`).
-        msg: String,
-        /// Repeatable: `--arg key=value`. Auto-typed: integer
-        /// → u64, `true`/`false` → bool, everything else → str.
-        #[arg(long, value_name = "KEY=VALUE")]
-        arg: Vec<String>,
+        /// Positional args for the message. Auto-typed against
+        /// the handler's parameter list (resolved from the actor's
+        /// `Message::META`). For backward-compat, `key=value`
+        /// pairs are still accepted.
+        args: Vec<String>,
         /// Manifest path. Defaults to `space.toml`.
         manifest: Option<PathBuf>,
         /// libp2p multiaddr to dial at startup. Repeatable.
         #[arg(long, value_name = "MULTIADDR")]
         connect: Vec<String>,
         /// Seconds to wait for registry sync before resolving
-        /// the target name. Ignored when target is `0x…`.
+        /// the target name.
         #[arg(long, default_value_t = 3)]
         sync_timeout: u64,
     },
@@ -161,35 +176,43 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::New { name }) => {
+            commands::new::run(&name);
+        }
+        Some(Command::Up { manifest, data_dir, no_persist, listen, connect, once }) => {
+            let (m, dir) = manifest_from(manifest);
+            commands::start::run(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect, once);
+        }
+        Some(Command::Join { bootnode, manifest, data_dir, no_persist, listen }) => {
+            commands::join::run(
+                &bootnode,
+                manifest.as_deref(),
+                data_dir.as_deref(),
+                no_persist,
+                &listen,
+            );
+        }
         Some(Command::Run { program, payload, hex, gas }) => {
             commands::run::run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry, worker, data_dir, no_persist, consistency }) => {
-            let dir = if no_persist { None } else { data_dir.as_deref() };
-            commands::node::run(&programs, registry.as_deref(), &worker, dir, consistency.into());
-        }
-        Some(Command::Start { manifest, data_dir, no_persist, listen, connect }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::start::run(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect);
-        }
-        Some(Command::List { manifest }) => {
+        Some(Command::Ls { manifest }) => {
             let (m, dir) = manifest_from(manifest);
             commands::list::run(&m, &dir);
         }
-        Some(Command::Status { manifest, connect, sync_timeout }) => {
+        Some(Command::Ps { manifest, connect, sync_timeout }) => {
             let (m, dir) = manifest_from(manifest);
             commands::status::run(&m, &dir, &connect, sync_timeout);
         }
-        Some(Command::Invoke { target, msg, arg, manifest, connect, sync_timeout }) => {
+        Some(Command::Call { target, args, manifest, connect, sync_timeout }) => {
             let (m, dir) = manifest_from(manifest);
-            commands::invoke::run(&m, &dir, &target, &msg, &arg, &connect, sync_timeout);
+            commands::invoke::run_call(&m, &dir, &target, &args, &connect, sync_timeout);
         }
         None if cli.file.as_ref().is_some_and(|p| !manifest::is_manifest(p)) => {
             commands::run::run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);
         }
         None => {
             let (m, dir) = manifest_from(cli.file);
-            commands::start::run(&m, &dir, Some(Path::new("data")), false, &[], &[]);
+            commands::start::run(&m, &dir, Some(Path::new("data")), false, &[], &[], false);
         }
     }
 }

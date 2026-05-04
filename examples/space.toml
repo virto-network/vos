@@ -5,8 +5,8 @@
 # layer lands; today this still runs as a standalone node.
 #
 # Run with:
-#   vosx start examples/Kunekt.toml
-#   vosx list  examples/Kunekt.toml
+#   vosx up examples/Kunekt.toml
+#   vosx ls  examples/Kunekt.toml
 #
 # Per-instance config (libp2p identity, listen addrs, data dir)
 # typically lives in a gitignored `Kunekt.local.toml` overlay so
@@ -41,7 +41,7 @@ version = "0.1.0"
 # `provides`: opt-in role tags. Other actors / operators address
 # the agent by role rather than by local name. Future runtime will
 # expose `@role` lookup in init values; today these are surfaced in
-# the boot log and `vosx list`.
+# the boot log and `vosx ls`.
 #
 # Either `path` (development) or `service` (registry lookup;
 # requires the networking layer) — not both.

@@ -3,9 +3,9 @@
 # declared agent into it on startup. Two vosx processes pointed
 # at this same file converge on a shared directory.
 #
-#   vosx start examples/space-hyperspace.toml \
+#   vosx up examples/space-hyperspace.toml \
 #     --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811
-#   vosx start examples/space-hyperspace.toml \
+#   vosx up examples/space-hyperspace.toml \
 #     --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811
 
 space = "hyperspace-demo"

@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "counter"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# When enabled by a host consumer, `#[messages]` emits the
+# typed `CounterClient`. Off for the riscv64 actor build.
+host = []
+
+[lib]
+name = "counter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "counter"
+path = "src/main.rs"
+
+[dependencies]
+# Path dep into the kunekt checkout. Replace with a registry
+# version once `vos` is published.
+vos = { path = "{{vos_path}}", default-features = false, features = ["macros", "service"] }

@@ -1,4 +1,4 @@
-//! `vosx start [<manifest>]` — boot a space defined by a TOML
+//! `vosx up [<manifest>]` — boot a space defined by a TOML
 //! manifest. Auto-spawns the hyperspace registry when declared,
 //! announces every local service into it, runs forever (or
 //! until idle when no network is attached).
@@ -13,12 +13,21 @@ use vos::value::Args;
 
 use crate::hyperspace::{flush_registry_announces, heartbeat_loop, AnnouncePlan};
 use crate::manifest::{
-    apply_init, encode_on_start, parse_members, resolve_entry_path,
+    apply_init, encode_on_start, resolve_entry_path,
     resolve_replication_id, toml_to_value,
     ConsistencyDef, Manifest,
 };
 use crate::network::start_network_if_needed;
 use crate::util::{die, exit_with_status, format_provides, hex32, load_blob, load_file};
+
+/// How long `vosx up` waits for `--connect` bootnodes to
+/// complete the libp2p Hello handshake before a Raft cluster's
+/// initial membership is frozen. Each bootnode that hasn't
+/// answered by the deadline is treated as missing — the
+/// cluster forms with whoever did show up. Tuned long enough
+/// for normal LAN/loopback startup but short enough that a
+/// truly absent peer doesn't strand the operator.
+const RAFT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn run(
     manifest: &Manifest,
@@ -27,6 +36,7 @@ pub fn run(
     no_persist: bool,
     listen_cli: &[String],
     connect_cli: &[String],
+    run_once: bool,
 ) {
     eprintln!(
         "vosx: starting space '{}' ({} agent(s), {} worker(s))",
@@ -73,9 +83,21 @@ pub fn run(
     register_workers(manifest, dir, state_dir.as_deref(), &mut node,
         &mut name_ids, &mut provides_map);
 
+    // Resolve the initial Raft membership from the bootnodes the
+    // operator dialed via `--connect`. The list is `{self} ∪
+    // {connected peer prefixes}` once every bootnode has Hello-
+    // handshaked (or the timeout fires). Empty when no agent uses
+    // Raft — saves the wait.
+    let raft_members = if manifest_has_raft(manifest) {
+        resolve_raft_members(network.as_ref(), connect_cli)
+    } else {
+        Vec::new()
+    };
+
     register_agents(
         manifest, dir, state_dir.as_deref(), &mut node,
         &mut name_ids, &mut provides_map, registry_active, &mut announces,
+        &raft_members,
     );
 
     // Hand the network off to the node — both die together at
@@ -92,11 +114,25 @@ pub fn run(
     let heartbeat = spawn_heartbeat(manifest, &node, &announces, registry_active, networked);
 
     eprintln!("vosx: running space '{}'...\n", manifest.space);
-    if networked {
-        eprintln!("vosx: networking on — running until shutdown (Ctrl-C)");
-        node.run_forever();
-    } else {
+    // `vosx up` is a long-running boot command — by default it
+    // runs until Ctrl-C even on a non-networked space, so a
+    // newcomer running `vosx up` in the examples dir doesn't
+    // see actors go idle and the process exit ~2s later.
+    // `--once` falls back to the previous run-until-idle
+    // behavior for tests and one-shot smoke checks.
+    if run_once {
+        eprintln!("vosx: --once — exiting once actors go idle");
         node.run();
+    } else {
+        if networked {
+            eprintln!("vosx: networking on — running until shutdown (Ctrl-C)");
+        } else {
+            eprintln!(
+                "vosx: no network attached — running until shutdown (Ctrl-C). \
+                 Pass --once to exit once actors go idle."
+            );
+        }
+        node.run_forever();
     }
 
     if let Some(h) = heartbeat {
@@ -217,6 +253,7 @@ fn register_agents(
     provides_map: &mut BTreeMap<String, Vec<u32>>,
     registry_active: bool,
     announces: &mut Vec<AnnouncePlan>,
+    raft_members: &[u16],
 ) {
     for a in &manifest.agent {
         // Child actors first so the parent agent's `init` can
@@ -240,7 +277,7 @@ fn register_agents(
                 }
             }
             if a.consistency == ConsistencyDef::Raft {
-                cfg = cfg.with_members(parse_members(&a.members));
+                cfg = cfg.with_members(raft_members.to_vec());
             }
             cfg = apply_init(cfg, &child.init, &elf_data, name_ids, provides_map);
             if !child.on_start.is_empty() {
@@ -287,7 +324,7 @@ fn register_agents(
             }
         }
         if a.consistency == ConsistencyDef::Raft {
-            cfg = cfg.with_members(parse_members(&a.members));
+            cfg = cfg.with_members(raft_members.to_vec());
         }
         cfg = apply_init(cfg, &a.init, &elf_data, name_ids, provides_map);
         if !a.on_start.is_empty() {
@@ -342,4 +379,77 @@ fn spawn_heartbeat(
         names.len(),
     );
     Some(std::thread::spawn(move || heartbeat_loop(handle, names, interval)))
+}
+
+/// `true` when at least one agent (or child actor) declares
+/// `consistency = "raft"`. Used to decide whether to pay the
+/// `--connect` handshake wait.
+fn manifest_has_raft(manifest: &Manifest) -> bool {
+    manifest
+        .agent
+        .iter()
+        .any(|a| a.consistency == ConsistencyDef::Raft)
+}
+
+/// Resolve the initial Raft cluster membership at startup.
+///
+/// The list is `{self_prefix} ∪ {prefixes of every --connect
+/// bootnode that completed the libp2p Hello handshake within
+/// [`RAFT_BOOTSTRAP_TIMEOUT`]}`. A bootnode that never
+/// handshakes is dropped — the cluster forms without it. With
+/// `network = None` (no listening / no dialing), returns
+/// `vec![]` which `vos::node` interprets as single-node mode.
+fn resolve_raft_members(
+    network: Option<&vos::network::Network>,
+    connect_cli: &[String],
+) -> Vec<u16> {
+    let Some(net) = network else {
+        return Vec::new();
+    };
+    let self_prefix = net.local_prefix();
+    if connect_cli.is_empty() {
+        // Bootstrap node: solo cluster, future joiners arrive via
+        // `change_membership` once Phase B's join RPC lands.
+        eprintln!(
+            "vosx: raft cluster bootstrapping solo (no --connect peers); \
+             additional members can join later via dynamic membership"
+        );
+        return vec![self_prefix];
+    }
+    eprintln!(
+        "vosx: waiting up to {}s for {} --connect bootnode(s) to handshake \
+         before freezing raft membership",
+        RAFT_BOOTSTRAP_TIMEOUT.as_secs(),
+        connect_cli.len(),
+    );
+    // Each --connect address may have already been dialed by
+    // `Network::start`'s bootstrap list. We don't know which
+    // PeerId each address resolves to until the handshake
+    // completes, so the wait condition is purely numeric:
+    // peers_with_prefixes().len() >= connect_cli.len().
+    let deadline = std::time::Instant::now() + RAFT_BOOTSTRAP_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if net.peers_with_prefixes().len() >= connect_cli.len() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut members: Vec<u16> = std::iter::once(self_prefix)
+        .chain(net.peers_with_prefixes().into_iter().map(|(p, _)| p))
+        .collect();
+    members.sort_unstable();
+    members.dedup();
+    let discovered = members.len() - 1; // minus self
+    if discovered < connect_cli.len() {
+        eprintln!(
+            "vosx: warning — only {discovered} of {} --connect peer(s) \
+             handshaked within {}s; raft cluster forming with {} member(s)",
+            connect_cli.len(),
+            RAFT_BOOTSTRAP_TIMEOUT.as_secs(),
+            members.len(),
+        );
+    }
+    let pretty: Vec<String> = members.iter().map(|p| format!("{p:#06x}")).collect();
+    eprintln!("vosx: raft initial membership = [{}]", pretty.join(", "));
+    members
 }

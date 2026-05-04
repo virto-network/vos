@@ -77,7 +77,7 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
-/// Format a `provides = [...]` tag for `vosx list` output, or
+/// Format a `provides = [...]` tag for `vosx ls` output, or
 /// the empty string when the actor advertises no roles.
 pub fn format_provides(provides: &[String]) -> String {
     if provides.is_empty() {
@@ -100,7 +100,7 @@ pub fn exit_with_status(panics: u32) {
 
 /// Print the actor metadata baked into an ELF — the actor's
 /// declared messages and constructor params, recovered from
-/// the `.vos_meta` section. Used by `vosx list` to render the
+/// the `.vos_meta` section. Used by `vosx ls` to render the
 /// space's API surface.
 pub fn print_actor_meta(name: &str, path: &Path, role: &str) {
     let Ok(data) = std::fs::read(path) else {
