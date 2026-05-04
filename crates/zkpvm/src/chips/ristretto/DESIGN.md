@@ -463,6 +463,35 @@ point ops + their carry-chain witnesses).
   with a precomputed table chip; defer to Phase R2 unless
   measurements show it's the difference between 1.2 s and 0.8 s.
 
+## 10b. Measured row projection (R1e)
+
+The R1e double-and-add composition gives concrete row counts per
+operation, validated by `project_ristretto_chip_size_for_one_payment`:
+
+| Operation                              | Rows  |
+|----------------------------------------|------:|
+| Scalar mult (256-bit, double-and-add)  | 4150–6400 |
+| Point addition (extended Edwards)      | 18 |
+| Point doubling (extended Edwards)      | 16 |
+
+**Per cipher-clerk private payment** (1 Pedersen v·G + b·H + add,
+1 Schnorr k·G + sk·G): **21,118 chip rows ⇒ chip log_size 15**.
+
+Throughput on the dev box, from clerk-private-pay-bench at log17 in
+6.5s: ~17.7M cells/s.  Projected prove time IF the constraint-debug
+bug were resolved:
+
+| Configuration                        | Prove time |
+|--------------------------------------|----:|
+| CPU only                             | ~7.8 s |
+| CPU + GPU (3×)                       | ~2.6 s |
+| CPU + NAF-w4 (−30% rows) + GPU       | ~1.8 s |
+
+**Sub-second** requires **all** of: NAF-w4, GPU/SIMD, tighter chip
+cells (smaller M31 carry chains), AND lower security parameters
+(e.g. 80-bit for low-value, 96-bit for high-value).  ~2 s on
+mobile is the realistic floor without major chip refactors.
+
 ## 10. Sub-second target — what hits
 
 Working back from the goal:
