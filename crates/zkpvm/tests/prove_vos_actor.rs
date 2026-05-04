@@ -899,6 +899,88 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
     }
 }
 
+/// R1f-combined: realistic prove-time measurement combining the
+/// RistrettoChip's per-payment row sequence (~21K rows) with a
+/// non-trivial CpuChip baseline (loaded from fibonacci_actor's
+/// PVM trace).  This is the "chip on top of an existing actor
+/// trace" cost — the configuration users would actually pay for.
+#[test]
+fn bench_ristretto_chip_combined_with_cpu_baseline() {
+    use zkpvm::chips::ristretto::point::{
+        scalar_mult_rows, point_add_rows, point_identity,
+    };
+    use zkpvm::core::tracing::TracingPvm;
+    use std::time::Instant;
+
+    // CpuChip baseline: clerk-private-pay-bench actor (~37K PVM
+    // steps, log17 trace) — the realistic per-payment baseline.
+    let blob = load_actor_blob("clerk-private-pay-bench");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE")).expect("parse code");
+    let mut tracing = TracingPvm::new(interp);
+    let _ = tracing.run_with_vos_stubs();
+    let steps = tracing.into_trace();
+    eprintln!("CpuChip baseline: {} PVM steps", steps.len());
+
+    let mut side_note = zkpvm::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
+
+    // Push one private payment's worth of chip rows on top.
+    let scalar_v: [u8; 32] = {
+        let mut s = [0u8; 32]; s[0] = 50; s
+    };
+    let scalar_b: [u8; 32] = {
+        let mut s = [0u8; 32];
+        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
+        s[31] &= 0x7f; s
+    };
+    let id = point_identity();
+    let (vg_rows, vg_pt) = scalar_mult_rows(&scalar_v, &id);
+    let (bh_rows, bh_pt) = scalar_mult_rows(&scalar_b, &id);
+    let (add_rows, _) = point_add_rows(&vg_pt, &bh_pt);
+    let (kg_rows, _) = scalar_mult_rows(&scalar_v, &id);
+    let (skg_rows, _) = scalar_mult_rows(&scalar_b, &id);
+    let mut chip_rows = Vec::new();
+    chip_rows.extend(vg_rows);
+    chip_rows.extend(bh_rows);
+    chip_rows.extend(add_rows);
+    chip_rows.extend(kg_rows);
+    chip_rows.extend(skg_rows);
+    eprintln!("RistrettoChip rows: {}", chip_rows.len());
+
+    for row in chip_rows {
+        side_note.add_ristretto_field_row(row);
+    }
+
+    eprintln!("Proving combined trace (CpuChip + RistrettoChip)...");
+    let t = Instant::now();
+    let (proof, _) = prove_profiled(&mut side_note).expect("prove");
+    let prove_time = t.elapsed();
+    eprintln!("Prove: {:?}", prove_time);
+
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
+
+    let t = Instant::now();
+    verify(proof, &side_note).expect("verify");
+    eprintln!("Verify: {:?}", t.elapsed());
+
+    eprintln!();
+    eprintln!("=== ACTUAL combined prove time, fibonacci CpuChip + 1 payment chip ===");
+    eprintln!("Prove: {:>6.2} s", prove_time.as_secs_f64());
+}
+
 /// R1f: actual end-to-end prove-time measurement for one private
 /// payment's crypto core (1 Pedersen v·G + b·H + add, 1 Schnorr
 /// k·G + sk·G).  Pushes the full ~21K-row sequence through the
