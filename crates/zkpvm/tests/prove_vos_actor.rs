@@ -844,6 +844,85 @@ fn debug_fill_mul_one_times_one() {
         r.is_add, r.is_sub, r.is_mul, r.is_real);
 }
 
+/// R1e-quat diagnostic: 17 rows of 0·0=0 (forces log_size > LOG_N_LANES).
+/// If this passes, multiple is_mul rows compose; the failure on
+/// 1·1=1 is row-content-specific, not a row-count issue.
+#[test]
+#[ignore]
+fn debug_seventeen_mul_zero_rows() {
+    use zkpvm::chips::ristretto::witness::fill_mul;
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    for _ in 0..17 {
+        side_note.add_ristretto_field_row(fill_mul([0u8; 32], [0u8; 32]));
+    }
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("17 mul-zero rows: prove failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("17 mul-zero rows: verify failed");
+    eprintln!("17 mul-zero rows: PROVED + VERIFIED");
+}
+
+/// R1e-quat bisect over which witness CELL triggers the failure.
+/// Each scenario hand-crafts a single field-op row with one specific
+/// non-zero cell and reports prove pass/fail.
+#[test]
+#[ignore]
+fn debug_mul_cell_bisect() {
+    use zkpvm::chips::ristretto::witness::FieldOpRow;
+
+    let scenarios: Vec<(&str, Box<dyn Fn(&mut FieldOpRow)>)> = vec![
+        ("only_a0",       Box::new(|r| { r.a[0] = 1; })),
+        ("a0_and_mp0",    Box::new(|r| { r.a[0] = 1; r.mul_product[0] = 1; })),
+        ("a0b0_mp0",      Box::new(|r| { r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1; })),
+        ("a0b0_mp0_p1lo0",Box::new(|r| { r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1; r.pass1_lo[0] = 1; })),
+        ("full_chain_no_out",  Box::new(|r| {
+            r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1;
+            r.pass1_lo[0] = 1; r.pass2_lo[0] = 1; r.after_top_bit[0] = 1;
+        })),
+        ("full_chain",    Box::new(|r| {
+            r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1;
+            r.pass1_lo[0] = 1; r.pass2_lo[0] = 1; r.after_top_bit[0] = 1;
+            r.out[0] = 1;
+        })),
+    ];
+
+    for (name, mutate) in scenarios {
+        let mut side_note = zkpvm::SideNote::new(
+            Vec::new(), Vec::new(), Vec::new(),
+        );
+        let mut row = FieldOpRow::default();
+        row.is_mul = 1;
+        row.is_real = 1;
+        // Final-form borrow chain expects p − out − 1 ≥ 0; for the
+        // small `out` values we use, the witness produces ff_brw=0
+        // throughout if we recompute it.
+        mutate(&mut row);
+        // Recompute final_form_borrow for the chosen out:
+        let mut bw: i16 = 1;
+        for i in 0..32 {
+            let p_i = if i == 0 { 0xed } else if i == 31 { 0x7f } else { 0xff };
+            let v = p_i as i16 - row.out[i] as i16 - bw;
+            bw = if v < 0 { 1 } else { 0 };
+            row.final_form_borrow[i] = bw as u8;
+        }
+        side_note.add_ristretto_field_row(row);
+
+        let config = zkpvm::PcsConfig {
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        };
+        let r = zkpvm::prove_with_config(&mut side_note, config);
+        eprintln!("scenario {}: {}", name, if r.is_ok() { "OK" } else { "FAIL" });
+    }
+}
+
 /// R1e-quat: chip-on test for the trivial is_mul row 0·0=0.  All
 /// witness columns hold zero, every is_mul-gated chain reduces to
 /// 0 = 0.  Demonstrates the chip-on integration plumbing works
