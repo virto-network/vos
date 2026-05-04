@@ -28,6 +28,7 @@ use stwo::{
         poly::{circle::CircleEvaluation, BitReversedOrder},
     },
 };
+use num_traits::{One, Zero};
 use stwo_constraint_framework::EvalAtRow;
 
 #[cfg(feature = "prover")]
@@ -125,7 +126,34 @@ pub enum PreprocessedColumn {
     Reserved,
 }
 
+/// p25519 byte constants — `p = 2²⁵⁵ - 19`, little-endian.  Used by
+/// the conditional-reduction sub-chain in `add_constraints` to embed
+/// the modulus as AIR-time constants rather than preprocessed columns
+/// (saves 32 preprocessed cells × num_rows for purely static data).
+const P_BYTE_CONSTS: [u8; 32] = {
+    let mut p = [0xffu8; 32];
+    p[0] = 0xed; // matches field::P_BYTES; cross-checked below
+    p[31] = 0x7f;
+    p
+};
+// Compile-time agreement with the host reference.
+#[cfg(feature = "prover")]
+const _: () = {
+    let h = field::P_BYTES;
+    let c = P_BYTE_CONSTS;
+    let mut i = 0;
+    while i < 32 {
+        assert!(h[i] == c[i], "P_BYTE_CONSTS diverged from field::P_BYTES");
+        i += 1;
+    }
+};
+
 impl BuiltInComponent for RistrettoChip {
+    /// Sum-chain and sub-chain constraints are degree 3 (`is_real *
+    /// is_add * (...)`).  Boolean checks on flags are degree 2.  Both
+    /// fit a log_size + 2 trace bound.
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     /// Placeholder.  Real lookups (MemoryAccess for boundary I/O,
@@ -136,12 +164,101 @@ impl BuiltInComponent for RistrettoChip {
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
-        _trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         _lookup_elements: &Range256LookupElements,
     ) {
-        // No constraints in the empty stub.  A `finalize_logup()` is
-        // still required so the framework knows the chip's lookup
-        // bookkeeping is closed.
+        let a       = crate::trace::trace_eval!(trace_eval, Column::FieldA);
+        let b       = crate::trace::trace_eval!(trace_eval, Column::FieldB);
+        let out     = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
+        let interm  = crate::trace::trace_eval!(trace_eval, Column::AddIntermediate);
+        let carry   = crate::trace::trace_eval!(trace_eval, Column::AddCarry);
+        let borrow  = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
+        let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
+        let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
+        let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
+        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+
+        let f256 = E::F::from(BaseField::from(256u32));
+
+        // ── Boolean flags ──
+        // Each flag column must hold 0 or 1.  Degree-2 each.
+        for flag in [&is_ovf, &is_add, &is_sub, &is_real] {
+            eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
+        }
+        for c in carry.iter() {
+            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+        }
+        for c in borrow.iter() {
+            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+        }
+
+        // ── Real-row partition: exactly one op flag is 1 ──
+        // is_real = 1 ⇒ is_add + is_sub = 1.
+        // is_real = 0 ⇒ is_add = is_sub = 0 (gated below by other
+        // chains), partition collapses to 0 = 0.
+        eval.add_constraint(
+            is_real[0].clone() * (is_add[0].clone() + is_sub[0].clone() - E::F::one())
+        );
+        // Padding rows: all op flags zero (so the gating chains stay
+        // inert and we don't witness fictitious operations).
+        let not_real = E::F::one() - is_real[0].clone();
+        eval.add_constraint(not_real.clone() * is_add[0].clone());
+        eval.add_constraint(not_real * is_sub[0].clone());
+
+        // ── R1c-3: byte-wise sum chain (is_add rows only) ──
+        //
+        //   intermediate[i] + 256·carry[i] = a[i] + b[i] + carry[i-1]
+        //
+        // gated by is_real · is_add so non-add rows leave intermediate
+        // and carry free (will be pinned by R1c-3-bis sub chain and
+        // R1c-4 mul chain in their respective op flavors).  carry[-1]
+        // is the implicit 0.
+        let real_add = is_real[0].clone() * is_add[0].clone();
+        for i in 0..32 {
+            let carry_in = if i == 0 { E::F::zero() } else { carry[i - 1].clone() };
+            let lhs = interm[i].clone() + carry[i].clone() * f256.clone();
+            let rhs = a[i].clone() + b[i].clone() + carry_in;
+            eval.add_constraint(real_add.clone() * (lhs - rhs));
+        }
+
+        // ── R1c-3: conditional-reduction sub-chain (is_add rows) ──
+        //
+        //   out[i] = intermediate[i] − is_overflow·p[i] + 256·sub_borrow[i]
+        //                                                 − sub_borrow[i-1]
+        //
+        // rearranged to constraint form:
+        //
+        //   intermediate[i] − is_overflow·p[i] − sub_borrow[i-1]
+        //     + 256·sub_borrow[i] − out[i] = 0
+        //
+        // gated by is_real · is_add.  Same gating discipline as the
+        // sum chain so non-add rows are unconstrained on these cells.
+        for i in 0..32 {
+            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
+            let borrow_in = if i == 0 { E::F::zero() } else { borrow[i - 1].clone() };
+            let constraint = interm[i].clone()
+                - is_ovf[0].clone() * p_i
+                - borrow_in
+                + borrow[i].clone() * f256.clone()
+                - out[i].clone();
+            eval.add_constraint(real_add.clone() * constraint);
+        }
+
+        // R1c-3 leaves OPEN:
+        // 1. Final-form check `out < p` to make is_overflow witness-
+        //    deterministic.  R1c-3-bis lands either via a Range256
+        //    consumer chain or a "p − out" sub-chain that proves
+        //    p − out > 0.  Without this, the chip is incomplete (a
+        //    malicious prover could pick is_overflow = 0 and have
+        //    out = a+b ≥ p without subtracting).  The chip is gated
+        //    OFF in active_components today so this isn't a live
+        //    soundness gap, just a TODO before R1f turns it on.
+        // 2. is_sub constraint chain (currently an unconstrained op
+        //    classifier).  R1c-3-bis adds the mirror sub-chain.
+        // 3. Range checks on FieldA/FieldB/FieldOut/AddIntermediate
+        //    bytes (each ∈ [0, 256)).  R1c-3-bis emits 32 Range256
+        //    lookups per real row.
+
         eval.finalize_logup();
     }
 }
