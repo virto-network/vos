@@ -76,6 +76,16 @@ pub struct SideNote {
     pub compare_entries: Vec<CompareEntry>,
     /// Phase 54g: per-divrem-row witness for DivRemChip.
     pub divrem_entries: Vec<DivRemEntry>,
+    /// R1e-quat: per-row witness for RistrettoChip's field-arithmetic
+    /// rows (is_add / is_sub / is_mul rows produced by the host-side
+    /// composition in chips::ristretto::{witness, point}).  Populated
+    /// either directly (chip-level tests) or by the trace driver
+    /// when an ECALL_RISTRETTO_SCALAR_MULT step is captured (R1f).
+    /// Empty when the chip is gated off; in that case
+    /// `generate_main_trace` emits all-zero padding rows and the
+    /// chip's lookup balance stays at 0 = 0.
+    #[cfg(feature = "prover")]
+    pub ristretto_field_rows: Vec<crate::chips::ristretto::witness::FieldOpRow>,
 }
 
 /// Phase 54g/54i/54k — Single divrem-row witness for the DivRemLookup
@@ -219,6 +229,8 @@ impl SideNote {
             bitwise_entries: Vec::new(),
             compare_entries: Vec::new(),
             divrem_entries: Vec::new(),
+            #[cfg(feature = "prover")]
+            ristretto_field_rows: Vec::new(),
         }
     }
 
@@ -248,6 +260,47 @@ impl SideNote {
 
     pub fn add_range256(&mut self, value: u8) {
         self.range256_counts[value as usize] += 1;
+    }
+
+    /// R1e-quat: push one RistrettoChip field-op row AND increment the
+    /// Range256 multiplicity for every committed byte on that row.
+    /// Must be used in place of `ristretto_field_rows.push(row)` —
+    /// RangeMultiplicity256's trace fill runs at component index 9
+    /// while RistrettoChip is at index 19, so RistrettoChip can't
+    /// add to the byte counts after its own trace is being built.
+    /// Pushing through this helper guarantees Range256's negative-
+    /// multiplicity consumer side balances against the chip's
+    /// positive emissions.
+    #[cfg(feature = "prover")]
+    pub fn add_ristretto_field_row(
+        &mut self,
+        row: crate::chips::ristretto::witness::FieldOpRow,
+    ) {
+        if row.is_real != 0 {
+            for k in 0..32 {
+                self.add_range256(row.a[k]);
+                self.add_range256(row.b[k]);
+                self.add_range256(row.out[k]);
+                self.add_range256(row.add_intermediate[k]);
+                self.add_range256(row.pass1_lo[k]);
+                self.add_range256(row.pass1_carry[k]);
+                self.add_range256(row.pass1_carry_mid[k]);
+                self.add_range256(row.pass2_lo[k]);
+                self.add_range256(row.pass2_carry[k]);
+                self.add_range256(row.after_top_bit[k]);
+                self.add_range256(row.after_top_carry[k]);
+            }
+            for k in 0..64 {
+                self.add_range256(row.mul_product[k]);
+                self.add_range256(row.mul_carry[k]);
+                self.add_range256(row.mul_carry_mid[k]);
+                self.add_range256(row.mul_carry_hi[k]);
+            }
+            for k in 0..2 {
+                self.add_range256(row.pass1_hi[k]);
+            }
+        }
+        self.ristretto_field_rows.push(row);
     }
 
     pub fn add_bitwise_and(&mut self, a: u8, b: u8) {

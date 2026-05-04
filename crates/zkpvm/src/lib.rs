@@ -214,10 +214,10 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         {
             a.blake2b = true;
         }
-        // Phase R1b — Ristretto scalar-mult ECALL detection.  Today
-        // the chip is empty (no constraints, no lookups), but the
-        // gating is wired so R1c–R1e can drop real columns in
-        // without re-touching activity selection.
+        // Phase R1b/R1e-quat — Ristretto chip activity is true if
+        // either an ECALL_RISTRETTO_SCALAR_MULT step is present, OR
+        // the SideNote already carries pre-built field rows (chip-
+        // level tests that skip the ECALL path).
         if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
             && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64
         {
@@ -238,6 +238,11 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
             || f.is_branch
         { a.compare = true; }
         if f.is_div_rem { a.divrem = true; }
+    }
+    // Chip-level tests that bypass the ECALL path can pre-populate
+    // ristretto_field_rows directly.
+    if !side_note.ristretto_field_rows.is_empty() {
+        a.ristretto = true;
     }
     a
 }

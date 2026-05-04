@@ -60,8 +60,19 @@ use crate::side_note::SideNote;
 pub struct RistrettoChip;
 
 /// Smallest valid log_size — one SIMD lane's worth of padding rows.
-/// Real chip will switch to a per-call sizing once R1c–R1e land.
-const RISTRETTO_LOG_SIZE: u32 = LOG_N_LANES;
+/// Used when the chip is gated on but has zero rows (boundary case).
+const RISTRETTO_MIN_LOG_SIZE: u32 = LOG_N_LANES;
+
+/// R1e-quat: derive the chip's log_size from `side_note
+/// .ristretto_field_rows.len()`.  Each row witnesses one field op;
+/// the chip pads to the next power of two ≥ rows.len(), with a
+/// floor at LOG_N_LANES.
+#[cfg(feature = "prover")]
+fn ristretto_log_size(side_note: &SideNote) -> u32 {
+    let n = side_note.ristretto_field_rows.len() as u32;
+    let log = 32 - n.saturating_sub(1).leading_zeros();
+    log.max(RISTRETTO_MIN_LOG_SIZE)
+}
 
 /// Per-row column layout for the field-arithmetic phase of the chip.
 ///
@@ -251,10 +262,12 @@ const _: () = {
 };
 
 impl BuiltInComponent for RistrettoChip {
-    /// Sum-chain and sub-chain constraints are degree 3 (`is_real *
-    /// is_add * (...)`).  Boolean checks on flags are degree 2.  Both
-    /// fit a log_size + 2 trace bound.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    /// Schoolbook constraint is `real_mul · (a[i]·b[j] − ...)`,
+    /// degree 4 (real_mul = is_real·is_mul = degree 2; partial-
+    /// product is degree 2).  Bump to bound 3 to give 2³+1 = 9
+    /// degree headroom; dial back to 2 if we can refactor real_mul
+    /// to a single witness column.
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 3;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -567,22 +580,15 @@ impl BuiltInComponent for RistrettoChip {
         // contributions inline.
         for k in 0..32 {
             let carry_in = if k == 0 { E::F::zero() } else { pass2_carry[k - 1].clone() };
-            // inject 38·pass1_hi at byte position 0 and 1; higher
-            // positions = 0 (since 38·pass1_hi fits in ≤ 16 bits).
+            // Inject 38·pass1_hi[0] at k=0 and 38·pass1_hi[1] at
+            // k=1.  Each is at most 38·255 = 9690 (~14 bits).  The
+            // carry chain absorbs this; pass2_carry[k] can hold up
+            // to ~15 bits at k=0..1 (Range256-pinned to a byte; the
+            // tighter range invariant is enforced implicitly by the
+            // chain closure constraint below).
             let inject_byte = match k {
-                // 38 · pass1_hi[0] contributes to byte 0; high byte
-                // of (38·pass1_hi[0]) overflows into byte 1.
-                // Plus 38·pass1_hi[1] is at byte 1 (256-place).
-                //
-                // Cleanest: model 38·pass1_hi_value as a 32-byte
-                // injection, gated to be nonzero only at k ∈ {0, 1, 2}.
-                // For chip simplicity and to avoid chain branching,
-                // we inject the FULL value 38·pass1_hi_value at k=0
-                // and let the carry chain absorb it.  This means
-                // inject[0] = 38·pass1_hi_value (which can be ≤
-                // 1482 = 5.5 bits + 5 bits = 2-byte field element);
-                // the carry chain naturally splits it across k=0..2.
-                0 => f38.clone() * pass1_hi_value(),
+                0 => f38.clone() * pass1_hi[0].clone(),
+                1 => f38.clone() * pass1_hi[1].clone(),
                 _ => E::F::zero(),
             };
             let constraint = pass2_lo[k].clone()
@@ -763,9 +769,10 @@ impl BuiltInProverComponent for RistrettoChip {
     fn generate_preprocessed_trace(
         &self,
         _log_size: u32,
-        _side_note: &SideNote,
+        side_note: &SideNote,
     ) -> FinalizedTrace {
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(RISTRETTO_LOG_SIZE);
+        let log_size = ristretto_log_size(side_note);
+        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
             trace.fill_columns(row, BaseField::from(0u32), PreprocessedColumn::Reserved);
@@ -773,22 +780,63 @@ impl BuiltInProverComponent for RistrettoChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace(&self, _side_note: &mut SideNote) -> FinalizedTrace {
-        // R1c-2: trace is still all-zero rows.  Real per-call rows
-        // come from `side_note.ristretto_field_rows` once R1e schedules
-        // them through the chip; for now the chip is gated off in
-        // active_components anyway, so num_rows worth of padding is
-        // sufficient for the framework's commitment shape.
-        let mut trace = TraceBuilder::<Column>::new(RISTRETTO_LOG_SIZE);
+    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+        // R1e-quat: lay each FieldOpRow into its column slots.
+        // Padding rows beyond rows.len() have is_real = 0 and all
+        // cells zero — chip's gating constraints make them inert.
+        let log_size = ristretto_log_size(side_note);
+        let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
-        for row in 0..num_rows {
-            // Padding row: is_real = 0, all other cells = 0.
-            // Layout exists in `Column` enum so future commits can
-            // light it up row-by-row without re-touching the chip's
-            // shape (which would bump PROOF_FORMAT_VERSION).
-            trace.fill_columns(row, BaseField::from(0u32), Column::IsReal);
-            let _ = row; // silence unused on the padding-only path
+        // Borrow the rows — the side_note is shared with the
+        // verifier-side active_components selection, which checks
+        // `ristretto_field_rows.is_empty()` to decide whether the
+        // chip is in the active set.  Moving the rows out would
+        // hide them from the verifier and trigger a chip-set
+        // mismatch.
+        for row_i in 0..num_rows {
+            let r = side_note.ristretto_field_rows.get(row_i).copied().unwrap_or_default();
+
+            // 32-byte cells.
+            trace.fill_columns_bytes(row_i, &r.a,                  Column::FieldA);
+            trace.fill_columns_bytes(row_i, &r.b,                  Column::FieldB);
+            trace.fill_columns_bytes(row_i, &r.out,                Column::FieldOut);
+            trace.fill_columns_bytes(row_i, &r.add_intermediate,   Column::AddIntermediate);
+            trace.fill_columns_bytes(row_i, &r.add_carry,          Column::AddCarry);
+            trace.fill_columns_bytes(row_i, &r.sub_borrow,         Column::SubBorrow);
+            trace.fill_columns_bytes(row_i, &r.final_form_borrow,  Column::FinalFormBorrow);
+            trace.fill_columns_bytes(row_i, &r.sub_chain_borrow,   Column::SubChainBorrow);
+            trace.fill_columns_bytes(row_i, &r.pass1_lo,           Column::Pass1Lo);
+            trace.fill_columns_bytes(row_i, &r.pass1_carry,        Column::Pass1Carry);
+            trace.fill_columns_bytes(row_i, &r.pass1_carry_mid,    Column::Pass1CarryMid);
+            trace.fill_columns_bytes(row_i, &r.pass2_lo,           Column::Pass2Lo);
+            trace.fill_columns_bytes(row_i, &r.pass2_carry,        Column::Pass2Carry);
+            trace.fill_columns_bytes(row_i, &r.after_top_bit,      Column::AfterTopBit);
+            trace.fill_columns_bytes(row_i, &r.after_top_carry,    Column::AfterTopCarry);
+
+            // 64-byte cells (mul witnesses).
+            trace.fill_columns_bytes(row_i, &r.mul_product,        Column::MulProduct);
+            trace.fill_columns_bytes(row_i, &r.mul_carry,          Column::MulCarry);
+            trace.fill_columns_bytes(row_i, &r.mul_carry_mid,      Column::MulCarryMid);
+            trace.fill_columns_bytes(row_i, &r.mul_carry_hi,       Column::MulCarryHi);
+
+            // 2-byte (Pass1Hi).
+            trace.fill_columns_bytes(row_i, &r.pass1_hi,           Column::Pass1Hi);
+
+            // 1-byte flag/bit cells.
+            trace.fill_columns(row_i, r.is_overflow,     Column::IsOverflow);
+            trace.fill_columns(row_i, r.pass2_carry_out, Column::Pass2CarryOut);
+            trace.fill_columns(row_i, r.pass2_top_bit,   Column::Pass2TopBit);
+            trace.fill_columns(row_i, r.is_add,          Column::IsAdd);
+            trace.fill_columns(row_i, r.is_sub,          Column::IsSub);
+            trace.fill_columns(row_i, r.is_mul,          Column::IsMul);
+            trace.fill_columns(row_i, r.is_real,         Column::IsReal);
+
+            // Range256 multiplicity is bumped by the row-push
+            // helper `SideNote::add_ristretto_field_row` (called
+            // BEFORE prove_impl runs).  RangeMultiplicity256's main
+            // trace fill then matches the consumer-side balance.
         }
+
         trace.finalize_bit_reversed()
     }
 

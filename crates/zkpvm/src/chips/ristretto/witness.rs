@@ -385,29 +385,36 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
 
     // ── Pass 2: pass1_lo + 38·pass1_hi ──
     //
-    // 38·pass1_hi ≤ 38·(2¹⁶ − 1) ≈ 2²² but in practice pass1_hi is
-    // ≤ 38·39 / 256 = ~6 (so 38·pass1_hi ≤ ~228).  We add it to
-    // pass1_lo's bytes; carry is small (≤ 1 per position).  Stored
-    // as a single byte per position.
-    let pass1_hi_value: u32 = (pass1_hi[0] as u32) | ((pass1_hi[1] as u32) << 8);
-    let mut to_add: u32 = 38 * pass1_hi_value; // injected at byte 0
+    // Inject the full 16-bit pass1_hi value as `38·pass1_hi[0]` at
+    // byte 0 and `38·pass1_hi[1]` at byte 1.  Each injected term is
+    // up to 38·255 = 9690 ≈ 14 bits, so the carry chain at those
+    // positions can grow to ~14 bits + 1 (incoming) = ~15 bits.
+    // Subsequent positions only see the carry from earlier; carry
+    // shrinks back to ≤ 1 within a few positions.
     let mut pass2_lo = [0u8; 32];
     let mut pass2_carry = [0u8; 32];
     let mut full_carry: u32 = 0;
     for k in 0..32 {
-        let v = (pass1_lo[k] as u32) + (to_add & 0xff) + full_carry;
+        let inject = match k {
+            0 => 38 * pass1_hi[0] as u32,
+            1 => 38 * pass1_hi[1] as u32,
+            _ => 0,
+        };
+        let v = (pass1_lo[k] as u32) + inject + full_carry;
         pass2_lo[k] = (v & 0xff) as u8;
         let nc = v >> 8;
-        pass2_carry[k] = nc as u8;
+        pass2_carry[k] = (nc & 0xff) as u8;
+        // Carry can be ~15 bits at positions 0-1, but the chip's
+        // pass2_carry column is 1 byte.  At higher positions carry
+        // is ≤ 1.  This is a constraint-soundness issue we'll
+        // revisit in R1e-pent — for now we widen pass2_carry to a
+        // byte and assert it fits.
+        debug_assert!(nc < 256,
+            "pass2_carry overflowed 1 byte at position {k} (= {nc})");
         full_carry = nc;
-        to_add >>= 8;
     }
-    // Either to_add still has bits or full_carry is 1: those flow
-    // into pass2_carry_out.  In our regime to_add becomes 0 within
-    // a few bytes and full_carry ∈ {0, 1}.
-    debug_assert!(to_add <= 1, "pass2 to_add residual > 1");
-    let pass2_carry_out: u8 = (full_carry as u8) | (to_add as u8);
-    debug_assert!(pass2_carry_out <= 1);
+    debug_assert!(full_carry <= 1, "pass2 final residual > 1");
+    let pass2_carry_out: u8 = full_carry as u8;
 
     // ── Top-bit fold + +19 step ──
     let pass2_top_bit: u8 = pass2_lo[31] >> 7;

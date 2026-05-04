@@ -160,7 +160,7 @@ pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -
 #[cfg(feature = "debug-internals")]
 pub fn debug_claimed_sums(side_note: &mut SideNote) {
     use num_traits::Zero;
-    let components = BASE_COMPONENTS;
+    let components = crate::BASE_COMPONENTS;
     let component_names = [
         "CpuChip", "Blake2b", "MemoryChip", "MemBoundary",
         "RegMemory", "RegMemBoundary",
