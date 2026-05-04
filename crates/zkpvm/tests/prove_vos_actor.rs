@@ -786,6 +786,64 @@ fn prove_ristretto_chip_field_mul() {
     eprintln!("RistrettoChip field-mul: PROVED + VERIFIED");
 }
 
+/// R1e-quat diagnostic: prove an is_mul row whose every byte
+/// matches a known-passing is_add row.  Specifically: take 1+2=3
+/// add witness, but flip is_add → is_mul.  This isolates whether
+/// the bug is "any non-zero is_mul row" or "is_mul row with the
+/// schoolbook witness pattern".
+#[test]
+#[ignore]
+fn prove_ristretto_chip_field_mul_minimal_diff() {
+    use zkpvm::chips::ristretto::witness::{fill_add, FieldOpRow};
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    let mut a = [0u8; 32]; a[0] = 1;
+    let mut b = [0u8; 32]; b[0] = 2;
+    // Build an is_add row, then mutate just is_add → is_mul.
+    let mut row = fill_add(a, b);
+    row.is_add = 0;
+    row.is_mul = 1;
+    let _ = FieldOpRow::default;
+    side_note.add_ristretto_field_row(row);
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("minimal-diff (add witness w/ is_mul flag) failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("minimal-diff verify failed");
+    eprintln!("minimal-diff: PROVED + VERIFIED");
+}
+
+#[test]
+#[ignore]
+fn debug_fill_mul_one_times_one() {
+    use zkpvm::chips::ristretto::witness::fill_mul;
+    let mut a = [0u8; 32]; a[0] = 1;
+    let mut b = [0u8; 32]; b[0] = 1;
+    let r = fill_mul(a, b);
+    eprintln!("a[0]={}, b[0]={}, out[0]={}", r.a[0], r.b[0], r.out[0]);
+    eprintln!("mul_product[0..4]={:?}", &r.mul_product[..4]);
+    eprintln!("mul_carry[0..4]={:?}", &r.mul_carry[..4]);
+    eprintln!("mul_carry_mid[0..4]={:?}", &r.mul_carry_mid[..4]);
+    eprintln!("mul_carry_hi[0..4]={:?}", &r.mul_carry_hi[..4]);
+    eprintln!("pass1_lo[0..4]={:?}", &r.pass1_lo[..4]);
+    eprintln!("pass1_hi={:?}", r.pass1_hi);
+    eprintln!("pass2_lo[0..4]={:?}", &r.pass2_lo[..4]);
+    eprintln!("pass2_carry_out={}, pass2_top_bit={}", r.pass2_carry_out, r.pass2_top_bit);
+    eprintln!("after_top_bit[0..4]={:?}", &r.after_top_bit[..4]);
+    eprintln!("is_overflow={}, sub_borrow[0]={}", r.is_overflow, r.sub_borrow[0]);
+    eprintln!("ff_borrow[31]={}", r.final_form_borrow[31]);
+    eprintln!("flags: is_add={}, is_sub={}, is_mul={}, is_real={}",
+        r.is_add, r.is_sub, r.is_mul, r.is_real);
+}
+
 /// R1e-quat: chip-on test for the trivial is_mul row 0·0=0.  All
 /// witness columns hold zero, every is_mul-gated chain reduces to
 /// 0 = 0.  Demonstrates the chip-on integration plumbing works

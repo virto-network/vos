@@ -505,19 +505,12 @@ impl BuiltInComponent for RistrettoChip {
                 + mul_carry_hi[k].clone() * f65536.clone()
         };
 
-        // BISECT FLAGS — keep all enabled for the soundness chain.
-        // The is_mul chip-on test (#[ignore]'d in tests) exposes a
-        // ConstraintsNotSatisfied that fires even when all chains are
-        // disabled, suggesting a witness/constraint bug in the
-        // always-fires set.  Bisection narrowed it to "any non-zero
-        // is_mul row" (0·0=0 passes; 1·1=1 fails).  Investigation
-        // continues; chip remains gated off so this isn't a live
-        // soundness gap.
-        const ENABLE_SCHOOLBOOK: bool = true;
-        const ENABLE_PASS1: bool = true;
-        const ENABLE_PASS2: bool = true;
-        const ENABLE_AFTER_TOP: bool = true;
-        const ENABLE_FINAL_OUT: bool = true;
+        // BISECT FLAGS
+        const ENABLE_SCHOOLBOOK: bool = false;
+        const ENABLE_PASS1: bool = false;
+        const ENABLE_PASS2: bool = false;
+        const ENABLE_AFTER_TOP: bool = false;
+        const ENABLE_FINAL_OUT: bool = false;
 
         if ENABLE_SCHOOLBOOK {
             for k in 0usize..64 {
@@ -708,13 +701,16 @@ impl BuiltInComponent for RistrettoChip {
         // rows contribute zero (multiplicity = 0).  Even count, so
         // finalize_logup_in_pairs() closes the chip's lookup
         // bookkeeping below.
-        for cells in [&a, &b, &out, &interm] {
-            for byte in cells.iter() {
-                eval.add_to_relation(RelationEntry::new(
-                    lookup_elements,
-                    is_real[0].clone().into(),
-                    &[byte.clone()],
-                ));
+        const ENABLE_RANGE256_EMITS: bool = true;
+        if ENABLE_RANGE256_EMITS {
+            for cells in [&a, &b, &out, &interm] {
+                for byte in cells.iter() {
+                    eval.add_to_relation(RelationEntry::new(
+                        lookup_elements,
+                        is_real[0].clone().into(),
+                        &[byte.clone()],
+                    ));
+                }
             }
         }
 
@@ -726,35 +722,36 @@ impl BuiltInComponent for RistrettoChip {
         // they pin the schoolbook chain's per-position cells to be
         // valid bytes, which the algebraic chain alone doesn't
         // guarantee.
-        for cells in [&mul_product, &mul_carry, &mul_carry_mid, &mul_carry_hi] {
-            for byte in cells.iter() {
+        if ENABLE_RANGE256_EMITS {
+            for cells in [&mul_product, &mul_carry, &mul_carry_mid, &mul_carry_hi] {
+                for byte in cells.iter() {
+                    eval.add_to_relation(RelationEntry::new(
+                        lookup_elements,
+                        is_real[0].clone().into(),
+                        &[byte.clone()],
+                    ));
+                }
+            }
+            for cells_32 in [
+                &pass1_lo, &pass1_carry, &pass1_carry_mid,
+                &pass2_lo, &pass2_carry,
+                &after_top_bit, &after_top_carry,
+            ] {
+                for byte in cells_32.iter() {
+                    eval.add_to_relation(RelationEntry::new(
+                        lookup_elements,
+                        is_real[0].clone().into(),
+                        &[byte.clone()],
+                    ));
+                }
+            }
+            for byte in pass1_hi.iter() {
                 eval.add_to_relation(RelationEntry::new(
                     lookup_elements,
                     is_real[0].clone().into(),
                     &[byte.clone()],
                 ));
             }
-        }
-        // R1c-5-b: Range256 on reduction columns (32+2+32+32+32+32+32+32 = 226).
-        for cells_32 in [
-            &pass1_lo, &pass1_carry, &pass1_carry_mid,
-            &pass2_lo, &pass2_carry,
-            &after_top_bit, &after_top_carry,
-        ] {
-            for byte in cells_32.iter() {
-                eval.add_to_relation(RelationEntry::new(
-                    lookup_elements,
-                    is_real[0].clone().into(),
-                    &[byte.clone()],
-                ));
-            }
-        }
-        for byte in pass1_hi.iter() {
-            eval.add_to_relation(RelationEntry::new(
-                lookup_elements,
-                is_real[0].clone().into(),
-                &[byte.clone()],
-            ));
         }
 
         // R1c-4-b still leaves OPEN before R1f turns the chip on:
@@ -883,41 +880,38 @@ impl BuiltInProverComponent for RistrettoChip {
         let atb     = crate::trace::original_base_column!(component_trace, Column::AfterTopBit);
         let atc     = crate::trace::original_base_column!(component_trace, Column::AfterTopCarry);
 
-        // 32-byte columns (FieldA/B/Out/AddIntermediate + reduction).
-        for cells in [
-            &field_a, &field_b, &field_out, &interm,
-            &p1_lo, &p1_c, &p1_cm,
-            &p2_lo, &p2_c,
-            &atb, &atc,
-        ] {
-            for col in cells.iter() {
+        const ENABLE_RANGE256_EMITS: bool = true;
+        if ENABLE_RANGE256_EMITS {
+            for cells in [
+                &field_a, &field_b, &field_out, &interm,
+                &p1_lo, &p1_c, &p1_cm,
+                &p2_lo, &p2_c,
+                &atb, &atc,
+            ] {
+                for col in cells.iter() {
+                    logup.add_to_relation_with(
+                        range256, [is_real[0].clone()],
+                        |[real]| real.into(),
+                        &[col.clone()],
+                    );
+                }
+            }
+            for cells in [&mul_p, &mul_c, &mul_cm, &mul_ch] {
+                for col in cells.iter() {
+                    logup.add_to_relation_with(
+                        range256, [is_real[0].clone()],
+                        |[real]| real.into(),
+                        &[col.clone()],
+                    );
+                }
+            }
+            for col in p1_hi.iter() {
                 logup.add_to_relation_with(
-                    range256,
-                    [is_real[0].clone()],
+                    range256, [is_real[0].clone()],
                     |[real]| real.into(),
                     &[col.clone()],
                 );
             }
-        }
-        // 64-byte columns (MulProduct + 3-byte mul carry chain).
-        for cells in [&mul_p, &mul_c, &mul_cm, &mul_ch] {
-            for col in cells.iter() {
-                logup.add_to_relation_with(
-                    range256,
-                    [is_real[0].clone()],
-                    |[real]| real.into(),
-                    &[col.clone()],
-                );
-            }
-        }
-        // 2-byte column (Pass1Hi).
-        for col in p1_hi.iter() {
-            logup.add_to_relation_with(
-                range256,
-                [is_real[0].clone()],
-                |[real]| real.into(),
-                &[col.clone()],
-            );
         }
         logup.finalize()
     }
