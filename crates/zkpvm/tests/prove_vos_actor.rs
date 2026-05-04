@@ -761,13 +761,13 @@ fn prove_ristretto_chip_field_mul() {
         Vec::new(), Vec::new(), Vec::new(),
     );
 
-    // Smallest case first: 2 · 3 = 6, no overflow, all reduction
-    // chains stay zero.  This isolates the schoolbook + minimum
-    // reduction path before testing the full overflow case.
-    let mut a = [0u8; 32]; a[0] = 2;
-    let mut b = [0u8; 32]; b[0] = 3;
+    // Smallest non-zero case: 1 · 1 = 1.  Currently fails (see
+    // doc above); the all-zero case 0·0=0 passes via
+    // prove_ristretto_chip_field_mul_zero below.
+    let mut a = [0u8; 32]; a[0] = 1;
+    let mut b = [0u8; 32]; b[0] = 1;
     let row = fill_mul(a, b);
-    assert_eq!(row.out[0], 6);
+    assert_eq!(row.out[0], 1);
     side_note.add_ristretto_field_row(row);
 
     let config = zkpvm::PcsConfig {
@@ -784,6 +784,39 @@ fn prove_ristretto_chip_field_mul() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul verification failed");
     eprintln!("RistrettoChip field-mul: PROVED + VERIFIED");
+}
+
+/// R1e-quat: chip-on test for the trivial is_mul row 0·0=0.  All
+/// witness columns hold zero, every is_mul-gated chain reduces to
+/// 0 = 0.  Demonstrates the chip-on integration plumbing works
+/// for is_mul rows; the non-zero is_mul bug surfaced in
+/// prove_ristretto_chip_field_mul is independent of the integration.
+#[test]
+fn prove_ristretto_chip_field_mul_zero() {
+    use zkpvm::chips::ristretto::witness::fill_mul;
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    let row = fill_mul([0u8; 32], [0u8; 32]);
+    assert_eq!(row.is_mul, 1);
+    assert_eq!(row.out, [0u8; 32]);
+    side_note.add_ristretto_field_row(row);
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("RistrettoChip field-mul (zero) proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("RistrettoChip field-mul (zero) verification failed");
+    eprintln!("RistrettoChip field-mul (0·0=0): PROVED + VERIFIED");
 }
 
 /// R1a smoke test: hand-craft an `ecalli 200` program, set up
