@@ -231,6 +231,26 @@ pub enum Column {
     /// real rows.
     #[size = 1]
     IsMul,
+    /// R1e-bdry: 1 iff this row is a BOUNDARY-INPUT producer row.
+    /// On is_input rows the chip emits the per-byte producer
+    /// tuples (so subsequent rows can consume from this row's
+    /// row_id) but DOES NOT fire field-op constraints or consumer
+    /// emissions.  The `out` column holds the boundary value;
+    /// `a`/`b` are unconstrained on is_input rows (typically zero).
+    /// Used for: ECALL scalar/point bytes, curve constants
+    /// (ED25519_TWO_D), point-identity coords, etc.
+    /// Mutually exclusive with IsAdd/IsSub/IsMul on real rows.
+    #[size = 1]
+    IsInput,
+    /// R1e-bdry: 1 iff this row is a BOUNDARY-OUTPUT consumer row.
+    /// On is_output rows the chip emits ONE consumer emission for
+    /// `a` (no producer, no `b` consumer, no field-op constraints).
+    /// Drains the final row's `out` from the chain so the lookup
+    /// balances.  In R1f, the ECALL OUTPUT boundary takes this
+    /// role via MemoryChip's write entries; for chip-only tests,
+    /// this row class lets us close the chain.
+    #[size = 1]
+    IsOutput,
 
     /// R1e-pent: row-id (low byte) of the row that produced this
     /// row's `a` input.  The chip emits a CONSUMER lookup keyed
@@ -355,13 +375,15 @@ impl BuiltInComponent for RistrettoChip {
         let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
         let is_mul  = crate::trace::trace_eval!(trace_eval, Column::IsMul);
+        let is_input = crate::trace::trace_eval!(trace_eval, Column::IsInput);
+        let is_output = crate::trace::trace_eval!(trace_eval, Column::IsOutput);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
         let f256 = E::F::from(BaseField::from(256u32));
 
         // ── Boolean flags ──
         // Each flag column must hold 0 or 1.  Degree-2 each.
-        for flag in [&is_ovf, &is_add, &is_sub, &is_mul, &is_real] {
+        for flag in [&is_ovf, &is_add, &is_sub, &is_mul, &is_input, &is_output, &is_real] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         for c in carry.iter() {
@@ -381,17 +403,20 @@ impl BuiltInComponent for RistrettoChip {
         }
 
         // ── Real-row partition: exactly one op flag is 1 ──
-        // is_real = 1 ⇒ is_add + is_sub + is_mul = 1.
+        // is_real = 1 ⇒ is_add + is_sub + is_mul + is_input + is_output = 1.
         // is_real = 0 ⇒ all op flags zero.
         eval.add_constraint(
             is_real[0].clone() * (
-                is_add[0].clone() + is_sub[0].clone() + is_mul[0].clone() - E::F::one()
+                is_add[0].clone() + is_sub[0].clone() + is_mul[0].clone()
+                    + is_input[0].clone() + is_output[0].clone() - E::F::one()
             )
         );
         let not_real = E::F::one() - is_real[0].clone();
         eval.add_constraint(not_real.clone() * is_add[0].clone());
         eval.add_constraint(not_real.clone() * is_sub[0].clone());
-        eval.add_constraint(not_real * is_mul[0].clone());
+        eval.add_constraint(not_real.clone() * is_mul[0].clone());
+        eval.add_constraint(not_real.clone() * is_input[0].clone());
+        eval.add_constraint(not_real * is_output[0].clone());
 
         // ── R1c-3: byte-wise sum chain (is_add rows only) ──
         //
@@ -817,11 +842,20 @@ impl BuiltInComponent for RistrettoChip {
         // producer — closes the inter-row binding gap by ensuring
         // every input must come from a prior row's `out` (or from
         // an external boundary producer with a sentinel row_id).
+        // Producer fires on rows that produce (op rows + input rows;
+        // NOT output rows which only consume).
+        let producer_gate = is_real[0].clone() * (E::F::one() - is_output[0].clone());
+        // Consumer A fires on op rows AND on output rows.
+        let consumer_a_gate = is_real[0].clone() * (E::F::one() - is_input[0].clone());
+        // Consumer B fires only on op rows (not on input or output).
+        let consumer_b_gate = is_real[0].clone()
+            * (E::F::one() - is_input[0].clone())
+            * (E::F::one() - is_output[0].clone());
         for k in 0..32 {
             // Producer.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                is_real[0].clone().into(),
+                producer_gate.clone().into(),
                 &[
                     row_idx_lo[0].clone(),
                     row_idx_hi[0].clone(),
@@ -829,10 +863,10 @@ impl BuiltInComponent for RistrettoChip {
                     out[k].clone(),
                 ],
             ));
-            // Consumer A.
+            // Consumer A: op rows + output rows.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                (-is_real[0].clone()).into(),
+                (-consumer_a_gate.clone()).into(),
                 &[
                     a_src_lo[0].clone(),
                     a_src_hi[0].clone(),
@@ -840,10 +874,10 @@ impl BuiltInComponent for RistrettoChip {
                     a[k].clone(),
                 ],
             ));
-            // Consumer B.
+            // Consumer B: op rows only.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                (-is_real[0].clone()).into(),
+                (-consumer_b_gate.clone()).into(),
                 &[
                     b_src_lo[0].clone(),
                     b_src_hi[0].clone(),
@@ -944,6 +978,8 @@ impl BuiltInProverComponent for RistrettoChip {
             trace.fill_columns(row_i, r.is_add,          Column::IsAdd);
             trace.fill_columns(row_i, r.is_sub,          Column::IsSub);
             trace.fill_columns(row_i, r.is_mul,          Column::IsMul);
+            trace.fill_columns(row_i, r.is_input,        Column::IsInput);
+            trace.fill_columns(row_i, r.is_output,       Column::IsOutput);
             trace.fill_columns(row_i, r.is_real,         Column::IsReal);
             // R1e-pent: source row IDs (2 bytes each).
             trace.fill_columns(row_i, (r.a_source_row & 0xff) as u8, Column::ASourceRowLo);
@@ -1069,11 +1105,18 @@ impl BuiltInProverComponent for RistrettoChip {
             component_trace, Column::FieldA);
         let b_cols = crate::trace::original_base_column!(
             component_trace, Column::FieldB);
+        let is_input_col = crate::trace::original_base_column!(
+            component_trace, Column::IsInput);
+        let is_output_col = crate::trace::original_base_column!(
+            component_trace, Column::IsOutput);
+        let one_packed = || stwo::prover::backend::simd::m31::PackedM31::broadcast(
+            BaseField::from(1u32));
         for k in 0..32 {
-            // Producer
+            // Producer: is_real * (1 - is_output)
             logup.add_to_relation_with(
-                regfile, [is_real[0].clone()],
-                |[real]| real.into(),
+                regfile,
+                [is_real[0].clone(), is_output_col[0].clone()],
+                |[real, output_flag]| (real * (one_packed() - output_flag)).into(),
                 &[
                     row_idx_lo_pp[0].clone(),
                     row_idx_hi_pp[0].clone(),
@@ -1081,10 +1124,11 @@ impl BuiltInProverComponent for RistrettoChip {
                     out_cols[k].clone(),
                 ],
             );
-            // Consumer A: -is_real
+            // Consumer A: is_real * (1 - is_input) [fires on op rows + output rows]
             logup.add_to_relation_with(
-                regfile, [is_real[0].clone()],
-                |[real]| (-real).into(),
+                regfile,
+                [is_real[0].clone(), is_input_col[0].clone()],
+                |[real, input_flag]| (-(real * (one_packed() - input_flag))).into(),
                 &[
                     a_src_lo_col[0].clone(),
                     a_src_hi_col[0].clone(),
@@ -1092,10 +1136,13 @@ impl BuiltInProverComponent for RistrettoChip {
                     a_cols[k].clone(),
                 ],
             );
-            // Consumer B: -is_real
+            // Consumer B: is_real * (1 - is_input) * (1 - is_output)
             logup.add_to_relation_with(
-                regfile, [is_real[0].clone()],
-                |[real]| (-real).into(),
+                regfile,
+                [is_real[0].clone(), is_input_col[0].clone(), is_output_col[0].clone()],
+                |[real, input_flag, output_flag]| {
+                    (-(real * (one_packed() - input_flag) * (one_packed() - output_flag))).into()
+                },
                 &[
                     b_src_lo_col[0].clone(),
                     b_src_hi_col[0].clone(),

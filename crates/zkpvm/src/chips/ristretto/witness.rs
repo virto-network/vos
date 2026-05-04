@@ -97,6 +97,15 @@ pub struct FieldOpRow {
     pub is_add: u8,
     pub is_sub: u8,
     pub is_mul: u8,
+    /// R1e-bdry: 1 iff this row is a boundary-INPUT producer (no
+    /// field-op constraints, no consumer emissions; only emits
+    /// producer tuples for `out`).  Mutually exclusive with
+    /// is_add/is_sub/is_mul on real rows.
+    pub is_input: u8,
+    /// R1e-bdry: 1 iff this row is a boundary-OUTPUT consumer
+    /// (drains the chain's final out via consumer A).  No producer,
+    /// no consumer B, no field-op constraints.
+    pub is_output: u8,
     /// R1e-pent: row-id of the row whose `out` produces this row's
     /// `a`.  Bound to the chip's `RistrettoRegisterFile` lookup.
     /// 0 by default (sentinel "input" row); writers must set
@@ -138,6 +147,8 @@ impl Default for FieldOpRow {
             is_add: 0,
             is_sub: 0,
             is_mul: 0,
+            is_input: 0,
+            is_output: 0,
             is_real: 0,
             a_source_row: 0,
             b_source_row: 0,
@@ -236,6 +247,8 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         is_add: 1,
         is_sub: 0,
         is_mul: 0,
+        is_input: 0,
+        is_output: 0,
         is_real: 1,
         a_source_row: 0, // caller sets via post-fill mutation if chaining
         b_source_row: 0,
@@ -323,6 +336,8 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         is_add: 0,
         is_sub: 1,
         is_mul: 0,
+        is_input: 0,
+        is_output: 0,
         is_real: 1,
         a_source_row: 0,
         b_source_row: 0,
@@ -525,10 +540,54 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         is_add: 0,
         is_sub: 0,
         is_mul: 1,
+        is_input: 0,
+        is_output: 0,
         is_real: 1,
         a_source_row: 0,
         b_source_row: 0,
     }
+}
+
+/// R1e-bdry: build a boundary-INPUT producer row.  Holds the
+/// supplied boundary value in `out`; emits per-byte producer
+/// tuples (so subsequent op rows can consume from this row's
+/// row_id) without firing field-op constraints or consumer
+/// emissions.  Caller pushes these rows FIRST so they get the
+/// low row_ids that subsequent op rows reference.
+pub fn fill_input(value: Bytes) -> FieldOpRow {
+    debug_assert!(less_than_p(&value),
+        "input value must be canonical (< p)");
+    // Final-form chain on `out`: required for the FinalFormBorrow
+    // closure which is gated by is_real (fires on input rows too).
+    let mut final_form_borrow = [0u8; 32];
+    let mut bw: i16 = 1;
+    for i in 0..32 {
+        let v = field::P_BYTES[i] as i16 - value[i] as i16 - bw;
+        bw = if v < 0 { 1 } else { 0 };
+        final_form_borrow[i] = bw as u8;
+    }
+    debug_assert_eq!(final_form_borrow[31], 0);
+
+    let mut row = FieldOpRow::default();
+    row.out = value;
+    row.final_form_borrow = final_form_borrow;
+    row.is_input = 1;
+    row.is_real = 1;
+    row
+}
+
+/// R1e-bdry: build a boundary-OUTPUT consumer row.  Sets `a` to the
+/// value being drained and points `a_source_row` to the row that
+/// produced it.  No producer, no consumer B, no field-op
+/// constraints.  Used to close the chain in chip-only tests; in R1f,
+/// the ECALL OUTPUT boundary takes this role via MemoryChip writes.
+pub fn fill_output(value: Bytes, source_row: u16) -> FieldOpRow {
+    let mut row = FieldOpRow::default();
+    row.a = value;
+    row.a_source_row = source_row;
+    row.is_output = 1;
+    row.is_real = 1;
+    row
 }
 
 /// Padding row (all zeros, `is_real = 0`).  Constraint blocks gate

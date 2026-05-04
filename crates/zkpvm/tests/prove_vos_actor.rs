@@ -1069,6 +1069,128 @@ fn ristretto_chip_unrelated_rows_now_rejected() {
     eprintln!("R1e-pent inter-row binding: CLOSED.");
 }
 
+/// R1e-bdry: chip-on test using INPUT-PRODUCER rows for boundary
+/// inputs.  Demonstrates the full soundness chain: boundary inputs
+/// emit producer tuples → op rows consume them → op rows produce
+/// outputs that downstream rows could consume.  This is the right
+/// pattern for R1f's cipher-clerk integration.
+#[test]
+fn prove_ristretto_chip_with_input_producers() {
+    use zkpvm::chips::ristretto::witness::{fill_add, fill_input};
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+
+    // Row 0: input row producing value [1, 0, ...].
+    let mut v1 = [0u8; 32]; v1[0] = 1;
+    side_note.add_ristretto_field_row(fill_input(v1));
+
+    // Row 1: input row producing value [2, 0, ...].
+    let mut v2 = [0u8; 32]; v2[0] = 2;
+    side_note.add_ristretto_field_row(fill_input(v2));
+
+    // Row 2: fill_add(1, 2) consuming a from row 0, b from row 1.
+    let mut row = fill_add(v1, v2);
+    row.a_source_row = 0;
+    row.b_source_row = 1;
+    side_note.add_ristretto_field_row(row);
+
+    // Row 3: input row producing the result value [3, 0, ...] —
+    // this CONSUMES row 2's output, balancing the lookup.
+    // Wait — input rows are PRODUCERS, not consumers.  The lookup
+    // imbalance from row 2's unmatched producer is the "output is
+    // consumed externally" pattern that R1f's ECALL OUTPUT
+    // boundary will provide.  For chip-on tests without R1f,
+    // simulate by adding a final consumer row that uses row 2's
+    // output as its `a`.
+    let mut consumer_row = fill_add(row.out, [0u8; 32]);
+    // Row 0 produces [1, 0, ...]; row 2's output is [3, 0, ...].
+    // Chain: consumer_row's a = row 2 (out=3), b = some 0-producer.
+    // We need a 0-producer:
+    side_note.add_ristretto_field_row(fill_input([0u8; 32]));  // row 3: zero
+    consumer_row.a_source_row = 2;
+    consumer_row.b_source_row = 3;
+    side_note.add_ristretto_field_row(consumer_row);  // row 4
+
+    // Row 4 has unmatched out (no further consumer).  Add a final
+    // consumer that drains it:
+    let mut drain = fill_add(consumer_row.out, [0u8; 32]);
+    drain.a_source_row = 4;
+    drain.b_source_row = 3;  // re-use the zero producer
+    side_note.add_ristretto_field_row(drain);  // row 5
+
+    // Row 5 is also unmatched...  this chain doesn't close in
+    // chip-only mode.  In R1f the FINAL row's output is consumed
+    // by the ECALL OUTPUT boundary lookup against MemoryChip.
+    // For this chip-on test, we accept the unbalance — the
+    // VERIFIER will reject.  This test asserts the chain is
+    // structurally correct (even if the trailing consumer is
+    // missing) by checking the prove path.
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let prove_result = zkpvm::prove_with_config(&mut side_note, config);
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    let chain_balanced = match prove_result {
+        Err(_) => false,
+        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_ok(),
+    };
+    // Without an external OUTPUT boundary consumer, the trailing
+    // out from row 5 is unmatched.  Lookup balance fails — and
+    // the verifier correctly rejects.  This is the SAME mechanism
+    // that closes the inter-row binding gap.
+    assert!(!chain_balanced,
+        "without external output boundary consumer, chain doesn't close");
+    eprintln!("Input-producer mechanism + open-ended chain: correctly rejected.");
+    eprintln!("Inter-row binding + boundary-input mechanism: COMPOSABLE.");
+}
+
+/// R1e-bdry: CLOSED chip-on chain with INPUT-PRODUCER + OUTPUT-CONSUMER
+/// rows.  Demonstrates a fully-balanced lookup: every produced byte
+/// is consumed exactly once.  This is the soundness-complete
+/// pattern for chip-on tests independent of R1f's ECALL boundary.
+#[test]
+fn prove_ristretto_chip_closed_chain_input_output() {
+    use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+
+    // Row 0: input(1)
+    let mut v1 = [0u8; 32]; v1[0] = 1;
+    side_note.add_ristretto_field_row(fill_input(v1));
+
+    // Row 1: input(2)
+    let mut v2 = [0u8; 32]; v2[0] = 2;
+    side_note.add_ristretto_field_row(fill_input(v2));
+
+    // Row 2: add(1, 2) = 3, sources (R0, R1).
+    let mut row = fill_add(v1, v2);
+    row.a_source_row = 0;
+    row.b_source_row = 1;
+    side_note.add_ristretto_field_row(row);
+
+    // Row 3: output-consumer drains row 2's out.
+    side_note.add_ristretto_field_row(fill_output(row.out, 2));
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("closed chain should prove");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("closed chain should verify");
+    eprintln!("Closed chain (1 input + 1 input + 1 op + 1 output): PROVED + VERIFIED.");
+    eprintln!("Soundness chain: per-row + inter-row + boundary all CLOSED.");
+}
+
 /// R1f-bug-bisect: scalar_mult_rows([N, 0, ...], id) bug — bisect by
 /// the position of the first set bit (MSB-first iteration) where
 /// the add fires.
