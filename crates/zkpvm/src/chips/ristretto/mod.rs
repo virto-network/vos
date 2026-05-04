@@ -228,6 +228,10 @@ impl BuiltInComponent for RistrettoChip {
         let borrow  = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
         let ff_brw  = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
         let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
+        let mul_product   = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
+        let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
+        let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
+        let mul_carry_hi  = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
         let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
         let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
@@ -400,6 +404,54 @@ impl BuiltInComponent for RistrettoChip {
         // Closure: integer equality holds without overflow.
         eval.add_constraint(real_sub.clone() * sub_chain_brw[31].clone());
 
+        // ── R1c-4-b: schoolbook field multiplication chain ──
+        //
+        //   Σ_{i+j=k, 0≤i,j<32} a[i]·b[j] + carry_in[k]
+        //     = product[k] + 256·full_carry[k]
+        //
+        // gated by is_real · is_mul, where
+        //
+        //   carry_in[k]    = full_carry[k−1]                   (carry_in[0] = 0)
+        //   full_carry[k]  = mul_carry[k] + 256·mul_carry_mid[k]
+        //                                + 65536·mul_carry_hi[k]
+        //
+        // Each position's full_carry can grow to ~21 bits at peak
+        // density (k = 31 accumulates 32 terms ≤ 65025 plus the
+        // incoming carry); 3-byte split has plenty of headroom.
+        // Closure: full_carry[63] = 0 — the 512-bit unreduced
+        // product fits exactly in 64 bytes when both operands < 2²⁵⁶.
+        //
+        // Constraint degree: a[i]·b[j] is degree 2, gated by
+        // real_mul (degree 2) ⇒ degree 4 overall, matching MulChip's
+        // bound at LOG_CONSTRAINT_DEGREE_BOUND = 2.
+        let real_mul = is_real[0].clone() * is_mul[0].clone();
+        let f65536: E::F = E::F::from(BaseField::from(65536u32));
+
+        let full_carry = |k: usize| -> E::F {
+            mul_carry[k].clone()
+                + mul_carry_mid[k].clone() * f256.clone()
+                + mul_carry_hi[k].clone() * f65536.clone()
+        };
+
+        for k in 0usize..64 {
+            let mut partial_sum = E::F::zero();
+            for i in 0usize..32 {
+                let j = k.wrapping_sub(i);
+                if j < 32 {
+                    partial_sum += a[i].clone() * b[j].clone();
+                }
+            }
+            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
+            let constraint = partial_sum
+                + carry_in
+                - mul_product[k].clone()
+                - full_carry(k) * f256.clone();
+            eval.add_constraint(real_mul.clone() * constraint);
+        }
+        // Closure: position-63 full_carry must be 0 (no 65th byte
+        // overflow) since 256-bit × 256-bit fits exactly in 512 bits.
+        eval.add_constraint(real_mul.clone() * full_carry(63));
+
         // ── R1c-3-ter: per-byte Range256 lookups ──
         //
         // Pin every committed byte cell on real rows to lie in [0, 256).
@@ -424,7 +476,25 @@ impl BuiltInComponent for RistrettoChip {
             }
         }
 
-        // R1c-3-ter still leaves OPEN before R1f turns the chip on:
+        // R1c-4-b adds Range256 emissions on the mul witness columns
+        // (256 emissions per is_real row: 64 product + 64·3 carry
+        // bytes).  Gated by is_real so padding contributes 0; on
+        // is_add/is_sub rows the witness fills these zero, so the
+        // Range256 lookup is balanced (0 ∈ [0, 256)).  On is_mul rows
+        // they pin the schoolbook chain's per-position cells to be
+        // valid bytes, which the algebraic chain alone doesn't
+        // guarantee.
+        for cells in [&mul_product, &mul_carry, &mul_carry_mid, &mul_carry_hi] {
+            for byte in cells.iter() {
+                eval.add_to_relation(RelationEntry::new(
+                    lookup_elements,
+                    is_real[0].clone().into(),
+                    &[byte.clone()],
+                ));
+            }
+        }
+
+        // R1c-4-b still leaves OPEN before R1f turns the chip on:
         //  - R1c-3-quat: is_sub constraint chain (the symmetric
         //    sub variant).  The witness builder already produces
         //    is_sub rows but the chip emits no constraints binding
@@ -495,8 +565,24 @@ impl BuiltInProverComponent for RistrettoChip {
         let field_b = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let field_out = crate::trace::original_base_column!(component_trace, Column::FieldOut);
         let interm = crate::trace::original_base_column!(component_trace, Column::AddIntermediate);
+        let mul_p   = crate::trace::original_base_column!(component_trace, Column::MulProduct);
+        let mul_c   = crate::trace::original_base_column!(component_trace, Column::MulCarry);
+        let mul_cm  = crate::trace::original_base_column!(component_trace, Column::MulCarryMid);
+        let mul_ch  = crate::trace::original_base_column!(component_trace, Column::MulCarryHi);
 
+        // 32-byte columns (FieldA/B/Out/AddIntermediate).
         for cells in [&field_a, &field_b, &field_out, &interm] {
+            for col in cells.iter() {
+                logup.add_to_relation_with(
+                    range256,
+                    [is_real[0].clone()],
+                    |[real]| real.into(),
+                    &[col.clone()],
+                );
+            }
+        }
+        // 64-byte columns (MulProduct + 3-byte mul carry chain).
+        for cells in [&mul_p, &mul_c, &mul_cm, &mul_ch] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
                     range256,
