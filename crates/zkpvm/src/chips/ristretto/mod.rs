@@ -267,6 +267,13 @@ pub enum PreprocessedColumn {
     /// chip log_size up to 16).
     #[size = 1]
     RowIndexHi,
+    /// R1e-pent: byte-index constants {0, 1, ..., 31} packed into
+    /// a 32-cell preprocessed column.  Used to inject the byte_idx
+    /// element of producer/consumer lookup tuples without requiring
+    /// per-emission constant materialization in the interaction
+    /// trace.  At every row, ByteIdx[k] = k.
+    #[size = 32]
+    ByteIdx,
 }
 
 /// p25519 byte constants — `p = 2²⁵⁵ - 19`, little-endian.  Used by
@@ -329,6 +336,7 @@ impl BuiltInComponent for RistrettoChip {
         let b_src_hi = crate::trace::trace_eval!(trace_eval, Column::BSourceRowHi);
         let row_idx_lo = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
         let row_idx_hi = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
+        let byte_idx_pp = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
         let mul_product   = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
         let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
         let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
@@ -795,13 +803,55 @@ impl BuiltInComponent for RistrettoChip {
             ));
         }
 
-        // R1e-pent constraint-side emissions are TODO; see the
-        // mirroring TODO in generate_interaction_trace.  Witness
-        // columns ASourceRowLo/Hi/BSourceRowLo/Hi are wired through
-        // and filled to 0; the regfile lookup is declared and
-        // registered so its space in AllLookupElements is reserved.
-        let _ = (regfile_lookup, &a_src_lo, &a_src_hi, &b_src_lo,
-                 &b_src_hi, &row_idx_lo, &row_idx_hi);
+        // ── R1e-pent: register-file inter-row binding ──
+        //
+        // PRODUCER per real row: 32 tuples
+        //   (row_idx_lo, row_idx_hi, byte_idx[k], out[k])
+        // for k ∈ 0..32, with multiplicity = is_real.
+        //
+        // CONSUMER per real row: 32 tuples for `a` plus 32 for `b`,
+        // keyed on (a_src_lo, a_src_hi, byte_idx[k], a[k]) etc.,
+        // with multiplicity = -is_real.
+        //
+        // Lookup balance forces every consumer to find a matching
+        // producer — closes the inter-row binding gap by ensuring
+        // every input must come from a prior row's `out` (or from
+        // an external boundary producer with a sentinel row_id).
+        for k in 0..32 {
+            // Producer.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                is_real[0].clone().into(),
+                &[
+                    row_idx_lo[0].clone(),
+                    row_idx_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+            // Consumer A.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                (-is_real[0].clone()).into(),
+                &[
+                    a_src_lo[0].clone(),
+                    a_src_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    a[k].clone(),
+                ],
+            ));
+            // Consumer B.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                (-is_real[0].clone()).into(),
+                &[
+                    b_src_lo[0].clone(),
+                    b_src_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    b[k].clone(),
+                ],
+            ));
+        }
 
         // R1c-4-b still leaves OPEN before R1f turns the chip on:
         //  - R1c-3-quat: is_sub constraint chain (the symmetric
@@ -837,6 +887,9 @@ impl BuiltInProverComponent for RistrettoChip {
             let row_hi = ((row >> 8) & 0xff) as u8;
             trace.fill_columns(row, row_lo, PreprocessedColumn::RowIndexLo);
             trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
+            // ByteIdx[k] = k for every row.
+            let byte_idx_arr: [u8; 32] = core::array::from_fn(|k| k as u8);
+            trace.fill_columns_bytes(row, &byte_idx_arr, PreprocessedColumn::ByteIdx);
         }
         trace.finalize_bit_reversed()
     }
@@ -990,14 +1043,67 @@ impl BuiltInProverComponent for RistrettoChip {
             );
         }
 
-        // R1e-pent interaction-side emissions are TODO — injecting
-        // per-byte constants into Stwo logup tuples requires either
-        // (a) 32 dedicated preprocessed byte-index columns, (b)
-        // expanding chip rows 32× to stream bytes, or (c) packing
-        // bytes into M31-fitting fingerprints.  Each option is a
-        // significant chip-shape change.  Constraint-side emissions
-        // are present but unbalanced; remove them to keep the chip
-        // gated-off-soundness-equivalent for now.
+        // ── R1e-pent: register-file inter-row binding ──
+        //
+        // Mirror the constraint-side producer + 2-consumer pattern.
+        // Order MUST match add_constraints exactly because
+        // finalize_logup_in_pairs() pairs adjacent emissions.
+        let regfile: &RistrettoRegisterFileLookupElements = lookup_elements.as_ref();
+        let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::RowIndexLo);
+        let row_idx_hi_pp = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::RowIndexHi);
+        let byte_idx_pp = crate::trace::preprocessed_base_column!(
+            component_trace, PreprocessedColumn::ByteIdx);
+        let a_src_lo_col = crate::trace::original_base_column!(
+            component_trace, Column::ASourceRowLo);
+        let a_src_hi_col = crate::trace::original_base_column!(
+            component_trace, Column::ASourceRowHi);
+        let b_src_lo_col = crate::trace::original_base_column!(
+            component_trace, Column::BSourceRowLo);
+        let b_src_hi_col = crate::trace::original_base_column!(
+            component_trace, Column::BSourceRowHi);
+        let out_cols = crate::trace::original_base_column!(
+            component_trace, Column::FieldOut);
+        let a_cols = crate::trace::original_base_column!(
+            component_trace, Column::FieldA);
+        let b_cols = crate::trace::original_base_column!(
+            component_trace, Column::FieldB);
+        for k in 0..32 {
+            // Producer
+            logup.add_to_relation_with(
+                regfile, [is_real[0].clone()],
+                |[real]| real.into(),
+                &[
+                    row_idx_lo_pp[0].clone(),
+                    row_idx_hi_pp[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
+                ],
+            );
+            // Consumer A: -is_real
+            logup.add_to_relation_with(
+                regfile, [is_real[0].clone()],
+                |[real]| (-real).into(),
+                &[
+                    a_src_lo_col[0].clone(),
+                    a_src_hi_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    a_cols[k].clone(),
+                ],
+            );
+            // Consumer B: -is_real
+            logup.add_to_relation_with(
+                regfile, [is_real[0].clone()],
+                |[real]| (-real).into(),
+                &[
+                    b_src_lo_col[0].clone(),
+                    b_src_hi_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    b_cols[k].clone(),
+                ],
+            );
+        }
         logup.finalize()
     }
 }
