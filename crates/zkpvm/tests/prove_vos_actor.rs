@@ -887,7 +887,58 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     assert!(!try_prove(bad), "tampered pass2_top_bit must fail");
 
     eprintln!("All 11 negative-witness cases correctly REJECTED.");
-    eprintln!("Per-row soundness: AUDITED across add, sub, and mul paths.");
+
+    // Tamper #12: tamper with FinalFormBorrow — flip last position
+    // (closure constraint enforces ff_brw[31] = 0).
+    let mut bad = fill_add(a_small, b_small);
+    bad.final_form_borrow[31] = 1; // claim out >= p (false)
+    assert!(!try_prove(bad), "tampered FinalFormBorrow[31] must fail");
+
+    // Tamper #13: substitute fake out > p (would-be canonical).
+    // out = p exactly is invalid (must be < p).
+    let mut bad = fill_add(a_small, b_small);
+    bad.out = zkpvm::chips::ristretto::field::P_BYTES;
+    // Recompute final-form: p - p - 1 = -1 < 0, so ff_brw[0] = 1 immediately.
+    let mut bw: i16 = 1;
+    for i in 0..32 {
+        let p_i = zkpvm::chips::ristretto::field::P_BYTES[i] as i16;
+        let v = p_i - bad.out[i] as i16 - bw;
+        bw = if v < 0 { 1 } else { 0 };
+        bad.final_form_borrow[i] = bw as u8;
+    }
+    // Even with ff_brw recomputed (final = 1), the chip's closure
+    // is_real * ff_brw[31] = 0 will reject.
+    assert!(!try_prove(bad), "out = p must fail (final-form rejects)");
+
+    // Tamper #14: add row claims out > p directly via add_intermediate
+    // tampering (intermediate must equal a + b which is forced).
+    let mut bad = fill_add(a_small, b_small);
+    bad.add_intermediate[0] = bad.add_intermediate[0].wrapping_add(7);
+    assert!(!try_prove(bad), "tampered add_intermediate must fail");
+
+    // Tamper #15: mul row with tampered after_top_carry breaking the
+    // closure (after_top_carry[31] must be 0).
+    let mut bad = fill_mul(a_big, b_big);
+    bad.after_top_carry[31] = 1;
+    assert!(!try_prove(bad), "tampered after_top_carry[31] must fail");
+
+    // Tamper #16: mul row tampered Pass1 closure (pass1_full_carry(31)
+    // must equal pass1_hi as 16-bit value).
+    let mut bad = fill_mul(a_big, b_big);
+    bad.pass1_hi[0] = bad.pass1_hi[0].wrapping_add(1);
+    assert!(!try_prove(bad), "tampered Pass1Hi must fail");
+
+    // Tamper #17: claim is_real = 1 but no op flag (partition fail).
+    let mut bad = fill_add(a_small, b_small);
+    bad.is_add = 0;
+    bad.is_sub = 0;
+    bad.is_mul = 0;
+    // is_real still 1.  Partition: 1·(0+0+0-1) = -1 ≠ 0.
+    assert!(!try_prove(bad), "is_real=1 with no op flag must fail");
+
+    eprintln!("All 17 negative-witness cases correctly REJECTED.");
+    eprintln!("Per-row soundness: AUDITED across add, sub, mul, reduction,");
+    eprintln!("final-form, partition, and closure constraints.");
 }
 
 /// R1e-pent diagnostic: confirm the inter-row binding soundness gap.
