@@ -736,24 +736,10 @@ fn prove_ristretto_chip_field_add() {
     eprintln!("RistrettoChip field-add: PROVED + VERIFIED");
 }
 
-/// R1e-quat: chip-on test for field-mul.  Exercises the full is_mul
-/// row constraint chain (schoolbook R1c-4-b → 2-pass reduction
-/// R1c-5-b → final < p check R1c-3-bis).
-///
-/// **Currently failing (`#[ignore]`)**: there is a witness/constraint
-/// disagreement somewhere in the is_mul reduction chain — even
-/// `2·3=6` (no overflow, all reduction chains inert) doesn't pass.
-/// The simpler `prove_ristretto_chip_field_add` passes, so the chip-
-/// on integration (R1e-quat) and add-side constraints
-/// (R1c-3..R1c-3-ter) are sound.  Bisecting the is_mul gap is
-/// follow-up work — bisect by commenting out constraint blocks
-/// (after_top_bit, pass-2, pass-1, schoolbook closure) until the
-/// trace passes, then narrow.  The single-byte `pass2_carry` width
-/// may also need expansion since k=0 / k=1 carries can reach ~39 in
-/// some inputs; soundness of the constraint vs. expected byte range
-/// is one of the suspects.
+/// R1e-quat: chip-on test for field-mul.  Exercises the full
+/// is_mul row constraint chain (schoolbook R1c-4-b → 2-pass
+/// reduction R1c-5-b → final < p check R1c-3-bis).
 #[test]
-#[ignore]
 fn prove_ristretto_chip_field_mul() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
@@ -784,41 +770,6 @@ fn prove_ristretto_chip_field_mul() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul verification failed");
     eprintln!("RistrettoChip field-mul: PROVED + VERIFIED");
-}
-
-/// R1e-quat diagnostic: prove an is_mul row whose every byte
-/// matches a known-passing is_add row.  Specifically: take 1+2=3
-/// add witness, but flip is_add → is_mul.  This isolates whether
-/// the bug is "any non-zero is_mul row" or "is_mul row with the
-/// schoolbook witness pattern".
-#[test]
-#[ignore]
-fn prove_ristretto_chip_field_mul_minimal_diff() {
-    use zkpvm::chips::ristretto::witness::{fill_add, FieldOpRow};
-
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
-    let mut a = [0u8; 32]; a[0] = 1;
-    let mut b = [0u8; 32]; b[0] = 2;
-    // Build an is_add row, then mutate just is_add → is_mul.
-    let mut row = fill_add(a, b);
-    row.is_add = 0;
-    row.is_mul = 1;
-    let _ = FieldOpRow::default;
-    side_note.add_ristretto_field_row(row);
-
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("minimal-diff (add witness w/ is_mul flag) failed");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("minimal-diff verify failed");
-    eprintln!("minimal-diff: PROVED + VERIFIED");
 }
 
 #[test]
@@ -908,6 +859,58 @@ fn project_ristretto_chip_size_for_one_payment() {
     eprintln!("Projected total prove: ~{:.1}s on CPU", projected_secs);
     eprintln!("With GPU (3×):  ~{:.1}s", projected_secs / 3.0);
     eprintln!("With NAF-w4 (-30% rows) + GPU: ~{:.1}s", projected_secs * 0.7 / 3.0);
+}
+
+/// R1e-quat diagnostic: bisect over the COLUMN that triggers the
+/// fail.  Each scenario hand-builds a row with all-zero witness
+/// EXCEPT one specific column has its index-0 cell = 1.  Reports
+/// which columns are "tainted" by a non-zero cell.
+#[test]
+#[ignore]
+fn debug_mul_column_bisect() {
+    use zkpvm::chips::ristretto::witness::FieldOpRow;
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut FieldOpRow)>)> = vec![
+        ("a[0]",                Box::new(|r| { r.a[0] = 1; })),
+        ("b[0]",                Box::new(|r| { r.b[0] = 1; })),
+        ("out[0]",              Box::new(|r| { r.out[0] = 1; })),
+        ("add_intermediate[0]", Box::new(|r| { r.add_intermediate[0] = 1; })),
+        ("add_carry[0]",        Box::new(|r| { r.add_carry[0] = 1; })),
+        ("sub_borrow[0]",       Box::new(|r| { r.sub_borrow[0] = 1; })),
+        ("ff_borrow[0]",        Box::new(|r| { r.final_form_borrow[0] = 1; })),
+        ("sub_chain_brw[0]",    Box::new(|r| { r.sub_chain_borrow[0] = 1; })),
+        ("mul_product[0]",      Box::new(|r| { r.mul_product[0] = 1; })),
+        ("mul_carry[0]",        Box::new(|r| { r.mul_carry[0] = 1; })),
+        ("mul_carry_mid[0]",    Box::new(|r| { r.mul_carry_mid[0] = 1; })),
+        ("mul_carry_hi[0]",     Box::new(|r| { r.mul_carry_hi[0] = 1; })),
+        ("pass1_lo[0]",         Box::new(|r| { r.pass1_lo[0] = 1; })),
+        ("pass1_hi[0]",         Box::new(|r| { r.pass1_hi[0] = 1; })),
+        ("pass1_carry[0]",      Box::new(|r| { r.pass1_carry[0] = 1; })),
+        ("pass1_carry_mid[0]",  Box::new(|r| { r.pass1_carry_mid[0] = 1; })),
+        ("pass2_lo[0]",         Box::new(|r| { r.pass2_lo[0] = 1; })),
+        ("pass2_carry[0]",      Box::new(|r| { r.pass2_carry[0] = 1; })),
+        ("pass2_carry_out",     Box::new(|r| { r.pass2_carry_out = 1; })),
+        ("pass2_top_bit",       Box::new(|r| { r.pass2_top_bit = 1; })),
+        ("after_top_bit[0]",    Box::new(|r| { r.after_top_bit[0] = 1; })),
+        ("after_top_carry[0]",  Box::new(|r| { r.after_top_carry[0] = 1; })),
+        ("is_overflow",         Box::new(|r| { r.is_overflow = 1; })),
+    ];
+
+    for (name, mutate) in cases {
+        let mut side_note = zkpvm::SideNote::new(
+            Vec::new(), Vec::new(), Vec::new(),
+        );
+        let mut row = FieldOpRow::default();
+        row.is_mul = 1;
+        row.is_real = 1;
+        mutate(&mut row);
+        side_note.add_ristretto_field_row(row);
+        let config = zkpvm::PcsConfig {
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        };
+        let r = zkpvm::prove_with_config(&mut side_note, config);
+        eprintln!("{:>22}: {}", name, if r.is_ok() { "PASS" } else { "FAIL" });
+    }
 }
 
 /// R1e-quat diagnostic: 17 rows of 0·0=0 (forces log_size > LOG_N_LANES).
@@ -1020,6 +1023,36 @@ fn prove_ristretto_chip_field_mul_zero() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul (zero) verification failed");
     eprintln!("RistrettoChip field-mul (0·0=0): PROVED + VERIFIED");
+}
+
+/// R1e-quat: chip-on test for field-mul with operands that overflow
+/// 2²⁵⁶, exercising the full reduction chain (pass-1 fold + pass-2
+/// fold + top-bit fold + final < p).
+#[test]
+fn prove_ristretto_chip_field_mul_with_reduction() {
+    use zkpvm::chips::ristretto::witness::fill_mul;
+
+    let mut side_note = zkpvm::SideNote::new(
+        Vec::new(), Vec::new(), Vec::new(),
+    );
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
+    for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
+    a[31] &= 0x7f; b[31] &= 0x7f;
+    side_note.add_ristretto_field_row(fill_mul(a, b));
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("RistrettoChip field-mul (with reduction) proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("RistrettoChip field-mul (with reduction) verification failed");
+    eprintln!("RistrettoChip field-mul (full reduction): PROVED + VERIFIED");
 }
 
 /// R1a smoke test: hand-craft an `ecalli 200` program, set up
