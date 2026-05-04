@@ -126,12 +126,41 @@ pub enum Column {
     #[size = 32]
     SubChainBorrow,
 
+    /// R1c-4: 64-byte unreduced schoolbook product `a · b` for is_mul
+    /// rows.  Position k holds the canonical byte
+    /// `(prod >> 8·k) & 0xff` of the integer product (which fits in
+    /// 512 bits / 64 bytes since each operand is < 2²⁵⁶).
+    /// Reduction `mod p` happens separately in R1c-5 (this is the
+    /// pre-reduction product).
+    #[size = 64]
+    MulProduct,
+    /// R1c-4: per-position low byte of the schoolbook carry chain.
+    /// 64 positions; at each, the carry value can grow to ~16 bits
+    /// (the partial-product sum at position k accumulates up to
+    /// `min(k+1, 64-k)` terms of ≤ 65025, so up to ~32 · 65025 ≈
+    /// 2M ≈ 21 bits — split as low 8 + high 16 bits).  Pinned by
+    /// R1c-4-b's per-position constraint chain.
+    #[size = 64]
+    MulCarry,
+    /// R1c-4: per-position middle byte of the schoolbook carry.
+    #[size = 64]
+    MulCarryMid,
+    /// R1c-4: per-position high (upper) byte of the schoolbook carry.
+    #[size = 64]
+    MulCarryHi,
+
     /// Operation classifier flags — exactly one is 1 on a real row.
-    /// R1c-3+ adds is_mul and is_inv to this set.
+    /// R1c-3+ adds is_mul; is_inv composes mul rows + a Fermat
+    /// ladder driver, no separate row class.
     #[size = 1]
     IsAdd,
     #[size = 1]
     IsSub,
+    /// R1c-4: 1 iff this row witnesses a 256-bit × 256-bit field
+    /// multiplication.  Mutually exclusive with IsAdd / IsSub on
+    /// real rows.
+    #[size = 1]
+    IsMul,
 
     /// 0 iff this is a padding / unused row.
     #[size = 1]
@@ -202,13 +231,14 @@ impl BuiltInComponent for RistrettoChip {
         let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
         let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
+        let is_mul  = crate::trace::trace_eval!(trace_eval, Column::IsMul);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
         let f256 = E::F::from(BaseField::from(256u32));
 
         // ── Boolean flags ──
         // Each flag column must hold 0 or 1.  Degree-2 each.
-        for flag in [&is_ovf, &is_add, &is_sub, &is_real] {
+        for flag in [&is_ovf, &is_add, &is_sub, &is_mul, &is_real] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         for c in carry.iter() {
@@ -225,17 +255,17 @@ impl BuiltInComponent for RistrettoChip {
         }
 
         // ── Real-row partition: exactly one op flag is 1 ──
-        // is_real = 1 ⇒ is_add + is_sub = 1.
-        // is_real = 0 ⇒ is_add = is_sub = 0 (gated below by other
-        // chains), partition collapses to 0 = 0.
+        // is_real = 1 ⇒ is_add + is_sub + is_mul = 1.
+        // is_real = 0 ⇒ all op flags zero.
         eval.add_constraint(
-            is_real[0].clone() * (is_add[0].clone() + is_sub[0].clone() - E::F::one())
+            is_real[0].clone() * (
+                is_add[0].clone() + is_sub[0].clone() + is_mul[0].clone() - E::F::one()
+            )
         );
-        // Padding rows: all op flags zero (so the gating chains stay
-        // inert and we don't witness fictitious operations).
         let not_real = E::F::one() - is_real[0].clone();
         eval.add_constraint(not_real.clone() * is_add[0].clone());
-        eval.add_constraint(not_real * is_sub[0].clone());
+        eval.add_constraint(not_real.clone() * is_sub[0].clone());
+        eval.add_constraint(not_real * is_mul[0].clone());
 
         // ── R1c-3: byte-wise sum chain (is_add rows only) ──
         //

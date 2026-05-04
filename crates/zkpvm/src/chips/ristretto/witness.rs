@@ -55,9 +55,22 @@ pub struct FieldOpRow {
     /// `out + b ≡ a (mod p)`.  Final entry must be 0 (closure
     /// enforced by the chip).  Zero throughout on is_add rows.
     pub sub_chain_borrow: [u8; 32],
+    /// R1c-4: unreduced 64-byte schoolbook product `a · b` for
+    /// is_mul rows.  Bytes 0..32 are the low half; 32..64 the high
+    /// half.  Zero throughout on is_add / is_sub rows.
+    pub mul_product: [u8; 64],
+    /// R1c-4: per-position carry chain split into 3 bytes (lo, mid,
+    /// hi) per position.  full_carry[k] = mul_carry[k] + 256·mul_carry_mid[k]
+    /// + 65536·mul_carry_hi[k].  At most ~21 bits / position — the
+    /// hi byte is usually 0 but reserved for the maximum-density
+    /// schoolbook column near k = 31.
+    pub mul_carry: [u8; 64],
+    pub mul_carry_mid: [u8; 64],
+    pub mul_carry_hi: [u8; 64],
     /// Operation classifier — exactly one of these is 1 on a real row.
     pub is_add: u8,
     pub is_sub: u8,
+    pub is_mul: u8,
     /// 0 iff this is a padding / unused row.
     pub is_real: u8,
 }
@@ -74,8 +87,13 @@ impl Default for FieldOpRow {
             sub_borrow: [0u8; 32],
             final_form_borrow: [0u8; 32],
             sub_chain_borrow: [0u8; 32],
+            mul_product: [0u8; 64],
+            mul_carry: [0u8; 64],
+            mul_carry_mid: [0u8; 64],
+            mul_carry_hi: [0u8; 64],
             is_add: 0,
             is_sub: 0,
+            is_mul: 0,
             is_real: 0,
         }
     }
@@ -154,8 +172,13 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         sub_borrow,
         final_form_borrow,
         sub_chain_borrow: [0u8; 32], // unused on is_add rows
+        mul_product: [0u8; 64],      // unused on is_add rows
+        mul_carry: [0u8; 64],
+        mul_carry_mid: [0u8; 64],
+        mul_carry_hi: [0u8; 64],
         is_add: 1,
         is_sub: 0,
+        is_mul: 0,
         is_real: 1,
     }
 }
@@ -218,8 +241,13 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         is_overflow: is_underflow,
         final_form_borrow,
         sub_chain_borrow,
+        mul_product: [0u8; 64],      // unused on is_sub rows
+        mul_carry: [0u8; 64],
+        mul_carry_mid: [0u8; 64],
+        mul_carry_hi: [0u8; 64],
         is_add: 0,
         is_sub: 1,
+        is_mul: 0,
         is_real: 1,
     }
 }
@@ -234,6 +262,73 @@ fn ge_bytes(a: &Bytes, b: &Bytes) -> bool {
         }
     }
     true
+}
+
+/// Build a witness row for `out = (a · b)` (UN-reduced — the post-
+/// reduction `(a · b) mod p` lands in a R1c-5 row).
+///
+/// The output stored in `FieldOpRow.out` is the LOW 32 bytes of the
+/// unreduced product, but soundness only enforces correctness against
+/// the full 64-byte `mul_product` chain.  R1c-5 reduces those 64
+/// bytes to a canonical 32-byte field element via the `2²⁵⁵ ≡ 19`
+/// fold, after which `field::mul(&a, &b)` is the right cross-check.
+///
+/// The schoolbook carry is split into 3 bytes (lo, mid, hi) per
+/// position; we precompute and emit all three so the chip's
+/// constraint chain can re-witness the per-position partial-product
+/// sum.
+pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
+    debug_assert!(less_than_p(&a));
+    debug_assert!(less_than_p(&b));
+
+    // Schoolbook over u32 partial sums (each position accumulates
+    // up to 32 byte-products, so up to ~32 · 65025 ≈ 2M ≈ 21 bits;
+    // u32 has plenty of headroom).
+    let mut prod = [0u32; 64];
+    for i in 0..32 {
+        for j in 0..32 {
+            prod[i + j] += (a[i] as u32) * (b[j] as u32);
+        }
+    }
+
+    // Carry-propagate so each output byte fits in [0, 256).
+    let mut mul_product = [0u8; 64];
+    let mut mul_carry = [0u8; 64];
+    let mut mul_carry_mid = [0u8; 64];
+    let mut mul_carry_hi = [0u8; 64];
+    let mut full_carry: u32 = 0;
+    for k in 0..64 {
+        let v = prod[k] + full_carry;
+        mul_product[k] = (v & 0xff) as u8;
+        let new_carry = v >> 8;
+        mul_carry[k]     = (new_carry & 0xff) as u8;
+        mul_carry_mid[k] = ((new_carry >> 8) & 0xff) as u8;
+        mul_carry_hi[k]  = ((new_carry >> 16) & 0xff) as u8;
+        full_carry = new_carry;
+    }
+    debug_assert_eq!(full_carry, 0, "schoolbook chain didn't close at position 63");
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mul_product[..32]);
+
+    FieldOpRow {
+        a, b, out,
+        // is_add / is_sub witness fields zero on is_mul rows.
+        add_intermediate: [0u8; 32],
+        add_carry: [0u8; 32],
+        is_overflow: 0,
+        sub_borrow: [0u8; 32],
+        final_form_borrow: [0u8; 32],
+        sub_chain_borrow: [0u8; 32],
+        mul_product,
+        mul_carry,
+        mul_carry_mid,
+        mul_carry_hi,
+        is_add: 0,
+        is_sub: 0,
+        is_mul: 1,
+        is_real: 1,
+    }
 }
 
 /// Padding row (all zeros, `is_real = 0`).  Constraint blocks gate
@@ -325,5 +420,53 @@ mod tests {
         let row = fill_sub(small(5), small(10));
         let expected = field::sub(&small(5), &small(10));
         assert_eq!(row.out, expected);
+    }
+
+    #[test]
+    fn fill_mul_small_produces_unreduced_product() {
+        // 7 · 13 = 91; low byte of mul_product should be 91, all
+        // higher bytes 0.
+        let row = fill_mul(small(7), small(13));
+        assert_eq!(row.is_mul, 1);
+        assert_eq!(row.mul_product[0], 91);
+        for i in 1..64 { assert_eq!(row.mul_product[i], 0); }
+        assert_eq!(row.out[0], 91);
+    }
+
+    #[test]
+    fn fill_mul_chain_closes_for_random_inputs() {
+        // Use mid-range bytes so partial products near k=31 hit
+        // their max density and the carry chain exercises hi byte.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
+        for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
+        a[31] &= 0x7f; // canonical
+        b[31] &= 0x7f;
+        let row = fill_mul(a, b);
+
+        // Re-derive the schoolbook chain: prod[k] = Σ_{i+j=k} a[i]·b[j],
+        // carry-propagated so each byte fits in [0, 256).  Cross-check
+        // against the witness.
+        let mut prod = [0u64; 64];
+        for i in 0..32 {
+            for j in 0..32 {
+                prod[i + j] += (a[i] as u64) * (b[j] as u64);
+            }
+        }
+        let mut full_carry: u64 = 0;
+        for k in 0..64 {
+            let v = prod[k] + full_carry;
+            assert_eq!(row.mul_product[k] as u64, v & 0xff,
+                "mul_product diverges at position {k}");
+            let new_carry = v >> 8;
+            let reconstructed = row.mul_carry[k] as u32
+                + 256 * row.mul_carry_mid[k] as u32
+                + 65536 * row.mul_carry_hi[k] as u32;
+            assert_eq!(reconstructed as u64, new_carry,
+                "carry split mismatched at position {k}");
+            full_carry = new_carry;
+        }
+        assert_eq!(full_carry, 0, "chain must close at position 63");
     }
 }
