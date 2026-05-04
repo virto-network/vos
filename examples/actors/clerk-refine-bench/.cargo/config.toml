@@ -1,5 +1,13 @@
 [build]
 target = "riscv64em-javm.json"
+# Inject no_std/no_main so actors look like normal Rust.
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Zcrate-attr=no_main",
+    "-Aduplicate-macro-attributes",
+    "-Aunused-attributes",
+]
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]

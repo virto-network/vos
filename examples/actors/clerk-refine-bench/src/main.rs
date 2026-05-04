@@ -1,70 +1,14 @@
-//! cipher-clerk refine-shape benchmark — runs the canonical
-//! ledger sub-actor's hot CPU path directly in `_start`.
+//! cipher-clerk refine-shape benchmark — vos actor that builds a
+//! batch of cipher-clerk Transfers and computes their canonical
+//! signing payloads (the rkyv archive a verifier reproduces, the
+//! kernel's heaviest per-transfer serialization).
 //!
-//! This bench mirrors what a vos `apply_batch_refine` sub-actor does
-//! per batch, minus the message-passing layer (vos needs a FETCH
-//! invocation that the bare zkpvm test harness doesn't set up).
-//! The cipher-clerk computation is identical:
-//!
-//!   1. Build N Account values (kernel state lookup hot path).
-//!   2. Build N Transfer values with K entries each (the
-//!      apply_batch input shape).
-//!   3. Compute each transfer's `signing_payload` (the rkyv archive
-//!      of the stripped TransferSigningView — Merkle leaf input,
-//!      proof binding source, and the heaviest serialization the
-//!      kernel does per transfer).
-//!   4. Fold the bytes into a rolling hash so the workload can't
-//!      be const-folded.
-//!
-//! Workload params: 10 transfers × 4 entries each = the typical
-//! micro-batch size for a small-volume clerk under one JAM block.
+//! Models the CPU cost an `apply_batch_refine` sub-actor pays per
+//! batch.  Doesn't yet call `kernel::apply_batch` — that requires
+//! pre-signed Transfers and an Oracle/LedgerState, deferred to the
+//! per-privacy-level clerk-l0/l1/l2/l3 actors under crates/actors/.
 
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-use core::alloc::{GlobalAlloc, Layout};
-
-// Bump allocator backed by a static buffer.  cipher-clerk's
-// signing_payload allocates a Vec; we need a real allocator.
-use core::cell::UnsafeCell;
-
-const HEAP_SIZE: usize = 64 * 1024;
-struct BumpAlloc {
-    heap: UnsafeCell<[u8; HEAP_SIZE]>,
-    offset: UnsafeCell<usize>,
-}
-// PVM is singlethreaded — no atomics required.  Marking Sync for the
-// global-allocator slot.
-unsafe impl Sync for BumpAlloc {}
-
-unsafe impl GlobalAlloc for BumpAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let size = layout.size();
-        unsafe {
-            let cur = *self.offset.get();
-            let aligned = (cur + align - 1) & !(align - 1);
-            let new_offset = aligned + size;
-            if new_offset > HEAP_SIZE {
-                return core::ptr::null_mut();
-            }
-            *self.offset.get() = new_offset;
-            (*self.heap.get()).as_mut_ptr().add(aligned)
-        }
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
-#[global_allocator]
-static ALLOC: BumpAlloc = BumpAlloc {
-    heap: UnsafeCell::new([0u8; HEAP_SIZE]),
-    offset: UnsafeCell::new(0),
-};
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
-
+use vos::{actor, messages};
 use cipher_clerk::ids::{AccountId, JournalId, TransferId, TxTemplateId, EntryId};
 use cipher_clerk::types::{Account, Transfer};
 use cipher_clerk::types::flags::{Direction, Layer};
@@ -73,6 +17,50 @@ use cipher_clerk::crypto::sig::{AuthKey, Signature};
 use cipher_clerk::crypto::commit::Amount;
 
 const N_TRANSFERS: u8 = 10;
+
+#[actor]
+struct ClerkRefineBench;
+
+#[messages]
+impl ClerkRefineBench {
+    fn new() -> Self {
+        ClerkRefineBench
+    }
+
+    /// Run one refine-shape batch: 4 accounts + 10 transfers ×
+    /// 4 entries each, signing-payload archive + rolling hash.
+    /// Returns the digest so the caller can spot non-determinism.
+    #[msg]
+    async fn refine(&self, _ctx: &mut Context<Self>) -> u64 {
+        let journal_id = JournalId([7u8; 16]);
+
+        let accounts: [Account; 4] = [
+            build_account(1, journal_id),
+            build_account(2, journal_id),
+            build_account(3, journal_id),
+            build_account(4, journal_id),
+        ];
+
+        let mut digest: u64 = 0;
+        for a in &accounts {
+            for b in a.id.0.iter() {
+                digest = digest.wrapping_add(*b as u64).rotate_left(7);
+            }
+        }
+
+        let mut i: u8 = 0;
+        while i < N_TRANSFERS {
+            let t = build_transfer(i, journal_id, &accounts);
+            let payload = t.signing_payload();
+            for &b in payload.iter() {
+                digest = digest.wrapping_add(b as u64).rotate_left(11);
+            }
+            i += 1;
+        }
+
+        digest
+    }
+}
 
 #[inline(never)]
 fn build_account(seed: u8, journal_id: JournalId) -> Account {
@@ -84,8 +72,8 @@ fn build_account(seed: u8, journal_id: JournalId) -> Account {
         AccountId(id_bytes),
         journal_id,
         AuthKey(auth_bytes),
-        840u32,             // ledger (USD per ISO-4217)
-        100u16,             // code (asset class)
+        840u32,
+        100u16,
         Direction::Credit,
     )
 }
@@ -127,39 +115,4 @@ fn build_transfer(seed: u8, journal_id: JournalId, accounts: &[Account; 4]) -> T
     let signatures = alloc::vec![Signature::ZERO; 2];
 
     Transfer::new(transfer_id, journal_id, template_id, entries, signatures)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    let journal_id = JournalId([7u8; 16]);
-
-    let accounts: [Account; 4] = [
-        build_account(1, journal_id),
-        build_account(2, journal_id),
-        build_account(3, journal_id),
-        build_account(4, journal_id),
-    ];
-
-    let mut digest: u64 = 0;
-    // Touch every account's id bytes (kernel does this on
-    // get_account → Merkle path verify).
-    for a in &accounts {
-        for b in a.id.0.iter() {
-            digest = digest.wrapping_add(*b as u64).rotate_left(7);
-        }
-    }
-
-    let mut i: u8 = 0;
-    while i < N_TRANSFERS {
-        let t = build_transfer(i, journal_id, &accounts);
-        let payload = t.signing_payload();
-        for &b in payload.iter() {
-            digest = digest.wrapping_add(b as u64).rotate_left(11);
-        }
-        i += 1;
-    }
-
-    core::hint::black_box(digest);
-    unsafe { core::arch::asm!("unimp") }
-    loop {}
 }
