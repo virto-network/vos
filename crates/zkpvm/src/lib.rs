@@ -141,6 +141,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::BitwiseChip,  // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::CompareChip,  // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
     &chips::DivRemChip,   // Phase 54g — consumer of DivRemLookup
+    &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, gated by activity.ristretto
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -162,6 +163,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::ByteToBitsChip, // Phase 55a
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
 ];
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
@@ -201,7 +203,7 @@ pub(crate) fn active_components(side_note: &side_note::SideNote)
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
-    use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT};
     use crate::core::opcode::Opcode;
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
@@ -211,6 +213,15 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
             && step.imm == ECALL_BLAKE2B_COMPRESS as u64
         {
             a.blake2b = true;
+        }
+        // Phase R1b — Ristretto scalar-mult ECALL detection.  Today
+        // the chip is empty (no constraints, no lookups), but the
+        // gating is wired so R1c–R1e can drop real columns in
+        // without re-touching activity selection.
+        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
+            && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64
+        {
+            a.ristretto = true;
         }
         let f = classify(step.opcode);
         if f.is_jump_ind || f.is_load_imm_jump_ind { a.jump_table = true; }
@@ -242,6 +253,7 @@ struct ChipActivity {
     bitwise: bool,
     compare: bool,
     divrem: bool,
+    ristretto: bool,
 }
 
 #[cfg(feature = "prover")]
@@ -256,6 +268,7 @@ impl ChipActivity {
             16 => self.bitwise,
             17 => self.compare,
             18 => self.divrem,
+            19 => self.ristretto,
             _ => true,
         }
     }

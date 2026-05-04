@@ -17,6 +17,7 @@ pub mod program_memory;
 pub mod range_multiplicity;
 pub mod register_memory;
 pub mod register_memory_boundary;
+pub mod ristretto;
 
 pub use bitcount::BitcountChip;
 pub use bitwise::BitwiseChip;
@@ -37,3 +38,4 @@ pub use program_memory::ProgramMemoryChip;
 pub use range_multiplicity::RangeMultiplicity256;
 pub use register_memory::RegisterMemoryChip;
 pub use register_memory_boundary::RegisterMemoryBoundaryChip;
+pub use ristretto::RistrettoChip;
