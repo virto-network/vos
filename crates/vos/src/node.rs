@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -403,12 +403,22 @@ pub struct VosNode {
     pub(crate) shared_network: SharedNetwork,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
-    /// `replication_id` is added. Read by [`NodeSyncHandler`]
-    /// (db only) to answer inbound sync queries; the agent
-    /// thread and sync ticker share the `commit_lock` to
-    /// serialize their writes against each other.
+    /// `replication_id` is added. Read by [`NodeService`] (db
+    /// only) to answer inbound sync queries; the agent thread
+    /// and sync ticker share the `commit_lock` to serialize
+    /// their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
     pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// Optional manifest payload exposed to peers via
+    /// [`Frame::ManifestReq`](crate::network::Frame::ManifestReq).
+    /// Populated by [`set_manifest`](Self::set_manifest) before
+    /// [`attach_network`](Self::attach_network) — vosx loads the
+    /// space.toml + actor blobs and stashes them here so the
+    /// `NetworkService` impl can serve them when a `vosx join`er
+    /// asks. Set-once; `None` for nodes that don't expose a
+    /// manifest (transient peers, manifest-less raw `vosx run`).
+    #[cfg(feature = "network")]
+    pub(crate) manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     /// Join handles for the per-replica sync threads spawned
     /// by [`spawn_sync_thread`]. We keep these so [`collect`]
     /// can wait for the threads to exit before returning —
@@ -487,34 +497,81 @@ impl InvokeHandle {
 #[cfg(feature = "network")]
 type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 
-/// `InvokeHandler` impl that routes inbound cross-node invokes
-/// into this node's local invoke-route table. The network thread
-/// runs `dispatch` on a `tokio::task::spawn_blocking`, so blocking
-/// on the std `mpsc` reply channel here is fine.
+/// Single inbound-frame service for the node. Combines what used
+/// to be three separate trait impls (invoke / sync / manifest)
+/// behind one [`NetworkService`](crate::network::NetworkService)
+/// installation. Each method either delegates to a node-owned
+/// table (invoke routes, CRDT replicas) or returns the data the
+/// host pre-stashed (manifest).
+///
+/// Constructed in [`VosNode::attach_network`] from the node's
+/// already-existing tables; the manifest slot is populated by the
+/// host (`vosx up`) before `attach_network` runs.
 #[cfg(feature = "network")]
-struct LocalInvokeHandler {
+struct NodeService {
     invoke_routes: InvokeRoutes,
-}
-
-/// `SyncHandler` impl backed by the node's `crdt_replicas` map.
-/// Looks up the shared `Arc<Database>` for the replication group
-/// and reads roots / DAG nodes directly through the public
-/// `commit::read_roots` / `commit::read_dag_node` helpers. Reads
-/// are pure redb read txns — they don't need the commit lock.
-#[cfg(all(feature = "network", feature = "storage"))]
-struct NodeSyncHandler {
+    #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    manifest: Arc<OnceLock<crate::network::ManifestReply>>,
 }
 
-#[cfg(all(feature = "network", feature = "storage"))]
-impl crate::network::SyncHandler for NodeSyncHandler {
-    fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+#[cfg(feature = "network")]
+impl crate::network::NetworkService for NodeService {
+    fn dispatch_invoke(
+        &self,
+        _from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> Vec<u8> {
+        // The chain arrived already including the original caller's
+        // ID (the remote peer's agent). The receiver's own
+        // external_invoke prepends *this* agent's ID when dispatching
+        // further hops, so we don't need to touch the chain here.
+        let tx = self
+            .invoke_routes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&to).cloned());
+        let Some(tx) = tx else {
+            return Vec::new();
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(InvokeRequest { msg, reply_tx, chain })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        // The receiver replies with the full invoke envelope; the
+        // libp2p protocol still ships only reply bytes, so unwrap
+        // here. A future protocol bump can carry the envelope so
+        // remote yielded children become drivable cross-node.
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .ok()
+            .and_then(|env| unwrap_invoke_envelope(&env))
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "storage")]
+    fn sync_roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_roots(&slot.db).ok()
     }
-    fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+
+    #[cfg(feature = "storage")]
+    fn sync_get_node(
+        &self,
+        replication_id: &[u8; 32],
+        cid: &[u8; 32],
+    ) -> Option<Vec<u8>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
+    }
+
+    fn manifest(&self) -> Option<crate::network::ManifestReply> {
+        self.manifest.get().cloned()
     }
 }
 
@@ -799,44 +856,6 @@ fn sync_with_peer(
     Ok(SyncOutcome::PeerHasGroup { inserted: inserted_any })
 }
 
-#[cfg(feature = "network")]
-impl crate::network::InvokeHandler for LocalInvokeHandler {
-    fn dispatch(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
-        // The chain arrived already including the original caller's
-        // ID (the remote peer's agent). The receiver's own
-        // external_invoke prepends *this* agent's ID when dispatching
-        // further hops, so we don't need to touch the chain here.
-        let tx = self
-            .invoke_routes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&to).cloned());
-        let Some(tx) = tx else {
-            return Vec::new();
-        };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(InvokeRequest {
-                msg,
-                reply_tx,
-                chain,
-            })
-            .is_err()
-        {
-            return Vec::new();
-        }
-        // The receiver replies with the full invoke envelope; the
-        // libp2p protocol still ships only reply bytes, so unwrap
-        // here. A future protocol bump can carry the envelope so
-        // remote yielded children become drivable cross-node.
-        reply_rx
-            .recv_timeout(Duration::from_secs(10))
-            .ok()
-            .and_then(|env| unwrap_invoke_envelope(&env))
-            .unwrap_or_default()
-    }
-}
-
 /// Shared "last activity" instant, bumped on every dispatch. The
 /// node uses it as a global idle signal that — unlike outbox-only
 /// monitoring — also accounts for invoke traffic, which doesn't
@@ -866,9 +885,24 @@ impl VosNode {
             shared_network: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "network")]
+            manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
             sync_threads: Vec::new(),
         }
+    }
+
+    /// Pre-populate the manifest payload exposed to peers via
+    /// `Frame::ManifestReq`. Set-once: a second call is a
+    /// programming error and is silently ignored. Call before
+    /// [`attach_network`](Self::attach_network) — the
+    /// `NetworkService` snapshot taken there reads from this slot.
+    /// `vosx up` calls this with the parsed `space.toml` bytes
+    /// plus every actor blob so `vosx join`ers can fetch the
+    /// cluster's manifest without `--manifest`.
+    #[cfg(feature = "network")]
+    pub fn set_manifest(&self, reply: crate::network::ManifestReply) {
+        let _ = self.manifest.set(reply);
     }
 
     /// Attach a libp2p [`Network`](crate::network::Network) so the
@@ -888,25 +922,18 @@ impl VosNode {
     /// being collected).
     #[cfg(feature = "network")]
     pub fn attach_network(&mut self, network: crate::network::Network) {
-        // Install the dispatcher first so any inbound InvokeRequest
+        // Install the unified service first so any inbound frame
         // that arrives between now and the bridge starting gets
-        // resolved against this node's invoke_routes rather than
-        // the empty-reply default.
-        let dispatcher = Arc::new(LocalInvokeHandler {
+        // resolved against this node's tables (invoke_routes,
+        // crdt_replicas, host-supplied manifest) rather than the
+        // trait's empty-reply defaults.
+        let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
+            #[cfg(feature = "storage")]
+            replicas: self.crdt_replicas.clone(),
+            manifest: self.manifest.clone(),
         });
-        network.set_invoke_handler(dispatcher);
-
-        // Same story for the sync provider — answers inbound
-        // FetchHeads/FetchNode against the local CRDT replicas
-        // already opened by `register`.
-        #[cfg(feature = "storage")]
-        {
-            let sync_provider = Arc::new(NodeSyncHandler {
-                replicas: self.crdt_replicas.clone(),
-            });
-            network.set_sync_handler(sync_provider);
-        }
+        network.set_service(service);
 
         let inbox_rx = match network.take_inbox() {
             Some(rx) => rx,
