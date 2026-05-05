@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 mod commands;
 mod hyperspace;
+mod identity;
 mod manifest;
 mod network;
 mod query;

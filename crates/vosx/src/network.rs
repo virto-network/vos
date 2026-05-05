@@ -43,7 +43,7 @@ pub fn start_network_if_needed(
         return None;
     }
 
-    let keypair = vos::network::load_or_generate_identity(
+    let keypair = crate::identity::load_or_generate_identity(
         manifest.node.identity.as_deref(),
         data_dir,
     )

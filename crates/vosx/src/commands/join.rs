@@ -24,9 +24,10 @@ use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 
 use vos::node::{AgentConfig, VosNode};
 use vos::network::{
-    derive_node_prefix, load_or_generate_identity, ManifestBlob, Network, NetworkConfig,
-    RaftJoinResult,
+    derive_node_prefix, ManifestBlob, Network, NetworkConfig, RaftJoinResult,
 };
+
+use crate::identity::load_or_generate_identity;
 
 use crate::manifest::{
     apply_init, encode_on_start, manifest_from, resolve_replication_id, ConsistencyDef, Manifest,
