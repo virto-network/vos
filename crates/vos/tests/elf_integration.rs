@@ -4871,16 +4871,16 @@ fn manifest_req_returns_installed_provider_payload() {
     use std::sync::Arc;
     use std::time::Duration;
     use vos::network::{
-        derive_node_prefix, ManifestBlob, ManifestHandler, Network, NetworkConfig,
+        derive_node_prefix, ManifestBlob, ManifestHandler, ManifestReply,
+        Network, NetworkConfig,
     };
 
     struct StubManifest {
-        toml: Vec<u8>,
-        blobs: Vec<ManifestBlob>,
+        reply: ManifestReply,
     }
     impl ManifestHandler for StubManifest {
-        fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
-            Some((self.toml.clone(), self.blobs.clone()))
+        fn manifest(&self) -> Option<ManifestReply> {
+            Some(self.reply.clone())
         }
     }
 
@@ -4911,8 +4911,7 @@ version = "0.1.0"
         ManifestBlob { name: "scheduler".into(), blob: vec![0xBB; 32] },
     ];
     net_a.set_manifest_handler(Arc::new(StubManifest {
-        toml: toml.clone(),
-        blobs: blobs.clone(),
+        reply: ManifestReply { toml: toml.clone(), blobs: blobs.clone() },
     }));
 
     let net_b = Arc::new(Network::start(NetworkConfig {
@@ -4924,12 +4923,12 @@ version = "0.1.0"
     let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
 
     let rx = net_b.send_manifest_req(target_a);
-    let (got_toml, got_blobs) = rx
+    let got = rx
         .recv_timeout(Duration::from_secs(2))
         .expect("manifest reply");
 
-    assert_eq!(got_toml, toml, "toml bytes round-trip");
-    assert_eq!(got_blobs, blobs, "blobs round-trip");
+    assert_eq!(got.toml, toml, "toml bytes round-trip");
+    assert_eq!(got.blobs, blobs, "blobs round-trip");
 
     match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
     match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }

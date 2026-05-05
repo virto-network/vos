@@ -246,9 +246,11 @@ fn fetch_manifest_from_bootnode(
 ) -> Result<(Manifest, std::path::PathBuf, BTreeMap<String, ManifestBlob>), String> {
     eprintln!("vosx: fetching manifest from bootnode...");
     let rx = network.send_manifest_req(bootnode_peer);
-    let (toml_bytes, blobs) = rx
+    let reply = rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|e| format!("manifest fetch: {e}"))?;
+    let toml_bytes = reply.toml;
+    let blobs = reply.blobs;
     if toml_bytes.is_empty() {
         return Err(
             "bootnode did not expose a manifest (no `set_manifest_handler` registered) — \

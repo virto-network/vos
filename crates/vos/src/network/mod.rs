@@ -218,18 +218,24 @@ impl RaftStatusReply {
     }
 }
 
-/// Local provider for the bootnode's manifest. Implemented by
+/// Reply to a [`Frame::ManifestReq`]: the raw `space.toml`
+/// content and a list of every actor blob the manifest
+/// references, keyed by name. The joiner writes the blobs into
+/// a local cache so its replication_id derivation
+/// (`blake2b(name || 0 || blob)`) lines up with the bootnode's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestReply {
+    pub toml: Vec<u8>,
+    pub blobs: Vec<ManifestBlob>,
+}
+
+/// Local handler for the bootnode's manifest. Implemented by
 /// `vosx` so a fresh `vosx join <bootnode>` can fetch the
 /// space.toml + actor blobs without the operator pre-distributing
 /// the manifest. Returns `None` for nodes that don't expose a
 /// manifest (transient peers, manifest-less raw `vosx run`).
 pub trait ManifestHandler: Send + Sync {
-    /// `(toml_bytes, blobs)` — the raw `space.toml` content and a
-    /// list of every actor blob the manifest references, keyed
-    /// by name. The joiner writes the blobs into a local cache
-    /// keyed by the same name so its replication_id derivation
-    /// (`blake2b(name || 0 || blob)`) lines up with the bootnode's.
-    fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)>;
+    fn manifest(&self) -> Option<ManifestReply>;
 }
 
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
@@ -475,7 +481,7 @@ enum NetworkCmd {
     /// the bootnode's space.toml + actor blobs.
     SendManifestReq {
         target_peer: PeerId,
-        reply: std_mpsc::Sender<(Vec<u8>, Vec<ManifestBlob>)>,
+        reply: std_mpsc::Sender<ManifestReply>,
     },
     /// Send a [`Frame::RaftStatusReq`] for one replication
     /// group. Reply yields the peer's view of the group.
@@ -496,7 +502,7 @@ enum OutboundReply {
     RaftVote(std_mpsc::Sender<RaftVoteResult>),
     RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
     RaftJoin(std_mpsc::Sender<RaftJoinResult>),
-    Manifest(std_mpsc::Sender<(Vec<u8>, Vec<ManifestBlob>)>),
+    Manifest(std_mpsc::Sender<ManifestReply>),
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
 }
 
@@ -652,14 +658,13 @@ impl Network {
         rx
     }
 
-    /// Send a [`Frame::ManifestReq`] to a bootnode. The reply is
-    /// `(toml_bytes, blobs)`; on transport failure the Sender is
-    /// dropped. Used by `vosx join` when the operator hasn't
-    /// supplied `--manifest`.
+    /// Send a [`Frame::ManifestReq`] to a bootnode. On transport
+    /// failure the Sender is dropped. Used by `vosx join` when the
+    /// operator hasn't supplied `--manifest`.
     pub fn send_manifest_req(
         &self,
         target_peer: PeerId,
-    ) -> std_mpsc::Receiver<(Vec<u8>, Vec<ManifestBlob>)> {
+    ) -> std_mpsc::Receiver<ManifestReply> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendManifestReq {
             target_peer,
@@ -1641,18 +1646,24 @@ fn handle_req_resp(
                         });
                     }
                     Frame::ManifestReq => {
-                        // Manifest provider just reads in-memory
+                        // Manifest handler just reads in-memory
                         // bytes; serve inline.
-                        let provider = manifest_provider
+                        let handler = manifest_provider
                             .lock()
                             .ok()
                             .and_then(|g| g.clone());
-                        let (toml_bytes, blobs) = provider
-                            .and_then(|p| p.manifest())
-                            .unwrap_or_default();
+                        let reply = handler
+                            .and_then(|h| h.manifest())
+                            .unwrap_or_else(|| ManifestReply {
+                                toml: Vec::new(),
+                                blobs: Vec::new(),
+                            });
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
-                            Frame::ManifestResp { toml_bytes, blobs },
+                            Frame::ManifestResp {
+                                toml_bytes: reply.toml,
+                                blobs: reply.blobs,
+                            },
                         );
                     }
                     Frame::RaftStatusReq { replication_id } => {
@@ -1742,7 +1753,7 @@ fn handle_req_resp(
                         Frame::ManifestResp { toml_bytes, blobs },
                         Some(OutboundReply::Manifest(tx)),
                     ) => {
-                        let _ = tx.send((toml_bytes, blobs));
+                        let _ = tx.send(ManifestReply { toml: toml_bytes, blobs });
                     }
                     (
                         Frame::RaftStatusResp {

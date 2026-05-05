@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos::abi::service::ServiceId;
-use vos::network::{ManifestBlob, ManifestHandler};
+use vos::network::{ManifestBlob, ManifestHandler, ManifestReply};
 use vos::node::{AgentConfig, Consistency, VosNode, WorkerConfig};
 use vos::value::Args;
 
@@ -33,8 +33,11 @@ struct LocalManifestHandler {
 }
 
 impl ManifestHandler for LocalManifestHandler {
-    fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
-        Some((self.toml.clone(), self.blobs.clone()))
+    fn manifest(&self) -> Option<ManifestReply> {
+        Some(ManifestReply {
+            toml: self.toml.clone(),
+            blobs: self.blobs.clone(),
+        })
     }
 }
 
