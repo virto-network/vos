@@ -30,6 +30,7 @@
 #![cfg(feature = "network")]
 
 mod codec;
+mod ops;
 mod wire;
 
 pub use wire::{
@@ -370,7 +371,7 @@ type ListenAddrs = Arc<Mutex<Vec<Multiaddr>>>;
 pub struct Network {
     peer_id: PeerId,
     local_prefix: u16,
-    cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
+    pub(in crate::network) cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
@@ -413,7 +414,7 @@ pub struct NetworkConfig {
     pub bootstrap: Vec<Multiaddr>,
 }
 
-enum NetworkCmd {
+pub(in crate::network) enum NetworkCmd {
     Connect(Multiaddr),
     SendTell {
         target_peer: PeerId,
@@ -634,60 +635,10 @@ impl Network {
             .unwrap_or_default()
     }
 
-    /// Send a [`Frame::RaftJoinReq`] to a bootnode. The receiver
-    /// either calls `change_membership` (returning
-    /// [`RaftJoinResult::Accepted`]) or redirects with
-    /// [`RaftJoinResult::NotLeader`] + a leader hint. The reply
-    /// channel yields exactly once; on transport failure the
-    /// Sender is dropped (`recv` yields `Disconnected`).
-    pub fn send_raft_join_req(
-        &self,
-        target_peer: PeerId,
-        replication_id: [u8; 32],
-        joiner_prefix: u16,
-    ) -> std_mpsc::Receiver<RaftJoinResult> {
-        let (tx, rx) = std_mpsc::channel();
-        let _ = self.cmd_tx.send(NetworkCmd::SendRaftJoin {
-            target_peer,
-            replication_id,
-            joiner_prefix,
-            reply: tx,
-        });
-        rx
-    }
-
-    /// Send a [`Frame::ManifestReq`] to a bootnode. On transport
-    /// failure the Sender is dropped. Used by `vosx join` when the
-    /// operator hasn't supplied `--manifest`.
-    pub fn send_manifest_req(
-        &self,
-        target_peer: PeerId,
-    ) -> std_mpsc::Receiver<ManifestReply> {
-        let (tx, rx) = std_mpsc::channel();
-        let _ = self.cmd_tx.send(NetworkCmd::SendManifestReq {
-            target_peer,
-            reply: tx,
-        });
-        rx
-    }
-
-    /// Send a [`Frame::RaftStatusReq`] for one replication
-    /// group. The reply describes that peer's view of the
-    /// group. `vosx ps` fans this out across every connected
-    /// peer to assemble the cluster snapshot.
-    pub fn send_raft_status_req(
-        &self,
-        target_peer: PeerId,
-        replication_id: [u8; 32],
-    ) -> std_mpsc::Receiver<RaftStatusReply> {
-        let (tx, rx) = std_mpsc::channel();
-        let _ = self.cmd_tx.send(NetworkCmd::SendRaftStatus {
-            target_peer,
-            replication_id,
-            reply: tx,
-        });
-        rx
-    }
+    // Operator-tooling senders (manifest fetch, raft join, raft
+    // status) live in the `ops` submodule — they're driven by
+    // `vosx join` / `vosx ps`, never by the PVM-actor runtime.
+    // See `crates/vos/src/network/ops.rs`.
 
     /// Send a Raft `AppendEntries` RPC to a specific peer. Receiver
     /// yields `RaftAppendResult`; on transport failure the Sender
