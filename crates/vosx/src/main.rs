@@ -180,8 +180,8 @@ fn main() {
             commands::new::run(&name);
         }
         Some(Command::Up { manifest, data_dir, no_persist, listen, connect, once }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::start::run(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect, once);
+            let (m, dir, toml) = manifest_from(manifest);
+            commands::start::run(&m, &dir, &toml, data_dir.as_deref(), no_persist, &listen, &connect, once);
         }
         Some(Command::Join { bootnode, manifest, data_dir, no_persist, listen }) => {
             commands::join::run(
@@ -196,23 +196,23 @@ fn main() {
             commands::run::run(&program, &payload, &hex, gas);
         }
         Some(Command::Ls { manifest }) => {
-            let (m, dir) = manifest_from(manifest);
+            let (m, dir, _toml) = manifest_from(manifest);
             commands::list::run(&m, &dir);
         }
         Some(Command::Ps { manifest, connect, sync_timeout }) => {
-            let (m, dir) = manifest_from(manifest);
+            let (m, dir, _toml) = manifest_from(manifest);
             commands::status::run(&m, &dir, &connect, sync_timeout);
         }
         Some(Command::Call { target, args, manifest, connect, sync_timeout }) => {
-            let (m, dir) = manifest_from(manifest);
+            let (m, dir, _toml) = manifest_from(manifest);
             commands::invoke::run_call(&m, &dir, &target, &args, &connect, sync_timeout);
         }
         None if cli.file.as_ref().is_some_and(|p| !manifest::is_manifest(p)) => {
             commands::run::run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);
         }
         None => {
-            let (m, dir) = manifest_from(cli.file);
-            commands::start::run(&m, &dir, Some(Path::new("data")), false, &[], &[], false);
+            let (m, dir, toml) = manifest_from(cli.file);
+            commands::start::run(&m, &dir, &toml, Some(Path::new("data")), false, &[], &[], false);
         }
     }
 }

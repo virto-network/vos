@@ -5,9 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use vos::abi::service::ServiceId;
+use vos::network::{ManifestBlob, ManifestProvider};
 use vos::node::{AgentConfig, Consistency, VosNode, WorkerConfig};
 use vos::value::Args;
 
@@ -19,6 +21,46 @@ use crate::manifest::{
 };
 use crate::network::start_network_if_needed;
 use crate::util::{die, exit_with_status, format_provides, hex32, load_blob, load_file};
+
+/// Local impl of [`ManifestProvider`] — serves `vosx join`ers the
+/// base `space.toml` bytes plus every actor blob the manifest
+/// references. Without this installed, joiners that don't pass
+/// `--manifest <path>` see an empty reply and fall back to a hard
+/// error.
+struct LocalManifestProvider {
+    toml: Vec<u8>,
+    blobs: Vec<ManifestBlob>,
+}
+
+impl ManifestProvider for LocalManifestProvider {
+    fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
+        Some((self.toml.clone(), self.blobs.clone()))
+    }
+}
+
+/// Walk the manifest's agents + child actors and load each entry's
+/// PVM blob. Workers are intentionally skipped — they're loaded via
+/// `path = ".../*.so"` not `*.elf`, can't be transpiled into a Raft
+/// replica's blob hash, and are therefore not part of what a joiner
+/// needs to mirror the cluster's actor set.
+fn collect_manifest_blobs(manifest: &Manifest, dir: &Path) -> Vec<ManifestBlob> {
+    let mut blobs = Vec::new();
+    for a in &manifest.agent {
+        for child in &a.actors {
+            let path = resolve_entry_path(&child.name, &child.path, &child.service, dir);
+            blobs.push(ManifestBlob {
+                name: child.name.clone(),
+                blob: load_blob(&path),
+            });
+        }
+        let path = resolve_entry_path(&a.name, &a.path, &a.service, dir);
+        blobs.push(ManifestBlob {
+            name: a.name.clone(),
+            blob: load_blob(&path),
+        });
+    }
+    blobs
+}
 
 /// How long `vosx up` waits for `--connect` bootnodes to
 /// complete the libp2p Hello handshake before a Raft cluster's
@@ -32,6 +74,7 @@ const RAFT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub fn run(
     manifest: &Manifest,
     dir: &Path,
+    manifest_toml: &[u8],
     data_dir_cli: Option<&Path>,
     no_persist: bool,
     listen_cli: &[String],
@@ -99,6 +142,19 @@ pub fn run(
         &mut name_ids, &mut provides_map, registry_active, &mut announces,
         &raft_members,
     );
+
+    // Install the manifest provider before the node consumes
+    // the network — bootnodes serve their own manifest + blobs
+    // verbatim to `vosx join`ers via this trait. Without it,
+    // joiners that don't pass `--manifest <path>` see an empty
+    // reply.
+    if let Some(net) = &network {
+        let blobs = collect_manifest_blobs(manifest, dir);
+        net.set_manifest_provider(Arc::new(LocalManifestProvider {
+            toml: manifest_toml.to_vec(),
+            blobs,
+        }));
+    }
 
     // Hand the network off to the node — both die together at
     // collect time.

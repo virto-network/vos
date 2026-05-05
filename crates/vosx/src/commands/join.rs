@@ -135,7 +135,7 @@ pub fn run(
     //   group. Use `--manifest` to defend against that.
     let (manifest, dir) = match manifest_arg {
         Some(p) => {
-            let (m, d) = manifest_from(Some(p.to_path_buf()));
+            let (m, d, _toml) = manifest_from(Some(p.to_path_buf()));
             // Validate every referenced blob exists locally
             // BEFORE we propose any change_membership at the
             // bootnode. A typo'd path otherwise surfaces only

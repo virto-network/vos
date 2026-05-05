@@ -4853,3 +4853,85 @@ fn raft_status_req_returns_absent_for_unknown_group() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+#[cfg(feature = "network")]
+fn manifest_req_returns_installed_provider_payload() {
+    // Regression: `vosx join <bootnode>` (without `--manifest`)
+    // hits `Frame::ManifestReq` to fetch the bootnode's
+    // space.toml + actor blobs. The bootnode side requires a
+    // `ManifestProvider` to be installed via
+    // `set_manifest_provider`; until vosx wired that up, every
+    // joiner saw an empty reply and bailed with the misleading
+    // "no manifest exposed" error.
+    //
+    // This test stands in for the vosx integration: install a
+    // stub provider on A, send a ManifestReq from B, assert the
+    // payload round-trips. Without the install (and without the
+    // vosx-side wiring) the same call returns empty bytes.
+    use std::sync::Arc;
+    use std::time::Duration;
+    use vos::network::{
+        derive_node_prefix, ManifestBlob, ManifestProvider, Network, NetworkConfig,
+    };
+
+    struct StubManifest {
+        toml: Vec<u8>,
+        blobs: Vec<ManifestBlob>,
+    }
+    impl ManifestProvider for StubManifest {
+        fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
+            Some((self.toml.clone(), self.blobs.clone()))
+        }
+    }
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    }));
+    let a_addr = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let toml = br#"space = "demo"
+version = "0.1.0"
+"#
+    .to_vec();
+    let blobs = vec![
+        ManifestBlob { name: "ledger".into(), blob: vec![0xAA; 64] },
+        ManifestBlob { name: "scheduler".into(), blob: vec![0xBB; 32] },
+    ];
+    net_a.set_manifest_provider(Arc::new(StubManifest {
+        toml: toml.clone(),
+        blobs: blobs.clone(),
+    }));
+
+    let net_b = Arc::new(Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    }));
+    wait_for(|| net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
+        Duration::from_secs(15)).expect("Hello");
+    let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+
+    let rx = net_b.send_manifest_req(target_a);
+    let (got_toml, got_blobs) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("manifest reply");
+
+    assert_eq!(got_toml, toml, "toml bytes round-trip");
+    assert_eq!(got_blobs, blobs, "blobs round-trip");
+
+    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+}
+

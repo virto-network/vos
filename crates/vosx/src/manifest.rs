@@ -224,10 +224,19 @@ struct LocalOverlayAgent {
 
 // ── Loader ──────────────────────────────────────────────────────────
 
-pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
+/// Load and parse a `space.toml`, applying any sibling
+/// `*.local.toml` overlay. Returns the merged `Manifest`, the
+/// manifest's parent directory (for resolving `path = "..."`
+/// references), and the **base** TOML bytes — without the overlay
+/// — so a bootnode can serve them verbatim to a `vosx join`er via
+/// the `ManifestProvider` path. The overlay carries
+/// instance-specific bits (libp2p identity, listen addrs) that
+/// should never be propagated to other peers.
+pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf, Vec<u8>) {
     let path = path.unwrap_or_else(|| "space.toml".into());
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| die(&format!("reading {}: {e}", path.display())));
+    let base_bytes = content.as_bytes().to_vec();
     // Tripwire for the dropped `members` field. serde silently
     // ignores unknown fields, so a stale `members = [...]` would
     // otherwise pass parse and operators wouldn't notice the
@@ -283,7 +292,7 @@ pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
     }
 
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    (manifest, dir)
+    (manifest, dir, base_bytes)
 }
 
 /// Derive the local-overlay file path: insert `.local` before the
