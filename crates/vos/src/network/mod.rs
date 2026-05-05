@@ -804,9 +804,38 @@ impl Network {
         rx
     }
 
-    /// Subscribe the local node to a replication group's
-    /// gossipsub topic. Idempotent — call once per local
-    /// replica when registered.
+    /// Join a replication group's gossipsub topic and register a
+    /// hint channel in one call. This is the typical path for a
+    /// replica: it needs to *receive* head announcements to drive
+    /// its sync loop, and the loop won't fire without both the
+    /// subscription AND the channel installed.
+    ///
+    /// `hint_sender` receives one `PeerId` per inbound head
+    /// announcement on this group — the matching agent's
+    /// sync loop drains it and triggers an immediate fetch from
+    /// that peer, bypassing the periodic poll.
+    ///
+    /// For publish-only nodes (no local replica, just bootstrap
+    /// mesh participation) use [`subscribe_rep`](Self::subscribe_rep)
+    /// directly.
+    pub fn join_replication(
+        &self,
+        replication_id: [u8; 32],
+        hint_sender: std_mpsc::Sender<PeerId>,
+    ) {
+        self.subscribe_rep(replication_id);
+        let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
+            replication_id,
+            sender: hint_sender,
+        });
+    }
+
+    /// Subscribe to a replication group's gossipsub topic without
+    /// registering a hint channel. Mostly useful for publish-only
+    /// participants (e.g. tests, or relays that bootstrap the
+    /// mesh without holding a local replica). Real replicas should
+    /// use [`join_replication`](Self::join_replication) instead —
+    /// otherwise inbound head announcements arrive but go nowhere.
     pub fn subscribe_rep(&self, replication_id: [u8; 32]) {
         let _ = self.cmd_tx.send(NetworkCmd::SubscribeRep { replication_id });
     }
@@ -817,23 +846,6 @@ impl Network {
     /// sync tick.
     pub fn publish_heads(&self, replication_id: [u8; 32], roots: Vec<[u8; 32]>) {
         let _ = self.cmd_tx.send(NetworkCmd::PublishHeads { replication_id, roots });
-    }
-
-    /// Register a sender that receives hint `(peer)` whenever a
-    /// gossipsub head announcement arrives for this replication
-    /// group. The matching sync_loop drains the receiver and
-    /// triggers an immediate fetch — that's how cycle 8 turns
-    /// the previously-poll-only sync into a near-zero-latency
-    /// push.
-    pub fn register_hint_sender(
-        &self,
-        replication_id: [u8; 32],
-        sender: std_mpsc::Sender<PeerId>,
-    ) {
-        let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
-            replication_id,
-            sender,
-        });
     }
 
     /// Synchronously invoke a service on a remote peer. Returns a
@@ -2298,13 +2310,11 @@ mod tests {
 
         let rep_id = [0x77u8; 32];
         let (hint_tx, hint_rx) = std_mpsc::channel::<PeerId>();
-        net_b.register_hint_sender(rep_id, hint_tx);
-
-        // Both sides subscribe — gossipsub needs a mesh of at
-        // least one subscriber per side before publish actually
-        // delivers anything.
+        // B is the receiver — subscribe AND register a hint
+        // channel. A is publish-only — bare subscribe to satisfy
+        // gossipsub's mesh requirement.
+        net_b.join_replication(rep_id, hint_tx);
         net_a.subscribe_rep(rep_id);
-        net_b.subscribe_rep(rep_id);
 
         // Wait for the gossipsub heartbeat (1s) to form the
         // mesh, then publish from A. Retry the publish until B

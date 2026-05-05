@@ -666,8 +666,7 @@ fn sync_loop(
         // the gossipsub topic and register our hint channel so
         // peer head announcements wake us up.
         if !subscribed {
-            net.subscribe_rep(rep_id);
-            net.register_hint_sender(rep_id, hint_tx.clone());
+            net.join_replication(rep_id, hint_tx.clone());
             subscribed = true;
         }
         let local = net.peer_id();
