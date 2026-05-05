@@ -89,6 +89,18 @@ impl ClerkPrivatePayBench {
 
         let value: u64 = 50;
 
+        // Step 1 (zkpvm-precompiles shim) — issue the Ristretto
+        // scalar-mult ECALL so the on-target asm path is exercised
+        // by the binary.  In the gated-off chip prover this returns
+        // [0u8; 32] (the shim host-fallback would return real bytes,
+        // but the actor runs on PVM where the chip handler captures
+        // the call).  Used here purely to pin the asm instantiation;
+        // when R1f's full integration lands, this becomes the real
+        // call site for `Amount::commit`.
+        let mut probe_scalar = [0u8; 32]; probe_scalar[0] = (value as u8) ^ 0x5a;
+        let mut probe_point = [0u8; 32]; probe_point[0] = 0xed;
+        let _probe_out = zkpvm_precompiles::ristretto_scalar_mult(&probe_scalar, &probe_point);
+
         // Pre-baked Pedersen-commit bytes (would be `Amount::commit(value,
         // &blinding)` once we have a Ristretto precompile).  Random-looking
         // 32 bytes from the RNG so they don't compress to identity.

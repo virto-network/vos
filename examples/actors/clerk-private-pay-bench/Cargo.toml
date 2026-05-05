@@ -14,6 +14,10 @@ cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features 
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 rand_core = { version = "0.6", default-features = false }
 blake2 = { version = "0.10", default-features = false }
+# Step 1 verification: depend on zkpvm-precompiles (no_std, no
+# host-fallback feature) so the on-target inline-asm path
+# compiles for riscv64em-javm.
+zkpvm-precompiles = { path = "../../../crates/zkpvm-precompiles" }
 
 [profile.release]
 opt-level = "s"

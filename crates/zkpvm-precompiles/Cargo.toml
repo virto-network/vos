@@ -1,0 +1,22 @@
+[package]
+name = "zkpvm-precompiles"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Guest-side shims for zkpvm precompile ECALLs.  Users (cipher-clerk, vos actors, etc.) link this to call into chip-accelerated host computations via the JAM ECALL ABI.  On host (non-riscv64) builds the shims fall through to native crypto so the same code path runs in tests."
+
+[features]
+# Enable the dalek-backed host fallback (required when building
+# off-target for tests / development).  Off by default so no_std
+# guest builds don't pull in dalek at all.
+host-fallback = ["dep:curve25519-dalek"]
+
+[dependencies]
+# Off-target only; the on-target path uses inline asm and pulls in
+# nothing.  Gated behind `host-fallback` so a default no_std build
+# stays empty.
+curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables"] }
+
+[dev-dependencies]
+# Test path always runs on host; pull dalek in unconditionally.
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }

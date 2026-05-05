@@ -4976,6 +4976,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkpvm-precompiles"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+]
+
+[[package]]
 name = "zkpvm-verifier"
 version = "0.1.0"
 dependencies = [
