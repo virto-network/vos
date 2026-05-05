@@ -105,7 +105,7 @@ pub struct AgentConfig {
     pub replication_id: Option<[u8; 32]>,
     /// Pre-opened, shared `redb::Database` for the agent's
     /// `CrdtCommit`. When `register` plans to wire this actor
-    /// into the network's `SyncProvider`, it opens the file
+    /// into the network's `SyncHandler`, it opens the file
     /// here, hands the same `Arc` to the agent's commit
     /// strategy *and* to the sync layer — redb is exclusive on
     /// file open, so this is the only way to share. `None`
@@ -403,7 +403,7 @@ pub struct VosNode {
     pub(crate) shared_network: SharedNetwork,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
-    /// `replication_id` is added. Read by [`NodeSyncProvider`]
+    /// `replication_id` is added. Read by [`NodeSyncHandler`]
     /// (db only) to answer inbound sync queries; the agent
     /// thread and sync ticker share the `commit_lock` to
     /// serialize their writes against each other.
@@ -422,7 +422,7 @@ pub struct VosNode {
 
 /// Shared handle for one CRDT replication group. The same
 /// `Arc<Database>` powers the agent's `CrdtCommit` and the
-/// sync layer's `SyncProvider`; the `commit_lock` serializes
+/// sync layer's `SyncHandler`; the `commit_lock` serializes
 /// the agent's `commit_with_log` against the sync ticker's
 /// `insert_node` + `compact_roots`.
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -487,27 +487,27 @@ impl InvokeHandle {
 #[cfg(feature = "network")]
 type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 
-/// `InvokeDispatcher` impl that routes inbound cross-node invokes
+/// `InvokeHandler` impl that routes inbound cross-node invokes
 /// into this node's local invoke-route table. The network thread
 /// runs `dispatch` on a `tokio::task::spawn_blocking`, so blocking
 /// on the std `mpsc` reply channel here is fine.
 #[cfg(feature = "network")]
-struct LocalInvokeDispatcher {
+struct LocalInvokeHandler {
     invoke_routes: InvokeRoutes,
 }
 
-/// `SyncProvider` impl backed by the node's `crdt_replicas` map.
+/// `SyncHandler` impl backed by the node's `crdt_replicas` map.
 /// Looks up the shared `Arc<Database>` for the replication group
 /// and reads roots / DAG nodes directly through the public
 /// `commit::read_roots` / `commit::read_dag_node` helpers. Reads
 /// are pure redb read txns — they don't need the commit lock.
 #[cfg(all(feature = "network", feature = "storage"))]
-struct NodeSyncProvider {
+struct NodeSyncHandler {
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl crate::network::SyncProvider for NodeSyncProvider {
+impl crate::network::SyncHandler for NodeSyncHandler {
     fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_roots(&slot.db).ok()
@@ -753,7 +753,7 @@ fn sync_with_peer(
     use crate::effect_log::EffectLog;
     use merkle_crdt::DagNode;
 
-    let heads_rx = net.fetch_heads(peer, *rep_id);
+    let heads_rx = net.send_fetch_heads(peer, *rep_id);
     let heads = match heads_rx.recv_timeout(SYNC_FETCH_TIMEOUT) {
         Ok(v) => v,
         Err(_) => return Ok(SyncOutcome::PeerEmpty),
@@ -774,7 +774,7 @@ fn sync_with_peer(
         if cc.get_node_bytes(&cid)?.is_some() {
             continue;
         }
-        let node_rx = net.fetch_node(peer, *rep_id, cid);
+        let node_rx = net.send_fetch_node(peer, *rep_id, cid);
         let Ok(Some(node_bytes)) = node_rx.recv_timeout(SYNC_FETCH_TIMEOUT) else {
             continue;
         };
@@ -801,7 +801,7 @@ fn sync_with_peer(
 }
 
 #[cfg(feature = "network")]
-impl crate::network::InvokeDispatcher for LocalInvokeDispatcher {
+impl crate::network::InvokeHandler for LocalInvokeHandler {
     fn dispatch(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
         // The chain arrived already including the original caller's
         // ID (the remote peer's agent). The receiver's own
@@ -893,20 +893,20 @@ impl VosNode {
         // that arrives between now and the bridge starting gets
         // resolved against this node's invoke_routes rather than
         // the empty-reply default.
-        let dispatcher = Arc::new(LocalInvokeDispatcher {
+        let dispatcher = Arc::new(LocalInvokeHandler {
             invoke_routes: self.invoke_routes.clone(),
         });
-        network.set_invoke_dispatcher(dispatcher);
+        network.set_invoke_handler(dispatcher);
 
         // Same story for the sync provider — answers inbound
         // FetchHeads/FetchNode against the local CRDT replicas
         // already opened by `register`.
         #[cfg(feature = "storage")]
         {
-            let sync_provider = Arc::new(NodeSyncProvider {
+            let sync_provider = Arc::new(NodeSyncHandler {
                 replicas: self.crdt_replicas.clone(),
             });
-            network.set_sync_provider(sync_provider);
+            network.set_sync_handler(sync_provider);
         }
 
         let inbox_rx = match network.take_inbox() {
@@ -976,7 +976,7 @@ impl VosNode {
         // Pre-open the redb database for CRDT actors that declare
         // a replication group, so the same `Arc<Database>` powers
         // both the agent's `CrdtCommit` and the network's
-        // `SyncProvider`. redb is exclusive on file open, so this
+        // `SyncHandler`. redb is exclusive on file open, so this
         // is the only way to share the file across threads.
         //
         // When the file opens cleanly we also create a one-shot-

@@ -87,7 +87,7 @@ pub struct InboundTell {
 /// an empty `Vec` is interpreted as "no reply" / "target not
 /// found" and surfaces to the original caller as an empty
 /// `InvokeReply`.
-pub trait InvokeDispatcher: Send + Sync {
+pub trait InvokeHandler: Send + Sync {
     fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8>;
 }
 
@@ -96,7 +96,7 @@ pub trait InvokeDispatcher: Send + Sync {
 /// directly on its current_thread tokio runtime; implementations
 /// must return quickly (a redb read transaction is fine — micro-
 /// seconds typically, well below the cross-await budget).
-pub trait SyncProvider: Send + Sync {
+pub trait SyncHandler: Send + Sync {
     /// Return the current root CIDs for a replication group, or
     /// `None` if no replica of that group is registered locally.
     fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>>;
@@ -223,7 +223,7 @@ impl RaftStatusReply {
 /// space.toml + actor blobs without the operator pre-distributing
 /// the manifest. Returns `None` for nodes that don't expose a
 /// manifest (transient peers, manifest-less raw `vosx run`).
-pub trait ManifestProvider: Send + Sync {
+pub trait ManifestHandler: Send + Sync {
     /// `(toml_bytes, blobs)` — the raw `space.toml` content and a
     /// list of every actor blob the manifest references, keyed
     /// by name. The joiner writes the blobs into a local cache
@@ -232,7 +232,7 @@ pub trait ManifestProvider: Send + Sync {
     fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)>;
 }
 
-/// Local handler for inbound Raft RPCs. Mirrors [`SyncProvider`]'s
+/// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
 /// shape: the swarm thread invokes the trait methods on its current-
 /// thread runtime, so implementations must be fast. Any redb writes
 /// implied by an `append_entries` call should be funnelled through
@@ -339,14 +339,14 @@ pub struct Network {
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
-    /// Set via [`set_invoke_dispatcher`](Self::set_invoke_dispatcher).
+    /// Set via [`set_invoke_handler`](Self::set_invoke_handler).
     /// Read by the swarm thread on every inbound `InvokeRequest`
     /// to dispatch against the local node.
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    /// Set via [`set_sync_provider`](Self::set_sync_provider).
+    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
+    /// Set via [`set_sync_handler`](Self::set_sync_handler).
     /// Read by the swarm thread on every inbound `FetchHeads` /
     /// `FetchNode` to look up the local replica.
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
     /// Per-replication-group inbound Raft handler map. Populated
     /// via [`register_raft_handler`](Self::register_raft_handler);
     /// read by the swarm thread on every inbound
@@ -355,11 +355,11 @@ pub struct Network {
     /// Frames carrying a `replication_id` with no entry surface to
     /// the peer as the default empty / current-term answer.
     raft_handlers: RaftHandlerMap,
-    /// Set via [`set_manifest_provider`](Self::set_manifest_provider).
+    /// Set via [`set_manifest_handler`](Self::set_manifest_handler).
     /// Read by the swarm thread on inbound `ManifestReq` frames
     /// so a fresh `vosx join` can fetch the bootnode's space.toml
     /// + actor blobs.
-    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
+    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -507,12 +507,12 @@ impl Network {
         let local_prefix = config.local_prefix;
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
-        let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>> =
+        let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>> =
             Arc::new(Mutex::new(None));
-        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> =
+        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>> =
             Arc::new(Mutex::new(None));
         let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
-        let manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>> =
+        let manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>> =
             Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
@@ -565,7 +565,7 @@ impl Network {
     /// Install the handler used to dispatch inbound `InvokeRequest`
     /// frames into the local node. Without it, remote invokes
     /// receive an empty `InvokeReply`.
-    pub fn set_invoke_dispatcher(&self, dispatcher: Arc<dyn InvokeDispatcher>) {
+    pub fn set_invoke_handler(&self, dispatcher: Arc<dyn InvokeHandler>) {
         if let Ok(mut g) = self.invoke_dispatcher.lock() {
             *g = Some(dispatcher);
         }
@@ -575,7 +575,7 @@ impl Network {
     /// `FetchNode` frames against the local CRDT replicas.
     /// Without it, peers asking us for sync data get empty
     /// replies.
-    pub fn set_sync_provider(&self, provider: Arc<dyn SyncProvider>) {
+    pub fn set_sync_handler(&self, provider: Arc<dyn SyncHandler>) {
         if let Ok(mut g) = self.sync_provider.lock() {
             *g = Some(provider);
         }
@@ -624,7 +624,7 @@ impl Network {
     /// frames so a fresh `vosx join` can fetch the bootnode's
     /// space.toml + actor blobs. Without it, peers asking us
     /// for the manifest get an empty reply.
-    pub fn set_manifest_provider(&self, provider: Arc<dyn ManifestProvider>) {
+    pub fn set_manifest_handler(&self, provider: Arc<dyn ManifestHandler>) {
         if let Ok(mut g) = self.manifest_provider.lock() {
             *g = Some(provider);
         }
@@ -769,7 +769,7 @@ impl Network {
     /// group. The receiver yields the peer's roots vec; on
     /// failure the Sender is dropped (caller's recv yields
     /// `Disconnected`).
-    pub fn fetch_heads(
+    pub fn send_fetch_heads(
         &self,
         target_peer: PeerId,
         replication_id: [u8; 32],
@@ -786,7 +786,7 @@ impl Network {
     /// Point-fetch a single DAG node from a peer. The receiver
     /// yields `Some(bytes)` if the peer has the node, `None` if
     /// it doesn't (typical during sync racing).
-    pub fn fetch_node(
+    pub fn send_fetch_node(
         &self,
         target_peer: PeerId,
         replication_id: [u8; 32],
@@ -966,10 +966,10 @@ async fn network_main(
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_tx: std_mpsc::Sender<InboundTell>,
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
+    sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
     raft_handlers: RaftHandlerMap,
-    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
+    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -1327,10 +1327,10 @@ fn handle_swarm_event(
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
+    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
     raft_handlers: &RaftHandlerMap,
-    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
+    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
@@ -1398,10 +1398,10 @@ fn handle_req_resp(
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
+    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
     raft_handlers: &RaftHandlerMap,
-    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestProvider>>>>,
+    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -2153,7 +2153,7 @@ mod tests {
     /// Slice 3b end-to-end: VosNode B has a CRDT replica registered
     /// in `crdt_replicas` (via the test helper) with some DAG
     /// nodes pre-populated; VosNode A asks via the network and
-    /// reads them back through `NodeSyncProvider`.
+    /// reads them back through `NodeSyncHandler`.
     #[test]
     fn cross_node_sync_via_vosnode_replicas() {
         use crate::commit::{CommitStrategy, CrdtCommit};
@@ -2245,14 +2245,14 @@ mod tests {
 
         // Ask B for heads of the replication group.
         let heads = net_a_arc
-            .fetch_heads(peer_b, rep_id)
+            .send_fetch_heads(peer_b, rep_id)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply");
         assert_eq!(heads, vec![expected_root]);
 
         // Point-fetch the root node.
         let node = net_a_arc
-            .fetch_node(peer_b, rep_id, expected_root)
+            .send_fetch_node(peer_b, rep_id, expected_root)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply");
         assert_eq!(node.as_deref(), Some(expected_node_bytes.as_slice()));
@@ -2324,7 +2324,7 @@ mod tests {
 
     /// Network-level test: A asks B for the heads of a replication
     /// group and then point-fetches a DAG node by CID. Verifies
-    /// the SyncProvider on B sees the requests and the responses
+    /// the SyncHandler on B sees the requests and the responses
     /// round-trip through the request_response wire.
     #[test]
     fn cross_node_sync_fetch_heads_and_node() {
@@ -2334,7 +2334,7 @@ mod tests {
             nodes: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
         }
 
-        impl SyncProvider for StaticProvider {
+        impl SyncHandler for StaticProvider {
             fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
                 if replication_id == &self.rep_id {
                     Some(self.roots.clone())
@@ -2380,7 +2380,7 @@ mod tests {
         let mut nodes = std::collections::BTreeMap::new();
         nodes.insert(cid_present, b"node-bytes-here".to_vec());
 
-        net_b.set_sync_provider(Arc::new(StaticProvider {
+        net_b.set_sync_handler(Arc::new(StaticProvider {
             rep_id,
             roots: vec![cid_present],
             nodes,
@@ -2394,7 +2394,7 @@ mod tests {
         let peer_b = net_a.peer_for_prefix(net_b.local_prefix()).unwrap();
 
         // FetchHeads
-        let heads_rx = net_a.fetch_heads(peer_b, rep_id);
+        let heads_rx = net_a.send_fetch_heads(peer_b, rep_id);
         let heads = heads_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply");
@@ -2403,13 +2403,13 @@ mod tests {
         // FetchHeads for an unknown rep_id returns empty.
         let unknown_rep = [0u8; 32];
         let empty_heads = net_a
-            .fetch_heads(peer_b, unknown_rep)
+            .send_fetch_heads(peer_b, unknown_rep)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply for unknown group");
         assert!(empty_heads.is_empty());
 
         // FetchNode for a known CID returns Some.
-        let node_rx = net_a.fetch_node(peer_b, rep_id, cid_present);
+        let node_rx = net_a.send_fetch_node(peer_b, rep_id, cid_present);
         let node = node_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply");
@@ -2417,7 +2417,7 @@ mod tests {
 
         // FetchNode for an unknown CID returns None.
         let missing = net_a
-            .fetch_node(peer_b, rep_id, cid_missing)
+            .send_fetch_node(peer_b, rep_id, cid_missing)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply for missing CID");
         assert_eq!(missing, None);
@@ -2427,7 +2427,7 @@ mod tests {
     }
 
     /// Network-level test: outbound `send_invoke` on A dispatches
-    /// against an `InvokeDispatcher` installed on B, and the
+    /// against an `InvokeHandler` installed on B, and the
     /// reply flows back through the request_response response
     /// slot to the original caller.
     #[test]
@@ -2437,7 +2437,7 @@ mod tests {
             reply: Vec<u8>,
         }
 
-        impl InvokeDispatcher for RecordingDispatcher {
+        impl InvokeHandler for RecordingDispatcher {
             fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
                 *self.seen.lock().unwrap() =
                     Some((from, to, chain.clone(), msg));
@@ -2474,7 +2474,7 @@ mod tests {
 
         // Install dispatcher on B before any invoke can race in.
         let seen = Arc::new(Mutex::new(None));
-        net_b.set_invoke_dispatcher(Arc::new(RecordingDispatcher {
+        net_b.set_invoke_handler(Arc::new(RecordingDispatcher {
             seen: seen.clone(),
             reply: b"the answer".to_vec(),
         }));
@@ -2510,7 +2510,7 @@ mod tests {
     }
 
     /// Full path: `VosNode::invoke` on A finds no local route,
-    /// falls through to the network, hits B's `LocalInvokeDispatcher`
+    /// falls through to the network, hits B's `LocalInvokeHandler`
     /// (installed by `attach_network`), which dispatches against
     /// B's invoke_routes table where a test responder lives.
     #[test]
@@ -2559,7 +2559,7 @@ mod tests {
         .expect("Hello completes");
 
         // Build node B with a responder, then attach the network so
-        // the LocalInvokeDispatcher sees the responder's route.
+        // the LocalInvokeHandler sees the responder's route.
         let mut node_b = VosNode::with_prefix(prefix_b);
         let responder_id = node_b.install_invoke_responder(|msg| {
             // Echo with a marker so we can assert on the reply.

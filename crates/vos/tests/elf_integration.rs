@@ -4859,8 +4859,8 @@ fn manifest_req_returns_installed_provider_payload() {
     // Regression: `vosx join <bootnode>` (without `--manifest`)
     // hits `Frame::ManifestReq` to fetch the bootnode's
     // space.toml + actor blobs. The bootnode side requires a
-    // `ManifestProvider` to be installed via
-    // `set_manifest_provider`; until vosx wired that up, every
+    // `ManifestHandler` to be installed via
+    // `set_manifest_handler`; until vosx wired that up, every
     // joiner saw an empty reply and bailed with the misleading
     // "no manifest exposed" error.
     //
@@ -4871,14 +4871,14 @@ fn manifest_req_returns_installed_provider_payload() {
     use std::sync::Arc;
     use std::time::Duration;
     use vos::network::{
-        derive_node_prefix, ManifestBlob, ManifestProvider, Network, NetworkConfig,
+        derive_node_prefix, ManifestBlob, ManifestHandler, Network, NetworkConfig,
     };
 
     struct StubManifest {
         toml: Vec<u8>,
         blobs: Vec<ManifestBlob>,
     }
-    impl ManifestProvider for StubManifest {
+    impl ManifestHandler for StubManifest {
         fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
             Some((self.toml.clone(), self.blobs.clone()))
         }
@@ -4910,7 +4910,7 @@ version = "0.1.0"
         ManifestBlob { name: "ledger".into(), blob: vec![0xAA; 64] },
         ManifestBlob { name: "scheduler".into(), blob: vec![0xBB; 32] },
     ];
-    net_a.set_manifest_provider(Arc::new(StubManifest {
+    net_a.set_manifest_handler(Arc::new(StubManifest {
         toml: toml.clone(),
         blobs: blobs.clone(),
     }));

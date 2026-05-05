@@ -326,7 +326,7 @@ mod crdt {
         /// Build a `CrdtCommit` on a pre-opened, shared
         /// `Arc<redb::Database>`. Used when the host wants the
         /// same database exposed to a parallel reader (e.g. a
-        /// `SyncProvider`) without double-opening — redb is
+        /// `SyncHandler`) without double-opening — redb is
         /// exclusive on file open, so this is the only way to
         /// share access.
         ///
@@ -523,7 +523,7 @@ mod crdt {
     }
 
     /// Read a single DAG node's serialized bytes by CID from a
-    /// shared redb database. Public so a `SyncProvider` (or any
+    /// shared redb database. Public so a `SyncHandler` (or any
     /// other reader) can serve fetches without holding a
     /// `CrdtCommit` mutex.
     pub fn read_dag_node(

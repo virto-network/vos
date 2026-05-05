@@ -251,7 +251,7 @@ fn fetch_manifest_from_bootnode(
         .map_err(|e| format!("manifest fetch: {e}"))?;
     if toml_bytes.is_empty() {
         return Err(
-            "bootnode did not expose a manifest (no `set_manifest_provider` registered) — \
+            "bootnode did not expose a manifest (no `set_manifest_handler` registered) — \
              pass --manifest <path> to use a local copy"
                 .into(),
         );

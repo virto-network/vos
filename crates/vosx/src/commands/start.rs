@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos::abi::service::ServiceId;
-use vos::network::{ManifestBlob, ManifestProvider};
+use vos::network::{ManifestBlob, ManifestHandler};
 use vos::node::{AgentConfig, Consistency, VosNode, WorkerConfig};
 use vos::value::Args;
 
@@ -22,17 +22,17 @@ use crate::manifest::{
 use crate::network::start_network_if_needed;
 use crate::util::{die, exit_with_status, format_provides, hex32, load_blob, load_file};
 
-/// Local impl of [`ManifestProvider`] — serves `vosx join`ers the
+/// Local impl of [`ManifestHandler`] — serves `vosx join`ers the
 /// base `space.toml` bytes plus every actor blob the manifest
 /// references. Without this installed, joiners that don't pass
 /// `--manifest <path>` see an empty reply and fall back to a hard
 /// error.
-struct LocalManifestProvider {
+struct LocalManifestHandler {
     toml: Vec<u8>,
     blobs: Vec<ManifestBlob>,
 }
 
-impl ManifestProvider for LocalManifestProvider {
+impl ManifestHandler for LocalManifestHandler {
     fn manifest(&self) -> Option<(Vec<u8>, Vec<ManifestBlob>)> {
         Some((self.toml.clone(), self.blobs.clone()))
     }
@@ -150,7 +150,7 @@ pub fn run(
     // reply.
     if let Some(net) = &network {
         let blobs = collect_manifest_blobs(manifest, dir);
-        net.set_manifest_provider(Arc::new(LocalManifestProvider {
+        net.set_manifest_handler(Arc::new(LocalManifestHandler {
             toml: manifest_toml.to_vec(),
             blobs,
         }));

@@ -229,7 +229,7 @@ struct LocalOverlayAgent {
 /// manifest's parent directory (for resolving `path = "..."`
 /// references), and the **base** TOML bytes — without the overlay
 /// — so a bootnode can serve them verbatim to a `vosx join`er via
-/// the `ManifestProvider` path. The overlay carries
+/// the `ManifestHandler` path. The overlay carries
 /// instance-specific bits (libp2p identity, listen addrs) that
 /// should never be propagated to other peers.
 pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf, Vec<u8>) {
