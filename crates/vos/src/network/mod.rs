@@ -39,7 +39,7 @@ pub use wire::{
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -347,12 +347,14 @@ pub struct Network {
     inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
     /// Set via [`set_invoke_handler`](Self::set_invoke_handler).
     /// Read by the swarm thread on every inbound `InvokeRequest`
-    /// to dispatch against the local node.
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
+    /// to dispatch against the local node. Set-once: a second
+    /// `set_invoke_handler` call is a programming error and is
+    /// silently ignored (the original handler stays installed).
+    invoke_dispatcher: Arc<OnceLock<Arc<dyn InvokeHandler>>>,
     /// Set via [`set_sync_handler`](Self::set_sync_handler).
     /// Read by the swarm thread on every inbound `FetchHeads` /
-    /// `FetchNode` to look up the local replica.
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
+    /// `FetchNode` to look up the local replica. Set-once.
+    sync_provider: Arc<OnceLock<Arc<dyn SyncHandler>>>,
     /// Per-replication-group inbound Raft handler map. Populated
     /// via [`register_raft_handler`](Self::register_raft_handler);
     /// read by the swarm thread on every inbound
@@ -364,8 +366,8 @@ pub struct Network {
     /// Set via [`set_manifest_handler`](Self::set_manifest_handler).
     /// Read by the swarm thread on inbound `ManifestReq` frames
     /// so a fresh `vosx join` can fetch the bootnode's space.toml
-    /// + actor blobs.
-    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
+    /// + actor blobs. Set-once.
+    manifest_provider: Arc<OnceLock<Arc<dyn ManifestHandler>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -513,13 +515,13 @@ impl Network {
         let local_prefix = config.local_prefix;
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
-        let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>> =
-            Arc::new(Mutex::new(None));
-        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>> =
-            Arc::new(Mutex::new(None));
+        let invoke_dispatcher: Arc<OnceLock<Arc<dyn InvokeHandler>>> =
+            Arc::new(OnceLock::new());
+        let sync_provider: Arc<OnceLock<Arc<dyn SyncHandler>>> =
+            Arc::new(OnceLock::new());
         let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
-        let manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>> =
-            Arc::new(Mutex::new(None));
+        let manifest_provider: Arc<OnceLock<Arc<dyn ManifestHandler>>> =
+            Arc::new(OnceLock::new());
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
@@ -570,21 +572,18 @@ impl Network {
 
     /// Install the handler used to dispatch inbound `InvokeRequest`
     /// frames into the local node. Without it, remote invokes
-    /// receive an empty `InvokeReply`.
+    /// receive an empty `InvokeReply`. Set-once: a second call is
+    /// a programming error and is silently ignored.
     pub fn set_invoke_handler(&self, dispatcher: Arc<dyn InvokeHandler>) {
-        if let Ok(mut g) = self.invoke_dispatcher.lock() {
-            *g = Some(dispatcher);
-        }
+        let _ = self.invoke_dispatcher.set(dispatcher);
     }
 
     /// Install the handler used to answer inbound `FetchHeads` /
     /// `FetchNode` frames against the local CRDT replicas.
     /// Without it, peers asking us for sync data get empty
-    /// replies.
+    /// replies. Set-once.
     pub fn set_sync_handler(&self, provider: Arc<dyn SyncHandler>) {
-        if let Ok(mut g) = self.sync_provider.lock() {
-            *g = Some(provider);
-        }
+        let _ = self.sync_provider.set(provider);
     }
 
     /// Register a handler for one Raft replication group.
@@ -629,11 +628,9 @@ impl Network {
     /// Install the provider used to answer inbound `ManifestReq`
     /// frames so a fresh `vosx join` can fetch the bootnode's
     /// space.toml + actor blobs. Without it, peers asking us
-    /// for the manifest get an empty reply.
+    /// for the manifest get an empty reply. Set-once.
     pub fn set_manifest_handler(&self, provider: Arc<dyn ManifestHandler>) {
-        if let Ok(mut g) = self.manifest_provider.lock() {
-            *g = Some(provider);
-        }
+        let _ = self.manifest_provider.set(provider);
     }
 
     /// Send a [`Frame::RaftJoinReq`] to a bootnode. The receiver
@@ -971,10 +968,10 @@ async fn network_main(
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_tx: std_mpsc::Sender<InboundTell>,
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
+    invoke_dispatcher: Arc<OnceLock<Arc<dyn InvokeHandler>>>,
+    sync_provider: Arc<OnceLock<Arc<dyn SyncHandler>>>,
     raft_handlers: RaftHandlerMap,
-    manifest_provider: Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
+    manifest_provider: Arc<OnceLock<Arc<dyn ManifestHandler>>>,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -1332,10 +1329,10 @@ fn handle_swarm_event(
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
+    invoke_dispatcher: &Arc<OnceLock<Arc<dyn InvokeHandler>>>,
+    sync_provider: &Arc<OnceLock<Arc<dyn SyncHandler>>>,
     raft_handlers: &RaftHandlerMap,
-    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
+    manifest_provider: &Arc<OnceLock<Arc<dyn ManifestHandler>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
@@ -1403,10 +1400,10 @@ fn handle_req_resp(
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeHandler>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncHandler>>>>,
+    invoke_dispatcher: &Arc<OnceLock<Arc<dyn InvokeHandler>>>,
+    sync_provider: &Arc<OnceLock<Arc<dyn SyncHandler>>>,
     raft_handlers: &RaftHandlerMap,
-    manifest_provider: &Arc<Mutex<Option<Arc<dyn ManifestHandler>>>>,
+    manifest_provider: &Arc<OnceLock<Arc<dyn ManifestHandler>>>,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -1437,7 +1434,7 @@ fn handle_req_resp(
                         // park the runtime if awaited inline. The task
                         // calls back with (channel, InvokeReply) which the
                         // swarm select! arm forwards via send_response.
-                        let dispatcher = invoke_dispatcher.lock().ok().and_then(|g| g.clone());
+                        let dispatcher = invoke_dispatcher.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let payload = match dispatcher {
@@ -1458,9 +1455,8 @@ fn handle_req_resp(
                     Frame::FetchHeads { replication_id } => {
                         // Sync reads are quick redb txns; serve them
                         // inline rather than spawning a blocking task.
-                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
-                        let roots = provider
-                            .as_ref()
+                        let roots = sync_provider
+                            .get()
                             .and_then(|p| p.roots(&replication_id))
                             .unwrap_or_default();
                         let _ = swarm.behaviour_mut().req_resp.send_response(
@@ -1469,9 +1465,8 @@ fn handle_req_resp(
                         );
                     }
                     Frame::FetchNode { replication_id, cid } => {
-                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
-                        let node = provider
-                            .as_ref()
+                        let node = sync_provider
+                            .get()
                             .and_then(|p| p.get_node(&replication_id, &cid));
                         let _ = swarm
                             .behaviour_mut()
@@ -1648,11 +1643,8 @@ fn handle_req_resp(
                     Frame::ManifestReq => {
                         // Manifest handler just reads in-memory
                         // bytes; serve inline.
-                        let handler = manifest_provider
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.clone());
-                        let reply = handler
+                        let reply = manifest_provider
+                            .get()
                             .and_then(|h| h.manifest())
                             .unwrap_or_else(|| ManifestReply {
                                 toml: Vec::new(),
