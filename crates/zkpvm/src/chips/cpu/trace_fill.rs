@@ -1581,6 +1581,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_base_field(
                 row, &[BaseField::from(dsap_v)], Column::DivSActivePartialH
             );
+            // Wave 8 fix (lookup mult): IsShiftCNotRotrH = is_shift_c · (1 - rot_r64 - rot_r32).
+            let no_rotr = !flags.is_rotate_r64 && !flags.is_rotate_r32;
+            trace.fill_columns(
+                row, is_shift_constrained && no_rotr, Column::IsShiftCNotRotrH
+            );
         }
 
         for &b in &range_bytes {

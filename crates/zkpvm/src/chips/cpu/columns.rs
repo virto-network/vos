@@ -986,6 +986,9 @@ pub enum Column {
     #[size = 1] DivSActivePartialH,
     /// `IsDivS · (1 - DivByZero)` — root helper for DivSActivePartialH.
     #[size = 1] IsDivSNotDbzH,
+    /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32)` — Phase 36
+    /// PowerOfTwo lookup multiplicity for the classic shift case.
+    #[size = 1] IsShiftCNotRotrH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

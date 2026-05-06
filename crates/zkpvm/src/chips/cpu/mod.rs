@@ -117,6 +117,8 @@ impl BuiltInComponent for CpuChip {
             crate::trace::trace_eval!(trace_eval, Column::ValRPartNZTimesIndH);
         let div_s_active_partial_h =
             crate::trace::trace_eval!(trace_eval, Column::DivSActivePartialH);
+        let is_shift_c_not_rotr_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsShiftCNotRotrH);
 
         let is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
@@ -1742,14 +1744,19 @@ impl BuiltInComponent for CpuChip {
             let is_shift_c = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
             let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
             tuple.extend_from_slice(&val_d);
-            // Multiplicity: is_shift_c · (1 − is_rotate_r64 − is_rotate_r32).
-            let mult = is_shift_c[0].clone()
-                * (E::F::one()
-                    - is_rotate_r64_pow2[0].clone()
-                    - is_rotate_r32_pow2[0].clone());
+            // Wave 8 fix: routed `is_shift_c · (1 - rot_r64 - rot_r32)` through
+            // IsShiftCNotRotrH so the lookup multiplicity stays at deg 1.
+            // Helper-defining constraint added below.
+            eval.add_constraint(
+                is_shift_c_not_rotr_h[0].clone()
+                    - is_shift_c[0].clone()
+                        * (E::F::one()
+                            - is_rotate_r64_pow2[0].clone()
+                            - is_rotate_r32_pow2[0].clone())
+            );
             eval.add_to_relation(RelationEntry::new(
                 pow2_lookup,
-                mult.into(),
+                is_shift_c_not_rotr_h[0].clone().into(),
                 &tuple,
             ));
         }
