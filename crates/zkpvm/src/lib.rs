@@ -340,6 +340,7 @@ pub use proof::{
 #[cfg(feature = "prover")]
 pub use prove::{
     prove, prove_with_config, prove_profiled, prove_profiled_with_config,
+    prove_with_explicit_components,
     ProveProfile, production_pcs_config, production_pcs_config_mobile,
     install_thread_pool,
 };
@@ -350,9 +351,22 @@ pub use stwo::core::fri::FriConfig;
 #[cfg(feature = "prover")]
 pub use verify::{
     verify, verify_chain, verify_with_max_log_size, verify_with_options,
-    verify_with_pcs_policy, DEFAULT_MAX_LOG_SIZE,
+    verify_with_pcs_policy, verify_with_explicit_components,
+    DEFAULT_MAX_LOG_SIZE,
 };
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
+
+/// Phase I.0 chip-isolated harness surface — re-exports the trait
+/// objects callers need to assemble an explicit component slice for
+/// `prove_with_explicit_components` / `verify_with_explicit_components`.
+/// Intended only for the v2.x chip-rewrite validation harness; production
+/// code should use `prove` / `verify`.  Callers build their own
+/// `&[&dyn MachineProverComponent]` slice from the chip structs in
+/// `crate::chips`.
+#[cfg(feature = "prover")]
+pub mod harness {
+    pub use crate::framework::{MachineComponent, MachineProverComponent};
+}
 #[cfg(feature = "prover")]
 pub use program_id::{program_commitment_of_proof, program_commitment_hex, ProgramCommitment};

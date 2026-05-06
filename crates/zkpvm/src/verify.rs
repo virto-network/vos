@@ -92,6 +92,48 @@ pub fn verify_with_options(
     // the prover used).  See `active_components_verifier` doc-comment.
     let components_owned = super::active_components_verifier(side_note);
     let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
+    let prover_components_owned = super::active_components(side_note);
+    let prover_components: &[&dyn crate::framework::MachineProverComponent] =
+        &prover_components_owned;
+    verify_with_options_explicit_components(
+        proof, side_note, max_log_size, policy, components, prover_components,
+    )
+}
+
+/// Phase I.0 chip-isolated verify path — pair with `prove_with_explicit_components`.
+///
+/// `components` is the verifier-trait view of the chip set (used for the
+/// constraint check).  `prover_components` is the prover-trait view of the
+/// SAME set (used to regenerate the preprocessed trace).  In practice they
+/// point to the same underlying unit chips and `MachineProverComponent`
+/// extends `MachineComponent`, so callers usually have one slice and pass
+/// it twice (once via `as &dyn MachineComponent` upcast, once raw).
+///
+/// `policy` lets the harness use a cheap `PcsConfig` for fast chip-rewrite
+/// validation cycles (e.g. `pow_bits = 5`) without tripping the production
+/// `PcsPolicy::STANDARD` floor.
+pub fn verify_with_explicit_components(
+    proof: Proof,
+    side_note: &SideNote,
+    components: &[&dyn crate::framework::MachineComponent],
+    prover_components: &[&dyn crate::framework::MachineProverComponent],
+    policy: &crate::proof::PcsPolicy,
+) -> Result<(), VerificationError> {
+    verify_with_options_explicit_components(
+        proof, side_note, DEFAULT_MAX_LOG_SIZE,
+        policy,
+        components, prover_components,
+    )
+}
+
+fn verify_with_options_explicit_components(
+    proof: Proof,
+    side_note: &SideNote,
+    max_log_size: u32,
+    policy: &crate::proof::PcsPolicy,
+    components: &[&dyn crate::framework::MachineComponent],
+    prover_components: &[&dyn crate::framework::MachineProverComponent],
+) -> Result<(), VerificationError> {
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
     // chip list / column counts / lookup-tuple shape changes in a way
@@ -140,7 +182,10 @@ pub fn verify_with_options(
     });
 
     // Verify preprocessed trace commitment
-    verify_preprocessed_trace(&proof, side_note, verifier_channel, &claimed_log_sizes, &config)?;
+    verify_preprocessed_trace(
+        &proof, side_note, verifier_channel, &claimed_log_sizes, &config,
+        prover_components,
+    )?;
 
     let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
     let sizes: Vec<TreeVec<Vec<u32>>> = components
@@ -198,13 +243,14 @@ fn verify_preprocessed_trace(
     verifier_channel: &Blake2sChannel,
     log_sizes: &[u32],
     config: &PcsConfig,
+    components: &[&dyn crate::framework::MachineProverComponent],
 ) -> Result<(), VerificationError> {
-    // Phase 60: same active-component filter the prover used.  This
-    // helper actually re-runs prover-side preprocessing-trace
-    // generation to re-commit, so it needs the prover trait, not
-    // the verifier-side MachineComponent.
-    let components_owned = super::active_components(side_note);
-    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
+    // Phase 60: caller passes the same prover-trait component set the
+    // prover used (either `active_components(side_note)` for the default
+    // path, or an explicit slice for the chip-isolated harness).  This
+    // helper actually re-runs prover-side preprocessing-trace generation
+    // to re-commit, so it needs the prover trait, not the verifier-side
+    // MachineComponent.
     let max_constraint_log_degree_bound = components
         .iter()
         .zip(log_sizes)

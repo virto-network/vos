@@ -226,11 +226,39 @@ fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::
 }
 
 fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
-    use std::time::Instant;
     // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
+    let component_mask = super::active_component_mask(side_note);
+    prove_impl_with_components(side_note, config, profile, components, component_mask)
+}
+
+/// Phase I.0: chip-isolated prove path.  Bypasses `active_components` so
+/// callers can pick an arbitrary component slice — used by the chip-rewrite
+/// validation harness to prove a single high-bound chip + its lookup
+/// closure without dragging in always-active CpuChip.  See
+/// `STWO_PHASE_I_BLAKE2B.md`.  Proofs produced here have
+/// `component_mask = 0` and are not verifiable via `verify_standalone`;
+/// pair only with `verify_with_explicit_components`.
+pub fn prove_with_explicit_components(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+    components: &[&'static dyn crate::framework::MachineProverComponent],
+) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    let (proof, _) = prove_impl_with_components(side_note, config, false, components, 0)?;
+    Ok(proof)
+}
+
+fn prove_impl_with_components(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+    profile: bool,
+    components: &[&dyn crate::framework::MachineProverComponent],
+    component_mask: u32,
+) -> Result<(Proof, ProveProfile), ProvingError> {
+    use std::time::Instant;
 
     // Phase 9a: backfill initial_regs from the first step's regs_before if the
     // caller left it at the default all-zero but the tracer recorded non-zero
@@ -393,10 +421,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
         }
     };
 
-    // Phase 60: encode the active-chip set as a bitmask so the standalone
-    // verifier (no SideNote) can reconstruct exactly which chips ran.
-    let component_mask = super::active_component_mask(side_note);
-
+    // Phase 60: caller supplies the bitmask (empty for chip-isolated harness).
     Ok((Proof {
         format_version: PROOF_FORMAT_VERSION,
         stark_proof: proof,

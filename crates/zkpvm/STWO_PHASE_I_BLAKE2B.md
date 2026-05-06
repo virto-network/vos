@@ -235,18 +235,50 @@ Phase I.0 before starting subphase 1 of any chip rewrite. The
 upfront cost is small relative to the downstream debugging cost of
 trusted-blind rewrites.
 
+## Phase I.0 landed (2026-05-06)
+
+The chip-isolated prove harness is now in place:
+
+- `prove_with_explicit_components(side_note, config, &[&dyn
+  MachineProverComponent])` (re-exported from `zkpvm`).
+- `verify_with_explicit_components(proof, side_note, &[&dyn
+  MachineComponent], &[&dyn MachineProverComponent], policy)`.
+- `harness::{MachineComponent, MachineProverComponent}` trait
+  re-exports for callers building component slices.
+- Smoke test `tests/chip_isolated.rs::harness_smoke_bound1_only`
+  PASSES on the bumped pin (`e1286720`) using just
+  `[&RangeMultiplicity256]` and an empty side_note.
+
+**Strategic confirmation:** the smoke test's success means v2.x's
+lifted protocol DOES support bound-1 AIRs cleanly. The Phase H block
+applies specifically to AIRs with constraint degree ≥ 3 (i.e., our
+chips at `LOG_CONSTRAINT_DEGREE_BOUND ≥ 2`). Once each high-bound
+chip is flattened to bound 1, the harness will validate it with the
+same machinery the smoke test exercises. The migration *is*
+unblockable — at the cost the audit estimates.
+
 ## Stopping point for this session
 
-This audit is the deliverable. Phases G + H are committed. Code changes
-to the chip itself are deferred to a session with multi-week scope.
+Phases G + H + I.0 (harness) are committed. Phase I subphase 1 (gate
+helpers for Blake2bChip) deferred to a session with multi-week scope.
+
 The next session should:
 
 1. Read this doc.
 2. Verify Phase G's pin still applies (`grep e1286720 Cargo.toml`).
 3. Run `cargo test -p zkpvm --features prover --release --test
+   chip_isolated harness_smoke_bound1_only` — should pass; confirms
+   harness is intact.
+4. Run `cargo test -p zkpvm --features prover --release --test
    phase2_alu prove_add64` — should reproduce
-   `ConstraintsNotSatisfied`.
-4. Start I-blake2b-1.
+   `ConstraintsNotSatisfied`; confirms chip-flatten work still
+   needed.
+5. Add a `tests/chip_isolated.rs::harness_blake2b_isolated` test that
+   uses `[&Blake2bChip + sink components]` and a side_note carrying
+   one synthetic Blake2bCall. Document the lookup-balance strategy
+   (sink components, or accept open-chain rejection like
+   `prove_ristretto_chip_with_input_producers`).
+6. Start I-blake2b-1.
 
 When MulChip is started, do a similar audit pass for it — its 16
 constraints over 64-bit schoolbook multiply are likely simpler than

@@ -31,6 +31,12 @@ pub trait BuiltInComponent {
 
     type PreprocessedColumn: PreprocessedAirColumn;
     type MainColumn: AirColumn;
+    // `ComponentLookupElements` is `pub(crate)` (sealed); harmless when
+    // `BuiltInComponent` itself stays `pub(crate)`-reachable, but the
+    // Phase I.0 harness re-exports `MachineComponent` through which this
+    // bound becomes lexically reachable at `pub`.  Suppress the warning;
+    // sealing remains effective since callers can't impl it.
+    #[allow(private_bounds)]
     type LookupElements: ComponentLookupElements;
 
     fn add_constraints<E: EvalAtRow>(
