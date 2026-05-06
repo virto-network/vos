@@ -143,6 +143,55 @@ pub enum Column {
     AbsCmpCarry,
     #[size = 1]
     IsPadding,
+
+    // ── Phase I-divrem Stwo-v2.x degree-flatten helpers ──
+    //
+    // DivRemChip's natural form has constraints at degree 3-6, primarily
+    // because the gating chains use up to 4 binary flags before
+    // multiplying the constraint body.  Helpers below materialise each
+    // multi-flag selector and the schoolbook quadratic body so every
+    // gated constraint factors into (deg 1 column ref) × (deg 1 body).
+
+    /// `IsDivRem · (1 - DivByZero)` — div is "active" (non-zero divisor).
+    #[size = 1] DivActiveH,
+    /// `(1 - IsPadding) · DivActiveH` — real row + active div.
+    #[size = 1] NotPaddingDivH,
+    /// `NotPaddingDivH · Is64Bit` (Is64Bit = 1 - Is32Bit).
+    #[size = 1] DivActive64H,
+    /// `NotPaddingDivH · Is32Bit`.
+    #[size = 1] DivActive32H,
+    /// `NotPaddingDivH · (1 - IsDivS)` — unsigned-div uniqueness chain gate.
+    #[size = 1] DivUActiveH,
+    /// `NotPaddingDivH · IsDivS` — signed-div sign-correction gate.
+    #[size = 1] DivSActiveH,
+    /// `DivSActiveH · Is64Bit`, `DivSActiveH · Is32Bit` —
+    /// per-width signed-div gates.
+    #[size = 1] DivS64H,
+    #[size = 1] DivS32H,
+    /// `(1 - IsPadding) · (1 - SignBitD)` and `(1 - IsPadding) · SignBitD`
+    /// — split AbsD chain gates by the conditional-negation case.
+    #[size = 1] RealNotSdH,
+    #[size = 1] RealSdH,
+    /// Same shape on SignBitR for the AbsR chain.
+    #[size = 1] RealNotSrH,
+    #[size = 1] RealSrH,
+
+    /// 64-bit schoolbook partial-sum helper: `DivPartialSum64[k] :=
+    /// Σ_{i+j=k, i,j<8} DivQuotient[i] · ValD[j]` (deg 2 def).  k=0..16.
+    #[size = 16] DivPartialSum64,
+    /// 32-bit schoolbook partial-sum helper, k=0..8 with i,j<4.
+    #[size = 8] DivPartialSum32,
+
+    /// `DivCmpCarry[i] · (1 - DivCmpCarry[i])` — boolean witness for
+    /// the unsigned r<d uniqueness chain's per-byte carry.  `is_real ·
+    /// boolean` becomes deg-2 via this helper instead of deg-3 inline.
+    #[size = 8] DivCmpCarryB,
+
+    /// DivS chain quadratic body helpers (Phase 54k flatten).
+    /// `SignQValDH[i] := SignBitQ · ValD[i]`
+    #[size = 8] SignQValDH,
+    /// `SignDQuotH[i] := SignBitD · DivQuotient[i]`
+    #[size = 8] SignDQuotH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -150,11 +199,13 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for DivRemChip {
-    /// Phase 54k: bumped from 2 to 3 (max degree 8).  The Phase 54k
-    /// sign-correction chain is degree 6 (`div_s_active * is_64bit *
-    /// (sign_bit_q * val_d[i] + ...)` = 4 * 1 * 2).  Schoolbook chain
-    /// (54g) is degree 4 (was at the prior bound).
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 3;
+    /// Phase I-divrem flatten: dropped from 3 back to 2 — every
+    /// degree-3+ constraint has been lifted via helper columns
+    /// (DivActiveH, DivS64H, DivCmpCarryB, DivPartialSum64/32, etc.) so
+    /// the chip's actual algebraic degree is now ≤ 2.  Stwo v2.x's
+    /// lifted protocol enforces actual degree, not declared bound, but
+    /// we keep the declared bound aligned for clarity.
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -193,6 +244,23 @@ impl BuiltInComponent for DivRemChip {
         let abs_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::AbsCmpCarry);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
+        // ── Phase I-divrem degree-flatten helpers ──
+        let div_active_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveH);
+        let not_padding_div_h = crate::trace::trace_eval!(trace_eval, Column::NotPaddingDivH);
+        let div_active_64_h = crate::trace::trace_eval!(trace_eval, Column::DivActive64H);
+        let div_active_32_h = crate::trace::trace_eval!(trace_eval, Column::DivActive32H);
+        let div_u_active_h = crate::trace::trace_eval!(trace_eval, Column::DivUActiveH);
+        let div_s_active_h = crate::trace::trace_eval!(trace_eval, Column::DivSActiveH);
+        let div_s_64_h = crate::trace::trace_eval!(trace_eval, Column::DivS64H);
+        let div_s_32_h = crate::trace::trace_eval!(trace_eval, Column::DivS32H);
+        let real_not_sd_h = crate::trace::trace_eval!(trace_eval, Column::RealNotSdH);
+        let real_sd_h = crate::trace::trace_eval!(trace_eval, Column::RealSdH);
+        let real_not_sr_h = crate::trace::trace_eval!(trace_eval, Column::RealNotSrH);
+        let real_sr_h = crate::trace::trace_eval!(trace_eval, Column::RealSrH);
+        let div_partial_sum_64 = crate::trace::trace_eval!(trace_eval, Column::DivPartialSum64);
+        let div_partial_sum_32 = crate::trace::trace_eval!(trace_eval, Column::DivPartialSum32);
+        let div_cmp_carry_b = crate::trace::trace_eval!(trace_eval, Column::DivCmpCarryB);
+
         // Boolean constraints on flag columns.
         for flag in [
             &is_div_rem, &div_by_zero, &is_32bit, &is_div_s,
@@ -205,6 +273,76 @@ impl BuiltInComponent for DivRemChip {
         let is_64bit = E::F::one() - is_32bit[0].clone();
         let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
 
+        // ── Phase I-divrem helper-defining constraints ──
+        eval.add_constraint(
+            div_active_h[0].clone() - is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone())
+        );
+        eval.add_constraint(
+            not_padding_div_h[0].clone() - is_real.clone() * div_active_h[0].clone()
+        );
+        eval.add_constraint(
+            div_active_64_h[0].clone() - not_padding_div_h[0].clone() * is_64bit.clone()
+        );
+        eval.add_constraint(
+            div_active_32_h[0].clone() - not_padding_div_h[0].clone() * is_32bit[0].clone()
+        );
+        eval.add_constraint(
+            div_u_active_h[0].clone()
+                - not_padding_div_h[0].clone() * (E::F::one() - is_div_s[0].clone())
+        );
+        eval.add_constraint(
+            div_s_active_h[0].clone() - not_padding_div_h[0].clone() * is_div_s[0].clone()
+        );
+        eval.add_constraint(
+            div_s_64_h[0].clone() - div_s_active_h[0].clone() * is_64bit.clone()
+        );
+        eval.add_constraint(
+            div_s_32_h[0].clone() - div_s_active_h[0].clone() * is_32bit[0].clone()
+        );
+        eval.add_constraint(
+            real_not_sd_h[0].clone() - is_real.clone() * (E::F::one() - sign_bit_d[0].clone())
+        );
+        eval.add_constraint(
+            real_sd_h[0].clone() - is_real.clone() * sign_bit_d[0].clone()
+        );
+        eval.add_constraint(
+            real_not_sr_h[0].clone() - is_real.clone() * (E::F::one() - sign_bit_r[0].clone())
+        );
+        eval.add_constraint(
+            real_sr_h[0].clone() - is_real.clone() * sign_bit_r[0].clone()
+        );
+        // Partial-sum bodies (deg 2 def) — without div_remainder term;
+        // the schoolbook constraint adds it inline since it's already linear.
+        for k in 0..16usize {
+            let mut psum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let j = k.wrapping_sub(i);
+                if j < WORD_SIZE {
+                    psum += div_quotient[i].clone() * val_d[j].clone();
+                }
+            }
+            eval.add_constraint(div_partial_sum_64[k].clone() - psum);
+        }
+        for k in 0..8usize {
+            let mut psum = E::F::zero();
+            for i in 0..4usize {
+                let j = k.wrapping_sub(i);
+                if j < 4 {
+                    psum += div_quotient[i].clone() * val_d[j].clone();
+                }
+            }
+            eval.add_constraint(div_partial_sum_32[k].clone() - psum);
+        }
+        // DivCmpCarry boolean witness (deg 2 def).
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                div_cmp_carry_b[i].clone()
+                    - div_cmp_carry[i].clone()
+                        * (E::F::one() - div_cmp_carry[i].clone())
+            );
+        }
+        let _ = div_active; // helpers above replace it everywhere below
+
         // ── Phase 54g: schoolbook carry chain ──
         let f256: E::F = E::F::from(BaseField::from(256));
         let full_carry = |k: usize| -> E::F {
@@ -212,51 +350,37 @@ impl BuiltInComponent for DivRemChip {
         };
 
         // 64-bit chain (16 positions).  Low 8 → val_b; high 8 → div_corr_hi.
+        // Phase I-divrem flatten: gate is DivActive64H (deg 1 helper);
+        // partial-sum body lifted into DivPartialSum64[k] (deg 1 helper).
         for k in 0..16usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..WORD_SIZE {
-                let j = k.wrapping_sub(i);
-                if j < WORD_SIZE {
-                    partial_sum += div_quotient[i].clone() * val_d[j].clone();
-                }
-            }
-            if k < WORD_SIZE {
-                partial_sum += div_remainder[k].clone();
-            }
+            let rem_term = if k < WORD_SIZE {
+                div_remainder[k].clone()
+            } else {
+                E::F::zero()
+            };
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let expected = if k < WORD_SIZE {
                 val_b[k].clone()
             } else {
                 div_corr_hi[k - WORD_SIZE].clone()
             };
-            let c = expected + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(
-                is_real.clone() * div_active.clone() * is_64bit.clone() * c
-            );
+            let c = expected + full_carry(k) * f256.clone()
+                - div_partial_sum_64[k].clone() - rem_term - carry_in;
+            eval.add_constraint(div_active_64_h[0].clone() * c);
         }
 
         // 32-bit chain (8 positions).  Low 4 → val_b; high 4 → div_corr_hi.
         for k in 0..8usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..4usize {
-                let j = k.wrapping_sub(i);
-                if j < 4 {
-                    partial_sum += div_quotient[i].clone() * val_d[j].clone();
-                }
-            }
-            if k < 4 {
-                partial_sum += div_remainder[k].clone();
-            }
+            let rem_term = if k < 4 { div_remainder[k].clone() } else { E::F::zero() };
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let expected = if k < 4 {
                 val_b[k].clone()
             } else {
                 div_corr_hi[k - 4].clone()
             };
-            let c = expected + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(
-                is_real.clone() * div_active.clone() * is_32bit[0].clone() * c
-            );
+            let c = expected + full_carry(k) * f256.clone()
+                - div_partial_sum_32[k].clone() - rem_term - carry_in;
+            eval.add_constraint(div_active_32_h[0].clone() * c);
         }
 
         // ── Phase 54i: r < d uniqueness chain (unsigned div rows) ──
@@ -267,16 +391,12 @@ impl BuiltInComponent for DivRemChip {
         // pair — see CpuChip's prior comment block at the same spot.
         // Boolean carry on every real row so the column can't drift
         // even when div_u_active=0.
+        // Phase I-divrem flatten: boolean carry pinned via DivCmpCarryB
+        // helper; gate becomes is_real · helper (deg 2).
         for i in 0..WORD_SIZE {
-            eval.add_constraint(
-                is_real.clone() * div_cmp_carry[i].clone()
-                    * (E::F::one() - div_cmp_carry[i].clone())
-            );
+            eval.add_constraint(is_real.clone() * div_cmp_carry_b[i].clone());
         }
-        // Carry chain (gated on `is_real · is_div_rem · ¬div_by_zero · ¬is_div_s`).
-        let div_u_active = is_real.clone() * is_div_rem[0].clone()
-            * (E::F::one() - div_by_zero[0].clone())
-            * (E::F::one() - is_div_s[0].clone());
+        // Carry chain — gate is DivUActiveH (deg 1 helper).
         let f_255: E::F = E::F::from(BaseField::from(255));
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 {
@@ -285,7 +405,7 @@ impl BuiltInComponent for DivRemChip {
                 div_cmp_carry[i - 1].clone()
             };
             eval.add_constraint(
-                div_u_active.clone() * (
+                div_u_active_h[0].clone() * (
                     div_cmp_diff[i].clone()
                         + div_cmp_carry[i].clone() * f256.clone()
                         - val_d[i].clone()
@@ -297,7 +417,7 @@ impl BuiltInComponent for DivRemChip {
         }
         // Top carry must be 1 (val_d > div_remainder ⇔ r < d).
         eval.add_constraint(
-            div_u_active * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
+            div_u_active_h[0].clone() * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone())
         );
 
         // ── Phase 54k: DivS sign-correction chain ──
@@ -315,8 +435,32 @@ impl BuiltInComponent for DivRemChip {
         // chain (its bytes are bytes of high(q·d+r) mod 2^64), and the
         // prover's freedom in div_corr_carry doesn't enable false
         // proofs given the schoolbook + chain identities.
-        let div_s_active = is_real.clone() * is_div_rem[0].clone()
-            * (E::F::one() - div_by_zero[0].clone()) * is_div_s[0].clone();
+        // Phase I-divrem flatten: gate via DivS64H / DivS32H (deg 1
+        // helpers).  Body has `sign_bit_q · val_d[i]` and `sign_bit_d ·
+        // div_quotient[i]` quadratic terms — but they're already deg 2
+        // and gated by deg-1 helper, so total deg 3.  STILL TOO HIGH —
+        // need body helpers too.
+        // Materialise SignQ_ValD[i] and SignD_DivQ[i] inline in the
+        // helper-defining section above… actually, easier: the gate is
+        // deg 1 (helper), the body has terms like `sign_bit_q · val_d[i]`
+        // (deg 2), so total = deg 3.  Need to lift the body too.
+        //
+        // Use two more body helpers for the DivS chain:
+        //   sign_q_d[i]  := sign_bit_q · val_d[i]
+        //   sign_d_q[i]  := sign_bit_d · div_quotient[i]
+        // Then body = div_corr_hi + div_corr_carry·256 + extra_lhs -
+        //             sign_q_d[i] - sign_d_q[i] - carry_in - extra_rhs
+        // becomes linear, gate × body = deg 2.
+        let sign_q_d = crate::trace::trace_eval!(trace_eval, Column::SignQValDH);
+        let sign_d_q = crate::trace::trace_eval!(trace_eval, Column::SignDQuotH);
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                sign_q_d[i].clone() - sign_bit_q[0].clone() * val_d[i].clone()
+            );
+            eval.add_constraint(
+                sign_d_q[i].clone() - sign_bit_d[0].clone() * div_quotient[i].clone()
+            );
+        }
         // 64-bit chain.
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 {
@@ -327,19 +471,18 @@ impl BuiltInComponent for DivRemChip {
             let extra_lhs = if i == 0 { sign_bit_b[0].clone() } else { E::F::zero() };
             let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
             eval.add_constraint(
-                div_s_active.clone() * is_64bit.clone() * (
+                div_s_64_h[0].clone() * (
                     div_corr_hi[i].clone()
                         + div_corr_carry[i].clone() * f256.clone()
                         + extra_lhs
-                        - sign_bit_q[0].clone() * val_d[i].clone()
-                        - sign_bit_d[0].clone() * div_quotient[i].clone()
+                        - sign_q_d[i].clone()
+                        - sign_d_q[i].clone()
                         - carry_in
                         - extra_rhs
                 )
             );
         }
-        // 32-bit chain (low 4 bytes only; high 4 of div_corr_hi are
-        // unconstrained on 32-bit DivS rows but never observed).
+        // 32-bit chain (low 4 bytes only).
         for i in 0..4 {
             let carry_in = if i == 0 {
                 E::F::zero()
@@ -349,12 +492,12 @@ impl BuiltInComponent for DivRemChip {
             let extra_lhs = if i == 0 { sign_bit_b[0].clone() } else { E::F::zero() };
             let extra_rhs = if i == 0 { sign_bit_r[0].clone() } else { E::F::zero() };
             eval.add_constraint(
-                div_s_active.clone() * is_32bit[0].clone() * (
+                div_s_32_h[0].clone() * (
                     div_corr_hi[i].clone()
                         + div_corr_carry[i].clone() * f256.clone()
                         + extra_lhs
-                        - sign_bit_q[0].clone() * val_d[i].clone()
-                        - sign_bit_d[0].clone() * div_quotient[i].clone()
+                        - sign_q_d[i].clone()
+                        - sign_d_q[i].clone()
                         - carry_in
                         - extra_rhs
                 )
@@ -369,19 +512,18 @@ impl BuiltInComponent for DivRemChip {
         //   sign(X) = 0: Abs[i] = X[i],  AbsCarry[i] = 0
         //   sign(X) = 1: Abs[i] + AbsCarry[i]·256 = (255 − X[i]) + carry_in
         //                 with carry_in[0] = 1 (the +1 of two's complement).
+        // Phase I-divrem flatten: AbsD/AbsR conditional negation chains
+        // gated via RealNotSdH / RealSdH (and Sr counterparts).  Each is
+        // a deg-1 helper; chain bodies are linear.
         let f_255: E::F = E::F::from(BaseField::from(255));
         // AbsD chain.
         for i in 0..WORD_SIZE {
             // sign_bit_d = 0 ⇒ AbsD[i] = val_d[i], AbsDCarry[i] = 0.
             eval.add_constraint(
-                is_real.clone()
-                    * (E::F::one() - sign_bit_d[0].clone())
-                    * (abs_d[i].clone() - val_d[i].clone())
+                real_not_sd_h[0].clone() * (abs_d[i].clone() - val_d[i].clone())
             );
             eval.add_constraint(
-                is_real.clone()
-                    * (E::F::one() - sign_bit_d[0].clone())
-                    * abs_d_carry[i].clone()
+                real_not_sd_h[0].clone() * abs_d_carry[i].clone()
             );
             // sign_bit_d = 1 ⇒ chain.
             let neg_carry_in = if i == 0 {
@@ -390,28 +532,22 @@ impl BuiltInComponent for DivRemChip {
                 abs_d_carry[i - 1].clone()
             };
             eval.add_constraint(
-                is_real.clone()
-                    * sign_bit_d[0].clone()
-                    * (
-                        abs_d[i].clone()
-                            + abs_d_carry[i].clone() * f256.clone()
-                            - f_255.clone()
-                            + val_d[i].clone()
-                            - neg_carry_in
-                    )
+                real_sd_h[0].clone() * (
+                    abs_d[i].clone()
+                        + abs_d_carry[i].clone() * f256.clone()
+                        - f_255.clone()
+                        + val_d[i].clone()
+                        - neg_carry_in
+                )
             );
         }
-        // AbsR chain (same shape on div_remainder).
+        // AbsR chain (same shape on div_remainder, sign_bit_r).
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_real.clone()
-                    * (E::F::one() - sign_bit_r[0].clone())
-                    * (abs_r[i].clone() - div_remainder[i].clone())
+                real_not_sr_h[0].clone() * (abs_r[i].clone() - div_remainder[i].clone())
             );
             eval.add_constraint(
-                is_real.clone()
-                    * (E::F::one() - sign_bit_r[0].clone())
-                    * abs_r_carry[i].clone()
+                real_not_sr_h[0].clone() * abs_r_carry[i].clone()
             );
             let neg_carry_in = if i == 0 {
                 E::F::one()
@@ -419,15 +555,13 @@ impl BuiltInComponent for DivRemChip {
                 abs_r_carry[i - 1].clone()
             };
             eval.add_constraint(
-                is_real.clone()
-                    * sign_bit_r[0].clone()
-                    * (
-                        abs_r[i].clone()
-                            + abs_r_carry[i].clone() * f256.clone()
-                            - f_255.clone()
-                            + div_remainder[i].clone()
-                            - neg_carry_in
-                    )
+                real_sr_h[0].clone() * (
+                    abs_r[i].clone()
+                        + abs_r_carry[i].clone() * f256.clone()
+                        - f_255.clone()
+                        + div_remainder[i].clone()
+                        - neg_carry_in
+                )
             );
         }
         // AbsCmp chain: |val_d| > |div_remainder| iff (AbsD − 1 − AbsR) ≥ 0.
@@ -450,9 +584,10 @@ impl BuiltInComponent for DivRemChip {
                 )
             );
         }
-        // Top carry = 1 on signed-div rows.
+        // Top carry = 1 on signed-div rows.  Phase I-divrem: gate via
+        // DivSActiveH (deg 1 helper).
         eval.add_constraint(
-            div_s_active.clone() * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone())
+            div_s_active_h[0].clone() * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone())
         );
 
         // Range256 emissions on DivCmpDiff bytes.  8 emissions per real
@@ -546,6 +681,86 @@ impl BuiltInProverComponent for DivRemChip {
             trace.fill_columns_bytes(row, &e.abs_cmp_diff, Column::AbsCmpDiff);
             trace.fill_columns_bytes(row, &e.abs_cmp_carry, Column::AbsCmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
+
+            // ── Phase I-divrem helper fills ──
+            // IsDivRem is hardcoded `true` for every real entry (above);
+            // div_active = is_div_rem && !div_by_zero collapses to !div_by_zero.
+            let div_active = !e.div_by_zero;
+            let np_div = div_active; // (1 - is_padding) = 1 on real rows
+            let np_div_64 = np_div && !e.is_32bit;
+            let np_div_32 = np_div && e.is_32bit;
+            let div_u_active = np_div && !e.is_div_s;
+            let div_s_active = np_div && e.is_div_s;
+            let div_s_64 = div_s_active && !e.is_32bit;
+            let div_s_32 = div_s_active && e.is_32bit;
+            // Sign-bit columns are u8 ∈ {0, 1}.
+            let sd_set = e.sign_bit_d != 0;
+            let sr_set = e.sign_bit_r != 0;
+            let real_not_sd = !sd_set;
+            let real_sd = sd_set;
+            let real_not_sr = !sr_set;
+            let real_sr = sr_set;
+            trace.fill_columns(row, np_div, Column::DivActiveH);
+            // DivActiveH ≠ NotPaddingDivH (NotPaddingDivH is the same as
+            // np_div on real rows; on padding both are 0).
+            trace.fill_columns(row, np_div, Column::NotPaddingDivH);
+            trace.fill_columns(row, np_div_64, Column::DivActive64H);
+            trace.fill_columns(row, np_div_32, Column::DivActive32H);
+            trace.fill_columns(row, div_u_active, Column::DivUActiveH);
+            trace.fill_columns(row, div_s_active, Column::DivSActiveH);
+            trace.fill_columns(row, div_s_64, Column::DivS64H);
+            trace.fill_columns(row, div_s_32, Column::DivS32H);
+            trace.fill_columns(row, real_not_sd, Column::RealNotSdH);
+            trace.fill_columns(row, real_sd, Column::RealSdH);
+            trace.fill_columns(row, real_not_sr, Column::RealNotSrH);
+            trace.fill_columns(row, real_sr, Column::RealSrH);
+
+            // PartialSum bodies as BaseField (values can exceed u8).
+            use stwo::core::fields::m31::BaseField;
+            let q_bytes = e.div_quotient.to_le_bytes();
+            let d_bytes = e.val_d.to_le_bytes();
+            let mut psum_64 = [BaseField::from(0u32); 16];
+            for k in 0..16usize {
+                let mut s: u32 = 0;
+                for i in 0..WORD_SIZE {
+                    let j = k.wrapping_sub(i);
+                    if j < WORD_SIZE {
+                        s += q_bytes[i] as u32 * d_bytes[j] as u32;
+                    }
+                }
+                psum_64[k] = BaseField::from(s);
+            }
+            trace.fill_columns_base_field(row, &psum_64, Column::DivPartialSum64);
+            let mut psum_32 = [BaseField::from(0u32); 8];
+            for k in 0..8usize {
+                let mut s: u32 = 0;
+                for i in 0..4usize {
+                    let j = k.wrapping_sub(i);
+                    if j < 4 {
+                        s += q_bytes[i] as u32 * d_bytes[j] as u32;
+                    }
+                }
+                psum_32[k] = BaseField::from(s);
+            }
+            trace.fill_columns_base_field(row, &psum_32, Column::DivPartialSum32);
+
+            // DivCmpCarryB[i] = DivCmpCarry[i] · (1 - DivCmpCarry[i]).
+            // For valid div_cmp_carry ∈ {0, 1}, this is always 0.
+            let cmp_b = [0u8; 8];
+            trace.fill_columns_bytes(row, &cmp_b, Column::DivCmpCarryB);
+
+            // DivS body helpers: SignQValDH[i] = sign_bit_q · val_d[i],
+            // SignDQuotH[i] = sign_bit_d · div_quotient[i].
+            let mut sqvd = [0u8; 8];
+            let mut sdq = [0u8; 8];
+            let sq = e.sign_bit_q as u8;
+            let sd = e.sign_bit_d as u8;
+            for i in 0..WORD_SIZE {
+                sqvd[i] = sq * d_bytes[i];
+                sdq[i] = sd * q_bytes[i];
+            }
+            trace.fill_columns_bytes(row, &sqvd, Column::SignQValDH);
+            trace.fill_columns_bytes(row, &sdq, Column::SignDQuotH);
         }
 
         for row in entries.len()..num_rows {
