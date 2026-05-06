@@ -181,8 +181,109 @@ impl BuiltInComponent for CpuChip {
         let f256 = E::F::from(BaseField::from(256u32));
         let f255 = E::F::from(BaseField::from(255u32));
 
+        // ── Phase I-cpu Wave-1 selector helpers (Add/Sub/Mul-sign-ext) ──
+        let is_add_64_h = crate::trace::trace_eval!(trace_eval, Column::IsAdd64bitH);
+        let is_add_32_h = crate::trace::trace_eval!(trace_eval, Column::IsAdd32bitH);
+        let is_sub_not_negadd_h = crate::trace::trace_eval!(trace_eval, Column::IsSubNotNegaddH);
+        let is_sub_negadd_h = crate::trace::trace_eval!(trace_eval, Column::IsSubNegaddH);
+        let is_sub_64_not_negadd_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsSub64NotNegaddH);
+        let is_sub_64_negadd_h = crate::trace::trace_eval!(trace_eval, Column::IsSub64NegaddH);
+        let is_sub_32_h = crate::trace::trace_eval!(trace_eval, Column::IsSub32bitH);
+        let is_mul_32_h = crate::trace::trace_eval!(trace_eval, Column::IsMul32bitH);
+        // Helper-defining constraints (deg 2 each).
+        eval.add_constraint(is_add_64_h[0].clone() - is_add[0].clone() * is_64bit.clone());
+        eval.add_constraint(is_add_32_h[0].clone() - is_add[0].clone() * is_32bit[0].clone());
+        eval.add_constraint(
+            is_sub_not_negadd_h[0].clone()
+                - is_sub[0].clone() * (E::F::one() - is_neg_add[0].clone())
+        );
+        eval.add_constraint(
+            is_sub_negadd_h[0].clone() - is_sub[0].clone() * is_neg_add[0].clone()
+        );
+        eval.add_constraint(
+            is_sub_64_not_negadd_h[0].clone() - is_sub_not_negadd_h[0].clone() * is_64bit.clone()
+        );
+        eval.add_constraint(
+            is_sub_64_negadd_h[0].clone() - is_sub_negadd_h[0].clone() * is_64bit.clone()
+        );
+        eval.add_constraint(
+            is_sub_32_h[0].clone() - is_sub[0].clone() * is_32bit[0].clone()
+        );
+        eval.add_constraint(
+            is_mul_32_h[0].clone() - is_mul[0].clone() * is_32bit[0].clone()
+        );
+
+        // ── Phase I-cpu Wave-2 helpers (Compare / DivRem-binding) ──
+        let signs_diff_h = crate::trace::trace_eval!(trace_eval, Column::SignsDiffH);
+        let is_cmp_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsCmpVdzH);
+        let is_cmov_iz_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsCmovIzVdzH);
+        let is_cmov_nz_not_vdz_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsCmovNzNotVdzH);
+        let cmp_lt_val_b_h = crate::trace::trace_eval!(trace_eval, Column::CmpLtValBH);
+        let cmp_lt_val_d_h = crate::trace::trace_eval!(trace_eval, Column::CmpLtValDH);
+        let cpu_div_active_h = crate::trace::trace_eval!(trace_eval, Column::CpuDivActiveH);
+        let gate_div_h = crate::trace::trace_eval!(trace_eval, Column::GateDivH);
+        let gate_rem_h = crate::trace::trace_eval!(trace_eval, Column::GateRemH);
+        let div_active_quot_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveQuotH);
+        let div_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveRemH);
+        let is_div_rem_32_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRem32bitH);
+        let val_d_is_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
+        // SignsDiffH defined further down once sign_b/sign_d columns are
+        // referenced.  Defined here using the existing column refs.
+        {
+            let sb = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
+            let sd = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
+            // SignsDiff = sb + sd - 2·sb·sd.
+            eval.add_constraint(
+                signs_diff_h[0].clone()
+                    - (sb[0].clone() + sd[0].clone()
+                        - E::F::from(BaseField::from(2u32))
+                            * sb[0].clone() * sd[0].clone())
+            );
+        }
+        // ValDIsZero is a column; IsCompare/IsCmovIz/IsCmovNz selectors
+        // are sums of column refs (deg 1).  Helpers below all deg 2 def.
+        eval.add_constraint(is_cmp_vdz_h[0].clone() - is_compare_e() * val_d_is_zero_for_h[0].clone());
+        eval.add_constraint(
+            is_cmov_iz_vdz_h[0].clone() - is_cmov_iz_flag[0].clone() * val_d_is_zero_for_h[0].clone()
+        );
+        eval.add_constraint(
+            is_cmov_nz_not_vdz_h[0].clone()
+                - is_cmov_nz_flag[0].clone() * (E::F::one() - val_d_is_zero_for_h[0].clone())
+        );
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(cmp_lt_val_b_h[i].clone() - cmp_lt_flag[0].clone() * val_b[i].clone());
+            eval.add_constraint(cmp_lt_val_d_h[i].clone() - cmp_lt_flag[0].clone() * val_d[i].clone());
+        }
+        // DivRem helpers.
+        let div_by_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
+        let is_div_rem_for_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
+        let div_rem_op_for_h = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
+        eval.add_constraint(
+            cpu_div_active_h[0].clone()
+                - is_div_rem_for_h[0].clone() * (E::F::one() - div_by_zero_for_h[0].clone())
+        );
+        let drop2_for_h = div_rem_op_for_h[0].clone() - E::F::from(BaseField::from(2u32));
+        let drop3_for_h = div_rem_op_for_h[0].clone() - E::F::from(BaseField::from(3u32));
+        eval.add_constraint(gate_div_h[0].clone() - drop2_for_h.clone() * drop3_for_h.clone());
+        eval.add_constraint(
+            gate_rem_h[0].clone()
+                - div_rem_op_for_h[0].clone() * (div_rem_op_for_h[0].clone() - E::F::one())
+        );
+        eval.add_constraint(
+            div_active_quot_h[0].clone() - cpu_div_active_h[0].clone() * gate_div_h[0].clone()
+        );
+        eval.add_constraint(
+            div_active_rem_h[0].clone() - cpu_div_active_h[0].clone() * gate_rem_h[0].clone()
+        );
+        eval.add_constraint(
+            is_div_rem_32_h[0].clone() - is_div_rem_for_h[0].clone() * is_32bit[0].clone()
+        );
+
         // ════════════════════════════════════════════════════════════════════
         // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
+        // (Phase I-cpu Wave-1 flattened)
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 { E::F::zero() } else { carry[i - 1].clone() };
@@ -191,21 +292,20 @@ impl BuiltInComponent for CpuChip {
             if i < 4 {
                 eval.add_constraint(is_add[0].clone() * c);
             } else {
-                eval.add_constraint(is_add[0].clone() * is_64bit.clone() * c);
+                eval.add_constraint(is_add_64_h[0].clone() * c);
             }
         }
-        // Phase 19: `result[4..8] = 0xFF · SignBitResult` on 32-bit
-        // Add rows (was: `= 0`).  Matches the interpreter's
-        // `sign_extend_32` of the low-32 sum.
+        // Phase 19: `result[4..8] = 0xFF · SignBitResult` on 32-bit Add rows.
         for i in 4..WORD_SIZE {
             eval.add_constraint(
-                is_add[0].clone() * is_32bit[0].clone()
+                is_add_32_h[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
         }
 
         // ════════════════════════════════════════════════════════════════════
         // SUB: two's complement addition a + ~b + 1
+        // (Phase I-cpu Wave-1 flattened)
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 { E::F::one() } else { carry[i - 1].clone() };
@@ -214,16 +314,16 @@ impl BuiltInComponent for CpuChip {
             let c_neg = result[i].clone() + carry[i].clone() * f256.clone()
                 - val_d[i].clone() - f255.clone() + val_b[i].clone() - carry_in;
             if i < 4 {
-                eval.add_constraint(is_sub[0].clone() * (E::F::one() - is_neg_add[0].clone()) * c_normal);
-                eval.add_constraint(is_sub[0].clone() * is_neg_add[0].clone() * c_neg);
+                eval.add_constraint(is_sub_not_negadd_h[0].clone() * c_normal);
+                eval.add_constraint(is_sub_negadd_h[0].clone() * c_neg);
             } else {
-                eval.add_constraint(is_sub[0].clone() * is_64bit.clone() * (E::F::one() - is_neg_add[0].clone()) * c_normal);
-                eval.add_constraint(is_sub[0].clone() * is_64bit.clone() * is_neg_add[0].clone() * c_neg);
+                eval.add_constraint(is_sub_64_not_negadd_h[0].clone() * c_normal);
+                eval.add_constraint(is_sub_64_negadd_h[0].clone() * c_neg);
             }
         }
         for i in 4..WORD_SIZE {
             eval.add_constraint(
-                is_sub[0].clone() * is_32bit[0].clone()
+                is_sub_32_h[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
         }
@@ -247,10 +347,10 @@ impl BuiltInComponent for CpuChip {
         // result high bytes since it reads only result + sign_bit_result
         // (both still on CpuChip).
         // 32-bit mul: upper result limbs (i ∈ 4..8) = 0xFF · SignBitResult
-        // (Phase 19 sign-extension).
+        // (Phase 19 sign-extension; Phase I-cpu Wave-1 flattened).
         for i in 4..WORD_SIZE {
             eval.add_constraint(
-                is_mul[0].clone() * is_32bit[0].clone()
+                is_mul_32_h[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
         }
@@ -352,27 +452,25 @@ impl BuiltInComponent for CpuChip {
         // Phase 54f: cmp_carry chain + cmp_lt_flag derivation moved to
         // CompareChip.  CpuChip's cmp_lt_flag is bound via the
         // CompareLookup tuple to CompareChip's pinned value.
-        // Constrain cmp_lt_s_flag via sign-bit analysis (also for branches)
+        // Constrain cmp_lt_s_flag via sign-bit analysis (also for branches).
+        // Phase I-cpu Wave-2 flatten: SignsDiffH lifts the per-row deg-2
+        // `signs_differ` into a column ref so the gated constraint is deg 2.
         {
             let sign_b_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-            let sign_b_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-            let signs_differ = sign_b_b[0].clone() + sign_b_d[0].clone()
-                - E::F::from(BaseField::from(2u32)) * sign_b_b[0].clone() * sign_b_d[0].clone();
-            let expected_s = signs_differ.clone() * sign_b_b[0].clone()
-                + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
+            let expected_s = signs_diff_h[0].clone() * sign_b_b[0].clone()
+                + (E::F::one() - signs_diff_h[0].clone()) * cmp_lt_flag[0].clone();
             eval.add_constraint(
                 is_cmp_or_branch.clone() * (cmp_lt_s_flag[0].clone() - expected_s)
             );
         }
-        // Compare sub-ops use per-op flag columns (degree-2 to degree-4 constraints)
+        // Compare sub-ops use per-op flag columns
+        // (Phase I-cpu Wave-2 flattened to deg 2).
         {
             let val_d_is_zero = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
 
-            // Constrain val_d_is_zero: if flag=1, all val_d limbs must be 0
+            // Constrain val_d_is_zero: gated via IsCmpVdzH (deg 1 helper).
             for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_compare_e() * val_d_is_zero[0].clone() * val_d[i].clone()
-                );
+                eval.add_constraint(is_cmp_vdz_h[0].clone() * val_d[i].clone());
             }
 
             // SetLtU: result = cmp_lt_flag (zero-extended)
@@ -387,12 +485,9 @@ impl BuiltInComponent for CpuChip {
             {
                 let cmp_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::CmpLtSFlag);
                 let sign_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-                let sign_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
 
-                let signs_differ = sign_b[0].clone() + sign_d[0].clone()
-                    - E::F::from(BaseField::from(2u32)) * sign_b[0].clone() * sign_d[0].clone();
-                let expected_s = signs_differ.clone() * sign_b[0].clone()
-                    + (E::F::one() - signs_differ) * cmp_lt_flag[0].clone();
+                let expected_s = signs_diff_h[0].clone() * sign_b[0].clone()
+                    + (E::F::one() - signs_diff_h[0].clone()) * cmp_lt_flag[0].clone();
                 eval.add_constraint(
                     is_set_lt_s_flag[0].clone() * (cmp_lt_s_flag[0].clone() - expected_s)
                 );
@@ -405,34 +500,26 @@ impl BuiltInComponent for CpuChip {
                 }
             }
 
-            // CmovIz: if val_d==0, result=val_b
+            // CmovIz / CmovNz — gated via the per-condition helpers.
+            let _ = val_d_is_zero;
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_cmov_iz_flag[0].clone()
-                    * val_d_is_zero[0].clone() * (result[i].clone() - val_b[i].clone())
+                    is_cmov_iz_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone())
+                );
+                eval.add_constraint(
+                    is_cmov_nz_not_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone())
                 );
             }
 
-            // CmovNz: if val_d!=0, result=val_b
+            // MinU/MaxU — body lifted into CmpLtValBH / CmpLtValDH so
+            // the result-binding constraint becomes deg 2 (selector × linear).
             for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_cmov_nz_flag[0].clone()
-                    * (E::F::one() - val_d_is_zero[0].clone()) * (result[i].clone() - val_b[i].clone())
-                );
-            }
-
-            // MinU: result = (val_b < val_d) ? val_b : val_d
-            for i in 0..WORD_SIZE {
-                let expected = cmp_lt_flag[0].clone() * val_b[i].clone()
-                    + (E::F::one() - cmp_lt_flag[0].clone()) * val_d[i].clone();
-                eval.add_constraint(is_min_u_flag[0].clone() * (result[i].clone() - expected));
-            }
-
-            // MaxU: result = (val_b < val_d) ? val_d : val_b
-            for i in 0..WORD_SIZE {
-                let expected = cmp_lt_flag[0].clone() * val_d[i].clone()
-                    + (E::F::one() - cmp_lt_flag[0].clone()) * val_b[i].clone();
-                eval.add_constraint(is_max_u_flag[0].clone() * (result[i].clone() - expected));
+                let expected_min = cmp_lt_val_b_h[i].clone()
+                    + val_d[i].clone() - cmp_lt_val_d_h[i].clone();
+                eval.add_constraint(is_min_u_flag[0].clone() * (result[i].clone() - expected_min));
+                let expected_max = cmp_lt_val_d_h[i].clone()
+                    + val_b[i].clone() - cmp_lt_val_b_h[i].clone();
+                eval.add_constraint(is_max_u_flag[0].clone() * (result[i].clone() - expected_max));
             }
         }
 
@@ -467,35 +554,30 @@ impl BuiltInComponent for CpuChip {
         let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
 
-        // Gate: only constrain when is_div_rem=1 and div_by_zero=0
-        let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
+        // Phase I-cpu Wave-2 flattened: gate via DivActiveQuotH /
+        // DivActiveRemH / IsDivRem32bitH (each a deg-1 helper) so result-
+        // binding constraints sit at deg 2.
 
-        // Phase 54g: 32-bit divrem schoolbook moved to DivRemChip.
-
-        // For div ops (op 0,1): result = quotient
-        // div_rem_op ∈ {0,1} for div. Gate: op*(op-1) = 0 when op=0 or op=1.
-        // Use: (op-2)*(op-3) is nonzero for op=0,1 and zero for op=2,3.
-        let drop2 = div_rem_op[0].clone() - E::F::from(BaseField::from(2u32));
-        let drop3 = div_rem_op[0].clone() - E::F::from(BaseField::from(3u32));
-        let gate_div = drop2.clone() * drop3.clone(); // nonzero when op=0 or op=1
+        // For div ops (op ∈ {0, 1}): result = quotient.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                div_active.clone() * gate_div.clone() * (result[i].clone() - div_quotient[i].clone())
+                div_active_quot_h[0].clone()
+                    * (result[i].clone() - div_quotient[i].clone())
             );
         }
 
-        // For rem ops (op 2,3): result = remainder
-        let gate_rem = div_rem_op[0].clone() * (div_rem_op[0].clone() - E::F::one());  // nonzero when op=2 or op=3
+        // For rem ops (op ∈ {2, 3}): result = remainder.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                div_active.clone() * gate_rem.clone() * (result[i].clone() - div_remainder[i].clone())
+                div_active_rem_h[0].clone()
+                    * (result[i].clone() - div_remainder[i].clone())
             );
         }
 
-        // 32-bit: upper result limbs = 0
+        // 32-bit: upper result limbs match the sign-extension pattern.
         for i in 4..WORD_SIZE {
             eval.add_constraint(
-                is_div_rem[0].clone() * is_32bit[0].clone()
+                is_div_rem_32_h[0].clone()
                     * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
             );
         }

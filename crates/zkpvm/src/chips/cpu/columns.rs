@@ -785,6 +785,66 @@ pub enum Column {
     #[size = 1] FlagByte3,
     #[size = 1] FlagByte4,
     #[size = 1] FlagByte5,
+
+    // ── Phase I-cpu Stwo-v2.x degree-flatten helpers ──
+    //
+    // CpuChip's natural form has dozens of `is_real · is_op · is_width
+    // · …` selector chains gated against linear bodies; with all
+    // factors as deg-1 column refs, these reach degree 3-5.  Helpers
+    // below materialise each multi-flag selector chain so every gated
+    // constraint factors into (deg 1 helper) × (deg 1 body) = deg 2.
+    //
+    // Naming convention: `Is{Op}{Width}{Variant}H` for two-flag/three-
+    // flag products of an op flag with width / variant flags.
+
+    // Wave 1: ADD / SUB / MUL sign-extension blocks.
+    /// `IsAdd · Is64Bit` (Is64Bit = 1 - Is32Bit).
+    #[size = 1] IsAdd64bitH,
+    /// `IsAdd · Is32Bit`.
+    #[size = 1] IsAdd32bitH,
+    /// `IsSub · (1 - IsNegAdd)` — non-negate path.
+    #[size = 1] IsSubNotNegaddH,
+    /// `IsSub · IsNegAdd` — negate path.
+    #[size = 1] IsSubNegaddH,
+    /// `IsSubNotNegaddH · Is64Bit`.
+    #[size = 1] IsSub64NotNegaddH,
+    /// `IsSubNegaddH · Is64Bit`.
+    #[size = 1] IsSub64NegaddH,
+    /// `IsSub · Is32Bit` — sign-extension on 32-bit Sub rows.
+    #[size = 1] IsSub32bitH,
+    /// `IsMul · Is32Bit` — sign-extension on 32-bit Mul rows.
+    #[size = 1] IsMul32bitH,
+
+    // Wave 2: Compare / DivRem-binding blocks.
+    /// `IsCmpOrBranch · SignsDiff` body helper for cmp_lt_s expected-sign
+    /// expression.  `SignsDiff = SignBitB + SignBitD - 2·SignBitB·SignBitD`
+    /// is degree 2; this materialises the per-row value so the
+    /// `is_cmp_or_branch · (cmp_lt_s - expected_s)` constraint becomes
+    /// degree 2 instead of 3.
+    #[size = 1] SignsDiffH,
+    /// `IsCompare · ValDIsZero` — gates the val_d-is-zero pinning.
+    #[size = 1] IsCmpVdzH,
+    /// `IsCmovIz · ValDIsZero` — the if-zero CMOV path.
+    #[size = 1] IsCmovIzVdzH,
+    /// `IsCmovNz · (1 - ValDIsZero)` — the if-not-zero CMOV path.
+    #[size = 1] IsCmovNzNotVdzH,
+    /// MinU/MaxU result-binding body helpers: `CmpLtFlag · ValB[i]` and
+    /// `CmpLtFlag · ValD[i]`.  Per-byte (size 8 each).
+    #[size = 8] CmpLtValBH,
+    #[size = 8] CmpLtValDH,
+
+    /// `IsDivRem · (1 - DivByZero)` — div is active.
+    #[size = 1] CpuDivActiveH,
+    /// `(op-2)·(op-3)` — nonzero when op ∈ {0, 1} (div ops).
+    #[size = 1] GateDivH,
+    /// `op·(op-1)` — nonzero when op ∈ {2, 3} (rem ops).
+    #[size = 1] GateRemH,
+    /// `CpuDivActiveH · GateDivH` — full quotient-binding selector.
+    #[size = 1] DivActiveQuotH,
+    /// `CpuDivActiveH · GateRemH` — full remainder-binding selector.
+    #[size = 1] DivActiveRemH,
+    /// `IsDivRem · Is32Bit` — sign-extension on 32-bit DivRem rows.
+    #[size = 1] IsDivRem32bitH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

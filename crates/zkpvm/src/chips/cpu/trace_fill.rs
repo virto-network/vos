@@ -462,6 +462,27 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_add, Column::IsAdd);
             trace.fill_columns(row, flags.is_sub, Column::IsSub);
             trace.fill_columns(row, flags.is_mul, Column::IsMul);
+
+            // Phase I-cpu Wave-1 selector helpers (filled inline next to
+            // the flags they're derived from).
+            let is_64bit_b = !flags.is_32bit;
+            trace.fill_columns(row, flags.is_add && is_64bit_b, Column::IsAdd64bitH);
+            trace.fill_columns(row, flags.is_add && flags.is_32bit, Column::IsAdd32bitH);
+            trace.fill_columns(
+                row, flags.is_sub && !flags.is_neg_add, Column::IsSubNotNegaddH
+            );
+            trace.fill_columns(row, flags.is_sub && flags.is_neg_add, Column::IsSubNegaddH);
+            trace.fill_columns(
+                row, flags.is_sub && !flags.is_neg_add && is_64bit_b, Column::IsSub64NotNegaddH
+            );
+            trace.fill_columns(
+                row, flags.is_sub && flags.is_neg_add && is_64bit_b, Column::IsSub64NegaddH
+            );
+            trace.fill_columns(row, flags.is_sub && flags.is_32bit, Column::IsSub32bitH);
+            trace.fill_columns(row, flags.is_mul && flags.is_32bit, Column::IsMul32bitH);
+            // Wave-2 helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
+            // div_by_zero, which are computed later in this iteration.  See
+            // "Phase I-cpu Wave-2 helper fills" near the end of the loop body.
             // Phase 53: IsMulUpper folded into the (mu_uu+mu_su+mu_ss)
             // sum expression — no CpuChip column to fill.
             trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
@@ -1135,6 +1156,62 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 accesses.result_write.map(|(a, _)| a).unwrap_or(0),
                 Column::ResultRegIdx,
             );
+
+            // ── Phase I-cpu Wave-2 helper fills ──
+            // All inputs (val_b, val_d, sign_bit_b, sign_bit_d, cmp_lt_flag,
+            // div_by_zero, val_d_is_zero, flags.div_rem_op) are now in scope.
+            {
+                use stwo::core::fields::m31::BaseField;
+                let signs_diff_b = (sign_bit_b ^ sign_bit_d) != 0;
+                trace.fill_columns(row, signs_diff_b, Column::SignsDiffH);
+                let vd_zero_b = val_d == 0;
+                let is_compare_b = flags.is_set_lt_u || flags.is_set_lt_s
+                    || flags.is_cmov_iz || flags.is_cmov_nz
+                    || flags.is_min_s || flags.is_min_u
+                    || flags.is_max_s || flags.is_max_u;
+                trace.fill_columns(row, is_compare_b && vd_zero_b, Column::IsCmpVdzH);
+                trace.fill_columns(row, flags.is_cmov_iz && vd_zero_b, Column::IsCmovIzVdzH);
+                trace.fill_columns(
+                    row, flags.is_cmov_nz && !vd_zero_b, Column::IsCmovNzNotVdzH
+                );
+                // CmpLtValB/D body helpers — byte-wise products.
+                let cmp_lt_u8: u8 = if cmp_lt_flag != 0 { 1 } else { 0 };
+                let mut cmp_lt_vb = [0u8; 8];
+                let mut cmp_lt_vd = [0u8; 8];
+                for i in 0..8 {
+                    cmp_lt_vb[i] = cmp_lt_u8 * val_b_bytes[i];
+                    cmp_lt_vd[i] = cmp_lt_u8 * val_d_bytes[i];
+                }
+                trace.fill_columns_bytes(row, &cmp_lt_vb, Column::CmpLtValBH);
+                trace.fill_columns_bytes(row, &cmp_lt_vd, Column::CmpLtValDH);
+
+                // DivRem helpers.
+                let div_active_b = flags.is_div_rem && div_by_zero == 0;
+                let op_i32 = flags.div_rem_op as i32;
+                let gate_div_v = ((op_i32 - 2) * (op_i32 - 3)).rem_euclid(stwo::core::fields::m31::P as i32) as u32;
+                let gate_rem_v = (op_i32 * (op_i32 - 1)).rem_euclid(stwo::core::fields::m31::P as i32) as u32;
+                trace.fill_columns(row, div_active_b, Column::CpuDivActiveH);
+                trace.fill_columns_base_field(
+                    row, &[BaseField::from(gate_div_v)], Column::GateDivH
+                );
+                trace.fill_columns_base_field(
+                    row, &[BaseField::from(gate_rem_v)], Column::GateRemH
+                );
+                let active_v: u32 = if div_active_b { 1 } else { 0 };
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from((active_v * gate_div_v).rem_euclid(stwo::core::fields::m31::P))],
+                    Column::DivActiveQuotH,
+                );
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from((active_v * gate_rem_v).rem_euclid(stwo::core::fields::m31::P))],
+                    Column::DivActiveRemH,
+                );
+                trace.fill_columns(
+                    row, flags.is_div_rem && flags.is_32bit, Column::IsDivRem32bitH
+                );
+            }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.
             let reg_val_b_u64 = accesses.val_b_read.map(|(_, v)| v).unwrap_or(0);
