@@ -97,3 +97,55 @@ work. Doing all five is a project, not a step.
   dedicated 6–8 week phase with proper instrumentation (per-chip
   constraint-degree audit before refactor, before/after column counts,
   before/after prove times). Not feasible inside this conversation.
+
+---
+
+## Recon refresh — 2026-05-06 (start of dedicated migration phase)
+
+User has committed to the migration regardless of upstream movement.
+Re-checked the upstream picture before resuming Phase G.
+
+### Upstream still blocked
+- **Stwo HEAD (`e1286720`, Apr 30 2026)**: Poseidon test still
+  `#[ignore = "AIRs with constraint degree >= 2 are not supported yet
+  in the lifted protocol."]` (`crates/examples/src/poseidon/mod.rs:489,534`).
+  The block hasn't moved.
+- No PR or branch in flight on the upstream repo addressing degree-≥2
+  in the lifted protocol (searched issues + PRs for "constraint degree",
+  "lifted", "degree >= 2"; nothing relevant).
+- The draft issue at `STWO_UPSTREAM_ISSUE_DRAFT.md` was **not filed**.
+  Filing it now wouldn't change the migration scope materially — we'd
+  still need the chip rewrites — but it would set up a watch signal
+  for the eventual fix.
+
+### Newer release than v2.2.0?
+- **No.** v2.2.0 (`289c20de`, tag dated by PR #1376) is still the latest tag.
+- 18 commits exist between v2.2.0 and HEAD `e1286720`. Notable ones we
+  inherit by pinning to HEAD instead of the v2.2.0 tag:
+  - **#1389** `Parallelize fold_circle_into_line`
+  - **#1392** `Parallelize fold_circle_evaluation_into_line`
+  - **#1393** `Optimize fold_circle_evaluation_into_line with alpha decomposition`
+  - **#1390** `Add column slice types and parallel chunk methods`
+  - **#1395** `Add Keccak256MerkleChannel for Solidity-friendly Fiat-Shamir`
+    (separate channel; doesn't help our degree problem but useful future option)
+  - **#1398** `Add SIMD-parallel Keccak-f[1600] permutation primitive`
+  - **#1384/#1385** new error types `InvalidLiftingLogSizeError`,
+    `InvalidCanonicCosetLogSize` — minor API touch on `FriConfig`/`PcsConfig`
+- **#1388** is a *revert* of `FrameworkComponent::is_enabled` (#1308) —
+  if any of our chips picked up `is_enabled`, we'll need to drop it.
+
+### Decision
+- **Pin target: HEAD `e1286720`** (not the v2.2.0 tag). Captures the
+  post-v2.2.0 FRI fold parallelization for free, same blocker either way.
+- Issue draft stays unfiled for now. Optionally file once Phase G is
+  committed and we can link to a concrete reproducer in our tree.
+
+### Phase G additions vs. the original plan
+On top of the original Phase-G items (path renames, `lifting_log_size`,
+`set_store_polynomials_coefficients`, `FriConfig::new` 4th arg,
+`LOG_N_LANES` import gating):
+- Audit any usage of `FrameworkComponent::is_enabled` — if present,
+  remove (reverted upstream).
+- Watch for `InvalidLiftingLogSizeError` / `InvalidCanonicCosetLogSize`
+  on the verifier side; convert wherever we currently wrap raw `String`
+  errors from those constructors.
