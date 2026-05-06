@@ -229,7 +229,7 @@ This is a strategic call for the user, not a technical one.
 | `Blake2bChip` | ✅ flattened (commits f841e8b…e7e812a, 6 subphases) | +236 cells/row | OODS passes; harness gate hits stwo MerkleProverLifted upstream bug |
 | `MulChip`     | ✅ flattened (commit a166221, single commit) | +46 cells/row  | Schoolbook 64/32-bit + sign-correction + result-variant dispatch |
 | `DivRemChip`  | ✅ flattened (commit d0cef2f, single commit) | +44 cells/row  | Selector chain (12) + partial sums (24) + sign-correction body (16) |
-| `CpuChip`     | ⏳ pending | (audit: ~150-300) | 2650-line chip, 117 add_constraint sites, dozens of flag combos. Mechanically the same flatten pattern (multi-flag selector helpers) as DivRem/Mul, just at scale. ~2 weeks per audit. |
+| `CpuChip`     | ⏳ partial (Waves 1-3 of ~7-8) | +50 cells/row so far | Waves done: Add/Sub/Mul-sign-ext (a5634b0), Compare/DivRem-binding (a5634b0), ValDIsZero/DBZ (fb3a2d0).  Pending: BitManip PartialNZMsb recurrences, TZ/LZ result binding (intricate polynomial bodies), Branch conditions, Control flow / next_pc, Load/Store/Memory binding, Phase 9 register binding.  ~70% remains. |
 | `RistrettoChip` | ⏳ pending | (audit: thousands or lookup-rewrite) | 256-bit field schoolbook, 35 constraints at bound 3. ~3+ weeks per audit; lookup-rewrite path may be cheaper than schoolbook helpers. |
 
 After CpuChip + Ristretto land, `prove_add64` is the production-path
