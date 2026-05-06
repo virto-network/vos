@@ -191,6 +191,29 @@ pub enum Column {
     #[size = 1] GateH,
     #[size = 1] InitGateH,
     #[size = 1] OutputGateH,
+    // Phase I-blake2b-2 carry-bound helpers — flatten the degree-3 / -4
+    // carry-domain constraints to degree 2.
+    //
+    // For Carry1 / Carry3 (3-input adds, c ∈ {0,1,2}):
+    //   `is_real · c · (c-1) · (c-2)` is degree 4.  Two helpers per byte:
+    //     Carry1XcM1[i] := Carry1[i] · (Carry1[i] - 1)              (deg 2)
+    //     Carry1Full[i] := Carry1XcM1[i] · (Carry1[i] - 2)          (deg 2)
+    //     is_real · Carry1Full[i] = 0                                (deg 2)
+    //   For valid carries (0/1/2) Carry1Full is always 0; the constraint
+    //   forces it.
+    //
+    // For Carry2 / Carry4 / Rot63Carry (2-input adds, c ∈ {0,1}):
+    //   `is_real · c · (c-1)` is degree 3.  One helper per byte:
+    //     Carry2XcM1[i] := Carry2[i] · (Carry2[i] - 1)              (deg 2)
+    //     is_real · Carry2XcM1[i] = 0                                (deg 2)
+    //   For valid carries (0/1) XcM1 is always 0.
+    #[size = 8] Carry1XcM1,
+    #[size = 8] Carry1Full,
+    #[size = 8] Carry3XcM1,
+    #[size = 8] Carry3Full,
+    #[size = 8] Carry2XcM1,
+    #[size = 8] Carry4XcM1,
+    #[size = 8] Rot63XcM1,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

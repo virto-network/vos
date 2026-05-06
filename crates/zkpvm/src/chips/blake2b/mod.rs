@@ -383,32 +383,63 @@ impl BuiltInComponent for Blake2bChip {
         // NOTE: finalize_logup_in_pairs is called at the very end of this
         // method so Phase 2b relation entries are included in the pairing.
 
-        // ── Carry / rot-carry bounds ──
+        // ── Carry / rot-carry bounds (Phase I-blake2b-2 helper-flattened) ──
         // 3-input additions (steps 1, 5) produce Carry ∈ {0,1,2}: a+b+c+cin ≤ 767.
         // 2-input additions (steps 3, 7) produce Carry ∈ {0,1}: a+b+cin ≤ 511.
         // Rot63Carry is the top bit of xor4, bounded to {0,1}.
+        //
+        // Original formulation `is_real · c · (c-1) · (c-2)` (deg 4) and
+        // `is_real · c · (c-1)` (deg 3) flattened via XcM1 / Full helper
+        // columns (`Column::Carry{1,2,3,4}XcM1`, `Carry{1,3}Full`, `Rot63XcM1`).
         let f1 = E::F::one();
+        let carry1_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry1XcM1);
+        let carry1_full = crate::trace::trace_eval!(trace_eval, Column::Carry1Full);
+        let carry3_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry3XcM1);
+        let carry3_full = crate::trace::trace_eval!(trace_eval, Column::Carry3Full);
+        let carry2_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry2XcM1);
+        let carry4_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry4XcM1);
+        let rot63_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Rot63XcM1);
         for i in 0..8 {
+            // Carry1: degree-4 → degree-2 via 2 helpers.
             let c1_v = carry1[i].clone();
             eval.add_constraint(
-                is_real[0].clone()
-                    * c1_v.clone()
-                    * (c1_v.clone() - f1.clone())
-                    * (c1_v - f2.clone()),
+                carry1_xcm1[i].clone() - c1_v.clone() * (c1_v.clone() - f1.clone())
             );
+            eval.add_constraint(
+                carry1_full[i].clone() - carry1_xcm1[i].clone() * (c1_v - f2.clone())
+            );
+            eval.add_constraint(is_real[0].clone() * carry1_full[i].clone());
+
+            // Carry3: same.
             let c3_v = carry3[i].clone();
             eval.add_constraint(
-                is_real[0].clone()
-                    * c3_v.clone()
-                    * (c3_v.clone() - f1.clone())
-                    * (c3_v - f2.clone()),
+                carry3_xcm1[i].clone() - c3_v.clone() * (c3_v.clone() - f1.clone())
             );
+            eval.add_constraint(
+                carry3_full[i].clone() - carry3_xcm1[i].clone() * (c3_v - f2.clone())
+            );
+            eval.add_constraint(is_real[0].clone() * carry3_full[i].clone());
+
+            // Carry2: degree-3 → degree-2 via 1 helper.
             let c2_v = carry2[i].clone();
-            eval.add_constraint(is_real[0].clone() * c2_v.clone() * (c2_v - f1.clone()));
+            eval.add_constraint(
+                carry2_xcm1[i].clone() - c2_v.clone() * (c2_v - f1.clone())
+            );
+            eval.add_constraint(is_real[0].clone() * carry2_xcm1[i].clone());
+
+            // Carry4: same.
             let c4_v = carry4[i].clone();
-            eval.add_constraint(is_real[0].clone() * c4_v.clone() * (c4_v - f1.clone()));
+            eval.add_constraint(
+                carry4_xcm1[i].clone() - c4_v.clone() * (c4_v - f1.clone())
+            );
+            eval.add_constraint(is_real[0].clone() * carry4_xcm1[i].clone());
+
+            // Rot63Carry: same.
             let r_v = rot63_carry[i].clone();
-            eval.add_constraint(is_real[0].clone() * r_v.clone() * (r_v - f1.clone()));
+            eval.add_constraint(
+                rot63_xcm1[i].clone() - r_v.clone() * (r_v - f1.clone())
+            );
+            eval.add_constraint(is_real[0].clone() * rot63_xcm1[i].clone());
         }
 
         // ── D_out reification ──
@@ -1241,6 +1272,45 @@ impl BuiltInProverComponent for Blake2bChip {
                 trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
             }
             trace.fill_columns(row_idx, true, Column::IsReal);
+
+            // Phase I-blake2b-2 carry-bound helpers.  Carries c ∈ {0,1,2}
+            // for Carry1/3 and ∈ {0,1} for Carry2/4/Rot63 — see DESIGN
+            // notes on `Column::Carry1XcM1` etc.  XcM1 = c·(c-1) is 0 for
+            // c ∈ {0,1} and 2 for c=2.  Full = XcM1·(c-2) is 0 for any
+            // valid c (so the runtime values are always 0; the helpers
+            // exist purely to flatten the constraint degree).  All math
+            // in i32 to dodge u8 underflow on `c - 1` when c=0.
+            let xcm1 = |c: u8| -> u8 {
+                let c = c as i32;
+                (c * (c - 1)) as u8
+            };
+            let full = |c: u8| -> u8 {
+                let c = c as i32;
+                (c * (c - 1) * (c - 2)) as u8
+            };
+            let mut c1_xcm1 = [0u8; 8];
+            let mut c1_full = [0u8; 8];
+            let mut c3_xcm1 = [0u8; 8];
+            let mut c3_full = [0u8; 8];
+            let mut c2_xcm1 = [0u8; 8];
+            let mut c4_xcm1 = [0u8; 8];
+            let mut rot_xcm1 = [0u8; 8];
+            for i in 0..8 {
+                c1_xcm1[i] = xcm1(r.carry1[i]);
+                c1_full[i] = full(r.carry1[i]);
+                c3_xcm1[i] = xcm1(r.carry3[i]);
+                c3_full[i] = full(r.carry3[i]);
+                c2_xcm1[i] = xcm1(r.carry2[i]);
+                c4_xcm1[i] = xcm1(r.carry4[i]);
+                rot_xcm1[i] = xcm1(r.rot63_carry[i]);
+            }
+            trace.fill_columns_bytes(row_idx, &c1_xcm1, Column::Carry1XcM1);
+            trace.fill_columns_bytes(row_idx, &c1_full, Column::Carry1Full);
+            trace.fill_columns_bytes(row_idx, &c3_xcm1, Column::Carry3XcM1);
+            trace.fill_columns_bytes(row_idx, &c3_full, Column::Carry3Full);
+            trace.fill_columns_bytes(row_idx, &c2_xcm1, Column::Carry2XcM1);
+            trace.fill_columns_bytes(row_idx, &c4_xcm1, Column::Carry4XcM1);
+            trace.fill_columns_bytes(row_idx, &rot_xcm1, Column::Rot63XcM1);
 
             // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
             // the helper values reduce to the preprocessed selector value:
