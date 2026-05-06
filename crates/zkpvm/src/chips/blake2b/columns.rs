@@ -220,6 +220,19 @@ pub enum Column {
     //                                 deg 3, before flatten)
     // F ∈ {0,1} so FBoundH is always 0 in valid traces.
     #[size = 1] FBoundH,
+    // Phase I-blake2b-4 input-match sum helpers — flatten the 4 input
+    // identity constraints (a_in / b_in / c_in / d_in vs the active V slot).
+    //
+    // Original (deg 3): is_real · (a_in[i] - Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i])
+    // Flattened:
+    //   InMatchA[i] := Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i]      (deg 2 helper-def)
+    //   is_real · (a_in[i] - InMatchA[i]) = 0                      (deg 2 main)
+    // Same shape for B / C / D (G_INDICES[j][1..4]).  In valid traces
+    // exactly one IsGIdx[j_active] = 1 per row, so InMatchA[i] = a_in[i].
+    #[size = 8] InMatchA,
+    #[size = 8] InMatchB,
+    #[size = 8] InMatchC,
+    #[size = 8] InMatchD,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

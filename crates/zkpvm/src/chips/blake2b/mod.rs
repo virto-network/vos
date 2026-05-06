@@ -507,8 +507,14 @@ impl BuiltInComponent for Blake2bChip {
             crate::trace::trace_eval_next_row!(trace_eval, Column::V15),
         ];
 
-        // Input match: a_in[i] = V[G_INDICES[j][0]][i] when IsGIdx[j]=1, etc.
-        // Written as a_in[i] = Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i].
+        // Input match (Phase I-blake2b-4 helper-flattened): a_in[i] = V[G_INDICES[j][0]][i]
+        // when IsGIdx[j]=1, etc.  Written as a_in[i] = Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i]
+        // and routed through `InMatch{A,B,C,D}` sum helpers so the gate × sum product
+        // sits at degree 2 instead of 3.
+        let in_match_a = crate::trace::trace_eval!(trace_eval, Column::InMatchA);
+        let in_match_b = crate::trace::trace_eval!(trace_eval, Column::InMatchB);
+        let in_match_c = crate::trace::trace_eval!(trace_eval, Column::InMatchC);
+        let in_match_d = crate::trace::trace_eval!(trace_eval, Column::InMatchD);
         for i in 0..8 {
             let mut exp_a = E::F::zero();
             let mut exp_b = E::F::zero();
@@ -520,10 +526,16 @@ impl BuiltInComponent for Blake2bChip {
                 exp_c += is_gidx[j][0].clone() * v_cols[cj][i].clone();
                 exp_d += is_gidx[j][0].clone() * v_cols[dj][i].clone();
             }
-            eval.add_constraint(is_real[0].clone() * (a_in[i].clone() - exp_a));
-            eval.add_constraint(is_real[0].clone() * (b_in[i].clone() - exp_b));
-            eval.add_constraint(is_real[0].clone() * (c_in[i].clone() - exp_c));
-            eval.add_constraint(is_real[0].clone() * (d_in[i].clone() - exp_d));
+            // Helper-defining (deg 2): InMatchX[i] = Σ IsGIdx[j] · V[…][i].
+            eval.add_constraint(in_match_a[i].clone() - exp_a);
+            eval.add_constraint(in_match_b[i].clone() - exp_b);
+            eval.add_constraint(in_match_c[i].clone() - exp_c);
+            eval.add_constraint(in_match_d[i].clone() - exp_d);
+            // Main (deg 2): is_real · (input_byte - InMatchX[i]) = 0.
+            eval.add_constraint(is_real[0].clone() * (a_in[i].clone() - in_match_a[i].clone()));
+            eval.add_constraint(is_real[0].clone() * (b_in[i].clone() - in_match_b[i].clone()));
+            eval.add_constraint(is_real[0].clone() * (c_in[i].clone() - in_match_c[i].clone()));
+            eval.add_constraint(is_real[0].clone() * (d_in[i].clone() - in_match_d[i].clone()));
         }
 
         // V_next update: for slot k at byte i, V_next[k][i] equals
@@ -1316,6 +1328,14 @@ impl BuiltInProverComponent for Blake2bChip {
 
             // Phase I-blake2b-3 F-bound helper.  F ∈ {0,1} ⇒ F·(F-1) = 0.
             trace.fill_columns(row_idx, false, Column::FBoundH);
+
+            // Phase I-blake2b-4 input-match sum helpers.  Exactly one
+            // `IsGIdx[j_active] = 1` per row, so the sum equals the active
+            // V slot's byte — which is what `r.{a,b,c,d}_in` already hold.
+            trace.fill_columns_bytes(row_idx, &r.a_in, Column::InMatchA);
+            trace.fill_columns_bytes(row_idx, &r.b_in, Column::InMatchB);
+            trace.fill_columns_bytes(row_idx, &r.c_in, Column::InMatchC);
+            trace.fill_columns_bytes(row_idx, &r.d_in, Column::InMatchD);
 
             // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
             // the helper values reduce to the preprocessed selector value:
