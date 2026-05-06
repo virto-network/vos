@@ -806,7 +806,7 @@ fn sync_with_peer(
     slot: &ReplicaSlot,
 ) -> Result<SyncOutcome, crate::commit::CommitError> {
     use crate::commit::CrdtCommit;
-    use crate::effect_log::EffectLog;
+    use crate::effect_log::CrdtEvent;
     use merkle_crdt::DagNode;
 
     let heads_rx = net.send_fetch_heads(peer, *rep_id);
@@ -818,7 +818,18 @@ fn sync_with_peer(
         return Ok(SyncOutcome::PeerEmpty);
     }
 
-    let mut cc = CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone());
+    // Sync only inserts peer-produced DAG nodes; it never allocates
+    // a fresh `(origin, seq)`. The replica_origin we hand the
+    // strategy here would only matter if a local write slipped in
+    // — derive it the same way the agent thread does so the two
+    // CrdtCommits over the same redb agree on origin if they ever
+    // both write.
+    let replica_origin = derive_replica_origin(rep_id, net.local_prefix());
+    let mut cc = CrdtCommit::from_db_arc_locked(
+        slot.db.clone(),
+        slot.commit_lock.clone(),
+        replica_origin,
+    );
     let mut frontier: Vec<[u8; 32]> = heads.clone();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut inserted_any = false;
@@ -843,7 +854,7 @@ fn sync_with_peer(
             }
         }
         // Walk children so the BFS keeps going.
-        if let Some(node) = DagNode::<crate::commit::Blake2b, EffectLog>::from_bytes(&node_bytes) {
+        if let Some(node) = DagNode::<crate::commit::Blake2b, CrdtEvent>::from_bytes(&node_bytes) {
             for child in node.children {
                 frontier.push(child.0);
             }
@@ -2147,6 +2158,27 @@ fn dispatch_once(
 /// without a `data_dir`. We deliberately do not silently downgrade
 /// to `NoCommit` — a CRDT actor that can't open its DAG file
 /// shouldn't pretend to be replicated.
+/// Derive the per-replica `CrdtEvent.origin` from the group's
+/// replication_id and the host node's 16-bit prefix.
+///
+/// `blake2b("vos-replica-origin/v1" || replication_id || prefix)`
+/// — the prefix domain-separates replicas of the same group
+/// running on different nodes, while the replication_id
+/// domain-separates groups that happen to share a node. The
+/// prefix string keeps this hash from colliding with other vos
+/// blake2b uses (registry rep_id derivation, etc).
+#[cfg(feature = "storage")]
+fn derive_replica_origin(replication_id: &[u8; 32], node_prefix: u16) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"vos-replica-origin/v1");
+    h.update(&[0u8]);
+    h.update(replication_id);
+    h.update(&node_prefix.to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
 fn build_agent_strategy(
     config: &AgentConfig,
     id: ServiceId,
@@ -2166,13 +2198,45 @@ fn build_agent_strategy(
                 Ok(Box::new(crate::commit::LocalCommit::open(&path)?))
             }
             Consistency::Crdt => {
+                // CRDT events are tagged with a per-replica origin
+                // so peer replicas can tell our events apart from
+                // theirs by content alone. Two replicas of the same
+                // group share the *replication_id* (it's the group
+                // identity for sync/discovery), so we can't reuse
+                // that — the per-replica origin is derived from
+                // `(replication_id, node_prefix)` so:
+                //   - replicas on different nodes get different
+                //     origins (different prefixes),
+                //   - a replica's origin is stable across restarts
+                //     of the same node (same prefix),
+                //   - origins are domain-separated by group, so
+                //     two unrelated groups on the same node never
+                //     share origins.
+                // We still require `replication_id` to be set
+                // explicitly: an unconfigured Crdt agent has no
+                // group identity to sync against, which is a
+                // silent determinism failure waiting to happen.
+                let replication_id = config.replication_id.ok_or_else(|| {
+                    crate::commit::CommitError::Config(
+                        "Crdt consistency requires AgentConfig::replication_id; \
+                         set one explicitly or use `auto_replication_id(name)`".into(),
+                    )
+                })?;
+                let replica_origin = derive_replica_origin(
+                    &replication_id,
+                    self_node_prefix,
+                );
                 if let Some(arc) = &config.pre_opened_db {
                     let cc = match &config.pre_opened_lock {
                         Some(lock) => crate::commit::CrdtCommit::from_db_arc_locked(
                             arc.clone(),
                             lock.clone(),
+                            replica_origin,
                         ),
-                        None => crate::commit::CrdtCommit::from_db_arc(arc.clone()),
+                        None => crate::commit::CrdtCommit::from_db_arc(
+                            arc.clone(),
+                            replica_origin,
+                        ),
                     };
                     return Ok(Box::new(cc));
                 }
@@ -2181,7 +2245,7 @@ fn build_agent_strategy(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
-                Ok(Box::new(crate::commit::CrdtCommit::open(&path)?))
+                Ok(Box::new(crate::commit::CrdtCommit::open(&path, replica_origin)?))
             }
             Consistency::Raft => {
                 // Single-node-only path: agent_thread handles the

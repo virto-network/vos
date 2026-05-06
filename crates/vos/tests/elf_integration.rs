@@ -637,8 +637,14 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 
     let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
     let mut node = VosNode::new();
+    // Provide replication_id so the data_dir check fires next —
+    // this test is specifically about the data_dir requirement.
+    // (A separate `crdt_consistency_without_replication_id_fails_loud`
+    // test below covers the rep_id check.)
     let _id = node.register(
-        AgentConfig::new(blob).with_consistency(Consistency::Crdt),
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .with_replication_id([0xa5u8; 32]),
         // intentionally NOT calling .persist(...) — Crdt without
         // data_dir is a configuration error
     );
@@ -653,6 +659,59 @@ fn crdt_consistency_without_data_dir_fails_loud() {
         err.contains("Crdt") && err.contains("data_dir"),
         "error should call out the missing data_dir, got: {err}",
     );
+}
+
+#[test]
+fn crdt_consistency_without_replication_id_fails_loud() {
+    // The (origin, seq) tagging that gives CRDT events globally-unique
+    // CIDs requires every CrdtCommit to know its origin. Registering a
+    // Crdt agent without a replication_id is a configuration error
+    // — without one, every "unconfigured" Crdt agent would share an
+    // origin and silently dedup each other's events.
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let agent_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let dir = std::env::temp_dir().join(format!(
+        "vos_crdt_no_repid_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut node = VosNode::new();
+    let _id = node.register(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir),
+        // intentionally NOT calling .with_replication_id(...) — that's
+        // the configuration error under test
+    );
+    node.run();
+    let results = node.collect();
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert!(r.error.is_some(), "expected fatal error, got: panics={}, error={:?}", r.panics, r.error);
+    let err = r.error.as_ref().unwrap();
+    assert!(
+        err.contains("replication_id"),
+        "error should call out the missing replication_id, got: {err}",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -776,6 +835,7 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
         AgentConfig::new(scheduler_blob)
             .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), encoded)])
             .with_consistency(Consistency::Crdt)
+            .with_replication_id([0xa3u8; 32])
             .persist(&data_dir),
     );
 
@@ -808,7 +868,9 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
     );
 
     // Decode every DAG node and check each effect log; at least
-    // one should carry a recorded reply (the greeter invoke).
+    // one should carry a recorded reply (the greeter invoke). The
+    // payload is now a `CrdtEvent` wrapping the original
+    // `EffectLog`, so peel the wrapper before counting replies.
     let mut total_replies = 0usize;
     for entry in dag_table.iter().unwrap() {
         let (_key, value) = entry.unwrap();
@@ -816,9 +878,9 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
         // DagNode wire format: [payload_len:u64 LE][payload][n_children:u64 LE][children...]
         let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let payload_bytes = &bytes[8..8 + payload_len];
-        let log = vos::effect_log::EffectLog::from_bytes(payload_bytes)
-            .expect("decode EffectLog");
-        total_replies += log.reply_count();
+        let event = vos::effect_log::CrdtEvent::from_bytes(payload_bytes)
+            .expect("decode CrdtEvent");
+        total_replies += event.log.reply_count();
     }
     assert!(
         total_replies >= 1,
@@ -1032,6 +1094,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
         AgentConfig::new(blob)
             .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes)])
             .with_consistency(Consistency::Crdt)
+            .with_replication_id([0xa1u8; 32])
             .persist(&data_dir),
     );
 
@@ -1125,6 +1188,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
         AgentConfig::new(blob2)
             .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes2)])
             .with_consistency(Consistency::Crdt)
+            .with_replication_id([0xa1u8; 32])
             .persist(&data_dir),
     );
     node2.run();
@@ -1232,7 +1296,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // are tail-anchored — the Archived type sits at the END of
     // the buffer — so leading padding is tolerated by
     // `access_unchecked` while trailing padding would break it.
-    let m = Msg::new("inc").with("tag", 1u32);
+    let m = Msg::new("inc");
     let encoded = m.encode();
     let pad_len = 4096 - 1 - encoded.len();
     let mut payload = Vec::with_capacity(4096);
@@ -1297,8 +1361,8 @@ fn crdt_counter_local_invoke_smoke() {
     let id = node.register(AgentConfig::new(blob));
 
     let counter = CrdtCounterRef::at(id);
-    vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
-    vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+    vos::block_on(counter.inc(&mut &node)).expect("inc 1");
+    vos::block_on(counter.inc(&mut &node)).expect("inc 2");
     assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get"), 2);
 
     node.shutdown();
@@ -1335,7 +1399,7 @@ fn crdt_counter_init_payloads_dispatch() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let inc_payload = {
-        let m = Msg::new("inc").with("tag", 7u32);
+        let m = Msg::new("inc");
         let encoded = m.encode();
         let mut p = Vec::with_capacity(1 + encoded.len());
         p.push(TAG_DYNAMIC);
@@ -1347,6 +1411,7 @@ fn crdt_counter_init_payloads_dispatch() {
     let id = node.register(
         AgentConfig::new(blob)
             .with_consistency(Consistency::Crdt)
+            .with_replication_id([0xa2u8; 32])
             .persist(&dir)
             .with_init_payloads(vec![inc_payload]),
     );
@@ -1511,20 +1576,23 @@ fn crdt_counter_converges_across_nodes_live() {
     .expect("Hello completes");
 
     // ── Drive each replica once ────────────────────────────────
-    // Use distinct tags so each replica's EffectLog hashes to a
-    // different CID; otherwise the merkle-DAG dedups identical
-    // events and the two replicas appear pre-converged at the
-    // single-node level.
-    let inc_with_tag = |tag: u32| -> Vec<u8> {
-        let m = Msg::new("inc").with("tag", tag);
+    // Both replicas call the *same* `inc()` (no payload). With the
+    // `(origin, seq)` tagging on `CrdtEvent`, each replica stamps
+    // its event with its own per-node origin so the two events get
+    // distinct CIDs even though their `EffectLog`s are byte-
+    // identical. Without that fix, the merkle-DAG would dedup them
+    // and both replicas would appear "pre-converged" at count=1
+    // — a silent loss of one of the increments.
+    let inc_payload = || -> Vec<u8> {
+        let m = Msg::new("inc");
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
         payload
     };
-    let _ = node_a.invoke(counter_a, inc_with_tag(1)).expect("inc on A");
-    let _ = node_b.invoke(counter_b, inc_with_tag(2)).expect("inc on B");
+    let _ = node_a.invoke(counter_a, inc_payload()).expect("inc on A");
+    let _ = node_b.invoke(counter_b, inc_payload()).expect("inc on B");
 
     // ── Wait for convergence ───────────────────────────────────
     // Both replicas should observe count=2 once the sync ticker
@@ -1680,7 +1748,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     ).expect("Hello completes");
 
     let inc_with_tag = |tag: u32| -> Vec<u8> {
-        let m = Msg::new("inc").with("tag", tag);
+        let m = Msg::new("inc");
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(TAG_DYNAMIC);
@@ -2478,9 +2546,9 @@ fn crdt_counter_restart_replays_state_from_disk() {
         counter_id = id;
 
         let counter = CrdtCounterRef::at(id);
-        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
-        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
-        vos::block_on(counter.inc(&mut &node, 3)).expect("inc 3");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 3");
         assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
 
         node.shutdown();
@@ -2529,7 +2597,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
         // One more inc after restart — confirms the replayed
         // state isn't a frozen snapshot, the actor really is
         // alive and writable on the same DAG.
-        vos::block_on(counter.inc(&mut &node, 4)).expect("inc post-restart");
+        vos::block_on(counter.inc(&mut &node)).expect("inc post-restart");
         assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
 
         node.shutdown();
@@ -2606,8 +2674,8 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         );
         counter_id = id;
         let counter = CrdtCounterRef::at(id);
-        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
-        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 2");
         assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get"), 2);
         node.shutdown();
         let _ = node.collect();
@@ -2673,7 +2741,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         // Once we've handled the corruption, the agent thread
         // must still respond to subsequent calls — even if
         // they error.
-        let _ = vos::block_on(counter.inc(&mut &node, 99));
+        let _ = vos::block_on(counter.inc(&mut &node));
         let _ = vos::block_on(counter.get(&mut &node));
 
         node.shutdown();
@@ -2818,8 +2886,8 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
 
     // Build up some state first so we can detect corruption
     // post-panic.
-    vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
-    vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+    vos::block_on(counter.inc(&mut &node)).expect("inc 1");
+    vos::block_on(counter.inc(&mut &node)).expect("inc 2");
     assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-boom"), 2);
 
     // Trigger the panic. The macro-generated Ref returns
@@ -2846,13 +2914,13 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // Subsequent writes must still land. This is the test
     // that fails loudest if the agent thread died on the panic
     // (the invoke would time out / return Unreachable).
-    vos::block_on(counter.inc(&mut &node, 3)).expect("inc post-boom must succeed");
+    vos::block_on(counter.inc(&mut &node)).expect("inc post-boom must succeed");
     assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 3);
 
     // Hit boom a second time — exercises the recovery path
     // twice in case the first survival was a fluke.
     let _ = vos::block_on(counter.boom(&mut &node));
-    vos::block_on(counter.inc(&mut &node, 4)).expect("inc after second boom");
+    vos::block_on(counter.inc(&mut &node)).expect("inc after second boom");
     assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final-final"), 4);
 
     node.shutdown();
@@ -2930,7 +2998,7 @@ fn crdt_counter_shutdown_under_active_load() {
     use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
     let inc_with_tag = |tag: u32| -> Vec<u8> {
-        let m = Msg::new("inc").with("tag", tag);
+        let m = Msg::new("inc");
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(TAG_DYNAMIC);
@@ -3133,8 +3201,8 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
         { Some(()) } else { None }
     }, std::time::Duration::from_secs(10)).expect("Hello completes");
 
-    let _ = node_a.invoke(counter_a, dyn_payload(Msg::new("inc").with("tag", 1u32))).expect("inc A");
-    let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc").with("tag", 2u32))).expect("inc B");
+    let _ = node_a.invoke(counter_a, dyn_payload(Msg::new("inc"))).expect("inc A");
+    let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc"))).expect("inc B");
 
     wait_for(|| if read_count(&node_a, counter_a) == Some(2) { Some(()) } else { None },
         std::time::Duration::from_secs(8)).expect("A converges to 2");
@@ -3147,7 +3215,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     // While A is offline, give B a few more incs.
     for tag in 3u32..=5 {
-        let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc").with("tag", tag)))
+        let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc")))
             .expect("inc on B while A offline");
     }
     wait_for(|| if read_count(&node_b, counter_b) == Some(5) { Some(()) } else { None },
@@ -3516,7 +3584,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         let counter = CrdtCounterRef::at(id);
 
         // Phase 1: one inc → one DAG node.
-        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 1");
         node.shutdown();
         let _ = node.collect();
     }
@@ -3565,7 +3633,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         );
         assert_eq!(id, counter_id);
         let counter = CrdtCounterRef::at(id);
-        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 2");
         assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get post-inc"), 2);
         node.shutdown();
         let _ = node.collect();
@@ -3789,9 +3857,9 @@ fn raft_counter_single_node_replays_log_after_restart() {
         );
         counter_id = id;
         let counter = CrdtCounterRef::at(id);
-        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
-        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
-        vos::block_on(counter.inc(&mut &node, 3)).expect("inc 3");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node)).expect("inc 3");
         // Sanity reads — must NOT bloat the log.
         for _ in 0..5 {
             assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
@@ -3838,7 +3906,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
             "log replay must produce identical state",
         );
         // One more inc: log appends a fourth entry post-restart.
-        vos::block_on(counter.inc(&mut &node, 4)).expect("inc post-restart");
+        vos::block_on(counter.inc(&mut &node)).expect("inc post-restart");
         assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
         node.shutdown();
         let _ = node.collect();
@@ -4017,7 +4085,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         loop {
             for (node, id) in counters.iter() {
                 let counter = CrdtCounterRef::at(*id);
-                if vos::block_on(counter.inc(&mut &**node, tag)).is_ok() {
+                if vos::block_on(counter.inc(&mut &**node)).is_ok() {
                     return true;
                 }
             }
@@ -4256,7 +4324,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         loop {
             for (node, id) in counters.iter() {
                 let counter = CrdtCounterRef::at(*id);
-                if vos::block_on(counter.inc(&mut &**node, tag)).is_ok() {
+                if vos::block_on(counter.inc(&mut &**node)).is_ok() {
                     return true;
                 }
             }

@@ -1,22 +1,20 @@
 //! CRDT counter — a minimal actor whose state replicates across
-//! nodes via the cycle-3/4 merkle-CRDT machinery.
+//! nodes via the merkle-CRDT machinery.
 //!
 //! Two messages:
-//!   - `inc(tag: u32)` increments the count by one. The `tag`
-//!     parameter is part of the EffectLog payload, so callers
-//!     using different tags produce different DAG-node CIDs —
-//!     necessary because the merkle-DAG content-addresses
-//!     events and would otherwise dedup byte-identical incs
-//!     coming from concurrent replicas. Use a per-replica
-//!     unique tag (or a monotone source counter) when driving
-//!     it; for unit tests, simple integers suffice.
+//!   - `inc()` increments the count by one. Two replicas calling
+//!     this concurrently produce distinct DAG nodes (and so the
+//!     merge surfaces both events) because the runtime stamps
+//!     each event with `(origin, seq)` — see
+//!     [`vos::effect_log::CrdtEvent`]. Handlers don't see those
+//!     fields; they're metadata for CID stability.
 //!   - `get() -> u64` reports the current count (read-only →
 //!     no DAG node, see `crdt_commit_skips_unchanged_plain_commits`).
 //!
-//! Replication shape: each `inc(tag)` is recorded as an
-//! EffectLog. Replicas that see the same set of logs converge
-//! to the same count regardless of order, since the underlying
-//! op is commutative.
+//! Replication shape: each `inc()` is recorded as an EffectLog
+//! tagged with the producing replica's origin+seq. Replicas that
+//! see the same set of logs converge to the same count regardless
+//! of order, since the underlying op is commutative.
 
 #![cfg_attr(any(target_arch = "riscv64", target_arch = "wasm32"), no_std)]
 use vos::prelude::*;
@@ -32,12 +30,9 @@ impl CrdtCounter {
     }
 
     #[msg]
-    async fn inc(&mut self, tag: u32) {
-        // `tag` is in the EffectLog so concurrent incs from different
-        // replicas hash to different DAG-node CIDs. Not used in the
-        // state transition.
+    async fn inc(&mut self) {
         self.count += 1;
-        log::info!("crdt-counter: inc tag={tag} -> count={}", self.count);
+        log::info!("crdt-counter: inc -> count={}", self.count);
     }
 
     #[msg]

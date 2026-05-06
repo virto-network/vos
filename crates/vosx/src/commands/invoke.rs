@@ -295,7 +295,7 @@ mod tests {
             return;
         };
         let (manifest, dir) = manifest_pointing_at(&elf);
-        // crdt-counter's `inc(tag: u32)` — the metadata tags
+        // crdt-counter's `inc()` — no args, the metadata tags
         // `tag` as a `u32`, so positional `5` should pack as
         // `tag=u32:5`.
         let typed = positional_to_typed(&manifest, &dir, "counter", "inc", &["5".into()])
