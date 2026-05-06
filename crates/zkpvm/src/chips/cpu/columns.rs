@@ -892,6 +892,19 @@ pub enum Column {
     #[size = 1] IsTzb32H,
     #[size = 1] IsLzb64H,
     #[size = 1] IsLzb32H,
+
+    // Wave 5: Branch conditions + sequential PC.
+    /// `IsBrEq · BranchTaken` — `val_b == val_d` constraint gate.
+    #[size = 1] IsBrEqTakenH,
+    /// `IsBrNe · (1 - BranchTaken)` — `val_b == val_d` (when not taken) gate.
+    #[size = 1] IsBrNeNotTakenH,
+    /// `EqFlag · (1 - EqFlag)` boolean witness for the eq_flag column.
+    #[size = 1] EqFlagBoolH,
+    /// `IsCmpOrBranch · EqFlag` — gate for the val_b/val_d byte-equal pinning.
+    #[size = 1] IsCmpOrBranchEqH,
+    /// `IsBranch · BranchTaken` — feeds the is_sequential expression and
+    /// keeps it deg 1.  IsBranch = sum of 10 br_* sub-flag column refs (deg 1).
+    #[size = 1] IsBranchTakenH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

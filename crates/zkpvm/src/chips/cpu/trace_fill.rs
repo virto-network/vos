@@ -1361,6 +1361,22 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 trace.fill_columns(row, flags.is_tzb && flags.is_32bit, Column::IsTzb32H);
                 trace.fill_columns(row, flags.is_lzb && is_64bit_b, Column::IsLzb64H);
                 trace.fill_columns(row, flags.is_lzb && flags.is_32bit, Column::IsLzb32H);
+
+                // ── Wave-5: Branch / sequential PC selectors ──
+                let bt = step.branch_taken;
+                let eq_b = eq_flag != 0;
+                let is_branch_b = flags.is_br_eq || flags.is_br_ne
+                    || flags.is_br_lt_u || flags.is_br_ge_u
+                    || flags.is_br_le_u || flags.is_br_gt_u
+                    || flags.is_br_lt_s || flags.is_br_ge_s
+                    || flags.is_br_le_s || flags.is_br_gt_s;
+                trace.fill_columns(row, flags.is_br_eq && bt, Column::IsBrEqTakenH);
+                trace.fill_columns(row, flags.is_br_ne && !bt, Column::IsBrNeNotTakenH);
+                // EqFlagBoolH = eq · (1 - eq) — always 0 for eq ∈ {0, 1}.
+                trace.fill_columns(row, false, Column::EqFlagBoolH);
+                trace.fill_columns(row, is_compare_b && eq_b || is_branch_b && eq_b,
+                                   Column::IsCmpOrBranchEqH);
+                trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
             }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.

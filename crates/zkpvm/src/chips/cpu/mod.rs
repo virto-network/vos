@@ -1084,6 +1084,38 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(is_lzb_64_h[0].clone() - is_lzb[0].clone() * is_64bit.clone());
             eval.add_constraint(is_lzb_32_h[0].clone() - is_lzb[0].clone() * is_32bit[0].clone());
         }
+
+        // ── Phase I-cpu Wave-5 helpers (Branch conditions + sequential PC) ──
+        let is_br_eq_taken_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsBrEqTakenH);
+        let is_br_ne_not_taken_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsBrNeNotTakenH);
+        let eq_flag_bool_h = crate::trace::trace_eval!(trace_eval, Column::EqFlagBoolH);
+        let is_cmp_or_branch_eq_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsCmpOrBranchEqH);
+        let is_branch_taken_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsBranchTakenH);
+        {
+            let branch_taken_top =
+                crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
+            let eq_flag_top = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
+            eval.add_constraint(
+                is_br_eq_taken_h[0].clone() - is_br_eq[0].clone() * branch_taken_top[0].clone()
+            );
+            eval.add_constraint(
+                is_br_ne_not_taken_h[0].clone()
+                    - is_br_ne[0].clone() * (E::F::one() - branch_taken_top[0].clone())
+            );
+            eval.add_constraint(
+                eq_flag_bool_h[0].clone() - eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone())
+            );
+            eval.add_constraint(
+                is_cmp_or_branch_eq_h[0].clone() - is_cmp_or_branch.clone() * eq_flag_top[0].clone()
+            );
+            eval.add_constraint(
+                is_branch_taken_h[0].clone() - is_branch_e() * branch_taken_top[0].clone()
+            );
+        }
         // Main TZ constraint flattened to a sum of deg-2 terms.
         // Original: is_tzb · (result[0] - tz_expr) = 0 with tz_expr deg 3.
         // Flatten: is_tzb·result - is_tzb·TzLo4H
@@ -1169,14 +1201,11 @@ impl BuiltInComponent for CpuChip {
         // branch_taken witness produces the same next_pc and the rest of
         // the trace is unaffected.  See the loose-corner test in
         // tests/control_flow_negative.rs.
+        // Phase I-cpu Wave-5 flatten: gate via IsBrEqTakenH / IsBrNeNotTakenH.
         for i in 0..WORD_SIZE {
             let diff = val_b[i].clone() - val_d[i].clone();
-            eval.add_constraint(
-                is_br_eq[0].clone() * branch_taken[0].clone() * diff.clone()
-            );
-            eval.add_constraint(
-                is_br_ne[0].clone() * (E::F::one() - branch_taken[0].clone()) * diff
-            );
+            eval.add_constraint(is_br_eq_taken_h[0].clone() * diff.clone());
+            eval.add_constraint(is_br_ne_not_taken_h[0].clone() * diff);
         }
 
         // Unsigned Lt: branch_taken = cmp_lt_flag
@@ -1195,20 +1224,15 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(
             is_br_ge_s[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone()))
         );
-        // EqFlag: constrain val_b == val_d flag
+        // EqFlag: constrain val_b == val_d flag (Phase I-cpu Wave-5 flattened)
         let eq_flag = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
-        // eq_flag boolean
-        eval.add_constraint(
-            is_cmp_or_branch.clone() * eq_flag[0].clone() * (E::F::one() - eq_flag[0].clone())
-        );
-        // Phase 54f: eq_flag=1 ⇒ val_b[i] = val_d[i] (byte-wise).
-        // Reformulated to read val_b/val_d directly so cmp_sub_result
-        // can live on CompareChip.  Equivalent soundness — both arms
-        // pin "val_b == val_d byte-wise" iff eq_flag=1.
+        // eq_flag boolean — gate via EqFlagBoolH.
+        eval.add_constraint(is_cmp_or_branch.clone() * eq_flag_bool_h[0].clone());
+        // eq_flag=1 ⇒ val_b[i] = val_d[i] (byte-wise) — gate via IsCmpOrBranchEqH.
+        let _ = eq_flag; // routed through helpers above
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_cmp_or_branch.clone() * eq_flag[0].clone()
-                    * (val_b[i].clone() - val_d[i].clone())
+                is_cmp_or_branch_eq_h[0].clone() * (val_b[i].clone() - val_d[i].clone())
             );
         }
         // eq_flag=0 ⇒ cmp_lt_flag or NOT equal. Constrain: eq_flag + cmp_lt_flag <= 1 wouldn't work.
@@ -1251,9 +1275,11 @@ impl BuiltInComponent for CpuChip {
             let pc_carry = crate::trace::trace_eval!(trace_eval, Column::PcCarry);
             let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
             let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
+            // Phase I-cpu Wave-5 flatten: route is_branch · branch_taken
+            // through IsBranchTakenH so is_sequential stays at deg 1.
             let is_sequential = E::F::one() - is_pad[0].clone()
                 - is_jump[0].clone()
-                - is_branch_e() * branch_taken[0].clone()
+                - is_branch_taken_h[0].clone()
                 - is_exit[0].clone();
 
             // Byte 0: next_pc[0] + carry[0]*256 = pc[0] + 1 + skip_len
