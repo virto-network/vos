@@ -271,6 +271,43 @@ pub enum Column {
     /// 0 iff this is a padding / unused row.
     #[size = 1]
     IsReal,
+
+    // ── Phase I-ristretto Stwo-v2.x degree-flatten helpers ──
+    //
+    // RistrettoChip's natural form has many `is_real · is_op · linear`
+    // selector chains (deg 3) and the schoolbook chain has
+    // `is_real · is_mul · partial_sum` with quadratic body (deg 4).
+    // Lookup multiplicities `is_real · (1 - is_input) · (1 - is_output)`
+    // reach deg 3, which combined with deg-1 tuple yields paired-batch
+    // deg 4 — too high once the chip is dialed back to bound 1.
+
+    /// `IsReal · IsAdd` — full add-row selector.
+    #[size = 1]
+    RealAddH,
+    /// `IsReal · IsSub` — full sub-row selector.
+    #[size = 1]
+    RealSubH,
+    /// `IsReal · IsMul` — full mul-row selector.
+    #[size = 1]
+    RealMulH,
+    /// `IsReal · (1 - IsOutput)` — register-file producer multiplicity.
+    #[size = 1]
+    ProducerGateH,
+    /// `IsReal · (1 - IsInput)` — register-file consumer-A multiplicity
+    /// (also used as a chain step for ConsumerBGateH).
+    #[size = 1]
+    ConsumerAGateH,
+    /// `ConsumerAGateH · (1 - IsOutput)` — register-file consumer-B
+    /// multiplicity (op-rows only).
+    #[size = 1]
+    ConsumerBGateH,
+
+    /// 64-byte mul schoolbook partial-sum helper:
+    /// `MulPartialSum[k] := Σ_{i+j=k, i,j<32} FieldA[i] · FieldB[j]`
+    /// for k=0..64 (deg 2 def).  Lifts the per-position quadratic
+    /// body so the gated mul constraint sits at deg 2.
+    #[size = 64]
+    MulPartialSum,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -320,12 +357,13 @@ const _: () = {
 };
 
 impl BuiltInComponent for RistrettoChip {
-    /// Schoolbook constraint is `real_mul · (a[i]·b[j] − ...)`,
-    /// degree 4 (real_mul = is_real·is_mul = degree 2; partial-
-    /// product is degree 2).  Bound 3 gives 2³+1 = 9 degree headroom;
-    /// dial back to 2 once real_mul is refactored to a single
-    /// witness column.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 3;
+    /// Phase I-ristretto flatten: dropped from 3 to 2.  Every
+    /// schoolbook position now uses MulPartialSum[k] (deg-1 helper)
+    /// gated by RealMulH (deg-1 helper), bringing actual algebraic
+    /// degree to 2 across all constraints.  Stwo v2.x's lifted protocol
+    /// enforces actual degree, not declared bound, but we keep them
+    /// aligned for clarity (matches Blake2b/Mul/DivRem/Cpu).
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -382,6 +420,53 @@ impl BuiltInComponent for RistrettoChip {
 
         let f256 = E::F::from(BaseField::from(256u32));
 
+        // ── Phase I-ristretto degree-flatten helpers ──
+        let real_add_h = crate::trace::trace_eval!(trace_eval, Column::RealAddH);
+        let real_sub_h = crate::trace::trace_eval!(trace_eval, Column::RealSubH);
+        let real_mul_h = crate::trace::trace_eval!(trace_eval, Column::RealMulH);
+        let producer_gate_h =
+            crate::trace::trace_eval!(trace_eval, Column::ProducerGateH);
+        let consumer_a_gate_h =
+            crate::trace::trace_eval!(trace_eval, Column::ConsumerAGateH);
+        let consumer_b_gate_h =
+            crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
+        let mul_partial_sum =
+            crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
+        // Helper-defining constraints (deg 2 each).
+        eval.add_constraint(
+            real_add_h[0].clone() - is_real[0].clone() * is_add[0].clone()
+        );
+        eval.add_constraint(
+            real_sub_h[0].clone() - is_real[0].clone() * is_sub[0].clone()
+        );
+        eval.add_constraint(
+            real_mul_h[0].clone() - is_real[0].clone() * is_mul[0].clone()
+        );
+        eval.add_constraint(
+            producer_gate_h[0].clone()
+                - is_real[0].clone() * (E::F::one() - is_output[0].clone())
+        );
+        eval.add_constraint(
+            consumer_a_gate_h[0].clone()
+                - is_real[0].clone() * (E::F::one() - is_input[0].clone())
+        );
+        eval.add_constraint(
+            consumer_b_gate_h[0].clone()
+                - consumer_a_gate_h[0].clone()
+                    * (E::F::one() - is_output[0].clone())
+        );
+        // MulPartialSum[k] = Σ_{i+j=k, i,j<32} a[i]·b[j].
+        for k in 0..64usize {
+            let mut psum = E::F::zero();
+            for i in 0..32usize {
+                let j = k.wrapping_sub(i);
+                if j < 32 {
+                    psum += a[i].clone() * b[j].clone();
+                }
+            }
+            eval.add_constraint(mul_partial_sum[k].clone() - psum);
+        }
+
         // ── Boolean flags ──
         // Each flag column must hold 0 or 1.  Degree-2 each.
         for flag in [&is_ovf, &is_add, &is_sub, &is_mul, &is_input, &is_output, &is_real] {
@@ -427,12 +512,12 @@ impl BuiltInComponent for RistrettoChip {
         // and carry free (will be pinned by R1c-3-bis sub chain and
         // R1c-4 mul chain in their respective op flavors).  carry[-1]
         // is the implicit 0.
-        let real_add = is_real[0].clone() * is_add[0].clone();
+        let _real_add = is_real[0].clone() * is_add[0].clone(); // routed via RealAddH
         for i in 0..32 {
             let carry_in = if i == 0 { E::F::zero() } else { carry[i - 1].clone() };
             let lhs = interm[i].clone() + carry[i].clone() * f256.clone();
             let rhs = a[i].clone() + b[i].clone() + carry_in;
-            eval.add_constraint(real_add.clone() * (lhs - rhs));
+            eval.add_constraint(real_add_h[0].clone() * (lhs - rhs));
         }
 
         // ── R1c-3: conditional-reduction sub-chain (is_add rows) ──
@@ -455,7 +540,7 @@ impl BuiltInComponent for RistrettoChip {
                 - borrow_in
                 + borrow[i].clone() * f256.clone()
                 - out[i].clone();
-            eval.add_constraint(real_add.clone() * constraint);
+            eval.add_constraint(real_add_h[0].clone() * constraint);
         }
 
         // ── R1c-3-bis: final-form check `out < p` (real rows) ──
@@ -549,7 +634,7 @@ impl BuiltInComponent for RistrettoChip {
         // Per-byte (gated by is_real · is_sub):
         //   out[i] + b[i] + cy_obb[i-1] − 256·cy_obb[i]
         //     = a[i] + is_uf·p[i] + cy_aip[i-1] − 256·cy_aip[i]
-        let real_sub = is_real[0].clone() * is_sub[0].clone();
+        let _real_sub = is_real[0].clone() * is_sub[0].clone(); // routed via RealSubH
         for i in 0..32 {
             let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
             let cy_obb_in = if i == 0 { E::F::zero() } else { sub_chain_brw[i - 1].clone() };
@@ -562,12 +647,12 @@ impl BuiltInComponent for RistrettoChip {
                 - is_ovf[0].clone() * p_i
                 - cy_aip_in
                 + sub_chain_aip[i].clone() * f256.clone();
-            eval.add_constraint(real_sub.clone() * constraint);
+            eval.add_constraint(real_sub_h[0].clone() * constraint);
         }
         // Closure: cy_obb[31] == cy_aip[31] (both sides produce the
         // same total: integer equality `out + b = a + is_uf·p`).
         eval.add_constraint(
-            real_sub.clone() * (sub_chain_brw[31].clone() - sub_chain_aip[31].clone())
+            real_sub_h[0].clone() * (sub_chain_brw[31].clone() - sub_chain_aip[31].clone())
         );
 
         // ── R1c-4-b: schoolbook field multiplication chain ──
@@ -590,7 +675,7 @@ impl BuiltInComponent for RistrettoChip {
         // Constraint degree: a[i]·b[j] is degree 2, gated by
         // real_mul (degree 2) ⇒ degree 4 overall, matching MulChip's
         // bound at LOG_CONSTRAINT_DEGREE_BOUND = 2.
-        let real_mul = is_real[0].clone() * is_mul[0].clone();
+        let _real_mul = is_real[0].clone() * is_mul[0].clone(); // routed via RealMulH
         let f65536: E::F = E::F::from(BaseField::from(65536u32));
 
         let full_carry = |k: usize| -> E::F {
@@ -599,23 +684,19 @@ impl BuiltInComponent for RistrettoChip {
                 + mul_carry_hi[k].clone() * f65536.clone()
         };
 
+        // Phase I-ristretto flatten: partial_sum lifted into MulPartialSum[k]
+        // (deg-1 helper) so the gated constraint factors into deg-1 selector
+        // × deg-1 body = deg 2.
         for k in 0usize..64 {
-            let mut partial_sum = E::F::zero();
-            for i in 0usize..32 {
-                let j = k.wrapping_sub(i);
-                if j < 32 {
-                    partial_sum += a[i].clone() * b[j].clone();
-                }
-            }
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let constraint = partial_sum
+            let constraint = mul_partial_sum[k].clone()
                 + carry_in
                 - mul_product[k].clone()
                 - full_carry(k) * f256.clone();
-            eval.add_constraint(real_mul.clone() * constraint);
+            eval.add_constraint(real_mul_h[0].clone() * constraint);
         }
         // Closure: full_carry(63) = 0 (no 65th byte overflow).
-        eval.add_constraint(real_mul.clone() * full_carry(63));
+        eval.add_constraint(real_mul_h[0].clone() * full_carry(63));
 
         // ── R1c-5-b: pass-1 reduction fold lo + 38·hi ──
         //
@@ -640,10 +721,10 @@ impl BuiltInComponent for RistrettoChip {
                 - mul_product[k].clone()
                 - f38.clone() * mul_product[k + 32].clone()
                 - carry_in;
-            eval.add_constraint(real_mul.clone() * constraint);
+            eval.add_constraint(real_mul_h[0].clone() * constraint);
         }
         eval.add_constraint(
-            real_mul.clone() * (pass1_full_carry(31) - pass1_hi_value())
+            real_mul_h[0].clone() * (pass1_full_carry(31) - pass1_hi_value())
         );
 
         // ── R1c-5-b: pass-2 reduction fold pass1_lo + 38·pass1_hi ──
@@ -681,10 +762,10 @@ impl BuiltInComponent for RistrettoChip {
                 - pass1_lo[k].clone()
                 - inject_byte
                 - carry_in;
-            eval.add_constraint(real_mul.clone() * constraint);
+            eval.add_constraint(real_mul_h[0].clone() * constraint);
         }
         eval.add_constraint(
-            real_mul.clone() * (pass2_carry[31].clone() - pass2_carry_out[0].clone())
+            real_mul_h[0].clone() * (pass2_carry[31].clone() - pass2_carry_out[0].clone())
         );
 
         // ── R1c-5-b: top-bit fold ──
@@ -720,9 +801,9 @@ impl BuiltInComponent for RistrettoChip {
                 - inject
                 - carry_in
                 + bit_strip;
-            eval.add_constraint(real_mul.clone() * constraint);
+            eval.add_constraint(real_mul_h[0].clone() * constraint);
         }
-        eval.add_constraint(real_mul.clone() * after_top_carry[31].clone());
+        eval.add_constraint(real_mul_h[0].clone() * after_top_carry[31].clone());
 
         // ── R1c-5-b: pass2_top_bit boolean + bit-7 pin ──
         //
@@ -753,7 +834,7 @@ impl BuiltInComponent for RistrettoChip {
                 - borrow_in
                 + borrow[i].clone() * f256.clone()
                 - out[i].clone();
-            eval.add_constraint(real_mul.clone() * constraint);
+            eval.add_constraint(real_mul_h[0].clone() * constraint);
         }
 
         // Booleans: pass2_carry_out, pass2_top_bit ∈ {0, 1}.
@@ -845,18 +926,14 @@ impl BuiltInComponent for RistrettoChip {
         // an external boundary producer with a sentinel row_id).
         // Producer fires on rows that produce (op rows + input rows;
         // NOT output rows which only consume).
-        let producer_gate = is_real[0].clone() * (E::F::one() - is_output[0].clone());
-        // Consumer A fires on op rows AND on output rows.
-        let consumer_a_gate = is_real[0].clone() * (E::F::one() - is_input[0].clone());
-        // Consumer B fires only on op rows (not on input or output).
-        let consumer_b_gate = is_real[0].clone()
-            * (E::F::one() - is_input[0].clone())
-            * (E::F::one() - is_output[0].clone());
+        // Phase I-ristretto flatten: gate via deg-1 helper columns so
+        // multiplicities stay at deg ≤ 1 and paired-batch lookup
+        // constraints stay at deg ≤ 2.
         for k in 0..32 {
             // Producer.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                producer_gate.clone().into(),
+                producer_gate_h[0].clone().into(),
                 &[
                     row_idx_lo[0].clone(),
                     row_idx_hi[0].clone(),
@@ -867,7 +944,7 @@ impl BuiltInComponent for RistrettoChip {
             // Consumer A: op rows + output rows.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                (-consumer_a_gate.clone()).into(),
+                (-consumer_a_gate_h[0].clone()).into(),
                 &[
                     a_src_lo[0].clone(),
                     a_src_hi[0].clone(),
@@ -878,7 +955,7 @@ impl BuiltInComponent for RistrettoChip {
             // Consumer B: op rows only.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                (-consumer_b_gate.clone()).into(),
+                (-consumer_b_gate_h[0].clone()).into(),
                 &[
                     b_src_lo[0].clone(),
                     b_src_hi[0].clone(),
@@ -987,6 +1064,36 @@ impl BuiltInProverComponent for RistrettoChip {
             trace.fill_columns(row_i, ((r.a_source_row >> 8) & 0xff) as u8, Column::ASourceRowHi);
             trace.fill_columns(row_i, (r.b_source_row & 0xff) as u8, Column::BSourceRowLo);
             trace.fill_columns(row_i, ((r.b_source_row >> 8) & 0xff) as u8, Column::BSourceRowHi);
+
+            // ── Phase I-ristretto helper fills ──
+            // Selectors: bool products (each in {0, 1}).
+            let real_b = r.is_real != 0;
+            let add_b = r.is_add != 0;
+            let sub_b = r.is_sub != 0;
+            let mul_b = r.is_mul != 0;
+            let inp_b = r.is_input != 0;
+            let out_b = r.is_output != 0;
+            trace.fill_columns(row_i, real_b && add_b, Column::RealAddH);
+            trace.fill_columns(row_i, real_b && sub_b, Column::RealSubH);
+            trace.fill_columns(row_i, real_b && mul_b, Column::RealMulH);
+            trace.fill_columns(row_i, real_b && !out_b, Column::ProducerGateH);
+            trace.fill_columns(row_i, real_b && !inp_b, Column::ConsumerAGateH);
+            trace.fill_columns(row_i, real_b && !inp_b && !out_b, Column::ConsumerBGateH);
+
+            // MulPartialSum[k] = Σ a[i]·b[j] for i+j=k.  Values can
+            // exceed u8/u16 (up to 32 × 255² ≈ 2 million); fill via BaseField.
+            let mut psum = [BaseField::from(0u32); 64];
+            for k in 0..64usize {
+                let mut s: u32 = 0;
+                for i in 0..32usize {
+                    let j = k.wrapping_sub(i);
+                    if j < 32 {
+                        s += r.a[i] as u32 * r.b[j] as u32;
+                    }
+                }
+                psum[k] = BaseField::from(s);
+            }
+            trace.fill_columns_base_field(row_i, &psum, Column::MulPartialSum);
 
             // Range256 multiplicity is bumped by the row-push
             // helper `SideNote::add_ristretto_field_row` (called
