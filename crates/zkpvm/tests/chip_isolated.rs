@@ -76,3 +76,85 @@ fn harness_smoke_bound1_only() {
         &policy,
     ).expect("harness smoke: verify failed on bound-1 AIR — wiring bug");
 }
+
+/// Phase I.0 — Blake2bChip-isolated harness for the I-blake2b-N chip
+/// rewrite work.  The intended green state once Phase I lands:
+///
+/// - `prove_with_explicit_components([&Blake2bChip], ...)` SUCCEEDS
+///   (chip's algebraic constraints all degree ≤ 2 after flatten).
+/// - `verify_with_explicit_components(...)` REJECTS with
+///   `claimed logup sum is not zero` because the chip emits
+///   bitwise/range/mem/blake2b_call lookup contributions with no
+///   producer chips in scope to balance them.
+///
+/// Open-chain rejection is the chosen validation pattern (vs. building
+/// a sink chip that produces phantom balancing tuples) because:
+///
+/// - Open-chain catches every algebraic-constraint regression (OODS
+///   sanity check fires on `ConstraintsNotSatisfied` before lookup
+///   balance is even checked).
+/// - Sink-chip closure adds ~100+ lines of test-only chip code per
+///   high-bound chip — trades reviewable scope for marginal extra
+///   validation (lookup tuple correctness, which the existing
+///   integration tests on the OLD pin already covered).
+/// - When the full migration completes and `prove_add64` runs through
+///   the production path, lookup correctness is checked end-to-end.
+///
+/// CURRENT STATE (pre-flatten): the test panics in stwo's SIMD column
+/// code (`column.rs:111` index OOB) when run with `--ignored`.  The
+/// declared `LOG_CONSTRAINT_DEGREE_BOUND = 2` and the chip's interaction
+/// trace fill collide somewhere in the prover before the constraint
+/// check even fires.  The exact panic shape isn't critical for the
+/// migration — the gate signal we want is "test passes after flatten",
+/// not a specific failure mode pre-flatten.  Test is `#[ignore]`'d until
+/// the chip is flattened in I-blake2b-1 through I-blake2b-7.
+#[test]
+#[ignore = "Blake2bChip not yet flattened — re-enable after I-blake2b-7"]
+fn harness_blake2b_isolated() {
+    use zkpvm::chips::Blake2bCall;
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    // One synthetic compression call.  Inputs are arbitrary — the
+    // harness validates Blake2bChip's algebra (carry bounds, byte
+    // permutations, V-state chain, output derivation), not the
+    // specific output value.  Any well-formed (h, m, t, f) drives
+    // the chip's full constraint surface.
+    side_note.blake2b_calls.push(Blake2bCall {
+        h: [0u64; 8],
+        m: [0u64; 16],
+        t: 0,
+        f: true,
+    });
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("Blake2bChip harness: prove failed — chip-flatten regression \
+                 (the OODS sanity check fired; degree ≥ 3 constraint slipped in)");
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> =
+        components.iter().map(|c| *c as &dyn zkpvm::harness::MachineComponent).collect();
+
+    let policy = PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+
+    let verify_result = verify_with_explicit_components(
+        proof, &side_note, &verifier_components, components, &policy,
+    );
+
+    // Expect open-chain rejection (lookups don't close without producer chips).
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => (),
+        Err(e) => panic!("Blake2bChip harness: verify rejected for the wrong reason: {e:?}"),
+        Ok(()) => panic!("Blake2bChip harness: verify accepted unexpectedly — \
+                          something is balancing the lookups that shouldn't be"),
+    }
+}

@@ -501,7 +501,7 @@ fn debug_blake2s_prefix() {
     let steps = tracing.into_trace();
     eprintln!("blake2s: {} total steps", steps.len());
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     // Scan for first failing prefix (fresh side_note each time)
     let test_sizes = [steps.len()];
     for &n in &test_sizes {
@@ -719,7 +719,7 @@ fn prove_blake2b_precompile() {
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
     verify(proof, &side_note).expect("blake2b verification failed");
     eprintln!("Blake2b precompile: PROVED!");
@@ -762,7 +762,8 @@ fn prove_ristretto_chip_field_add() {
     // ristretto_field_rows.is_empty().
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-add proving failed");
@@ -804,7 +805,8 @@ fn prove_ristretto_chip_field_mul() {
 
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul proving failed");
@@ -860,7 +862,8 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
         let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
         };
         zkpvm::prove_with_config(&mut side_note, config).is_ok()
     }
@@ -1082,7 +1085,8 @@ fn ristretto_chip_unrelated_rows_now_rejected() {
         side_note.add_ristretto_field_row(fill_add(a, b));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
@@ -1161,7 +1165,8 @@ fn prove_ristretto_chip_with_input_producers() {
     // structurally correct (even if the trailing consumer is
     // missing) by checking the prove path.
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
@@ -1211,7 +1216,8 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     side_note.add_ristretto_field_row(fill_output(row.out, 2));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("closed chain should prove");
@@ -1273,7 +1279,8 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     eprintln!("Composed {n_ops} ops + boundary rows in {:?}", t0.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let t = Instant::now();
     let proof = zkpvm::prove_with_config(&mut side_note, config)
@@ -1316,7 +1323,8 @@ fn debug_scalar_mult_bisect_first_set_bit_position() {
         for r in rows { side_note.add_ristretto_field_row(r); }
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("scalar={:>3}: {}", scalar_val,
@@ -1350,7 +1358,8 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
             side_note.add_ristretto_field_row(r.clone());
         }
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
         if result.is_ok() { lo = mid + 1; }
@@ -1507,7 +1516,8 @@ fn bench_ristretto_chip_one_private_payment() {
     eprintln!("Pushed rows + bumped Range256 counts in {:?}", t1.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let t2 = Instant::now();
     let proof = zkpvm::prove_with_config(&mut side_note, config)
@@ -1639,7 +1649,8 @@ fn debug_mul_column_bisect() {
         mutate(&mut row);
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("{:>22}: {}", name, if r.is_ok() { "PASS" } else { "FAIL" });
@@ -1660,7 +1671,8 @@ fn debug_seventeen_mul_zero_rows() {
         side_note.add_ristretto_field_row(fill_mul([0u8; 32], [0u8; 32]));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("17 mul-zero rows: prove failed");
@@ -1718,7 +1730,8 @@ fn debug_mul_cell_bisect() {
         side_note.add_ristretto_field_row(row);
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("scenario {}: {}", name, if r.is_ok() { "OK" } else { "FAIL" });
@@ -1741,7 +1754,8 @@ fn prove_ristretto_chip_field_mul_zero() {
 
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul (zero) proving failed");
@@ -1776,7 +1790,8 @@ fn prove_ristretto_chip_field_mul_with_reduction() {
     side_note.add_ristretto_field_row(fill_mul(a, b));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul (with reduction) proving failed");
@@ -1936,7 +1951,7 @@ fn prove_blake2b_via_ecall() {
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
     eprintln!("Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
@@ -1993,7 +2008,7 @@ fn prove_ristretto_via_ecall_boundary() {
     side_note.ristretto_calls = r_records;
     side_note.ristretto_mem_ops = r_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("ristretto via ECALL boundary proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2041,7 +2056,7 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     side_note.ristretto_add_calls = records;
     side_note.ristretto_add_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("point_add proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2085,7 +2100,7 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     side_note.scalar_reduce_wide_calls = records;
     side_note.scalar_reduce_wide_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar_reduce_wide proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2132,7 +2147,7 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     side_note.scalar_binop_calls = records;
     side_note.scalar_binop_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar_mul_mod_l proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2183,7 +2198,7 @@ fn prove_scalar_mul_then_add_mod_l() {
     side_note.scalar_binop_calls = records;
     side_note.scalar_binop_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar mul+add proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2236,7 +2251,7 @@ fn prove_scalar_mult_then_point_add() {
     side_note.ristretto_add_calls = tracing.ristretto_add_records.clone();
     side_note.ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar_mult + point_add proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2284,7 +2299,7 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     side_note.ristretto_calls = tracing.ristretto_records.clone();
     side_note.ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("two-ecall proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
@@ -2331,7 +2346,7 @@ fn prove_scalar_mul_chained_add() {
     side_note.scalar_binop_calls = tracing.scalar_binop_records.clone();
     side_note.scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("chained mul+add proving failed");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2383,7 +2398,7 @@ fn prove_ristretto_chip_double_chained() {
     side_note.add_ristretto_field_row(fill_output(doubled.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(doubled.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("doubling-chained should prove");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2441,7 +2456,7 @@ fn prove_ristretto_chip_add_chained() {
     side_note.add_ristretto_field_row(fill_output(sum.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(sum.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("add-chained should prove");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
@@ -2501,7 +2516,7 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     side_note.add_ristretto_field_row(fill_output(result.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(result.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3) };
+    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar-mult-chained should prove");
     let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };

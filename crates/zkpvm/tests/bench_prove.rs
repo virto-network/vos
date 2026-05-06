@@ -189,7 +189,7 @@ fn profile_log14_mobile() {
 /// Sweep log_sizes with test-config (8-bit security) to find the scale breaking point.
 #[test]
 fn scale_sweep() {
-    let test_config = PcsConfig { pow_bits: 5, fri_config: FriConfig::new(0, 1, 3) };
+    let test_config = PcsConfig { pow_bits: 5, fri_config: FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     eprintln!("=== Scale sweep (test security, rough memory estimate) ===");
     eprintln!("  main_cols=286, interaction_cols=~90, constraint_blowup=4");
     eprintln!();
@@ -240,7 +240,7 @@ fn bench_security(log_size: u32, pow_bits: u32, log_blowup: u32, n_queries: usiz
     let steps = tracing.into_trace();
     let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
 
-    let config = PcsConfig { pow_bits, fri_config: FriConfig::new(0, log_blowup, n_queries) };
+    let config = PcsConfig { pow_bits, fri_config: FriConfig::new(0, log_blowup, n_queries, 1), lifting_log_size: None };
     let sec_bits = config.security_bits();
 
     let t = std::time::Instant::now();
@@ -356,14 +356,14 @@ fn pcs_config_sweep_log14() {
     eprintln!();
     // Baseline: production STANDARD (96 bits, blowup=16)
     bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19, 1), lifting_log_size: None });
     // Same blowup, fewer queries (under-secure if pow_bits don't compensate)
     bench_pcs_config(log, "blowup=2^3, q=20, pow=16 (96 bits)",
-        PcsConfig { pow_bits: 16, fri_config: FriConfig::new(0, 3, 20) });
+        PcsConfig { pow_bits: 16, fri_config: FriConfig::new(0, 3, 20, 1), lifting_log_size: None });
     bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
     bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76, 1), lifting_log_size: None });
     // Same blowup=2, more pow trade.  pow=32 makes prove ~10x slower
     // (PoW-grind dominates at high pow_bits).  Documented for the
     // record; not a useful config.
@@ -377,15 +377,15 @@ fn pcs_config_sweep_log14_security_levels() {
     eprintln!("(blowup=4 is the MOBILE-class shape; varying queries × pow trades security for prove time)");
     eprintln!();
     bench_pcs_config(log, "MOBILE-96bit:  pow=20, q=38",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
     bench_pcs_config(log, "MOBILE-80bit:  pow=20, q=30",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 30) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 30, 1), lifting_log_size: None });
     bench_pcs_config(log, "MOBILE-64bit:  pow=20, q=22",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 22) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 22, 1), lifting_log_size: None });
     eprintln!();
     eprintln!("(blowup=4 with raised pow_bits — cheaper FRI but PoW grind cost)");
     bench_pcs_config(log, "pow=24, q=36 (96 bits)",
-        PcsConfig { pow_bits: 24, fri_config: FriConfig::new(0, 2, 36) });
+        PcsConfig { pow_bits: 24, fri_config: FriConfig::new(0, 2, 36, 1), lifting_log_size: None });
 }
 
 #[test]
@@ -393,11 +393,11 @@ fn pcs_config_sweep_log10() {
     let log = 10;
     eprintln!("=== PCS config sweep at LogSize={log} (1024 steps) ===");
     bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19, 1), lifting_log_size: None });
     bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
     bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76) });
+        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76, 1), lifting_log_size: None });
 }
 
 // `cargo test --workspace` runs every `#[test]` by default; log16 needs
