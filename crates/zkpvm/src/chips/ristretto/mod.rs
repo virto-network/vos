@@ -61,6 +61,7 @@ pub struct RistrettoChip;
 
 /// Smallest valid log_size — one SIMD lane's worth of padding rows.
 /// Used when the chip is gated on but has zero rows (boundary case).
+#[cfg(feature = "prover")]
 const RISTRETTO_MIN_LOG_SIZE: u32 = LOG_N_LANES;
 
 /// R1e-quat: derive the chip's log_size from `side_note

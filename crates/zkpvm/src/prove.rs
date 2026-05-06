@@ -5,7 +5,7 @@ use stwo::{
         fri::FriConfig,
         pcs::PcsConfig,
         poly::circle::CanonicCoset,
-        vcs::blake2_merkle::Blake2sMerkleChannel
+        vcs_lifted::blake2_merkle::Blake2sMerkleChannel
     },
     prover::{
         backend::simd::SimdBackend, poly::circle::PolyOps, CommitmentSchemeProver, ComponentProver,
@@ -68,7 +68,10 @@ fn pct(part: std::time::Duration, total: std::time::Duration) -> f64 {
 pub fn production_pcs_config() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
-        fri_config: FriConfig::new(0, 4, 19)
+        fri_config: FriConfig::new(0, 4, 19, 1),
+        // Stwo v2.x lifted protocol; `None` lets `try_get_lifting_log_size`
+        // default it to `log_trace_size`.  See crates/zkpvm/STWO_2.2.0_MIGRATION.md.
+        lifting_log_size: None,
     }
 }
 
@@ -123,7 +126,8 @@ pub fn install_thread_pool() -> usize {
 pub fn production_pcs_config_mobile() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
-        fri_config: FriConfig::new(0, 2, 38)
+        fri_config: FriConfig::new(0, 2, 38, 1),
+        lifting_log_size: None,
     }
 }
 

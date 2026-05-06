@@ -54,13 +54,19 @@ zkpvm-derive = { path = "crates/zkpvm-derive" }
 zkpvm-verifier = { path = "crates/zkpvm-verifier" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
-# Stwo (pinned to same rev as Nexus zkVM)
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "0790eba", features = [
+# Stwo — Phase G of the v2.x migration: pinned to upstream HEAD as of
+# 2026-04-30 (`e1286720`).  Captures the post-v2.2.0 perf cluster
+# (parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
+# subdomain quotients #1372/#1373, FRI fold parallelization
+# #1389/#1392/#1393).  Lifted-protocol degree-≥2 block stands at this
+# rev — see crates/zkpvm/STWO_2.2.0_MIGRATION.md.  Phase I rewrites the
+# 5 high-bound chips with helper columns to clear the block.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", features = [
     "std",
     "prover",
     "parallel",
 ] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "0790eba", features = [
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", features = [
     "std",
     "prover",
     "parallel",

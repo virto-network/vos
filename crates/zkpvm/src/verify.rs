@@ -6,7 +6,7 @@ use stwo::{
         fields::qm31::SecureField,
         pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
         poly::circle::CanonicCoset,
-        vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher},
+        vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher},
         verifier::VerificationError,
     },
     prover::{

@@ -22,7 +22,7 @@ use stwo::{
         channel::{Blake2sChannel, Channel},
         fields::qm31::SecureField,
         pcs::{CommitmentSchemeVerifier, TreeVec},
-        vcs::blake2_merkle::Blake2sMerkleChannel,
+        vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
         verifier::VerificationError,
     },
 };

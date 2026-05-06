@@ -9,7 +9,7 @@ use stwo::core::{
     fields::qm31::SecureField,
     pcs::PcsConfig,
     proof::StarkProof,
-    vcs::blake2_merkle::Blake2sMerkleHasher,
+    vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
 };
 
 /// Current proof format version.  Bumped whenever the AIR shape (number
