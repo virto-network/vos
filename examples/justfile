@@ -9,6 +9,7 @@ build:
     cd actors/math && cargo build --release
     cd actors/pipeline && cargo build --release
     cd actors/crdt-counter && cargo build --release
+    cd actors/pushy && cargo build --release
 
 run: build
     cargo run --manifest-path ../Cargo.toml -p vosx -- start space.toml --no-persist

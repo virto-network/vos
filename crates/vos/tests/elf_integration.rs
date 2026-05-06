@@ -32,7 +32,7 @@ fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos::abi::service::Servic
 #[test]
 fn transpile_all_examples() {
     // Smoke test: all example ELFs transpile without error.
-    for name in &["greeter", "counter", "fizzbuzz", "hasher", "animation", "display"] {
+    for name in &["greeter", "counter", "fizzbuzz", "hasher", "animation", "display", "pushy"] {
         let elf = example_elf(name);
         let blob = transpile_actor(&elf);
         assert!(!blob.is_empty(), "{name} produced empty blob");
@@ -773,6 +773,84 @@ fn cross_agent_invoke_returns_typed_reply() {
             r.id, r.panics, r.error,
         );
     }
+}
+
+#[test]
+fn pushy_vec_push_grows_correctly() {
+    // Regression for the JAVM ScaledAdd self-aliasing bug. The
+    // recompiler peephole that fused `slli a1,s0,2; add a0,a0,a1;
+    // sw a1,0(a0)` into a scaled-index store re-applied the
+    // stride at emit time when the `add`'s destination aliased
+    // its base operand, so each non-grow `Vec::push` wrote at
+    // offset `len*8` instead of `len*4`. The visible effect:
+    // `prove_grow` (which pushes 11, 22, 33 in one handler call)
+    // produced `[11, 0, 22]` pre-fix and `[11, 22, 33]` post-fix.
+    use vos::node::{AgentConfig, VosNode};
+
+    let pushy_data = example_elf("pushy");
+    let pushy_blob = grey_transpiler::link_elf(&pushy_data).expect("transpile pushy");
+
+    let mut node = VosNode::new();
+    let pushy_id = node.register(AgentConfig::new(pushy_blob));
+
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let dyn_payload = |m: Msg| -> Vec<u8> {
+        let encoded = m.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payload
+    };
+
+    // (a) Single-handler triple push hits the no-grow path twice.
+    let _ = node
+        .invoke(pushy_id, dyn_payload(Msg::new("prove_grow")))
+        .expect("prove_grow failed");
+    let bytes = node
+        .invoke(pushy_id, dyn_payload(Msg::new("get")))
+        .expect("get() failed");
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    let items = value.as_list_u32().expect("get() reply not a ListU32").to_vec();
+    assert_eq!(
+        items,
+        vec![11u32, 22u32, 33u32],
+        "prove_grow corrupted — got {items:?} (expected [11, 22, 33])",
+    );
+
+    // (b) Two sequential `push` invokes — second push runs after
+    // the actor was serialized + deserialized via STATE_KEY, so
+    // `items` arrives at the second handler with cap=len=1 and
+    // the push triggers the grow path. Independent regression
+    // angle on the same bug.
+    let _ = node
+        .invoke(pushy_id, dyn_payload(Msg::new("push").with("val", 100u32)))
+        .expect("push(100) failed");
+    let _ = node
+        .invoke(pushy_id, dyn_payload(Msg::new("push").with("val", 200u32)))
+        .expect("push(200) failed");
+    let bytes = node
+        .invoke(pushy_id, dyn_payload(Msg::new("get")))
+        .expect("get() failed");
+    let value: vos::value::Value = vos::Decode::decode(&bytes);
+    let items = value.as_list_u32().expect("get() reply not a ListU32").to_vec();
+
+    node.shutdown();
+    let results = node.collect();
+    for r in &results {
+        assert!(
+            r.is_ok(),
+            "agent {} failed: panics={} error={:?}",
+            r.id, r.panics, r.error,
+        );
+    }
+
+    assert_eq!(
+        items,
+        vec![11u32, 22u32, 33u32, 100u32, 200u32],
+        "two-invoke push corrupted — got {items:?} \
+         (expected prove_grow's [11, 22, 33] plus [100, 200])",
+    );
 }
 
 #[test]
