@@ -642,9 +642,12 @@ impl BuiltInComponent for Blake2bChip {
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot15),
         ];
 
-        // Mx / My selection from M by preprocessed selector.
+        // Mx / My selection from M by preprocessed selector
+        // (Phase I-blake2b-5 helper-flattened).
         let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
         let my = crate::trace::trace_eval!(trace_eval, Column::My);
+        let mx_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MxSlotSum);
+        let my_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MySlotSum);
         for i in 0..8 {
             let mut exp_mx = E::F::zero();
             let mut exp_my = E::F::zero();
@@ -652,8 +655,12 @@ impl BuiltInComponent for Blake2bChip {
                 exp_mx += is_mx_slot[k][0].clone() * m_cols[k][i].clone();
                 exp_my += is_my_slot[k][0].clone() * m_cols[k][i].clone();
             }
-            eval.add_constraint(is_real[0].clone() * (mx[i].clone() - exp_mx));
-            eval.add_constraint(is_real[0].clone() * (my[i].clone() - exp_my));
+            // Helper-defining (deg 2): SlotSum[i] = Σ_k IsXSlot[k] · M[k][i].
+            eval.add_constraint(mx_slot_sum[i].clone() - exp_mx);
+            eval.add_constraint(my_slot_sum[i].clone() - exp_my);
+            // Main (deg 2): is_real · (mx[i] - MxSlotSum[i]) = 0.
+            eval.add_constraint(is_real[0].clone() * (mx[i].clone() - mx_slot_sum[i].clone()));
+            eval.add_constraint(is_real[0].clone() * (my[i].clone() - my_slot_sum[i].clone()));
         }
 
         // Inter-row: M[k] stays constant within a compression.  Gate identical
@@ -1336,6 +1343,12 @@ impl BuiltInProverComponent for Blake2bChip {
             trace.fill_columns_bytes(row_idx, &r.b_in, Column::InMatchB);
             trace.fill_columns_bytes(row_idx, &r.c_in, Column::InMatchC);
             trace.fill_columns_bytes(row_idx, &r.d_in, Column::InMatchD);
+
+            // Phase I-blake2b-5 Mx / My slot-selection helpers.  Exactly
+            // one IsMxSlot[k_mx] = 1 per row (k_mx = SIGMA[round][2·g_idx]),
+            // so MxSlotSum[i] = M[k_mx][i] = mx[i].  Same shape for My.
+            trace.fill_columns_bytes(row_idx, &r.mx, Column::MxSlotSum);
+            trace.fill_columns_bytes(row_idx, &r.my, Column::MySlotSum);
 
             // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
             // the helper values reduce to the preprocessed selector value:

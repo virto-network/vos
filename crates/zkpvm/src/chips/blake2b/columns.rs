@@ -233,6 +233,16 @@ pub enum Column {
     #[size = 8] InMatchB,
     #[size = 8] InMatchC,
     #[size = 8] InMatchD,
+    // Phase I-blake2b-5 Mx / My slot-selection helpers — flatten the
+    // 2 SIGMA-driven message-byte selectors.
+    //
+    // Original (deg 3): is_real · (mx[i] - Σ_k IsMxSlot[k] · M[k][i])
+    // Flattened:
+    //   MxSlotSum[i] := Σ_k IsMxSlot[k] · M[k][i]    (deg 2 helper-def)
+    //   is_real · (mx[i] - MxSlotSum[i]) = 0          (deg 2 main)
+    // (My uses IsMySlot.)
+    #[size = 8] MxSlotSum,
+    #[size = 8] MySlotSum,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
