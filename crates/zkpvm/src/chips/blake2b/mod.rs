@@ -682,10 +682,12 @@ impl BuiltInComponent for Blake2bChip {
         let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
         let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
 
-        // F ∈ {0,1}
+        // F ∈ {0,1} (Phase I-blake2b-3 helper-flattened).
+        let f_bound_h = crate::trace::trace_eval!(trace_eval, Column::FBoundH);
         eval.add_constraint(
-            is_real[0].clone() * f_e[0].clone() * (f_e[0].clone() - f1.clone())
+            f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone())
         );
+        eval.add_constraint(is_real[0].clone() * f_bound_h[0].clone());
 
         // Gate substitution (Phase I-blake2b-1): init_gate ← InitGateH.
         let init_gate = init_gate_h[0].clone();
@@ -1311,6 +1313,9 @@ impl BuiltInProverComponent for Blake2bChip {
             trace.fill_columns_bytes(row_idx, &c2_xcm1, Column::Carry2XcM1);
             trace.fill_columns_bytes(row_idx, &c4_xcm1, Column::Carry4XcM1);
             trace.fill_columns_bytes(row_idx, &rot_xcm1, Column::Rot63XcM1);
+
+            // Phase I-blake2b-3 F-bound helper.  F ∈ {0,1} ⇒ F·(F-1) = 0.
+            trace.fill_columns(row_idx, false, Column::FBoundH);
 
             // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
             // the helper values reduce to the preprocessed selector value:

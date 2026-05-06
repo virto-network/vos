@@ -214,6 +214,12 @@ pub enum Column {
     #[size = 8] Carry2XcM1,
     #[size = 8] Carry4XcM1,
     #[size = 8] Rot63XcM1,
+    // Phase I-blake2b-3 F-bound helper.
+    //   FBoundH := F · (F-1)        (deg 2 helper-defining)
+    //   is_real · FBoundH = 0        (deg 2; was `is_real · F · (F-1)`,
+    //                                 deg 3, before flatten)
+    // F ∈ {0,1} so FBoundH is always 0 in valid traces.
+    #[size = 1] FBoundH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
