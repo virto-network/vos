@@ -268,7 +268,13 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
     let prover_channel = &mut Blake2sChannel::default();
 
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);    log_sizes.iter().for_each(|log_size| {
+        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+    // Stwo v2.x requires polynomial coefficients to be stored — without
+    // this, ComponentProver::get_evaluation_on_domain panics with "The
+    // polynomial's coefficients are not stored".  The toggle costs some
+    // memory but is the only supported path for our chip shape.
+    commitment_scheme.set_store_polynomials_coefficients();
+    log_sizes.iter().for_each(|log_size| {
         prover_channel.mix_u64(*log_size as u64);
     });
 

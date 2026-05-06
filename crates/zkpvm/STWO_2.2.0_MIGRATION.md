@@ -149,3 +149,28 @@ On top of the original Phase-G items (path renames, `lifting_log_size`,
 - Watch for `InvalidLiftingLogSizeError` / `InvalidCanonicCosetLogSize`
   on the verifier side; convert wherever we currently wrap raw `String`
   errors from those constructors.
+
+### Phase H findings (2026-05-06)
+
+Confirmed the upstream block applies on the new pin via a small ALU
+prove test (`prove_add64`):
+
+- **Library unit tests pass:** 29/29 in `chips::ristretto::*` — the
+  pure witness-level math runs unchanged.
+- **Any prove path fails with `ConstraintsNotSatisfied`** — every
+  `prove` call goes through `CpuChip` (bound = 2), so even the
+  smallest 64-bit ADD prover trips the lifted-protocol degree
+  restriction. Same failure mode as the prior Phase H attempt at
+  v2.2.0; the v2.x→HEAD delta is irrelevant to the block.
+
+New finding vs the original Phase-G plan:
+- **`set_store_polynomials_coefficients()` is now MANDATORY**, not
+  optional. Without it the prover panics at
+  `component_prover.rs:77` with "The polynomial's coefficients are
+  not stored" before constraint checking starts. The default
+  barycentric-weights path in `prove_values` no longer covers our
+  shape at HEAD — a column whose coeffs aren't stored hits
+  `get_evaluation_on_domain` directly. Costs some memory but is
+  the only supported path.
+
+Phase H complete. Phase I (chip rewrites) is the next step.
