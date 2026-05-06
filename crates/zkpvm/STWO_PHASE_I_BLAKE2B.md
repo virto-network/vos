@@ -140,9 +140,10 @@ inflation**, plausibly cancelling or exceeding the v2.x perf cluster's
 
 ## Implementation order for a future session
 
-Once the work begins, do these subphases. Each is independently
-testable (chip runs, witness math correct) but only the final subphase
-clears `ConstraintsNotSatisfied`:
+Once the work begins, do these subphases. **Caveat:** none of these is
+independently validatable end-to-end (see "Validation gate is global"
+section below). They pass `cargo check`; the chip runs the prove path
+only after the *last* subphase of the *last* chip lands.
 
 1. **I-blake2b-1** — add gate helpers (`gate_h`, `init_gate_h`,
    `output_gate_h`), update `Column` enum, fill them in
@@ -182,6 +183,57 @@ Commit per subphase.
   `1` only at the *very end*, after the chip-isolated test passes at
   the current bound. Lowering the declared bound first triggers the
   framework's actual-degree check before the helpers are wired.
+
+## Critical: validation gate is global, not per-chip
+
+The Stwo lifted-protocol restriction is over the **whole AIR**, not
+individual components. Confirmed by Stwo's own Poseidon `#[ignore]`:
+the test ignores even a single-component prove because the
+*combined* AIR (preprocessed + main + interaction across the one
+component) has constraint degree ≥ 2.
+
+Concrete consequence for our migration: we have no per-chip
+validation gate. Specifically:
+
+- `BASE_COMPONENTS[0] = CpuChip` is always-active (`is_active` returns
+  `_ => true`); every `prove` call pulls it in. CpuChip has
+  `LOG_CONSTRAINT_DEGREE_BOUND = 2`. Until CpuChip is flattened, no
+  prove path completes — even one whose `side_note` only triggers
+  Blake2b activity, because the ECALL step itself is a CpuChip row.
+- Likewise, even a hypothetical chip-isolated harness running
+  `Blake2bChip` alone would fail until all of its constraints are
+  ≤ degree 2. There's no way to land "Blake2bChip done, MulChip
+  pending" and validate Blake2bChip via the prove path.
+
+This contradicts the audit doc's "Commit per subphase" cadence and
+the original migration prompt's "Run [bench] after every chip is
+migrated" guidance. Both assumed per-chip validation was possible;
+it isn't.
+
+**Implications for the rewrite cadence:**
+
+- Per-subphase commits are *structural-only*: they pass `cargo
+  check` but no test validates them until the *final* subphase of
+  the *last* chip lands. That's a 10–14 week trust-the-algebra
+  window where a subtle witness/constraint mismatch would be
+  invisible.
+- One-big-commit bundling all 5 chips (≈ thousands of helper
+  column entries spread across the witness fill code, plus a
+  matching constraint refactor) is hard to review.
+- The honest alternative: build a **chip-isolated prove harness**
+  before starting the rewrites. That requires (a) a `prove` variant
+  taking an explicit component list, (b) a `side_note` builder that
+  only triggers the chip under test, and (c) accepting that lookup
+  balance won't close (Blake2b emits to MemoryChip, BitwiseLookup,
+  Range256, Blake2bCallLookup — all of which need producers in scope
+  to balance). Probably 1–2 weeks of harness work *before* a single
+  chip rewrite line is written. Pays back many times across the 5
+  chips, since each gets independent validation.
+
+**Strongly recommended:** do the chip-isolated prove harness as
+Phase I.0 before starting subphase 1 of any chip rewrite. The
+upfront cost is small relative to the downstream debugging cost of
+trusted-blind rewrites.
 
 ## Stopping point for this session
 

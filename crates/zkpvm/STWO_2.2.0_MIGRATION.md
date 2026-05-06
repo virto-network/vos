@@ -221,3 +221,31 @@ Blake2bChip-1:
    shipped milestone.
 
 This is a strategic call for the user, not a technical one.
+
+### Phase I.0 — global validation gate (added on second pass)
+
+Re-examining the upstream constraint check: it's at the **AIR
+level**, not per-component (Stwo's Poseidon `#[ignore]` covers a
+*single*-component prove for the same reason). Combined with our
+`BASE_COMPONENTS[0] = CpuChip` being always-active (`is_active`
+returns `_ => true`), the consequence is:
+
+- **No prove path completes until every high-bound chip is
+  flattened.** Not even a `side_note` that only triggers Blake2b
+  activity — the ECALL step itself is a CpuChip row.
+- Per-subphase commits are *structural-only*: pass `cargo check`,
+  fail every prove. The first runnable validation is at the *end*
+  of all 5 chip rewrites.
+- That's a 10–14 week trust-the-algebra window where subtle
+  witness/constraint mismatches go undetected.
+
+**Strongly recommended preparatory step (Phase I.0)**: build a
+chip-isolated prove harness — a `prove_with_components` API that
+takes an explicit component list, plus a side_note builder that
+triggers only one chip's activity. Probably 1–2 weeks of harness
+work *before* a single chip rewrite line is written. Without it the
+rewrites are blind. With it, each chip gets independent validation
+through the rewrite.
+
+Detailed analysis in `STWO_PHASE_I_BLAKE2B.md` "Critical:
+validation gate is global, not per-chip" section.
