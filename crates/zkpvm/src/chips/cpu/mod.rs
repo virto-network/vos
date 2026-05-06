@@ -281,6 +281,65 @@ impl BuiltInComponent for CpuChip {
             is_div_rem_32_h[0].clone() - is_div_rem_for_h[0].clone() * is_32bit[0].clone()
         );
 
+        // ── Phase I-cpu Wave-3 helpers (ValDIsZero / DBZ binding) ──
+        let val_d_byte_indicator_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValDByteIndicatorH);
+        let val_d_byte_ind_minus_1_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValDByteIndMinus1H);
+        let part_nz_times_ind_h =
+            crate::trace::trace_eval!(trace_eval, Column::PartNZTimesIndH);
+        let is_div_rem_times_vdz_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsDivRemTimesVdzH);
+        let dbz_active_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveH);
+        let dbz_active_quot_h =
+            crate::trace::trace_eval!(trace_eval, Column::DbzActiveQuotH);
+        let dbz_active_rem_h =
+            crate::trace::trace_eval!(trace_eval, Column::DbzActiveRemH);
+        // ValDByteInv columns aren't read here directly — they're pulled
+        // in within the inverse-pinning block below.  But we do define
+        // helpers in terms of them at this top region for visibility:
+        {
+            let val_d_byte_inv_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
+            let val_d_partial_nz_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    val_d_byte_indicator_h[i].clone()
+                        - val_d[i].clone() * val_d_byte_inv_top[i].clone()
+                );
+                // ValDByteIndMinus1H[i] = ValD[i] · (ByteIndicator - 1)
+                //                       = ValD · ByteIndicator − ValD
+                eval.add_constraint(
+                    val_d_byte_ind_minus_1_h[i].clone()
+                        - val_d[i].clone() * val_d_byte_indicator_h[i].clone()
+                        + val_d[i].clone()
+                );
+            }
+            // PartNZTimesIndH[i] = PartialNZ[i-1] · ByteIndicator[i] for i ≥ 1.
+            // Index 0 unused; default fill = 0.
+            for i in 1..WORD_SIZE {
+                eval.add_constraint(
+                    part_nz_times_ind_h[i].clone()
+                        - val_d_partial_nz_top[i - 1].clone()
+                            * val_d_byte_indicator_h[i].clone()
+                );
+            }
+        }
+        eval.add_constraint(
+            is_div_rem_times_vdz_h[0].clone()
+                - is_div_rem_for_h[0].clone() * val_d_is_zero_for_h[0].clone()
+        );
+        eval.add_constraint(
+            dbz_active_h[0].clone() - is_div_rem_for_h[0].clone() * div_by_zero_for_h[0].clone()
+        );
+        eval.add_constraint(
+            dbz_active_quot_h[0].clone() - dbz_active_h[0].clone() * gate_div_h[0].clone()
+        );
+        eval.add_constraint(
+            dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone()
+        );
+
         // ════════════════════════════════════════════════════════════════════
         // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
         // (Phase I-cpu Wave-1 flattened)
@@ -541,7 +600,7 @@ impl BuiltInComponent for CpuChip {
         // When divisor == 0 (div_by_zero=1): constraint bypassed (special result).
         // ════════════════════════════════════════════════════════════════════
         let is_div_rem = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
-        let div_rem_op = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
+        let _div_rem_op = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
         let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
         let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
         // Phase 54g/54k: divrem chains moved to DivRemChip.
@@ -615,46 +674,41 @@ impl BuiltInComponent for CpuChip {
         //                      − PartialNZ[i-1] · ByteIndicator[i]
         //   PartialNZ[7] = 1 ↔ any byte non-zero ↔ val_d ≠ 0.
         //   ValDIsZero = 1 − PartialNZ[7].
+        // Phase I-cpu Wave-3 flatten: ValDIsZero recurrence + DBZ binding.
         {
-            let val_d_byte_inv = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
             let val_d_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
             let val_d_is_zero_p29 = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
-            let div_by_zero_p29 = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
 
-            // Per-byte indicator constraint.  Forces the prover to
-            // set ByteInv[i] = 1/val_d[i] whenever val_d[i] ≠ 0
-            // (else `val_d[i] · ByteInv[i]` would be != 1, making
-            // `val_d[i] · (val_d[i]·ByteInv[i] − 1) ≠ 0`).
-            // For val_d[i] = 0 the constraint is trivially satisfied;
-            // the prover can pick any ByteInv[i].
+            // Per-byte indicator: `val_d · (val_d · inv − 1) = 0`.  Lifted
+            // via `ValDByteIndMinus1H[i] = val_d[i] · (ByteIndicator − 1)`
+            // (helper-defined above); main constraint is is_real · helper = deg 2.
             for i in 0..WORD_SIZE {
-                let byte_indicator = val_d[i].clone() * val_d_byte_inv[i].clone();
                 eval.add_constraint(
-                    is_real.clone() * val_d[i].clone()
-                        * (byte_indicator - E::F::one())
+                    is_real.clone() * val_d_byte_ind_minus_1_h[i].clone()
                 );
             }
 
-            // PartialNZ recurrence.  Each PartialNZ[i] is a column; the
-            // constraint pins it to the OR of (PartialNZ[i-1],
-            // ByteIndicator[i]).  Degree 3 (column · column · column).
+            // PartialNZ recurrence — flattened via PartNZTimesIndH.
             // PartialNZ[0] = ByteIndicator[0].
             eval.add_constraint(
                 is_real.clone()
-                    * (val_d_partial_nz[0].clone()
-                        - val_d[0].clone() * val_d_byte_inv[0].clone())
+                    * (val_d_partial_nz[0].clone() - val_d_byte_indicator_h[0].clone())
             );
             for i in 1..WORD_SIZE {
-                let byte_indicator = val_d[i].clone() * val_d_byte_inv[i].clone();
-                let or_expr = val_d_partial_nz[i - 1].clone()
-                    + byte_indicator.clone()
-                    - val_d_partial_nz[i - 1].clone() * byte_indicator;
+                // OR(PartialNZ[i-1], Ind[i]) = PartialNZ[i-1] + Ind[i] -
+                //                              PartialNZ[i-1]·Ind[i]
+                // The product term is now PartNZTimesIndH[i] (deg 1 helper).
                 eval.add_constraint(
-                    is_real.clone() * (val_d_partial_nz[i].clone() - or_expr)
+                    is_real.clone() * (
+                        val_d_partial_nz[i].clone()
+                            - val_d_partial_nz[i - 1].clone()
+                            - val_d_byte_indicator_h[i].clone()
+                            + part_nz_times_ind_h[i].clone()
+                    )
                 );
             }
 
-            // ValDIsZero = 1 − PartialNZ[7].
+            // ValDIsZero = 1 − PartialNZ[7].  (deg 2, unchanged)
             eval.add_constraint(
                 is_real.clone()
                     * (val_d_is_zero_p29[0].clone()
@@ -662,35 +716,19 @@ impl BuiltInComponent for CpuChip {
                         - E::F::one())
             );
 
-            // DivByZero = is_div_rem · ValDIsZero.  On non-divrem rows
-            // DivByZero must be 0; on divrem rows it must equal
-            // ValDIsZero (which now correctly tracks val_d==0).
+            // DivByZero = is_div_rem · ValDIsZero — flattened via IsDivRemTimesVdzH.
             eval.add_constraint(
-                is_real.clone()
-                    * (div_by_zero_p29[0].clone()
-                        - is_div_rem[0].clone() * val_d_is_zero_p29[0].clone())
+                is_real.clone() * (div_by_zero_for_h[0].clone() - is_div_rem_times_vdz_h[0].clone())
             );
 
-            // DivByZero result binding.  On `is_div_rem · div_by_zero`
-            // rows the schoolbook is bypassed (div_active = 0); the
-            // interpreter writes u64::MAX for div and the dividend
-            // for rem.  Reuse the existing `gate_div` (op ∈ {0,1})
-            // and `gate_rem` (op ∈ {2,3}) expressions from the
-            // schoolbook block above.
+            // DivByZero result binding — flattened via DbzActiveQuotH/RemH.
             let f_ff_p29: E::F = E::F::from(BaseField::from(255));
-            let drop2 = div_rem_op[0].clone() - E::F::from(BaseField::from(2u32));
-            let drop3 = div_rem_op[0].clone() - E::F::from(BaseField::from(3u32));
-            let gate_div_p29 = drop2.clone() * drop3;
-            let gate_rem_p29 = div_rem_op[0].clone() * (div_rem_op[0].clone() - E::F::one());
-            let dbz_active = is_div_rem[0].clone() * div_by_zero_p29[0].clone();
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    dbz_active.clone() * gate_div_p29.clone()
-                        * (result[i].clone() - f_ff_p29.clone())
+                    dbz_active_quot_h[0].clone() * (result[i].clone() - f_ff_p29.clone())
                 );
                 eval.add_constraint(
-                    dbz_active.clone() * gate_rem_p29.clone()
-                        * (result[i].clone() - val_b[i].clone())
+                    dbz_active_rem_h[0].clone() * (result[i].clone() - val_b[i].clone())
                 );
             }
         }

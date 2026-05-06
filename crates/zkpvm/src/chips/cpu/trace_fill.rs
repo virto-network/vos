@@ -1211,6 +1211,49 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 trace.fill_columns(
                     row, flags.is_div_rem && flags.is_32bit, Column::IsDivRem32bitH
                 );
+
+                // ── Wave-3 helpers ──
+                // val_d_byte_inv / val_d_partial_nz are filled at line 356-357.
+                // Reuse the locals from that fill.
+                let mut indicator = [BaseField::from(0u32); 8];
+                let mut ind_minus1 = [BaseField::from(0u32); 8];
+                let mut part_nz_times_ind = [BaseField::from(0u32); 8];
+                for i in 0..WORD_SIZE {
+                    let vd_i = BaseField::from(val_d_bytes[i] as u32);
+                    indicator[i] = vd_i * val_d_byte_inv[i];
+                    // ValDByteIndMinus1H = val_d · (indicator - 1).
+                    // For valid traces with vd=0 → ind=0, helper=0;
+                    // with vd≠0 → ind=1, helper=0.  Either way 0.
+                    let _ = vd_i; // implicit in the math
+                    ind_minus1[i] = BaseField::from(0u32);
+                    if i >= 1 {
+                        // PartialNZ[i-1] · ByteIndicator[i].
+                        let pnz_prev = BaseField::from(val_d_partial_nz[i - 1] as u32);
+                        part_nz_times_ind[i] = pnz_prev * indicator[i];
+                    }
+                }
+                trace.fill_columns_base_field(row, &indicator, Column::ValDByteIndicatorH);
+                trace.fill_columns_base_field(row, &ind_minus1, Column::ValDByteIndMinus1H);
+                trace.fill_columns_base_field(row, &part_nz_times_ind, Column::PartNZTimesIndH);
+                // is_div_rem · val_d_is_zero (booleans).
+                trace.fill_columns(
+                    row, flags.is_div_rem && vd_zero_b, Column::IsDivRemTimesVdzH
+                );
+                // dbz_active = is_div_rem · div_by_zero (boolean).
+                let dbz_active_b = flags.is_div_rem && (div_by_zero != 0);
+                trace.fill_columns(row, dbz_active_b, Column::DbzActiveH);
+                // dbz_active * gate_div / gate_rem (field-element products).
+                let dbz_active_v: u32 = if dbz_active_b { 1 } else { 0 };
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from((dbz_active_v * gate_div_v).rem_euclid(stwo::core::fields::m31::P))],
+                    Column::DbzActiveQuotH,
+                );
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from((dbz_active_v * gate_rem_v).rem_euclid(stwo::core::fields::m31::P))],
+                    Column::DbzActiveRemH,
+                );
             }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.

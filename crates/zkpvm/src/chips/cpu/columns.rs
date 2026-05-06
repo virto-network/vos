@@ -845,6 +845,29 @@ pub enum Column {
     #[size = 1] DivActiveRemH,
     /// `IsDivRem · Is32Bit` — sign-extension on 32-bit DivRem rows.
     #[size = 1] IsDivRem32bitH,
+
+    // Wave 3: ValDIsZero / PartialNZ recurrence + DivByZero result binding.
+    /// `ValD[i] · ValDByteInv[i]` — per-byte ValD nonzero indicator
+    /// (1 when ValD[i] != 0, else 0).  Lifts the deg-2 product into a
+    /// deg-1 column for the recurrence.
+    #[size = 8] ValDByteIndicatorH,
+    /// `ValD[i] · (ValDByteIndicatorH[i] - 1)` per byte.  Lifts the
+    /// deg-2 ValDByteInv pinning constraint to deg 2 when wrapped in
+    /// `is_real`.
+    #[size = 8] ValDByteIndMinus1H,
+    /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` for i = 1..8 — used
+    /// in the OR-recurrence `PartialNZ[i] = PartialNZ[i-1] + Ind[i] -
+    /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ[0] is set
+    /// directly to ValDByteIndicatorH[0]).
+    #[size = 8] PartNZTimesIndH,
+    /// `IsDivRem · ValDIsZero` — pins DivByZero on divrem rows.
+    #[size = 1] IsDivRemTimesVdzH,
+    /// `IsDivRem · DivByZero` — DivByZero-active selector.
+    #[size = 1] DbzActiveH,
+    /// `DbzActiveH · GateDivH` and `DbzActiveH · GateRemH` —
+    /// DivByZero quotient/remainder result-binding selectors.
+    #[size = 1] DbzActiveQuotH,
+    #[size = 1] DbzActiveRemH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
