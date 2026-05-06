@@ -110,7 +110,7 @@ fn standalone_verify_rejects_weak_pcs_config() {
     // 1 FRI query.  Honest prover output but at "test-grade" security.
     let weak_config = PcsConfig {
         pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1),
+        fri_config: FriConfig::new(0, 4, 1)
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
@@ -139,7 +139,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
 
     let weak_config = PcsConfig {
         pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1),
+        fri_config: FriConfig::new(0, 4, 1)
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
@@ -150,7 +150,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
     let test_policy = zkpvm_verifier::PcsPolicy {
         min_pow_bits: 0,
         min_fri_queries: 1,
-        min_fri_log_blowup: 4,
+        min_fri_log_blowup: 4
     };
     zkpvm_verifier::verify_standalone_with_pcs_policy(proof, preprocessed_commitment, &test_policy)
         .expect("relaxed-policy verify must accept the weak proof");

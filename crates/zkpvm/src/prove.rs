@@ -5,18 +5,18 @@ use stwo::{
         fri::FriConfig,
         pcs::PcsConfig,
         poly::circle::CanonicCoset,
-        vcs::blake2_merkle::Blake2sMerkleChannel,
+        vcs::blake2_merkle::Blake2sMerkleChannel
     },
     prover::{
         backend::simd::SimdBackend, poly::circle::PolyOps, CommitmentSchemeProver, ComponentProver,
-        ProvingError,
-    },
+        ProvingError
+    }
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
 use crate::trace::{
     component::ComponentTrace,
-    eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX},
+    eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX}
 };
 
 // Phase 60: prove_impl uses super::active_components(side_note) instead
@@ -36,7 +36,7 @@ pub struct ProveProfile {
     pub stark_prove: std::time::Duration,
     pub log_sizes: Vec<u32>,
     pub total_main_columns: usize,
-    pub total_interaction_columns: usize,
+    pub total_interaction_columns: usize
 }
 
 impl std::fmt::Display for ProveProfile {
@@ -68,7 +68,7 @@ fn pct(part: std::time::Duration, total: std::time::Duration) -> f64 {
 pub fn production_pcs_config() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
-        fri_config: FriConfig::new(0, 4, 19),
+        fri_config: FriConfig::new(0, 4, 19)
     }
 }
 
@@ -123,7 +123,7 @@ pub fn install_thread_pool() -> usize {
 pub fn production_pcs_config_mobile() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
-        fri_config: FriConfig::new(0, 2, 38),
+        fri_config: FriConfig::new(0, 2, 38)
     }
 }
 
@@ -264,8 +264,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
     let prover_channel = &mut Blake2sChannel::default();
 
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
-    log_sizes.iter().for_each(|log_size| {
+        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);    log_sizes.iter().for_each(|log_size| {
         prover_channel.mix_u64(*log_size as u64);
     });
 
@@ -347,7 +346,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
         trace_gen, preprocess_commit, main_commit,
         interaction_gen, interaction_commit, stark_prove,
         log_sizes: log_sizes.clone(),
-        total_main_columns, total_interaction_columns,
+        total_main_columns, total_interaction_columns
     };
 
     if profile {
@@ -365,7 +364,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
             pc: first.pc,
             timestamp: first.timestamp,
             registers: regs,
-            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
+            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes()
         }
     };
     let final_state = if side_note.steps.is_empty() {
@@ -380,7 +379,7 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
             pc: last.next_pc,
             timestamp: last.timestamp + 1,
             registers: regs,
-            memory_commitment: compute_final_memory_commitment(&side_note.initial_memory, &side_note.steps),
+            memory_commitment: compute_final_memory_commitment(&side_note.initial_memory, &side_note.steps)
         }
     };
 
@@ -397,6 +396,6 @@ fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Res
         component_mask,
         pcs_config: config,
         initial_state,
-        final_state,
+        final_state
     }, prof))
 }

@@ -296,7 +296,7 @@ fn profile_actor(name: &str, gas: u64) {
     // Steps 9-18: install precompile ECALL records on side_note.
     for c in &blake2b_calls {
         side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: c.h, m: c.m, t: c.t, f: c.f,
+            h: c.h, m: c.m, t: c.t, f: c.f
         });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
@@ -554,7 +554,7 @@ fn prove_diverse() {
             verify(p, &side_note).expect("verify");
             eprintln!("PROVED in {:?} ({kb:.1} KB)", t.elapsed());
         }
-        Err(e) => eprintln!("FAIL: {e}"),
+        Err(e) => eprintln!("FAIL: {e}")
     }
 }
 
@@ -714,7 +714,7 @@ fn prove_blake2b_precompile() {
     ).with_memory(flat_mem);
     for rec in &blake2b_records {
         side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: rec.h, m: rec.m, t: rec.t, f: rec.f,
+            h: rec.h, m: rec.m, t: rec.t, f: rec.f
         });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
@@ -762,7 +762,7 @@ fn prove_ristretto_chip_field_add() {
     // ristretto_field_rows.is_empty().
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-add proving failed");
@@ -771,7 +771,7 @@ fn prove_ristretto_chip_field_add() {
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0,
+        min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-add verification failed");
@@ -804,14 +804,14 @@ fn prove_ristretto_chip_field_mul() {
 
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul proving failed");
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0,
+        min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul verification failed");
@@ -860,7 +860,7 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
         let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
         };
         zkpvm::prove_with_config(&mut side_note, config).is_ok()
     }
@@ -1002,7 +1002,7 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
 fn ristretto_chip_per_payment_row_sequence_composes() {
     use zkpvm::chips::ristretto::point::{
         scalar_mult_rows, point_add_rows, point_identity, ExtendedPoint,
-        ED25519_TWO_D,
+        ED25519_TWO_D
     };
     use zkpvm::chips::ristretto::witness::{validate_row_sequence_composes, FieldOpRow};
 
@@ -1082,11 +1082,11 @@ fn ristretto_chip_unrelated_rows_now_rejected() {
         side_note.add_ristretto_field_row(fill_add(a, b));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     let rejected = match prove_result {
         Err(_) => true,
@@ -1161,15 +1161,15 @@ fn prove_ristretto_chip_with_input_producers() {
     // structurally correct (even if the trailing consumer is
     // missing) by checking the prove path.
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     let chain_balanced = match prove_result {
         Err(_) => false,
-        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_ok(),
+        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_ok()
     };
     // Without an external OUTPUT boundary consumer, the trailing
     // out from row 5 is unmatched.  Lookup balance fails — and
@@ -1211,12 +1211,12 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     side_note.add_ristretto_field_row(fill_output(row.out, 2));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("closed chain should prove");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("closed chain should verify");
@@ -1273,7 +1273,7 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     eprintln!("Composed {n_ops} ops + boundary rows in {:?}", t0.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let t = Instant::now();
     let proof = zkpvm::prove_with_config(&mut side_note, config)
@@ -1281,7 +1281,7 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     let prove_time = t.elapsed();
 
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     let t = Instant::now();
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
@@ -1316,7 +1316,7 @@ fn debug_scalar_mult_bisect_first_set_bit_position() {
         for r in rows { side_note.add_ristretto_field_row(r); }
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("scalar={:>3}: {}", scalar_val,
@@ -1350,7 +1350,7 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
             side_note.add_ristretto_field_row(r.clone());
         }
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
         if result.is_ok() { lo = mid + 1; }
@@ -1379,7 +1379,7 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
 #[ignore]
 fn bench_ristretto_chip_combined_with_cpu_baseline() {
     use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity,
+        scalar_mult_rows, point_add_rows, point_identity
     };
     use zkpvm::core::tracing::TracingPvm;
     use std::time::Instant;
@@ -1465,7 +1465,7 @@ fn bench_ristretto_chip_combined_with_cpu_baseline() {
 #[ignore]
 fn bench_ristretto_chip_one_private_payment() {
     use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity,
+        scalar_mult_rows, point_add_rows, point_identity
     };
     use std::time::Instant;
 
@@ -1507,7 +1507,7 @@ fn bench_ristretto_chip_one_private_payment() {
     eprintln!("Pushed rows + bumped Range256 counts in {:?}", t1.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let t2 = Instant::now();
     let proof = zkpvm::prove_with_config(&mut side_note, config)
@@ -1516,7 +1516,7 @@ fn bench_ristretto_chip_one_private_payment() {
     eprintln!("Prove time: {:?}", prove_time);
 
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     let t3 = Instant::now();
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
@@ -1536,7 +1536,7 @@ fn bench_ristretto_chip_one_private_payment() {
 #[test]
 fn project_ristretto_chip_size_for_one_payment() {
     use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity, ED25519_TWO_D,
+        scalar_mult_rows, point_add_rows, point_identity, ED25519_TWO_D
     };
 
     // One Pedersen amount commit needs 2 scalar mults + 1 point add:
@@ -1639,7 +1639,7 @@ fn debug_mul_column_bisect() {
         mutate(&mut row);
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("{:>22}: {}", name, if r.is_ok() { "PASS" } else { "FAIL" });
@@ -1660,12 +1660,12 @@ fn debug_seventeen_mul_zero_rows() {
         side_note.add_ristretto_field_row(fill_mul([0u8; 32], [0u8; 32]));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("17 mul-zero rows: prove failed");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("17 mul-zero rows: verify failed");
@@ -1718,7 +1718,7 @@ fn debug_mul_cell_bisect() {
         side_note.add_ristretto_field_row(row);
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("scenario {}: {}", name, if r.is_ok() { "OK" } else { "FAIL" });
@@ -1741,14 +1741,14 @@ fn prove_ristretto_chip_field_mul_zero() {
 
     let config = zkpvm::PcsConfig {
         pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul (zero) proving failed");
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0,
+        min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul (zero) verification failed");
@@ -1776,12 +1776,12 @@ fn prove_ristretto_chip_field_mul_with_reduction() {
     side_note.add_ristretto_field_row(fill_mul(a, b));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3),
+        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3)
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul (with reduction) proving failed");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul (with reduction) verification failed");
@@ -1931,7 +1931,7 @@ fn prove_blake2b_via_ecall() {
 
     for rec in &blake2b_records {
         side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: rec.h, m: rec.m, t: rec.t, f: rec.f,
+            h: rec.h, m: rec.m, t: rec.t, f: rec.f
         });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
