@@ -956,6 +956,36 @@ pub enum Column {
     #[size = 1] RealPhi7BoolH,
     /// `Phi7Field · Phi7InvField` — body helper for the Phi7-nonzero proof.
     #[size = 1] Phi7TimesInvH,
+
+    // Wave 7-fix: missed deg-3 patterns from Phase 40 (RotR ImmAlt val_b
+    // pinning) and Phase 36/37 (32-bit shift val_d-high-bytes-zero).
+    /// `IsRotateRImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
+    #[size = 1] IsRotRImmAltNotTruncH,
+    /// `IsRotateRImmAlt · IsTruncated` — truncated ImmAlt gate.
+    #[size = 1] IsRotRImmAltTruncH,
+    /// `Is32Bit · IsShiftConstrained` — 32-bit shift gate.
+    #[size = 1] Is32ShiftCH,
+
+    // Wave 8: residual deg-3+ patterns missed by the earlier wave grep.
+    /// `IsReal · IsTrap` — Phase 13e terminal-row gate.
+    #[size = 1] IsRealTrapH,
+    /// `MemAddrCarry[i] · (1 - MemAddrCarry[i])` — boolean witness per byte.
+    #[size = 4] MemAddrCarryBoolH,
+    /// `Is64Bit · (BytePopcount[4] + ... + BytePopcount[7])` — used in
+    /// CountSetBits result-binding to keep the gated body at deg 1.
+    #[size = 1] Is64bitPopcountHiH,
+    /// `IsLoadLocal · (1 - MemByteActive[i])` — Phase 20 inactive-byte gate.
+    #[size = 8] IsLoadLocalNotActiveH,
+    /// `DivRemainder[i] · ValRByteInv[i]` — Phase 31 nonzero indicator.
+    #[size = 8] ValRByteIndicatorH,
+    /// `DivRemainder[i] · (ValRByteIndicatorH - 1)` — Phase 31 inv pinning.
+    #[size = 8] ValRByteIndMinus1H,
+    /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` — Phase 31 OR-recurrence.
+    #[size = 8] ValRPartNZTimesIndH,
+    /// `IsDivS · (1 - DivByZero) · ValRPartialNZ[7]` — Phase 31 sign-of-r gate.
+    #[size = 1] DivSActivePartialH,
+    /// `IsDivS · (1 - DivByZero)` — root helper for DivSActivePartialH.
+    #[size = 1] IsDivSNotDbzH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

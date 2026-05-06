@@ -1506,6 +1506,81 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 row, &[BaseField::from(prod as u32)], Column::Phi7TimesInvH
             );
             let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
+
+            // Wave 7-fix: missed deg-3 patterns in CpuChip.
+            trace.fill_columns(
+                row,
+                flags.is_rotate_r_imm_alt && !is_truncated_b,
+                Column::IsRotRImmAltNotTruncH,
+            );
+            trace.fill_columns(
+                row,
+                flags.is_rotate_r_imm_alt && is_truncated_b,
+                Column::IsRotRImmAltTruncH,
+            );
+            trace.fill_columns(
+                row,
+                flags.is_32bit && is_shift_constrained,
+                Column::Is32ShiftCH,
+            );
+
+            // ── Wave 8 helper fills (residuals) ──
+            trace.fill_columns(row, flags.is_trap, Column::IsRealTrapH);
+            // MemAddrCarryBoolH = c·(1-c); booleans always satisfy this = 0.
+            trace.fill_columns_bytes(row, &[0u8; 4], Column::MemAddrCarryBoolH);
+            // Is64bitPopcountHiH = (1 - is_32bit) · (popcount[4]+...+popcount[7]).
+            let is_64bit_b = !flags.is_32bit;
+            let pop_hi: u32 = if is_64bit_b {
+                byte_popcount[4..8].iter().map(|&b| b as u32).sum()
+            } else { 0 };
+            trace.fill_columns_base_field(
+                row, &[BaseField::from(pop_hi)], Column::Is64bitPopcountHiH
+            );
+            // IsLoadLocalNotActiveH[i] = is_load · (1 - mem_byte_active[i]).
+            let mut load_not_active = [0u8; 8];
+            if flags.is_load {
+                // mem_byte_active is filled inside the `if mem` block above.
+                // Reconstruct it here from MemSize.
+                let mem_size: u8 = step.mem_read.as_ref()
+                    .or(step.mem_write.as_ref())
+                    .map(|m| m.size).unwrap_or(0);
+                for i in 0..8 {
+                    let active = (i as u8) < mem_size;
+                    load_not_active[i] = if !active { 1 } else { 0 };
+                }
+            }
+            trace.fill_columns_bytes(row, &load_not_active, Column::IsLoadLocalNotActiveH);
+            // ValR* helpers (Phase 31).  In valid traces ind_minus_1 = 0.
+            // val_r_byte_inv and val_r_partial_nz are computed earlier from
+            // div_remainder (the local array), so use that as the source —
+            // the constraint reads `div_remainder_top[i]·val_r_byte_inv_top[i]`.
+            let mut vr_indicator = [BaseField::from(0u32); 8];
+            let mut vr_part_nz_times_ind = [BaseField::from(0u32); 8];
+            for i in 0..8 {
+                let vr_i = BaseField::from(div_remainder[i] as u32);
+                vr_indicator[i] = vr_i * val_r_byte_inv[i];
+                if i >= 1 {
+                    let pnz_prev = BaseField::from(val_r_partial_nz[i - 1] as u32);
+                    vr_part_nz_times_ind[i] = pnz_prev * vr_indicator[i];
+                }
+            }
+            trace.fill_columns_base_field(row, &vr_indicator, Column::ValRByteIndicatorH);
+            trace.fill_columns_base_field(
+                row, &[BaseField::from(0u32); 8], Column::ValRByteIndMinus1H
+            );
+            trace.fill_columns_base_field(
+                row, &vr_part_nz_times_ind, Column::ValRPartNZTimesIndH
+            );
+            // DivS Phase 31 helpers.
+            let div_s_not_dbz_b = flags.is_div_s && (div_by_zero == 0);
+            trace.fill_columns(row, div_s_not_dbz_b, Column::IsDivSNotDbzH);
+            // DivSActivePartialH = (IsDivSNotDbz) · ValRPartialNZ[7].
+            let dsap_v: u32 = if div_s_not_dbz_b {
+                val_r_partial_nz[7] as u32
+            } else { 0 };
+            trace.fill_columns_base_field(
+                row, &[BaseField::from(dsap_v)], Column::DivSActivePartialH
+            );
         }
 
         for &b in &range_bytes {
