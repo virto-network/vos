@@ -1641,6 +1641,191 @@ fn crdt_counter_converges_across_nodes_live() {
 
 #[test]
 #[cfg(feature = "network")]
+fn crdt_scheduler_install_propagates_across_nodes() {
+    // CRDT replication of an agent that drives sub-actors. The
+    // scheduler tracks state (`round`, `children`, `run_queue`)
+    // and on each external dispatch invokes its registered children
+    // via `lifecycle::invoke` — those replies land in the
+    // EffectLog so peer replicas can replay deterministically
+    // without re-issuing the invokes.
+    //
+    // What this exercises that the crdt-counter tests don't:
+    //   - the recorded `replies` array on the EffectLog is non-empty
+    //     (scheduler invokes its children inside the handler).
+    //   - state is a non-trivial structure (Vec<u32> + Vec<...>),
+    //     not a single u64.
+    //   - replay's effect-cursor short-circuits the runtime's
+    //     INVOKE hostcall on the replica that didn't originate
+    //     the dispatch.
+    //
+    // Setup:
+    //   1. Two networked nodes A, B with a shared rep_id.
+    //   2. Both register scheduler with consistency = Crdt and
+    //      empty children initially. Greeter is registered as an
+    //      `Ephemeral` sibling on each node so scheduler's child
+    //      invokes have a real local target — but the test only
+    //      asserts on the scheduler's own state, not greeter's.
+    //   3. From outside, `install(some_id)` lands on A only.
+    //   4. Wait for B's scheduler to also report `some_id` in its
+    //      `get_children()` — that's the convergence signal. The
+    //      `id` we pick is intentionally not registered on either
+    //      side, so install's `invoke_child` reply is NotFound on
+    //      A and the same recorded NotFound on B's replay.
+    use vos::abi::service::ServiceId;
+    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let scheduler_path = format!(
+        "{}/../../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace,
+    );
+    let scheduler_data = match std::fs::read(&scheduler_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_crdt_sched_{}_{}", std::process::id(), stamp,
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"crdt-scheduler-test");
+        h.update(&[0u8]);
+        h.update(&scheduler_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // Networks
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a, local_prefix: prefix_a,
+        listen: vec![listen.clone()], bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(5),
+    ).expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b, local_prefix: prefix_b,
+        listen: vec![listen], bootstrap: vec![a_dial],
+    });
+
+    // Empty initial children so install(N) is the only state
+    // mutation we need to observe.
+    let init_args = vos::init::InitArgs::new()
+        .with("children", vos::init::InitValue::ListU32(Vec::new()));
+    let init_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args)
+        .unwrap()
+        .to_vec();
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let scheduler_a = node_a.register(
+        AgentConfig::new(scheduler_blob.clone())
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes.clone())])
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let scheduler_b = node_b.register(
+        AgentConfig::new(scheduler_blob)
+            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes)])
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+    );
+    node_b.attach_network(net_b);
+
+    // Hello handshake first so the first install's sync attempt
+    // doesn't get swallowed.
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(
+        || (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
+        std::time::Duration::from_secs(10),
+    ).expect("Hello completes");
+
+    // Drive install(0xC0DE) on A only. The id isn't registered as a
+    // service anywhere, so scheduler's `invoke_child` inside install
+    // gets NotFound back — recorded in A's EffectLog as the single
+    // reply. children gets pushed unconditionally.
+    let install_payload = {
+        let m = Msg::new("install").with("actor_id", 0xC0DEu32);
+        let encoded = m.encode();
+        let mut p = Vec::with_capacity(1 + encoded.len());
+        p.push(TAG_DYNAMIC);
+        p.extend_from_slice(&encoded);
+        p
+    };
+    let _ = node_a.invoke(scheduler_a, install_payload).expect("install on A");
+
+    // Probe both replicas. A sees the change immediately; B has to
+    // catch up via the sync ticker (cycle-3) then a soft-restart
+    // replays the single DAG node.
+    let get_children_payload = || {
+        let m = Msg::new("get_children");
+        let encoded = m.encode();
+        let mut p = Vec::with_capacity(1 + encoded.len());
+        p.push(TAG_DYNAMIC);
+        p.extend_from_slice(&encoded);
+        p
+    };
+    let read_children = |node: &VosNode, target: ServiceId| -> Option<Vec<u32>> {
+        let bytes = node.invoke(target, get_children_payload())?;
+        let v: vos::value::Value = vos::Decode::decode(&bytes);
+        v.as_list_u32().map(|s| s.to_vec())
+    };
+
+    // A applied locally.
+    assert_eq!(read_children(&node_a, scheduler_a), Some(vec![0xC0DE]));
+
+    // B converges via CRDT replay.
+    let b_children = wait_for(
+        || match read_children(&node_b, scheduler_b) {
+            Some(v) if v == vec![0xC0DE] => Some(v),
+            _ => None,
+        },
+        std::time::Duration::from_secs(8),
+    );
+    assert_eq!(
+        b_children,
+        Some(vec![0xC0DE]),
+        "B did not converge to A's installed children list within deadline",
+    );
+
+    let _ = node_a.collect();
+    let _ = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
+#[test]
+#[cfg(feature = "network")]
 fn crdt_counter_burst_converges_under_concurrent_load() {
     // Robustness probe: the existing convergence test does one
     // inc() per side. Real workloads will have bursts of writes

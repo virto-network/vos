@@ -112,5 +112,21 @@ impl Agent {
             ctx.tell(ctx.id(), &Msg::new("tick"));
         }
     }
+
+    /// Probe — current round counter. Useful for tests that
+    /// observe the scheduler's tick activity from outside the
+    /// actor (e.g. CRDT-replication tests verifying that
+    /// state transitions on one replica reach a peer).
+    #[msg]
+    async fn get_round(&self) -> u32 {
+        self.round
+    }
+
+    /// Probe — registered children. Returns the current
+    /// `children` list as it stands after any `install` calls.
+    #[msg]
+    async fn get_children(&self) -> Vec<u32> {
+        self.children.clone()
+    }
 }
 
