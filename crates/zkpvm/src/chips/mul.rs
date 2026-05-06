@@ -125,6 +125,49 @@ pub enum Column {
     /// 1 iff this is a padding row.
     #[size = 1]
     IsPadding,
+
+    // ── Phase I-mul Stwo-v2.x degree-flatten helpers ──
+    //
+    // Stwo's lifted protocol enforces algebraic constraint degree ≤ 2.
+    // Several MulChip constraints sit at degree 3-5 in their natural
+    // form — chiefly the schoolbook chain (`gate · partial_sum`) and the
+    // multi-flag selectors `is_real · is_64bit · is_mul_lo · …`.
+    // These helpers materialise the high-degree intermediates so every
+    // gated constraint factors into (deg 1 column ref) × (deg 1 body).
+
+    /// `(1 - IsPadding) · (1 - Is32Bit)` — deg-1 helper standing in for
+    /// the "real 64-bit row" gate; defined via deg-2 helper-defining
+    /// constraint `NotPadding64bit - (1 - IsPadding)(1 - Is32Bit) = 0`.
+    /// Reused by the schoolbook 64-bit mul_lo and mul_upper chains.
+    #[size = 1] NotPadding64bit,
+    /// `NotPadding64bit · IsMulLo` — full mul_lo 64-bit selector.
+    #[size = 1] MulLoActive,
+    /// `NotPadding64bit · (IsMulUpperUU + IsMulUpperSU + IsMulUpperSS)`
+    /// — full mul_upper 64-bit selector.
+    #[size = 1] MulUpperActive,
+    /// `(1 - IsPadding) · Is32Bit` — full 32-bit row selector.
+    #[size = 1] Is32BitActive,
+    /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64)` —
+    /// full mul_lo 64-bit non-rotate selector for `result = upl` binding.
+    #[size = 1] MulLoNoRotate64,
+    /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32)` —
+    /// full 32-bit non-rotate selector for `result = upl` binding.
+    #[size = 1] Is32BitNoRotate32,
+
+    /// 64-bit schoolbook partial-sum helper at position k:
+    /// `PartialSum64[k] := Σ_{i+j=k, i,j<8} ValB[i]·ValD[j]` (deg 2 def).
+    /// Used by both mul_lo and mul_upper 64-bit chains (k=0..16).
+    #[size = 16] PartialSum64,
+    /// 32-bit schoolbook partial-sum helper at position k:
+    /// `PartialSum32[k] := Σ_{i+j=k, i,j<4} ValB[i]·ValD[j]` (deg 2 def).
+    /// k=0..8.
+    #[size = 8] PartialSum32,
+
+    /// Sign-correction body helpers (Phase 54c flatten).
+    /// `SignDA[i] := SignBitB · ValD[i]` for i=0..8 (deg 2 def).
+    #[size = 8] SignDA,
+    /// `SignDB[i] := SignBitD · ValB[i]` for i=0..8 (deg 2 def).
+    #[size = 8] SignDB,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -172,6 +215,18 @@ impl BuiltInComponent for MulChip {
         let is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
+        // ── Phase I-mul degree-flatten helpers ──
+        let not_padding_64bit = crate::trace::trace_eval!(trace_eval, Column::NotPadding64bit);
+        let mul_lo_active = crate::trace::trace_eval!(trace_eval, Column::MulLoActive);
+        let mul_upper_active = crate::trace::trace_eval!(trace_eval, Column::MulUpperActive);
+        let is_32bit_active = crate::trace::trace_eval!(trace_eval, Column::Is32BitActive);
+        let mul_lo_no_rotate64 = crate::trace::trace_eval!(trace_eval, Column::MulLoNoRotate64);
+        let is_32bit_no_rotate32 = crate::trace::trace_eval!(trace_eval, Column::Is32BitNoRotate32);
+        let partial_sum_64 = crate::trace::trace_eval!(trace_eval, Column::PartialSum64);
+        let partial_sum_32 = crate::trace::trace_eval!(trace_eval, Column::PartialSum32);
+        let sign_d_a = crate::trace::trace_eval!(trace_eval, Column::SignDA);
+        let sign_d_b = crate::trace::trace_eval!(trace_eval, Column::SignDB);
+
         // Boolean constraints on flag columns.
         for flag in [&is_mul_lo, &is_mu_uu, &is_mu_su, &is_mu_ss, &is_32bit, &is_padding] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
@@ -184,6 +239,65 @@ impl BuiltInComponent for MulChip {
         let is_mul_upper_e = is_mu_uu[0].clone() + is_mu_su[0].clone() + is_mu_ss[0].clone();
         let is_64bit = E::F::one() - is_32bit[0].clone();
 
+        // ── Phase I-mul helper-defining constraints ──
+        // Each helper is one main-trace column; the constraint here pins
+        // it to the algebraic expression so a malicious prover can't
+        // diverge from the gates the original chip used.  All deg 2.
+        eval.add_constraint(
+            not_padding_64bit[0].clone() - is_real.clone() * is_64bit.clone()
+        );
+        eval.add_constraint(
+            mul_lo_active[0].clone() - not_padding_64bit[0].clone() * is_mul_lo[0].clone()
+        );
+        eval.add_constraint(
+            mul_upper_active[0].clone() - not_padding_64bit[0].clone() * is_mul_upper_e.clone()
+        );
+        eval.add_constraint(
+            is_32bit_active[0].clone() - is_real.clone() * is_32bit[0].clone()
+        );
+        let one_minus_rotate_64 = E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone();
+        let one_minus_rotate_32 = E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone();
+        eval.add_constraint(
+            mul_lo_no_rotate64[0].clone() - mul_lo_active[0].clone() * one_minus_rotate_64.clone()
+        );
+        eval.add_constraint(
+            is_32bit_no_rotate32[0].clone()
+                - is_32bit_active[0].clone() * one_minus_rotate_32.clone()
+        );
+
+        // PartialSum64[k] = Σ_{i+j=k, i,j<8} ValB[i]·ValD[j] for k=0..16.
+        for k in 0..16usize {
+            let mut psum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let j = k.wrapping_sub(i);
+                if j < WORD_SIZE {
+                    psum += val_b[i].clone() * val_d[j].clone();
+                }
+            }
+            eval.add_constraint(partial_sum_64[k].clone() - psum);
+        }
+        // PartialSum32[k] = Σ_{i+j=k, i,j<4} ValB[i]·ValD[j] for k=0..8.
+        for k in 0..8usize {
+            let mut psum = E::F::zero();
+            for i in 0..4usize {
+                let j = k.wrapping_sub(i);
+                if j < 4 {
+                    psum += val_b[i].clone() * val_d[j].clone();
+                }
+            }
+            eval.add_constraint(partial_sum_32[k].clone() - psum);
+        }
+
+        // Sign-correction body helpers.
+        for i in 0..WORD_SIZE {
+            eval.add_constraint(
+                sign_d_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone()
+            );
+            eval.add_constraint(
+                sign_d_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone()
+            );
+        }
+
         // Partition: on a real row, exactly one variant flag is 1.
         let variant_sum = is_mul_lo[0].clone()
             + is_mu_uu[0].clone()
@@ -192,39 +306,32 @@ impl BuiltInComponent for MulChip {
         eval.add_constraint(is_real.clone() * (variant_sum.clone() - E::F::one()));
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
-        // ── Phase 54b: schoolbook byte-level carry chain ──
+        // ── Phase 54b: schoolbook byte-level carry chain (Phase I-mul flattened) ──
+        // PartialSum64/32 and MulLoActive / MulUpperActive / Is32BitActive
+        // helpers compress the original deg-4/5 selector × quadratic-body
+        // expressions to deg-2 (selector_h × linear_body).
         let f256: E::F = E::F::from(BaseField::from(256));
         let full_carry = |k: usize| -> E::F {
             mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
         };
         for k in 0..16usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..WORD_SIZE {
-                let j = k.wrapping_sub(i);
-                if j < WORD_SIZE {
-                    partial_sum += val_b[i].clone() * val_d[j].clone();
-                }
-            }
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let out_normal = if k < 8 { upl[k].clone() } else { mul_high[k - 8].clone() };
             let out_upper = if k < 8 { mul_high[k].clone() } else { uph[k - 8].clone() };
-            let c_normal = out_normal + full_carry(k) * f256.clone() - partial_sum.clone() - carry_in.clone();
-            let c_upper = out_upper + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(is_real.clone() * is_64bit.clone() * is_mul_lo[0].clone() * c_normal);
-            eval.add_constraint(is_real.clone() * is_64bit.clone() * is_mul_upper_e.clone() * c_upper);
+            // Body now linear in column refs (PartialSum64[k] is one helper col).
+            let c_normal = out_normal + full_carry(k) * f256.clone()
+                - partial_sum_64[k].clone() - carry_in.clone();
+            let c_upper = out_upper + full_carry(k) * f256.clone()
+                - partial_sum_64[k].clone() - carry_in;
+            eval.add_constraint(mul_lo_active[0].clone() * c_normal);
+            eval.add_constraint(mul_upper_active[0].clone() * c_upper);
         }
         for k in 0..8usize {
-            let mut partial_sum = E::F::zero();
-            for i in 0..4usize {
-                let j = k.wrapping_sub(i);
-                if j < 4 {
-                    partial_sum += val_b[i].clone() * val_d[j].clone();
-                }
-            }
             let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
             let out_byte = if k < 4 { upl[k].clone() } else { mul_high[k - 4].clone() };
-            let c = out_byte + full_carry(k) * f256.clone() - partial_sum - carry_in;
-            eval.add_constraint(is_real.clone() * is_32bit[0].clone() * c);
+            let c = out_byte + full_carry(k) * f256.clone()
+                - partial_sum_32[k].clone() - carry_in;
+            eval.add_constraint(is_32bit_active[0].clone() * c);
         }
 
         // ── Phase 54c: Phase 12c MulUpper SS/SU sign-correction ──
@@ -234,16 +341,16 @@ impl BuiltInComponent for MulChip {
         //   TermA[i]: SU/SS → sa·val_d[i]; UU → 0.
         //   TermB[i]: SS    → sb·val_b[i]; UU/SU → 0.
         for i in 0..WORD_SIZE {
-            // TermA:
+            // TermA (Phase I-mul flattened): SignDA[i] = SignBitB · ValD[i].
             eval.add_constraint(
                 (is_mu_su[0].clone() + is_mu_ss[0].clone())
-                    * (term_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone())
+                    * (term_a[i].clone() - sign_d_a[i].clone())
             );
             eval.add_constraint(is_mu_uu[0].clone() * term_a[i].clone());
-            // TermB:
+            // TermB (Phase I-mul flattened): SignDB[i] = SignBitD · ValB[i].
             eval.add_constraint(
                 is_mu_ss[0].clone()
-                    * (term_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone())
+                    * (term_b[i].clone() - sign_d_b[i].clone())
             );
             eval.add_constraint((is_mu_uu[0].clone() + is_mu_su[0].clone()) * term_b[i].clone());
         }
@@ -277,14 +384,13 @@ impl BuiltInComponent for MulChip {
         // 32-bit upper result limbs (i ∈ 4..8) are pinned by CpuChip's
         // Phase 19 sign-extension constraint (still on CpuChip side).
         {
-            let one_minus_rotate_64 = E::F::one()
-                - is_rot_l64[0].clone()
-                - is_rot_r64[0].clone();
             let is_rotate_64_either = is_rot_l64[0].clone() + is_rot_r64[0].clone();
             for i in 0..WORD_SIZE {
+                // Non-rotate path (Phase I-mul flattened): mul_lo_no_rotate64
+                // is the deg-1 helper standing in for the original 4-factor
+                // gate `is_real · is_64bit · is_mul_lo · (1 - rot_l - rot_r)`.
                 eval.add_constraint(
-                    is_real.clone() * is_64bit.clone() * is_mul_lo[0].clone()
-                        * one_minus_rotate_64.clone()
+                    mul_lo_no_rotate64[0].clone()
                         * (result[i].clone() - upl[i].clone())
                 );
                 eval.add_constraint(
@@ -292,14 +398,10 @@ impl BuiltInComponent for MulChip {
                         * (result[i].clone() - upl[i].clone() - mul_high[i].clone())
                 );
             }
-            let one_minus_rotate_32 = E::F::one()
-                - is_rot_l32[0].clone()
-                - is_rot_r32[0].clone();
             let is_rotate_32_either = is_rot_l32[0].clone() + is_rot_r32[0].clone();
             for i in 0..4 {
                 eval.add_constraint(
-                    is_real.clone() * is_32bit[0].clone()
-                        * one_minus_rotate_32.clone()
+                    is_32bit_no_rotate32[0].clone()
                         * (result[i].clone() - upl[i].clone())
                 );
                 eval.add_constraint(
@@ -383,6 +485,64 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns(row, e.is_mul_upper_ss, Column::IsMulUpperSS);
             trace.fill_columns(row, e.is_32bit, Column::Is32Bit);
             trace.fill_columns(row, false, Column::IsPadding);
+
+            // ── Phase I-mul helper fills ──
+            // Selector helpers — in valid traces, evaluated bool products.
+            let real = true;  // not padding
+            let np_64 = real && !e.is_32bit;
+            let mu_e = e.is_mul_upper_uu || e.is_mul_upper_su || e.is_mul_upper_ss;
+            let mlo_active = np_64 && e.is_mul_lo;
+            let mup_active = np_64 && mu_e;
+            let i32_active = real && e.is_32bit;
+            let no_rot_64 = !e.is_rotate_l64 && !e.is_rotate_r64;
+            let no_rot_32 = !e.is_rotate_l32 && !e.is_rotate_r32;
+            trace.fill_columns(row, np_64, Column::NotPadding64bit);
+            trace.fill_columns(row, mlo_active, Column::MulLoActive);
+            trace.fill_columns(row, mup_active, Column::MulUpperActive);
+            trace.fill_columns(row, i32_active, Column::Is32BitActive);
+            trace.fill_columns(row, mlo_active && no_rot_64, Column::MulLoNoRotate64);
+            trace.fill_columns(row, i32_active && no_rot_32, Column::Is32BitNoRotate32);
+
+            // PartialSum helpers — values can exceed u8, so fill via BaseField.
+            use stwo::core::fields::m31::BaseField;
+            let val_b_bytes = e.val_b.to_le_bytes();
+            let val_d_bytes = e.val_d.to_le_bytes();
+            let mut psum_64 = [BaseField::from(0u32); 16];
+            for k in 0..16usize {
+                let mut s: u32 = 0;
+                for i in 0..WORD_SIZE {
+                    let j = k.wrapping_sub(i);
+                    if j < WORD_SIZE {
+                        s += val_b_bytes[i] as u32 * val_d_bytes[j] as u32;
+                    }
+                }
+                psum_64[k] = BaseField::from(s);
+            }
+            trace.fill_columns_base_field(row, &psum_64, Column::PartialSum64);
+            let mut psum_32 = [BaseField::from(0u32); 8];
+            for k in 0..8usize {
+                let mut s: u32 = 0;
+                for i in 0..4usize {
+                    let j = k.wrapping_sub(i);
+                    if j < 4 {
+                        s += val_b_bytes[i] as u32 * val_d_bytes[j] as u32;
+                    }
+                }
+                psum_32[k] = BaseField::from(s);
+            }
+            trace.fill_columns_base_field(row, &psum_32, Column::PartialSum32);
+
+            // Sign-correction body helpers.  SignBitB · ValD[i] and
+            // SignBitD · ValB[i] both fit in u8 (sign_bit ∈ {0,1},
+            // val ∈ 0..256).
+            let mut sda = [0u8; 8];
+            let mut sdb = [0u8; 8];
+            for i in 0..WORD_SIZE {
+                sda[i] = e.sign_bit_b * val_d_bytes[i];
+                sdb[i] = e.sign_bit_d * val_b_bytes[i];
+            }
+            trace.fill_columns_bytes(row, &sda, Column::SignDA);
+            trace.fill_columns_bytes(row, &sdb, Column::SignDB);
         }
 
         for row in entries.len()..num_rows {
