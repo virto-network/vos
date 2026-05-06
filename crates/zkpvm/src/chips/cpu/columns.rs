@@ -868,6 +868,15 @@ pub enum Column {
     /// DivByZero quotient/remainder result-binding selectors.
     #[size = 1] DbzActiveQuotH,
     #[size = 1] DbzActiveRemH,
+
+    // Wave 4a: BitManip MSB recurrences + SignExtBit boolean.
+    /// `SignExtBit · (SignExtBit - 1)` boolean witness.
+    #[size = 1] SignExtBitBoolH,
+    /// `ValDPartialNZMsb[i+1] · ValDByteIndicatorH[i]` for the MSB-direction
+    /// recurrence — i ∈ 0..7 (index 7 unused; default fill = 0).
+    #[size = 8] PartNZMsbTimesIndH,
+    /// Same for the low-4-byte MSB recurrence — i ∈ 0..3 (index 3 unused).
+    #[size = 4] PartNZMsbLoTimesIndH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

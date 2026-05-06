@@ -1254,6 +1254,44 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     &[BaseField::from((dbz_active_v * gate_rem_v).rem_euclid(stwo::core::fields::m31::P))],
                     Column::DbzActiveRemH,
                 );
+
+                // ── Wave-4a helpers ──
+                // SignExtBitBoolH = sign_ext_bit · (sign_ext_bit - 1).
+                // sign_ext_bit ∈ {0, 1} ⇒ helper always 0 in valid traces.
+                trace.fill_columns(row, false, Column::SignExtBitBoolH);
+                // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
+                // val_d_partial_nz_msb is computed at line ~1025+ AFTER this
+                // helper-fill block — we need to compute it here independently.
+                let mut pnz_msb = [0u8; 8];
+                let mut running_msb: u8 = 0;
+                for i in (0..WORD_SIZE).rev() {
+                    let nz = if val_d_bytes[i] != 0 { 1 } else { 0 };
+                    running_msb |= nz;
+                    pnz_msb[i] = running_msb;
+                }
+                let mut pnz_msb_lo = [0u8; 4];
+                let mut running_msb_lo: u8 = 0;
+                for i in (0..4).rev() {
+                    let nz = if val_d_bytes[i] != 0 { 1 } else { 0 };
+                    running_msb_lo |= nz;
+                    pnz_msb_lo[i] = running_msb_lo;
+                }
+                let mut pnz_msb_times_ind = [BaseField::from(0u32); 8];
+                for i in 0..7 {
+                    let pnz_next = BaseField::from(pnz_msb[i + 1] as u32);
+                    pnz_msb_times_ind[i] = pnz_next * indicator[i];
+                }
+                trace.fill_columns_base_field(
+                    row, &pnz_msb_times_ind, Column::PartNZMsbTimesIndH
+                );
+                let mut pnz_msb_lo_times_ind = [BaseField::from(0u32); 4];
+                for i in 0..3 {
+                    let pnz_next = BaseField::from(pnz_msb_lo[i + 1] as u32);
+                    pnz_msb_lo_times_ind[i] = pnz_next * indicator[i];
+                }
+                trace.fill_columns_base_field(
+                    row, &pnz_msb_lo_times_ind, Column::PartNZMsbLoTimesIndH
+                );
             }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.

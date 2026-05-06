@@ -340,6 +340,42 @@ impl BuiltInComponent for CpuChip {
             dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone()
         );
 
+        // ── Phase I-cpu Wave-4a helpers (BitManip MSB + SignExtBit) ──
+        let sign_ext_bit_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::SignExtBitBoolH);
+        let part_nz_msb_times_ind_h =
+            crate::trace::trace_eval!(trace_eval, Column::PartNZMsbTimesIndH);
+        let part_nz_msb_lo_times_ind_h =
+            crate::trace::trace_eval!(trace_eval, Column::PartNZMsbLoTimesIndH);
+        {
+            let sign_ext_bit_top = crate::trace::trace_eval!(trace_eval, Column::SignExtBit);
+            let val_d_partial_nz_msb_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsb);
+            let val_d_partial_nz_msb_lo_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
+            eval.add_constraint(
+                sign_ext_bit_bool_h[0].clone()
+                    - sign_ext_bit_top[0].clone()
+                        * (sign_ext_bit_top[0].clone() - E::F::one())
+            );
+            // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
+            for i in 0..7 {
+                eval.add_constraint(
+                    part_nz_msb_times_ind_h[i].clone()
+                        - val_d_partial_nz_msb_top[i + 1].clone()
+                            * val_d_byte_indicator_h[i].clone()
+                );
+            }
+            // PartNZMsbLoTimesIndH[i] = PartialNZMsbLo[i+1] · ByteIndicator[i] for i ∈ 0..3.
+            for i in 0..3 {
+                eval.add_constraint(
+                    part_nz_msb_lo_times_ind_h[i].clone()
+                        - val_d_partial_nz_msb_lo_top[i + 1].clone()
+                            * val_d_byte_indicator_h[i].clone()
+                );
+            }
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
         // (Phase I-cpu Wave-1 flattened)
@@ -845,12 +881,8 @@ impl BuiltInComponent for CpuChip {
         let is_sign_ext = is_sign_ext_8[0].clone() + is_sign_ext_16[0].clone();
         let ff_se: E::F = E::F::from(BaseField::from(255));
 
-        // SignExtBit ∈ {0, 1}.
-        eval.add_constraint(
-            is_sign_ext.clone()
-                * sign_ext_bit[0].clone()
-                * (sign_ext_bit[0].clone() - E::F::one()),
-        );
+        // SignExtBit ∈ {0, 1} (Phase I-cpu Wave-4a flattened).
+        eval.add_constraint(is_sign_ext.clone() * sign_ext_bit_bool_h[0].clone());
         // SE8 + SE16 both copy byte 0.
         eval.add_constraint(
             is_sign_ext.clone() * (result[0].clone() - val_d[0].clone()),
@@ -947,40 +979,40 @@ impl BuiltInComponent for CpuChip {
         let val_d_partial_nz_msb_lo = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
         let val_d_byte_inv_p34 = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
 
-        // ── ValDPartialNZMsb[8] recurrence (MSB direction over all 8 bytes).
-        // partial_msb[7] = byte_indicator[7];
-        // partial_msb[i] = partial_msb[i+1] OR byte_indicator[i].
+        // ── ValDPartialNZMsb[8] recurrence (Phase I-cpu Wave-4a flattened) ──
+        // PartialNZMsb[7] = ByteIndicator[7]; for i < 7, OR-recurrence
+        // routed through PartNZMsbTimesIndH[i] body helper.
+        let _ = val_d_byte_inv_p34; // ByteIndicator now sourced from ValDByteIndicatorH
         eval.add_constraint(
             is_real.clone()
-                * (val_d_partial_nz_msb[7].clone()
-                    - val_d[7].clone() * val_d_byte_inv_p34[7].clone())
+                * (val_d_partial_nz_msb[7].clone() - val_d_byte_indicator_h[7].clone())
         );
         for i in (0..7).rev() {
-            let byte_ind = val_d[i].clone() * val_d_byte_inv_p34[i].clone();
-            let or_expr = val_d_partial_nz_msb[i + 1].clone()
-                + byte_ind.clone()
-                - val_d_partial_nz_msb[i + 1].clone() * byte_ind;
+            // OR(prev, ind) = prev + ind - prev·ind, with prev =
+            // PartialNZMsb[i+1] and ind = ByteIndicator[i].
             eval.add_constraint(
-                is_real.clone() * (val_d_partial_nz_msb[i].clone() - or_expr)
+                is_real.clone() * (
+                    val_d_partial_nz_msb[i].clone()
+                        - val_d_partial_nz_msb[i + 1].clone()
+                        - val_d_byte_indicator_h[i].clone()
+                        + part_nz_msb_times_ind_h[i].clone()
+                )
             );
         }
 
-        // ── ValDPartialNZMsbLo[4] recurrence (MSB direction over low 4
-        //   bytes only — for LZ32, where high bytes of val_d are ignored).
-        // partial_msb_lo[3] = byte_indicator[3];
-        // partial_msb_lo[i] = partial_msb_lo[i+1] OR byte_indicator[i].
+        // ── ValDPartialNZMsbLo[4] recurrence (Phase I-cpu Wave-4a flattened) ──
         eval.add_constraint(
             is_real.clone()
-                * (val_d_partial_nz_msb_lo[3].clone()
-                    - val_d[3].clone() * val_d_byte_inv_p34[3].clone())
+                * (val_d_partial_nz_msb_lo[3].clone() - val_d_byte_indicator_h[3].clone())
         );
         for i in (0..3).rev() {
-            let byte_ind = val_d[i].clone() * val_d_byte_inv_p34[i].clone();
-            let or_expr = val_d_partial_nz_msb_lo[i + 1].clone()
-                + byte_ind.clone()
-                - val_d_partial_nz_msb_lo[i + 1].clone() * byte_ind;
             eval.add_constraint(
-                is_real.clone() * (val_d_partial_nz_msb_lo[i].clone() - or_expr)
+                is_real.clone() * (
+                    val_d_partial_nz_msb_lo[i].clone()
+                        - val_d_partial_nz_msb_lo[i + 1].clone()
+                        - val_d_byte_indicator_h[i].clone()
+                        + part_nz_msb_lo_times_ind_h[i].clone()
+                )
             );
         }
 
