@@ -235,6 +235,37 @@ Phase I.0 before starting subphase 1 of any chip rewrite. The
 upfront cost is small relative to the downstream debugging cost of
 trusted-blind rewrites.
 
+## I-blake2b-1 through I-blake2b-6 landed (2026-05-06)
+
+All algebraic-degree subphases landed: gate helpers, carry-bound
+helpers, F-bound, input-match sums, mx/my sums, V_next sums.  The
+chip's constraint polynomial is now degree ≤ 2 across the board — the
+OODS sanity check passes cleanly (no `ConstraintsNotSatisfied`).
+
+**New failure mode** in `harness_blake2b_isolated`:
+`MerkleProverLifted::decommit` panics with an `index out of bounds`
+inside `column.rs:111`.  Confirmed via `RUST_BACKTRACE=1` — the panic
+is in stwo's lifted Merkle layer at the FRI decommitment phase, not
+in our chip's algebra.  This is upstream / Merkle-layer territory.
+
+Tried-and-failed mitigations:
+- Single Blake2bCall with cheap PcsConfig (pow_bits=5, blowup=1, q=3)
+  → OOB len=16 idx=16
+- Two Blake2bCalls + cheap config → OOB len=64 idx=93
+- Single call + standard PcsConfig (blowup=4, q=19) → OOB len=256 idx=302
+- Adding [&BitwiseLookupChip, &RangeMultiplicity256] alongside
+  Blake2bChip → OOB len=64 idx=67
+
+The OOB index always slightly exceeds the column length; appears
+parametric in trace shape but trips for every combination tried.
+
+Path forward: defer subphase 7 (integration / harness flip green) to
+the post-all-chips state.  Once Mul / DivRem / Cpu / Ristretto are
+also flattened, `prove_add64` runs through the production path with
+the standard BASE_COMPONENTS set — that's the actual end-to-end
+validation gate, and its column shape may not trip the lifted Merkle
+bug.  If it does, we file a stwo issue with our reproducer.
+
 ## Phase I.0 landed (2026-05-06)
 
 The chip-isolated prove harness is now in place:

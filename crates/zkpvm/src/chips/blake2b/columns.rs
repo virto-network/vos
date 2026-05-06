@@ -243,6 +243,36 @@ pub enum Column {
     // (My uses IsMySlot.)
     #[size = 8] MxSlotSum,
     #[size = 8] MySlotSum,
+    // Phase I-blake2b-6 V_next sum helpers — flatten the 16 V-state
+    // update constraints from degree 3 to degree 2.
+    //
+    // Original (deg 3): GateH · (V_next[k][i] - Σ_j IsGIdx[j] · contribution_j(k, i))
+    //   where contribution_j(k, i) ∈ {a_out[i], b_out[i], c_out[i], d_out[i],
+    //   V[k][i]} depending on whether k matches G_INDICES[j][0..3] or not.
+    // Flattened:
+    //   VNextSumK[i] := Σ_j IsGIdx[j] · contribution_j(k, i)        (deg 2 helper-def)
+    //   GateH · (V_next[k][i] - VNextSumK[i]) = 0                    (deg 2 main)
+    //
+    // 16 slots × 8 bytes = 128 helper cells per row.  Witness-fill: at
+    // row r with j_active = r % 8, the sum collapses to v_after[k][i]
+    // where v_after = r.v with G_INDICES[j_active] slots replaced by
+    // r.{a,b,c,d}_out.
+    #[size = 8] VNextSum0,
+    #[size = 8] VNextSum1,
+    #[size = 8] VNextSum2,
+    #[size = 8] VNextSum3,
+    #[size = 8] VNextSum4,
+    #[size = 8] VNextSum5,
+    #[size = 8] VNextSum6,
+    #[size = 8] VNextSum7,
+    #[size = 8] VNextSum8,
+    #[size = 8] VNextSum9,
+    #[size = 8] VNextSum10,
+    #[size = 8] VNextSum11,
+    #[size = 8] VNextSum12,
+    #[size = 8] VNextSum13,
+    #[size = 8] VNextSum14,
+    #[size = 8] VNextSum15,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

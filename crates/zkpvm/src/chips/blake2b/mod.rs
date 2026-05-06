@@ -538,13 +538,32 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_constraint(is_real[0].clone() * (d_in[i].clone() - in_match_d[i].clone()));
         }
 
-        // V_next update: for slot k at byte i, V_next[k][i] equals
+        // V_next update (Phase I-blake2b-6 helper-flattened): for slot k
+        // at byte i, V_next[k][i] equals
         //   Σ_j IsGIdx[j] · (a_out/b_out/c_out/d_out if k is touched by G_j,
         //                    else V[k]).
         // Gated by is_real · (1 - is_last_of_compression) so the constraint
         // does not cross a compression boundary or fire on padding.
         // Gate substitution (Phase I-blake2b-1): gate ← GateH.
         let gate = gate_h[0].clone();
+        let v_next_sum: [_; 16] = [
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum0),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum1),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum2),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum3),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum4),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum5),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum6),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum7),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum8),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum9),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum10),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum11),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum12),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum13),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum14),
+            crate::trace::trace_eval!(trace_eval, Column::VNextSum15),
+        ];
         for k in 0..16 {
             for i in 0..8 {
                 let mut update = E::F::zero();
@@ -556,8 +575,11 @@ impl BuiltInComponent for Blake2bChip {
                         else { v_cols[k][i].clone() };
                     update += is_gidx[j][0].clone() * contribution;
                 }
+                // Helper-defining (deg 2): VNextSumK[i] = Σ_j IsGIdx[j] · contribution_j(k, i).
+                eval.add_constraint(v_next_sum[k][i].clone() - update);
+                // Main (deg 2): GateH · (V_next[k][i] - VNextSumK[i]) = 0.
                 eval.add_constraint(
-                    gate.clone() * (v_cols_next[k][i].clone() - update)
+                    gate.clone() * (v_cols_next[k][i].clone() - v_next_sum[k][i].clone())
                 );
             }
         }
@@ -1349,6 +1371,27 @@ impl BuiltInProverComponent for Blake2bChip {
             // so MxSlotSum[i] = M[k_mx][i] = mx[i].  Same shape for My.
             trace.fill_columns_bytes(row_idx, &r.mx, Column::MxSlotSum);
             trace.fill_columns_bytes(row_idx, &r.my, Column::MySlotSum);
+
+            // Phase I-blake2b-6 V_next sum helpers.  At row r with
+            // j_active = row_idx % 8, the sum collapses to v_after[k][i]
+            // where v_after equals r.v with G_INDICES[j_active] slots
+            // replaced by the G-call outputs.
+            let g_idx_active = row_idx % 8;
+            let [ai_v, bi_v, ci_v, di_v] = G_INDICES[g_idx_active];
+            let mut v_after_bytes = r.v;
+            v_after_bytes[ai_v] = r.a_out;
+            v_after_bytes[bi_v] = r.b_out;
+            v_after_bytes[ci_v] = r.c_out;
+            v_after_bytes[di_v] = r.d_out;
+            const V_NEXT_SUM_COLS: [Column; 16] = [
+                Column::VNextSum0, Column::VNextSum1, Column::VNextSum2, Column::VNextSum3,
+                Column::VNextSum4, Column::VNextSum5, Column::VNextSum6, Column::VNextSum7,
+                Column::VNextSum8, Column::VNextSum9, Column::VNextSum10, Column::VNextSum11,
+                Column::VNextSum12, Column::VNextSum13, Column::VNextSum14, Column::VNextSum15,
+            ];
+            for k in 0..16 {
+                trace.fill_columns_bytes(row_idx, &v_after_bytes[k], V_NEXT_SUM_COLS[k]);
+            }
 
             // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
             // the helper values reduce to the preprocessed selector value:
