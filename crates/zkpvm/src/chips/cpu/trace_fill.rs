@@ -1377,6 +1377,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 trace.fill_columns(row, is_compare_b && eq_b || is_branch_b && eq_b,
                                    Column::IsCmpOrBranchEqH);
                 trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
+
+                // ── Wave-6: control-flow + memory boolean helpers ──
+                // All three helpers evaluate to 0 in valid traces (boolean
+                // identities and prefix-1 monotonicity).
+                trace.fill_columns(row, false, Column::BranchTakenBoolH);
+                let zeros8 = [0u8; 8];
+                trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveBoolH);
+                trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveMonoH);
             }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.

@@ -905,6 +905,15 @@ pub enum Column {
     /// `IsBranch · BranchTaken` — feeds the is_sequential expression and
     /// keeps it deg 1.  IsBranch = sum of 10 br_* sub-flag column refs (deg 1).
     #[size = 1] IsBranchTakenH,
+
+    // Wave 6: Control flow next_pc + memory boolean/monotonicity.
+    /// `BranchTaken · (1 - BranchTaken)` boolean witness.
+    #[size = 1] BranchTakenBoolH,
+    /// `MemByteActive[i] · (1 - MemByteActive[i])` per byte.
+    #[size = 8] MemByteActiveBoolH,
+    /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
+    /// (index 7 unused, default fill = 0).
+    #[size = 8] MemByteActiveMonoH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

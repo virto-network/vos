@@ -1116,6 +1116,39 @@ impl BuiltInComponent for CpuChip {
                 is_branch_taken_h[0].clone() - is_branch_e() * branch_taken_top[0].clone()
             );
         }
+
+        // ── Phase I-cpu Wave-6 helpers (control flow + memory boolean) ──
+        let branch_taken_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::BranchTakenBoolH);
+        let mem_byte_active_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::MemByteActiveBoolH);
+        let mem_byte_active_mono_h =
+            crate::trace::trace_eval!(trace_eval, Column::MemByteActiveMonoH);
+        {
+            let branch_taken_w6 =
+                crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
+            let mem_byte_active_w6 =
+                crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+            eval.add_constraint(
+                branch_taken_bool_h[0].clone()
+                    - branch_taken_w6[0].clone()
+                        * (E::F::one() - branch_taken_w6[0].clone())
+            );
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    mem_byte_active_bool_h[i].clone()
+                        - mem_byte_active_w6[i].clone()
+                            * (E::F::one() - mem_byte_active_w6[i].clone())
+                );
+            }
+            for i in 0..WORD_SIZE - 1 {
+                eval.add_constraint(
+                    mem_byte_active_mono_h[i].clone()
+                        - mem_byte_active_w6[i + 1].clone()
+                            * (E::F::one() - mem_byte_active_w6[i].clone())
+                );
+            }
+        }
         // Main TZ constraint flattened to a sum of deg-2 terms.
         // Original: is_tzb · (result[0] - tz_expr) = 0 with tz_expr deg 3.
         // Flatten: is_tzb·result - is_tzb·TzLo4H
@@ -1170,21 +1203,18 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
-        // For conditional branches:
+        // For conditional branches (Phase I-cpu Wave-6 flattened):
         //   branch_taken=1 → next_pc = branch_target
-        //   branch_taken=0 → next_pc = pc + 1 + skip_len (sequential)
-        // Constraint: is_branch * branch_taken * (next_pc - branch_target) = 0
+        // Gate via IsBranchTakenH (already defined Wave 5).
         for i in 0..4 {
             eval.add_constraint(
-                is_branch_e() * branch_taken[0].clone()
-                * (next_pc[i].clone() - branch_target[i].clone())
+                is_branch_taken_h[0].clone()
+                    * (next_pc[i].clone() - branch_target[i].clone())
             );
         }
 
-        // branch_taken must be boolean
-        eval.add_constraint(
-            is_branch_e() * branch_taken[0].clone() * (E::F::one() - branch_taken[0].clone())
-        );
+        // branch_taken must be boolean — gate via BranchTakenBoolH.
+        eval.add_constraint(is_branch_e() * branch_taken_bool_h[0].clone());
 
         // ── Branch condition constraints ──
         // Phase 54h: dropped ByteEq[8] + ByteDiffInv[8].  Branch eq/ne
@@ -1368,23 +1398,16 @@ impl BuiltInComponent for CpuChip {
         // flags through ProgramMemoryChip).
         {
             let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
-            // Boolean per byte.  Gate by is_real so padding rows
-            // (MemByteActive = 0) trivially satisfy this without
-            // forcing extra zeros.
+            // Boolean per byte (Phase I-cpu Wave-6 flattened).
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_real.clone()
-                        * mem_byte_active[i].clone()
-                        * (E::F::one() - mem_byte_active[i].clone())
+                    is_real.clone() * mem_byte_active_bool_h[i].clone()
                 );
             }
-            // Monotonicity: active[i+1] = 1 ⇒ active[i] = 1.  Encoded
-            // as `active[i+1] · (1 - active[i]) = 0`.
+            // Monotonicity (Phase I-cpu Wave-6 flattened).
             for i in 0..WORD_SIZE - 1 {
                 eval.add_constraint(
-                    is_real.clone()
-                        * mem_byte_active[i + 1].clone()
-                        * (E::F::one() - mem_byte_active[i].clone())
+                    is_real.clone() * mem_byte_active_mono_h[i].clone()
                 );
             }
             // MemSize equals the count of active bytes.
