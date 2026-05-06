@@ -174,3 +174,50 @@ New finding vs the original Phase-G plan:
   the only supported path.
 
 Phase H complete. Phase I (chip rewrites) is the next step.
+
+---
+
+## Phase I — scope corrected after Blake2bChip audit (2026-05-06)
+
+A constraint-by-constraint degree audit of `Blake2bChip` lives in
+`STWO_PHASE_I_BLAKE2B.md`.  Headline:
+
+- **~236 helper columns** for Blake2bChip alone, vs. the original "~50"
+  estimate.  Discrepancy is the per-loop multiplier the original
+  estimate missed: `add_constraints` has 40 `eval.add_constraint`
+  call sites but they sit inside `for i in 0..8` / `for k in 0..16`
+  loops emitting ~830–1000 individual algebraic constraints.
+- **Realistic effort: 2–3 person-weeks for Blake2bChip** (not "~1 week").
+- **Five-chip total likely 10–14 weeks**, not 6–8.
+- **Column inflation ~85% for Blake2bChip alone** — plausibly cancels
+  or exceeds the v2.x perf cluster's expected 10–30% gain on the
+  Blake2b leg.  Whether the migration is net-positive on prove time
+  is no longer the conservative bet it appeared to be in the original
+  scope.
+
+### Stopping point for this session
+Phase G (pin bump + path renames) and Phase H (block confirmed) are
+landed.  Phase I audit + helper-column design for Blake2bChip is in
+`STWO_PHASE_I_BLAKE2B.md`.  Code changes to chip files are deferred to
+a future session with multi-week scope — starting them now risks
+witness/constraint-mismatch landmines that pass chip tests while
+silently breaking verifier soundness.
+
+### Strategic re-check before continuing
+With the corrected scope, the build-vs-wait calculus shifts.  Two
+paths the user should weigh before sinking the next 2–3 weeks into
+Blake2bChip-1:
+
+1. **Keep building**: chip rewrites in the order from
+   `STWO_PHASE_I_BLAKE2B.md`.  10–14 weeks total; final benchmark
+   could be neutral or negative on prove time.  Wins regardless on
+   "future Stwo upgrades unblocked."
+2. **Stay on `0790eba` and pressure upstream**: file the issue draft
+   (`STWO_UPSTREAM_ISSUE_DRAFT.md`), check upstream every 2–4 weeks.
+   If Stwo lands degree-≥2 in the lifted protocol (no current ETA but
+   not architectural — they ignored Poseidon for the same reason),
+   the migration drops back to "1 week of path renames".  Worst case:
+   we're stuck at 3.85 s a while longer, which is already a real
+   shipped milestone.
+
+This is a strategic call for the user, not a technical one.
