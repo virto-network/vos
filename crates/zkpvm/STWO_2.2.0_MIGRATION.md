@@ -229,7 +229,7 @@ This is a strategic call for the user, not a technical one.
 | `Blake2bChip` | ✅ flattened (commits f841e8b…e7e812a, 6 subphases) | +236 cells/row | OODS passes; harness gate hits stwo MerkleProverLifted upstream bug |
 | `MulChip`     | ✅ flattened (commit a166221, single commit) | +46 cells/row  | Schoolbook 64/32-bit + sign-correction + result-variant dispatch |
 | `DivRemChip`  | ✅ flattened (commit d0cef2f, single commit) | +44 cells/row  | Selector chain (12) + partial sums (24) + sign-correction body (16) |
-| `CpuChip`     | ⏳ partial (Waves 1-3 of ~7-8) | +50 cells/row so far | Waves done: Add/Sub/Mul-sign-ext (a5634b0), Compare/DivRem-binding (a5634b0), ValDIsZero/DBZ (fb3a2d0).  Pending: BitManip PartialNZMsb recurrences, TZ/LZ result binding (intricate polynomial bodies), Branch conditions, Control flow / next_pc, Load/Store/Memory binding, Phase 9 register binding.  ~70% remains. |
+| `CpuChip`     | ✅ structurally flat (Waves 1-7 done) | +115 cells/row | Commits: a5634b0 (W1+W2 Add/Sub/Mul-sign-ext + Compare/DivRem-binding), fb3a2d0 (W3 ValDIsZero/DBZ), 9dfd3e8 (W4a BitManip MSB / SignExtBit), 9dfd3e8 (W4b TZ/LZ result-binding), 2b328cf (W5 Branch conditions), 6bc75ab (W6 Control flow + memory boolean), 74e3184 (W7 Phase 9 register-memory binding). All identified `X · Y · Z` triple-product and 4-factor patterns in `add_constraints` flattened. prove_add64 still ConstraintsNotSatisfied — RistrettoChip remains at bound 3. |
 | `RistrettoChip` | ⏳ pending | (audit: thousands or lookup-rewrite) | 256-bit field schoolbook, 35 constraints at bound 3. ~3+ weeks per audit; lookup-rewrite path may be cheaper than schoolbook helpers. |
 
 After CpuChip + Ristretto land, `prove_add64` is the production-path
