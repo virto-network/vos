@@ -271,3 +271,55 @@ through the rewrite.
 
 Detailed analysis in `STWO_PHASE_I_BLAKE2B.md` "Critical:
 validation gate is global, not per-chip" section.
+
+## Phase I complete + Phase J results — 2026-05-06
+
+All 5 high-bound chips flattened to bound 1 (Blake2b, Mul, DivRem,
+Cpu, Ristretto).  CpuChip's residual `ConstraintsNotSatisfied` was
+resolved by pinpointing constraint #29 (`GateDivH = (DivRemOp - 2)·
+(DivRemOp - 3)`) via Stwo's `AssertEvaluator` + `ExprEvaluator`
+running over the chip-isolated harness.  Padding-row fill was
+emitting 0 where the unconditional constraint required 6.
+
+Validation:
+- `harness_cpuchip_isolated_add64`: GREEN.
+- `harness_blake2b_isolated`: GREEN (open-chain rejection).
+- `harness_smoke_bound1_only`: GREEN.
+- `prove_add64` (production path): GREEN.
+- `phase2_alu` test suite: 93/93 GREEN.
+
+Phase J — full Phase-2 bench (clerk-private-pay-bench, 96-bit
+security, single trial on Intel Core Ultra 7 155H):
+
+| Metric              | Old pin (0790eba) | New pin (e1286720) | Delta |
+|---                  |---                |---                 |---    |
+| Prove time          | ~3.85 s           | **1.33 s**         | -65%  |
+| Proof size          | (n/a)             | 932 KB             | —     |
+| Verify time         | (n/a)             | 42 ms              | —     |
+
+`hash-bench` (635 PVM steps mixed opcodes): 89 ms prove, 194 KB
+proof, 3.6 ms verify.  No PGO/native-CPU optimisations enabled —
+pure release build with default codegen.
+
+Phase J SUCCESS: migration is a clear net-positive on prove time
+(2.9× speedup on clerk-private-pay-bench).  The bound-1 helper
+columns add some witness work but the v2.x lifted protocol's
+proving improvements more than compensate.
+
+Debug infrastructure preserved (debug-internals feature):
+- `MachineProverComponent::debug_assert_constraints` — drives
+  Stwo's `AssertEvaluator` row-by-row to pinpoint failing
+  constraint by row + constraint #.
+- `CPU_EXPR_DUMP=1` env var — dumps every constraint's symbolic
+  form via `ExprEvaluator` plus a column-offset → variant-name
+  table (used to localise constraint #29 in this session).
+- `debug_assert_constraints_explicit(side_note, components)` in
+  prove.rs — orchestrates per-component dump.
+- `CPU_DUMP=1` env var — dumps row-0/row-1 helper-column values to
+  stderr.
+
+Outstanding: file the two upstream issue drafts
+(`STWO_UPSTREAM_ISSUE_DRAFT.md` for the lifted-protocol degree-≥2
+gap, `STWO_MERKLE_LIFTED_OOB_ISSUE_DRAFT.md` for the
+`MerkleProverLifted::decommit` OOB at bound 2) — non-blocking,
+since the bound-1 flatten is a permanent fix on our side.
