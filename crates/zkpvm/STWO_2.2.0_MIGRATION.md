@@ -222,6 +222,23 @@ Blake2bChip-1:
 
 This is a strategic call for the user, not a technical one.
 
+### Phase I progress tracker (session of 2026-05-06)
+
+| Chip | Status | Helpers added | Notes |
+|---|---|---:|---|
+| `Blake2bChip` | ✅ flattened (commits f841e8b…e7e812a, 6 subphases) | +236 cells/row | OODS passes; harness gate hits stwo MerkleProverLifted upstream bug |
+| `MulChip`     | ✅ flattened (commit a166221, single commit) | +46 cells/row  | Schoolbook 64/32-bit + sign-correction + result-variant dispatch |
+| `DivRemChip`  | ✅ flattened (commit d0cef2f, single commit) | +44 cells/row  | Selector chain (12) + partial sums (24) + sign-correction body (16) |
+| `CpuChip`     | ⏳ pending | (audit: ~150-300) | 2650-line chip, 117 add_constraint sites, dozens of flag combos. Mechanically the same flatten pattern (multi-flag selector helpers) as DivRem/Mul, just at scale. ~2 weeks per audit. |
+| `RistrettoChip` | ⏳ pending | (audit: thousands or lookup-rewrite) | 256-bit field schoolbook, 35 constraints at bound 3. ~3+ weeks per audit; lookup-rewrite path may be cheaper than schoolbook helpers. |
+
+After CpuChip + Ristretto land, `prove_add64` is the production-path
+end-to-end validation gate.  If it also trips the
+`MerkleProverLifted::decommit` OOB seen in `harness_blake2b_isolated`,
+file a stwo issue with the reproducer.  If it passes, the migration
+deliverable is complete and Phase J (full Phase-2 bench) becomes
+runnable.
+
 ### Phase I.0 — global validation gate (added on second pass)
 
 Re-examining the upstream constraint check: it's at the **AIR
