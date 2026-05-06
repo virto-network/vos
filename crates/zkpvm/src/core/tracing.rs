@@ -6,7 +6,11 @@ use javm::PVM_REGISTER_COUNT;
 
 use crate::core::step::{MemAccess, PvmStep};
 
-pub use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT};
+pub use crate::core::ecall::{
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT, ECALL_RISTRETTO_POINT_ADD,
+    ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
+    ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L,
+};
 
 /// A recorded blake2b call for the precompile chip.
 #[derive(Clone, Debug)]
@@ -36,6 +40,70 @@ pub struct Blake2bMemOp {
     pub m_bytes: [u8; 128],
     /// 64 bytes of blake2b output written at (h_ptr + i, ts).
     pub out_bytes: [u8; 64],
+}
+
+/// A recorded scalar mul/add mod ℓ call for chip integration.
+/// Both ECALL types share the same shape: 32B + 32B → 32B.
+#[derive(Clone, Debug)]
+pub struct ScalarBinopRecord {
+    pub op_id: u32,           // ECALL_SCALAR_MUL_MOD_L or _ADD_MOD_L
+    pub a: [u8; 32],
+    pub b: [u8; 32],
+    pub output: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct ScalarBinopMemOp {
+    pub a_ptr: u32,
+    pub b_ptr: u32,
+    pub output_ptr: u32,
+    pub ts: u64,
+    pub a_bytes: [u8; 32],
+    pub b_bytes: [u8; 32],
+    pub out_bytes: [u8; 32],
+}
+
+/// A recorded wide-scalar reduction call for chip integration.
+#[derive(Clone, Debug)]
+pub struct ScalarReduceWideRecord {
+    pub wide: [u8; 64],
+    pub output: [u8; 32],
+}
+
+/// Per-byte memory operations for a single
+/// scalar_from_bytes_mod_order_wide ECALL: 64 reads + 32 writes.
+#[derive(Clone, Debug)]
+pub struct ScalarReduceWideMemOp {
+    pub wide_ptr: u32,
+    pub output_ptr: u32,
+    pub ts: u64,
+    pub wide_bytes: [u8; 64],
+    pub out_bytes: [u8; 32],
+}
+
+/// A recorded Ristretto255 point-add call for the (in-progress) chip
+/// integration.  Captures both compressed inputs + the compressed
+/// output — the bytes the chip's boundary lookup will commit to.
+#[derive(Clone, Debug)]
+pub struct RistrettoPointAddRecord {
+    pub p: [u8; 32],
+    pub q: [u8; 32],
+    pub output: [u8; 32],
+}
+
+/// Per-byte memory operations for a single ristretto_point_add ECALL.
+/// 32 P-bytes + 32 Q-bytes read at the call's timestamp + 32 output
+/// bytes written.  Insertion order in the MemoryChip ledger keeps
+/// reads before writes at tie-break.
+#[derive(Clone, Debug)]
+pub struct RistrettoPointAddMemOp {
+    pub p_ptr: u32,
+    pub q_ptr: u32,
+    pub output_ptr: u32,
+    pub ts: u64,
+    pub p_bytes: [u8; 32],
+    pub q_bytes: [u8; 32],
+    pub out_bytes: [u8; 32],
 }
 
 /// A recorded Ristretto255 scalar-mult call for the precompile chip.
@@ -78,6 +146,12 @@ pub struct TracingPvm {
     pub blake2b_mem_ops: Vec<Blake2bMemOp>,
     pub ristretto_records: Vec<RistrettoRecord>,
     pub ristretto_mem_ops: Vec<RistrettoMemOp>,
+    pub ristretto_add_records: Vec<RistrettoPointAddRecord>,
+    pub ristretto_add_mem_ops: Vec<RistrettoPointAddMemOp>,
+    pub scalar_reduce_wide_records: Vec<ScalarReduceWideRecord>,
+    pub scalar_reduce_wide_mem_ops: Vec<ScalarReduceWideMemOp>,
+    pub scalar_binop_records: Vec<ScalarBinopRecord>,
+    pub scalar_binop_mem_ops: Vec<ScalarBinopMemOp>,
     timestamp: u64,
 }
 
@@ -90,6 +164,12 @@ impl TracingPvm {
             blake2b_mem_ops: Vec::new(),
             ristretto_records: Vec::new(),
             ristretto_mem_ops: Vec::new(),
+            ristretto_add_records: Vec::new(),
+            ristretto_add_mem_ops: Vec::new(),
+            scalar_reduce_wide_records: Vec::new(),
+            scalar_reduce_wide_mem_ops: Vec::new(),
+            scalar_binop_records: Vec::new(),
+            scalar_binop_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
     }
@@ -194,6 +274,18 @@ impl TracingPvm {
                     ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
                         self.handle_ristretto_scalar_mult_ecall();
                     }
+                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
+                        self.handle_ristretto_point_add_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+                        self.handle_scalar_reduce_wide_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
+                        self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
+                        self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                    }
                     other => return other,
                 }
             }
@@ -213,6 +305,21 @@ impl TracingPvm {
                 match exit {
                     ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
                         self.handle_blake2b_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
+                        self.handle_ristretto_scalar_mult_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
+                        self.handle_ristretto_point_add_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+                        self.handle_scalar_reduce_wide_ecall();
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
+                        self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
+                        self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
                     }
                     ExitReason::HostCall(id) => match id {
                         // imm=0 is the IPC/REPLY slot — `halt_with_output`
@@ -339,6 +446,114 @@ impl TracingPvm {
         });
     }
 
+    /// Step 18: scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
+    fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
+        let a_ptr_u = self.pvm.registers[10] as usize;
+        let b_ptr_u = self.pvm.registers[11] as usize;
+        let output_ptr_u = self.pvm.registers[12] as usize;
+        let a_ptr = self.pvm.registers[10] as u32;
+        let b_ptr = self.pvm.registers[11] as u32;
+        let output_ptr = self.pvm.registers[12] as u32;
+
+        let mut a_bytes = [0u8; 32];
+        let mut b_bytes = [0u8; 32];
+        let mem_len = self.pvm.flat_mem.len();
+        let buffers_in_bounds = a_ptr_u.saturating_add(32) <= mem_len
+            && b_ptr_u.saturating_add(32) <= mem_len
+            && output_ptr_u.saturating_add(32) <= mem_len;
+        if buffers_in_bounds {
+            a_bytes.copy_from_slice(&self.pvm.flat_mem[a_ptr_u..a_ptr_u + 32]);
+            b_bytes.copy_from_slice(&self.pvm.flat_mem[b_ptr_u..b_ptr_u + 32]);
+        }
+
+        let out_bytes = scalar_binop_sw(op_id, &a_bytes, &b_bytes);
+
+        if buffers_in_bounds {
+            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+        }
+
+        let ts = self.timestamp - 1;
+        self.scalar_binop_records.push(ScalarBinopRecord {
+            op_id, a: a_bytes, b: b_bytes, output: out_bytes,
+        });
+        self.scalar_binop_mem_ops.push(ScalarBinopMemOp {
+            a_ptr, b_ptr, output_ptr, ts,
+            a_bytes, b_bytes, out_bytes,
+        });
+    }
+
+    /// Read 64 wide-bytes from flat_mem, reduce via dalek's
+    /// `from_bytes_mod_order_wide`, write 32 canonical scalar bytes
+    /// back, capture the call.  Out-of-bounds buffers ⇒ all-zero
+    /// output (canonical zero scalar).
+    fn handle_scalar_reduce_wide_ecall(&mut self) {
+        let wide_ptr_u = self.pvm.registers[10] as usize;
+        let output_ptr_u = self.pvm.registers[11] as usize;
+        let wide_ptr = self.pvm.registers[10] as u32;
+        let output_ptr = self.pvm.registers[11] as u32;
+
+        let mut wide_bytes = [0u8; 64];
+        let mem_len = self.pvm.flat_mem.len();
+        let buffers_in_bounds = wide_ptr_u.saturating_add(64) <= mem_len
+            && output_ptr_u.saturating_add(32) <= mem_len;
+        if buffers_in_bounds {
+            wide_bytes.copy_from_slice(&self.pvm.flat_mem[wide_ptr_u..wide_ptr_u + 64]);
+        }
+
+        let out_bytes = scalar_reduce_wide_sw(&wide_bytes);
+
+        if buffers_in_bounds {
+            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+        }
+
+        let ts = self.timestamp - 1;
+        self.scalar_reduce_wide_records.push(ScalarReduceWideRecord {
+            wide: wide_bytes, output: out_bytes,
+        });
+        self.scalar_reduce_wide_mem_ops.push(ScalarReduceWideMemOp {
+            wide_ptr, output_ptr, ts, wide_bytes, out_bytes,
+        });
+    }
+
+    /// Read 32 P-bytes + 32 Q-bytes from flat_mem, run host-side
+    /// `dalek` point addition (compress(decompress(P) + decompress(Q))),
+    /// write 32 output bytes back, and capture the call.  Buffers
+    /// out of bounds → canonical compressed identity sentinel.
+    fn handle_ristretto_point_add_ecall(&mut self) {
+        let p_ptr_u = self.pvm.registers[10] as usize;
+        let q_ptr_u = self.pvm.registers[11] as usize;
+        let output_ptr_u = self.pvm.registers[12] as usize;
+        let p_ptr = self.pvm.registers[10] as u32;
+        let q_ptr = self.pvm.registers[11] as u32;
+        let output_ptr = self.pvm.registers[12] as u32;
+
+        let mut p_bytes = [0u8; 32];
+        let mut q_bytes = [0u8; 32];
+        let mem_len = self.pvm.flat_mem.len();
+        let buffers_in_bounds = p_ptr_u.saturating_add(32) <= mem_len
+            && q_ptr_u.saturating_add(32) <= mem_len
+            && output_ptr_u.saturating_add(32) <= mem_len;
+        if buffers_in_bounds {
+            p_bytes.copy_from_slice(&self.pvm.flat_mem[p_ptr_u..p_ptr_u + 32]);
+            q_bytes.copy_from_slice(&self.pvm.flat_mem[q_ptr_u..q_ptr_u + 32]);
+        }
+
+        let out_bytes = ristretto_point_add_sw(&p_bytes, &q_bytes);
+
+        if buffers_in_bounds {
+            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+        }
+
+        let ts = self.timestamp - 1;
+        self.ristretto_add_records.push(RistrettoPointAddRecord {
+            p: p_bytes, q: q_bytes, output: out_bytes,
+        });
+        self.ristretto_add_mem_ops.push(RistrettoPointAddMemOp {
+            p_ptr, q_ptr, output_ptr, ts,
+            p_bytes, q_bytes, out_bytes,
+        });
+    }
+
     /// Consume and return the recorded trace.
     pub fn into_trace(self) -> Vec<PvmStep> {
         self.steps
@@ -424,6 +639,44 @@ fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: 
 // RistrettoChip will be constrained to compute — by going through the
 // same crate cipher-clerk uses, the precompile's input/output
 // agreement with cipher-clerk's own crypto is by construction.
+
+fn scalar_binop_sw(op_id: u32, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::scalar::Scalar;
+    let sa = Scalar::from_canonical_bytes(*a).into_option();
+    let sb = Scalar::from_canonical_bytes(*b).into_option();
+    match (sa, sb) {
+        (Some(x), Some(y)) => match op_id {
+            ECALL_SCALAR_MUL_MOD_L => (x * y).to_bytes(),
+            ECALL_SCALAR_ADD_MOD_L => (x + y).to_bytes(),
+            _ => [0u8; 32],
+        },
+        _ => [0u8; 32],
+    }
+}
+
+fn scalar_reduce_wide_sw(wide_bytes: &[u8; 64]) -> [u8; 32] {
+    use curve25519_dalek::scalar::Scalar;
+    Scalar::from_bytes_mod_order_wide(wide_bytes).to_bytes()
+}
+
+fn ristretto_point_add_sw(p_bytes: &[u8; 32], q_bytes: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    let p = match CompressedRistretto::from_slice(p_bytes)
+        .ok()
+        .and_then(|c| c.decompress())
+    {
+        Some(p) => p,
+        None => return [0u8; 32],
+    };
+    let q = match CompressedRistretto::from_slice(q_bytes)
+        .ok()
+        .and_then(|c| c.decompress())
+    {
+        Some(q) => q,
+        None => return [0u8; 32],
+    };
+    (p + q).compress().to_bytes()
+}
 
 fn ristretto_scalar_mult_sw(scalar_bytes: &[u8; 32], point_bytes: &[u8; 32]) -> [u8; 32] {
     use curve25519_dalek::ristretto::CompressedRistretto;

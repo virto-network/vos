@@ -115,6 +115,18 @@ pub struct FieldOpRow {
     pub b_source_row: u16,
     /// 0 iff this is a padding / unused row.
     pub is_real: u8,
+    /// Step 4: number of distinct downstream consumer rows that
+    /// reference THIS row's `out` via their `a_source_row` /
+    /// `b_source_row`.  The chip scales the producer lookup
+    /// emission by this count, so a single op row's output can be
+    /// consumed N times without inserting passthrough rows.
+    /// Defaults to 1 on real producer rows (input + add/sub/mul);
+    /// 0 on output and padding rows (chip enforces both).  Witness
+    /// builders that compose multi-consumer chains MUST set this
+    /// correctly per row, else the chip's lookup won't balance.
+    /// Stored as u16 — full 256-bit scalar-mult ladders push some
+    /// producers (zero, basepoint coords) past 256.
+    pub producer_multiplicity: u16,
 }
 
 impl Default for FieldOpRow {
@@ -152,6 +164,7 @@ impl Default for FieldOpRow {
             is_real: 0,
             a_source_row: 0,
             b_source_row: 0,
+            producer_multiplicity: 0,
         }
     }
 }
@@ -252,6 +265,9 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         is_real: 1,
         a_source_row: 0, // caller sets via post-fill mutation if chaining
         b_source_row: 0,
+        // Set by `SideNote::finalize_ristretto_multiplicities()` from
+        // observed consumer counts; default 0 here.
+        producer_multiplicity: 0,
     }
 }
 
@@ -341,6 +357,7 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         is_real: 1,
         a_source_row: 0,
         b_source_row: 0,
+        producer_multiplicity: 1,
     }
 }
 
@@ -545,6 +562,7 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         is_real: 1,
         a_source_row: 0,
         b_source_row: 0,
+        producer_multiplicity: 1,
     }
 }
 
@@ -573,6 +591,7 @@ pub fn fill_input(value: Bytes) -> FieldOpRow {
     row.final_form_borrow = final_form_borrow;
     row.is_input = 1;
     row.is_real = 1;
+    // Multiplicity set by `SideNote::finalize_ristretto_multiplicities`.
     row
 }
 

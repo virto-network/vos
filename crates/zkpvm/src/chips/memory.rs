@@ -184,6 +184,94 @@ impl BuiltInProverComponent for MemoryChip {
             }
         }
 
+        // Step 13: Ristretto255 scalar-mult precompile memory ops.
+        // 32 reads each (scalar + point) + 32 writes (output), all
+        // at the ECALL ts.  Producer side comes from
+        // RistrettoEcallChip.
+        for op in &side_note.ristretto_mem_ops {
+            for (i, &b) in op.scalar_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.scalar_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.point_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.point_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.out_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.output_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: true,
+                });
+            }
+        }
+
+        // Step 13: Ristretto255 point-add precompile memory ops:
+        // 32 reads each (P + Q) + 32 writes (output), all at ECALL ts.
+        for op in &side_note.ristretto_add_mem_ops {
+            for (i, &b) in op.p_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.p_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.q_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.q_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.out_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.output_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: true,
+                });
+            }
+        }
+
+        // Step 18: scalar mul/add mod ℓ precompile memory ops:
+        // 32 reads (a) + 32 reads (b) + 32 writes (output) per call.
+        for op in &side_note.scalar_binop_mem_ops {
+            for (i, &b) in op.a_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.a_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.b_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.b_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.out_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.output_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: true,
+                });
+            }
+        }
+
+        // Step 13: scalar_from_bytes_mod_order_wide precompile memory
+        // ops: 64 reads (wide input) + 32 writes (canonical output).
+        for op in &side_note.scalar_reduce_wide_mem_ops {
+            for (i, &b) in op.wide_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.wide_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: false,
+                });
+            }
+            for (i, &b) in op.out_bytes.iter().enumerate() {
+                entries.push(MemEntry {
+                    address: op.output_ptr + i as u32,
+                    value: b, timestamp: op.ts, is_write: true,
+                });
+            }
+        }
+
         // Inject initial memory writes at timestamp 0 for byte addresses read without prior write.
         if !side_note.initial_memory.is_empty() {
             let mut first_access: BTreeMap<u32, bool> = BTreeMap::new();

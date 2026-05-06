@@ -20,3 +20,6 @@ default = []
 # the multiplication with an ECALL but keeps the type signatures.
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
 
+[dev-dependencies]
+blake2 = "0.10"
+

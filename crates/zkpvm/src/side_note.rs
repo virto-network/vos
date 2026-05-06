@@ -38,6 +38,28 @@ pub struct SideNote {
     /// writes for output).  MemoryChip ingests these into the ledger so the
     /// Blake2bChip memory-consumer lookups balance.
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
+    /// R1f: Ristretto255 scalar-mult ECALL records (scalar / input
+    /// point / output point as 32 LE bytes each).  Populated by the
+    /// trace driver after `TracingPvm::run_with_precompiles`; consumed
+    /// by `ingest_ristretto_boundary` to emit RistrettoChip boundary
+    /// rows.  Empty unless the program issued at least one
+    /// ECALL_RISTRETTO_SCALAR_MULT.
+    pub ristretto_calls: Vec<crate::core::tracing::RistrettoRecord>,
+    /// R1f: per-byte memory operations for each Ristretto ECALL (32
+    /// scalar reads + 32 point reads + 32 output writes).  MemoryChip
+    /// will eventually ingest these into the ledger so the
+    /// RistrettoChip memory-consumer lookups balance — currently
+    /// captured but not yet wired into the ledger.
+    pub ristretto_mem_ops: Vec<crate::core::tracing::RistrettoMemOp>,
+    /// Step 9: Ristretto255 point-add ECALL records.
+    pub ristretto_add_calls: Vec<crate::core::tracing::RistrettoPointAddRecord>,
+    pub ristretto_add_mem_ops: Vec<crate::core::tracing::RistrettoPointAddMemOp>,
+    /// Step 12: scalar_from_bytes_mod_order_wide ECALL records.
+    pub scalar_reduce_wide_calls: Vec<crate::core::tracing::ScalarReduceWideRecord>,
+    pub scalar_reduce_wide_mem_ops: Vec<crate::core::tracing::ScalarReduceWideMemOp>,
+    /// Step 18: scalar mul/add mod ℓ ECALL records.
+    pub scalar_binop_calls: Vec<crate::core::tracing::ScalarBinopRecord>,
+    pub scalar_binop_mem_ops: Vec<crate::core::tracing::ScalarBinopMemOp>,
     /// Initial register state at the start of the traced execution.  Seeds
     /// the RegisterMemoryBoundaryChip producers at ts=0 and surfaces in the
     /// public SegmentState boundary.  Default all-zero; callers that care
@@ -221,6 +243,14 @@ impl SideNote {
             byte_to_bits_counts: vec![0u32; 256],
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            ristretto_calls: Vec::new(),
+            ristretto_mem_ops: Vec::new(),
+            ristretto_add_calls: Vec::new(),
+            ristretto_add_mem_ops: Vec::new(),
+            scalar_reduce_wide_calls: Vec::new(),
+            scalar_reduce_wide_mem_ops: Vec::new(),
+            scalar_binop_calls: Vec::new(),
+            scalar_binop_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
             program_memory_counts: HashMap::new(),
             jump_table: Vec::new(),
@@ -302,6 +332,103 @@ impl SideNote {
             }
         }
         self.ristretto_field_rows.push(row);
+    }
+
+    /// Step 4: walk the chip's row stream and set every producer
+    /// row's `producer_multiplicity` to the count of downstream
+    /// consumer rows that reference it via `a_source_row` /
+    /// `b_source_row`.  Op rows (add/sub/mul) and OUTPUT rows
+    /// consume `a`; op rows additionally consume `b`.  Run this AFTER
+    /// composing all chip rows and BEFORE prove (the prove path
+    /// reads `producer_multiplicity` into a trace column that
+    /// scales the register-file lookup emission).
+    ///
+    /// O(n) over `ristretto_field_rows.len()`.  Idempotent.
+    #[cfg(feature = "prover")]
+    pub fn finalize_ristretto_multiplicities(&mut self) {
+        for r in self.ristretto_field_rows.iter_mut() {
+            r.producer_multiplicity = 0;
+        }
+        let n = self.ristretto_field_rows.len();
+        for i in 0..n {
+            let row = self.ristretto_field_rows[i];
+            if row.is_real == 0 || row.is_input != 0 {
+                // INPUT rows have no a/b source — skip consumer accounting
+                // for them.  Padding (is_real=0) likewise.
+                if row.is_input != 0 { /* still real, but no consumer fields */ }
+            }
+            if row.is_real == 0 { continue; }
+            // OUTPUT and op rows consume `a`.
+            if row.is_input == 0 {
+                let a_src = row.a_source_row as usize;
+                if a_src < n {
+                    let cur = self.ristretto_field_rows[a_src].producer_multiplicity;
+                    self.ristretto_field_rows[a_src].producer_multiplicity =
+                        cur.checked_add(1).expect("producer_multiplicity overflowed u16");
+                }
+            }
+            // Op rows additionally consume `b` (NOT input nor output).
+            if row.is_input == 0 && row.is_output == 0 {
+                let b_src = row.b_source_row as usize;
+                if b_src < n {
+                    let cur = self.ristretto_field_rows[b_src].producer_multiplicity;
+                    self.ristretto_field_rows[b_src].producer_multiplicity =
+                        cur.checked_add(1).expect("producer_multiplicity overflowed u16");
+                }
+            }
+        }
+    }
+
+    /// R1f boundary capture: convert each captured Ristretto255 ECALL
+    /// record into a balanced 6-row block on the chip:
+    ///
+    ///   row k+0: INPUT producer  out = scalar bytes
+    ///   row k+1: INPUT producer  out = point bytes
+    ///   row k+2: INPUT producer  out = output bytes
+    ///   row k+3: OUTPUT consumer a = scalar bytes (source = k+0)
+    ///   row k+4: OUTPUT consumer a = point bytes  (source = k+1)
+    ///   row k+5: OUTPUT consumer a = output bytes (source = k+2)
+    ///
+    /// The lookup balances by construction: every producer is drained
+    /// by exactly one consumer.  The chip activates iff at least one
+    /// ECALL was captured.
+    ///
+    /// Caller MUST populate `ristretto_calls` from
+    /// `TracingPvm::ristretto_records()` (and `ristretto_mem_ops` for
+    /// the eventual MemoryChip integration) BEFORE invoking this
+    /// method, and MUST invoke it before any chip's trace fill so the
+    /// Range256 multiplicities accumulate correctly.
+    ///
+    /// **Step-3 limitation**: this is the BYTE-BOUNDARY closure only.
+    /// It does not yet bind the chip output bytes to the actual
+    /// scalar-mult result — that work threads through Step 4 (the
+    /// scalar-mult chain on extended Edwards coords + curve-equation
+    /// witness for compress / decompress).  Until then, the chip
+    /// simply attests "these 96 bytes per call were observed" without
+    /// constraining their relationship.
+    ///
+    /// **Canonicality precondition**: each of scalar / point / output
+    /// must satisfy `< p` byte-wise (debug_assert in `fill_input`).
+    /// Most natural Ristretto encodings sit comfortably under p, but
+    /// arbitrary scalars (mod ℓ) can exceed p; a `fill_input_unchecked`
+    /// variant for the dedicated boundary path lands together with
+    /// Step 4.
+    #[cfg(feature = "prover")]
+    pub fn ingest_ristretto_boundary(&mut self) {
+        use crate::chips::ristretto::witness::{fill_input, fill_output};
+        let calls = std::mem::take(&mut self.ristretto_calls);
+        for rec in &calls {
+            let scalar_row = self.ristretto_field_rows.len() as u16;
+            self.add_ristretto_field_row(fill_input(rec.scalar));
+            let point_row = self.ristretto_field_rows.len() as u16;
+            self.add_ristretto_field_row(fill_input(rec.point));
+            let output_row = self.ristretto_field_rows.len() as u16;
+            self.add_ristretto_field_row(fill_input(rec.output));
+            self.add_ristretto_field_row(fill_output(rec.scalar, scalar_row));
+            self.add_ristretto_field_row(fill_output(rec.point,  point_row));
+            self.add_ristretto_field_row(fill_output(rec.output, output_row));
+        }
+        self.ristretto_calls = calls;
     }
 
     pub fn add_bitwise_and(&mut self, a: u8, b: u8) {

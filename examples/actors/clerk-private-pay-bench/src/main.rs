@@ -89,45 +89,25 @@ impl ClerkPrivatePayBench {
 
         let value: u64 = 50;
 
-        // Step 1 (zkpvm-precompiles shim) — issue the Ristretto
-        // scalar-mult ECALL so the on-target asm path is exercised
-        // by the binary.  In the gated-off chip prover this returns
-        // [0u8; 32] (the shim host-fallback would return real bytes,
-        // but the actor runs on PVM where the chip handler captures
-        // the call).  Used here purely to pin the asm instantiation;
-        // when R1f's full integration lands, this becomes the real
-        // call site for `Amount::commit`.
-        let mut probe_scalar = [0u8; 32]; probe_scalar[0] = (value as u8) ^ 0x5a;
-        let mut probe_point = [0u8; 32]; probe_point[0] = 0xed;
-        let _probe_out = zkpvm_precompiles::ristretto_scalar_mult(&probe_scalar, &probe_point);
+        // Step 15: Phase-2 real Amount::commit through cipher-clerk's
+        // pvm-precompile feature.  Issues 4 ECALLs (1 scalar_reduce +
+        // 2 scalar_mult + 1 point_add) — all routed through the
+        // RistrettoEcallChip + dalek-validation transmute bypass.
+        let blinding = Blinding::random(&mut rng);
+        let amt = Amount::commit(value, &blinding);
 
-        // Pre-baked Pedersen-commit bytes (would be `Amount::commit(value,
-        // &blinding)` once we have a Ristretto precompile).  Random-looking
-        // 32 bytes from the RNG so they don't compress to identity.
-        let mut amt_bytes = [0u8; 32];
-        rng.fill_bytes(&mut amt_bytes);
-        let amt = Amount(amt_bytes);
-
-        // Note commitment also pre-baked.  The blake2b half (value scalar)
-        // is what we DO want to measure — fold it manually so the trace
-        // shows the same hash work without the scalar mul.
-        let mut rho = [0u8; 32];
-        rng.fill_bytes(&mut rho);
-        {
-            use blake2::digest::{Update, VariableOutput};
-            let mut h = blake2::Blake2bVar::new(64).unwrap();
-            h.update(b"cipher-clerk/notes/commitment");
-            h.update(&Iso4217::USD.as_ledger_id().to_le_bytes());
-            h.update(&value.to_le_bytes());
-            h.update(&recipient_pk.0);
-            h.update(&rho);
-            let mut wide = [0u8; 64];
-            h.finalize_variable(&mut wide).unwrap();
-            // Drop wide — we just wanted the blake2b work in-trace.
-            for b in wide.iter() {
-                core::hint::black_box(*b);
-            }
-        }
+        // Note::commitment back on for bisection.
+        let mut rho_bytes = [0u8; 32];
+        rng.fill_bytes(&mut rho_bytes);
+        let note_blinding = Blinding::random(&mut rng);
+        let note = Note {
+            asset_tag: Iso4217::USD.as_ledger_id(),
+            value,
+            owner: recipient_pk,
+            blinding: note_blinding,
+            rho: rho_bytes,
+        };
+        let _note_commitment = note.commitment().expect("note blinding canonical");
 
         // Construct Transfer + entries manually with deterministic IDs.
         // `Transfer::builder` calls `TransferId::random()` /
@@ -148,26 +128,26 @@ impl ClerkPrivatePayBench {
             alloc::vec::Vec::new(),
         );
 
-        // Placeholder signature: 64 random bytes split r||s.  The real
-        // path runs SecretKey::sign, which is two Ristretto scalar mults
-        // + one blake2b_512 — gated on the Ristretto precompile.
-        let mut r = [0u8; 32];
-        let mut s = [0u8; 32];
-        rng.fill_bytes(&mut r);
-        rng.fill_bytes(&mut s);
+        // Step 19: real Schnorr sign with deduped signing_payload —
+        // compute the rkyv archive once (same bytes as
+        // signed.signing_payload() since signatures are excluded).
+        // Use black_box on the result to prevent dead-code elimination
+        // without a heavy per-byte digest loop.
+        let signing_kp = Keypair::generate_with(&mut rng);
+        let payload = unsigned.signing_payload();
+        let sig = signing_kp.secret.sign(&payload, &mut rng);
         let mut signed = unsigned;
-        signed.signatures = alloc::vec![Signature { r, s }];
+        signed.signatures = alloc::vec![sig];
 
-        let payload = signed.signing_payload();
-
-        let mut digest: u64 = 0;
-        for &b in payload.iter() {
-            digest = digest.wrapping_add(b as u64).rotate_left(7);
-        }
-        for &b in &amt.0 {
-            digest = digest.wrapping_add(b as u64).rotate_left(13);
-        }
-        digest
+        // Dead-code prevention: black_box first 8 bytes of payload +
+        // first byte of sig + first byte of amt.  ~3 ops vs ~3K ops.
+        let mut digest: u64 = u64::from_le_bytes(
+            payload.get(..8).map(|s| s.try_into().unwrap()).unwrap_or([0u8; 8])
+        );
+        digest ^= sig.r[0] as u64;
+        digest ^= amt.0[0] as u64;
+        let _ = signed;
+        core::hint::black_box(digest)
     }
 }
 
@@ -187,11 +167,10 @@ impl DetRng {
     }
 
     fn refill(&mut self) {
-        use blake2::digest::{Update, VariableOutput};
-        let mut h = blake2::Blake2bVar::new(32).unwrap();
-        h.update(&self.seed);
-        h.update(&self.counter.to_le_bytes());
-        h.finalize_variable(&mut self.buf).unwrap();
+        // Route through the blake2b precompile so DetRng's RNG fills
+        // don't fill the trace with thousands of pure-Rust blake2 ops.
+        let counter_bytes = self.counter.to_le_bytes();
+        self.buf = zkpvm_precompiles::blake2b_hash::<32>(&self.seed, &[&counter_bytes]);
         self.counter = self.counter.wrapping_add(1);
         self.buf_pos = 0;
     }

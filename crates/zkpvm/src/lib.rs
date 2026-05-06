@@ -142,6 +142,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CompareChip,  // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
     &chips::DivRemChip,   // Phase 54g — consumer of DivRemLookup
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, gated by activity.ristretto
+    &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, gated by activity.ristretto_ecall
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -164,6 +165,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
+    &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, mirrored in verifier-only build
 ];
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
@@ -203,7 +205,11 @@ pub(crate) fn active_components(side_note: &side_note::SideNote)
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
-    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT};
+    use crate::core::ecall::{
+        ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT,
+        ECALL_RISTRETTO_POINT_ADD, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
+        ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L,
+    };
     use crate::core::opcode::Opcode;
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
@@ -222,6 +228,18 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
             && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64
         {
             a.ristretto = true;
+            a.ristretto_ecall = true;
+        }
+        // Step 13 ECALL gates: point-add and scalar-reduce-wide
+        // activate the RistrettoEcallChip but not RistrettoChip
+        // (those don't fire field-op rows).
+        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
+            && (step.imm == ECALL_RISTRETTO_POINT_ADD as u64
+                || step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
+                || step.imm == ECALL_SCALAR_MUL_MOD_L as u64
+                || step.imm == ECALL_SCALAR_ADD_MOD_L as u64)
+        {
+            a.ristretto_ecall = true;
         }
         let f = classify(step.opcode);
         if f.is_jump_ind || f.is_load_imm_jump_ind { a.jump_table = true; }
@@ -259,6 +277,7 @@ struct ChipActivity {
     compare: bool,
     divrem: bool,
     ristretto: bool,
+    ristretto_ecall: bool,
 }
 
 #[cfg(feature = "prover")]
@@ -274,6 +293,7 @@ impl ChipActivity {
             17 => self.compare,
             18 => self.divrem,
             19 => self.ristretto,
+            20 => self.ristretto_ecall,
             _ => true,
         }
     }

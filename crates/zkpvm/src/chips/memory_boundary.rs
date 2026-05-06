@@ -198,6 +198,25 @@ fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
         for k in 0..128u32 { note(op.m_ptr + k, op.ts, false); }
         for i in 0..64u32 { note(op.h_ptr + i, op.ts, true); }
     }
+    for op in &side_note.ristretto_mem_ops {
+        for i in 0..32u32 { note(op.scalar_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.point_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+    }
+    for op in &side_note.ristretto_add_mem_ops {
+        for i in 0..32u32 { note(op.p_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.q_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+    }
+    for op in &side_note.scalar_reduce_wide_mem_ops {
+        for i in 0..64u32 { note(op.wide_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+    }
+    for op in &side_note.scalar_binop_mem_ops {
+        for i in 0..32u32 { note(op.a_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.b_ptr + i, op.ts, false); }
+        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+    }
     // Convert to (addr, is_write) of the first event.
     let first_is_write: HashMap<u32, bool> = first_ts_is_write
         .into_iter()

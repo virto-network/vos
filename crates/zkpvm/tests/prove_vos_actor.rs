@@ -249,11 +249,27 @@ fn profile_actor(name: &str, gas: u64) {
     // their on_start handler under the bare interpreter.  Pure-compute
     // actors with no hostcalls behave the same as `run()`.
     let exit = tracing.run_with_vos_stubs();
+    // Step 9-18 ECALL records — capture before consuming `tracing`.
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
+    let ristretto_add_records = tracing.ristretto_add_records.clone();
+    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
+    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
+    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
+    let scalar_binop_records = tracing.scalar_binop_records.clone();
+    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
     let steps = tracing.into_trace();
     let trace_time = t0.elapsed();
 
     eprintln!("=== {name} actor ===");
     eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+    eprintln!(
+        "Precompile ECALLs: blake2b={}, ristretto_scalar_mult={}, ristretto_point_add={}, scalar_reduce_wide={}, scalar_binop={}",
+        blake2b_calls.len(), ristretto_calls.len(), ristretto_add_records.len(),
+        scalar_reduce_records.len(), scalar_binop_records.len(),
+    );
 
     // Opcode stats
     let mut mem_ops = 0u32;
@@ -276,6 +292,23 @@ fn profile_actor(name: &str, gas: u64) {
     )
     .with_memory(flat_mem)
     .with_jump_table(code_blob.jump_table.to_vec());
+
+    // Steps 9-18: install precompile ECALL records on side_note.
+    for c in &blake2b_calls {
+        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
+            h: c.h, m: c.m, t: c.t, f: c.f,
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+    side_note.ristretto_calls = ristretto_calls;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ristretto_add_calls = ristretto_add_records;
+    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
+    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
+    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
+    side_note.scalar_binop_calls = scalar_binop_records;
+    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
+    side_note.ingest_ristretto_boundary();
 
     eprintln!("\nProve (96-bit security):");
     let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
