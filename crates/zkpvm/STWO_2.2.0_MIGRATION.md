@@ -229,7 +229,11 @@ This is a strategic call for the user, not a technical one.
 | `Blake2bChip` | ✅ flattened (commits f841e8b…e7e812a, 6 subphases) | +236 cells/row | OODS passes; harness gate hits stwo MerkleProverLifted upstream bug |
 | `MulChip`     | ✅ flattened (commit a166221, single commit) | +46 cells/row  | Schoolbook 64/32-bit + sign-correction + result-variant dispatch |
 | `DivRemChip`  | ✅ flattened (commit d0cef2f, single commit) | +44 cells/row  | Selector chain (12) + partial sums (24) + sign-correction body (16) |
-| `CpuChip`     | ✅ structurally flat (Waves 1-7 done) | +115 cells/row | Commits: a5634b0 (W1+W2 Add/Sub/Mul-sign-ext + Compare/DivRem-binding), fb3a2d0 (W3 ValDIsZero/DBZ), 9dfd3e8 (W4a BitManip MSB / SignExtBit), 9dfd3e8 (W4b TZ/LZ result-binding), 2b328cf (W5 Branch conditions), 6bc75ab (W6 Control flow + memory boolean), 74e3184 (W7 Phase 9 register-memory binding). All identified `X · Y · Z` triple-product and 4-factor patterns in `add_constraints` flattened. prove_add64 still ConstraintsNotSatisfied — RistrettoChip remains at bound 3. |
+| `CpuChip`     | ✅ structurally flat (Waves 1-7 done) | +115 cells/row | Commits: a5634b0 (W1+W2), fb3a2d0 (W3), 9dfd3e8 (W4a+b), 2b328cf (W5), 6bc75ab (W6), 74e3184 (W7).  All identified `X · Y · Z` and 4-factor patterns flattened. |
+| `RistrettoChip` | ✅ structurally flat | +70 cells/row | Commit 758b8c1.  Selectors RealAdd/Sub/Mul + ProducerGate/ConsumerA/B (lookup multiplicity flatten) + 64-byte MulPartialSum body helper. |
+| Other deg-3 sites | ✅ flat | +~10 cells/row | Commit aaf9958.  Memory/RegMem `is_real · is_read · linear` (Real­ReadH); Compare boolean witnesses (CmpLtFlagBoolH, CmpCarryBoolH).  All chips dropped to LOG_CONSTRAINT_DEGREE_BOUND = 1. |
+| Validation: `harness_blake2b_isolated` | ✅ GREEN (commit 83d9164) | — | First end-to-end gate: chip prove succeeds, verify rejects with expected open-chain logup message.  MerkleProverLifted::decommit OOB does NOT fire at bound=1. |
+| Validation: `prove_add64` (production path) | ⏳ ConstraintsNotSatisfied | — | OODS still fails, suspected witness-fill bug in one of the ~250 CpuChip helpers (or another residual deg-3 pattern not surfaced by grep).  Continuing investigation in next session. |
 | `RistrettoChip` | ⏳ pending | (audit: thousands or lookup-rewrite) | 256-bit field schoolbook, 35 constraints at bound 3. ~3+ weeks per audit; lookup-rewrite path may be cheaper than schoolbook helpers. |
 
 After CpuChip + Ristretto land, `prove_add64` is the production-path
