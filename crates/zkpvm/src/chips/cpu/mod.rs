@@ -53,7 +53,12 @@ pub struct CpuChip;
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1; // max degree 4 (flag * flag * flag * linear)
+    /// Phase I-cpu flatten: dropped from 2 to 1.  All multi-flag selector
+    /// chains and quadratic bodies routed through the helper columns
+    /// declared at the end of `Column` (waves 1-7 across commits
+    /// a5634b0..74e3184).  Stwo v2.x's lifted protocol enforces the
+    /// declared bound; bound = 1 means actual algebraic degree ≤ 2.
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
