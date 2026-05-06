@@ -1595,6 +1595,130 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             side_note.add_bitwise_and(a, b);
         }
 
+        // DIAGNOSTIC scaffolding for next-session bisection.  Set
+        // CPU_DUMP=1 in the env to dump row-0 + row-1 helper values
+        // to stderr; useful for spot-checking that witness fill
+        // matches expected algebraic values.  Confirmed (this session)
+        // that 50+ helpers checked all match — bug is elsewhere.
+        if std::env::var("CPU_DUMP").is_ok() {
+            use crate::air_column::AirColumn;
+            let cols_to_dump: &[(&str, Column)] = &[
+                ("IsReal", Column::IsPadding),  // is_real = 1 - is_padding
+                ("IsAdd", Column::IsAdd),
+                ("Is32Bit", Column::Is32Bit),
+                ("IsTruncated", Column::IsTruncated),
+                ("ValBIsReg", Column::ValBIsReg),
+                ("ValDIsReg", Column::ValDIsReg),
+                ("Phi7Bool", Column::Phi7Bool),
+                ("IsAdd64bitH", Column::IsAdd64bitH),
+                ("Real32bitH", Column::Real32bitH),
+                ("ValBIsRegH", Column::ValBIsRegH),
+                ("ValBIsRegNotTruncH", Column::ValBIsRegNotTruncH),
+                ("ValDIsRegH", Column::ValDIsRegH),
+                ("NonShiftGateH", Column::NonShiftGateH),
+                ("NonShiftGateNotTruncH", Column::NonShiftGateNotTruncH),
+                ("RealNotPhi7BoolH", Column::RealNotPhi7BoolH),
+                ("RealPhi7BoolH", Column::RealPhi7BoolH),
+                ("Phi7TimesInvH", Column::Phi7TimesInvH),
+                ("IsRealTrapH", Column::IsRealTrapH),
+                ("Is64bitPopcountHiH", Column::Is64bitPopcountHiH),
+                ("DivSActivePartialH", Column::DivSActivePartialH),
+                ("IsDivSNotDbzH", Column::IsDivSNotDbzH),
+                ("IsShiftCNotRotrH", Column::IsShiftCNotRotrH),
+                ("ValDByteIndicatorH", Column::ValDByteIndicatorH),
+                ("ValDByteIndMinus1H", Column::ValDByteIndMinus1H),
+                ("PartNZTimesIndH", Column::PartNZTimesIndH),
+                ("ValDPartialNZ", Column::ValDPartialNZ),
+                ("ValDByteInv", Column::ValDByteInv),
+                ("ValD", Column::ValD),
+                ("ValB", Column::ValB),
+                ("CmpLtFlag", Column::CmpLtFlag),
+                ("CmpLtSFlag", Column::CmpLtSFlag),
+                ("EqFlag", Column::EqFlag),
+                ("BranchTaken", Column::BranchTaken),
+                ("ValDIsZero", Column::ValDIsZero),
+                ("DivByZero", Column::DivByZero),
+                ("SignsDiffH", Column::SignsDiffH),
+                ("IsCmpVdzH", Column::IsCmpVdzH),
+                ("CpuDivActiveH", Column::CpuDivActiveH),
+                ("GateDivH", Column::GateDivH),
+                ("GateRemH", Column::GateRemH),
+                ("DivActiveQuotH", Column::DivActiveQuotH),
+                ("DivActiveRemH", Column::DivActiveRemH),
+                ("DivRemOp", Column::DivRemOp),
+                ("IsDivRem", Column::IsDivRem),
+                ("IsDivRemTimesVdzH", Column::IsDivRemTimesVdzH),
+                ("DbzActiveH", Column::DbzActiveH),
+                ("DbzActiveQuotH", Column::DbzActiveQuotH),
+                ("DbzActiveRemH", Column::DbzActiveRemH),
+                ("CmpLtValBH", Column::CmpLtValBH),
+                ("CmpLtValDH", Column::CmpLtValDH),
+                ("IsBranchTakenH", Column::IsBranchTakenH),
+                ("IsCmovIzVdzH", Column::IsCmovIzVdzH),
+                ("IsCmovNzNotVdzH", Column::IsCmovNzNotVdzH),
+                ("BranchTakenBoolH", Column::BranchTakenBoolH),
+                ("EqFlagBoolH", Column::EqFlagBoolH),
+                ("IsCmpOrBranchEqH", Column::IsCmpOrBranchEqH),
+                ("MemByteActive", Column::MemByteActive),
+                ("MemByteActiveBoolH", Column::MemByteActiveBoolH),
+                ("MemByteActiveMonoH", Column::MemByteActiveMonoH),
+                ("MemAddrCarry", Column::MemAddrCarry),
+                ("MemAddrCarryBoolH", Column::MemAddrCarryBoolH),
+                ("IsLoadLocalNotActiveH", Column::IsLoadLocalNotActiveH),
+                ("IsRotRImmAltNotTruncH", Column::IsRotRImmAltNotTruncH),
+                ("IsRotRImmAltTruncH", Column::IsRotRImmAltTruncH),
+                ("Is32ShiftCH", Column::Is32ShiftCH),
+                ("ValDPartialNZMsb", Column::ValDPartialNZMsb),
+                ("ValDPartialNZMsbLo", Column::ValDPartialNZMsbLo),
+                ("PartNZMsbTimesIndH", Column::PartNZMsbTimesIndH),
+                ("PartNZMsbLoTimesIndH", Column::PartNZMsbLoTimesIndH),
+                ("SignExtBitBoolH", Column::SignExtBitBoolH),
+                ("TzLo4H", Column::TzLo4H),
+                ("TzHi4H", Column::TzHi4H),
+                ("Lz64H", Column::Lz64H),
+                ("Lz32H", Column::Lz32H),
+                ("IsTzb64H", Column::IsTzb64H),
+                ("IsTzb32H", Column::IsTzb32H),
+                ("IsLzb64H", Column::IsLzb64H),
+                ("IsLzb32H", Column::IsLzb32H),
+                ("ValRPartialNZ", Column::ValRPartialNZ),
+                ("ValRByteInv", Column::ValRByteInv),
+                ("ValRByteIndicatorH", Column::ValRByteIndicatorH),
+                ("ValRByteIndMinus1H", Column::ValRByteIndMinus1H),
+                ("ValRPartNZTimesIndH", Column::ValRPartNZTimesIndH),
+                ("DivRemainder", Column::DivRemainder),
+                ("IsAdd32bitH", Column::IsAdd32bitH),
+                ("IsSubNotNegaddH", Column::IsSubNotNegaddH),
+                ("IsSubNegaddH", Column::IsSubNegaddH),
+                ("IsSub64NotNegaddH", Column::IsSub64NotNegaddH),
+                ("IsSub64NegaddH", Column::IsSub64NegaddH),
+                ("IsSub32bitH", Column::IsSub32bitH),
+                ("IsMul32bitH", Column::IsMul32bitH),
+                ("IsDivRem32bitH", Column::IsDivRem32bitH),
+            ];
+            for &(name, col) in cols_to_dump {
+                let off = col.offset();
+                let sz = col.size();
+                eprint!("DUMP row 0 {}: ", name);
+                for k in 0..sz {
+                    let v = trace.cols[off + k][0];
+                    eprint!("[{}]={:?} ", k, v);
+                }
+                eprintln!();
+            }
+            // Also dump row 1.
+            for &(name, col) in cols_to_dump {
+                let off = col.offset();
+                let sz = col.size();
+                eprint!("DUMP row 1 {}: ", name);
+                for k in 0..sz {
+                    let v = trace.cols[off + k][1];
+                    eprint!("[{}]={:?} ", k, v);
+                }
+                eprintln!();
+            }
+        }
+
         let last_ts = side_note.steps.last().map(|s| s.timestamp).unwrap_or(0);
         for row in num_steps..num_rows {
             let ts = last_ts + (row - num_steps + 1) as u64;
