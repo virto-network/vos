@@ -90,6 +90,21 @@ pub trait MachineProverComponent: MachineComponent {
         log_size: u32,
         claimed_sum: SecureField,
     ) -> Box<dyn ComponentProver<SimdBackend> + 'a>;
+
+    /// Phase I.0 debug: pinpoint failing constraint by row + constraint #.
+    /// Drives Stwo's `AssertEvaluator` over this chip's main + interaction
+    /// trace.  When prove fails with `ConstraintsNotSatisfied` and the
+    /// `CPU_DUMP` diagnostic isn't enough to localise the bug, this helper
+    /// panics with `row: #X, constraint #Y` — much faster than a wave-by-
+    /// wave bisection.
+    #[cfg(feature = "debug-internals")]
+    fn debug_assert_constraints(
+        &self,
+        component_trace: &ComponentTrace,
+        interaction_trace: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+        lookup_elements: &AllLookupElements,
+        claimed_sum: SecureField,
+    );
 }
 
 impl<C: BuiltInComponent> MachineComponent for C
@@ -217,5 +232,85 @@ where
             },
             claimed_sum,
         ))
+    }
+
+    #[cfg(feature = "debug-internals")]
+    fn debug_assert_constraints(
+        &self,
+        component_trace: &ComponentTrace,
+        interaction_trace: &[CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+        lookup_elements: &AllLookupElements,
+        claimed_sum: SecureField,
+    ) {
+        use stwo_constraint_framework::assert_constraints_on_polys;
+        let log_size = component_trace.log_size;
+        let preprocessed_polys: Vec<_> = component_trace
+            .preprocessed_trace
+            .iter()
+            .map(|col| {
+                let domain = CanonicCoset::new(log_size).circle_domain();
+                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, col.clone())
+                    .interpolate()
+            })
+            .collect();
+        let original_polys: Vec<_> = component_trace
+            .original_trace
+            .iter()
+            .map(|col| {
+                let domain = CanonicCoset::new(log_size).circle_domain();
+                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, col.clone())
+                    .interpolate()
+            })
+            .collect();
+        let interaction_polys: Vec<_> = interaction_trace
+            .iter()
+            .map(|eval| eval.clone().interpolate())
+            .collect();
+        let trace_polys = TreeVec::new(vec![preprocessed_polys, original_polys, interaction_polys]);
+        let lookup_elements_ce = C::LookupElements::get(lookup_elements);
+        let component_eval = BuiltInComponentEval::<C> {
+            component: self,
+            log_size,
+            lookup_elements: lookup_elements_ce,
+        };
+
+        // Optional symbolic dump of all constraint expressions: when the
+        // env var `CPU_EXPR_DUMP` is set, run an `ExprEvaluator` pass and
+        // print every constraint's symbolic form indexed by counter.
+        // Lets us identify constraint #N when AssertEvaluator panics with
+        // `row #X, constraint #N`.
+        if std::env::var("CPU_EXPR_DUMP").is_ok() {
+            let expr_eval = stwo_constraint_framework::expr::ExprEvaluator::default();
+            let component_eval_for_expr = BuiltInComponentEval::<C> {
+                component: self,
+                log_size,
+                lookup_elements: C::LookupElements::get(lookup_elements),
+            };
+            let result = component_eval_for_expr.evaluate(expr_eval);
+            // Column offset → variant name table (helps decode trace_1_column_NNN).
+            for v in <C::MainColumn as crate::air_column::AirColumn>::ALL_VARIANTS {
+                let off = v.offset();
+                let sz = v.size();
+                if sz == 1 {
+                    eprintln!("col_{off:>3} = {v:?}");
+                } else {
+                    for k in 0..sz {
+                        eprintln!("col_{:>3} = {v:?}[{k}]", off + k);
+                    }
+                }
+            }
+            for (i, c) in result.constraints.iter().enumerate() {
+                eprintln!("constraint #{i} = {}", c.simplify_and_format());
+            }
+        }
+
+        assert_constraints_on_polys(
+            &trace_polys,
+            CanonicCoset::new(log_size),
+            |assert_eval| {
+                let _ = component_eval.evaluate(assert_eval);
+            },
+            claimed_sum,
+        );
     }
 }

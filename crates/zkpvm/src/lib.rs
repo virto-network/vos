@@ -345,7 +345,7 @@ pub use prove::{
     install_thread_pool,
 };
 #[cfg(feature = "debug-internals")]
-pub use prove::debug_claimed_sums;
+pub use prove::{debug_claimed_sums, debug_assert_constraints_explicit};
 pub use stwo::core::pcs::PcsConfig;
 pub use stwo::core::fri::FriConfig;
 #[cfg(feature = "prover")]

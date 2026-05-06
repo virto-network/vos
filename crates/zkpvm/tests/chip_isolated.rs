@@ -162,21 +162,16 @@ fn harness_blake2b_isolated() {
     }
 }
 
-/// Bisection harness: does `[&CpuChip]` alone (with a real Add64 PVM
-/// step) survive the OODS sanity check?  Used to localise the
-/// `prove_add64` production-path `ConstraintsNotSatisfied` to a specific
-/// chip's flatten or witness fill.
+/// CpuChip-isolated harness: prove `[&CpuChip]` alone with a real Add64
+/// PVM step.  Validates that CpuChip's algebra (post Phase-I flatten)
+/// is sound on the new Stwo pin.  Verify is open-chain — lookups don't
+/// close without producer chips, but prove reaching SUCCESS means the
+/// OODS sanity check passes (no constraint algebra regressions).
 ///
-/// EXPECTED: prove succeeds (chip's algebra at deg ≤ 2), verify rejects
-/// on lookup imbalance (open-chain).
-///
-/// CURRENT (post 30-commit migration session): prove fails with
-/// `ConstraintsNotSatisfied` — there's a witness-fill bug in one of
-/// the ~7 waves of CpuChip helpers (or a residual deg-3 constraint
-/// not surfaced by the grep heuristic).  Marked `#[ignore]` so CI is
-/// green; future session bisects within CpuChip to locate the bug.
+/// FIXED (commit after this): GateDivH padding-row fill — the helper
+/// `(DivRemOp - 2)·(DivRemOp - 3)` has unconditional constraint, so
+/// padding rows where DivRemOp=0 needed GateDivH = 6, not 0.
 #[test]
-#[ignore = "CpuChip flatten has a witness-fill / residual deg-3 bug — bisect in next session"]
 fn harness_cpuchip_isolated_add64() {
     use javm::interpreter::Interpreter;
     use javm::instruction::Opcode;
@@ -209,16 +204,41 @@ fn harness_cpuchip_isolated_add64() {
     // OODS sanity check.
     let components: &[&'static dyn MachineProverComponent] = &[&chips::CpuChip];
 
-    let prove_result = prove_with_explicit_components(&mut side_note, config, components);
-    match prove_result {
-        Ok(_) => {
-            // Algebra OK.  Don't bother with verify — we just want the
-            // bisection signal.
-            eprintln!("CpuChip-only prove SUCCEEDED — flatten algebra is sound");
-        }
-        Err(e) => {
-            panic!("CpuChip-only prove failed: {e:?} — chip flatten has a bug \
-                    if this is ConstraintsNotSatisfied");
-        }
-    }
+    prove_with_explicit_components(&mut side_note, config, components)
+        .expect("CpuChip-only prove failed — chip flatten regression");
+}
+
+/// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
+/// Pinpoints the failing constraint by row + constraint-#, replacing the
+/// wave-by-wave bisection approach.  Requires the `debug-internals`
+/// feature; run with:
+///
+///   cargo test -p zkpvm --features debug-internals --test chip_isolated \
+///       harness_cpuchip_debug_add64 -- --ignored --nocapture
+#[cfg(feature = "debug-internals")]
+#[test]
+#[ignore = "debug-only — pinpoints failing constraint when prove fails"]
+fn harness_cpuchip_debug_add64() {
+    use javm::interpreter::Interpreter;
+    use javm::instruction::Opcode;
+    use javm::PVM_REGISTER_COUNT;
+    use zkpvm::core::tracing::TracingPvm;
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 100;
+    regs[1] = 200;
+    let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    let pvm = Interpreter::new(
+        code.clone(), bitmask.clone(), vec![], regs,
+        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, javm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::CpuChip];
+
+    zkpvm::debug_assert_constraints_explicit(&mut side_note, components);
 }

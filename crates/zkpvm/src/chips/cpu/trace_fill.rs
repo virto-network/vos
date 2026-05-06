@@ -1725,6 +1725,15 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, true, Column::IsPadding);
             trace.fill_columns(row, ts, Column::Timestamp);
             trace.fill_columns(row, ts + 1, Column::NextTimestamp);
+            // Wave-2 helper GateDivH = (DivRemOp - 2)·(DivRemOp - 3).
+            // Constraint is unconditional (no is_real gate); on padding
+            // rows DivRemOp = 0, so GateDivH must be filled with
+            // (0 - 2)·(0 - 3) = 6.  Other Wave helpers reduce to zero
+            // when their cofactors are zero on padding, so they don't
+            // need an explicit fill.
+            trace.fill_columns_base_field(
+                row, &[stwo::core::fields::m31::BaseField::from(6u32)], Column::GateDivH
+            );
         }
 
         trace.finalize_bit_reversed()
