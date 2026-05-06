@@ -363,7 +363,7 @@ impl BuiltInComponent for RistrettoChip {
     /// degree to 2 across all constraints.  Stwo v2.x's lifted protocol
     /// enforces actual degree, not declared bound, but we keep them
     /// aligned for clarity (matches Blake2b/Mul/DivRem/Cpu).
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;

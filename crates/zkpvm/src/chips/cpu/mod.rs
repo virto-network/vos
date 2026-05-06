@@ -53,7 +53,7 @@ pub struct CpuChip;
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2; // max degree 4 (flag * flag * flag * linear)
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1; // max degree 4 (flag * flag * flag * linear)
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;

@@ -205,7 +205,7 @@ impl BuiltInComponent for DivRemChip {
     /// the chip's actual algebraic degree is now ≤ 2.  Stwo v2.x's
     /// lifted protocol enforces actual degree, not declared bound, but
     /// we keep the declared bound aligned for clarity.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;

@@ -179,7 +179,7 @@ impl BuiltInComponent for MulChip {
     // is_mul_lo * (val_b*val_d - ...)`).  Sign-correction term
     // pinning is `(mu_su + mu_ss) * (term_a - sign_bit_b * val_d[i])`
     // = degree 3.  Both fit log_size + 2.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;

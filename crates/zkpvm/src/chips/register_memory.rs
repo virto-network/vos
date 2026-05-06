@@ -69,6 +69,9 @@ pub enum Column {
     /// 1 if padding row (beyond real ledger entries).
     #[size = 1]
     IsPadding,
+    /// Phase I-regmem flatten: `IsReal · IsRead` selector helper.
+    #[size = 1]
+    RealReadH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -110,10 +113,15 @@ impl BuiltInComponent for RegisterMemoryChip {
         // ledger only has ts=0 writes so this constraint is a no-op here;
         // it becomes load-bearing in Phase 9d once CpuChip starts emitting
         // reads interleaved with writes.
+        // Phase I-regmem flatten: routed through RealReadH.
+        let real_read_h = crate::trace::trace_eval!(trace_eval, Column::RealReadH);
         let is_read = E::F::one() - is_write[0].clone();
+        eval.add_constraint(
+            real_read_h[0].clone() - is_real.clone() * is_read.clone()
+        );
         for i in 0..8 {
             eval.add_constraint(
-                is_real.clone() * is_read.clone() * (value[i].clone() - prev_value[i].clone())
+                real_read_h[0].clone() * (value[i].clone() - prev_value[i].clone())
             );
         }
 
@@ -214,6 +222,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
                 && entries[row + 1].reg_addr == entry.reg_addr;
             trace.fill_columns(row, same_reg_next, Column::IsSameRegNext);
             trace.fill_columns(row, false, Column::IsPadding);
+            trace.fill_columns(row, !entry.is_write, Column::RealReadH);
         }
 
         for row in num_entries..num_rows {

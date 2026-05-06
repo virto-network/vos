@@ -65,6 +65,10 @@ pub enum Column {
     CmpCarry,
     #[size = 1]
     IsPadding,
+    /// Phase I-cmp flatten: `CmpLtFlag · (1 - CmpLtFlag)` boolean witness.
+    #[size = 1] CmpLtFlagBoolH,
+    /// `CmpCarry[i] · (1 - CmpCarry[i])` boolean witness per byte.
+    #[size = 8] CmpCarryBoolH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -92,16 +96,24 @@ impl BuiltInComponent for CompareChip {
 
         // Boolean constraint on padding.
         eval.add_constraint(is_padding[0].clone() * (E::F::one() - is_padding[0].clone()));
-        // cmp_lt_flag boolean (gated on is_real).
+        // cmp_lt_flag boolean (Phase I-cmp flattened via CmpLtFlagBoolH).
         let is_real = E::F::one() - is_padding[0].clone();
+        let cmp_lt_flag_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::CmpLtFlagBoolH);
+        let cmp_carry_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::CmpCarryBoolH);
         eval.add_constraint(
-            is_real.clone() * cmp_lt_flag[0].clone() * (E::F::one() - cmp_lt_flag[0].clone())
+            cmp_lt_flag_bool_h[0].clone()
+                - cmp_lt_flag[0].clone() * (E::F::one() - cmp_lt_flag[0].clone())
         );
+        eval.add_constraint(is_real.clone() * cmp_lt_flag_bool_h[0].clone());
         // cmp_carry per-byte boolean.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_real.clone() * cmp_carry[i].clone() * (E::F::one() - cmp_carry[i].clone())
+                cmp_carry_bool_h[i].clone()
+                    - cmp_carry[i].clone() * (E::F::one() - cmp_carry[i].clone())
             );
+            eval.add_constraint(is_real.clone() * cmp_carry_bool_h[i].clone());
         }
 
         // ── Subtraction carry chain ──
@@ -179,6 +191,10 @@ impl BuiltInProverComponent for CompareChip {
             trace.fill_columns_bytes(row, &e.cmp_sub_result, Column::CmpSubResult);
             trace.fill_columns_bytes(row, &e.cmp_carry, Column::CmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
+            // Phase I-cmp helper fills.  Boolean helpers are 0 in valid
+            // traces (cmp_lt_flag, cmp_carry[i] ∈ {0, 1}).
+            trace.fill_columns(row, false, Column::CmpLtFlagBoolH);
+            trace.fill_columns_bytes(row, &[0u8; 8], Column::CmpCarryBoolH);
         }
 
         for row in entries.len()..num_rows {

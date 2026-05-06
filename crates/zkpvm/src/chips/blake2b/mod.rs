@@ -62,7 +62,7 @@ pub struct Blake2bChip;
 impl BuiltInComponent for Blake2bChip {
     // Carry bound identity is_real · c · (c-1) · (c-2) is degree 4, so require
     // the same bound that CpuChip uses.
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 2;
+    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
