@@ -6,29 +6,43 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# Default off so the riscv64 actor build stays minimal — no
-# `Client`, no `replication_id`. Hosts (vosx, tests) enable
-# `host` to get the typed wrapper and the CRDT group-id
-# derivation. The `host` name is deliberate: this is about
-# being on the driver side of the actor, not about std vs
-# no_std (the actor is also no_std). Once blake2b becomes a
-# host ecall the only host-side helper using blake2b_simd
-# (`replication_id`) will route through that, and the dep can
-# go away entirely.
-default = []
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+default = ["bin"]
+bin = []
 host = ["dep:blake2b_simd"]
 
 [lib]
+# rlib  : usable as Ref source by other actors / host crates.
+# cdylib: produces the worker `.so` on host targets and the wasm
+#         `.wasm` on wasm32 targets.
 name = "registry"
+crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
 [[bin]]
 name = "registry-actor"
-path = "src/main.rs"
+path = "src/lib.rs"
+required-features = ["bin"]
 
-[dependencies]
+# Target-conditional vos deps — pick the right feature set per build target.
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
 blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "worker"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+
 
 [profile.release]
 opt-level = "s"

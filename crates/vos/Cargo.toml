@@ -30,6 +30,11 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 vos-macros = { path = "../vos-macros", optional = true }
 vos-raft = { path = "../vos-raft", default-features = false, features = ["std"], optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+# Logging facade — re-exported as `vos::log` and pulled into
+# `vos::prelude::*`. `default-features = false` keeps it usable
+# in no_std actor / wasm guests; the std-side host code can use
+# the same facade and bridge to tracing if it wants.
+log = { version = "0.4", default-features = false }
 
 # std-only: PVM runtime and vosx binary dependencies
 javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }
@@ -58,12 +63,13 @@ futures-executor = { version = "0.3", default-features = false, features = ["std
 futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
 
 [dev-dependencies]
-# Tests need typed access to the registry actor — `host` pulls
-# in `Client` and `replication_id`. Cargo allows this dev-dep
-# cycle (registry → vos) because dev-deps don't participate in
-# the regular dep graph; only test/example builds activate it.
-registry = { path = "../actors/registry", features = ["host"] }
-crdt-counter = { path = "../../examples/actors/crdt-counter", features = ["host"] }
+# Tests use the typed `RegistryRef` (always emitted) and the
+# host-only `replication_id` helper (gated on registry's `host`
+# feature). Cargo allows this dev-dep cycle (registry → vos)
+# because dev-deps don't participate in the regular dep graph;
+# only test/example builds activate it.
+registry = { path = "../actors/registry", default-features = false, features = ["host"] }
+crdt-counter = { path = "../../examples/actors/crdt-counter", default-features = false }
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"

@@ -3875,6 +3875,7 @@ dependencies = [
  "javm",
  "libloading",
  "libp2p",
+ "log",
  "merkle-crdt",
  "pollster",
  "redb",
