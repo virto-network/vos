@@ -1442,6 +1442,70 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             for &fb in &flag_bytes {
                 side_note.byte_to_bits_counts[fb as usize] += 1;
             }
+
+            // ── Phase I-cpu Wave-7 helper fills ──
+            // is_truncated, val_b_is_reg / val_d_is_reg / result_is_reg,
+            // phi7_bool, is_blake_ecall_b, is_shift_constrained are all
+            // booleans (or u8 ∈ {0,1}) in valid traces.  All Bool-helpers
+            // are 0 in valid traces (boolean identity always holds).
+            // Selector helpers are simple bool products of known flags.
+            let is_truncated_b = is_truncated != 0;
+            let val_b_is_reg_b = accesses.val_b_read.is_some();
+            let val_d_is_reg_b = accesses.val_d_read.is_some();
+            let result_is_reg_b = accesses.result_write.is_some();
+            let phi7_bool_b = phi7_bool != 0;
+            let _is_blake_ecall_b = is_blake_ecall;
+            let real_b = true; // not padding
+            let is_32bit_b = flags.is_32bit;
+            let is_shift_c_b = is_shift_constrained;
+            let is_rot_r_either_b = flags.is_rotate_r64 || flags.is_rotate_r32;
+            // All Bool helpers are 0.
+            trace.fill_columns(row, false, Column::IsTruncatedBoolH);
+            trace.fill_columns(row, false, Column::ValBIsRegBoolH);
+            trace.fill_columns(row, false, Column::ValDIsRegBoolH);
+            trace.fill_columns(row, false, Column::ResultIsRegBoolH);
+            trace.fill_columns(row, false, Column::Phi7BoolBoolH);
+            trace.fill_columns(row, false, Column::IsBlakeEcallBoolH);
+            // Selector helpers.
+            trace.fill_columns(row, real_b && is_32bit_b, Column::Real32bitH);
+            trace.fill_columns(row, val_b_is_reg_b, Column::ValBIsRegH);
+            trace.fill_columns(
+                row, val_b_is_reg_b && !is_truncated_b, Column::ValBIsRegNotTruncH
+            );
+            trace.fill_columns(
+                row, val_b_is_reg_b && is_truncated_b, Column::ValBIsRegTruncH
+            );
+            trace.fill_columns(row, val_d_is_reg_b, Column::ValDIsRegH);
+            trace.fill_columns(
+                row, val_d_is_reg_b && !is_shift_c_b, Column::NonShiftGateH
+            );
+            trace.fill_columns(
+                row, val_d_is_reg_b && !is_shift_c_b && !is_truncated_b,
+                Column::NonShiftGateNotTruncH
+            );
+            trace.fill_columns(
+                row, val_d_is_reg_b && !is_shift_c_b && is_truncated_b,
+                Column::NonShiftGateTruncH
+            );
+            trace.fill_columns(
+                row, val_d_is_reg_b && is_shift_c_b, Column::ValDIsRegShiftCH
+            );
+            trace.fill_columns(row, real_b && is_rot_r_either_b, Column::IsRotateRGateH);
+            // Phi7 helpers.
+            trace.fill_columns(row, real_b && !phi7_bool_b, Column::RealNotPhi7BoolH);
+            trace.fill_columns(row, real_b && phi7_bool_b, Column::RealPhi7BoolH);
+            // Phi7TimesInvH = Phi7 (u64) · Phi7Inv (u64) reduced mod P.
+            // For Phi7 = 0 → both 0 → 0.  For Phi7 ≠ 0 → product = 1 (mod P).
+            // Compute via u128 to dodge overflow.
+            let phi7_field_u32 = (phi7_u64 % stwo::core::fields::m31::P as u64) as u32;
+            let phi7_inv_field_u32 = phi7_inv_u64 as u32;
+            let prod = (phi7_field_u32 as u64 * phi7_inv_field_u32 as u64)
+                % stwo::core::fields::m31::P as u64;
+            use stwo::core::fields::m31::BaseField;
+            trace.fill_columns_base_field(
+                row, &[BaseField::from(prod as u32)], Column::Phi7TimesInvH
+            );
+            let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
         }
 
         for &b in &range_bytes {

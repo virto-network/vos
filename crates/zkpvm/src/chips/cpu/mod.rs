@@ -1149,6 +1149,150 @@ impl BuiltInComponent for CpuChip {
                 );
             }
         }
+
+        // ── Phase I-cpu Wave-7 helpers (Phase 9 register-memory binding) ──
+        let is_truncated_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsTruncatedBoolH);
+        let val_b_is_reg_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValBIsRegBoolH);
+        let val_d_is_reg_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValDIsRegBoolH);
+        let result_is_reg_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::ResultIsRegBoolH);
+        let phi7_bool_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::Phi7BoolBoolH);
+        let is_blake_ecall_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcallBoolH);
+        let real_32bit_h = crate::trace::trace_eval!(trace_eval, Column::Real32bitH);
+        let val_b_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValBIsRegH);
+        let val_b_is_reg_not_trunc_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValBIsRegNotTruncH);
+        let val_b_is_reg_trunc_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValBIsRegTruncH);
+        let val_d_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsRegH);
+        let non_shift_gate_h = crate::trace::trace_eval!(trace_eval, Column::NonShiftGateH);
+        let non_shift_gate_not_trunc_h =
+            crate::trace::trace_eval!(trace_eval, Column::NonShiftGateNotTruncH);
+        let non_shift_gate_trunc_h =
+            crate::trace::trace_eval!(trace_eval, Column::NonShiftGateTruncH);
+        let val_d_is_reg_shift_c_h =
+            crate::trace::trace_eval!(trace_eval, Column::ValDIsRegShiftCH);
+        let is_rotate_r_gate_h =
+            crate::trace::trace_eval!(trace_eval, Column::IsRotateRGateH);
+        {
+            let is_truncated_top =
+                crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
+            let val_b_is_reg_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValBIsReg);
+            let val_d_is_reg_top =
+                crate::trace::trace_eval!(trace_eval, Column::ValDIsReg);
+            let result_is_reg_top =
+                crate::trace::trace_eval!(trace_eval, Column::ResultIsReg);
+            let phi7_bool_top =
+                crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            let is_blake_ecall_top =
+                crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
+            let is_shift_c_top =
+                crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
+            let is_rot_r64_top =
+                crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            let is_rot_r32_top =
+                crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+            // Boolean helpers (deg 2 def).
+            eval.add_constraint(
+                is_truncated_bool_h[0].clone()
+                    - is_truncated_top[0].clone()
+                        * (E::F::one() - is_truncated_top[0].clone())
+            );
+            eval.add_constraint(
+                val_b_is_reg_bool_h[0].clone()
+                    - val_b_is_reg_top[0].clone()
+                        * (E::F::one() - val_b_is_reg_top[0].clone())
+            );
+            eval.add_constraint(
+                val_d_is_reg_bool_h[0].clone()
+                    - val_d_is_reg_top[0].clone()
+                        * (E::F::one() - val_d_is_reg_top[0].clone())
+            );
+            eval.add_constraint(
+                result_is_reg_bool_h[0].clone()
+                    - result_is_reg_top[0].clone()
+                        * (E::F::one() - result_is_reg_top[0].clone())
+            );
+            eval.add_constraint(
+                phi7_bool_bool_h[0].clone()
+                    - phi7_bool_top[0].clone()
+                        * (E::F::one() - phi7_bool_top[0].clone())
+            );
+            eval.add_constraint(
+                is_blake_ecall_bool_h[0].clone()
+                    - is_blake_ecall_top[0].clone()
+                        * (E::F::one() - is_blake_ecall_top[0].clone())
+            );
+            // Selector helpers (deg 2 def each).
+            eval.add_constraint(
+                real_32bit_h[0].clone() - is_real.clone() * is_32bit[0].clone()
+            );
+            eval.add_constraint(
+                val_b_is_reg_h[0].clone() - is_real.clone() * val_b_is_reg_top[0].clone()
+            );
+            eval.add_constraint(
+                val_b_is_reg_not_trunc_h[0].clone()
+                    - val_b_is_reg_h[0].clone() * (E::F::one() - is_truncated_top[0].clone())
+            );
+            eval.add_constraint(
+                val_b_is_reg_trunc_h[0].clone()
+                    - val_b_is_reg_h[0].clone() * is_truncated_top[0].clone()
+            );
+            eval.add_constraint(
+                val_d_is_reg_h[0].clone() - is_real.clone() * val_d_is_reg_top[0].clone()
+            );
+            eval.add_constraint(
+                non_shift_gate_h[0].clone()
+                    - val_d_is_reg_h[0].clone() * (E::F::one() - is_shift_c_top[0].clone())
+            );
+            eval.add_constraint(
+                non_shift_gate_not_trunc_h[0].clone()
+                    - non_shift_gate_h[0].clone() * (E::F::one() - is_truncated_top[0].clone())
+            );
+            eval.add_constraint(
+                non_shift_gate_trunc_h[0].clone()
+                    - non_shift_gate_h[0].clone() * is_truncated_top[0].clone()
+            );
+            eval.add_constraint(
+                val_d_is_reg_shift_c_h[0].clone()
+                    - val_d_is_reg_h[0].clone() * is_shift_c_top[0].clone()
+            );
+            eval.add_constraint(
+                is_rotate_r_gate_h[0].clone()
+                    - is_real.clone()
+                        * (is_rot_r64_top[0].clone() + is_rot_r32_top[0].clone())
+            );
+        }
+        // Phi7-related helpers (Wave 7 continued).
+        let real_not_phi7_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::RealNotPhi7BoolH);
+        let real_phi7_bool_h =
+            crate::trace::trace_eval!(trace_eval, Column::RealPhi7BoolH);
+        let phi7_times_inv_h =
+            crate::trace::trace_eval!(trace_eval, Column::Phi7TimesInvH);
+        {
+            let phi7_top = crate::trace::trace_eval!(trace_eval, Column::Phi7);
+            let phi7_inv_top = crate::trace::trace_eval!(trace_eval, Column::Phi7Inv);
+            let phi7_bool_top = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            eval.add_constraint(
+                real_not_phi7_bool_h[0].clone()
+                    - is_real.clone() * (E::F::one() - phi7_bool_top[0].clone())
+            );
+            eval.add_constraint(
+                real_phi7_bool_h[0].clone() - is_real.clone() * phi7_bool_top[0].clone()
+            );
+            let phi7_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_top);
+            let phi7_inv_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_inv_top);
+            eval.add_constraint(
+                phi7_times_inv_h[0].clone() - phi7_field_local * phi7_inv_field_local
+            );
+        }
         // Main TZ constraint flattened to a sum of deg-2 terms.
         // Original: is_tzb · (result[0] - tz_expr) = 0 with tz_expr deg 3.
         // Flatten: is_tzb·result - is_tzb·TzLo4H
@@ -1607,62 +1751,52 @@ impl BuiltInComponent for CpuChip {
                 &tuple_a,
             ));
 
-            // Phase 9g: IsTruncated is 1 iff Is32Bit AND (IsAdd + IsSub +
-            // IsMul + IsDivRem).  Validity constraint ties it to the op flags
-            // so a prover can't flip it independently.
+            // Phase 9g: IsTruncated boolean + identity binding (Phase I-cpu Wave-7 flattened).
             let is_truncated = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
-            eval.add_constraint(
-                is_real.clone() * is_truncated[0].clone() * (is_truncated[0].clone() - E::F::one())
-            );
+            eval.add_constraint(is_real.clone() * is_truncated_bool_h[0].clone());
+            // is_truncated = is_32bit · (is_add+is_sub+is_mul+is_div_rem).
+            // is_real · is_32bit lifted into Real32bitH so the constraint
+            // factors as is_real·is_truncated - Real32bitH·trunc_sum.
             let trunc_sum = is_add[0].clone() + is_sub[0].clone()
                 + is_mul[0].clone() + is_div_rem[0].clone();
             eval.add_constraint(
-                is_real.clone()
-                    * (is_truncated[0].clone() - is_32bit[0].clone() * trunc_sum)
+                is_real.clone() * is_truncated[0].clone()
+                    - real_32bit_h[0].clone() * trunc_sum
             );
 
-            // ValB byte-wise cross-constraint.  ValB is not affected by shifts.
-            //   - low 4 bytes: ValB[i] == RegValB[i] whenever ValBIsReg=1
-            //   - upper 4 bytes: match when NOT truncated, zero when truncated.
+            // ValB byte-wise cross-constraint (Phase I-cpu Wave-7 flattened).
             for i in 0..4 {
                 eval.add_constraint(
-                    is_real.clone() * val_b_is_reg[0].clone()
+                    val_b_is_reg_h[0].clone()
                         * (val_b[i].clone() - reg_val_b[i].clone())
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
-                    is_real.clone() * val_b_is_reg[0].clone()
-                        * (E::F::one() - is_truncated[0].clone())
+                    val_b_is_reg_not_trunc_h[0].clone()
                         * (val_b[i].clone() - reg_val_b[i].clone())
                 );
                 eval.add_constraint(
-                    is_real.clone() * val_b_is_reg[0].clone()
-                        * is_truncated[0].clone() * val_b[i].clone()
+                    val_b_is_reg_trunc_h[0].clone() * val_b[i].clone()
                 );
             }
 
-            // ValD byte-wise cross-constraint.  Skip shift rows (handled by
-            // the ShiftQuotient identity below).
+            // ValD byte-wise cross-constraint (Phase I-cpu Wave-7 flattened).
+            // Skip shift rows (handled by the ShiftQuotient identity below).
             let is_shift_c = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
-            let non_shift_gate = is_real.clone()
-                * val_d_is_reg[0].clone()
-                * (E::F::one() - is_shift_c[0].clone());
+            let _ = is_shift_c; // routed through helpers above
             for i in 0..4 {
                 eval.add_constraint(
-                    non_shift_gate.clone() * (val_d[i].clone() - reg_val_d[i].clone())
+                    non_shift_gate_h[0].clone() * (val_d[i].clone() - reg_val_d[i].clone())
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
-                    non_shift_gate.clone()
-                        * (E::F::one() - is_truncated[0].clone())
+                    non_shift_gate_not_trunc_h[0].clone()
                         * (val_d[i].clone() - reg_val_d[i].clone())
                 );
                 eval.add_constraint(
-                    non_shift_gate.clone()
-                        * is_truncated[0].clone()
-                        * val_d[i].clone()
+                    non_shift_gate_trunc_h[0].clone() * val_d[i].clone()
                 );
             }
 
@@ -1677,13 +1811,9 @@ impl BuiltInComponent for CpuChip {
             let two = E::F::from(BaseField::from(2u32));
             let thirty_two = E::F::from(BaseField::from(32u32));
             let modulus = thirty_two * (two - is_32b[0].clone());
-            // Gated on ValDIsReg too: for 32-bit shifts the ValD read is
-            // skipped (truncated_32bit) and RegValD = 0, so the constraint
-            // must not fire there — 9g will extend this.
+            // Gated on ValDIsReg too (Phase I-cpu Wave-7 flattened via ValDIsRegShiftCH).
             eval.add_constraint(
-                is_real.clone()
-                    * val_d_is_reg[0].clone()
-                    * is_shift_c[0].clone()
+                val_d_is_reg_shift_c_h[0].clone()
                     * (reg_val_d_field.clone() - shift_amount_e[0].clone() - modulus * shift_q_field)
             );
 
@@ -1704,11 +1834,9 @@ impl BuiltInComponent for CpuChip {
             let two_compl = E::F::from(BaseField::from(2u32));
             let thirty_two_compl = E::F::from(BaseField::from(32u32));
             let modulus_compl = thirty_two_compl * (two_compl - is_32b[0].clone());
-            let is_rotate_r_either = is_rotate_r64_p35_id[0].clone()
-                + is_rotate_r32_p36_id[0].clone();
+            let _ = (&is_rotate_r64_p35_id, &is_rotate_r32_p36_id); // routed via IsRotateRGateH
             eval.add_constraint(
-                is_real.clone()
-                    * is_rotate_r_either
+                is_rotate_r_gate_h[0].clone()
                     * (reg_val_d_field + shift_amount_compl[0].clone()
                         - modulus_compl * shift_q_compl_field)
             );
@@ -1722,16 +1850,10 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
-            // IsReg flags must be boolean.
-            eval.add_constraint(
-                is_real.clone() * val_b_is_reg[0].clone() * (val_b_is_reg[0].clone() - E::F::one())
-            );
-            eval.add_constraint(
-                is_real.clone() * val_d_is_reg[0].clone() * (val_d_is_reg[0].clone() - E::F::one())
-            );
-            eval.add_constraint(
-                is_real.clone() * result_is_reg[0].clone() * (result_is_reg[0].clone() - E::F::one())
-            );
+            // IsReg flags must be boolean (Phase I-cpu Wave-7 flattened).
+            eval.add_constraint(is_real.clone() * val_b_is_reg_bool_h[0].clone());
+            eval.add_constraint(is_real.clone() * val_d_is_reg_bool_h[0].clone());
+            eval.add_constraint(is_real.clone() * result_is_reg_bool_h[0].clone());
         }
 
         // ── Phase 9e: blake2b ECALL register-read producers + Phi7Bool tie ──
@@ -1739,7 +1861,7 @@ impl BuiltInComponent for CpuChip {
             let is_blake_ecall = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
             let phi7 = crate::trace::trace_eval!(trace_eval, Column::Phi7);
             let phi7_inv = crate::trace::trace_eval!(trace_eval, Column::Phi7Inv);
-            let phi7_bool = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            let _phi7_bool = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
             let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10);
             let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11);
             let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
@@ -1763,21 +1885,19 @@ impl BuiltInComponent for CpuChip {
             // with Phi7 because trace gen derives both from regs_before[7]).
             let phi7_field = crate::framework::eval::combine_le_u64::<E>(&phi7);
             let phi7_inv_field = crate::framework::eval::combine_le_u64::<E>(&phi7_inv);
-            // Phi7Bool is boolean.
-            eval.add_constraint(
-                is_real.clone() * phi7_bool[0].clone() * (phi7_bool[0].clone() - E::F::one())
-            );
+            // Phi7Bool is boolean (Phase I-cpu Wave-7 flattened).
+            eval.add_constraint(is_real.clone() * phi7_bool_bool_h[0].clone());
             // If Phi7Bool = 0, then Phi7 (as field) = 0.
+            let _ = phi7_field;
+            let _ = phi7_inv_field;
             eval.add_constraint(
-                is_real.clone()
-                    * (E::F::one() - phi7_bool[0].clone())
-                    * phi7_field.clone()
+                real_not_phi7_bool_h[0].clone()
+                    * crate::framework::eval::combine_le_u64::<E>(&phi7)
             );
-            // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 (so Phi7 is non-zero).
+            // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 — body lifted into
+            // Phi7TimesInvH so the gate × body is deg 2.
             eval.add_constraint(
-                is_real.clone()
-                    * phi7_bool[0].clone()
-                    * (phi7_field * phi7_inv_field - E::F::one())
+                real_phi7_bool_h[0].clone() * (phi7_times_inv_h[0].clone() - E::F::one())
             );
         }
 
@@ -1800,15 +1920,11 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
-            // Phi7Bool must be boolean (0 or 1) at all real rows, gated by
-            // is_real so padding rows aren't constrained.
-            eval.add_constraint(
-                is_real.clone() * phi7_bool[0].clone() * (phi7_bool[0].clone() - E::F::one())
-            );
-            // IsBlakeEcall must be boolean too.
-            eval.add_constraint(
-                is_real.clone() * is_blake_ecall[0].clone() * (is_blake_ecall[0].clone() - E::F::one())
-            );
+            // Phi7Bool boolean (Phase I-cpu Wave-7 flattened).
+            eval.add_constraint(is_real.clone() * phi7_bool_bool_h[0].clone());
+            // IsBlakeEcall boolean (Phase I-cpu Wave-7 flattened).
+            eval.add_constraint(is_real.clone() * is_blake_ecall_bool_h[0].clone());
+            let _ = is_blake_ecall;
         }
 
         // ════════════════════════════════════════════════════════════════════

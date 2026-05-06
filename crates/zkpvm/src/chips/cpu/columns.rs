@@ -914,6 +914,48 @@ pub enum Column {
     /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
     /// (index 7 unused, default fill = 0).
     #[size = 8] MemByteActiveMonoH,
+
+    // Wave 7: Phase 9 register-memory binding.  Many cross-constraints
+    // chain 3-4 selector flags before a linear body.
+    /// `IsTruncated · (1 - IsTruncated)` boolean witness.
+    #[size = 1] IsTruncatedBoolH,
+    /// `ValBIsReg · (1 - ValBIsReg)` boolean witness.
+    #[size = 1] ValBIsRegBoolH,
+    /// `ValDIsReg · (1 - ValDIsReg)` boolean witness.
+    #[size = 1] ValDIsRegBoolH,
+    /// `ResultIsReg · (1 - ResultIsReg)` boolean witness.
+    #[size = 1] ResultIsRegBoolH,
+    /// `Phi7Bool · (1 - Phi7Bool)` boolean witness.
+    #[size = 1] Phi7BoolBoolH,
+    /// `IsBlakeEcall · (1 - IsBlakeEcall)` boolean witness.
+    #[size = 1] IsBlakeEcallBoolH,
+    /// `(1 - IsPadding) · Is32Bit` — used in the IsTruncated identity binding.
+    #[size = 1] Real32bitH,
+    /// `(1 - IsPadding) · ValBIsReg` — gate root for ValB cross-constraints.
+    #[size = 1] ValBIsRegH,
+    /// `ValBIsRegH · (1 - IsTruncated)` — non-truncated ValB upper-byte gate.
+    #[size = 1] ValBIsRegNotTruncH,
+    /// `ValBIsRegH · IsTruncated` — truncated ValB upper-byte gate.
+    #[size = 1] ValBIsRegTruncH,
+    /// `(1 - IsPadding) · ValDIsReg` — gate root for ValD cross-constraints.
+    #[size = 1] ValDIsRegH,
+    /// `ValDIsRegH · (1 - IsShiftConstrained)` — non-shift ValD gate
+    /// (matches the original `non_shift_gate`).
+    #[size = 1] NonShiftGateH,
+    /// `NonShiftGateH · (1 - IsTruncated)` — non-shift, non-truncated.
+    #[size = 1] NonShiftGateNotTruncH,
+    /// `NonShiftGateH · IsTruncated` — non-shift, truncated.
+    #[size = 1] NonShiftGateTruncH,
+    /// `ValDIsRegH · IsShiftConstrained` — shift-amount identity gate.
+    #[size = 1] ValDIsRegShiftCH,
+    /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
+    #[size = 1] IsRotateRGateH,
+    /// `(1 - IsPadding) · (1 - Phi7Bool)` — gate for `Phi7=0` constraint.
+    #[size = 1] RealNotPhi7BoolH,
+    /// `(1 - IsPadding) · Phi7Bool` — gate for `Phi7·Phi7Inv=1` constraint.
+    #[size = 1] RealPhi7BoolH,
+    /// `Phi7Field · Phi7InvField` — body helper for the Phi7-nonzero proof.
+    #[size = 1] Phi7TimesInvH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
