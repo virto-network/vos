@@ -113,7 +113,6 @@ fn harness_smoke_bound1_only() {
 /// are flattened, `prove_add64` (production path with standard chip set)
 /// is the actual end-to-end validation.  Test stays `#[ignore]`'d.
 #[test]
-#[ignore = "Blake2bChip not yet flattened — re-enable after I-blake2b-7"]
 fn harness_blake2b_isolated() {
     use zkpvm::chips::Blake2bCall;
 
