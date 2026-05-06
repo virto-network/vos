@@ -90,6 +90,49 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
+    // PVM entry-point block — emitted only on riscv64 actor builds
+    // with the `bin` feature on. Same shape `pvm_main!` used to
+    // produce; lives here so the user's lib.rs needs neither a
+    // `pvm_main!()` invocation nor a separate `main.rs`. The
+    // helper symbols (`__VOS_ACTOR_META_ENCODED`,
+    // `_KEEP_ACCUMULATE`) are named with leading underscores /
+    // a `__VOS_` prefix so they don't shadow anything in the
+    // user's module.
+    let pvm_entries = quote! {
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() {
+            vos::run_refine_entry::<#name>();
+        }
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn accumulate() {
+            vos::run_accumulate_entry::<#name>();
+        }
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[used]
+        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        const __VOS_ACTOR_META_ENCODED: ([u8; 4096], usize) =
+            vos::metadata::encode::<4096>(
+                &<<#name as vos::Actor>::Message>::META,
+            );
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(link_section = ".vos_meta")]
+        #[used]
+        static _VOS_META: [u8; __VOS_ACTOR_META_ENCODED.1] = {
+            let (src, len) = __VOS_ACTOR_META_ENCODED;
+            let mut out = [0u8; __VOS_ACTOR_META_ENCODED.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
+    };
+
     let expanded = quote! {
         #struct_def
 
@@ -126,6 +169,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 vos::try_poll(msg.deliver(self, ctx))
             }
         }
+
+        #pvm_entries
     };
 
     expanded.into()
@@ -693,7 +738,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Preamble — always emitted. Worker/WASM entry blocks below
     // reference `_VOS_META_ENCODED` to embed the actor's metadata
     // into their respective `.vos_meta`-shaped exports. The PVM
-    // entries (now in `vos::pvm_main!`) compute their own meta.
+    // entries (auto-emitted by `#[actor]`) compute their own meta.
     let preamble = quote! {
         extern crate alloc;
 
@@ -708,66 +753,54 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             vos::metadata::encode::<4096>(&#enum_name::META);
     };
 
-    // PVM entry points used to land here, gated on
-    // `target_arch = "riscv64"`. They moved to the
-    // `vos::pvm_main!` decl-macro: lib.rs of an actor crate
-    // can now define `#[actor]` + `#[messages]` (so consumers
-    // can import its types and the generated `Client`/
-    // `ActorClient`) without duplicating `_start` /
-    // `accumulate` symbols when another actor crate links
-    // against it. The bin's `main.rs` invokes
-    // `vos::pvm_main!(crate::Foo)` once to materialize the
-    // entries + meta static.
+    // PVM entry points (`_start`, `accumulate`, `.vos_meta`) are
+    // auto-emitted by the `#[actor]` macro itself, gated on
+    // `cfg(all(target_arch = "riscv64", feature = "bin"))` so:
+    //   - host / worker / wasm builds skip them (different arch),
+    //   - cross-actor lib deps skip them (`bin` feature off).
+    // The user's lib.rs no longer needs `pvm_main!()`; one
+    // `#[actor]` is the whole story.
     let pvm_entries = quote! {};
 
     // Worker entry points — native .so plugins (poll-based async ABI).
     //
-    // Building with the `worker` feature also marks the actor as a
-    // [`vos::WorkerActor`], which unlocks the [`vos::WorkerCtx`]
-    // extension methods (`ctx.fetch`, etc.) inside handler bodies.
-    // The trait import below brings those methods into scope so user
-    // handlers can call `ctx.fetch(...)` without an extra `use`.
-    // Worker glue (`vos_worker_*` extern fns + `WorkerActor` impl)
-    // is emitted by a vos-side decl macro that's gated on vos's
-    // own `worker` feature. Calling it unconditionally here keeps
-    // user crates free of `cfg(feature = "worker")` warnings.
+    // The decl-macro itself is gated on vos's `worker` feature
+    // (expands to nothing when worker glue isn't relevant for
+    // this build target). Inside its expansion, the `vos_worker_*`
+    // extern fns are further gated on the user crate's `bin`
+    // feature, so cross-actor lib deps don't collide on those
+    // symbols at link time. The `WorkerActor` impl and
+    // `WorkerCtx` use stay unconditional so handler bodies can
+    // reach `ctx.fetch` / etc. regardless.
     let worker_entries = quote! {
         vos::__vos_emit_worker_glue!(#actor_name, #enum_name);
     };
 
 
-    // WASM entry points — for browser / WASI hosts.
-    //
-    // WASM is 32-bit and lacks multi-value returns in many toolchains,
-    // so we pack two u32s (ptr + len) into a u64 for "buffer" returns:
-    //   high 32 bits = ptr, low 32 bits = len
-    //
-    // The host (JS/WASI) drives the poll loop just like the worker host,
-    // reading effects from WASM linear memory directly.
-    // WASM cdylib entry points (`vos_wasm_*` extern fns) — emitted
-    // by a vos-side decl macro gated on vos's own `wasm` feature.
+    // WASM cdylib entry points (`vos_wasm_*` extern fns). Same
+    // bin-gating shape as worker_entries — the gate lives inside
+    // the decl-macro so the surrounding scope sees the right
+    // symbols regardless of `bin`.
     let wasm_entries = quote! {
         vos::__vos_emit_wasm_glue!(#actor_name, #enum_name);
     };
 
-    // ── Host client emission ────────────────────────────────────
+    // ── Unified Ref emission ────────────────────────────────────
     //
-    // Generate a `{Actor}Client` struct + impl with one typed
-    // method per `#[msg]`. Each method calls `VosNode::invoke`
-    // on a target ServiceId (set at construction time), encodes
-    // args into a dynamic `Msg`, and decodes the reply based on
-    // the handler's declared return type.
+    // `{Actor}Ref` is the typed reference for both call sites:
     //
-    // The vos-side `__vos_emit_host_client!` macro is gated on
-    // vos's `std` feature (the Client requires `vos::node::VosNode`),
-    // so guest builds — which depend on vos without `std` — get
-    // an empty expansion automatically. No user-side cfg needed.
-    let client_struct_name = format_ident!("{}Client", actor_name);
-    let client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
+    //   - inside a PVM actor handler, with `ctx` as the invoker
+    //     (`Context<A>: Invoker`),
+    //   - from host code, with `&node` as the invoker (gated on
+    //     vos's `std` feature where `&VosNode: Invoker` lives).
+    //
+    // Holds only a `ServiceId`, no_std + dep-free. Each method
+    // takes `&mut impl Invoker` as its first parameter. Methods
+    // are `async`; host callers wrap them with `vos::block_on`.
+    let ref_struct_name = format_ident!("{}Ref", actor_name);
+    let ref_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
         let method_ident = &m.wire_name;
         let wire_name = m.wire_name.to_string();
-        let arg_idents: Vec<&syn::Ident> = m.args.iter().map(|(n, _)| n).collect();
-        let arg_types: Vec<&syn::Type> = m.args.iter().map(|(_, t)| t).collect();
         let arg_decls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, t)| {
             quote! { #n: #t }
         }).collect();
@@ -781,10 +814,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let value_ident = format_ident!("__value");
         let decode = client_decode_body(&m.success_ty, &value_ident);
-        let _ = (arg_idents, arg_types); // silence unused — used inline
         quote! {
-            pub fn #method_ident(
+            pub async fn #method_ident<__I: vos::actors::client::Invoker>(
                 &self,
+                __inv: &mut __I,
                 #( #arg_decls ),*
             ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
                 use vos::Encode;
@@ -794,99 +827,31 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
                 __payload.push(vos::value::TAG_DYNAMIC);
                 __payload.extend_from_slice(&__encoded);
-                let __reply_bytes = self.node
-                    .invoke(self.target, __payload)
-                    .ok_or(vos::actors::client::ClientError::Unreachable)?;
-                // Unit-returning handlers reply with zero bytes;
-                // shape that as `Value::Unit` so the per-return-type
-                // decoder below doesn't panic in `Decode::decode`.
-                let #value_ident: vos::value::Value = if __reply_bytes.is_empty() {
-                    vos::value::Value::Unit
-                } else {
-                    vos::Decode::decode(&__reply_bytes)
-                };
+                let #value_ident: vos::value::Value =
+                    __inv.invoke(self.target, __payload).await?;
                 #decode
             }
         }
     }).collect();
 
-    // Host-side typed Client emission goes through a vos-side
-    // decl macro gated on vos's `std` feature (the Client requires
-    // `vos::node::VosNode`). The user crate's old `host` feature
-    // is no longer involved — it stays available for the user's
-    // own optional deps but doesn't gate Client.
-    let client_emission = quote! {
-        vos::__vos_emit_host_client! {
-            struct_name: #client_struct_name;
-            methods: { #( #client_methods_emit )* }
-        }
-    };
-
-    // ── Actor-side client emission ──────────────────────────────
-    //
-    // Same shape as the host client, but for use from inside
-    // another actor's handler. Holds `&mut Context<A>` and the
-    // target ServiceId. Methods are async; they call
-    // `ctx.ask_raw(target, payload).await`, get back a `Value`,
-    // and decode against the handler's declared return type.
-    //
-    // No feature gate — the actor framework that's needed is
-    // always available when `vos` is in the dep graph (which is
-    // a hard requirement for `#[messages]`).
-    let actor_client_struct_name = format_ident!("{}ActorClient", actor_name);
-    let actor_client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
-        let method_ident = &m.wire_name;
-        let wire_name = m.wire_name.to_string();
-        let arg_decls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, t)| {
-            quote! { #n: #t }
-        }).collect();
-        let with_calls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, _)| {
-            let n_str = n.to_string();
-            quote! { .with(#n_str, #n) }
-        }).collect();
-        let return_ty: proc_macro2::TokenStream = match &m.success_ty {
-            None => quote! { () },
-            Some(t) => quote! { #t },
-        };
-        let value_ident = format_ident!("__value");
-        let decode = client_decode_body(&m.success_ty, &value_ident);
-        quote! {
-            pub async fn #method_ident(
-                &mut self,
-                #( #arg_decls ),*
-            ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                use vos::Encode;
-                let __msg = vos::value::Msg::new(#wire_name)
-                    #( #with_calls )*;
-                let __encoded = __msg.encode();
-                let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                __payload.push(vos::value::TAG_DYNAMIC);
-                __payload.extend_from_slice(&__encoded);
-                let __reply_value = self.ctx.ask_raw(self.target, &__payload).await
-                    .map_err(|_| vos::actors::client::ClientError::Unreachable)?;
-                let #value_ident: vos::value::Value = __reply_value;
-                #decode
-            }
-        }
-    }).collect();
-
-    let actor_client_emission = quote! {
-        pub struct #actor_client_struct_name<'a, __A: vos::Actor> {
-            ctx: &'a mut vos::Context<__A>,
+    let ref_emission = quote! {
+        #[derive(Copy, Clone)]
+        pub struct #ref_struct_name {
             target: vos::abi::service::ServiceId,
         }
 
-        impl<'a, __A: vos::Actor> #actor_client_struct_name<'a, __A> {
-            /// Bind to an explicit `ServiceId` from inside another
-            /// actor's handler.
-            pub fn at(
-                ctx: &'a mut vos::Context<__A>,
-                target: vos::abi::service::ServiceId,
-            ) -> Self {
-                Self { ctx, target }
+        impl #ref_struct_name {
+            /// Bind to an explicit `ServiceId`. Cheap; copy freely.
+            pub const fn at(target: vos::abi::service::ServiceId) -> Self {
+                Self { target }
             }
 
-            #( #actor_client_methods_emit )*
+            /// The `ServiceId` this ref points at.
+            pub const fn id(&self) -> vos::abi::service::ServiceId {
+                self.target
+            }
+
+            #( #ref_methods_emit )*
         }
     };
 
@@ -899,8 +864,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #pvm_entries
         #worker_entries
         #wasm_entries
-        #client_emission
-        #actor_client_emission
+        #ref_emission
     };
 
     expanded.into()

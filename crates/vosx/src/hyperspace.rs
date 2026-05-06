@@ -22,19 +22,21 @@ pub struct AnnouncePlan {
 }
 
 /// Send an `announce(...)` to the local registry replica via
-/// the macro-generated [`registry::RegistryClient`] for every
+/// the macro-generated [`registry::RegistryRef`] for every
 /// plan. The local replica fans the entries out through the
 /// CRDT layer; in a single-host setup this is just a
 /// same-process invoke.
 pub fn flush_registry_announces(node: &VosNode, plans: &[AnnouncePlan]) {
-    let client = registry::RegistryClient::at(node, ServiceId::REGISTRY);
+    let reg = registry::RegistryRef::at(ServiceId::REGISTRY);
     for plan in plans {
-        match client.announce(
+        let result = vos::block_on(reg.announce(
+            &mut &*node,
             plan.name.clone(),
             plan.owner_prefix as u32,
             plan.service_id as u32,
             plan.roles.clone(),
-        ) {
+        ));
+        match result {
             Ok(()) => eprintln!("vosx: registered '{}' in registry", plan.name),
             Err(e) => eprintln!(
                 "vosx: warning: registry announce for '{}' failed: {e}",

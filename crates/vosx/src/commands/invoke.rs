@@ -182,12 +182,12 @@ fn resolve_target(node: &vos::node::VosNode, target_str: &str) -> ServiceId {
             .unwrap_or_else(|e| die(&format!("invalid 0x ServiceId '{target_str}': {e}")));
         return ServiceId(raw);
     }
-    // Resolve via the macro-generated `RegistryClient`. Returns
+    // Resolve via the macro-generated `RegistryRef`. Returns
     // 0 when the name isn't registered; we surface that as
     // "not found" since the registry's own ID (also 0) is
     // never a useful resolution target.
-    let id = registry::RegistryClient::at(node, ServiceId::REGISTRY)
-        .resolve(target_str.to_string())
+    let reg = registry::RegistryRef::at(ServiceId::REGISTRY);
+    let id = vos::block_on(reg.resolve(&mut &*node, target_str.to_string()))
         .unwrap_or_else(|e| die(&format!("resolve '{target_str}': {e}")));
     if id == 0 {
         eprintln!("'{target_str}' not registered");

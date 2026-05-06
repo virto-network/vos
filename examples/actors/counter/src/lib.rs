@@ -4,9 +4,7 @@
 //! Each invocation runs one iteration: increment, print, yield.
 //! The agent re-invokes to drive subsequent iterations.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
+use vos::prelude::*;
 
 #[actor]
 struct Counter {
@@ -23,10 +21,9 @@ impl Counter {
     async fn start(&mut self, ctx: &mut Context<Self>) {
         loop {
             self.count += 1;
-            println!("counter: count = {}", self.count);
+            log::info!("counter: count = {}", self.count);
             ctx.yield_now().await;
         }
     }
 }
 
-vos::pvm_main!(Counter);

@@ -1206,7 +1206,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // Pre-fix: the message gets silently dropped at fetch_raw,
     // counter never sees `inc()`, count stays 0.
     // Post-fix: the message arrives, dispatches, count goes to 1.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
@@ -1224,7 +1224,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
 
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(counter_blob));
-    let counter = CrdtCounterClient::at(&node, id);
+    let counter = CrdtCounterRef::at(id);
 
     // Build a valid TAG_DYNAMIC + Msg("inc", tag=1) payload, padded
     // to exactly 4096 bytes by inserting zero bytes between the
@@ -1246,7 +1246,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // needing run_until_idle.
     let _ = node.invoke(id, payload);
 
-    let count = counter.get().expect("get must succeed");
+    let count = vos::block_on(counter.get(&mut &node)).expect("get must succeed");
     assert_eq!(
         count, 1,
         "exact-fit FETCH must deliver the message — pre-fix the guest \
@@ -1277,10 +1277,10 @@ fn runtime_multiple_services_same_blob() {
 fn crdt_counter_local_invoke_smoke() {
     // Sanity check: drive the crdt-counter actor in a single
     // VosNode (no replication) using the macro-generated typed
-    // `CrdtCounterClient`. inc returns (), get returns u64 —
+    // `CrdtCounterRef`. inc returns (), get returns u64 —
     // both come from the actor's `#[msg]` signatures, no manual
     // `Msg::new(...)` plumbing needed.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -1296,10 +1296,10 @@ fn crdt_counter_local_invoke_smoke() {
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(blob));
 
-    let counter = CrdtCounterClient::at(&node, id);
-    counter.inc(1).expect("inc 1");
-    counter.inc(2).expect("inc 2");
-    assert_eq!(counter.get().expect("get"), 2);
+    let counter = CrdtCounterRef::at(id);
+    vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+    vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get"), 2);
 
     node.shutdown();
     let _ = node.collect();
@@ -1777,7 +1777,7 @@ fn ctx_resolve_returns_announced_service_id() {
     // Single-node setup — the path under test is the actor's
     // INVOKE hostcall to ServiceId::REGISTRY, decoding the rkyv
     // RegistryEntry, and surfacing the full u32 to the caller.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
@@ -1829,22 +1829,23 @@ fn ctx_resolve_returns_announced_service_id() {
 
     // Tell the registry that "kunekt/counter" lives at
     // counter_id. owner_prefix=0 since the node has no prefix.
-    let registry_client = || RegistryClient::at(&node, ServiceId::REGISTRY);
-    registry_client()
-        .announce(
-            "kunekt/counter".to_string(),
-            counter_id.node_prefix() as u32,
-            counter_id.local_id() as u32,
-            vec!["counter".to_string()],
-        )
-        .expect("announce");
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
+    vos::block_on(registry.announce(
+        &mut &node,
+        "kunekt/counter".to_string(),
+        counter_id.node_prefix() as u32,
+        counter_id.local_id() as u32,
+        vec!["counter".to_string()],
+    ))
+    .expect("announce");
 
     // Poll the registry until it sees the entry — the announce
     // returns immediately but the actor loop processes it on
     // its next tick. The macro-generated `lookup` returns
     // `Result<Option<RegistryEntry>, ClientError>` directly.
     wait_for(
-        || registry_client().lookup("kunekt/counter".to_string()).ok().flatten(),
+        || vos::block_on(registry.lookup(&mut &node, "kunekt/counter".to_string()))
+            .ok().flatten(),
         std::time::Duration::from_secs(3),
     )
     .expect("registry sees announce");
@@ -1886,7 +1887,7 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     // both replicas converge to a 2-entry directory. Lookup,
     // by_role, and paginated list all return consistent answers
     // from either side.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -1971,22 +1972,24 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     let alice_roles = vec!["worker".to_string()];
     let bob_roles = vec!["worker".to_string(), "leader".to_string()];
 
-    RegistryClient::at(&node_a, ServiceId::REGISTRY)
-        .announce(
-            "kunekt/alice".to_string(), prefix_a as u32, 100, alice_roles.clone(),
-        )
-        .expect("announce alice on A");
-    RegistryClient::at(&node_b, ServiceId::REGISTRY)
-        .announce(
-            "kunekt/bob".to_string(), prefix_b as u32, 200, bob_roles.clone(),
-        )
-        .expect("announce bob on B");
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
+    vos::block_on(registry.announce(
+        &mut &node_a,
+        "kunekt/alice".to_string(), prefix_a as u32, 100, alice_roles.clone(),
+    ))
+    .expect("announce alice on A");
+    vos::block_on(registry.announce(
+        &mut &node_b,
+        "kunekt/bob".to_string(), prefix_b as u32, 200, bob_roles.clone(),
+    ))
+    .expect("announce bob on B");
 
     // ── Wait for both replicas to converge on both entries ────
     let see_both = |node: &VosNode| -> bool {
-        let client = RegistryClient::at(node, ServiceId::REGISTRY);
-        client.lookup("kunekt/alice".to_string()).ok().flatten().is_some()
-        && client.lookup("kunekt/bob".to_string()).ok().flatten().is_some()
+        vos::block_on(registry.lookup(&mut &*node, "kunekt/alice".to_string()))
+            .ok().flatten().is_some()
+        && vos::block_on(registry.lookup(&mut &*node, "kunekt/bob".to_string()))
+            .ok().flatten().is_some()
     };
 
     wait_for(|| if see_both(&node_a) { Some(()) } else { None },
@@ -1998,49 +2001,58 @@ fn registry_announce_lookup_and_list_converge_across_nodes() {
     for (label, node, expected_a_prefix, expected_b_prefix) in
         [("A", &node_a, prefix_a, prefix_b), ("B", &node_b, prefix_a, prefix_b)]
     {
-        let client = RegistryClient::at(node, ServiceId::REGISTRY);
-        let alice = client.lookup("kunekt/alice".to_string()).unwrap()
+        let alice = vos::block_on(registry.lookup(&mut &*node, "kunekt/alice".to_string()))
+            .unwrap()
             .unwrap_or_else(|| panic!("{label}: alice missing"));
         assert_eq!(alice.name, "kunekt/alice");
         assert_eq!(alice.owner_prefix, expected_a_prefix);
         assert_eq!(alice.service_id, 100);
         assert_eq!(alice.roles, alice_roles);
 
-        let bob = client.lookup("kunekt/bob".to_string()).unwrap()
+        let bob = vos::block_on(registry.lookup(&mut &*node, "kunekt/bob".to_string()))
+            .unwrap()
             .unwrap_or_else(|| panic!("{label}: bob missing"));
         assert_eq!(bob.owner_prefix, expected_b_prefix);
         assert_eq!(bob.service_id, 200);
         assert_eq!(bob.roles, bob_roles);
 
         // Listing under the prefix returns both, sorted.
-        let page = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
+        let page = vos::block_on(registry.list(
+            &mut &*node, "kunekt/".to_string(), String::new(), 64,
+        )).unwrap();
         let names: Vec<_> = page.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["kunekt/alice", "kunekt/bob"], "{label}: list");
 
         // by_role narrows correctly.
-        let workers = client
-            .by_role("worker".to_string(), String::new(), String::new(), 64).unwrap();
+        let workers = vos::block_on(registry.by_role(
+            &mut &*node, "worker".to_string(), String::new(), String::new(), 64,
+        )).unwrap();
         let worker_names: Vec<_> = workers.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(worker_names, vec!["kunekt/alice", "kunekt/bob"], "{label}: workers");
 
-        let leaders = client
-            .by_role("leader".to_string(), String::new(), String::new(), 64).unwrap();
+        let leaders = vos::block_on(registry.by_role(
+            &mut &*node, "leader".to_string(), String::new(), String::new(), 64,
+        )).unwrap();
         let leader_names: Vec<_> = leaders.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(leader_names, vec!["kunekt/bob"], "{label}: leaders");
 
         // Lookup of a missing name returns None.
-        assert!(client.lookup("kunekt/nobody".to_string()).unwrap().is_none(),
+        assert!(vos::block_on(registry.lookup(&mut &*node, "kunekt/nobody".to_string()))
+            .unwrap().is_none(),
             "{label}: missing");
     }
 
     // ── Pagination: limit=1 walks both entries in 2 pages ─────
     {
-        let client = RegistryClient::at(&node_a, ServiceId::REGISTRY);
-        let p1 = client.list("kunekt/".to_string(), String::new(), 1).unwrap();
+        let p1 = vos::block_on(registry.list(
+            &mut &node_a, "kunekt/".to_string(), String::new(), 1,
+        )).unwrap();
         assert_eq!(p1.entries.len(), 1);
         assert_eq!(p1.entries[0].name, "kunekt/alice");
         assert!(p1.has_more());
-        let p2 = client.list("kunekt/".to_string(), p1.next.clone(), 1).unwrap();
+        let p2 = vos::block_on(registry.list(
+            &mut &node_a, "kunekt/".to_string(), p1.next.clone(), 1,
+        )).unwrap();
         assert_eq!(p2.entries.len(), 1);
         assert_eq!(p2.entries[0].name, "kunekt/bob");
         assert!(!p2.has_more());
@@ -2061,7 +2073,7 @@ fn registry_heartbeat_bumps_last_seen() {
     // convergence (the existing
     // `registry_announce_lookup_and_list_converge_across_nodes`
     // already exercises that).
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use vos::abi::service::ServiceId;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -2093,13 +2105,16 @@ fn registry_heartbeat_bumps_last_seen() {
         ServiceId::REGISTRY,
     );
 
-    let client = RegistryClient::at(&node, ServiceId::REGISTRY);
-    let lookup = |name: &str| client.lookup(name.to_string()).expect("invoke");
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
+    let lookup = |name: &str| vos::block_on(registry.lookup(&mut &node, name.to_string()))
+        .expect("invoke");
 
-    client.announce("kunekt/alpha".to_string(), 0, 11, vec!["worker".to_string()])
-        .expect("announce alpha");
-    client.announce("kunekt/beta".to_string(), 0, 22, vec![])
-        .expect("announce beta");
+    vos::block_on(registry.announce(
+        &mut &node, "kunekt/alpha".to_string(), 0, 11, vec!["worker".to_string()],
+    )).expect("announce alpha");
+    vos::block_on(registry.announce(
+        &mut &node, "kunekt/beta".to_string(), 0, 22, vec![],
+    )).expect("announce beta");
 
     // Initial state: announce assigns last_seen in tick order.
     let alpha_t0 = lookup("kunekt/alpha").expect("alpha");
@@ -2109,12 +2124,15 @@ fn registry_heartbeat_bumps_last_seen() {
         alpha_t0.last_seen, beta_t0.last_seen);
 
     // Page snapshot exposes the registry's current tick.
-    let page0 = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    let page0 = vos::block_on(registry.list(
+        &mut &node, "kunekt/".to_string(), String::new(), 64,
+    )).unwrap();
     assert!(page0.clock >= beta_t0.last_seen, "page clock {} < beta {}",
         page0.clock, beta_t0.last_seen);
 
     // Heartbeat alpha — last_seen should advance past beta's.
-    client.heartbeat("kunekt/alpha".to_string()).expect("heartbeat alpha");
+    vos::block_on(registry.heartbeat(&mut &node, "kunekt/alpha".to_string()))
+        .expect("heartbeat alpha");
     let alpha_t1 = lookup("kunekt/alpha").expect("alpha post-hb");
     assert!(alpha_t1.last_seen > beta_t0.last_seen,
         "heartbeat should bump alpha's last_seen above beta's: alpha={} beta={}",
@@ -2128,12 +2146,15 @@ fn registry_heartbeat_bumps_last_seen() {
     assert_eq!(beta_t1.last_seen, beta_t0.last_seen, "heartbeat should not touch siblings");
 
     // Heartbeat for an unknown name is a silent no-op.
-    client.heartbeat("kunekt/ghost".to_string()).expect("heartbeat ghost (no-op)");
+    vos::block_on(registry.heartbeat(&mut &node, "kunekt/ghost".to_string()))
+        .expect("heartbeat ghost (no-op)");
     assert!(lookup("kunekt/ghost").is_none(),
         "heartbeat should not create entries");
 
     // is_alive_within helper.
-    let page1 = client.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    let page1 = vos::block_on(registry.list(
+        &mut &node, "kunekt/".to_string(), String::new(), 64,
+    )).unwrap();
     assert!(alpha_t1.is_alive_within(page1.clock, 1), "alpha should be fresh");
     assert!(!beta_t0.is_alive_within(page1.clock, 1),
         "beta should age past max_age=1: clock={} beta.last_seen={}",
@@ -2153,7 +2174,7 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
     // primitive directly — register, announce, then drive
     // heartbeats from a worker thread and observe last_seen
     // climb.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2190,9 +2211,11 @@ fn registry_invoke_handle_drives_heartbeats_from_another_thread() {
         ServiceId::REGISTRY,
     );
 
-    let client = RegistryClient::at(&node, ServiceId::REGISTRY);
-    let lookup_entry = || client.lookup("kunekt/svc".to_string()).ok().flatten();
-    client.announce("kunekt/svc".to_string(), 0, 7, vec![]).expect("announce");
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
+    let lookup_entry = || vos::block_on(registry.lookup(&mut &node, "kunekt/svc".to_string()))
+        .ok().flatten();
+    vos::block_on(registry.announce(&mut &node, "kunekt/svc".to_string(), 0, 7, vec![]))
+        .expect("announce");
     let initial = lookup_entry().expect("svc");
 
     // Spin up a side thread that fires heartbeats every 50ms
@@ -2258,7 +2281,7 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     // should walk A's heads via FetchHeads/FetchNode, populate
     // its DAG, and replay on the local replica — no further
     // writes from anyone needed.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -2285,6 +2308,7 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     std::fs::create_dir_all(&dir_b).unwrap();
 
     let rep_id = registry::replication_id("cold-bootstrap-test");
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
 
     // ── Phase 1: only A exists, accumulates state ──────────────
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
@@ -2311,16 +2335,20 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     );
     node_a.attach_network(net_a);
 
-    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
-    client_a.announce("kunekt/alpha".to_string(), prefix_a as u32, 1, vec![])
-        .expect("announce alpha");
-    client_a.announce("kunekt/beta".to_string(), prefix_a as u32, 2, vec![])
-        .expect("announce beta");
-    client_a.announce("kunekt/gamma".to_string(), prefix_a as u32, 3,
-        vec!["worker".to_string()]).expect("announce gamma");
+    vos::block_on(registry.announce(&mut &node_a,
+        "kunekt/alpha".to_string(), prefix_a as u32, 1, vec![]
+    )).expect("announce alpha");
+    vos::block_on(registry.announce(&mut &node_a,
+        "kunekt/beta".to_string(), prefix_a as u32, 2, vec![]
+    )).expect("announce beta");
+    vos::block_on(registry.announce(&mut &node_a,
+        "kunekt/gamma".to_string(), prefix_a as u32, 3, vec!["worker".to_string()]
+    )).expect("announce gamma");
 
     // Confirm A has all three before bringing B up.
-    let initial = client_a.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    let initial = vos::block_on(registry.list(
+        &mut &node_a, "kunekt/".to_string(), String::new(), 64,
+    )).unwrap();
     assert_eq!(initial.entries.len(), 3,
         "A should hold three entries before B joins");
 
@@ -2343,12 +2371,14 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     node_b.attach_network(net_b);
 
     // ── Phase 3: B catches up via the sync protocol ────────────
-    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
     wait_for(
         || {
-            let alpha = client_b.lookup("kunekt/alpha".to_string()).ok().flatten();
-            let beta = client_b.lookup("kunekt/beta".to_string()).ok().flatten();
-            let gamma = client_b.lookup("kunekt/gamma".to_string()).ok().flatten();
+            let alpha = vos::block_on(registry.lookup(&mut &node_b, "kunekt/alpha".to_string()))
+                .ok().flatten();
+            let beta = vos::block_on(registry.lookup(&mut &node_b, "kunekt/beta".to_string()))
+                .ok().flatten();
+            let gamma = vos::block_on(registry.lookup(&mut &node_b, "kunekt/gamma".to_string()))
+                .ok().flatten();
             if alpha.is_some() && beta.is_some() && gamma.is_some() {
                 Some(())
             } else {
@@ -2361,15 +2391,19 @@ fn registry_cold_bootstrap_pulls_existing_state_from_peer() {
     // Confirm gamma's role list survived the round-trip — checks
     // that the EffectLog payload was replicated faithfully, not
     // just the entry count.
-    let gamma = client_b.lookup("kunekt/gamma".to_string())
+    let gamma = vos::block_on(registry.lookup(&mut &node_b, "kunekt/gamma".to_string()))
         .unwrap().expect("gamma");
     assert_eq!(gamma.roles, vec!["worker".to_string()]);
 
     // Both replicas now report the same clock — a side effect of
     // every announce flowing through both DAGs. They may differ
     // by 1 if a heartbeat raced; treat ≥ A's tick as sync-caught-up.
-    let page_a = client_a.list("kunekt/".to_string(), String::new(), 64).unwrap();
-    let page_b = client_b.list("kunekt/".to_string(), String::new(), 64).unwrap();
+    let page_a = vos::block_on(registry.list(
+        &mut &node_a, "kunekt/".to_string(), String::new(), 64,
+    )).unwrap();
+    let page_b = vos::block_on(registry.list(
+        &mut &node_b, "kunekt/".to_string(), String::new(), 64,
+    )).unwrap();
     assert!(page_b.clock >= page_a.clock - 1,
         "B's clock {} < A's clock {} — sync did not deliver tail events",
         page_b.clock, page_a.clock);
@@ -2386,7 +2420,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
     // must replay its EffectLog and rebuild the same state.
     // No networking — just one node, same redb file across two
     // VosNode instances, asserting `get()` survives the restart.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     // Initialize tracing so any error! / warn! from the agent
@@ -2443,11 +2477,11 @@ fn crdt_counter_restart_replays_state_from_disk() {
         );
         counter_id = id;
 
-        let counter = CrdtCounterClient::at(&node, id);
-        counter.inc(1).expect("inc 1");
-        counter.inc(2).expect("inc 2");
-        counter.inc(3).expect("inc 3");
-        assert_eq!(counter.get().expect("get pre-restart"), 3);
+        let counter = CrdtCounterRef::at(id);
+        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node, 3)).expect("inc 3");
+        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
 
         node.shutdown();
         let _ = node.collect();
@@ -2485,9 +2519,9 @@ fn crdt_counter_restart_replays_state_from_disk() {
         // state. (Same prefix, deterministic local-id allocation.)
         assert_eq!(id, counter_id, "restarted actor must reuse its ServiceId");
 
-        let counter = CrdtCounterClient::at(&node, id);
+        let counter = CrdtCounterRef::at(id);
         assert_eq!(
-            counter.get().expect("get post-restart"),
+            vos::block_on(counter.get(&mut &node)).expect("get post-restart"),
             3,
             "restart must replay the three logged incs",
         );
@@ -2495,8 +2529,8 @@ fn crdt_counter_restart_replays_state_from_disk() {
         // One more inc after restart — confirms the replayed
         // state isn't a frozen snapshot, the actor really is
         // alive and writable on the same DAG.
-        counter.inc(4).expect("inc post-restart");
-        assert_eq!(counter.get().expect("get final"), 4);
+        vos::block_on(counter.inc(&mut &node, 4)).expect("inc post-restart");
+        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
 
         node.shutdown();
         let _ = node.collect();
@@ -2527,7 +2561,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
     // `Decode::try_decode` (rkyv `access` + bytecheck), so a
     // corrupted blob falls back to `A::create()` and the
     // actor reports a clean count==0.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -2571,10 +2605,10 @@ fn crdt_counter_survives_corrupted_persisted_state() {
                 .with_replication_id(rep_id),
         );
         counter_id = id;
-        let counter = CrdtCounterClient::at(&node, id);
-        counter.inc(1).expect("inc 1");
-        counter.inc(2).expect("inc 2");
-        assert_eq!(counter.get().expect("get"), 2);
+        let counter = CrdtCounterRef::at(id);
+        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get"), 2);
         node.shutdown();
         let _ = node.collect();
     }
@@ -2613,7 +2647,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         );
         assert_eq!(id, counter_id);
 
-        let counter = CrdtCounterClient::at(&node, id);
+        let counter = CrdtCounterRef::at(id);
 
         // The expected behaviour after the fix lands:
         //   (a) get() returns Ok(0) — actor fell back to a
@@ -2624,7 +2658,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         // What MUST NOT happen: get() returns Ok(<garbage>),
         // because then any caller silently consumes wrong
         // state.
-        let get_result = counter.get();
+        let get_result = vos::block_on(counter.get(&mut &node));
         match get_result {
             Ok(0) => { /* fresh start, ideal */ }
             Err(_) => { /* explicit failure, also fine */ }
@@ -2639,8 +2673,8 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         // Once we've handled the corruption, the agent thread
         // must still respond to subsequent calls — even if
         // they error.
-        let _ = counter.inc(99);
-        let _ = counter.get();
+        let _ = vos::block_on(counter.inc(&mut &node, 99));
+        let _ = vos::block_on(counter.get(&mut &node));
 
         node.shutdown();
         let _ = node.collect();
@@ -2740,7 +2774,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // subsequent invoke times out and the actor is effectively
     // dead. That'd be a fatal regression for any production
     // use, so this is a load-bearing test.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -2780,21 +2814,21 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
             .with_replication_id(rep_id),
     );
 
-    let counter = CrdtCounterClient::at(&node, id);
+    let counter = CrdtCounterRef::at(id);
 
     // Build up some state first so we can detect corruption
     // post-panic.
-    counter.inc(1).expect("inc 1");
-    counter.inc(2).expect("inc 2");
-    assert_eq!(counter.get().expect("get pre-boom"), 2);
+    vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+    vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-boom"), 2);
 
-    // Trigger the panic. The macro-generated client returns
+    // Trigger the panic. The macro-generated Ref returns
     // `ClientError::Unreachable` because `node.invoke` returns
     // `None` when the actor's invoke pipeline reports a panic.
     // We don't care about the exact error variant — we care
     // that (a) the call returns *something* without hanging,
     // and (b) the agent thread is still alive after.
-    let boom_result = counter.boom();
+    let boom_result = vos::block_on(counter.boom(&mut &node));
     assert!(
         boom_result.is_err(),
         "boom() must surface the panic as an error, got Ok: {boom_result:?}",
@@ -2804,7 +2838,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // dispatching, state should be exactly 2 (the panic
     // mutated nothing observable since `boom` only panics).
     assert_eq!(
-        counter.get().expect("get post-boom must succeed"),
+        vos::block_on(counter.get(&mut &node)).expect("get post-boom must succeed"),
         2,
         "state should be unchanged after a handler panic",
     );
@@ -2812,14 +2846,14 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // Subsequent writes must still land. This is the test
     // that fails loudest if the agent thread died on the panic
     // (the invoke would time out / return Unreachable).
-    counter.inc(3).expect("inc post-boom must succeed");
-    assert_eq!(counter.get().expect("get final"), 3);
+    vos::block_on(counter.inc(&mut &node, 3)).expect("inc post-boom must succeed");
+    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 3);
 
     // Hit boom a second time — exercises the recovery path
     // twice in case the first survival was a fluke.
-    let _ = counter.boom();
-    counter.inc(4).expect("inc after second boom");
-    assert_eq!(counter.get().expect("get final-final"), 4);
+    let _ = vos::block_on(counter.boom(&mut &node));
+    vos::block_on(counter.inc(&mut &node, 4)).expect("inc after second boom");
+    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final-final"), 4);
 
     node.shutdown();
     let _ = node.collect();
@@ -2843,7 +2877,7 @@ fn crdt_counter_shutdown_under_active_load() {
     // locked across a node restart (commit 3d56179). This test
     // exercises a tighter loop — interleaving inc() with
     // shutdown — to make sure that fix holds under contention.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -2956,8 +2990,9 @@ fn crdt_counter_shutdown_under_active_load() {
                 .with_replication_id(rep_id),
         );
         assert_eq!(id2, counter_id, "service id should be stable across boots");
-        let counter2 = CrdtCounterClient::at(&node2, id2);
-        let count_after = counter2.get().expect("get must work after reboot");
+        let counter2 = CrdtCounterRef::at(id2);
+        let count_after = vos::block_on(counter2.get(&mut &node2))
+            .expect("get must work after reboot");
         assert_eq!(
             count_after, landed as u64,
             "post-reboot count must match the number of inc() calls that returned \
@@ -3165,7 +3200,7 @@ fn registry_remove_replicates_across_nodes() {
     // converge → remove → converge cycle end-to-end so any
     // ordering regression in the actor or the EffectLog replay
     // surfaces here.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -3186,6 +3221,7 @@ fn registry_remove_replicates_across_nodes() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let dir_root = std::env::temp_dir()
         .join(format!("vos_remove_{}_{}", std::process::id(), stamp));
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -3242,45 +3278,49 @@ fn registry_remove_replicates_across_nodes() {
         { Some(()) } else { None }
     }, Duration::from_secs(10)).expect("Hello completes");
 
-    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
-    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
-
     // ── Phase 1: A announces three; both converge ──────────────
     for (name, id) in [("alpha", 1u32), ("beta", 2), ("gamma", 3)] {
-        client_a.announce(format!("kunekt/{name}"), prefix_a as u32, id, vec![])
-            .expect("announce");
+        vos::block_on(registry.announce(
+            &mut &node_a, format!("kunekt/{name}"), prefix_a as u32, id, vec![],
+        )).expect("announce");
     }
-    let see_three = |client: &RegistryClient<'_>| -> bool {
+    let see_three = |node: &VosNode| -> bool {
         ["alpha", "beta", "gamma"].iter().all(|name|
-            client.lookup(format!("kunekt/{name}")).ok().flatten().is_some())
+            vos::block_on(registry.lookup(&mut &*node, format!("kunekt/{name}")))
+                .ok().flatten().is_some())
     };
-    wait_for(|| if see_three(&client_b) { Some(()) } else { None },
+    wait_for(|| if see_three(&node_b) { Some(()) } else { None },
         Duration::from_secs(10)).expect("B converges to all three");
 
     // ── Phase 2: A removes beta; B's beta should disappear ────
-    client_a.remove("kunekt/beta".to_string()).expect("remove beta");
+    vos::block_on(registry.remove(&mut &node_a, "kunekt/beta".to_string()))
+        .expect("remove beta");
     wait_for(
         || {
-            let beta = client_b.lookup("kunekt/beta".to_string()).ok().flatten();
+            let beta = vos::block_on(registry.lookup(&mut &node_b, "kunekt/beta".to_string()))
+                .ok().flatten();
             if beta.is_none() { Some(()) } else { None }
         },
         Duration::from_secs(10),
     ).expect("B propagates the remove");
 
     // Sibling entries unchanged — `remove` is targeted, not a wipe.
-    assert!(client_b.lookup("kunekt/alpha".to_string()).unwrap().is_some(),
-        "alpha must survive a sibling remove");
-    assert!(client_b.lookup("kunekt/gamma".to_string()).unwrap().is_some(),
-        "gamma must survive a sibling remove");
+    assert!(vos::block_on(registry.lookup(&mut &node_b, "kunekt/alpha".to_string()))
+        .unwrap().is_some(), "alpha must survive a sibling remove");
+    assert!(vos::block_on(registry.lookup(&mut &node_b, "kunekt/gamma".to_string()))
+        .unwrap().is_some(), "gamma must survive a sibling remove");
 
     // ── Phase 3: B announces beta back, A picks it up ──────────
     // Tests the inverse direction (A had the original announce
     // and the remove; B drives the new lifecycle).
-    client_b.announce("kunekt/beta".to_string(), prefix_b as u32, 99, vec![])
+    vos::block_on(registry.announce(
+        &mut &node_b, "kunekt/beta".to_string(), prefix_b as u32, 99, vec![],
+    ))
         .expect("re-announce beta on B");
     wait_for(
         || {
-            let entry = client_a.lookup("kunekt/beta".to_string()).ok().flatten()?;
+            let entry = vos::block_on(registry.lookup(&mut &node_a, "kunekt/beta".to_string()))
+                .ok().flatten()?;
             if entry.owner_prefix == prefix_b && entry.service_id == 99 {
                 Some(())
             } else {
@@ -3419,7 +3459,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
     // Probe shape: drive 1 inc() (1 DAG node), then 50 get()s
     // (no new nodes), then another inc() (1 more node). Counts
     // dag-table row count by opening redb directly.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -3473,10 +3513,10 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
                 .with_replication_id(rep_id),
         );
         counter_id = id;
-        let counter = CrdtCounterClient::at(&node, id);
+        let counter = CrdtCounterRef::at(id);
 
         // Phase 1: one inc → one DAG node.
-        counter.inc(1).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
         node.shutdown();
         let _ = node.collect();
     }
@@ -3499,9 +3539,9 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
                 .with_replication_id(rep_id),
         );
         assert_eq!(id, counter_id);
-        let counter = CrdtCounterClient::at(&node, id);
+        let counter = CrdtCounterRef::at(id);
         for _ in 0..50 {
-            assert_eq!(counter.get().expect("get during read-burst"), 1);
+            assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get during read-burst"), 1);
         }
         node.shutdown();
         let _ = node.collect();
@@ -3524,9 +3564,9 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
                 .with_replication_id(rep_id),
         );
         assert_eq!(id, counter_id);
-        let counter = CrdtCounterClient::at(&node, id);
-        counter.inc(2).expect("inc 2");
-        assert_eq!(counter.get().expect("get post-inc"), 2);
+        let counter = CrdtCounterRef::at(id);
+        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get post-inc"), 2);
         node.shutdown();
         let _ = node.collect();
     }
@@ -3557,7 +3597,7 @@ fn registry_concurrent_announce_and_remove_converges() {
     // reports the entry exists while the other reports it gone:
     // exactly the failure mode CRDTs are supposed to make
     // impossible.
-    use registry::RegistryClient;
+    use registry::RegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -3578,6 +3618,7 @@ fn registry_concurrent_announce_and_remove_converges() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let dir_root = std::env::temp_dir()
         .join(format!("vos_race_{}_{}", std::process::id(), stamp));
+    let registry = RegistryRef::at(ServiceId::REGISTRY);
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -3631,14 +3672,12 @@ fn registry_concurrent_announce_and_remove_converges() {
             && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
         Duration::from_secs(10)).expect("Hello completes");
 
-    let client_a = RegistryClient::at(&node_a, ServiceId::REGISTRY);
-    let client_b = RegistryClient::at(&node_b, ServiceId::REGISTRY);
-
     // ── Phase 1: A seeds an entry; both converge to seeing it ──
-    client_a.announce("kunekt/svc".into(), prefix_a as u32, 1, vec!["v1".into()])
-        .expect("seed announce");
+    vos::block_on(registry.announce(
+        &mut &node_a, "kunekt/svc".into(), prefix_a as u32, 1, vec!["v1".into()],
+    )).expect("seed announce");
     wait_for(
-        || client_b.lookup("kunekt/svc".into()).ok().flatten(),
+        || vos::block_on(registry.lookup(&mut &node_b, "kunekt/svc".into())).ok().flatten(),
         Duration::from_secs(10),
     ).expect("B converges to seed entry");
 
@@ -3647,15 +3686,18 @@ fn registry_concurrent_announce_and_remove_converges() {
     // between them. The local invokes return as soon as each
     // replica's CRDT commit lands; the cross-replica merge is
     // what we're stressing.
-    client_a.remove("kunekt/svc".into()).expect("A: remove");
-    client_b.announce("kunekt/svc".into(), prefix_b as u32, 99, vec!["v2".into()])
-        .expect("B: re-announce");
+    vos::block_on(registry.remove(&mut &node_a, "kunekt/svc".into())).expect("A: remove");
+    vos::block_on(registry.announce(
+        &mut &node_b, "kunekt/svc".into(), prefix_b as u32, 99, vec!["v2".into()],
+    )).expect("B: re-announce");
 
     // ── Phase 3: convergence — agree on whatever wins ─────────
     let agree = wait_for(
         || {
-            let a = client_a.lookup("kunekt/svc".into()).ok().flatten();
-            let b = client_b.lookup("kunekt/svc".into()).ok().flatten();
+            let a = vos::block_on(registry.lookup(&mut &node_a, "kunekt/svc".into()))
+                .ok().flatten();
+            let b = vos::block_on(registry.lookup(&mut &node_b, "kunekt/svc".into()))
+                .ok().flatten();
             let same = match (&a, &b) {
                 (None, None) => true,
                 (Some(ea), Some(eb)) =>
@@ -3714,7 +3756,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
     //   - skip-on-unchanged: `get()` calls don't append entries
     //   - cold restart: `replay_logs` rebuilds count from the log
     //   - subsequent inc()s continue from the rebuilt state
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -3746,13 +3788,13 @@ fn raft_counter_single_node_replays_log_after_restart() {
                 .persist(&dir),
         );
         counter_id = id;
-        let counter = CrdtCounterClient::at(&node, id);
-        counter.inc(1).expect("inc 1");
-        counter.inc(2).expect("inc 2");
-        counter.inc(3).expect("inc 3");
+        let counter = CrdtCounterRef::at(id);
+        vos::block_on(counter.inc(&mut &node, 1)).expect("inc 1");
+        vos::block_on(counter.inc(&mut &node, 2)).expect("inc 2");
+        vos::block_on(counter.inc(&mut &node, 3)).expect("inc 3");
         // Sanity reads — must NOT bloat the log.
         for _ in 0..5 {
-            assert_eq!(counter.get().expect("get pre-restart"), 3);
+            assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
         }
         node.shutdown();
         let _ = node.collect();
@@ -3789,15 +3831,15 @@ fn raft_counter_single_node_replays_log_after_restart() {
         );
         assert_eq!(id, counter_id, "service id stable across restart");
 
-        let counter = CrdtCounterClient::at(&node, id);
+        let counter = CrdtCounterRef::at(id);
         assert_eq!(
-            counter.get().expect("get post-restart"),
+            vos::block_on(counter.get(&mut &node)).expect("get post-restart"),
             3,
             "log replay must produce identical state",
         );
         // One more inc: log appends a fourth entry post-restart.
-        counter.inc(4).expect("inc post-restart");
-        assert_eq!(counter.get().expect("get final"), 4);
+        vos::block_on(counter.inc(&mut &node, 4)).expect("inc post-restart");
+        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
         node.shutdown();
         let _ = node.collect();
     }
@@ -3839,7 +3881,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     //   4. node.rs wires the worker + relay (phase 5.2).
     //   5. Followers' actor state catches up via sync_rx-driven
     //      soft restart — same path CRDT uses.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
@@ -3974,8 +4016,8 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         let until = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             for (node, id) in counters.iter() {
-                let client = CrdtCounterClient::at(*node, *id);
-                if client.inc(tag).is_ok() {
+                let counter = CrdtCounterRef::at(*id);
+                if vos::block_on(counter.inc(&mut &**node, tag)).is_ok() {
                     return true;
                 }
             }
@@ -3995,7 +4037,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     // soft_restart to replay the freshly-committed entries into
     // their actor state.
     let read_count = |node: &VosNode, id: ServiceId| -> Option<u64> {
-        CrdtCounterClient::at(node, id).get().ok()
+        vos::block_on(CrdtCounterRef::at(id).get(&mut &*node)).ok()
     };
     let final_a = wait_for(
         || (read_count(&node_a, counter_a) == Some(3)).then_some(3u64),
@@ -4085,7 +4127,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     // We poll each replica's redb directly until raft_log row
     // count drops below the hysteresis threshold + commit_index
     // reaches 64.
-    use crdt_counter::CrdtCounterClient;
+    use crdt_counter::CrdtCounterRef;
     use std::time::{Duration, Instant};
     use vos::network::{derive_node_prefix, Network, NetworkConfig};
     use vos::node::{AgentConfig, Consistency, VosNode};
@@ -4213,8 +4255,8 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         let until = Instant::now() + Duration::from_secs(20);
         loop {
             for (node, id) in counters.iter() {
-                let client = CrdtCounterClient::at(*node, *id);
-                if client.inc(tag).is_ok() {
+                let counter = CrdtCounterRef::at(*id);
+                if vos::block_on(counter.inc(&mut &**node, tag)).is_ok() {
                     return true;
                 }
             }

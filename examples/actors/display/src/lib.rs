@@ -6,10 +6,7 @@
 //!
 //! The `read` handler returns the current framebuffer contents.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 const WIDTH: u32 = 16;
 const HEIGHT: u32 = 8;
 
@@ -45,7 +42,7 @@ impl Display {
         let len = pixels.len().min(self.framebuffer.len());
         self.framebuffer[..len].copy_from_slice(&pixels[..len]);
 
-        println!("display: rendered frame ({}x{}, delta={})", WIDTH, HEIGHT, delta);
+        log::info!("display: rendered frame ({}x{}, delta={})", WIDTH, HEIGHT, delta);
         delta
     }
 
@@ -56,4 +53,3 @@ impl Display {
     }
 }
 
-vos::pvm_main!(Display);

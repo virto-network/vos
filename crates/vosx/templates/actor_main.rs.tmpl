@@ -1,8 +1,0 @@
-//! Bin entry. `vos::pvm_main!` emits `_start` / `accumulate`
-//! and the `.vos_meta` static; the actor itself lives in
-//! `lib.rs`.
-
-#![no_std]
-#![no_main]
-
-vos::pvm_main!(counter::Counter);

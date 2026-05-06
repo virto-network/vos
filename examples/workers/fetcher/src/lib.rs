@@ -7,7 +7,7 @@
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
-use vos::{actor, messages};
+use vos::prelude::*;
 
 #[actor]
 struct Fetcher;

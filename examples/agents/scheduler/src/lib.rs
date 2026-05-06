@@ -9,11 +9,7 @@
 //! subsequent tick rounds.
 
 use vos::lifecycle::InvokeResult;
-use vos::value::Msg;
-use vos::{actor, messages, lifecycle};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 /// No artificial cap — the runtime's per-tick iteration limit + gas
 /// budget provide the safety ceiling. Across ticks, continuations
 /// let the scheduler run indefinitely.
@@ -24,23 +20,23 @@ fn invoke_child(svc_id: u32, msg: &Msg, state: &[u8]) -> Option<Vec<u8>> {
     match lifecycle::invoke(svc_id, msg, state) {
         InvokeResult::Yielded { state, .. } => Some(state),
         InvokeResult::Done { .. } => {
-            println!("agent: child {} completed", svc_id);
+            log::info!("agent: child {} completed", svc_id);
             None
         }
         InvokeResult::Panicked => {
-            println!("agent: child {} panicked, dropping", svc_id);
+            log::info!("agent: child {} panicked, dropping", svc_id);
             None
         }
         InvokeResult::NotFound => {
-            println!("agent: child {} not found, dropping", svc_id);
+            log::info!("agent: child {} not found, dropping", svc_id);
             None
         }
         InvokeResult::OutOfGas => {
-            println!("agent: child {} out of gas, dropping", svc_id);
+            log::info!("agent: child {} out of gas, dropping", svc_id);
             None
         }
         InvokeResult::Error(s) => {
-            println!("agent: child {} error (0x{:02x}), dropping", svc_id, s);
+            log::info!("agent: child {} error (0x{:02x}), dropping", svc_id, s);
             None
         }
     }
@@ -57,7 +53,7 @@ struct Agent {
 #[messages]
 impl Agent {
     fn new(children: Vec<u32>) -> Self {
-        println!("agent: init");
+        log::info!("agent: init");
 
         // The host kicks us with a dynamic `start` message — no need to
         // self-schedule from the constructor (refine forbids raw
@@ -74,7 +70,7 @@ impl Agent {
     #[msg]
     async fn install(&mut self, actor_id: u32, ctx: &mut Context<Self>) {
         self.children.push(actor_id);
-        println!("agent: installed actor {}", actor_id);
+        log::info!("agent: installed actor {}", actor_id);
 
         let start_msg = Msg::new("start");
         if let Some(state) = invoke_child(actor_id, &start_msg, &[]) {
@@ -118,4 +114,3 @@ impl Agent {
     }
 }
 
-vos::pvm_main!(Agent);

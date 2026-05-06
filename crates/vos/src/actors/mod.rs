@@ -48,11 +48,8 @@ pub fn run_accumulate_entry<A: Actor>() { run::run_accumulate_service::<A>() }
 #[cfg(all(feature = "pvm", not(feature = "service")))]
 pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */ }
 
-// --- Guest I/O macros and panic handler ---
-
-#[cfg(feature = "pvm")]
-mod guest_io;
-
+// --- Guest panic handler ---
+//
 // Guest-only #[panic_handler]. Include only when we're a no_std
 // guest build — when both `pvm` and `std` are enabled (which
 // happens to vos itself when an actor crate is dev-deped from

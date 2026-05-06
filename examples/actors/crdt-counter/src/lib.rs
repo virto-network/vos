@@ -18,12 +18,8 @@
 //! to the same count regardless of order, since the underlying
 //! op is commutative.
 
-#![no_std]
-
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+#![cfg_attr(any(target_arch = "riscv64", target_arch = "wasm32"), no_std)]
+use vos::prelude::*;
 #[actor]
 pub struct CrdtCounter {
     count: u64,
@@ -41,12 +37,12 @@ impl CrdtCounter {
         // replicas hash to different DAG-node CIDs. Not used in the
         // state transition.
         self.count += 1;
-        println!("crdt-counter: inc tag={tag} -> count={}", self.count);
+        log::info!("crdt-counter: inc tag={tag} -> count={}", self.count);
     }
 
     #[msg]
     async fn get(&self) -> u64 {
-        println!("crdt-counter: get -> {}", self.count);
+        log::info!("crdt-counter: get -> {}", self.count);
         self.count
     }
 
@@ -61,28 +57,27 @@ impl CrdtCounter {
     }
 
     /// Resolve `name` against the hyperspace registry via the
-    /// macro-generated `RegistryActorClient`. The actor-side
-    /// client wraps `ctx.ask(REGISTRY, "resolve", ...).await`
-    /// in a typed method.
+    /// macro-generated `RegistryRef`. The same Ref type works
+    /// here (with `ctx` as the invoker) and from host code (with
+    /// `&node` as the invoker).
     #[msg]
     async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
         use vos::abi::service::ServiceId;
-        use registry::RegistryActorClient;
-        match RegistryActorClient::at(ctx, ServiceId::REGISTRY)
-            .resolve(name.clone()).await
-        {
+        use registry::RegistryRef;
+        match RegistryRef::at(ServiceId::REGISTRY).resolve(ctx, name.clone()).await {
             Ok(id) => {
                 if id == 0 {
-                    println!("crdt-counter: whois({name}) -> not found");
+                    log::info!("crdt-counter: whois({name}) -> not found");
                 } else {
-                    println!("crdt-counter: whois({name}) -> {id}");
+                    log::info!("crdt-counter: whois({name}) -> {id}");
                 }
                 id
             }
             Err(e) => {
-                println!("crdt-counter: whois({name}) -> error {e}");
+                log::info!("crdt-counter: whois({name}) -> error {e}");
                 0
             }
         }
     }
 }
+

@@ -2,10 +2,7 @@
 //!
 //! Actors appear as pipeable commands in nu scripts. Not yet implemented.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 #[actor]
 struct Nushell {
     children: Vec<u32>,
@@ -14,14 +11,13 @@ struct Nushell {
 #[messages]
 impl Nushell {
     fn new(children: Vec<u32>) -> Self {
-        println!("nushell: init (stub)");
+        log::info!("nushell: init (stub)");
         Nushell { children }
     }
 
     #[msg]
     async fn start(&mut self, _ctx: &mut Context<Self>) {
-        println!("nushell: not yet implemented");
+        log::info!("nushell: not yet implemented");
     }
 }
 
-vos::pvm_main!(Nushell);

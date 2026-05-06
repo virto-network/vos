@@ -71,9 +71,8 @@ fn print_peers(node: &vos::node::VosNode) {
 
 fn print_registry(node: &vos::node::VosNode) {
     println!();
-    let client = registry::RegistryClient::at(node, ServiceId::REGISTRY);
-    let page = client
-        .list(String::new(), String::new(), 256)
+    let reg = registry::RegistryRef::at(ServiceId::REGISTRY);
+    let page = vos::block_on(reg.list(&mut &*node, String::new(), String::new(), 256))
         .unwrap_or_else(|e| die(&format!("registry list: {e}")));
     if page.entries.is_empty() {
         println!("registry: (empty) clock={}", page.clock);

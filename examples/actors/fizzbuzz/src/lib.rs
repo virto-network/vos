@@ -3,10 +3,7 @@
 //! Demonstrates a stateful refine-only actor with conditional logic
 //! and a yield loop. Each invocation prints the next fizzbuzz value.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 #[actor]
 struct FizzBuzz {
     n: u32,
@@ -23,17 +20,16 @@ impl FizzBuzz {
         loop {
             self.n += 1;
             if self.n % 15 == 0 {
-                println!("fizzbuzz: fizzbuzz");
+                log::info!("fizzbuzz: fizzbuzz");
             } else if self.n % 3 == 0 {
-                println!("fizzbuzz: fizz");
+                log::info!("fizzbuzz: fizz");
             } else if self.n % 5 == 0 {
-                println!("fizzbuzz: buzz");
+                log::info!("fizzbuzz: buzz");
             } else {
-                println!("fizzbuzz: {}", self.n);
+                log::info!("fizzbuzz: {}", self.n);
             }
             ctx.yield_now().await;
         }
     }
 }
 
-vos::pvm_main!(FizzBuzz);

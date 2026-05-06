@@ -4,11 +4,7 @@
 //! invokes the target with a one-off invoke, and returns the reply.
 
 use vos::lifecycle::InvokeResult;
-use vos::value::Msg;
-use vos::{actor, messages, lifecycle, Decode};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 #[actor]
 struct Router {
     children: Vec<u32>,
@@ -17,14 +13,14 @@ struct Router {
 #[messages]
 impl Router {
     fn new(children: Vec<u32>) -> Self {
-        println!("router: init");
+        log::info!("router: init");
         Router { children }
     }
 
     /// Accept incoming messages and route them to children.
     #[msg]
     async fn start(&mut self, _ctx: &mut Context<Self>) {
-        println!("router: ready with {} children", self.children.len());
+        log::info!("router: ready with {} children", self.children.len());
     }
 
     /// Route a dynamic message to a target and return the reply.
@@ -39,11 +35,11 @@ impl Router {
                 }
             }
             InvokeResult::Panicked => {
-                println!("router: target {} panicked", target);
+                log::info!("router: target {} panicked", target);
                 vos::value::Value::Unit
             }
             InvokeResult::NotFound => {
-                println!("router: target {} not found", target);
+                log::info!("router: target {} not found", target);
                 vos::value::Value::Unit
             }
             _ => vos::value::Value::Unit,
@@ -51,4 +47,3 @@ impl Router {
     }
 }
 
-vos::pvm_main!(Router);

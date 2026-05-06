@@ -5,10 +5,7 @@
 //! returns `Yielded` on the first `.await`, and the agent re-sends
 //! the same `Start` message to drive the next iteration.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 /// Simple hash: XOR-fold with rotation.
 fn simple_hash(input: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -43,10 +40,9 @@ impl Hasher {
         loop {
             self.current_hash = simple_hash(&self.current_hash);
             self.iterations += 1;
-            println!("hasher: iteration {}", self.iterations);
+            log::info!("hasher: iteration {}", self.iterations);
             ctx.yield_now().await;
         }
     }
 }
 
-vos::pvm_main!(Hasher);

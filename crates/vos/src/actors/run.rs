@@ -324,6 +324,12 @@ pub fn run_refine_service<A: super::Actor>() {
     use alloc::boxed::Box;
     use core::ptr::addr_of_mut;
 
+    // Install the PVM `log::Log` impl on the first refine call.
+    // `set_logger` returns Err on duplicate install — we ignore it
+    // so warm restarts (which re-enter `_start` without flat_mem
+    // reset) don't trip on the second call.
+    crate::log_impl::install_pvm_logger();
+
     set_refine_mode(true);
 
     let id = lifecycle::service_id();

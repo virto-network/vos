@@ -16,10 +16,11 @@ use crate::util::die;
 
 const TMPL_SPACE: &str = include_str!("../../templates/space.toml.tmpl");
 const TMPL_ACTOR_LIB: &str = include_str!("../../templates/actor_lib.rs.tmpl");
-const TMPL_ACTOR_MAIN: &str = include_str!("../../templates/actor_main.rs.tmpl");
 const TMPL_ACTOR_CARGO: &str = include_str!("../../templates/actor_cargo.toml.tmpl");
 const TMPL_ACTOR_CARGO_CFG: &str =
     include_str!("../../templates/actor_cargo_config.toml.tmpl");
+const TMPL_RUST_TOOLCHAIN: &str =
+    include_str!("../../templates/rust_toolchain.toml.tmpl");
 const TMPL_TARGET_SPEC: &str = include_str!("../../templates/riscv64em-javm.json");
 
 pub fn run(name: &str) {
@@ -69,8 +70,8 @@ pub fn run(name: &str) {
         &subst(TMPL_ACTOR_CARGO, &[("vos_path", &vos_path)]),
     );
     write_file(&actor_src.join("lib.rs"), TMPL_ACTOR_LIB);
-    write_file(&actor_src.join("main.rs"), TMPL_ACTOR_MAIN);
     write_file(&actor_cargo_dir.join("config.toml"), TMPL_ACTOR_CARGO_CFG);
+    write_file(&actor_root.join("rust-toolchain.toml"), TMPL_RUST_TOOLCHAIN);
     write_file(&actor_root.join("riscv64em-javm.json"), TMPL_TARGET_SPEC);
 
     eprintln!("vosx: scaffolded space at {}", root.display());

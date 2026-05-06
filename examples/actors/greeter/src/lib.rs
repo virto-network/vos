@@ -3,10 +3,7 @@
 //! Demonstrates the simplest refine-only actor: a single `start()` handler
 //! that executes once and completes.
 
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 #[actor]
 struct Greeter {
     n: u32,
@@ -20,8 +17,7 @@ impl Greeter {
 
     #[msg]
     async fn start(&self, _ctx: &mut Context<Self>) {
-        println!("greeter: Hello n={}", self.n);
+        log::info!("greeter: Hello n={}", self.n);
     }
 }
 
-vos::pvm_main!(Greeter);

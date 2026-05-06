@@ -10,10 +10,7 @@
 //! Demonstrates cross-actor rendering: the animation logic lives here,
 //! the framebuffer/timing lives in the Display service.
 
-use vos::{actor, messages, value::Msg};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 const DISPLAY_ID: u32 = 6;
 const WIDTH: usize = 16;
 const HEIGHT: usize = 8;
@@ -90,11 +87,10 @@ impl Animation {
             // Advance spinner phase every 2 ticks
             self.phase += (delta as u32 + 1) / 2;
 
-            println!("animation: frame {} phase {} elapsed {}", self.frame, self.phase, self.elapsed);
+            log::info!("animation: frame {} phase {} elapsed {}", self.frame, self.phase, self.elapsed);
 
             ctx.yield_now().await;
         }
     }
 }
 
-vos::pvm_main!(Animation);

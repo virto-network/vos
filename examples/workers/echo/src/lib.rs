@@ -3,7 +3,7 @@
 //! Demonstrates a worker using the same `#[actor]`/`#[messages]` DSL
 //! as PVM actors but compiled as a native `.so` plugin.
 
-use vos::{actor, messages};
+use vos::prelude::*;
 
 #[actor]
 struct EchoWorker {
@@ -19,6 +19,7 @@ impl EchoWorker {
     #[msg]
     async fn echo(&mut self, text: String, _ctx: &mut Context<Self>) -> String {
         self.count += 1;
+        log::info!("echo-worker: echoing '{text}' (#{})", self.count);
         format!("echo #{}: {text}", self.count)
     }
 

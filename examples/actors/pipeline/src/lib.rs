@@ -12,10 +12,7 @@
 //! Demonstrates `ctx.ask().await` returning `Value`, handler return
 //! types as replies, and a loop that terminates with a result.
 
-use vos::{actor, messages, value::Msg};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 const MATH_ID: u32 = 8;
 const THRESHOLD: u64 = 1000;
 
@@ -48,7 +45,7 @@ impl Pipeline {
                 .with("b", offset))
                 .await.unwrap()
                 .as_u64().unwrap();
-            println!("pipeline: {} + {} = {}", base, offset, sum);
+            log::info!("pipeline: {} + {} = {}", base, offset, sum);
 
             let factor = self.step + 1;
 
@@ -58,13 +55,13 @@ impl Pipeline {
                 .with("b", factor))
                 .await.unwrap()
                 .as_u64().unwrap();
-            println!("pipeline: {} * {} = {}", sum, factor, product);
+            log::info!("pipeline: {} * {} = {}", sum, factor, product);
 
             self.total += product;
-            println!("pipeline: step {} total = {}", self.step, self.total);
+            log::info!("pipeline: step {} total = {}", self.step, self.total);
 
             if self.total >= THRESHOLD {
-                println!("pipeline: threshold crossed! returning {}", self.total);
+                log::info!("pipeline: threshold crossed! returning {}", self.total);
                 return self.total;
             }
 
@@ -73,4 +70,3 @@ impl Pipeline {
     }
 }
 
-vos::pvm_main!(Pipeline);
