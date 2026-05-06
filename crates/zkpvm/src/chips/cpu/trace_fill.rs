@@ -1292,6 +1292,75 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 trace.fill_columns_base_field(
                     row, &pnz_msb_lo_times_ind, Column::PartNZMsbLoTimesIndH
                 );
+
+                // ── Wave-4b: TZ/LZ result-binding helpers ──
+                // is_first_nz[i] = partial[i] - partial[i-1] (i ∈ 0..8)
+                //                = 1 at the first nonzero byte, else 0.
+                // TzLo4H = sum_{i<4} is_first_nz[i] · (8i + TzByte[i]).
+                // BaseField arithmetic to dodge u8 overflow on byte products.
+                let mut tz_lo4: u32 = 0;
+                let mut tz_hi4: u32 = 0;
+                for i in 0..WORD_SIZE {
+                    let prev = if i == 0 { 0u8 } else { val_d_partial_nz[i - 1] };
+                    let is_first = val_d_partial_nz[i].wrapping_sub(prev);
+                    // is_first ∈ {0, 1} (or 255 if prev > curr, which shouldn't happen).
+                    let weight = 8u32 * i as u32 + bit_op_tz[i] as u32;
+                    let term = (is_first as u32) * weight;
+                    if i < 4 { tz_lo4 += term; } else { tz_hi4 += term; }
+                }
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(tz_lo4.rem_euclid(stwo::core::fields::m31::P))],
+                    Column::TzLo4H,
+                );
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(tz_hi4.rem_euclid(stwo::core::fields::m31::P))],
+                    Column::TzHi4H,
+                );
+
+                // Lz64H = sum_{i<8} (PartialNZMsb[i] - PartialNZMsb[i+1])
+                //                   · (8(7-i) + LzByte[i]).
+                let mut lz_64: u32 = 0;
+                for i in 0..WORD_SIZE {
+                    let next = if i + 1 < WORD_SIZE {
+                        val_d_partial_nz_msb[i + 1]
+                    } else {
+                        0u8
+                    };
+                    let is_first = val_d_partial_nz_msb[i].wrapping_sub(next);
+                    let weight = 8u32 * (7 - i as u32) + bit_op_lz[i] as u32;
+                    lz_64 += (is_first as u32) * weight;
+                }
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(lz_64.rem_euclid(stwo::core::fields::m31::P))],
+                    Column::Lz64H,
+                );
+                // Lz32H = sum over LOW 4 bytes using PartialNZMsbLo.
+                let mut lz_32: u32 = 0;
+                for i in 0..4 {
+                    let next = if i + 1 < 4 {
+                        val_d_partial_nz_msb_lo[i + 1]
+                    } else {
+                        0u8
+                    };
+                    let is_first = val_d_partial_nz_msb_lo[i].wrapping_sub(next);
+                    let weight = 8u32 * (3 - i as u32) + bit_op_lz[i] as u32;
+                    lz_32 += (is_first as u32) * weight;
+                }
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(lz_32.rem_euclid(stwo::core::fields::m31::P))],
+                    Column::Lz32H,
+                );
+
+                // Is{Tzb,Lzb}{64,32}H selectors (bool products of flags).
+                let is_64bit_b = !flags.is_32bit;
+                trace.fill_columns(row, flags.is_tzb && is_64bit_b, Column::IsTzb64H);
+                trace.fill_columns(row, flags.is_tzb && flags.is_32bit, Column::IsTzb32H);
+                trace.fill_columns(row, flags.is_lzb && is_64bit_b, Column::IsLzb64H);
+                trace.fill_columns(row, flags.is_lzb && flags.is_32bit, Column::IsLzb32H);
             }
 
             // Phase 9g: raw register value behind ValB + IsTruncated flag.

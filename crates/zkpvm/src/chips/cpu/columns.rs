@@ -877,6 +877,21 @@ pub enum Column {
     #[size = 8] PartNZMsbTimesIndH,
     /// Same for the low-4-byte MSB recurrence — i ∈ 0..3 (index 3 unused).
     #[size = 4] PartNZMsbLoTimesIndH,
+
+    // Wave 4b: TZ / LZ result binding.
+    /// Sum_{i=0..4} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    #[size = 1] TzLo4H,
+    /// Sum_{i=4..8} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    #[size = 1] TzHi4H,
+    /// Sum_{i=0..8} (PartialNZMsb[i] - PartialNZMsb[i+1]) · (8(7-i) + LzByte[i]).
+    #[size = 1] Lz64H,
+    /// Sum_{i=0..4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
+    #[size = 1] Lz32H,
+    /// `IsTzb · Is64Bit`, `IsTzb · Is32Bit`, mirror for IsLzb.
+    #[size = 1] IsTzb64H,
+    #[size = 1] IsTzb32H,
+    #[size = 1] IsLzb64H,
+    #[size = 1] IsLzb32H,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

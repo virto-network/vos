@@ -1016,83 +1016,97 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
-        // ── TZ result binding ──
-        // is_first_nz[0] = partial[0]; is_first_nz[i] = partial[i] − partial[i-1].
-        let mut tz_lo4 = E::F::zero();
-        let mut tz_hi4 = E::F::zero();
-        for i in 0..WORD_SIZE {
-            let prev = if i == 0 {
-                E::F::zero()
-            } else {
-                val_d_partial_nz_p34[i - 1].clone()
-            };
-            let is_first_nz = val_d_partial_nz_p34[i].clone() - prev;
-            let term = is_first_nz
-                * (E::F::from(BaseField::from(8u32 * i as u32))
-                    + bit_op_tz_byte[i].clone());
-            if i < 4 {
-                tz_lo4 += term;
-            } else {
-                tz_hi4 += term;
+        // ── TZ / LZ result binding (Phase I-cpu Wave-4b flattened) ──
+        let tz_lo4_h = crate::trace::trace_eval!(trace_eval, Column::TzLo4H);
+        let tz_hi4_h = crate::trace::trace_eval!(trace_eval, Column::TzHi4H);
+        let lz64_h = crate::trace::trace_eval!(trace_eval, Column::Lz64H);
+        let lz32_h = crate::trace::trace_eval!(trace_eval, Column::Lz32H);
+        let is_tzb_64_h = crate::trace::trace_eval!(trace_eval, Column::IsTzb64H);
+        let is_tzb_32_h = crate::trace::trace_eval!(trace_eval, Column::IsTzb32H);
+        let is_lzb_64_h = crate::trace::trace_eval!(trace_eval, Column::IsLzb64H);
+        let is_lzb_32_h = crate::trace::trace_eval!(trace_eval, Column::IsLzb32H);
+        // Helper-defining constraints (deg 2 each).
+        {
+            // TzLo4H = sum_{i<4} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+            let mut tz_lo4_expr = E::F::zero();
+            let mut tz_hi4_expr = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let prev = if i == 0 {
+                    E::F::zero()
+                } else {
+                    val_d_partial_nz_p34[i - 1].clone()
+                };
+                let is_first_nz = val_d_partial_nz_p34[i].clone() - prev;
+                let term = is_first_nz
+                    * (E::F::from(BaseField::from(8u32 * i as u32))
+                        + bit_op_tz_byte[i].clone());
+                if i < 4 {
+                    tz_lo4_expr += term;
+                } else {
+                    tz_hi4_expr += term;
+                }
             }
+            eval.add_constraint(tz_lo4_h[0].clone() - tz_lo4_expr);
+            eval.add_constraint(tz_hi4_h[0].clone() - tz_hi4_expr);
+            // Lz64H = sum_{i<8} (PartialNZMsb[i] - PartialNZMsb[i+1]) · (8(7-i) + LzByte[i]).
+            let mut lz64_expr = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let next = if i + 1 < WORD_SIZE {
+                    val_d_partial_nz_msb[i + 1].clone()
+                } else {
+                    E::F::zero()
+                };
+                let is_first_nz_msb = val_d_partial_nz_msb[i].clone() - next;
+                let pos_weight = 8u32 * (7 - i as u32);
+                lz64_expr += is_first_nz_msb
+                    * (E::F::from(BaseField::from(pos_weight))
+                        + bit_op_lz_byte[i].clone());
+            }
+            eval.add_constraint(lz64_h[0].clone() - lz64_expr);
+            // Lz32H = sum_{i<4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
+            let mut lz32_expr = E::F::zero();
+            for i in 0..4 {
+                let next = if i + 1 < 4 {
+                    val_d_partial_nz_msb_lo[i + 1].clone()
+                } else {
+                    E::F::zero()
+                };
+                let is_first_nz_msb_lo = val_d_partial_nz_msb_lo[i].clone() - next;
+                let pos_weight = 8u32 * (3 - i as u32);
+                lz32_expr += is_first_nz_msb_lo
+                    * (E::F::from(BaseField::from(pos_weight))
+                        + bit_op_lz_byte[i].clone());
+            }
+            eval.add_constraint(lz32_h[0].clone() - lz32_expr);
+            // Is{Tzb,Lzb}{64,32}H selectors.
+            eval.add_constraint(is_tzb_64_h[0].clone() - is_tzb[0].clone() * is_64bit.clone());
+            eval.add_constraint(is_tzb_32_h[0].clone() - is_tzb[0].clone() * is_32bit[0].clone());
+            eval.add_constraint(is_lzb_64_h[0].clone() - is_lzb[0].clone() * is_64bit.clone());
+            eval.add_constraint(is_lzb_32_h[0].clone() - is_lzb[0].clone() * is_32bit[0].clone());
         }
-        // 64-bit branch: tz_lo4 + tz_hi4 + (1 - partial[7]) · 64.
-        // 32-bit branch: tz_lo4 + (1 - partial[3]) · 32.
-        let tz_default_64 = E::F::from(BaseField::from(64u32))
+        // Main TZ constraint flattened to a sum of deg-2 terms.
+        // Original: is_tzb · (result[0] - tz_expr) = 0 with tz_expr deg 3.
+        // Flatten: is_tzb·result - is_tzb·TzLo4H
+        //          - IsTzb64H·(TzHi4H + 64·(1 - PartialNZ[7]))
+        //          - IsTzb32H · 32·(1 - PartialNZ[3])  = 0
+        let tz_default_64_lin = E::F::from(BaseField::from(64u32))
             * (E::F::one() - val_d_partial_nz_p34[7].clone());
-        let tz_default_32 = E::F::from(BaseField::from(32u32))
+        let tz_default_32_lin = E::F::from(BaseField::from(32u32))
             * (E::F::one() - val_d_partial_nz_p34[3].clone());
-        let tz_expr = tz_lo4
-            + is_64bit.clone() * (tz_hi4 + tz_default_64)
-            + is_32bit[0].clone() * tz_default_32;
         eval.add_constraint(
-            is_tzb[0].clone() * (result[0].clone() - tz_expr)
+            is_tzb[0].clone() * (result[0].clone() - tz_lo4_h[0].clone())
+                - is_tzb_64_h[0].clone() * (tz_hi4_h[0].clone() + tz_default_64_lin)
+                - is_tzb_32_h[0].clone() * tz_default_32_lin
         );
-
-        // ── LZ result binding ──
-        // is_first_nz_msb[i] = partial_msb[i] − partial_msb[i+1] (with
-        //   partial_msb[8] := 0 for i = 7).
-        // is_first_nz_msb_lo[i] over the LOW 4 bytes uses partial_msb_lo
-        //   (which spans only bytes 0..3), with partial_msb_lo[4] := 0
-        //   for i = 3.
-        let mut lz_64 = E::F::zero();
-        for i in 0..WORD_SIZE {
-            let next = if i + 1 < WORD_SIZE {
-                val_d_partial_nz_msb[i + 1].clone()
-            } else {
-                E::F::zero()
-            };
-            let is_first_nz_msb = val_d_partial_nz_msb[i].clone() - next;
-            // For LZ64: position contribution is 8·(7 − i).
-            let pos_weight = 8u32 * (7 - i as u32);
-            let term = is_first_nz_msb
-                * (E::F::from(BaseField::from(pos_weight))
-                    + bit_op_lz_byte[i].clone());
-            lz_64 += term;
-        }
-        let lz_default_64 = E::F::from(BaseField::from(64u32))
+        // Main LZ constraint flattened similarly.
+        let lz_default_64_lin = E::F::from(BaseField::from(64u32))
             * (E::F::one() - val_d_partial_nz_msb[0].clone());
-        // LZ32 sums over bytes 0..3 with position contribution 8·(3 − i).
-        let mut lz_32 = E::F::zero();
-        for i in 0..4 {
-            let next = if i + 1 < 4 {
-                val_d_partial_nz_msb_lo[i + 1].clone()
-            } else {
-                E::F::zero()
-            };
-            let is_first_nz_msb_lo = val_d_partial_nz_msb_lo[i].clone() - next;
-            let pos_weight = 8u32 * (3 - i as u32);
-            let term = is_first_nz_msb_lo
-                * (E::F::from(BaseField::from(pos_weight))
-                    + bit_op_lz_byte[i].clone());
-            lz_32 += term;
-        }
-        let lz_default_32 = E::F::from(BaseField::from(32u32))
+        let lz_default_32_lin = E::F::from(BaseField::from(32u32))
             * (E::F::one() - val_d_partial_nz_msb_lo[0].clone());
-        let lz_expr = is_64bit.clone() * (lz_64 + lz_default_64)
-            + is_32bit[0].clone() * (lz_32 + lz_default_32);
         eval.add_constraint(
-            is_lzb[0].clone() * (result[0].clone() - lz_expr)
+            is_lzb[0].clone() * result[0].clone()
+                - is_lzb_64_h[0].clone() * (lz64_h[0].clone() + lz_default_64_lin)
+                - is_lzb_32_h[0].clone() * (lz32_h[0].clone() + lz_default_32_lin)
         );
 
         // High bytes of result are zero on LZ/TZ rows.
