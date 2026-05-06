@@ -295,12 +295,26 @@ mod tests {
             return;
         };
         let (manifest, dir) = manifest_pointing_at(&elf);
-        // crdt-counter's `inc()` — no args, the metadata tags
-        // `tag` as a `u32`, so positional `5` should pack as
-        // `tag=u32:5`.
-        let typed = positional_to_typed(&manifest, &dir, "counter", "inc", &["5".into()])
+        // crdt-counter's `whois(name: String)` — the metadata
+        // tags `name` as a String, so positional `alice` should
+        // pack as `name=str:alice`.
+        let typed = positional_to_typed(&manifest, &dir, "counter", "whois", &["alice".into()])
             .expect("positional_to_typed");
-        assert_eq!(typed, vec!["tag=u32:5".to_string()]);
+        assert_eq!(typed, vec!["name=str:alice".to_string()]);
+    }
+
+    #[test]
+    fn positional_args_zero_arg_msg() {
+        let Some(elf) = crdt_counter_elf() else {
+            eprintln!("SKIP: crdt-counter not built");
+            return;
+        };
+        let (manifest, dir) = manifest_pointing_at(&elf);
+        // `inc` takes zero args. Zero positional args resolve to
+        // an empty list (short-circuit before metadata lookup).
+        let typed = positional_to_typed(&manifest, &dir, "counter", "inc", &[])
+            .expect("positional_to_typed");
+        assert!(typed.is_empty(), "expected empty list, got {typed:?}");
     }
 
     #[test]
@@ -310,10 +324,10 @@ mod tests {
             return;
         };
         let (manifest, dir) = manifest_pointing_at(&elf);
-        // `get` takes zero args; passing one should fail with
+        // `inc` takes zero args; passing one should fail with
         // a clear arity mismatch.
         let err = positional_to_typed(
-            &manifest, &dir, "counter", "get", &["nope".into()],
+            &manifest, &dir, "counter", "inc", &["nope".into()],
         )
         .expect_err("must fail arity check");
         assert!(err.contains("takes 0 arg"), "expected arity error, got: {err}");

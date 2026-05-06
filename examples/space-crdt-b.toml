@@ -12,5 +12,5 @@ name = "counter"
 path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
 consistency = "crdt"
 on_start = [
-  { msg = "inc", args = { tag = 2 } },
+  { msg = "inc" },
 ]

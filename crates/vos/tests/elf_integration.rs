@@ -1290,7 +1290,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     let id = node.register(AgentConfig::new(counter_blob));
     let counter = CrdtCounterRef::at(id);
 
-    // Build a valid TAG_DYNAMIC + Msg("inc", tag=1) payload, padded
+    // Build a valid TAG_DYNAMIC + Msg("inc") payload, padded
     // to exactly 4096 bytes by inserting zero bytes between the
     // TAG_DYNAMIC byte and the rkyv-archived Msg. rkyv archives
     // are tail-anchored — the Archived type sits at the END of
@@ -1373,7 +1373,7 @@ fn crdt_counter_local_invoke_smoke() {
 #[cfg(feature = "network")]
 fn crdt_counter_init_payloads_dispatch() {
     // Smoke test the on_start manifest path: register a CRDT
-    // counter with an init_payload that encodes inc(tag=7) and
+    // counter with an init_payload that encodes inc() and
     // verify the count went up to 1 by the time we invoke get().
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
@@ -1433,7 +1433,7 @@ fn crdt_counter_init_payloads_dispatch() {
         },
         std::time::Duration::from_secs(3),
     );
-    assert_eq!(count, Some(1), "init_payload inc(tag=7) should drive count=1");
+    assert_eq!(count, Some(1), "init_payload inc() should drive count=1");
 
     node.shutdown();
     let _ = node.collect();

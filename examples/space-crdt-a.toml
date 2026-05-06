@@ -1,10 +1,11 @@
 # Cross-node CRDT demo, host A.
 #
 # Pair with `space-crdt-b.toml` running in another vosx process.
-# Each host kicks the local crdt-counter replica with a distinct
-# `tag` on startup so the two EffectLogs hash to different DAG
-# nodes (otherwise the merkle-DAG dedups byte-identical incs and
-# the replicas appear pre-converged at count=1).
+# Each host kicks the local crdt-counter replica with one `inc()`
+# on startup. After convergence both replicas should report
+# count = 2 (one increment per replica, both surviving the merge
+# because the runtime stamps each event with a unique
+# (origin, seq) pair — see `vos::effect_log::CrdtEvent`).
 #
 # Run:
 #   vosx up examples/space-crdt-a.toml \
@@ -22,5 +23,5 @@ name = "counter"
 path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
 consistency = "crdt"
 on_start = [
-  { msg = "inc", args = { tag = 1 } },
+  { msg = "inc" },
 ]
