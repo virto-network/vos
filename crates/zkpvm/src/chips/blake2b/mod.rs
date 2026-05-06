@@ -86,6 +86,33 @@ impl BuiltInComponent for Blake2bChip {
     ) {
         let (range256_lookup, bitwise_lookup, mem_lookup, blake2b_call_lookup) = lookup_elements;
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        // Phase I-blake2b-1 gate helpers — Stwo v2.x lifted-protocol degree
+        // flatten.  Pull in `IsFirstOfCompression` / `IsLastOfCompression`
+        // (preprocessed) and the 3 main-column helpers; tie them together
+        // with degree-2 definition constraints; thereafter all gated
+        // constraint sites use the helpers directly so the gate's
+        // contribution to algebraic degree drops from 2 to 1.  Subphases
+        // 2-7 finish flattening the rest of the chip.
+        let is_first = crate::trace::preprocessed_trace_eval!(
+            trace_eval, PreprocessedColumn::IsFirstOfCompression
+        );
+        let is_last = crate::trace::preprocessed_trace_eval!(
+            trace_eval, PreprocessedColumn::IsLastOfCompression
+        );
+        let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
+        let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
+        let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
+        let f1_top = E::F::one();
+        eval.add_constraint(
+            gate_h[0].clone()
+                - is_real[0].clone() * (f1_top.clone() - is_last[0].clone())
+        );
+        eval.add_constraint(
+            init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone()
+        );
+        eval.add_constraint(
+            output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone()
+        );
         let a_in = crate::trace::trace_eval!(trace_eval, Column::AIn);
         let b_in = crate::trace::trace_eval!(trace_eval, Column::BIn);
         let c_in = crate::trace::trace_eval!(trace_eval, Column::CIn);
@@ -411,9 +438,6 @@ impl BuiltInComponent for Blake2bChip {
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx6),
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx7),
         ];
-        let is_last = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::IsLastOfCompression
-        );
 
         let v_cols: [_; 16] = [
             crate::trace::trace_eval!(trace_eval, Column::V0),
@@ -476,7 +500,8 @@ impl BuiltInComponent for Blake2bChip {
         //                    else V[k]).
         // Gated by is_real · (1 - is_last_of_compression) so the constraint
         // does not cross a compression boundary or fire on padding.
-        let gate = is_real[0].clone() * (f1.clone() - is_last[0].clone());
+        // Gate substitution (Phase I-blake2b-1): gate ← GateH.
+        let gate = gate_h[0].clone();
         for k in 0..16 {
             for i in 0..8 {
                 let mut update = E::F::zero();
@@ -625,16 +650,14 @@ impl BuiltInComponent for Blake2bChip {
         let f_e = crate::trace::trace_eval!(trace_eval, Column::F);
         let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
         let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
-        let is_first = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::IsFirstOfCompression
-        );
 
         // F ∈ {0,1}
         eval.add_constraint(
             is_real[0].clone() * f_e[0].clone() * (f_e[0].clone() - f1.clone())
         );
 
-        let init_gate = is_real[0].clone() * is_first[0].clone();
+        // Gate substitution (Phase I-blake2b-1): init_gate ← InitGateH.
+        let init_gate = init_gate_h[0].clone();
         let f255 = E::F::from(BaseField::from(255u32));
         for i in 0..8 {
             let iv4_i = E::F::from(BaseField::from(IV[4].to_le_bytes()[i] as u32));
@@ -711,10 +734,8 @@ impl BuiltInComponent for Blake2bChip {
         let out_xor1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutXor1Hi);
         let out_and2_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2);
         let out_and2_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2Hi);
-        let is_last_e = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::IsLastOfCompression
-        );
-        let output_gate = is_real[0].clone() * is_last_e[0].clone();
+        // Gate substitution (Phase I-blake2b-1): output_gate ← OutputGateH.
+        let output_gate = output_gate_h[0].clone();
 
         // V_after source picker for the constraint side (mirror of the
         // interaction-trace v_after_byte closure).
@@ -822,7 +843,8 @@ impl BuiltInComponent for Blake2bChip {
 
         // Address derivation: HRdAddr[i] = HPtr + i as a u32 combo.
         // Single linear identity per offset, gated by is_real·is_first.
-        let init_gate_8b = is_real[0].clone() * is_first[0].clone();
+        // Gate substitution (Phase I-blake2b-1): init_gate_8b ← InitGateH (alias).
+        let init_gate_8b = init_gate_h[0].clone();
         let combine = crate::framework::eval::combine_le_u64::<E>;
         let h_ptr_u32 = combine(&[
             h_ptr_e[0].clone(), h_ptr_e[1].clone(),
@@ -911,7 +933,8 @@ impl BuiltInComponent for Blake2bChip {
         // 64 output writes — gated by is_real · IsLastOfCompression since
         // Output column is only populated at the last row of each
         // compression (Phase 2b witness); HWrAddr/CallTs stay constant.
-        let write_gate_8b = is_real[0].clone() * is_last_e[0].clone();
+        // Gate substitution (Phase I-blake2b-1): write_gate_8b ← OutputGateH (alias).
+        let write_gate_8b = output_gate_h[0].clone();
         for i in 0..64usize {
             let mut tuple: Vec<E::F> = Vec::with_capacity(14);
             tuple.push(h_wr_b0[i].clone());
@@ -1218,6 +1241,21 @@ impl BuiltInProverComponent for Blake2bChip {
                 trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
             }
             trace.fill_columns(row_idx, true, Column::IsReal);
+
+            // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
+            // the helper values reduce to the preprocessed selector value:
+            //   GateH        = 1 - is_last     (1 except at row 95)
+            //   InitGateH    = is_first        (1 only at row 0)
+            //   OutputGateH  = is_last         (1 only at row 95)
+            // Padding rows have IsReal=0, so all helpers are 0 there
+            // (default trace fill).  Constraints below tie these to the
+            // algebraic expressions at the AIR level.
+            let pos = row_idx % 96;
+            let is_first = pos == 0;
+            let is_last = pos == 95;
+            trace.fill_columns(row_idx, !is_last, Column::GateH);
+            trace.fill_columns(row_idx, is_first, Column::InitGateH);
+            trace.fill_columns(row_idx, is_last, Column::OutputGateH);
 
             // Emit per-byte nibble counts.  add_bitwise_and increments both the
             // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup

@@ -178,6 +178,19 @@ pub enum Column {
     #[size = 64] HWrAddrB3,
     // Row type
     #[size = 1] IsReal,
+    // Phase I gate helpers — Stwo v2.x lifted-protocol degree flatten.
+    // GateH        = IsReal · (1 - IsLastOfCompression)
+    // InitGateH    = IsReal · IsFirstOfCompression
+    // OutputGateH  = IsReal · IsLastOfCompression
+    // Each is the per-row product of `IsReal` (main) and one of the
+    // `IsFirstOfCompression`/`IsLastOfCompression` preprocessed columns.
+    // Lifting these into helper columns drops the gate's algebraic
+    // degree from 2 to 1 in every gated constraint, paving the way for
+    // the rest of the I-blake2b-N rewrites.  See
+    // `STWO_PHASE_I_BLAKE2B.md` for the full plan.
+    #[size = 1] GateH,
+    #[size = 1] InitGateH,
+    #[size = 1] OutputGateH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
