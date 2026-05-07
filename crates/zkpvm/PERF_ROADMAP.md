@@ -158,9 +158,58 @@ integration remains.
 * **Step 1 — DONE (`91fa0d6`)**: host-side `comb_table.rs` module, Ed25519 basepoint constants, `scalar_mult_via_comb` reference, 6 unit tests cross-checking against `point::scalar_mult_rows` for fixed + 5 random scalars.
 * **Step 7 + ECALL detection — DONE (`4efa343`)**: `ScalarMultKind { Variable, FixedBasepoint }` on `RistrettoRecord`, set at ECALL handler from `detect_scalar_mult_kind` (compares against `RISTRETTO_BASEPOINT_COMPRESSED`).
 * **Steps 3, 4, 6 — DONE (`0394ec2`)**: `RistrettoCombLookupElements` 130-limb relation; `RistrettoCombTableChip` with preprocessed table (1024 rows × 130 cols, filled from `comb_table::CombTable::from_base(&G)`); `Multiplicity` main column read from `side_note.ristretto_comb_counts`; chip-isolated harness pair (zero-mult succeeds, non-zero rejects open-chain).
-* **Step 5 OPEN**: consumer side.  Either extend `RistrettoChip` with a new IS_FIXED_BASE_COMB row class (per-row: +1 to `RistrettoCombLookupElements`, accumulator add of looked-up entry to running sum) OR build a separate `RistrettoFixedBaseConsumerChip` that handles the entire fixed-base mult independently.  This is the architectural decision the next session has to make first; both paths are ~2–3 days from there.
+* **Step 5 OPEN**: consumer side.  This is the architectural decision the next session opens with — see the **Step 5 design tree** below.
 * **Step 8 OPEN**: route `ScalarMultKind::FixedBasepoint` → fixed-base witness path.  One-line dispatch in `ingest_ristretto_boundary` once step 5 lands.
 * **Activity gating OPEN**: `ChipActivity.ristretto_comb` + add `RistrettoCombTableChip` to `BASE_COMPONENTS`.  Both deferred until step 5 because adding the table chip alone unbalances the relation across the whole prover (only the chip-isolated harness sees zero counts).
+
+### Step 5 design tree
+
+The consumer side has to (a) emit one `+1` contribution to
+`RistrettoCombLookupElements` per scalar-mult window, with the
+130-limb tuple `(window_idx, scalar_window, x[32], y[32], z[32], t[32])`
+matching the looked-up table entry, and (b) compose 64 point-adds
+that accumulate the looked-up entries into the scalar-mult result,
+binding the input scalar bytes (so the prover can't fake the
+windows) and the output point bytes (so the chip's running sum
+matches the ECALL output).
+
+Two architectural paths to choose between, in decreasing order of
+diff size and risk:
+
+**Path A — extend `RistrettoChip` (chips/ristretto/mod.rs, 1266 LOC).**
+Add an `IsFixedBaseComb` row-class flag.  Per such row:
+- The 32-byte X/Y/Z/T columns hold the looked-up table entry.
+- A new constraint emits `+is_fixed_base_comb` to the comb relation
+  with the 130-limb tuple from this row's columns + window/scalar
+  scratch columns.
+- The existing `IsAdd` row class accumulates the running sum,
+  source-row threaded onto the prior comb row's `out`.
+- The existing register-file lookup mechanism keeps inter-row binding.
+
+Pros: reuses existing 4501-column trace shape, source-row threading,
+register-file relation.
+Cons: large diff to a chip that's already complex; adds ~3 columns
+(window_idx, scalar_window, IsFixedBaseComb flag); has to coexist
+with the existing IsAdd/IsSub/IsMul/IsInput/IsOutput row-class
+partition without breaking the boolean-1-of-N closure.
+
+**Path B — sibling `RistrettoFixedBaseConsumerChip`.**
+Independent chip with its own column layout, 64-windows-per-mult
+trace shape, and constraint chain.  Receives input scalar / output
+point bytes from `ingest_ristretto_boundary` via a new boundary
+relation tying it to the existing RistrettoEcallChip ECALL records.
+
+Pros: clean separation; smaller diff to RistrettoChip (zero); easier
+to verify in isolation.
+Cons: rewrites the point-add chain that already exists in `point.rs`;
+needs a new boundary relation between this chip and
+RistrettoEcallChip; two chips for "ristretto scalar mult" splits the
+mental model.
+
+**Recommendation**: start with Path B as a chip-isolated proof of
+concept; if the boundary-relation overhead turns out to be acceptable,
+ship it.  If Path B's bench doesn't justify the duplicated point-add
+chain, fall back to Path A.
 
 * **Why this is the right tap-to-pay win**: cipher-clerk's private-pay flow does:
   * Pedersen commit: `v · G + b · H` — 2 fixed-base scalar-mults.
