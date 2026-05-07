@@ -30,7 +30,6 @@ mod manifest;
 mod network;
 mod paths;
 mod query;
-mod space_lock;
 mod spaces_index;
 mod util;
 

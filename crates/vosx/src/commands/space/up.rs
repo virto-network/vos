@@ -13,7 +13,6 @@ use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobHash};
-use crate::space_lock::SpaceLock;
 use crate::spaces_index;
 
 pub struct Args {
@@ -60,11 +59,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             data_dir.display(),
         );
     }
-
-    // Hold the per-space lock for the lifetime of this command.
-    // Concurrent `space publish`/`install`/etc. will see the
-    // flock and error rather than corrupt the redb.
-    let _lock = SpaceLock::acquire(&data_dir)?;
 
     // Attach a libp2p network when the entry declares listen
     // addrs or bootnodes. Pure-local spaces (created via `space
