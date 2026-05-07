@@ -1,6 +1,6 @@
 # zkpvm — performance benchmarks
 
-## Latest — Session 1 of perf roadmap (parallel trace-gen + PGO)
+## Latest — Session 1 + Session 2.1 producer side (parallel trace-gen + PGO with STANDARD training)
 
 `tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
@@ -8,32 +8,33 @@ is the canonical tap-to-pay bench: clerk-private-pay-bench actor
 steps).  Median of 5 trials, post B3 audit + parallel
 interaction-trace + parallel main-trace generation + PGO build
 (`scripts/build-pgo.sh` trains on `bench_prove` Add log10/12/14 +
-clerk-private-pay-bench-mobile), on the reference Intel Core
+clerk-private-pay-bench{,-mobile}), on the reference Intel Core
 Ultra 7 155H:
 
 | Config   | Prover entry point | Prove   | Proof size | Verify  |
 |---       |---                 |---      |---         |---      |
-| STANDARD | `prove()`          | 1.40 s  | 932 KB     | 45 ms   |
-| MOBILE   | `prove_mobile()`   | **0.64 s** | 1.5 MB  | 28 ms   |
+| STANDARD | `prove()`          | **1.35 s** | 932 KB  | 45 ms   |
+| MOBILE   | `prove_mobile()`   | **0.63 s** | 1.5 MB  | 28 ms   |
 
-MOBILE comfortably under the 1-second target with sub-650 ms
-margin.  STANDARD is unchanged from the pre-PGO baseline because
-the PGO training covers only MOBILE + Add-bench code paths; the
-FRI-blowup-16 / pow_bits-20 STANDARD shape isn't trained.  Adding
-a STANDARD-trained pass to `build-pgo.sh` is a low-cost follow-up
-if STANDARD prove latency matters for any production flow.
+Both shapes hit their best-ever numbers post-PGO with the
+two-shape training pass landed in `d10eb1e`.  MOBILE comfortably
+under the 1-second target.  Session 2.1 producer side
+(`RistrettoCombTableChip` + `ScalarMultKind` plumbing) added
+during this bench window is dormant code — not in
+`BASE_COMPONENTS` — so MOBILE/STANDARD are unaffected by it; the
+delta vs the pre-Session-2 numbers is pure bench noise.
 
 Stage-level breakdown at MOBILE (median trial, post-PGO):
 
 | Stage              | Time    | %    |
 |---                 |---      |---   |
-| trace_gen          |  85 ms  | 13%  | ← was 124 ms pre-PGO
+| trace_gen          |  82 ms  | 13%  | ← was 124 ms pre-PGO
 | preprocess_commit  |   6 ms  |  1%  |
-| main_commit        | 180 ms  | 28%  |
-| interaction_gen    |  87 ms  | 14%  |
+| main_commit        | 173 ms  | 27%  |
+| interaction_gen    |  90 ms  | 14%  |
 | interaction_commit |  50 ms  |  8%  |
-| FRI prove          | 217 ms  | 34%  | ← dominant stage at MOBILE
-| **total**          | **639 ms** | **100%** |
+| FRI prove          | 211 ms  | 33%  | ← dominant stage at MOBILE
+| **total**          | **634 ms** | **100%** |
 
 Reproducing the PGO build:
 
