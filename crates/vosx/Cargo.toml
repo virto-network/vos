@@ -33,6 +33,10 @@ anyhow = "1"
 # elf_integration tests; vos uses redb internally but doesn't
 # re-export it.
 redb = "2"
+# Per-space file lock (flock on Unix, LockFile on Windows) to
+# stop two `vosx space *` processes from corrupting each
+# other's redb writes.
+fs2 = "0.4"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

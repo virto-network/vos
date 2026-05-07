@@ -18,6 +18,7 @@ use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::up::derive_registry_replication_id;
+use crate::space_lock::SpaceLock;
 use crate::spaces_index::{self, SpaceEntry};
 
 pub struct TransientRegistry {
@@ -30,6 +31,9 @@ pub struct TransientRegistry {
     pub space_id: [u8; 32],
     #[allow(dead_code)]
     pub entry: SpaceEntry,
+    /// Held for the lifetime of this transient session — drops
+    /// after `shutdown()` releases the kernel-level flock.
+    _lock: SpaceLock,
 }
 
 impl TransientRegistry {
@@ -55,6 +59,10 @@ impl TransientRegistry {
             anyhow::bail!("data dir does not exist: {}", data_dir.display());
         }
 
+        // Take the lock before opening any redb. If `space up`
+        // is running this fails fast with a clear error.
+        let _lock = SpaceLock::acquire(&data_dir)?;
+
         let mut node = VosNode::new();
         let cfg = AgentConfig::new(blob)
             .with_consistency(Consistency::Crdt)
@@ -66,6 +74,7 @@ impl TransientRegistry {
             node,
             space_id,
             entry,
+            _lock,
         })
     }
 
