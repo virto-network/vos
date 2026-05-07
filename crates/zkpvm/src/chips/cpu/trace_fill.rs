@@ -1256,9 +1256,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 );
 
                 // ── Wave-4a helpers ──
-                // SignExtBitBoolH = sign_ext_bit · (sign_ext_bit - 1).
-                // sign_ext_bit ∈ {0, 1} ⇒ helper always 0 in valid traces.
-                trace.fill_columns(row, false, Column::SignExtBitBoolH);
+                // (B3 audit dropped SignExtBitBoolH — sign_ext_bit is now
+                // boolean unconditional and the helper is no longer needed.)
                 // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
                 // val_d_partial_nz_msb is computed at line ~1025+ AFTER this
                 // helper-fill block — we need to compute it here independently.
@@ -1372,18 +1371,16 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     || flags.is_br_le_s || flags.is_br_gt_s;
                 trace.fill_columns(row, flags.is_br_eq && bt, Column::IsBrEqTakenH);
                 trace.fill_columns(row, flags.is_br_ne && !bt, Column::IsBrNeNotTakenH);
-                // EqFlagBoolH = eq · (1 - eq) — always 0 for eq ∈ {0, 1}.
-                trace.fill_columns(row, false, Column::EqFlagBoolH);
+                // (B3 audit dropped EqFlagBoolH; eq_flag is now boolean
+                // unconditional.)
                 trace.fill_columns(row, is_compare_b && eq_b || is_branch_b && eq_b,
                                    Column::IsCmpOrBranchEqH);
                 trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
 
-                // ── Wave-6: control-flow + memory boolean helpers ──
-                // All three helpers evaluate to 0 in valid traces (boolean
-                // identities and prefix-1 monotonicity).
-                trace.fill_columns(row, false, Column::BranchTakenBoolH);
+                // ── Wave-6: memory monotonicity helper ──
+                // (B3 audit dropped BranchTakenBoolH and MemByteActiveBoolH —
+                // both flags are now boolean unconditional.)
                 let zeros8 = [0u8; 8];
-                trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveBoolH);
                 trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveMonoH);
             }
 
@@ -1459,13 +1456,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             let is_32bit_b = flags.is_32bit;
             let is_shift_c_b = is_shift_constrained;
             let is_rot_r_either_b = flags.is_rotate_r64 || flags.is_rotate_r32;
-            // All Bool helpers are 0.
-            trace.fill_columns(row, false, Column::IsTruncatedBoolH);
-            trace.fill_columns(row, false, Column::ValBIsRegBoolH);
-            trace.fill_columns(row, false, Column::ValDIsRegBoolH);
-            trace.fill_columns(row, false, Column::ResultIsRegBoolH);
-            trace.fill_columns(row, false, Column::Phi7BoolBoolH);
-            trace.fill_columns(row, false, Column::IsBlakeEcallBoolH);
+            // (B3 audit dropped 6 *BoolH helpers — IsTruncated/ValBIsReg/
+            // ValDIsReg/ResultIsReg/Phi7Bool/IsBlakeEcall — all now
+            // enforced as unconditional `X·(1-X)=0`.)
             // Selector helpers.
             trace.fill_columns(row, real_b && is_32bit_b, Column::Real32bitH);
             trace.fill_columns(row, val_b_is_reg_b, Column::ValBIsRegH);
@@ -1526,8 +1519,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
 
             // ── Wave 8 helper fills (residuals) ──
             trace.fill_columns(row, flags.is_trap, Column::IsRealTrapH);
-            // MemAddrCarryBoolH = c·(1-c); booleans always satisfy this = 0.
-            trace.fill_columns_bytes(row, &[0u8; 4], Column::MemAddrCarryBoolH);
+            // (B3 audit dropped MemAddrCarryBoolH — mem_addr_carry per-byte
+            // booleans are now enforced unconditionally.)
             // Is64bitPopcountHiH = (1 - is_32bit) · (popcount[4]+...+popcount[7]).
             let is_64bit_b = !flags.is_32bit;
             let pop_hi: u32 = if is_64bit_b {
@@ -1656,14 +1649,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 ("IsBranchTakenH", Column::IsBranchTakenH),
                 ("IsCmovIzVdzH", Column::IsCmovIzVdzH),
                 ("IsCmovNzNotVdzH", Column::IsCmovNzNotVdzH),
-                ("BranchTakenBoolH", Column::BranchTakenBoolH),
-                ("EqFlagBoolH", Column::EqFlagBoolH),
                 ("IsCmpOrBranchEqH", Column::IsCmpOrBranchEqH),
                 ("MemByteActive", Column::MemByteActive),
-                ("MemByteActiveBoolH", Column::MemByteActiveBoolH),
                 ("MemByteActiveMonoH", Column::MemByteActiveMonoH),
                 ("MemAddrCarry", Column::MemAddrCarry),
-                ("MemAddrCarryBoolH", Column::MemAddrCarryBoolH),
                 ("IsLoadLocalNotActiveH", Column::IsLoadLocalNotActiveH),
                 ("IsRotRImmAltNotTruncH", Column::IsRotRImmAltNotTruncH),
                 ("IsRotRImmAltTruncH", Column::IsRotRImmAltTruncH),
@@ -1672,7 +1661,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 ("ValDPartialNZMsbLo", Column::ValDPartialNZMsbLo),
                 ("PartNZMsbTimesIndH", Column::PartNZMsbTimesIndH),
                 ("PartNZMsbLoTimesIndH", Column::PartNZMsbLoTimesIndH),
-                ("SignExtBitBoolH", Column::SignExtBitBoolH),
                 ("TzLo4H", Column::TzLo4H),
                 ("TzHi4H", Column::TzHi4H),
                 ("Lz64H", Column::Lz64H),

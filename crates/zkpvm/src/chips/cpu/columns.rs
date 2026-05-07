@@ -869,9 +869,8 @@ pub enum Column {
     #[size = 1] DbzActiveQuotH,
     #[size = 1] DbzActiveRemH,
 
-    // Wave 4a: BitManip MSB recurrences + SignExtBit boolean.
-    /// `SignExtBit · (SignExtBit - 1)` boolean witness.
-    #[size = 1] SignExtBitBoolH,
+    // Wave 4a: BitManip MSB recurrences.  (B3 audit dropped
+    // SignExtBitBoolH — sign_ext_bit is now boolean unconditionally.)
     /// `ValDPartialNZMsb[i+1] · ValDByteIndicatorH[i]` for the MSB-direction
     /// recurrence — i ∈ 0..7 (index 7 unused; default fill = 0).
     #[size = 8] PartNZMsbTimesIndH,
@@ -898,37 +897,24 @@ pub enum Column {
     #[size = 1] IsBrEqTakenH,
     /// `IsBrNe · (1 - BranchTaken)` — `val_b == val_d` (when not taken) gate.
     #[size = 1] IsBrNeNotTakenH,
-    /// `EqFlag · (1 - EqFlag)` boolean witness for the eq_flag column.
-    #[size = 1] EqFlagBoolH,
     /// `IsCmpOrBranch · EqFlag` — gate for the val_b/val_d byte-equal pinning.
     #[size = 1] IsCmpOrBranchEqH,
     /// `IsBranch · BranchTaken` — feeds the is_sequential expression and
     /// keeps it deg 1.  IsBranch = sum of 10 br_* sub-flag column refs (deg 1).
     #[size = 1] IsBranchTakenH,
 
-    // Wave 6: Control flow next_pc + memory boolean/monotonicity.
-    /// `BranchTaken · (1 - BranchTaken)` boolean witness.
-    #[size = 1] BranchTakenBoolH,
-    /// `MemByteActive[i] · (1 - MemByteActive[i])` per byte.
-    #[size = 8] MemByteActiveBoolH,
+    // Wave 6: Control flow next_pc + memory monotonicity.
+    // (B3 audit dropped BranchTakenBoolH / MemByteActiveBoolH —
+    // booleans are now enforced unconditionally as `X·(1-X)=0`.)
     /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
     /// (index 7 unused, default fill = 0).
     #[size = 8] MemByteActiveMonoH,
 
     // Wave 7: Phase 9 register-memory binding.  Many cross-constraints
-    // chain 3-4 selector flags before a linear body.
-    /// `IsTruncated · (1 - IsTruncated)` boolean witness.
-    #[size = 1] IsTruncatedBoolH,
-    /// `ValBIsReg · (1 - ValBIsReg)` boolean witness.
-    #[size = 1] ValBIsRegBoolH,
-    /// `ValDIsReg · (1 - ValDIsReg)` boolean witness.
-    #[size = 1] ValDIsRegBoolH,
-    /// `ResultIsReg · (1 - ResultIsReg)` boolean witness.
-    #[size = 1] ResultIsRegBoolH,
-    /// `Phi7Bool · (1 - Phi7Bool)` boolean witness.
-    #[size = 1] Phi7BoolBoolH,
-    /// `IsBlakeEcall · (1 - IsBlakeEcall)` boolean witness.
-    #[size = 1] IsBlakeEcallBoolH,
+    // chain 3-4 selector flags before a linear body.  (B3 audit
+    // dropped 6 *BoolH helpers — IsTruncated/ValBIsReg/ValDIsReg/
+    // ResultIsReg/Phi7Bool/IsBlakeEcall — all now enforced as
+    // unconditional `X·(1-X)=0` constraints.)
     /// `(1 - IsPadding) · Is32Bit` — used in the IsTruncated identity binding.
     #[size = 1] Real32bitH,
     /// `(1 - IsPadding) · ValBIsReg` — gate root for ValB cross-constraints.
@@ -969,8 +955,8 @@ pub enum Column {
     // Wave 8: residual deg-3+ patterns missed by the earlier wave grep.
     /// `IsReal · IsTrap` — Phase 13e terminal-row gate.
     #[size = 1] IsRealTrapH,
-    /// `MemAddrCarry[i] · (1 - MemAddrCarry[i])` — boolean witness per byte.
-    #[size = 4] MemAddrCarryBoolH,
+    // (B3 audit dropped MemAddrCarryBoolH — mem_addr_carry per-byte boolean
+    // is now enforced unconditionally as `X·(1-X)=0`.)
     /// `Is64Bit · (BytePopcount[4] + ... + BytePopcount[7])` — used in
     /// CountSetBits result-binding to keep the gated body at deg 1.
     #[size = 1] Is64bitPopcountHiH,

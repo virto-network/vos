@@ -107,8 +107,6 @@ impl BuiltInComponent for CpuChip {
         // Trap (~line 2244), mem_addr_carry boolean (~line 2546), and
         // Phase 20 inactive-byte load (~line 2614).
         let is_real_trap_h = crate::trace::trace_eval!(trace_eval, Column::IsRealTrapH);
-        let mem_addr_carry_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::MemAddrCarryBoolH);
         let is_64bit_popcount_hi_h =
             crate::trace::trace_eval!(trace_eval, Column::Is64bitPopcountHiH);
         let is_load_local_not_active_h =
@@ -372,8 +370,6 @@ impl BuiltInComponent for CpuChip {
         );
 
         // ── Phase I-cpu Wave-4a helpers (BitManip MSB + SignExtBit) ──
-        let sign_ext_bit_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::SignExtBitBoolH);
         let part_nz_msb_times_ind_h =
             crate::trace::trace_eval!(trace_eval, Column::PartNZMsbTimesIndH);
         let part_nz_msb_lo_times_ind_h =
@@ -384,10 +380,12 @@ impl BuiltInComponent for CpuChip {
                 crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsb);
             let val_d_partial_nz_msb_lo_top =
                 crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
+            // B3 audit: sign_ext_bit boolean unconditional (was via SignExtBitBoolH).
+            // Trace fills 0 on non-sign-ext rows so 0·(1-0)=0 holds; gated form
+            // `is_sign_ext · bool_h = 0` is now redundant and removed below.
             eval.add_constraint(
-                sign_ext_bit_bool_h[0].clone()
-                    - sign_ext_bit_top[0].clone()
-                        * (sign_ext_bit_top[0].clone() - E::F::one())
+                sign_ext_bit_top[0].clone()
+                    * (E::F::one() - sign_ext_bit_top[0].clone())
             );
             // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
             for i in 0..7 {
@@ -914,8 +912,10 @@ impl BuiltInComponent for CpuChip {
         let is_sign_ext = is_sign_ext_8[0].clone() + is_sign_ext_16[0].clone();
         let ff_se: E::F = E::F::from(BaseField::from(255));
 
-        // SignExtBit ∈ {0, 1} (Phase I-cpu Wave-4a flattened).
-        eval.add_constraint(is_sign_ext.clone() * sign_ext_bit_bool_h[0].clone());
+        // B3 audit: SignExtBit ∈ {0, 1} now enforced unconditionally above
+        // (Wave-4a block).  The `is_sign_ext · bool_h = 0` constraint is
+        // redundant once sign_ext_bit is boolean on every row, since
+        // bool_h = 0 makes the product trivially zero.
         // SE8 + SE16 both copy byte 0.
         eval.add_constraint(
             is_sign_ext.clone() * (result[0].clone() - val_d[0].clone()),
@@ -1125,7 +1125,6 @@ impl BuiltInComponent for CpuChip {
             crate::trace::trace_eval!(trace_eval, Column::IsBrEqTakenH);
         let is_br_ne_not_taken_h =
             crate::trace::trace_eval!(trace_eval, Column::IsBrNeNotTakenH);
-        let eq_flag_bool_h = crate::trace::trace_eval!(trace_eval, Column::EqFlagBoolH);
         let is_cmp_or_branch_eq_h =
             crate::trace::trace_eval!(trace_eval, Column::IsCmpOrBranchEqH);
         let is_branch_taken_h =
@@ -1141,8 +1140,9 @@ impl BuiltInComponent for CpuChip {
                 is_br_ne_not_taken_h[0].clone()
                     - is_br_ne[0].clone() * (E::F::one() - branch_taken_top[0].clone())
             );
+            // B3 audit: EqFlag boolean unconditional (was via EqFlagBoolH).
             eval.add_constraint(
-                eq_flag_bool_h[0].clone() - eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone())
+                eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone())
             );
             eval.add_constraint(
                 is_cmp_or_branch_eq_h[0].clone() - is_cmp_or_branch.clone() * eq_flag_top[0].clone()
@@ -1153,10 +1153,6 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ── Phase I-cpu Wave-6 helpers (control flow + memory boolean) ──
-        let branch_taken_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::BranchTakenBoolH);
-        let mem_byte_active_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::MemByteActiveBoolH);
         let mem_byte_active_mono_h =
             crate::trace::trace_eval!(trace_eval, Column::MemByteActiveMonoH);
         {
@@ -1164,16 +1160,17 @@ impl BuiltInComponent for CpuChip {
                 crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
             let mem_byte_active_w6 =
                 crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+            // B3 audit: branch_taken/mem_byte_active boolean unconditional
+            // (was via BranchTakenBoolH / MemByteActiveBoolH).  Trace fills
+            // both as 0 on padding/non-mem rows.
             eval.add_constraint(
-                branch_taken_bool_h[0].clone()
-                    - branch_taken_w6[0].clone()
-                        * (E::F::one() - branch_taken_w6[0].clone())
+                branch_taken_w6[0].clone()
+                    * (E::F::one() - branch_taken_w6[0].clone())
             );
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    mem_byte_active_bool_h[i].clone()
-                        - mem_byte_active_w6[i].clone()
-                            * (E::F::one() - mem_byte_active_w6[i].clone())
+                    mem_byte_active_w6[i].clone()
+                        * (E::F::one() - mem_byte_active_w6[i].clone())
                 );
             }
             for i in 0..WORD_SIZE - 1 {
@@ -1186,18 +1183,9 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ── Phase I-cpu Wave-7 helpers (Phase 9 register-memory binding) ──
-        let is_truncated_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsTruncatedBoolH);
-        let val_b_is_reg_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::ValBIsRegBoolH);
-        let val_d_is_reg_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::ValDIsRegBoolH);
-        let result_is_reg_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::ResultIsRegBoolH);
-        let phi7_bool_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::Phi7BoolBoolH);
-        let is_blake_ecall_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcallBoolH);
+        // B3 audit: 6 *BoolH helpers (IsTruncated/ValBIsReg/ValDIsReg/
+        // ResultIsReg/Phi7Bool/IsBlakeEcall) dropped — boolean property
+        // is now enforced unconditionally below.
         let real_32bit_h = crate::trace::trace_eval!(trace_eval, Column::Real32bitH);
         let val_b_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValBIsRegH);
         let val_b_is_reg_not_trunc_h =
@@ -1233,37 +1221,16 @@ impl BuiltInComponent for CpuChip {
                 crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let is_rot_r32_top =
                 crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            // Boolean helpers (deg 2 def).
-            eval.add_constraint(
-                is_truncated_bool_h[0].clone()
-                    - is_truncated_top[0].clone()
-                        * (E::F::one() - is_truncated_top[0].clone())
-            );
-            eval.add_constraint(
-                val_b_is_reg_bool_h[0].clone()
-                    - val_b_is_reg_top[0].clone()
-                        * (E::F::one() - val_b_is_reg_top[0].clone())
-            );
-            eval.add_constraint(
-                val_d_is_reg_bool_h[0].clone()
-                    - val_d_is_reg_top[0].clone()
-                        * (E::F::one() - val_d_is_reg_top[0].clone())
-            );
-            eval.add_constraint(
-                result_is_reg_bool_h[0].clone()
-                    - result_is_reg_top[0].clone()
-                        * (E::F::one() - result_is_reg_top[0].clone())
-            );
-            eval.add_constraint(
-                phi7_bool_bool_h[0].clone()
-                    - phi7_bool_top[0].clone()
-                        * (E::F::one() - phi7_bool_top[0].clone())
-            );
-            eval.add_constraint(
-                is_blake_ecall_bool_h[0].clone()
-                    - is_blake_ecall_top[0].clone()
-                        * (E::F::one() - is_blake_ecall_top[0].clone())
-            );
+            // B3 audit: 6 boolean flags enforced unconditionally — the
+            // gated `is_real · bool_h = 0` pattern below is now redundant.
+            for flag in [
+                &is_truncated_top, &val_b_is_reg_top, &val_d_is_reg_top,
+                &result_is_reg_top, &phi7_bool_top, &is_blake_ecall_top,
+            ] {
+                eval.add_constraint(
+                    flag[0].clone() * (E::F::one() - flag[0].clone())
+                );
+            }
             // Selector helpers (deg 2 def each).
             eval.add_constraint(
                 real_32bit_h[0].clone() - is_real.clone() * is_32bit[0].clone()
@@ -1351,12 +1318,12 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_real_trap_h[0].clone() - is_real.clone() * is_trap_col_top[0].clone()
             );
-            // MemAddrCarry boolean per byte.
+            // B3 audit: MemAddrCarry boolean per byte (unconditional).
+            // Was via MemAddrCarryBoolH helper + `is_real · helper = 0`.
             for i in 0..4 {
                 eval.add_constraint(
-                    mem_addr_carry_bool_h[i].clone()
-                        - mem_addr_carry_top[i].clone()
-                            * (E::F::one() - mem_addr_carry_top[i].clone())
+                    mem_addr_carry_top[i].clone()
+                        * (E::F::one() - mem_addr_carry_top[i].clone())
                 );
             }
             // Popcount-hi helper.
@@ -1474,7 +1441,8 @@ impl BuiltInComponent for CpuChip {
         }
 
         // branch_taken must be boolean — gate via BranchTakenBoolH.
-        eval.add_constraint(is_branch_e() * branch_taken_bool_h[0].clone());
+        // B3 audit: redundant — branch_taken boolean is enforced
+        // unconditionally in the Wave-6 block above.
 
         // ── Branch condition constraints ──
         // Phase 54h: dropped ByteEq[8] + ByteDiffInv[8].  Branch eq/ne
@@ -1517,7 +1485,8 @@ impl BuiltInComponent for CpuChip {
         // EqFlag: constrain val_b == val_d flag (Phase I-cpu Wave-5 flattened)
         let eq_flag = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
         // eq_flag boolean — gate via EqFlagBoolH.
-        eval.add_constraint(is_cmp_or_branch.clone() * eq_flag_bool_h[0].clone());
+        // B3 audit: redundant — eq_flag boolean is enforced unconditionally
+        // in the Wave-5 (eq_flag) block above.
         // eq_flag=1 ⇒ val_b[i] = val_d[i] (byte-wise) — gate via IsCmpOrBranchEqH.
         let _ = eq_flag; // routed through helpers above
         for i in 0..WORD_SIZE {
@@ -1658,12 +1627,9 @@ impl BuiltInComponent for CpuChip {
         // flags through ProgramMemoryChip).
         {
             let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
-            // Boolean per byte (Phase I-cpu Wave-6 flattened).
-            for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone() * mem_byte_active_bool_h[i].clone()
-                );
-            }
+            // B3 audit: per-byte MemByteActive boolean is now enforced
+            // unconditionally in the Wave-6 block above; the gated form
+            // is redundant once each byte is boolean on every row.
             // Monotonicity (Phase I-cpu Wave-6 flattened).
             for i in 0..WORD_SIZE - 1 {
                 eval.add_constraint(
@@ -1872,9 +1838,9 @@ impl BuiltInComponent for CpuChip {
                 &tuple_a,
             ));
 
-            // Phase 9g: IsTruncated boolean + identity binding (Phase I-cpu Wave-7 flattened).
+            // Phase 9g: IsTruncated identity binding (Wave-7).  B3 audit:
+            // boolean property now enforced unconditionally (Wave-7 block).
             let is_truncated = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
-            eval.add_constraint(is_real.clone() * is_truncated_bool_h[0].clone());
             // is_truncated = is_32bit · (is_add+is_sub+is_mul+is_div_rem).
             // is_real · is_32bit lifted into Real32bitH so the constraint
             // factors as is_real·is_truncated - Real32bitH·trunc_sum.
@@ -1971,10 +1937,8 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
-            // IsReg flags must be boolean (Phase I-cpu Wave-7 flattened).
-            eval.add_constraint(is_real.clone() * val_b_is_reg_bool_h[0].clone());
-            eval.add_constraint(is_real.clone() * val_d_is_reg_bool_h[0].clone());
-            eval.add_constraint(is_real.clone() * result_is_reg_bool_h[0].clone());
+            // B3 audit: IsReg booleans now enforced unconditionally
+            // in the Wave-7 block above.
         }
 
         // ── Phase 9e: blake2b ECALL register-read producers + Phi7Bool tie ──
@@ -2006,8 +1970,8 @@ impl BuiltInComponent for CpuChip {
             // with Phi7 because trace gen derives both from regs_before[7]).
             let phi7_field = crate::framework::eval::combine_le_u64::<E>(&phi7);
             let phi7_inv_field = crate::framework::eval::combine_le_u64::<E>(&phi7_inv);
-            // Phi7Bool is boolean (Phase I-cpu Wave-7 flattened).
-            eval.add_constraint(is_real.clone() * phi7_bool_bool_h[0].clone());
+            // B3 audit: Phi7Bool boolean now enforced unconditionally
+            // in the Wave-7 block above.
             // If Phi7Bool = 0, then Phi7 (as field) = 0.
             let _ = phi7_field;
             let _ = phi7_inv_field;
@@ -2041,10 +2005,8 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
-            // Phi7Bool boolean (Phase I-cpu Wave-7 flattened).
-            eval.add_constraint(is_real.clone() * phi7_bool_bool_h[0].clone());
-            // IsBlakeEcall boolean (Phase I-cpu Wave-7 flattened).
-            eval.add_constraint(is_real.clone() * is_blake_ecall_bool_h[0].clone());
+            // B3 audit: Phi7Bool / IsBlakeEcall booleans now enforced
+            // unconditionally in the Wave-7 block above.
             let _ = is_blake_ecall;
         }
 
@@ -2642,13 +2604,9 @@ impl BuiltInComponent for CpuChip {
             let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             // Boolean carry per byte (gated by is_real so range is
             // forced even on non-indirect rows where the chain is
-            // dormant).
-            // Wave 8 flatten: gate via per-byte boolean helper.
-            for i in 0..4 {
-                eval.add_constraint(
-                    is_real.clone() * mem_addr_carry_bool_h[i].clone()
-                );
-            }
+            // dormant).  B3 audit: per-byte mem_addr_carry boolean is now
+            // enforced unconditionally in the Wave-8 block above; the
+            // gated form is redundant.
             // Add-with-carry chain (gated on is_mem_indirect).
             for i in 0..4 {
                 let carry_in = if i == 0 {
