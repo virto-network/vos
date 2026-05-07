@@ -163,7 +163,44 @@ integration remains.
   * **Self-contained** (Path A-style inside the consumer chip): add `Acc{X,Y,Z,T}` columns + 16 sub-rows per window for the point-add formula.  Cost: re-implementing RistrettoChip's full FieldOpRow constraint set in the consumer chip (boolean checks, real-row partition, ff_brw/sub_chain_brw closures, schoolbook mul chain, reduction chain, top-bit fold).  Realistically **2–3 days** of focused chip code.
   * **Reuse RistrettoChip's add chain** (originally proposed Path B): NOT VIABLE — RistrettoChip uses preprocessed `RowIndexLo`/`RowIndexHi` columns (chip-local row indexes; see `ristretto/mod.rs:398`) so source-row threading can't reach across chip boundaries without a per-chip relation rewrite.  Cross-chip register-file lookup would need a new shared row-numbering scheme.
   * **Inject looked-up entries via RistrettoChip's IsInput row class**: 4 coords × 32 bytes × 64 entries = 8192 input rows + 1152 add rows = **9344 rows**.  WORSE than today's 6500.  Discarded.
-* **Recommended next-session path**: self-contained running sum.  ~2–3 days as the original roadmap estimated.  Start by lifting the FieldOp constraint set from `ristretto/mod.rs` into a shared module (or Cargo path-share with the consumer chip), so both chips constrain FieldOpRows identically without code duplication.  Then add `Acc{X,Y,Z,T}` + 16-row sub-chains to the consumer chip; emit boundary-binding rows tying final Acc to ECALL output.
+* **Recommended next-session path**: self-contained running sum.  ~2–3 days as the original roadmap estimated.  ~~Start by lifting the FieldOp constraint set from `ristretto/mod.rs` into a shared module~~ **DONE** (`fdc6f0e`) — `chips/ristretto/field_op_constraints.rs` now provides `add_field_op_constraints(eval, &FieldOpRefs)` taking borrowed column refs.  RistrettoChip calls it; chip_isolated 7/7 + phase2_alu 94/94 still GREEN; no algebraic change.  Next-session entry point: extend `RistrettoFixedBaseConsumerChip`'s Column enum with the FieldOp witnesses + `Acc{X,Y,Z,T}` + chip-local source-row columns; lay 1-lookup + 4-input + 18-add row chunks per window (see "Running-sum row layout" below); emit boundary-binding rows tying final Acc to ECALL output.
+
+### Running-sum row layout (next-session implementation guide)
+
+**Per scalar-mult call** (~1412 rows; log_size 13 for 4 calls):
+- `~3` boundary input rows for constants (zero, one, ED25519_TWO_D).
+- `64 × 22 = 1408` window rows (4 lookup-input + 18 FieldOp add rows per window).
+- `1` boundary output row tying final Acc to ECALL output (see step 8).
+
+**Per window (22 rows = 4 lookup-input + 18 add)**:
+
+| Offset | Class | IsInput | IsLookupAnchor | `out` | Other columns | Emissions |
+|---:|:--|:-:|:-:|:--|:--|:--|
+| `+0` | lookup-anchor | 1 | 1 | `T[i][k_i].x` | WindowIdx=i, ScalarWindow=k_i, `X=out`, `Y=…y`, `Z=…z`, `T=…t` | +1 to `RistrettoCombLookupElements`; +1 producer to chip-local register-file (key: row_id, byte_idx, X[byte_idx]); 3 *consumer* tuples on chip-local register-file binding `Y/Z/T` columns to rows `+1/+2/+3`'s `out`. |
+| `+1..+3` | lookup-coord | 1 | 0 | `T[i][k_i].y/z/t` | — | +1 producer to chip-local register-file. |
+| `+4..+21` | FieldOp add | (no — is_add/is_sub/is_mul) | 0 | per `point_add_rows` (point.rs:139) | a, b, out, carry chains, source rows | FieldOp algebra (via shared `add_field_op_constraints`); register-file producer/consumer tuples for inter-row binding. |
+
+**Source-row threading** (chip-local, 16-bit row IDs, fits log_size ≤ 16):
+- The 18 FieldOp add rows for window `i` use:
+  - `(p.x, p.y, p.z, p.t)` → previous window's final Acc add rows (4 specific row IDs from window `i-1`'s add chain, or boundary input rows for `i = 0` / identity).
+  - `(q.x, q.y, q.z, q.t)` → window `i`'s rows `+0..+3` (the lookup-coord rows).
+- The first window seeds `acc = identity`; identity's coords come from the boundary input rows for zero (`acc.x = acc.t = 0`) and one (`acc.y = acc.z = 1`).
+
+**Soundness of lookup-anchor's Y/Z/T binding**: row `+0` holds `Y, Z, T` in dedicated witness columns whose values must match rows `+1..+3`'s `out`s.  Cross-row reads aren't directly expressible in Stwo's `add_constraints`, so we close the gap via the chip-local register-file relation:
+- Row `+0` emits *consumer* tuples `(row_+1_id, byte_idx, Y[byte_idx])` for byte_idx ∈ 0..32 (likewise for Z/T sourcing from `+2`/`+3`).
+- Rows `+1`/`+2`/`+3` emit *producer* tuples `(self_row_id, byte_idx, out[byte_idx])`.
+- Balance forces `Y == out_at_+1`, `Z == out_at_+2`, `T == out_at_+3`.
+- Row `+0`'s own `X == out` is a per-row constraint (no relation needed).
+
+**Lookup-anchor's emission to `RistrettoCombLookupElements`** uses `(WindowIdx, ScalarWindow, X, Y, Z, T)` from the row's own columns — the relation balance against `RistrettoCombTableChip` then forces these to equal the preprocessed table's `T[i][k_i]`.
+
+**Step 8 (ECALL boundary binding)** ties the consumer chip into RistrettoEcallChip's existing scalar/output byte boundary:
+- Add a new `RistrettoCombBoundaryLookupElements` relation with tuple `(call_idx, kind ∈ {scalar, output}, byte_idx, value)`.
+- Consumer chip emits `+1` per scalar/output byte on its first/last input rows respectively (32 bytes each per call × `n_calls` × 2 sides).
+- RistrettoEcallChip emits `−1` on the matching scalar/output bytes for `ScalarMultKind::FixedBasepoint` records.
+- Side-note plumbing: branch on `rec.kind` in `ingest_ristretto_boundary`; populate `ristretto_comb_calls` for fixed-base records.
+
+**Activity gating**: add `ChipActivity.ristretto_comb` (true iff `!side_note.ristretto_comb_calls.is_empty()`); gate `RistrettoCombTableChip` and `RistrettoFixedBaseConsumerChip` on it in `BASE_COMPONENTS`; mirror in `is_active`.
 * **Step 8 OPEN**: route `ScalarMultKind::FixedBasepoint` → fixed-base witness path.  One-line dispatch in `ingest_ristretto_boundary` once step 5 lands.
 * **Activity gating OPEN**: `ChipActivity.ristretto_comb` + add `RistrettoCombTableChip` to `BASE_COMPONENTS`.  Both deferred until step 5 because adding the table chip alone unbalances the relation across the whole prover (only the chip-isolated harness sees zero counts).
 
