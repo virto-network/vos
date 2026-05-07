@@ -1,38 +1,48 @@
 # zkpvm — performance benchmarks
 
-## Latest — parallel trace-gen pass (Session-1.2 of perf roadmap, no PGO)
+## Latest — Session 1 of perf roadmap (parallel trace-gen + PGO)
 
 `tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
 (Pedersen + Schnorr + commitment + signing payload, ~24 K PVM
 steps).  Median of 5 trials, post B3 audit + parallel
-interaction-trace + parallel main-trace generation, on the
-reference Intel Core Ultra 7 155H:
+interaction-trace + parallel main-trace generation + PGO build
+(`scripts/build-pgo.sh` trains on `bench_prove` Add log10/12/14 +
+clerk-private-pay-bench-mobile), on the reference Intel Core
+Ultra 7 155H:
 
 | Config   | Prover entry point | Prove   | Proof size | Verify  |
 |---       |---                 |---      |---         |---      |
-| STANDARD | `prove()`          | 1.34 s  | 932 KB     | 45 ms   |
-| MOBILE   | `prove_mobile()`   | **0.70 s** | 1.5 MB  | 28 ms   |
+| STANDARD | `prove()`          | 1.40 s  | 932 KB     | 45 ms   |
+| MOBILE   | `prove_mobile()`   | **0.64 s** | 1.5 MB  | 28 ms   |
 
-MOBILE stays comfortably under the 1-second target.  The
-parallel-trace-gen win is largely consumed by the
-producer-bottleneck (CpuChip dominates trace_gen wall-clock); on
-STANDARD the saving shows through as ~50 ms because trace_gen is
-a smaller fraction of the FRI-light shape.  PGO on top of MOBILE
-projects to ~0.58–0.62 s based on the documented −18% historical
-win (re-bench after `scripts/build-pgo.sh`).
+MOBILE comfortably under the 1-second target with sub-650 ms
+margin.  STANDARD is unchanged from the pre-PGO baseline because
+the PGO training covers only MOBILE + Add-bench code paths; the
+FRI-blowup-16 / pow_bits-20 STANDARD shape isn't trained.  Adding
+a STANDARD-trained pass to `build-pgo.sh` is a low-cost follow-up
+if STANDARD prove latency matters for any production flow.
 
-Stage-level breakdown at MOBILE (median trial):
+Stage-level breakdown at MOBILE (median trial, post-PGO):
 
 | Stage              | Time    | %    |
 |---                 |---      |---   |
-| trace_gen          | 124 ms  | 18%  | ← was 130 ms pre-parallel-trace
+| trace_gen          |  85 ms  | 13%  | ← was 124 ms pre-PGO
 | preprocess_commit  |   6 ms  |  1%  |
-| main_commit        | 175 ms  | 25%  |
-| interaction_gen    |  85 ms  | 12%  |
-| interaction_commit |  50 ms  |  7%  |
-| FRI prove          | 240 ms  | 35%  | ← dominant stage at MOBILE
-| **total**          | **698 ms** | **100%** |
+| main_commit        | 180 ms  | 28%  |
+| interaction_gen    |  87 ms  | 14%  |
+| interaction_commit |  50 ms  |  8%  |
+| FRI prove          | 217 ms  | 34%  | ← dominant stage at MOBILE
+| **total**          | **639 ms** | **100%** |
+
+Reproducing the PGO build:
+
+```
+bash scripts/build-pgo.sh   # ~10 min on the reference desktop
+RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/zkpvm-pgo-data/merged.profdata" \
+  cargo test -p zkpvm --release --test prove_vos_actor \
+  profile_clerk_private_pay_bench_mobile -- --exact --nocapture
+```
 
 Verifier-side, MOBILE proofs require
 `verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)`
