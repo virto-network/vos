@@ -44,12 +44,24 @@ echo "=== Step 1/3: Instrumented build ==="
 RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
   cargo build -p zkpvm --features prover --release --tests
 
-echo "=== Step 2/3: Training run (collects profile data) ==="
+echo "=== Step 2a/3: Training run — synthetic Add bench (ALU-heavy) ==="
 RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
   cargo test -p zkpvm --features prover --release --test bench_prove \
   -- profile_log14_mobile bench_prove_log10 bench_prove_log12 bench_prove_log14 \
   --nocapture --test-threads 1 \
   > /dev/null
+
+echo "=== Step 2b/3: Training run — clerk-private-pay (ECALL + ledger) ==="
+# Cover the tap-to-pay opcode mix so PGO inlining / branch hints
+# tune the prover for real-world latency-sensitive flows, not just
+# synthetic Add traces.  Falls back silently if the actor blob isn't
+# available in the local checkout (common on contributor machines).
+RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
+  cargo test -p zkpvm --features prover --release --test prove_vos_actor \
+  -- profile_clerk_private_pay_bench_mobile \
+  --nocapture --test-threads 1 \
+  > /dev/null \
+  || echo ">>> WARNING: clerk-private-pay-bench training skipped (actor blob missing); PGO will be ALU-tuned only."
 
 echo "=== Step 3/3: Merge profiles + final build ==="
 "$PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/*.profraw
