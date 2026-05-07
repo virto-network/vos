@@ -29,6 +29,7 @@ mod manifest;
 mod network;
 mod paths;
 mod query;
+mod spaces_index;
 mod util;
 
 use manifest::manifest_from;
@@ -149,6 +150,12 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sync_timeout: u64,
     },
+    /// Per-space lifecycle commands. New / list / info land in
+    /// Phase 1a; up / export / join in Phase 1b/1c.
+    Space {
+        #[command(subcommand)]
+        command: commands::space::SpaceCommand,
+    },
     /// Invoke a typed message on a service:
     ///   `vosx call counter.inc 5`
     /// Resolves the target via the manifest's registry, types
@@ -209,6 +216,12 @@ fn main() {
         Some(Command::Call { target, args, manifest, connect, sync_timeout }) => {
             let (m, dir, _toml) = manifest_from(manifest);
             commands::invoke::run_call(&m, &dir, &target, &args, &connect, sync_timeout);
+        }
+        Some(Command::Space { command }) => {
+            if let Err(e) = commands::space::run(command) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
         None if cli.file.as_ref().is_some_and(|p| !manifest::is_manifest(p)) => {
             commands::run::run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);

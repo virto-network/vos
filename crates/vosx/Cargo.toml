@@ -24,6 +24,10 @@ space-registry = { path = "../actors/space-registry", default-features = false, 
 # and `Hash` sources, only `Cid` and `Url` resolution touch
 # external services.
 hex = "0.4"
+# anyhow is the existing project's only convenience-error crate;
+# the new `space *` commands return Result for clean error
+# bubbling through the clap dispatcher.
+anyhow = "1"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }
