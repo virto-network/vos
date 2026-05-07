@@ -143,6 +143,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::DivRemChip,   // Phase 54g — consumer of DivRemLookup
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, gated by activity.ristretto
     &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, gated by activity.ristretto_ecall
+    &chips::RistrettoCombTableChip, // Session 2.1 step 4 — OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoFixedBaseConsumerChip, // Session 2.1 step 5(b) — OPTIONAL, gated by activity.ristretto_comb
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -166,6 +168,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
     &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, mirrored in verifier-only build
+    &chips::RistrettoCombTableChip,
+    &chips::RistrettoFixedBaseConsumerChip,
 ];
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
@@ -262,6 +266,14 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     if !side_note.ristretto_field_rows.is_empty() {
         a.ristretto = true;
     }
+    // Session 2.1 step 4: comb-method consumer + producer chips fire
+    // when at least one fixed-basepoint scalar mult call is queued in
+    // `ristretto_comb_calls`.  In production this is populated by step
+    // 8's ECALL routing; in chip-isolated tests the harness pushes
+    // calls directly.
+    if !side_note.ristretto_comb_calls.is_empty() {
+        a.ristretto_comb = true;
+    }
     a
 }
 
@@ -278,6 +290,7 @@ struct ChipActivity {
     divrem: bool,
     ristretto: bool,
     ristretto_ecall: bool,
+    ristretto_comb: bool,
 }
 
 #[cfg(feature = "prover")]
@@ -294,6 +307,7 @@ impl ChipActivity {
             18 => self.divrem,
             19 => self.ristretto,
             20 => self.ristretto_ecall,
+            21 | 22 => self.ristretto_comb,
             _ => true,
         }
     }
