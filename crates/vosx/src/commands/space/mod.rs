@@ -14,6 +14,7 @@ pub mod export;
 pub mod info;
 pub mod install;
 pub mod list;
+pub mod members;
 pub mod new;
 pub mod programs;
 pub mod publish;
@@ -134,6 +135,14 @@ pub enum SpaceCommand {
     Agents {
         space: String,
     },
+    /// Manage Node + Identity members. Subcommands: list,
+    /// add-node, remove-node, add-identity, remove-identity.
+    /// Bare `space members <space>` lists.
+    Members {
+        space: String,
+        #[command(subcommand)]
+        command: Option<members::MembersCommand>,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -196,5 +205,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             program_ref,
         }),
         SpaceCommand::Agents { space } => agents::run(&space),
+        SpaceCommand::Members { space, command } => {
+            members::run(members::Args { space, command })
+        }
     }
 }
