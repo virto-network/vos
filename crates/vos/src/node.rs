@@ -528,11 +528,20 @@ impl crate::network::NetworkService for NodeService {
         // ID (the remote peer's agent). The receiver's own
         // external_invoke prepends *this* agent's ID when dispatching
         // further hops, so we don't need to touch the chain here.
-        let tx = self
-            .invoke_routes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&to).cloned());
+        //
+        // Cross-network targets carry the receiver's `node_prefix` in
+        // the upper 16 bits. Many agents (notably the well-known
+        // registry at local_id 0) register themselves as unscoped
+        // (`ServiceId(0, local_id)`), so a literal lookup of `to`
+        // misses. Fall back to the unscoped form when the prefix
+        // matches our own node — same routing decision the local
+        // path makes via `is_on_node || is_local`.
+        let to_unscoped = to & 0xFFFF;
+        let tx = self.invoke_routes.lock().ok().and_then(|m| {
+            m.get(&to)
+                .cloned()
+                .or_else(|| if to != to_unscoped { m.get(&to_unscoped).cloned() } else { None })
+        });
         let Some(tx) = tx else {
             return Vec::new();
         };
@@ -1425,6 +1434,9 @@ impl VosNode {
                             Vec::new(),
                             msg,
                         );
+                        // Daemon's `dispatch_invoke` already strips
+                        // the envelope back to raw reply bytes, so
+                        // we just forward them.
                         return reply_rx.recv_timeout(timeout).ok();
                     }
                 }

@@ -1,11 +1,8 @@
 //! `space upgrade` — repoint an agent at a different program version.
 
-use vos::abi::service::ServiceId;
-use space_registry::{
-    SpaceRegistryRef, STATUS_NOT_FOUND, STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
-};
+use space_registry::{STATUS_NOT_FOUND, STATUS_OK, STATUS_PROGRAM_NOT_FOUND};
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub struct Args {
     pub space: String,
@@ -16,11 +13,11 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let (program_name, program_version) = parse_program_ref(&args.program_ref)?;
 
-    let reg_handle = TransientRegistry::boot(&args.space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(&args.space)?;
+    let reg = client.registry();
 
     let program = vos::block_on(reg.program(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         program_name.clone(),
         program_version.clone(),
     ))
@@ -28,7 +25,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     .ok_or_else(|| anyhow::anyhow!("program {program_name}:{program_version} not in catalog"))?;
 
     let status = vos::block_on(reg.upgrade(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         args.instance.clone(),
         program_name.clone(),
         program_version.clone(),
@@ -48,7 +45,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!("upgrade returned status {other}"),
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }
 
 fn parse_program_ref(s: &str) -> anyhow::Result<(String, String)> {

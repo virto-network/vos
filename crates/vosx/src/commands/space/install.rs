@@ -1,14 +1,13 @@
 //! `space install` — instantiate a published program as an
 //! installed agent.
 
-use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use space_registry::{
-    auto_replication_id, parse_consistency, SpaceRegistryRef, STATUS_INSTANCE_EXISTS,
+    auto_replication_id, parse_consistency, STATUS_INSTANCE_EXISTS,
     STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
 };
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub struct Args {
     pub space: String,
@@ -50,12 +49,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .to_vec()
     };
 
-    let reg_handle = TransientRegistry::boot(&args.space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(&args.space)?;
+    let reg = client.registry();
 
     // Look up the program so we know its hash to pin against.
     let program = vos::block_on(reg.program(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         program_name.clone(),
         program_version.clone(),
     ))
@@ -72,7 +71,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let status = vos::block_on(reg.install(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         instance_name.clone(),
         program_name.clone(),
         program_version.clone(),
@@ -100,7 +99,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!("install returned status {other}"),
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }
 
 fn parse_program_ref(s: &str) -> anyhow::Result<(String, String)> {

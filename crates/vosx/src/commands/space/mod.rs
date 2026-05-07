@@ -10,7 +10,9 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 pub mod agents;
+pub mod client;
 pub mod delete;
+pub mod endpoint;
 pub mod export;
 pub mod info;
 pub mod install;
@@ -20,11 +22,11 @@ pub mod members;
 pub mod new;
 pub mod programs;
 pub mod publish;
-pub mod transient;
 pub mod uninstall;
 pub mod unpublish;
 pub mod up;
 pub mod upgrade;
+pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {

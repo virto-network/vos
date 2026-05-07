@@ -1,16 +1,15 @@
 //! `space uninstall` — tombstone an agent.
 
-use vos::abi::service::ServiceId;
-use space_registry::{SpaceRegistryRef, STATUS_NOT_FOUND, STATUS_OK};
+use space_registry::{STATUS_NOT_FOUND, STATUS_OK};
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
-    let reg_handle = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
 
     let status = vos::block_on(reg.uninstall(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         instance.to_string(),
     ))
     .map_err(|e| anyhow::anyhow!("uninstall() failed: {e}"))?;
@@ -24,5 +23,5 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
     // TODO(phase 4): move per-agent redb to space_dir/trash/{instance}
     //   so the data is recoverable instead of left dangling.
 
-    reg_handle.shutdown()
+    client.shutdown()
 }

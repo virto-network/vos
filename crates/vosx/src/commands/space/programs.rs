@@ -1,14 +1,13 @@
 //! `space programs` — list the program catalog.
 
-use vos::abi::service::ServiceId;
-use space_registry::SpaceRegistryRef;
 
-use crate::commands::space::transient::TransientRegistry;
+
+use crate::commands::space::client::DaemonClient;
 
 pub fn run(space: &str) -> anyhow::Result<()> {
-    let reg_handle = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let programs = vos::block_on(reg.programs(&mut &*reg_handle.node()))
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
+    let programs = vos::block_on(reg.programs(&mut &*client.node()))
         .map_err(|e| anyhow::anyhow!("programs() failed: {e}"))?;
 
     if programs.is_empty() {
@@ -21,7 +20,7 @@ pub fn run(space: &str) -> anyhow::Result<()> {
         }
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }
 
 fn truncate(s: &str, max: usize) -> &str {

@@ -1,9 +1,8 @@
 //! `space unpublish` — remove a program from the catalog.
 
-use vos::abi::service::ServiceId;
-use space_registry::{SpaceRegistryRef, STATUS_IN_USE, STATUS_NOT_FOUND, STATUS_OK};
+use space_registry::{STATUS_IN_USE, STATUS_NOT_FOUND, STATUS_OK};
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub struct Args {
     pub space: String,
@@ -23,11 +22,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("name and version must both be non-empty");
     }
 
-    let reg_handle = TransientRegistry::boot(&args.space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(&args.space)?;
+    let reg = client.registry();
 
     let status = vos::block_on(reg.unpublish(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         n.to_string(),
         v.to_string(),
     ))
@@ -42,5 +41,5 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!("unpublish returned status {other}"),
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }

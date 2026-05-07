@@ -1,10 +1,9 @@
 //! `space publish` — add a program to the catalog.
 
-use vos::abi::service::ServiceId;
-use space_registry::{SpaceRegistryRef, STATUS_OK, STATUS_TAG_CONFLICT};
+use space_registry::{STATUS_OK, STATUS_TAG_CONFLICT};
 
 use crate::blob_store::{self, BlobSource};
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub struct Args {
     pub space: String,
@@ -20,11 +19,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let (hash, _bytes) = blob_store::resolve(&source)
         .map_err(|e| anyhow::anyhow!("blob: {e}"))?;
 
-    let reg_handle = TransientRegistry::boot(&args.space)?;
+    let client = DaemonClient::connect(&args.space)?;
 
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg = client.registry();
     let status = vos::block_on(reg.publish(
-        &mut &*reg_handle.node(),
+        &mut &*client.node(),
         name.clone(),
         version.clone(),
         hash.0.to_vec(),
@@ -43,7 +42,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!("publish returned status {other}"),
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }
 
 /// Parse `name` or `name:version`. When version is omitted,

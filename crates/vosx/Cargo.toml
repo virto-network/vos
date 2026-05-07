@@ -33,6 +33,9 @@ anyhow = "1"
 # elf_integration tests; vos uses redb internally but doesn't
 # re-export it.
 redb = "2"
+# `kill -0` to detect stale endpoint files left by a crashed
+# `space up` daemon.
+libc = "0.2"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

@@ -3935,6 +3935,7 @@ dependencies = [
  "clap",
  "grey-transpiler",
  "hex",
+ "libc",
  "libp2p",
  "redb",
  "registry",

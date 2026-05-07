@@ -1,14 +1,13 @@
 //! `space agents` — list installed agents.
 
-use vos::abi::service::ServiceId;
-use space_registry::{consistency_name, SpaceRegistryRef};
+use space_registry::consistency_name;
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 pub fn run(space: &str) -> anyhow::Result<()> {
-    let reg_handle = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let agents = vos::block_on(reg.agents(&mut &*reg_handle.node()))
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
+    let agents = vos::block_on(reg.agents(&mut &*client.node()))
         .map_err(|e| anyhow::anyhow!("agents() failed: {e}"))?;
 
     if agents.is_empty() {
@@ -30,7 +29,7 @@ pub fn run(space: &str) -> anyhow::Result<()> {
         }
     }
 
-    reg_handle.shutdown()
+    client.shutdown()
 }
 
 fn truncate(s: &str, max: usize) -> &str {

@@ -8,14 +8,13 @@
 
 use clap::Subcommand;
 
-use vos::abi::service::ServiceId;
 use space_registry::{
-    SpaceRegistryRef, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER,
     NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, STATUS_NOT_FOUND,
     STATUS_OK,
 };
 
-use crate::commands::space::transient::TransientRegistry;
+use crate::commands::space::client::DaemonClient;
 
 #[derive(Subcommand, Debug)]
 pub enum MembersCommand {
@@ -82,9 +81,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn list(space: &str) -> anyhow::Result<()> {
-    let h = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let members = vos::block_on(reg.members(&mut &*h.node()))
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
+    let members = vos::block_on(reg.members(&mut &*client.node()))
         .map_err(|e| anyhow::anyhow!("members() failed: {e}"))?;
 
     let nodes: Vec<_> = members.iter().filter(|m| m.kind == MEMBER_KIND_NODE).collect();
@@ -125,7 +124,7 @@ fn list(space: &str) -> anyhow::Result<()> {
     if nodes.is_empty() && identities.is_empty() {
         println!("no members. add one with `vosx space members add-node …` or `add-identity …`.");
     }
-    h.shutdown()
+    client.shutdown()
 }
 
 fn add_node(
@@ -145,10 +144,10 @@ fn add_node(
         other => anyhow::bail!("unknown role '{other}', expected voter|observer"),
     };
 
-    let h = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
     let status = vos::block_on(reg.add_node(
-        &mut &*h.node(),
+        &mut &*client.node(),
         prefix,
         peer_id.to_bytes(),
         role,
@@ -159,20 +158,20 @@ fn add_node(
         anyhow::bail!("add_node returned status {status}");
     }
     println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
-    h.shutdown()
+    client.shutdown()
 }
 
 fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
-    let h = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let status = vos::block_on(reg.remove_node(&mut &*h.node(), prefix))
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
+    let status = vos::block_on(reg.remove_node(&mut &*client.node(), prefix))
         .map_err(|e| anyhow::anyhow!("remove_node() failed: {e}"))?;
     match status {
         STATUS_OK => println!("removed node prefix=0x{:04x}", prefix as u16),
         STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
         other => anyhow::bail!("remove_node returned status {other}"),
     }
-    h.shutdown()
+    client.shutdown()
 }
 
 fn add_identity(
@@ -194,10 +193,10 @@ fn add_identity(
         None => Vec::new(),
     };
 
-    let h = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
     let status = vos::block_on(reg.add_identity(
-        &mut &*h.node(),
+        &mut &*client.node(),
         pubkey.clone(),
         proof_kind,
         proof_data,
@@ -210,20 +209,20 @@ fn add_identity(
         "added identity {} (proof={proof_kind_str})",
         &hex::encode(&pubkey)[..20.min(pubkey.len() * 2)],
     );
-    h.shutdown()
+    client.shutdown()
 }
 
 fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
     let pubkey = hex::decode(pubkey_hex.trim_start_matches("0x"))
         .map_err(|_| anyhow::anyhow!("public_key must be hex"))?;
-    let h = TransientRegistry::boot(space)?;
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let status = vos::block_on(reg.remove_identity(&mut &*h.node(), pubkey))
+    let client = DaemonClient::connect(space)?;
+    let reg = client.registry();
+    let status = vos::block_on(reg.remove_identity(&mut &*client.node(), pubkey))
         .map_err(|e| anyhow::anyhow!("remove_identity() failed: {e}"))?;
     match status {
         STATUS_OK => println!("removed identity"),
         STATUS_NOT_FOUND => anyhow::bail!("no identity with that public key"),
         other => anyhow::bail!("remove_identity returned status {other}"),
     }
-    h.shutdown()
+    client.shutdown()
 }

@@ -60,12 +60,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    // Attach a libp2p network when the entry declares listen
-    // addrs or bootnodes. Pure-local spaces (created via `space
-    // new` with no `--listen`) keep network attachment off and
-    // run as single-node.
-    let network = build_network_if_needed(&entry, &data_dir)?;
-    let local_prefix = network.as_ref().map(|n| n.local_prefix()).unwrap_or(0);
+    // Always attach a libp2p network — even local-only spaces
+    // bind a loopback port so client commands (`space publish`,
+    // `space install`, etc.) have an endpoint to dial.
+    let network = build_network_for_daemon(&entry, &data_dir)?;
+    let local_prefix = network.local_prefix();
 
     let mut node = VosNode::with_prefix(local_prefix);
     let cfg = AgentConfig::new(blob)
@@ -74,9 +73,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
-    if let Some(net) = network {
-        node.attach_network(net);
-    }
+    node.attach_network(network);
 
     eprintln!(
         "vosx: space '{}' (id={}…) registry as {id}",
@@ -88,6 +85,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Each gets a deterministic per-node ServiceId so its redb
     // path is stable across restarts.
     spawn_installed_agents(&mut node, &data_dir, local_prefix)?;
+
+    // Wait for the swarm to bind, then publish endpoint info
+    // so client commands (`space publish`, `space install`, …)
+    // can dial us. Removed in the cleanup block at the end.
+    publish_endpoint(&node, &data_dir, local_prefix)?;
 
     if args.once {
         eprintln!("vosx: --once — exiting once registry goes idle");
@@ -105,32 +107,39 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             eprintln!("vosx: agent {} error: {err}", r.id);
         }
     }
+
+    // Best-effort cleanup; if a crash short-circuits this,
+    // the next client invocation sees the stale endpoint and
+    // surfaces it via `endpoint::is_alive`.
+    crate::commands::space::endpoint::delete(&data_dir);
+
     if panics > 0 {
         anyhow::bail!("{panics} pvm panics");
     }
     Ok(())
 }
 
-/// Build a libp2p network from the entry's listen + bootnodes
-/// fields when at least one is non-empty. Loads the per-space
-/// keypair from `data_dir/node.key`. Returns `None` for
-/// pure-local spaces.
-fn build_network_if_needed(
+/// Build a Network for the daemon. Always attaches — local-only
+/// spaces get an auto-port loopback bind so clients have an
+/// endpoint to dial.
+fn build_network_for_daemon(
     entry: &spaces_index::SpaceEntry,
     data_dir: &std::path::Path,
-) -> anyhow::Result<Option<vos::network::Network>> {
-    if entry.listen.is_empty() && entry.bootnodes.is_empty() {
-        return Ok(None);
-    }
+) -> anyhow::Result<vos::network::Network> {
     let parse = |s: &str, kind: &str| -> anyhow::Result<libp2p::Multiaddr> {
         libp2p::Multiaddr::from_str(s)
             .map_err(|e| anyhow::anyhow!("bad {kind} multiaddr '{s}': {e}"))
     };
-    let listen: Vec<libp2p::Multiaddr> = entry
+    let mut listen: Vec<libp2p::Multiaddr> = entry
         .listen
         .iter()
         .map(|s| parse(s, "listen"))
         .collect::<anyhow::Result<_>>()?;
+    if listen.is_empty() {
+        // Default: bind to a loopback auto-port. The actual port
+        // is captured into `.endpoint` once the swarm reports it.
+        listen.push("/ip4/127.0.0.1/tcp/0".parse().unwrap());
+    }
     let bootstrap: Vec<libp2p::Multiaddr> = entry
         .bootnodes
         .iter()
@@ -148,14 +157,51 @@ fn build_network_if_needed(
         "vosx: node identity {peer_id} (prefix {local_prefix:#06x})",
     );
 
-    Ok(Some(vos::network::Network::start(
-        vos::network::NetworkConfig {
-            keypair,
-            local_prefix,
-            listen,
-            bootstrap,
-        },
-    )))
+    Ok(vos::network::Network::start(vos::network::NetworkConfig {
+        keypair,
+        local_prefix,
+        listen,
+        bootstrap,
+    }))
+}
+
+/// Wait briefly for the swarm to bind, then write the endpoint
+/// descriptor so clients can find us.
+fn publish_endpoint(
+    node: &VosNode,
+    data_dir: &std::path::Path,
+    prefix: u16,
+) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let net = node
+        .network()
+        .ok_or_else(|| anyhow::anyhow!("network not attached when publishing endpoint"))?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let multiaddrs = loop {
+        let addrs = net.listen_addrs();
+        if !addrs.is_empty() {
+            break addrs;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("swarm didn't bind a listen address within 3s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let peer_id = net.peer_id().to_string();
+    let multiaddrs: Vec<String> = multiaddrs.iter().map(|m| m.to_string()).collect();
+    let ep = crate::commands::space::endpoint::Endpoint {
+        peer_id,
+        multiaddrs: multiaddrs.clone(),
+        prefix,
+        pid: std::process::id(),
+    };
+    crate::commands::space::endpoint::write(data_dir, &ep)?;
+    eprintln!("vosx: endpoint published");
+    for a in &multiaddrs {
+        eprintln!("  {a}");
+    }
+    Ok(())
 }
 
 /// Query the registry for installed agents and register each
