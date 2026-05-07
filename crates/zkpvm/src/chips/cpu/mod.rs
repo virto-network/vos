@@ -690,7 +690,6 @@ impl BuiltInComponent for CpuChip {
         // CpuChip flows val_b/val_d/q/r + 4 sign bits + flags via the
         // 40-limb DivRemLookup tuple; DivCorrHi/DivCorrCarry are
         // DivRemChip-internal and no longer CpuChip columns.
-        let div_by_zero = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
 
         // Phase I-cpu Wave-2 flattened: gate via DivActiveQuotH /

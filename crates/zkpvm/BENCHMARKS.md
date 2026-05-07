@@ -1,21 +1,34 @@
 # zkpvm — performance benchmarks
 
-## Latest — private tap-to-pay sub-second target hit (post B3 audit, no PGO)
+## Latest — private tap-to-pay sub-second target hit (post B3 + parallel interaction-gen, no PGO)
 
 `tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
 (Pedersen + Schnorr + commitment + signing payload, ~24 K PVM
 steps).  Median of 5 trials, post Phase-I migration + B3
-helper-column audit, on the reference Intel Core Ultra 7 155H:
+helper-column audit + per-chip parallel interaction-trace
+generation, on the reference Intel Core Ultra 7 155H:
 
 | Config   | Prover entry point | Prove   | Proof size | Verify  |
 |---       |---                 |---      |---         |---      |
-| STANDARD | `prove()`          | 1.41 s  | 932 KB     | 45 ms   |
+| STANDARD | `prove()`          | 1.40 s  | 932 KB     | 45 ms   |
 | MOBILE   | `prove_mobile()`   | **0.71 s** | 1.5 MB  | 28 ms   |
 
 MOBILE comfortably under the 1-second target with margin.  PGO on
 top of MOBILE projects to ~0.58–0.62 s based on the documented
 −18% historical win (re-bench after `scripts/build-pgo.sh`).
+
+Stage-level breakdown at MOBILE (median trial):
+
+| Stage              | Time    | %    |
+|---                 |---      |---   |
+| trace_gen          | 130 ms  | 19%  |
+| preprocess_commit  |   6 ms  |  1%  |
+| main_commit        | 175 ms  | 25%  |
+| interaction_gen    |  80 ms  | 11%  | ← was 140 ms pre-parallel
+| interaction_commit |  50 ms  |  7%  |
+| FRI prove          | 270 ms  | 38%  | ← new dominant stage at MOBILE
+| **total**          | **710 ms** | **100%** |
 
 Verifier-side, MOBILE proofs require
 `verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)`
