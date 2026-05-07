@@ -28,6 +28,11 @@ hex = "0.4"
 # the new `space *` commands return Result for clean error
 # bubbling through the clap dispatcher.
 anyhow = "1"
+# Read the registry's genesis DAG root from its redb during
+# `space new`. Mirrors the dev-dep usage in vos's
+# elf_integration tests; vos uses redb internally but doesn't
+# re-export it.
+redb = "2"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

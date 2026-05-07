@@ -1,11 +1,20 @@
 //! `space new` — scaffold a fresh space.
 //!
-//! Phase 1a: derives a placeholder `space_id` from the
-//! creator's keypair + a random nonce. Phase 1b will replace
-//! this with the genesis-DAG-rooted derivation by booting the
-//! registry actor and reading its first commit hash.
+//! Boots the registry actor in a temp data dir, sends an
+//! `add_node` for the creator (the first entry in the
+//! members table), reads the genesis DAG root from the
+//! resulting redb, derives `space_id =
+//! derive_space_id(genesis_dag_root)`, then renames the temp
+//! dir to `~/.local/share/vosx/<space_id>/`. The first commit
+//! IS the genesis — joiners syncing this space see the same
+//! root and can verify the advertised space_id matches.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use vos::abi::service::ServiceId;
+use vos::node::{AgentConfig, Consistency, VosNode};
+use space_registry::{NODE_ROLE_VOTER, SpaceRegistryRef, STATUS_OK};
 
 use crate::blob_store::{self, BlobSource};
 use crate::paths;
@@ -23,94 +32,150 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("--name is required and must be non-empty");
     }
 
-    // 1. Resolve and cache the registry blob. Errors loud if the
-    //    source is unreachable so we don't leave half-state.
+    // 1. Resolve and cache the registry blob.
     let source = BlobSource::parse(&args.registry);
-    let (registry_hash, _registry_bytes) = blob_store::resolve(&source)
+    let (registry_hash, registry_bytes) = blob_store::resolve(&source)
         .map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
+    let registry_blob = grey_transpiler::link_elf(&registry_bytes)
+        .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
-    // 2. Generate a per-space libp2p keypair.
+    // 2. Generate a per-space libp2p keypair + derive prefix.
     let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let pubkey = keypair.public().encode_protobuf();
+    let peer_id = libp2p::PeerId::from(keypair.public());
+    let local_prefix = vos::network::derive_node_prefix(&peer_id);
 
-    // 3. PHASE 1a: placeholder space_id. Mixes creator pubkey
-    //    with a random nonce so two `space new` invocations
-    //    by the same creator produce distinct ids. Phase 1b
-    //    replaces this with `derive_space_id(genesis_dag_root)`
-    //    once the registry is actually booted.
-    let space_id = placeholder_space_id(&args.name, &pubkey);
+    // 3. Boot the registry in a temp dir under `data_root` so
+    //    the eventual rename to the canonical space dir stays
+    //    within the same filesystem.
+    let temp_dir = paths::data_root().join(format!(
+        ".genesis-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::create_dir_all(&temp_dir)?;
+    std::fs::create_dir_all(temp_dir.join("agents"))?;
 
-    // 4. Lay out the per-space data directory.
-    let space_dir = args
+    // 4. Register the registry agent. The replication_id passed
+    //    here doesn't affect the on-disk layout — it's a
+    //    network-only concern (gossipsub topic) that's not
+    //    engaged for this offline boot. The space_id-derived
+    //    replication_id will be used on subsequent `space up`.
+    let mut node = VosNode::with_prefix(local_prefix);
+    let cfg = AgentConfig::new(registry_blob)
+        .with_consistency(Consistency::Crdt)
+        .with_replication_id([0u8; 32])
+        .persist(&temp_dir);
+    let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
+
+    // 5. Send the genesis-defining message: register the creator
+    //    as the first Node member with Voter role. This produces
+    //    a non-trivial first commit so the genesis DAG root is
+    //    distinct per-creator.
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let status = vos::block_on(reg.add_node(
+        &mut &node,
+        local_prefix as u32,
+        peer_id.to_bytes(),
+        NODE_ROLE_VOTER,
+    ))
+    .map_err(|e| {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        anyhow::anyhow!("genesis add_node failed: {e}")
+    })?;
+    if status != STATUS_OK {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        anyhow::bail!("genesis add_node returned status {status}");
+    }
+
+    // 6. Drain the runtime so the commit is fully flushed.
+    node.shutdown();
+    let results = node.collect();
+    for r in &results {
+        if let Some(err) = &r.error {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            anyhow::bail!("genesis registry boot: {err}");
+        }
+    }
+
+    // 7. Read the genesis DAG root from the registry's redb.
+    let registry_db = temp_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+    let genesis_root = read_genesis_root(&registry_db).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        e
+    })?;
+    let space_id = space_registry::derive_space_id(&genesis_root);
+
+    // 8. Move temp dir to the canonical location.
+    let final_dir = args
         .data_dir
         .unwrap_or_else(|| paths::space_dir(&space_id));
-    if space_dir.exists() {
+    if final_dir.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
         anyhow::bail!(
             "space data dir already exists: {}",
-            space_dir.display()
+            final_dir.display(),
         );
     }
-    std::fs::create_dir_all(&space_dir)?;
-    std::fs::create_dir_all(space_dir.join("agents"))?;
+    if let Some(parent) = final_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&temp_dir, &final_dir)
+        .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", temp_dir.display(), final_dir.display()))?;
 
-    // 5. Persist the keypair as protobuf bytes (matches the
-    //    format `identity::load_or_generate_identity` reads).
-    let key_path = space_dir.join("node.key");
-    let key_bytes = keypair.to_protobuf_encoding()
+    // 9. Persist the keypair under the final dir.
+    let key_path = final_dir.join("node.key");
+    let key_bytes = keypair
+        .to_protobuf_encoding()
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(&key_path, key_bytes)?;
 
-    // 6. Append to the spaces index.
+    // 10. Append to the spaces index.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
     let mut entry = spaces_index::entry_for(&space_id, &args.name, args.listen.clone());
-    entry.data_dir = space_dir.to_string_lossy().to_string();
+    entry.data_dir = final_dir.to_string_lossy().to_string();
     entry.registry_hash = registry_hash.to_hex();
     spaces_index::upsert(&mut index, entry);
     spaces_index::save(&index)?;
 
-    // 7. Print the result so the user can copy the bootnode line.
+    // 11. Print.
     let space_id_hex = paths::space_id_hex(&space_id);
     println!("created space '{}'", args.name);
-    println!("  space_id   = {space_id_hex}");
-    println!("  data_dir   = {}", space_dir.display());
-    println!("  node.key   = {}", key_path.display());
-    println!("  registry   = {} ({})", args.registry, registry_hash);
+    println!("  space_id     = {space_id_hex}");
+    println!("  genesis_root = {}", hex::encode(genesis_root));
+    println!("  data_dir     = {}", final_dir.display());
+    println!("  node.key     = {}", key_path.display());
+    println!("  registry     = {} ({})", args.registry, registry_hash);
     if !args.listen.is_empty() {
-        println!("  listen     =");
+        println!("  listen       =");
         for addr in &args.listen {
             println!("    {addr}");
         }
-        let peer_id = libp2p::PeerId::from(keypair.public());
         println!("  bootnode hint:");
         println!(
             "    {space_id_hex}@{}/p2p/{peer_id}",
             args.listen[0],
         );
     }
-    println!();
-    println!("note: phase-1a space_id is a placeholder; Phase 1b will");
-    println!("replace it with a genesis-DAG-rooted hash.");
 
     Ok(())
 }
 
-/// Placeholder space_id: blake2b("vos-space-id-placeholder/v0a"
-/// || name || 0 || pubkey || 0 || nonce). The nonce defends
-/// against two creators with the same name colliding.
-fn placeholder_space_id(name: &str, pubkey: &[u8]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-space-id-placeholder/v0a");
-    h.update(&[0u8]);
-    h.update(name.as_bytes());
-    h.update(&[0u8]);
-    h.update(pubkey);
-    h.update(&[0u8]);
-    let nonce_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    h.update(&nonce_ns.to_le_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+/// Open the registry's redb and return the first DAG root.
+/// After a single state-changing commit there's exactly one
+/// root; the registry's first commit IS the genesis.
+fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    let db = redb::Database::open(db_path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", db_path.display()))?;
+    let roots = vos::commit::read_roots(&db)
+        .map_err(|e| anyhow::anyhow!("read roots: {e}"))?;
+    drop(db);
+    roots
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("registry has no roots after genesis commit"))
 }

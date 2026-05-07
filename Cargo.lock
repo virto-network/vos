@@ -3936,6 +3936,7 @@ dependencies = [
  "grey-transpiler",
  "hex",
  "libp2p",
+ "redb",
  "registry",
  "serde",
  "space-registry",
