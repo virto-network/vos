@@ -9,9 +9,11 @@
 use clap::Subcommand;
 use std::path::PathBuf;
 
+pub mod export;
 pub mod info;
 pub mod list;
 pub mod new;
+pub mod up;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
@@ -46,6 +48,21 @@ pub enum SpaceCommand {
         /// when present, else errors.
         space: Option<String>,
     },
+    /// Boot a saved space — load the registry from cache,
+    /// register it as `ServiceId::REGISTRY`, run forever.
+    Up {
+        /// Space id (full hex) or name.
+        space: String,
+        /// Exit when the registry goes idle (smoke-test mode).
+        #[arg(long)]
+        once: bool,
+    },
+    /// Query a space's registry and emit a round-trippable
+    /// TOML manifest to stdout.
+    Export {
+        /// Space id (full hex) or name.
+        space: String,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -63,5 +80,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         }),
         SpaceCommand::List | SpaceCommand::Ls => list::run(),
         SpaceCommand::Info { space } => info::run(space.as_deref()),
+        SpaceCommand::Up { space, once } => up::run(up::Args { query: space, once }),
+        SpaceCommand::Export { space } => export::run(export::Args { query: space }),
     }
 }

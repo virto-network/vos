@@ -64,6 +64,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
     let mut entry = spaces_index::entry_for(&space_id, &args.name, args.listen.clone());
     entry.data_dir = space_dir.to_string_lossy().to_string();
+    entry.registry_hash = registry_hash.to_hex();
     spaces_index::upsert(&mut index, entry);
     spaces_index::save(&index)?;
 

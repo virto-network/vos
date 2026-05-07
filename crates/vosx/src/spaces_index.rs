@@ -35,6 +35,12 @@ pub struct SpaceEntry {
     /// `data_root()/<id>` but may be overridden by `--data-dir`.
     #[serde(default)]
     pub data_dir: String,
+    /// Hex-encoded blake2b-256 hash of the space-registry actor
+    /// blob. Resolved at `space new` time and looked up in the
+    /// blob cache on subsequent `space up`. Empty until the
+    /// space has been initialized.
+    #[serde(default)]
+    pub registry_hash: String,
 }
 
 impl SpaceEntry {
@@ -149,6 +155,7 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str, listen: Vec<String>) -> SpaceE
         created_at: now_iso8601(),
         listen,
         data_dir,
+        registry_hash: String::new(),
     }
 }
 
@@ -221,6 +228,7 @@ mod tests {
                 created_at: "2026-05-07T00:00:00Z".into(),
                 listen: vec!["/ip4/127.0.0.1/tcp/4811".into()],
                 data_dir: "/tmp/data".into(),
+                registry_hash: String::new(),
             },
         );
         save_to(&idx, &p).unwrap();
@@ -242,6 +250,7 @@ mod tests {
                 created_at: "x".into(),
                 listen: vec![],
                 data_dir: "".into(),
+                registry_hash: String::new(),
             },
         );
         upsert(
@@ -252,6 +261,7 @@ mod tests {
                 created_at: "y".into(),
                 listen: vec![],
                 data_dir: "".into(),
+                registry_hash: String::new(),
             },
         );
         assert_eq!(idx.spaces.len(), 1);
@@ -270,6 +280,7 @@ mod tests {
                 created_at: "".into(),
                 listen: vec![],
                 data_dir: "".into(),
+                registry_hash: String::new(),
             },
         );
         assert_eq!(find(&idx, &id_a).unwrap().name, "alpha");
