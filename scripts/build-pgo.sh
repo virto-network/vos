@@ -58,10 +58,14 @@ echo "=== Step 2b/3: Training run — clerk-private-pay (ECALL + ledger) ==="
 # available in the local checkout (common on contributor machines).
 RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
   cargo test -p zkpvm --features prover --release --test prove_vos_actor \
-  -- profile_clerk_private_pay_bench_mobile \
+  -- profile_clerk_private_pay_bench_mobile profile_clerk_private_pay_bench \
   --nocapture --test-threads 1 \
   > /dev/null \
   || echo ">>> WARNING: clerk-private-pay-bench training skipped (actor blob missing); PGO will be ALU-tuned only."
+# Both MOBILE (fri_blowup=2) and STANDARD (fri_blowup=16) shapes are
+# trained in this pass so PGO covers both PCS configs — without the
+# STANDARD bench, prove() under production_pcs_config() regresses
+# slightly post-PGO (Session 1.1 follow-up of the perf roadmap).
 
 echo "=== Step 3/3: Merge profiles + final build ==="
 "$PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/*.profraw
