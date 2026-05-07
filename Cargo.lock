@@ -3382,6 +3382,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "space-registry"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "serde",
+ "vos",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3924,9 +3933,11 @@ dependencies = [
  "blake2b_simd",
  "clap",
  "grey-transpiler",
+ "hex",
  "libp2p",
  "registry",
  "serde",
+ "space-registry",
  "toml",
  "tracing",
  "tracing-subscriber",

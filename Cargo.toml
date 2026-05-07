@@ -15,6 +15,7 @@ exclude = [
     # it up as a workspace member.
     "crates/actors",
     "crates/actors/registry",
+    "crates/actors/space-registry",
 ]
 
 [workspace.package]

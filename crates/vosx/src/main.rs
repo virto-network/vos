@@ -21,11 +21,13 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+mod blob_store;
 mod commands;
 mod hyperspace;
 mod identity;
 mod manifest;
 mod network;
+mod paths;
 mod query;
 mod util;
 

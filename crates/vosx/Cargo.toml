@@ -16,6 +16,14 @@ grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c0
 # separate crate the old `vos → registry → vos` cycle is gone:
 # `registry → vos` and `vosx → {vos, registry}` is acyclic.
 registry = { path = "../actors/registry", features = ["host"] }
+# Per-space catalog of programs / agents / members. Source of
+# truth that the new `space *` subcommands operate on.
+space-registry = { path = "../actors/space-registry", default-features = false, features = ["host"] }
+# Content-addressed cache + IPFS resolver dependency for the
+# blob store. Stays a thin dep — no daemon required for `Path`
+# and `Hash` sources, only `Cid` and `Url` resolution touch
+# external services.
+hex = "0.4"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,41 @@
+[workspace]
+
+[package]
+name = "space-registry"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin"]
+bin = []
+host = ["dep:blake2b_simd", "dep:serde"]
+
+[lib]
+name = "space_registry"
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-registry-actor"
+path = "src/lib.rs"
+required-features = ["bin"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+serde = { version = "1", optional = true, default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+serde = { version = "1", optional = true, default-features = false }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "worker"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
