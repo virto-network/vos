@@ -1917,9 +1917,9 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = scalar_addr;
-    regs[11] = point_addr;
-    regs[12] = output_addr;
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code, bitmask, vec![], regs, flat_mem, 10_000, 25,
@@ -2065,7 +2065,7 @@ fn prove_ristretto_via_ecall_boundary() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = scalar_addr; regs[11] = point_addr; regs[12] = output_addr;
+    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
@@ -2307,6 +2307,10 @@ fn prove_scalar_mult_then_point_add() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    // scalar_mult handler reads φ[7/8/9] (post-02922c4 fix); point_add
+    // handler still reads φ[10/11/12].  Set both so the cross-type test
+    // exercises both ECALLs with the same buffer addresses.
+    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = a_addr;
     regs[10] = scalar_addr; regs[11] = point_addr; regs[12] = a_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
@@ -2358,7 +2362,7 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = scalar_addr; regs[11] = point_addr; regs[12] = output_addr;
+    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,

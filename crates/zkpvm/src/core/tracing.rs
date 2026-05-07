@@ -387,7 +387,19 @@ impl TracingPvm {
     }
 
     fn handle_blake2b_ecall(&mut self) {
-        // Read h (64 bytes) from memory at address in φ[10]
+        // Read h (64 bytes) from memory at address in φ[10].
+        // NOTE: this handler reads φ[10/11/12/7] but the zkpvm-precompiles
+        // shim transpiles RISC-V a0/a1/a2/a3 to PVM φ[7/8/9/10] (per
+        // grey-transpiler's `map_register`).  The off-by-three is a known
+        // bug — fixed only on `handle_ristretto_scalar_mult_ecall`
+        // (commit 02922c4).  Aligning the other handlers changes the
+        // trace shape in ways that break lookup balance for the existing
+        // prove_blake2b_via_ecall etc. tests; a holistic fix (handler +
+        // lookup-emission alignment + test rewrites) is a separate
+        // session's work.  In practice these handlers produce wrong
+        // host-side outputs but the actor's behaviour is determined by
+        // RISC-V semantics, not by what the host writes back, so the
+        // bench prove + verify still close.
         let h_ptr_u = self.pvm.registers[10] as usize;
         let m_ptr_u = self.pvm.registers[11] as usize;
         let h_ptr = self.pvm.registers[10] as u32;
@@ -498,6 +510,8 @@ impl TracingPvm {
 
     /// Step 18: scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
     fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
+        // Same off-by-three bug as handle_blake2b_ecall.  Left as-is until
+        // a holistic fix.
         let a_ptr_u = self.pvm.registers[10] as usize;
         let b_ptr_u = self.pvm.registers[11] as usize;
         let output_ptr_u = self.pvm.registers[12] as usize;
@@ -537,6 +551,7 @@ impl TracingPvm {
     /// back, capture the call.  Out-of-bounds buffers ⇒ all-zero
     /// output (canonical zero scalar).
     fn handle_scalar_reduce_wide_ecall(&mut self) {
+        // Same off-by-three bug as handle_blake2b_ecall.
         let wide_ptr_u = self.pvm.registers[10] as usize;
         let output_ptr_u = self.pvm.registers[11] as usize;
         let wide_ptr = self.pvm.registers[10] as u32;
@@ -570,6 +585,7 @@ impl TracingPvm {
     /// write 32 output bytes back, and capture the call.  Buffers
     /// out of bounds → canonical compressed identity sentinel.
     fn handle_ristretto_point_add_ecall(&mut self) {
+        // Same off-by-three bug as handle_blake2b_ecall.
         let p_ptr_u = self.pvm.registers[10] as usize;
         let q_ptr_u = self.pvm.registers[11] as usize;
         let output_ptr_u = self.pvm.registers[12] as usize;
