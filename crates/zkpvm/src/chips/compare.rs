@@ -157,7 +157,9 @@ impl BuiltInComponent for CompareChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for CompareChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let entries = &side_note.compare_entries;
         const MIN_LOG_SIZE: u32 = 5;
 

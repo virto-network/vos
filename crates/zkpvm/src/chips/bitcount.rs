@@ -104,6 +104,8 @@ impl BuiltInComponent for BitcountChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for BitcountChip {
+    const IS_PRODUCER: bool = false;
+
     fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         let log_size = BITCOUNT_LOG_SIZE.max(LOG_N_LANES);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
@@ -120,7 +122,7 @@ impl BuiltInProverComponent for BitcountChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let log_size = BITCOUNT_LOG_SIZE.max(LOG_N_LANES);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 

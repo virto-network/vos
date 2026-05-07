@@ -120,6 +120,8 @@ impl BuiltInComponent for JumpTableChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for JumpTableChip {
+    const IS_PRODUCER: bool = false;
+
     fn generate_preprocessed_trace(
         &self,
         _log_size: u32,
@@ -144,7 +146,7 @@ impl BuiltInProverComponent for JumpTableChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let log_size = chip_log_size(side_note.jump_table.len());
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();

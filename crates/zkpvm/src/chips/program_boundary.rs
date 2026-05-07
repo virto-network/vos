@@ -106,7 +106,9 @@ impl BuiltInComponent for ProgramBoundaryChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for ProgramBoundaryChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let log_size = LOG_N_LANES; // minimum size, only 1 real row
         let mut trace = TraceBuilder::<Column>::new(log_size);
 

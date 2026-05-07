@@ -145,7 +145,9 @@ impl BuiltInComponent for MemoryChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for MemoryChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let mut entries: Vec<MemEntry> = Vec::new();
 
         // Collect step memory accesses, decomposed to individual bytes

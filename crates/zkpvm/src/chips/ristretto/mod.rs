@@ -983,6 +983,8 @@ impl BuiltInComponent for RistrettoChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for RistrettoChip {
+    const IS_PRODUCER: bool = false;
+
     fn generate_preprocessed_trace(
         &self,
         _log_size: u32,
@@ -1006,7 +1008,7 @@ impl BuiltInProverComponent for RistrettoChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         // R1e-quat: lay each FieldOpRow into its column slots.
         // Padding rows beyond rows.len() have is_real = 0 and all
         // cells zero — chip's gating constraints make them inert.

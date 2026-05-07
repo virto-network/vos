@@ -62,7 +62,28 @@ pub trait BuiltInProverComponent: BuiltInComponent {
         FinalizedTrace::empty()
     }
 
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace;
+    /// Whether this chip writes to `SideNote` during trace generation.
+    /// Default `true` for safety.  Pure consumers override to `false` and
+    /// implement `generate_main_trace_immut` instead of (or in addition
+    /// to) `generate_main_trace` — `prove_impl_with_components` runs
+    /// producers sequentially and consumers in parallel.
+    const IS_PRODUCER: bool = true;
+
+    /// Producers (default `IS_PRODUCER = true`) override this.  Consumers
+    /// can either override this directly or override
+    /// `generate_main_trace_immut` and let the default forward.
+    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+        // Default: forward to immut path.  Producers MUST override.
+        self.generate_main_trace_immut(side_note)
+    }
+
+    /// Pure consumers (`IS_PRODUCER = false`) override this; the default
+    /// `generate_main_trace` forwards here.  Producers leave the default
+    /// panic — `prove_impl_with_components` never invokes this on
+    /// producer chips.
+    fn generate_main_trace_immut(&self, _side_note: &SideNote) -> FinalizedTrace {
+        unimplemented!("non-producer chip must override generate_main_trace_immut")
+    }
 
     fn generate_interaction_trace(
         &self,

@@ -140,7 +140,9 @@ impl BuiltInComponent for RegisterMemoryChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for RegisterMemoryChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let mut entries: Vec<RegEntry> = Vec::new();
 
         // Initial register state: one synthetic write per register at ts=0.

@@ -321,11 +321,40 @@ fn prove_impl_with_components(
         side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
     }
 
+    // Trace gen — split into a sequential *producer* pass and a parallel
+    // *consumer* pass.  Producers (CpuChip, Blake2bChip) write per-row
+    // multiplicities + entries into `side_note` while filling their main
+    // trace; consumer chips (ALU/range/lookup tables, boundary chips,
+    // memory ledgers, RistrettoChip, …) only read those, so they run on
+    // rayon with shared `&SideNote`.  Mirrors the producer/consumer
+    // split already used by interaction-trace generation a few stages
+    // below.  Measured saving on log17 clerk-private-pay-bench (MOBILE):
+    // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
-    let traces: Vec<ComponentTrace> = components
-        .iter()
-        .map(|c| c.generate_component_trace(side_note))
-        .collect();
+    let mut traces: Vec<Option<ComponentTrace>> =
+        (0..components.len()).map(|_| None).collect();
+    for (i, c) in components.iter().enumerate() {
+        if c.is_producer() {
+            traces[i] = Some(c.generate_component_trace(side_note));
+        }
+    }
+    {
+        use rayon::prelude::*;
+        let consumer_idxs: Vec<usize> = components
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (!c.is_producer()).then_some(i))
+            .collect();
+        let snr: &SideNote = side_note;
+        let consumer_traces: Vec<(usize, ComponentTrace)> = consumer_idxs
+            .par_iter()
+            .map(|&i| (i, components[i].generate_component_trace_immut(snr)))
+            .collect();
+        for (i, t) in consumer_traces {
+            traces[i] = Some(t);
+        }
+    }
+    let traces: Vec<ComponentTrace> = traces.into_iter().map(|x| x.unwrap()).collect();
     let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
     let trace_gen = t.elapsed();
 

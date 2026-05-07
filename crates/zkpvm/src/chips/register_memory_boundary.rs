@@ -91,7 +91,9 @@ impl BuiltInComponent for RegisterMemoryBoundaryChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(NUM_REGS);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 

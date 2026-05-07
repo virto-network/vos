@@ -92,7 +92,9 @@ impl BuiltInComponent for MemoryBoundaryChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for MemoryBoundaryChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         // Collect byte addresses that need initial values
         let initial_bytes = collect_initial_bytes(side_note);
 

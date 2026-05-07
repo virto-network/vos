@@ -78,7 +78,17 @@ pub trait MachineProverComponent: MachineComponent {
         side_note: &SideNote,
     ) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>;
 
+    /// Whether this chip mutates `side_note` during trace generation.
+    /// Drives the producer/consumer split in `prove_impl_with_components`.
+    fn is_producer(&self) -> bool;
+
     fn generate_component_trace(&self, side_note: &mut SideNote) -> ComponentTrace;
+
+    /// Trace-gen path that doesn't mutate `side_note`.  Only valid for
+    /// `is_producer() == false` chips; producers panic via the default in
+    /// `BuiltInProverComponent::generate_main_trace_immut`.  Used by the
+    /// parallel consumer pass in `prove_impl_with_components`.
+    fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace;
 
     fn generate_interaction_trace(
         &self,
@@ -188,6 +198,10 @@ where
             .collect()
     }
 
+    fn is_producer(&self) -> bool {
+        <C as BuiltInProverComponent>::IS_PRODUCER
+    }
+
     fn generate_component_trace(&self, side_note: &mut SideNote) -> ComponentTrace {
         let original_trace = <C as BuiltInProverComponent>::generate_main_trace(self, side_note);
 
@@ -198,6 +212,22 @@ where
             side_note,
         );
 
+        ComponentTrace {
+            log_size,
+            preprocessed_trace: preprocessed_trace.cols,
+            original_trace: original_trace.cols,
+        }
+    }
+
+    fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace {
+        let original_trace =
+            <C as BuiltInProverComponent>::generate_main_trace_immut(self, side_note);
+        let log_size = original_trace.log_size;
+        let preprocessed_trace = <C as BuiltInProverComponent>::generate_preprocessed_trace(
+            self,
+            log_size,
+            side_note,
+        );
         ComponentTrace {
             log_size,
             preprocessed_trace: preprocessed_trace.cols,
