@@ -1395,10 +1395,24 @@ impl VosNode {
         msg: Vec<u8>,
         timeout: Duration,
     ) -> Option<Vec<u8>> {
-        // 1. Local
+        // 1. Local. Same fallback `dispatch_invoke` uses: when
+        //    `target` carries this node's prefix but the agent
+        //    was registered as unscoped (`ServiceId(0, local_id)`),
+        //    retry with the prefix stripped. The well-known
+        //    registry registers at `ServiceId::REGISTRY` (= 0),
+        //    so a local invoke from an in-process Ref pointed
+        //    at `(self.node_prefix, 0)` wouldn't find it
+        //    otherwise.
         let local_tx = {
             let map = self.invoke_routes.lock().ok()?;
-            map.get(&target.0).cloned()
+            let direct = map.get(&target.0).cloned();
+            if direct.is_some() {
+                direct
+            } else if target.is_on_node(self.node_prefix) {
+                map.get(&(target.0 & 0xFFFF)).cloned()
+            } else {
+                None
+            }
         };
         if let Some(tx) = local_tx {
             let (reply_tx, reply_rx) = mpsc::channel();

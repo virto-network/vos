@@ -23,6 +23,7 @@ pub mod members;
 pub mod new;
 pub mod programs;
 pub mod publish;
+pub mod reconcile;
 pub mod uninstall;
 pub mod unpublish;
 pub mod up;
@@ -93,6 +94,14 @@ pub enum SpaceCommand {
         /// Exit when the registry goes idle (smoke-test mode).
         #[arg(long)]
         once: bool,
+        /// Optional TOML manifest. The startup pass reconciles
+        /// it into the registry: any `[[agent]]` not yet
+        /// installed gets published+installed; existing entries
+        /// are left alone unless `--reconcile-upgrade` is set.
+        /// Manifests are devhelpers — the registry remains the
+        /// runtime source of truth.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<std::path::PathBuf>,
     },
     /// Query a space's registry and emit a round-trippable
     /// TOML manifest to stdout.
@@ -226,7 +235,9 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             listen,
             data_dir,
         }),
-        SpaceCommand::Up { space, once } => up::run(up::Args { query: space, once }),
+        SpaceCommand::Up { space, once, manifest } => {
+            up::run(up::Args { query: space, once, manifest })
+        }
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Publish {
             space,

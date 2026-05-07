@@ -18,6 +18,7 @@ use crate::spaces_index;
 pub struct Args {
     pub query: String,
     pub once: bool,
+    pub manifest: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -126,6 +127,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         entry.name,
         &entry.id[..12],
     );
+
+    // Reconcile the optional --manifest BEFORE we spawn the
+    // currently-installed agents, so manifest-introduced
+    // agents land in the same boot.
+    if let Some(manifest_path) = &args.manifest {
+        let (manifest, manifest_dir) =
+            crate::commands::space::reconcile::parse_manifest_file(manifest_path)?;
+        crate::commands::space::reconcile::reconcile(
+            &node,
+            &manifest,
+            &manifest_dir,
+            local_prefix,
+        )?;
+    }
 
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
