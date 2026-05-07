@@ -9,7 +9,7 @@ license.workspace = true
 vos = { path = "../vos", features = ["std", "http", "storage", "network"] }
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
-grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler" }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6" }
 # Registry actor lib + the macro-generated host `RegistryClient`.
 # Used by `flush_registry_announces`, the auto-heartbeat thread,
 # and `cmd_invoke`'s name-resolution path. Now that vosx is a

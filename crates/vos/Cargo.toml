@@ -37,8 +37,8 @@ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytech
 log = { version = "0.4", default-features = false }
 
 # std-only: PVM runtime and vosx binary dependencies
-javm = { path = "../../../../jar/jar/grey/crates/javm", optional = true }
-grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler", optional = true }
+javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 blake2b_simd = { version = "1", optional = true }
