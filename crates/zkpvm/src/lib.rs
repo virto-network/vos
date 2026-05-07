@@ -339,7 +339,7 @@ pub use proof::{
 };
 #[cfg(feature = "prover")]
 pub use prove::{
-    prove, prove_with_config, prove_profiled, prove_profiled_with_config,
+    prove, prove_mobile, prove_with_config, prove_profiled, prove_profiled_with_config,
     prove_with_explicit_components,
     ProveProfile, production_pcs_config, production_pcs_config_mobile,
     install_thread_pool,

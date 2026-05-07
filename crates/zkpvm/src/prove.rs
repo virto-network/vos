@@ -137,6 +137,25 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     Ok(proof)
 }
 
+/// Prove using the MOBILE PCS config — the recommended path for
+/// latency-sensitive flows like *private tap-to-pay*.
+///
+/// Same 96-bit conjectured security as `prove()` but ~2× faster on
+/// real PVM workloads (clerk-private-pay-bench: ~0.7 s vs ~1.4 s on
+/// the reference Intel Core Ultra 7 155H).  Cost: proof size ~1.6×
+/// larger.  Acceptable trade for tap-to-pay where prove time
+/// dominates user experience.
+///
+/// Verifier-side, callers MUST use `verify_with_pcs_policy(proof,
+/// side_note, &PcsPolicy::MOBILE)` (or stricter) — the default
+/// `verify()` enforces the STANDARD policy and rejects MOBILE
+/// proofs.
+pub fn prove_mobile(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    let (proof, _) = prove_impl(side_note, production_pcs_config_mobile(), false)?;
+    Ok(proof)
+}
+
 pub fn prove_with_config(side_note: &mut SideNote, config: PcsConfig) -> Result<Proof, ProvingError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, config, false)?;
