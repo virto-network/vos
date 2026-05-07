@@ -48,10 +48,9 @@ pub struct SpaceEntry {
 }
 
 impl SpaceEntry {
-    /// Decode the hex id back to bytes. Used by Phase 1b/1c to
-    /// re-derive the per-space data dir for `space up` / `space
-    /// join`.
-    #[allow(dead_code)]
+    /// Decode the hex id back to bytes — used by `space up`
+    /// to re-derive the per-space replication id and verify
+    /// genesis.
     pub fn id_bytes(&self) -> Option<[u8; 32]> {
         let v = hex::decode(&self.id).ok()?;
         if v.len() != 32 {

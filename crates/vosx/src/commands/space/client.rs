@@ -116,12 +116,6 @@ impl DaemonClient {
         ServiceId::new(self.daemon_prefix, ServiceId::REGISTRY.local_id())
     }
 
-    /// The daemon's 16-bit identity prefix.
-    #[allow(dead_code)]
-    pub fn daemon_prefix(&self) -> u16 {
-        self.daemon_prefix
-    }
-
     pub fn node(&self) -> &VosNode {
         &self.node
     }

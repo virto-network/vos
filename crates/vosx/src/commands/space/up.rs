@@ -29,9 +29,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if entry.registry_hash.is_empty() {
         anyhow::bail!(
-            "space '{}' has no registry_hash recorded — re-create it \
-             with `vosx space new` (Phase 1a entries before the registry-hash \
-             field landed lack this metadata)",
+            "space '{}' has no registry_hash recorded — re-create it with \
+             `vosx space new`",
             entry.name,
         );
     }

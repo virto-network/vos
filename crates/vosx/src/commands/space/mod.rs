@@ -1,10 +1,20 @@
-//! `vosx space *` — per-space lifecycle commands.
+//! `vosx space *` — per-space lifecycle, daemon control,
+//! and registry-mediated agent management.
 //!
-//! Phase 1a covers the offline scaffolding — `new`, `list`,
-//! `info`. Running an existing space (`up`), exporting its
-//! state to TOML (`export`), and joining a remote space
-//! (`join`) require running-registry lifecycle work tracked
-//! as Phase 1b/1c.
+//! Three groups of commands:
+//!
+//! - **Offline**: `new`, `list`, `info`, `join`, `delete`,
+//!   `export` (read-only). Operate on `~/.config/vosx/spaces.toml`
+//!   and per-space data dirs without contacting a daemon.
+//! - **Daemon**: `up` runs the libp2p server that owns the
+//!   redb. One daemon per space, identified by an
+//!   `<data_dir>/.endpoint` file.
+//! - **Client**: `publish`, `install`, `upgrade`, `uninstall`,
+//!   `unpublish`, `programs`, `agents`, `members`, `call`.
+//!   Each spawns a tiny libp2p peer, dials the daemon's
+//!   endpoint, sends one registry invoke, and exits. Same
+//!   plumbing under `DaemonClient` — `call` is the floor
+//!   primitive, the rest are typed sugar.
 
 use clap::Subcommand;
 use std::path::PathBuf;

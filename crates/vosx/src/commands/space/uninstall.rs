@@ -20,8 +20,9 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
         other => anyhow::bail!("uninstall returned status {other}"),
     }
 
-    // TODO(phase 4): move per-agent redb to space_dir/trash/{instance}
-    //   so the data is recoverable instead of left dangling.
+    // TODO: move per-agent redb to space_dir/trash/{instance}
+    // so an `--undo` can recover instead of leaving the file
+    // orphaned.
 
     client.shutdown()
 }

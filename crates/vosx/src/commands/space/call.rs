@@ -45,7 +45,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 /// Parse `key=value` strings into a typed `Msg`. Heuristics:
 /// numeric → u64, `true`/`false` → bool, otherwise string.
-/// Same shape the Phase 2 install command uses for `--init`.
+/// Same shape `space install --init` and the manifest
+/// reconciler use.
 fn build_msg(method: &str, args: &[String]) -> anyhow::Result<Msg> {
     let mut msg = Msg::new(method);
     for a in args {

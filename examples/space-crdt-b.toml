@@ -1,8 +1,8 @@
 # Cross-node CRDT demo, host B. See space-crdt-a.toml for context.
 #
 # Run (after starting host A):
-#   vosx up examples/space-crdt-b.toml \
-#     --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811
+#   vosx space join <space-id>@/ip4/127.0.0.1/tcp/4811/p2p/<peer-a> --name b
+#   vosx space up b --manifest examples/space-crdt-b.toml &
 
 space = "crdt-demo"
 version = "0.1.0"

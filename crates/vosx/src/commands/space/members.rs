@@ -1,10 +1,10 @@
 //! `space members` — Node + Identity membership management.
 //!
-//! Phase 3 covers the CRUD surface; the consumer-side
-//! verification (an agent checking that an identity-authored
-//! message has a valid proof against the registry's merkle
-//! root) lands later. For now the registry stores proofs
-//! verbatim and the display commands surface them.
+//! CRUD over the registry's members table. The registry
+//! stores Identity proofs verbatim; consumer-side verification
+//! (an agent checking that an identity-authored message has a
+//! valid proof against the registry's merkle root before
+//! accepting it) is a separate consumer concern.
 
 use clap::Subcommand;
 
@@ -48,8 +48,12 @@ pub enum MembersCommand {
         /// `merkle` (default) or `zk`.
         #[arg(long, default_value = "merkle")]
         proof_kind: String,
-        /// Hex-encoded proof bytes. Optional — Phase 3 stores
-        /// the proof verbatim; verification happens later.
+        /// Hex-encoded proof bytes. The registry stores
+        /// these verbatim; verification is a consumer-side
+        /// concern (an agent that wants to authenticate an
+        /// identity-authored message looks the proof up in
+        /// the members table and checks it against the
+        /// registry's merkle root).
         #[arg(long, value_name = "HEX")]
         proof_data: Option<String>,
     },

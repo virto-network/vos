@@ -7,13 +7,15 @@
 # because the runtime stamps each event with a unique
 # (origin, seq) pair — see `vos::effect_log::CrdtEvent`).
 #
-# Run:
-#   vosx up examples/space-crdt-a.toml \
-#     --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811
+# Run (with isolated XDG dirs so two nodes don't share state):
+#   vosx space new --name a --listen /ip4/127.0.0.1/tcp/4811
+#   vosx space up a --manifest examples/space-crdt-a.toml &
+#   # … then in another shell, run space-crdt-b.toml …
 #
 # `replication_id` defaults to "auto" =
 # `blake2b(name || 0 || blob)` — both manifests reference the
-# same actor by the same name, so they auto-share a group.
+# same actor by the same name, so they auto-share a CRDT group.
+# `on_start` fires the inc once when each replica first boots.
 
 space = "crdt-demo"
 version = "0.1.0"

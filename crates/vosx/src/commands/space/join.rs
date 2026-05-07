@@ -1,16 +1,14 @@
 //! `space join` — register a remote space locally so
 //! `space up` can dial its bootnodes and sync.
 //!
-//! Phase 1c minimum: writes a spaces.toml entry and lays out
-//! the per-space data dir. Sync itself happens when the user
-//! runs `space up`. The registry blob is fetched from the
-//! `--registry` source (file path / cache hash / URL — peer
-//! fetch lands later). The space_id is taken on trust from
-//! the bootstrap address; verification (joiner re-derives
-//! `derive_space_id(genesis_dag_root)` against the synced
-//! registry's first DAG node and confirms it matches) is
-//! deferred until placeholder space_id is replaced with the
-//! genesis-rooted derivation.
+//! Writes a spaces.toml entry and lays out the per-space data
+//! dir. Sync itself happens when the user runs `space up`.
+//! The registry blob comes from `--registry <source>`
+//! (defaults to the bundled blob); peer-fetch over libp2p is
+//! a future addition. `space_id` is taken on trust from the
+//! bootstrap address — `space up` then verifies that the
+//! genesis CrdtEvent in the synced registry derives back to
+//! it (see `verify.rs`).
 
 use std::path::PathBuf;
 
