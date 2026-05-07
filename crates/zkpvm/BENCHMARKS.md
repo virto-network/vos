@@ -2,14 +2,23 @@
 
 ## Latest — Session 2.1 step 5(b)+8 (comb chip ACTIVE in production)
 
-`profile_clerk_private_pay_bench_mobile` post comb-chip activation:
-median of 7 trials, NON-PGO build, on the reference Intel Core Ultra
-7 155H — **~0.84 s MOBILE**.  This is a ~30% regression vs the
-0.63 s post-PGO baseline below; the cost is the comb chip pair
-(`RistrettoCombTableChip` log_size=10, `RistrettoFixedBaseConsumerChip`
-log_size=13, +993 main_cols, +~8M cells of FieldOp algebra) replacing
-`RistrettoChip`'s previous boundary-only attestation (log_size=6, 42
-rows of pure ledger entries with no FieldOp algebra).
+`profile_clerk_private_pay_bench_mobile` post comb-chip activation,
+on the reference Intel Core Ultra 7 155H:
+
+| Build  | Trials               | Median  | Min     | Max     |
+|---     |---                   |---      |---      |---      |
+| no-PGO | 7                    | 0.84 s  | 0.79 s  | 1.18 s  |
+| PGO    | 5 (post-fresh-train) | 0.83 s  | 0.79 s  | 0.98 s  |
+
+Both ~30% slower than the 0.63 s post-PGO baseline below; the cost is
+the comb chip pair (`RistrettoCombTableChip` log_size=10,
+`RistrettoFixedBaseConsumerChip` log_size=13, +993 main_cols, +~8M
+cells of FieldOp algebra) replacing `RistrettoChip`'s previous
+boundary-only attestation (log_size=6, 42 rows of pure ledger entries
+with no FieldOp algebra).  PGO retraining doesn't help much since the
+hot paths shifted entirely from `RistrettoChip`'s ledger emissions to
+the consumer chip's per-row FieldOp algebra; PGO and no-PGO are within
+noise of each other.
 
 The activation came in three steps:
 1. `02922c4` — fixed an off-by-three RISC-V→PVM register-map bug in
