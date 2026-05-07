@@ -1,24 +1,41 @@
 # zkpvm — performance benchmarks
 
-## Latest — Session 2.1 step 5(b)+8 (comb chip ACTIVE in production)
+## Latest — Session 2.1 column-shrink + step 5(b)+8 (comb chip pair active)
 
-`profile_clerk_private_pay_bench_mobile` post comb-chip activation,
-on the reference Intel Core Ultra 7 155H:
+`profile_clerk_private_pay_bench_mobile`, on the reference Intel Core
+Ultra 7 155H, after the column-shrink that split lookup-anchor
+metadata into `RistrettoCombAnchorChip`:
 
-| Build  | Trials               | Median  | Min     | Max     |
-|---     |---                   |---      |---      |---      |
-| no-PGO | 7                    | 0.84 s  | 0.79 s  | 1.18 s  |
-| PGO    | 5 (post-fresh-train) | 0.83 s  | 0.79 s  | 0.98 s  |
+| Build       | Trials | Median  | Min     | Max     |
+|---          |---     |---      |---      |---      |
+| no-PGO      | 9      | **0.77 s** | 0.75 s  | 0.79 s  |
 
-Both ~30% slower than the 0.63 s post-PGO baseline below; the cost is
-the comb chip pair (`RistrettoCombTableChip` log_size=10,
-`RistrettoFixedBaseConsumerChip` log_size=13, +993 main_cols, +~8M
-cells of FieldOp algebra) replacing `RistrettoChip`'s previous
-boundary-only attestation (log_size=6, 42 rows of pure ledger entries
-with no FieldOp algebra).  PGO retraining doesn't help much since the
-hot paths shifted entirely from `RistrettoChip`'s ledger emissions to
-the consumer chip's per-row FieldOp algebra; PGO and no-PGO are within
-noise of each other.
+vs ~0.84 s pre-shrink — an 8% improvement.  The shrink dropped the
+consumer chip's per-row width from 988 → 855 cells (saved ~1.1 M cells
+at log_size=13) and added ~69 K cells in the new anchor chip
+(135 cells × 512 rows at log_size=9).
+
+Still ~22% slower than the 0.63 s post-PGO boundary-only baseline
+below; the residual cost is the consumer chip's per-row FieldOp
+algebra (855 cols × 8192 rows ≈ 7.0 M cells) which RistrettoChip
+wasn't running before.  Closing the actor↔chip soundness binding
+(Step 8 scalar/output binding) is the remaining open piece — it'll
+add ~tens of rows but enables eventually retiring RistrettoChip's
+boundary attestation entirely.
+
+The column-shrink architecture:
+
+- `RistrettoCombAnchorChip` (sibling, log_size=9 for 5 calls): 64
+  rows per call holding `(CallIdx, WindowIdx, ScalarWindow, X/Y/Z/T)`.
+  Emits the 130-limb comb relation AND 128 +1 contributions per row
+  to a new `RistrettoCombCoordBoundaryLookupElements` keyed on
+  `(call_idx, window_idx, coord_kind, byte_idx, value)`.
+- `RistrettoFixedBaseConsumerChip` (log_size=13): 4 IsInput coord
+  rows (X/Y/Z/T, with `IsCoordInput=1` + `CallIdx/WindowIdx/CoordKind`
+  witness columns) + 18 FieldOp add rows per window.  IsInput coord
+  rows emit 32 −1 contributions each to the coord-boundary relation.
+  Balance forces each row's `out` to equal the anchor chip's matching
+  coord byte.
 
 The activation came in three steps:
 1. `02922c4` — fixed an off-by-three RISC-V→PVM register-map bug in
