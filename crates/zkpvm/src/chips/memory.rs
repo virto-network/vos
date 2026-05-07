@@ -67,11 +67,10 @@ pub enum Column {
     /// 1 if padding row
     #[size = 1]
     IsPadding,
-    /// Phase I-mem flatten: `IsReal · IsRead` selector helper
-    /// (`IsRead = 1 - IsWrite`).  Lifts the deg-3 read-consistency
-    /// gate to deg 2.
-    #[size = 1]
-    RealReadH,
+    // (B3 audit dropped RealReadH — read-consistency now uses an
+    // unconditional `(1 - is_write) · (value - prev_value) = 0`
+    // constraint.  Padding rows have value=0 and prev_value=0, so the
+    // stronger unconditional form holds.)
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -119,15 +118,12 @@ impl BuiltInComponent for MemoryChip {
         let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
-        // Read consistency: for reads, byte value must equal prev byte value
-        // (Phase I-mem flatten: routed through RealReadH = IsReal · (1 - IsWrite)).
-        let real_read_h = crate::trace::trace_eval!(trace_eval, Column::RealReadH);
+        // B3 audit: read consistency unconditional (was via
+        // RealReadH = is_real · (1 - is_write)).  On padding rows
+        // value=prev_value=0 so 1·0=0 holds.
         let is_read = E::F::one() - is_write[0].clone();
         eval.add_constraint(
-            real_read_h[0].clone() - is_real.clone() * is_read.clone()
-        );
-        eval.add_constraint(
-            real_read_h[0].clone() * (value[0].clone() - prev_value[0].clone())
+            is_read * (value[0].clone() - prev_value[0].clone())
         );
 
         // Consumer lookup (negative multiplicity)
@@ -337,8 +333,7 @@ impl BuiltInProverComponent for MemoryChip {
             trace.fill_columns(row, same_addr_next, Column::IsSameAddrNext);
             trace.fill_columns(row, false, Column::IsPadding);
             // Phase I-mem helper.  IsRead = 1 - IsWrite; on real rows
-            // RealReadH = !is_write; on padding RealReadH = 0.
-            trace.fill_columns(row, !entry.is_write, Column::RealReadH);
+            // (B3 audit dropped RealReadH fill.)
         }
 
         for row in num_entries..num_rows {
