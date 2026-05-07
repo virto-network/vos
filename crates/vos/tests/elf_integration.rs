@@ -818,11 +818,10 @@ fn pushy_vec_push_grows_correctly() {
         "prove_grow corrupted — got {items:?} (expected [11, 22, 33])",
     );
 
-    // (b) Two sequential `push` invokes — second push runs after
-    // the actor was serialized + deserialized via STATE_KEY, so
-    // `items` arrives at the second handler with cap=len=1 and
-    // the push triggers the grow path. Independent regression
-    // angle on the same bug.
+    // (b) Two further pushes via separate invokes — each invoke
+    // serializes and re-deserializes the actor via STATE_KEY, so
+    // both pushes hit `Vec::push` on a fresh-from-rkyv Vec where
+    // `cap == len` and a grow is needed.
     let _ = node
         .invoke(pushy_id, dyn_payload(Msg::new("push").with("val", 100u32)))
         .expect("push(100) failed");
@@ -848,8 +847,7 @@ fn pushy_vec_push_grows_correctly() {
     assert_eq!(
         items,
         vec![11u32, 22u32, 33u32, 100u32, 200u32],
-        "two-invoke push corrupted — got {items:?} \
-         (expected prove_grow's [11, 22, 33] plus [100, 200])",
+        "across-invoke push corrupted — got {items:?}",
     );
 }
 
@@ -2010,7 +2008,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
         std::time::Duration::from_secs(10),
     ).expect("Hello completes");
 
-    let inc_with_tag = |tag: u32| -> Vec<u8> {
+    let inc_payload = || -> Vec<u8> {
         let m = Msg::new("inc");
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -2020,20 +2018,18 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     };
 
     // Drive the bursts on background threads so both sides race.
-    // Tag values are partitioned: A uses 1..=N, B uses 100..=100+N,
-    // so neither replica sees a CID collision with the other.
     let handle_a = node_a.invoke_handle();
     let handle_b = node_b.invoke_handle();
     let one_sec = std::time::Duration::from_secs(10);
 
     let t_a = std::thread::spawn(move || {
-        for tag in 1..=PER_SIDE {
-            let _ = handle_a.invoke_with_timeout(counter_a, inc_with_tag(tag), one_sec);
+        for _ in 1..=PER_SIDE {
+            let _ = handle_a.invoke_with_timeout(counter_a, inc_payload(), one_sec);
         }
     });
     let t_b = std::thread::spawn(move || {
-        for tag in 1..=PER_SIDE {
-            let _ = handle_b.invoke_with_timeout(counter_b, inc_with_tag(100 + tag), one_sec);
+        for _ in 1..=PER_SIDE {
+            let _ = handle_b.invoke_with_timeout(counter_b, inc_payload(), one_sec);
         }
     });
     t_a.join().expect("burst A");
@@ -3260,7 +3256,7 @@ fn crdt_counter_shutdown_under_active_load() {
 
     use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
-    let inc_with_tag = |tag: u32| -> Vec<u8> {
+    let inc_payload = || -> Vec<u8> {
         let m = Msg::new("inc");
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -3271,13 +3267,11 @@ fn crdt_counter_shutdown_under_active_load() {
 
     let one_sec = std::time::Duration::from_secs(2);
     let burst = std::thread::spawn(move || {
-        let mut tag: u32 = 1;
         while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            match handle.invoke_with_timeout(counter_id, inc_with_tag(tag), one_sec) {
+            match handle.invoke_with_timeout(counter_id, inc_payload(), one_sec) {
                 Some(_) => { count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 None => break,
             }
-            tag += 1;
         }
     });
 
@@ -3477,7 +3471,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
     drop(net_a_arc); // release the test's reference so collect actually drops the redb arc
 
     // While A is offline, give B a few more incs.
-    for tag in 3u32..=5 {
+    for _ in 3u32..=5 {
         let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc")))
             .expect("inc on B while A offline");
     }
@@ -4343,7 +4337,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         (&node_b, counter_b),
         (&node_c, counter_c),
     ];
-    let try_inc = |tag: u32| -> bool {
+    let try_inc = || -> bool {
         let until = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             for (node, id) in counters.iter() {
@@ -4356,9 +4350,9 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    assert!(try_inc(1), "first inc must land on a leader");
-    assert!(try_inc(2), "second inc must land");
-    assert!(try_inc(3), "third inc must land");
+    assert!(try_inc(), "first inc must land on a leader");
+    assert!(try_inc(), "second inc must land");
+    assert!(try_inc(), "third inc must land");
 
     // ── Wait for all three replicas to converge on count=3. ──
     // The leader's commit_with_log already blocked on quorum,
@@ -4582,7 +4576,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     // `Config::compact_hysteresis = 16` entries past the previous
     // snap pointer).
     const N_INCS: u32 = 64;
-    let try_inc = |tag: u32| -> bool {
+    let try_inc = || -> bool {
         let until = Instant::now() + Duration::from_secs(20);
         loop {
             for (node, id) in counters.iter() {
@@ -4596,7 +4590,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         }
     };
     for i in 1..=N_INCS {
-        assert!(try_inc(i), "inc({i}) must land");
+        assert!(try_inc(), "inc({i}) must land");
     }
 
     // Wait for compaction to fire on every replica. The leader
