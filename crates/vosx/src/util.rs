@@ -1,12 +1,12 @@
-//! Small process / formatting / I/O helpers shared across
-//! `main`, `commands/*`, `network`, `hyperspace`, and `query`.
+//! Small process / I/O helpers.
 
 use std::path::Path;
 
 /// Print an error to stderr and exit with status 1. Used for
-/// any unrecoverable manifest, I/O, or CLI usage error — the
-/// CLI itself doesn't do error chaining, every fatal path
-/// converges here.
+/// any unrecoverable I/O or CLI usage error in `vosx run`. The
+/// `space *` commands return `anyhow::Result` and let the
+/// dispatcher print, so this is mostly the legacy non-space
+/// path.
 pub fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
@@ -24,8 +24,7 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Read a file or `die`. Common abbreviation across all the
-/// load_* helpers below.
+/// Read a file or `die`.
 pub fn load_file(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| die(&format!("reading {}: {e}", path.display())))
 }
@@ -66,71 +65,13 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// Lower-hex 32-byte → 64-char string. Used for printing
-/// replication-ids / DAG roots in operator output.
-pub fn hex32(bytes: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        use core::fmt::Write;
-        let _ = write!(&mut out, "{:02x}", b);
-    }
-    out
-}
-
-/// Format a `provides = [...]` tag for `vosx ls` output, or
-/// the empty string when the actor advertises no roles.
-pub fn format_provides(provides: &[String]) -> String {
-    if provides.is_empty() {
-        String::new()
-    } else {
-        format!(" provides={provides:?}")
-    }
-}
-
-/// Final exit handler shared by `vosx run`, `node`, and `start`.
-/// `panics > 0` exits with status 1 so CI catches actor panics;
-/// otherwise a `done` line + status 0.
+/// Final exit handler used by `vosx run`. `panics > 0` exits
+/// with status 1 so CI catches actor panics; otherwise a
+/// `done` line + status 0.
 pub fn exit_with_status(panics: u32) {
     if panics > 0 {
         eprintln!("\nvosx: {panics} panic(s)");
         std::process::exit(1);
     }
     eprintln!("\nvosx: done");
-}
-
-/// Print the actor metadata baked into an ELF — the actor's
-/// declared messages and constructor params, recovered from
-/// the `.vos_meta` section. Used by `vosx ls` to render the
-/// space's API surface.
-pub fn print_actor_meta(name: &str, path: &Path, role: &str) {
-    let Ok(data) = std::fs::read(path) else {
-        println!("  {name} ({role}) — not built");
-        return;
-    };
-    let Some(meta) = vos::metadata::from_elf(&data) else {
-        println!("  {name} ({role}) — no metadata");
-        return;
-    };
-    println!("  {} ({role}: {})", name, meta.actor_name);
-    if !meta.constructor.is_empty() {
-        let params: Vec<_> = meta
-            .constructor
-            .iter()
-            .map(|f| format!("{}: {}", f.name, f.ty.replace(' ', "")))
-            .collect();
-        println!("    new({})", params.join(", "));
-    }
-    for msg in &meta.messages {
-        let kind = if msg.is_query { "query" } else { "cmd" };
-        let params: Vec<_> = msg
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, f.ty.replace(' ', "")))
-            .collect();
-        if params.is_empty() {
-            println!("    {kind} {}()", msg.name);
-        } else {
-            println!("    {kind} {}({})", msg.name, params.join(", "));
-        }
-    }
 }
