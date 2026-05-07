@@ -1,6 +1,47 @@
 # zkpvm — performance benchmarks
 
-## Latest — Session 1 + Session 2.1 producer side (parallel trace-gen + PGO with STANDARD training)
+## Latest — Session 2.1 step 5(b)+8 (comb chip ACTIVE in production)
+
+`profile_clerk_private_pay_bench_mobile` post comb-chip activation:
+median of 7 trials, NON-PGO build, on the reference Intel Core Ultra
+7 155H — **~0.84 s MOBILE**.  This is a ~30% regression vs the
+0.63 s post-PGO baseline below; the cost is the comb chip pair
+(`RistrettoCombTableChip` log_size=10, `RistrettoFixedBaseConsumerChip`
+log_size=13, +993 main_cols, +~8M cells of FieldOp algebra) replacing
+`RistrettoChip`'s previous boundary-only attestation (log_size=6, 42
+rows of pure ledger entries with no FieldOp algebra).
+
+The activation came in three steps:
+1. `02922c4` — fixed an off-by-three RISC-V→PVM register-map bug in
+   `handle_ristretto_scalar_mult_ecall` that was silently routing
+   every record's point bytes to PVM-mem-address-0 garbage; without
+   the fix, `detect_scalar_mult_kind` never matched the canonical
+   basepoint and the comb-method routing in `ingest_ristretto_boundary`
+   stayed dormant for production traces.
+2. `af777d6` — routes `FixedBasepoint` records into
+   `ristretto_comb_calls` and skips RistrettoChip's boundary rows
+   for them.  The clerk-private-pay-bench classifies 5 of its 7
+   ECALL_RISTRETTO_SCALAR_MULT records as fixed-base.
+3. `daaff55` — `ChipActivity.ristretto_comb` gates the comb chip
+   pair into `BASE_COMPONENTS`.
+
+**Soundness gap (still open)**: the consumer chip's per-window k_i
+nibbles are NOT yet tied to the ECALL's input scalar bytes, and the
+chip's final extended-Edwards Acc is NOT yet tied to the output's
+compressed Ristretto bytes.  The comb chip therefore proves "some
+64 lookups composed via point-add into Acc" but doesn't yet
+constrain Acc = scalar · G.  Closing this gap requires the compress
+chain (R1e-bis) — next-larger deliverable.
+
+PGO retraining (`scripts/build-pgo.sh`) on the new trace shape did
+not recover perf — the changed shape doesn't benefit from the same
+PGO hints as the boundary-only-attestation shape.  Investigation
+follow-up: profile the comb chip's hot paths (FieldOp algebra,
+chip-local register-file emissions) and see if column-shrink work
+(e.g. splitting lookup-anchor columns into a sibling chip with
+fewer rows) recovers the regression.
+
+## Older — Session 1 + Session 2.1 producer side (parallel trace-gen + PGO with STANDARD training)
 
 `tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
