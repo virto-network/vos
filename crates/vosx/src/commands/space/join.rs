@@ -14,13 +14,13 @@
 
 use std::path::PathBuf;
 
-use crate::blob_store::{self, BlobSource};
+use crate::commands::space::new::resolve_registry_source;
 use crate::paths;
 use crate::spaces_index::{self, SpacesIndex};
 
 pub struct Args {
     pub bootstrap: String,
-    pub registry: String,
+    pub registry: Option<String>,
     pub name: Option<String>,
     pub listen: Vec<String>,
     pub data_dir: Option<PathBuf>,
@@ -35,12 +35,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .parse::<libp2p::Multiaddr>()
         .map_err(|e| anyhow::anyhow!("bad bootnode multiaddr '{bootnode}': {e}"))?;
 
-    // Resolve the registry blob source. The user has to supply
-    // it for now — fetching from peers needs the libp2p blob
-    // protocol that hasn't landed yet.
-    let source = BlobSource::parse(&args.registry);
-    let (registry_hash, _bytes) = blob_store::resolve(&source)
-        .map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
+    // Resolve the registry blob — explicit --registry, else
+    // bundled. The bytes are cached under `registry_hash` so
+    // `space up` finds them by hash.
+    let (registry_hash, _bytes, registry_label) =
+        resolve_registry_source(args.registry.as_deref())?;
 
     // Generate a per-space libp2p keypair (unique to this node
     // for this space — same per-space-identity story as
@@ -85,7 +84,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     println!("  space_id  = {space_id_hex}");
     println!("  data_dir  = {}", space_dir.display());
     println!("  bootnode  = {bootnode}");
-    println!("  registry  = {} ({})", args.registry, registry_hash);
+    println!("  registry  = {registry_label} ({registry_hash})");
     println!();
     println!("note: space_id is taken on trust from the bootstrap address. ");
     println!("      verification against genesis DAG root lands when the");

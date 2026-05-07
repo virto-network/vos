@@ -37,9 +37,10 @@ pub enum SpaceCommand {
         name: String,
         /// Source for the space-registry actor blob: file path,
         /// 64-hex content hash (cache lookup), `ipfs:<cid>`, or
-        /// `https://…`. Required until a bundled fallback ships.
+        /// `https://…`. Optional — falls back to the registry
+        /// blob bundled into the vosx binary at build time.
         #[arg(long, value_name = "SOURCE")]
-        registry: String,
+        registry: Option<String>,
         /// libp2p multiaddr to listen on. Repeatable.
         #[arg(long, value_name = "MULTIADDR")]
         listen: Vec<String>,
@@ -66,9 +67,10 @@ pub enum SpaceCommand {
         /// is 64 hex chars; the bootnode half is whatever
         /// follows the `@`.
         bootstrap: String,
-        /// Source for the space-registry actor blob.
+        /// Source for the space-registry actor blob. Optional —
+        /// falls back to the bundled blob.
         #[arg(long, value_name = "SOURCE")]
-        registry: String,
+        registry: Option<String>,
         /// Local short-name for the space. Defaults to a short
         /// hex prefix of the space_id.
         #[arg(long)]

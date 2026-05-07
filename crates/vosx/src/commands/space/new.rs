@@ -22,7 +22,7 @@ use crate::spaces_index::{self, SpacesIndex};
 
 pub struct Args {
     pub name: String,
-    pub registry: String,
+    pub registry: Option<String>,
     pub listen: Vec<String>,
     pub data_dir: Option<PathBuf>,
 }
@@ -32,10 +32,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("--name is required and must be non-empty");
     }
 
-    // 1. Resolve and cache the registry blob.
-    let source = BlobSource::parse(&args.registry);
-    let (registry_hash, registry_bytes) = blob_store::resolve(&source)
-        .map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
+    // 1. Resolve and cache the registry blob — explicit
+    //    --registry first, bundled fallback otherwise.
+    let (registry_hash, registry_bytes, registry_label) =
+        resolve_registry_source(args.registry.as_deref())?;
     let registry_blob = grey_transpiler::link_elf(&registry_bytes)
         .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
@@ -149,7 +149,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     println!("  genesis_root = {}", hex::encode(genesis_root));
     println!("  data_dir     = {}", final_dir.display());
     println!("  node.key     = {}", key_path.display());
-    println!("  registry     = {} ({})", args.registry, registry_hash);
+    println!("  registry     = {registry_label} ({registry_hash})");
     if !args.listen.is_empty() {
         println!("  listen       =");
         for addr in &args.listen {
@@ -163,6 +163,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the registry source: explicit `--registry` if given,
+/// else the bundled blob baked in at `vosx` build time.
+/// Returns `(hash, bytes, display_label)` so the print step
+/// can show whatever the user asked for (or "(bundled)").
+pub fn resolve_registry_source(
+    registry: Option<&str>,
+) -> anyhow::Result<(blob_store::BlobHash, Vec<u8>, String)> {
+    if let Some(s) = registry {
+        let source = BlobSource::parse(s);
+        let (hash, bytes) = blob_store::resolve(&source)
+            .map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
+        return Ok((hash, bytes, s.to_string()));
+    }
+    match crate::bundled::registry_elf() {
+        Some(bytes) => {
+            let hash = blob_store::cache_put(bytes)
+                .map_err(|e| anyhow::anyhow!("cache bundled blob: {e}"))?;
+            Ok((hash, bytes.to_vec(), "(bundled)".to_string()))
+        }
+        None => anyhow::bail!(
+            "no --registry provided and no bundled blob — run \
+             `cd crates/actors/space-registry && cargo actor` and \
+             rebuild vosx, or pass --registry <source>"
+        ),
+    }
 }
 
 /// Open the registry's redb and return the first DAG root.

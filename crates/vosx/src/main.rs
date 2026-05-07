@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 mod blob_store;
+mod bundled;
 mod commands;
 mod hyperspace;
 mod identity;
