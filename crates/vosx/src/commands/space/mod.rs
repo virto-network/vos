@@ -9,11 +9,19 @@
 use clap::Subcommand;
 use std::path::PathBuf;
 
+pub mod agents;
 pub mod export;
 pub mod info;
+pub mod install;
 pub mod list;
 pub mod new;
+pub mod programs;
+pub mod publish;
+pub mod transient;
+pub mod uninstall;
+pub mod unpublish;
 pub mod up;
+pub mod upgrade;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
@@ -63,6 +71,69 @@ pub enum SpaceCommand {
         /// Space id (full hex) or name.
         space: String,
     },
+    /// Add a program (PVM blob) to the catalog with an
+    /// immutable `(name, version)` tag.
+    Publish {
+        /// Space id or name.
+        space: String,
+        /// `name` or `name:version`. Bare `name` ⇒ `name:latest`.
+        program_ref: String,
+        /// Blob source: file path, hash, ipfs:<cid>, or URL.
+        source: String,
+    },
+    /// Remove a program from the catalog. Errors if any
+    /// installed agent still references the version.
+    Unpublish {
+        space: String,
+        /// `name:version` (both required).
+        program_ref: String,
+    },
+    /// List programs in the catalog.
+    Programs {
+        space: String,
+    },
+    /// Instantiate a published program as an installed agent.
+    Install {
+        /// Space id or name.
+        space: String,
+        /// Program ref: `name`, `name:version`. Bare `name`
+        /// resolves to `name:latest`.
+        program_ref: String,
+        /// Override the install/instance name. Defaults to
+        /// the program's `name`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Init args as `key=value` pairs (repeatable). Values
+        /// are typed as u64 / bool / String in that order.
+        #[arg(long, value_name = "KEY=VALUE")]
+        init: Vec<String>,
+        /// Consistency mode: ephemeral, local, crdt, or raft.
+        #[arg(long, default_value = "crdt")]
+        consistency: String,
+        /// Optional explicit replication id (64 hex). Default:
+        /// blake2b("vos-replication-id/v1" || instance_name ||
+        /// 0 || program_hash).
+        #[arg(long, value_name = "HEX")]
+        replication_id: Option<String>,
+    },
+    /// Tombstone an installed agent.
+    Uninstall {
+        space: String,
+        instance: String,
+    },
+    /// Repoint an installed agent at a different program
+    /// version. State is preserved (same replication_id, same
+    /// redb); replicas restart on next sync.
+    Upgrade {
+        space: String,
+        instance: String,
+        /// New program ref: `name:version`.
+        program_ref: String,
+    },
+    /// List installed agents.
+    Agents {
+        space: String,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -82,5 +153,48 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Info { space } => info::run(space.as_deref()),
         SpaceCommand::Up { space, once } => up::run(up::Args { query: space, once }),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
+        SpaceCommand::Publish {
+            space,
+            program_ref,
+            source,
+        } => publish::run(publish::Args {
+            space,
+            program_ref,
+            source,
+        }),
+        SpaceCommand::Unpublish {
+            space,
+            program_ref,
+        } => unpublish::run(unpublish::Args {
+            space,
+            program_ref,
+        }),
+        SpaceCommand::Programs { space } => programs::run(&space),
+        SpaceCommand::Install {
+            space,
+            program_ref,
+            name,
+            init,
+            consistency,
+            replication_id,
+        } => install::run(install::Args {
+            space,
+            program_ref,
+            name,
+            init,
+            consistency,
+            replication_id,
+        }),
+        SpaceCommand::Uninstall { space, instance } => uninstall::run(&space, &instance),
+        SpaceCommand::Upgrade {
+            space,
+            instance,
+            program_ref,
+        } => upgrade::run(upgrade::Args {
+            space,
+            instance,
+            program_ref,
+        }),
+        SpaceCommand::Agents { space } => agents::run(&space),
     }
 }

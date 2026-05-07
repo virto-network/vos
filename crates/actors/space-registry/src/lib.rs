@@ -67,6 +67,11 @@ pub struct AgentRow {
     /// 0 = Ephemeral, 1 = Local, 2 = Crdt, 3 = Raft. Mirrors
     /// `vos::node::Consistency` discriminants.
     pub consistency: u8,
+    /// rkyv-encoded `vos::init::InitArgs` captured at install
+    /// time. New replicas use this to bootstrap their copy of
+    /// the agent before its first message arrives. Empty when
+    /// the agent was installed without init args.
+    pub install_args: Vec<u8>,
 }
 
 // ── Members ──────────────────────────────────────────────────────
@@ -234,6 +239,7 @@ impl SpaceRegistry {
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
+        install_args: Vec<u8>,
     ) -> u8 {
         let Some(program_hash) = bytes_to_32(&program_hash) else { return STATUS_BAD_HASH; };
         let Some(replication_id) = bytes_to_32(&replication_id) else { return STATUS_BAD_HASH; };
@@ -273,6 +279,7 @@ impl SpaceRegistry {
                 program_version,
                 replication_id,
                 consistency,
+                install_args,
             },
         );
         STATUS_OK
