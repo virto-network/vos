@@ -10,6 +10,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 pub mod agents;
+pub mod call;
 pub mod client;
 pub mod delete;
 pub mod endpoint;
@@ -178,6 +179,23 @@ pub enum SpaceCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Invoke any agent on the running daemon. Generic floor
+    /// primitive; `publish` / `install` / etc. are typed sugar
+    /// wrappers around the same plumbing.
+    ///
+    /// `target` accepts:
+    /// - `registry` — the well-known per-space registry
+    /// - `<instance_name>` — an installed agent (resolved via
+    ///   the daemon's registry)
+    /// - `0xHEX` — bare 32-bit ServiceId
+    Call {
+        space: String,
+        target: String,
+        method: String,
+        /// Positional `key=value` args. Numbers and booleans
+        /// are auto-typed; everything else is a string.
+        args: Vec<String>,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -258,6 +276,9 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         }
         SpaceCommand::Delete { space, yes } => {
             delete::run(delete::Args { space, yes })
+        }
+        SpaceCommand::Call { space, target, method, args } => {
+            call::run(call::Args { space, target, method, args })
         }
     }
 }

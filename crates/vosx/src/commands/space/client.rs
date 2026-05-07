@@ -24,6 +24,7 @@ use crate::commands::space::endpoint;
 use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct DaemonClient {
     node: VosNode,
@@ -107,14 +108,88 @@ impl DaemonClient {
     /// Macro-generated typed `Ref` pointed at the daemon's
     /// registry. Use as `vos::block_on(client.registry().publish(&mut &*client.node(), ...))`.
     pub fn registry(&self) -> SpaceRegistryRef {
-        SpaceRegistryRef::at(ServiceId::new(
-            self.daemon_prefix,
-            ServiceId::REGISTRY.local_id(),
-        ))
+        SpaceRegistryRef::at(self.registry_id())
+    }
+
+    /// The daemon's registry `ServiceId` — `(daemon_prefix, 0)`.
+    pub fn registry_id(&self) -> ServiceId {
+        ServiceId::new(self.daemon_prefix, ServiceId::REGISTRY.local_id())
+    }
+
+    /// The daemon's 16-bit identity prefix.
+    pub fn daemon_prefix(&self) -> u16 {
+        self.daemon_prefix
     }
 
     pub fn node(&self) -> &VosNode {
         &self.node
+    }
+
+    /// Resolve a user-supplied target string to a daemon-side
+    /// `ServiceId`. Three forms supported:
+    ///
+    /// - `"registry"` — the well-known per-space registry.
+    /// - `"<instance_name>"` — looks the agent up in the daemon's
+    ///   registry, then derives its per-node ServiceId via
+    ///   `derive_instance_svc_id` (the same function `space up`
+    ///   uses to register installed agents, so the derived id
+    ///   matches the actual registration).
+    /// - `"0xHEX"` / 8-hex-chars — bare 32-bit ServiceId. The
+    ///   prefix half is honored as-is, letting power users
+    ///   target a specific node in a multi-node setup.
+    pub fn resolve_target(&self, target: &str) -> anyhow::Result<ServiceId> {
+        if target == "registry" {
+            return Ok(self.registry_id());
+        }
+        if let Some(hex) = target.strip_prefix("0x") {
+            let raw = u32::from_str_radix(hex, 16)
+                .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
+            return Ok(ServiceId(raw));
+        }
+        // Otherwise an installed-agent instance name. Ask the
+        // daemon's registry whether such an agent exists; if
+        // yes, derive the daemon-local svc_id from the name +
+        // daemon prefix.
+        let reg = self.registry();
+        let agent = vos::block_on(reg.agent(&mut &self.node, target.to_string()))
+            .map_err(|e| anyhow::anyhow!("registry.agent('{target}'): {e}"))?
+            .ok_or_else(|| anyhow::anyhow!(
+                "no agent named '{target}' is installed in this space \
+                 (use `vosx space agents <space>` to list)",
+            ))?;
+        // Sanity-check the lookup: the agent's name on the
+        // wire should match what we asked for. If a malicious
+        // bootnode ever returned a different agent we'd want
+        // to know.
+        debug_assert_eq!(agent.instance_name, target);
+        let raw = crate::commands::space::up::derive_instance_svc_id(target, self.daemon_prefix);
+        Ok(ServiceId(raw))
+    }
+
+    /// Generic invoke — send `msg` to `target` on the daemon
+    /// and return the decoded reply `Value`. Foundation under
+    /// every `space *` command that talks to the registry, and
+    /// the engine for `space call` against arbitrary agents.
+    pub fn invoke_dyn(
+        &self,
+        target: ServiceId,
+        msg: &vos::value::Msg,
+    ) -> anyhow::Result<vos::value::Value> {
+        use vos::Encode;
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(vos::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+
+        let reply = self.node.invoke_with_timeout(target, payload, INVOKE_TIMEOUT)
+            .ok_or_else(|| anyhow::anyhow!(
+                "daemon at {target} didn't reply within {:?} (target unreachable or timed out)",
+                INVOKE_TIMEOUT,
+            ))?;
+        if reply.is_empty() {
+            return Ok(vos::value::Value::Unit);
+        }
+        Ok(vos::Decode::decode(&reply))
     }
 
     /// Tear down the libp2p peer. Always call before exiting

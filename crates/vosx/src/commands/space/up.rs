@@ -280,7 +280,11 @@ fn spawn_installed_agents(
 /// `[0x100, 0x7FFF]` so it can't collide with `ServiceId::REGISTRY`
 /// (= 0) or any reserved low system ids. Stable across restarts
 /// of the same node so each instance's redb path persists.
-fn derive_instance_svc_id(instance_name: &str, local_prefix: u16) -> u32 {
+///
+/// Public so `DaemonClient::resolve_target` can compute the
+/// same value when resolving an instance name to a ServiceId
+/// for `space call`.
+pub fn derive_instance_svc_id(instance_name: &str, local_prefix: u16) -> u32 {
     let mut h = blake2b_simd::Params::new().hash_length(2).to_state();
     h.update(b"vos-instance-svc-id/v1");
     h.update(&[0u8]);
