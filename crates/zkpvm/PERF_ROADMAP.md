@@ -149,9 +149,13 @@ scalar-mults appear in any production workload.
 
 # Session 2 — Ristretto fixed-base scalar-mult
 
-Estimated wall-clock: 3–7 days.
+Estimated wall-clock: 3–7 days.  Step 1 done (`91fa0d6`); steps 2–8
+remain — schedule a dedicated session.
 
 ## Item 2.1 — C8: comb method for fixed bases (G and H)
+
+* **Step 1 — DONE (`91fa0d6`)**: host-side `comb_table.rs` module, Ed25519 basepoint constants, `scalar_mult_via_comb` reference, 6 unit tests cross-checking against `point::scalar_mult_rows` for fixed + 5 random scalars.
+* **Steps 2–8 OPEN**: chip-side integration (preprocessed columns, lookup relation, new row class, ECALL boundary detection, side-note plumbing, chip-isolated harness).
 
 * **Why this is the right tap-to-pay win**: cipher-clerk's private-pay flow does:
   * Pedersen commit: `v · G + b · H` — 2 fixed-base scalar-mults.
