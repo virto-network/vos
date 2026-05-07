@@ -5,7 +5,7 @@ use javm::program::{self, CapEntryType};
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, prove_profiled, verify};
+use zkpvm::{prove, prove_profiled, prove_profiled_with_config, production_pcs_config_mobile, verify};
 
 /// Load fibonacci PVM blob (transpiled from ELF).
 fn load_fibonacci_blob() -> Vec<u8> {
@@ -321,6 +321,71 @@ fn profile_actor(name: &str, gas: u64) {
     eprintln!("Verify: {:?}\n", t.elapsed());
 }
 
+fn profile_actor_with_config(name: &str, gas: u64, config: zkpvm::PcsConfig) {
+    let blob = load_actor_blob(name);
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
+
+    let t0 = std::time::Instant::now();
+    let mut tracing = TracingPvm::new(interp);
+    let exit = tracing.run_with_vos_stubs();
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
+    let ristretto_add_records = tracing.ristretto_add_records.clone();
+    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
+    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
+    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
+    let scalar_binop_records = tracing.scalar_binop_records.clone();
+    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
+    let steps = tracing.into_trace();
+    let trace_time = t0.elapsed();
+
+    eprintln!("=== {name} actor (custom PcsConfig) ===");
+    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+
+    let mut side_note = zkpvm::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
+    for c in &blake2b_calls {
+        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
+            h: c.h, m: c.m, t: c.t, f: c.f
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+    side_note.ristretto_calls = ristretto_calls;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ristretto_add_calls = ristretto_add_records;
+    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
+    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
+    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
+    side_note.scalar_binop_calls = scalar_binop_records;
+    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
+    side_note.ingest_ristretto_boundary();
+
+    eprintln!("\nProve:");
+    let (proof, _) = prove_profiled_with_config(&mut side_note, config)
+        .expect("proving failed");
+    let proof_bytes = bincode::serialize(&proof).expect("serialize");
+    eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
+
+    let t = std::time::Instant::now();
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &zkpvm::PcsPolicy::MOBILE)
+        .expect("verification failed");
+    eprintln!("Verify: {:?}\n", t.elapsed());
+}
+
 #[test]
 fn profile_hasher_actor() {
     profile_actor("hasher", 10_000_000);
@@ -356,6 +421,15 @@ fn trace_clerk_refine_bench() {
 #[test]
 fn profile_clerk_private_pay_bench() {
     profile_actor("clerk-private-pay-bench", 100_000_000);
+}
+
+#[test]
+fn profile_clerk_private_pay_bench_mobile() {
+    profile_actor_with_config(
+        "clerk-private-pay-bench",
+        100_000_000,
+        production_pcs_config_mobile(),
+    );
 }
 
 #[test]
