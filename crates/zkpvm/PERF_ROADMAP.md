@@ -69,14 +69,14 @@ scalar-mults appear in any production workload.
 
 # Session 1 — Operational + parallel-trace — DONE (2026-05-07)
 
-## Item 1.1 — Run PGO — DONE (`55cbe3b`)
+## Item 1.1 — Run PGO — DONE (`55cbe3b`, follow-up `d10eb1e`)
 
 * Re-ran `scripts/build-pgo.sh` on the post-parallel-trace tip.
 * MOBILE: 698 → 639 ms (~9% win, mostly from trace_gen 124 → 85 ms).
-* STANDARD: 1.34 → 1.40 s (no win — STANDARD shape isn't in the
-  training run).  Follow-up if STANDARD matters: add a
-  `profile_clerk_private_pay_bench` (non-mobile) pass to step 2 of
-  the PGO script.
+* STANDARD: 1.34 → 1.40 s post-PGO with MOBILE-only training (the
+  identified follow-up).  Closed in `d10eb1e` by also training on
+  `profile_clerk_private_pay_bench` (non-mobile).  Re-run
+  `scripts/build-pgo.sh` to pick up both shapes.
 * The −18% historical projection didn't fully materialize — likely
   because the parallel-trace + parallel-interaction paths are
   harder for PGO to specialize across thread variants.
@@ -149,13 +149,15 @@ scalar-mults appear in any production workload.
 
 # Session 2 — Ristretto fixed-base scalar-mult
 
-Estimated wall-clock: 3–7 days.  Step 1 done (`91fa0d6`); steps 2–8
+Estimated wall-clock: 3–7 days.  Steps 1–2 + 7 done; steps 3–6 + 8
 remain — schedule a dedicated session.
 
 ## Item 2.1 — C8: comb method for fixed bases (G and H)
 
 * **Step 1 — DONE (`91fa0d6`)**: host-side `comb_table.rs` module, Ed25519 basepoint constants, `scalar_mult_via_comb` reference, 6 unit tests cross-checking against `point::scalar_mult_rows` for fixed + 5 random scalars.
-* **Steps 2–8 OPEN**: chip-side integration (preprocessed columns, lookup relation, new row class, ECALL boundary detection, side-note plumbing, chip-isolated harness).
+* **Step 7 + ECALL detection — DONE (`4efa343`)**: `ScalarMultKind { Variable, FixedBasepoint }` on `RistrettoRecord`, set at ECALL handler from `detect_scalar_mult_kind` (compares against `RISTRETTO_BASEPOINT_COMPRESSED`).  3 unit tests; chip side still treats every record as variable-base — plumbing only.
+* **Steps 2–6 OPEN**: chip-side integration: `PreprocessedColumn::CombTable*` variants, `RistrettoCombTableLookupElements` relation, `scalar_mult_rows_fixed_base` host emitter, `RistrettoChip::add_constraints` lookup binding, producer chip for the table.  This is the bulk of the work; ~3–5 days fresh.
+* **Step 8 OPEN**: route `ScalarMultKind::FixedBasepoint` → fixed-base witness path in the chip.  One-line dispatch once steps 2–6 land.
 
 * **Why this is the right tap-to-pay win**: cipher-clerk's private-pay flow does:
   * Pedersen commit: `v · G + b · H` — 2 fixed-base scalar-mults.
