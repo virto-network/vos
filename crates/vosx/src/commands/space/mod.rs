@@ -10,6 +10,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 pub mod agents;
+pub mod delete;
 pub mod export;
 pub mod info;
 pub mod install;
@@ -165,6 +166,14 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<members::MembersCommand>,
     },
+    /// Remove a local space — wipes the per-space data dir and
+    /// the spaces.toml entry. The shared blob cache is kept.
+    Delete {
+        space: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -242,6 +251,9 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Agents { space } => agents::run(&space),
         SpaceCommand::Members { space, command } => {
             members::run(members::Args { space, command })
+        }
+        SpaceCommand::Delete { space, yes } => {
+            delete::run(delete::Args { space, yes })
         }
     }
 }

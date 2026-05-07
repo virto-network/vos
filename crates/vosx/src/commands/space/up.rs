@@ -65,11 +65,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // new` with no `--listen`) keep network attachment off and
     // run as single-node.
     let network = build_network_if_needed(&entry, &data_dir)?;
+    let local_prefix = network.as_ref().map(|n| n.local_prefix()).unwrap_or(0);
 
-    let mut node = match &network {
-        Some(net) => VosNode::with_prefix(net.local_prefix()),
-        None => VosNode::new(),
-    };
+    let mut node = VosNode::with_prefix(local_prefix);
     let cfg = AgentConfig::new(blob)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
@@ -85,6 +83,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         entry.name,
         &entry.id[..12],
     );
+
+    // Spawn every installed agent recorded in the registry.
+    // Each gets a deterministic per-node ServiceId so its redb
+    // path is stable across restarts.
+    spawn_installed_agents(&mut node, &data_dir, local_prefix)?;
 
     if args.once {
         eprintln!("vosx: --once — exiting once registry goes idle");
@@ -153,6 +156,94 @@ fn build_network_if_needed(
             bootstrap,
         },
     )))
+}
+
+/// Query the registry for installed agents and register each
+/// on the local node.
+fn spawn_installed_agents(
+    node: &mut VosNode,
+    data_dir: &std::path::Path,
+    local_prefix: u16,
+) -> anyhow::Result<()> {
+    use space_registry::SpaceRegistryRef;
+
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let agents = vos::block_on(reg.agents(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+
+    for a in agents {
+        let program_hash = BlobHash(a.program_hash);
+        let elf = match blob_store::cache_get(&program_hash)? {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "vosx: skipping agent '{}' — program blob {program_hash} not in local cache",
+                    a.instance_name,
+                );
+                continue;
+            }
+        };
+        let blob = grey_transpiler::link_elf(&elf)
+            .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
+
+        let consistency = match a.consistency {
+            0 => Consistency::Ephemeral,
+            1 => Consistency::Local,
+            2 => Consistency::Crdt,
+            3 => Consistency::Raft,
+            other => {
+                eprintln!(
+                    "vosx: skipping agent '{}' — unknown consistency {other}",
+                    a.instance_name,
+                );
+                continue;
+            }
+        };
+
+        let mut cfg = AgentConfig::new(blob).with_consistency(consistency);
+        if matches!(consistency, Consistency::Local | Consistency::Crdt | Consistency::Raft) {
+            cfg = cfg.persist(data_dir);
+        }
+        if matches!(consistency, Consistency::Crdt | Consistency::Raft) {
+            cfg = cfg.with_replication_id(a.replication_id);
+        }
+        if !a.install_args.is_empty() {
+            cfg = cfg.with_storage(vec![(
+                vos::lifecycle::INIT_KEY.to_vec(),
+                a.install_args.clone(),
+            )]);
+        }
+
+        let svc_id = vos::abi::service::ServiceId(derive_instance_svc_id(
+            &a.instance_name,
+            local_prefix,
+        ));
+        let id = node.register_at_id(cfg, svc_id);
+        eprintln!(
+            "vosx:   agent '{}' as {id} ({})",
+            a.instance_name,
+            space_registry::consistency_name(a.consistency),
+        );
+    }
+    Ok(())
+}
+
+/// Deterministic per-node ServiceId for an installed agent.
+/// `local_prefix` is the node's 16-bit identity prefix; the
+/// low 16 bits are derived from `instance_name` and clamped to
+/// `[0x100, 0x7FFF]` so it can't collide with `ServiceId::REGISTRY`
+/// (= 0) or any reserved low system ids. Stable across restarts
+/// of the same node so each instance's redb path persists.
+fn derive_instance_svc_id(instance_name: &str, local_prefix: u16) -> u32 {
+    let mut h = blake2b_simd::Params::new().hash_length(2).to_state();
+    h.update(b"vos-instance-svc-id/v1");
+    h.update(&[0u8]);
+    h.update(instance_name.as_bytes());
+    let bytes = h.finalize();
+    let buf = bytes.as_bytes();
+    let raw = u16::from_le_bytes([buf[0], buf[1]]);
+    let local = (raw & 0x7FFF).max(0x100);
+    ((local_prefix as u32) << 16) | (local as u32)
 }
 
 /// Per-space registry replication-id: blake2b("vos-space-registry/v1"
