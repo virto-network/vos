@@ -106,6 +106,42 @@ pub struct RistrettoPointAddMemOp {
     pub out_bytes: [u8; 32],
 }
 
+/// Classification of the input point in a `RistrettoRecord`, set by
+/// the ECALL handler from `detect_scalar_mult_kind`.  Lets the chip
+/// dispatch fixed-base scalar mults (Ristretto255 basepoint G) onto
+/// the comb-method path and variable-base mults onto double-and-add.
+///
+/// Session 2.1 of `crates/zkpvm/PERF_ROADMAP.md`: this enum is the
+/// side-note plumbing for the comb method.  The chip side (lookup
+/// relation, preprocessed columns, fixed-base row class) is the
+/// follow-up; today the field is informational and the chip still
+/// runs the variable-base path for every record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScalarMultKind {
+    /// Default: input point is not a registered fixed base.  Chip
+    /// runs the double-and-add ladder over the decompressed input.
+    #[default]
+    Variable,
+    /// Input point bytes matched the canonical Ristretto255 basepoint
+    /// `G`.  Chip can route through the comb-table fixed-base path.
+    FixedBasepoint,
+}
+
+/// Detect whether a 32-byte compressed Ristretto255 point is a
+/// registered fixed base.  Only the canonical basepoint is supported
+/// today; future protocols (Pedersen `H` etc.) would extend this.
+pub fn detect_scalar_mult_kind(point_bytes: &[u8; 32]) -> ScalarMultKind {
+    #[cfg(feature = "prover")]
+    {
+        let bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+        if *point_bytes == bp {
+            return ScalarMultKind::FixedBasepoint;
+        }
+    }
+    let _ = point_bytes;
+    ScalarMultKind::Variable
+}
+
 /// A recorded Ristretto255 scalar-mult call for the precompile chip.
 /// Captures the canonical 32-byte scalar, 32-byte compressed input
 /// point, and 32-byte compressed output point — exactly the bytes the
@@ -115,6 +151,9 @@ pub struct RistrettoRecord {
     pub scalar: [u8; 32],
     pub point: [u8; 32],
     pub output: [u8; 32],
+    /// Set by `detect_scalar_mult_kind` from `point` at ECALL time.
+    /// Drives chip-side dispatch between comb-method and double-and-add.
+    pub kind: ScalarMultKind,
 }
 
 /// Per-byte memory operations for a single ristretto_scalar_mult ECALL.
@@ -439,6 +478,7 @@ impl TracingPvm {
             scalar: scalar_bytes,
             point: point_bytes,
             output: out_bytes,
+            kind: detect_scalar_mult_kind(&point_bytes),
         });
         self.ristretto_mem_ops.push(RistrettoMemOp {
             scalar_ptr, point_ptr, output_ptr, ts,
@@ -933,6 +973,29 @@ fn decode_mem_access(
         _ => {}
     }
     (None, None)
+}
+
+#[cfg(all(test, feature = "prover"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_basepoint() {
+        let bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+        assert_eq!(detect_scalar_mult_kind(&bp), ScalarMultKind::FixedBasepoint);
+    }
+
+    #[test]
+    fn rejects_non_basepoint() {
+        let mut bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+        bp[0] ^= 0xff; // mutate first byte
+        assert_eq!(detect_scalar_mult_kind(&bp), ScalarMultKind::Variable);
+    }
+
+    #[test]
+    fn rejects_zero() {
+        assert_eq!(detect_scalar_mult_kind(&[0u8; 32]), ScalarMultKind::Variable);
+    }
 }
 
 /// Decode register indices from decoded instruction arguments.
