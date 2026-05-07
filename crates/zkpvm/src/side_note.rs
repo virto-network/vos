@@ -442,31 +442,61 @@ impl SideNote {
     #[cfg(feature = "prover")]
     pub fn ingest_ristretto_boundary(&mut self) {
         use crate::chips::ristretto::witness::{fill_input, fill_output};
+        use crate::core::tracing::ScalarMultKind;
         let calls = std::mem::take(&mut self.ristretto_calls);
         for rec in &calls {
-            let scalar_row = self.ristretto_field_rows.len() as u16;
-            self.add_ristretto_field_row(fill_input(rec.scalar));
-            let point_row = self.ristretto_field_rows.len() as u16;
-            self.add_ristretto_field_row(fill_input(rec.point));
-            let output_row = self.ristretto_field_rows.len() as u16;
-            self.add_ristretto_field_row(fill_input(rec.output));
-            self.add_ristretto_field_row(fill_output(rec.scalar, scalar_row));
-            self.add_ristretto_field_row(fill_output(rec.point,  point_row));
-            self.add_ristretto_field_row(fill_output(rec.output, output_row));
+            // Session 2.1 step 8 (partial): route fixed-basepoint
+            // records onto the comb-method path (RistrettoCombTableChip
+            // + RistrettoFixedBaseConsumerChip).  Variable-base records
+            // continue to use RistrettoChip's double-and-add ladder.
+            //
+            // **Soundness gap (deferred follow-up)**: this routing does
+            // not yet tie the consumer chip's per-window k_i nibbles to
+            // the input scalar bytes, nor the chip's final
+            // extended-Edwards Acc to the output's compressed Ristretto
+            // bytes.  Compress chain implementation (R1e-bis) is the
+            // next-larger deliverable; until then a malicious prover
+            // could fabricate a fixed-basepoint scalar mult result.
+            //
+            // We DO bypass RistrettoChip's boundary-row injection for
+            // fixed-base records to realize the perf win.  The chip
+            // gates off (activity.ristretto stays false if no field
+            // rows accumulate) freeing the trace's row budget.
+            match rec.kind {
+                ScalarMultKind::FixedBasepoint => {
+                    self.ristretto_comb_calls
+                        .push(RistrettoCombCall { scalar: rec.scalar });
+                }
+                ScalarMultKind::Variable => {
+                    let scalar_row = self.ristretto_field_rows.len() as u16;
+                    self.add_ristretto_field_row(fill_input(rec.scalar));
+                    let point_row = self.ristretto_field_rows.len() as u16;
+                    self.add_ristretto_field_row(fill_input(rec.point));
+                    let output_row = self.ristretto_field_rows.len() as u16;
+                    self.add_ristretto_field_row(fill_input(rec.output));
+                    self.add_ristretto_field_row(fill_output(rec.scalar, scalar_row));
+                    self.add_ristretto_field_row(fill_output(rec.point, point_row));
+                    self.add_ristretto_field_row(fill_output(rec.output, output_row));
+                }
+            }
         }
+        self.populate_ristretto_comb_counts();
         self.ristretto_calls = calls;
     }
 
     /// Session 2.1: walk every entry in `ristretto_comb_calls` and bump
     /// `ristretto_comb_counts[window_idx * 16 + scalar_window]` for each
-    /// of the call's 64 windows.  Idempotent only if called once after
-    /// all `ristretto_comb_calls` are populated; subsequent calls
-    /// double-count.
+    /// of the call's 64 windows.  Idempotent — resets the counts vector
+    /// to zero before walking, so multiple calls produce the same final
+    /// state.
     ///
     /// Drives the lookup balance between the
     /// `RistrettoFixedBaseConsumerChip` (emits +1 per window) and the
     /// `RistrettoCombTableChip` (emits −multiplicity per row).
     pub fn populate_ristretto_comb_counts(&mut self) {
+        for v in self.ristretto_comb_counts.iter_mut() {
+            *v = 0;
+        }
         for call in &self.ristretto_comb_calls {
             for i in 0..64usize {
                 let byte = call.scalar[i / 2];

@@ -237,8 +237,16 @@ fn harness_ristretto_isolated() {
     // scalar = 2
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[0] = 2;
-    let point_bytes: [u8; 32] =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    // Use a non-basepoint compressed point (`2 · G`) so the ECALL
+    // handler classifies the record as `ScalarMultKind::Variable` and
+    // drives RistrettoChip's variable-base ladder.  Step 8's routing
+    // sends `FixedBasepoint` records onto the comb path, bypassing
+    // RistrettoChip — using a fixed-base record here would leave
+    // ristretto_field_rows empty and trivialize this harness.
+    let two_g = curve25519_dalek::ristretto::RistrettoPoint::mul_base(
+        &curve25519_dalek::scalar::Scalar::from(2u8),
+    );
+    let point_bytes: [u8; 32] = two_g.compress().to_bytes();
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -263,10 +271,11 @@ fn harness_ristretto_isolated() {
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
-    // Confirm the ECALL detector classified the basepoint correctly —
-    // the Session 2.1 plumbing under test.
+    // Confirm the ECALL detector classified the non-basepoint correctly —
+    // step 8's routing sends FixedBasepoint records onto the comb path,
+    // so this harness uses Variable to keep exercising RistrettoChip.
     use zkpvm::core::tracing::ScalarMultKind;
-    assert_eq!(tracing.ristretto_records[0].kind, ScalarMultKind::FixedBasepoint);
+    assert_eq!(tracing.ristretto_records[0].kind, ScalarMultKind::Variable);
 
     let ristretto_records = std::mem::take(&mut tracing.ristretto_records);
     let ristretto_mem_ops = std::mem::take(&mut tracing.ristretto_mem_ops);
