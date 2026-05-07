@@ -37,6 +37,8 @@ pub mod field;
 pub mod witness;
 #[cfg(feature = "prover")]
 pub mod point;
+#[cfg(feature = "prover")]
+pub mod comb_table;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
