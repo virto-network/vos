@@ -485,6 +485,29 @@ fn harness_ristretto_comb_balance() {
     .expect("comb-balance harness: verify failed — relation didn't close end-to-end");
 }
 
+/// Debug: ConsumerChip-isolated with EMPTY side_note (no calls).
+/// All cells zero, all gates zero, no real emissions.  Should prove +
+/// verify cleanly (open-chain trivially balanced at zero).  If this
+/// panics the bug is structural; if it passes the bug is data-dependent.
+#[test]
+fn harness_ristretto_consumer_isolated_empty() {
+    use zkpvm::chips::RistrettoFixedBaseConsumerChip;
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] =
+        &[&RistrettoFixedBaseConsumerChip];
+
+    let _proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("consumer-empty harness: prove failed");
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`

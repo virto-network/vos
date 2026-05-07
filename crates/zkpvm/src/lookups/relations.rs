@@ -247,3 +247,26 @@ stwo_constraint_framework::relation!(
     RistrettoCombLookupElements,
     REL_RISTRETTO_COMB_LOOKUP_SIZE
 );
+
+// Session 2.1 step 5(b): chip-local register-file relation for
+// RistrettoFixedBaseConsumerChip.  Same shape as RistrettoChip's
+// (row_id_lo, row_id_hi, byte_idx, value) but a separate type so the
+// two chips' chip-local row numbering doesn't collide.
+//
+// PRODUCER per real row: 32 tuples (row_id_lo, row_id_hi, byte_idx[k],
+// out[k]) — emitted on input + add/sub/mul rows.
+// CONSUMER A per real row: 32 tuples for `a` keyed on (a_src_lo,
+// a_src_hi, byte_idx[k], a[k]) — emitted on add/sub/mul + output rows.
+// CONSUMER B per real row: 32 tuples for `b` — emitted only on
+// add/sub/mul rows (input/output rows have no `b`).
+//
+// Plus the lookup-anchor row's Y/Z/T cross-row binding emits 3 × 32
+// = 96 consumer tuples on the anchor row keyed on (y_src/z_src/t_src,
+// byte_idx[k], Y[k]/Z[k]/T[k]).  These tie the anchor row's Y/Z/T
+// witness columns to rows +1/+2/+3's `out` columns (those rows being
+// the Y-, Z-, T-coord IsInput producer rows for the same window).
+const REL_RISTRETTO_COMB_CONSUMER_REGFILE_SIZE: usize = 4;
+stwo_constraint_framework::relation!(
+    RistrettoCombConsumerRegisterFileLookupElements,
+    REL_RISTRETTO_COMB_CONSUMER_REGFILE_SIZE
+);
