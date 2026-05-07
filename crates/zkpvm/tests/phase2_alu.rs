@@ -4,7 +4,7 @@ use javm::interpreter::Interpreter;
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, verify};
+use zkpvm::{prove, prove_mobile, verify, verify_with_pcs_policy, PcsPolicy};
 
 /// Helper: build a PVM with a single three-register instruction followed by Trap.
 /// Bytecode: [opcode, ra | (rb<<4), rd, Trap]
@@ -62,6 +62,25 @@ fn test_three_reg_op(opcode: Opcode, r0: u64, r1: u64, expected: u64) {
 #[test]
 fn prove_add64() {
     test_three_reg_op(Opcode::Add64, 100, 200, 300);
+}
+
+/// Smoke test for the MOBILE prover entry point.  Exercises
+/// `prove_mobile()` + `verify_with_pcs_policy(MOBILE)` end-to-end on
+/// the simplest workload (a single Add64) so the public API stays
+/// regression-tested even when no real-actor benchmark is run in CI.
+#[test]
+fn prove_mobile_smoke() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 100;
+    regs[1] = 200;
+    let steps = run_three_reg(Opcode::Add64, 0, 1, 2, regs);
+    let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
+    let proof = prove_mobile(&mut side_note).expect("MOBILE proving failed");
+    verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
+        .expect("MOBILE verification failed");
 }
 
 #[test]
