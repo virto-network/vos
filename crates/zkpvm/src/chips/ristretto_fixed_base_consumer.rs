@@ -1,37 +1,40 @@
-//! Session 2.1 step 5(b) — RistrettoFixedBaseConsumerChip with
-//! running-sum binding.
+//! Session 2.1 step 5(b) + column-shrink — RistrettoFixedBaseConsumerChip.
 //!
 //! Per fixed-basepoint scalar mult call, lays out:
-//!   - 4 IsInput rows per window (1 lookup-anchor + 3 lookup-coord
-//!     rows for X/Y/Z/T of `T[i][k_i]`).
+//!   - 4 IsInput coord rows per window (X/Y/Z/T of `T[i][k_i]`).
 //!   - 18 FieldOp add rows per window for the point-add formula
 //!     `Acc' = Acc + T[i][k_i]` (see `point.rs::point_add_rows_chained`).
 //!
-//! Soundness chain:
-//!   - Comb relation (`RistrettoCombLookupElements`): the lookup-anchor
-//!     row emits +IsLookupAnchor with the 130-limb tuple `(WindowIdx,
-//!     ScalarWindow, X, Y, Z, T)` from its own witness columns.
-//!     Balanced against `RistrettoCombTableChip` (-Multiplicity).
-//!   - Anchor X-coord binding: per-row constraint
-//!     `IsLookupAnchor * (FieldOut - X) = 0` ties the anchor's `out`
-//!     to its X column.
-//!   - Anchor Y/Z/T-coord binding: chip-local register-file relation
-//!     (`RistrettoCombConsumerRegisterFileLookupElements`).  The anchor
-//!     row emits 96 *consumer* tuples (32 per coord) keyed on rows
-//!     `+1`/`+2`/`+3` (the lookup-coord rows) with byte_idx + Y/Z/T
-//!     value.  Those rows emit *producer* tuples for their `out`.
-//!     Balance forces `Y == out_at_+1`, `Z == out_at_+2`, `T == out_at_+3`.
-//!   - FieldOp algebra (shared helper at `chips::ristretto::field_op_constraints`):
-//!     pins each add/sub/mul row's algebra mod p25519.
-//!   - Source-row threading: the 18 add rows reference rows `+0`/`+1`/
-//!     `+2`/`+3` (this window's lookup rows) as `q.{x,y,z,t}` source
-//!     rows, and the previous window's final 4 add rows (or boundary
-//!     constants for window 0) as `p.{x,y,z,t}` source rows.  The
-//!     chip-local register-file balance forces each add row's `a`/`b`
-//!     inputs to equal the `out` column of the named source row.
+//! The previous "lookup-anchor" row that carried (WindowIdx,
+//! ScalarWindow, X/Y/Z/T) and emitted the 130-limb
+//! `RistrettoCombLookupElements` tuple has been split out into
+//! `RistrettoCombAnchorChip` (sibling chip with 64 rows per call).
+//! That trims ~137 cells from this chip's per-row width and saves
+//! ~1.1 M cells at log_size=13 (8192 rows).
 //!
-//! Step 8 (ECALL boundary binding) and Range256 byte-range emissions
-//! are deferred to a follow-up — see PERF_ROADMAP.md.
+//! Soundness chain:
+//!   - `RistrettoCombAnchorChip` emits the 130-limb comb relation
+//!     (drained by `RistrettoCombTableChip`) AND emits 128 +1
+//!     contributions per anchor row to
+//!     `RistrettoCombCoordBoundaryLookupElements` keyed on
+//!     `(call_idx, window_idx, coord_kind, byte_idx, value)`.
+//!   - This chip's IsInput coord rows (4 per window, with
+//!     `IsCoordInput=1`) emit 32 −1 contributions each to the same
+//!     coord-boundary relation, with the row's own `out` column
+//!     supplying the byte values and per-row witness columns
+//!     `(CallIdx, WindowIdx, CoordKind)` keying them.  Balance
+//!     forces each IsInput coord row's `out` to equal the matching
+//!     coord byte from the anchor chip.
+//!   - FieldOp algebra (shared helper) pins each add/sub/mul row's
+//!     algebra mod p25519.
+//!   - Source-row threading: the 18 add rows for window `i`
+//!     reference rows offsets `+0..+3` (this window's IsInput coord
+//!     rows) as `q.{x,y,z,t}` source rows, and the previous window's
+//!     final 4 add rows (or boundary constants for window 0) as
+//!     `p.{x,y,z,t}` source rows.  Chip-local register-file
+//!     (`RistrettoCombConsumerRegisterFileLookupElements`) balance
+//!     forces each add row's `a`/`b` to equal the named source
+//!     row's `out`.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -44,7 +47,6 @@ use stwo::{
         poly::{circle::CircleEvaluation, BitReversedOrder},
     },
 };
-use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -59,7 +61,8 @@ use crate::chips::ristretto::field_op_constraints;
 use crate::{
     framework::BuiltInComponent,
     lookups::{
-        RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombLookupElements,
+        RistrettoCombConsumerRegisterFileLookupElements,
+        RistrettoCombCoordBoundaryLookupElements,
     },
 };
 #[cfg(feature = "prover")]
@@ -71,7 +74,7 @@ use crate::side_note::SideNote;
 
 pub struct RistrettoFixedBaseConsumerChip;
 
-/// Number of rows per window: 4 IsInput rows (anchor + Y/Z/T coords) +
+/// Number of rows per window: 4 IsInput coord rows (X, Y, Z, T) +
 /// 18 FieldOp add rows from `point_add_rows_chained`.
 pub const ROWS_PER_WINDOW: usize = 4 + 18;
 /// Constant boundary input rows at the start of the chip's trace:
@@ -79,9 +82,8 @@ pub const ROWS_PER_WINDOW: usize = 4 + 18;
 pub const N_BOUNDARY_INPUTS: usize = 3;
 
 /// Per-row column layout.  Mirrors RistrettoChip's FieldOp witness
-/// columns (so the shared `field_op_constraints` helper applies) plus
-/// chip-specific lookup-anchor / source-row / producer-multiplicity
-/// columns.
+/// columns (so the shared `field_op_constraints` helper applies)
+/// plus chip-specific source-row + coord-binding metadata.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
     // ── FieldOp witness columns (mirror RistrettoChip) ──
@@ -171,59 +173,30 @@ pub enum Column {
     #[size = 1]
     BSourceRowHi,
 
-    // ── Lookup-anchor specific witness columns ──
-    /// `1` iff this row is the lookup-anchor row of a window (the row
-    /// that emits +1 to `RistrettoCombLookupElements`).  Constraint
-    /// chain: forces this row's `is_real=1`, `is_input=1`, and ties
-    /// `FieldOut` to `X[k]` per byte (so the comb-relation tuple's X
-    /// equals the chip's chosen `out`).
+    // ── Coord-boundary binding metadata ──
+    /// `1` iff this row is one of the 4 IsInput coord rows in a
+    /// window (offset 0..3 within the window's 22-row chunk).  Gates
+    /// the coord-boundary consumer emission.
     #[size = 1]
-    IsLookupAnchor,
-    /// Window index `i ∈ 0..64`.  Zero on non-anchor rows.
+    IsCoordInput,
+    /// Index of the scalar-mult call in `ristretto_comb_calls`.
+    /// Set on IsCoordInput rows; zero elsewhere.
+    #[size = 1]
+    CallIdx,
+    /// Window index `i ∈ 0..64`.  Set on IsCoordInput rows.
     #[size = 1]
     WindowIdx,
-    /// Scalar window value `k_i ∈ 0..16`.  Zero on non-anchor rows.
+    /// Coord kind ∈ {0=X, 1=Y, 2=Z, 3=T}.  Set on IsCoordInput rows.
     #[size = 1]
-    ScalarWindow,
-    /// Looked-up `T[i][k_i].x` — 32 LE bytes.  On the anchor row, also
-    /// equals `FieldOut` (per the IsLookupAnchor binding constraint).
-    #[size = 32]
-    X,
-    /// Looked-up `T[i][k_i].y` — 32 LE bytes.  Tied to row `+1`'s
-    /// `FieldOut` via chip-local register-file balance.
-    #[size = 32]
-    Y,
-    #[size = 32]
-    Z,
-    #[size = 32]
-    T,
-    /// Source row IDs for the anchor's Y/Z/T cross-row consumer
-    /// emissions.  Set to anchor_row+1/+2/+3 on anchor rows; zero
-    /// elsewhere.  Lo/Hi byte split (matches register-file row_id
-    /// encoding).
-    #[size = 1]
-    YSrcRowLo,
-    #[size = 1]
-    YSrcRowHi,
-    #[size = 1]
-    ZSrcRowLo,
-    #[size = 1]
-    ZSrcRowHi,
-    #[size = 1]
-    TSrcRowLo,
-    #[size = 1]
-    TSrcRowHi,
+    CoordKind,
 
     // ── Chip-local register-file producer multiplicity ──
-    /// How many downstream FieldOp consumers reference this row's `out`
-    /// (or, for lookup-coord rows, also count the anchor's Y/Z/T
-    /// consumer).  Drives the producer emission's multiplicity scalar.
-    /// Padding / output rows have 0.
+    /// How many downstream FieldOp consumers reference this row's
+    /// `out` (counts a/b refs across the trace).  Padding / output
+    /// rows have 0.
     #[size = 1]
     ProducerMultiplicity,
     /// `producer_gate_h * producer_multiplicity` deg-flatten helper.
-    /// Used as the producer emission's multiplicity coefficient so the
-    /// gated relation entry stays at deg ≤ 2.
     #[size = 1]
     ProducerEmissionMult,
 }
@@ -237,29 +210,20 @@ pub enum PreprocessedColumn {
     /// Chip-local row index (high byte).
     #[size = 1]
     RowIndexHi,
-    /// `ByteIdx[k] = k` for k=0..32.  Used as the `byte_idx` element
-    /// of register-file lookup tuples.
+    /// `ByteIdx[k] = k` for k=0..32.
     #[size = 32]
     ByteIdx,
 }
 
-/// Per-row witness for the consumer chip.  Composes a `FieldOpRow`
-/// (FieldOp algebra witness) with chip-specific lookup-anchor /
-/// source-row metadata.  Trace fill writes one of these per chip row.
+/// Per-row witness for the consumer chip.
 #[cfg(feature = "prover")]
 #[derive(Clone, Copy, Debug)]
 struct ConsumerRow {
     field: crate::chips::ristretto::witness::FieldOpRow,
-    is_lookup_anchor: u8,
+    is_coord_input: u8,
+    call_idx: u8,
     window_idx: u8,
-    scalar_window: u8,
-    x: [u8; 32],
-    y: [u8; 32],
-    z: [u8; 32],
-    t: [u8; 32],
-    y_src_row: u16,
-    z_src_row: u16,
-    t_src_row: u16,
+    coord_kind: u8,
 }
 
 #[cfg(feature = "prover")]
@@ -267,28 +231,15 @@ impl Default for ConsumerRow {
     fn default() -> Self {
         Self {
             field: crate::chips::ristretto::witness::FieldOpRow::default(),
-            is_lookup_anchor: 0,
+            is_coord_input: 0,
+            call_idx: 0,
             window_idx: 0,
-            scalar_window: 0,
-            x: [0u8; 32],
-            y: [0u8; 32],
-            z: [0u8; 32],
-            t: [0u8; 32],
-            y_src_row: 0,
-            z_src_row: 0,
-            t_src_row: 0,
+            coord_kind: 0,
         }
     }
 }
 
-/// Compute the consumer chip's row stream for the given side_note.
-/// Lays out 3 boundary input rows (zero, one, ED25519_TWO_D) followed
-/// by per-call `64 × ROWS_PER_WINDOW` rows.  Source-row threading
-/// follows `point_add_rows_chained` semantics.
-///
-/// After laying out all rows, walks the stream to count downstream
-/// consumer references and sets `producer_multiplicity` on each
-/// producer row accordingly.
+/// Build the per-row witness stream from the side_note.
 #[cfg(feature = "prover")]
 fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
     use crate::chips::ristretto::comb_table::{
@@ -302,7 +253,6 @@ fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
 
     let mut rows: Vec<ConsumerRow> = Vec::new();
 
-    // Boundary input rows (constants).
     let zero_row_id: u16 = 0;
     let one_row_id: u16 = 1;
     let two_d_row_id: u16 = 2;
@@ -316,8 +266,7 @@ fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
 
     let table = CombTable::from_base(&ed25519_basepoint_extended());
 
-    for call in &side_note.ristretto_comb_calls {
-        // Acc starts at identity = (0, 1, 1, 0).
+    for (call_idx, call) in side_note.ristretto_comb_calls.iter().enumerate() {
         let mut acc = point_identity();
         let mut acc_sources = ExtendedPointSources {
             x_source: zero_row_id,
@@ -332,35 +281,31 @@ fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
             let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
             let entry: ExtendedPoint = table.rows[w][k_i];
 
-            let anchor_row_id = rows.len() as u16;
-            let y_row_id = anchor_row_id + 1;
-            let z_row_id = anchor_row_id + 2;
-            let t_row_id = anchor_row_id + 3;
-            let add_chain_start = anchor_row_id + 4;
+            let x_row_id = rows.len() as u16;
+            let y_row_id = x_row_id + 1;
+            let z_row_id = x_row_id + 2;
+            let t_row_id = x_row_id + 3;
+            let add_chain_start = x_row_id + 4;
 
-            // Anchor row: IsInput, IsLookupAnchor; out = entry.x.
-            let mut anchor = ConsumerRow::default();
-            anchor.field = fill_input(entry.x);
-            anchor.is_lookup_anchor = 1;
-            anchor.window_idx = w as u8;
-            anchor.scalar_window = k_i as u8;
-            anchor.x = entry.x;
-            anchor.y = entry.y;
-            anchor.z = entry.z;
-            anchor.t = entry.t;
-            anchor.y_src_row = y_row_id;
-            anchor.z_src_row = z_row_id;
-            anchor.t_src_row = t_row_id;
-            rows.push(anchor);
+            // 4 IsInput coord rows: X (offset 0), Y, Z, T.
+            for (kind, coord_bytes) in [
+                (0u8, entry.x),
+                (1u8, entry.y),
+                (2u8, entry.z),
+                (3u8, entry.t),
+            ] {
+                let mut cr = ConsumerRow::default();
+                cr.field = fill_input(coord_bytes);
+                cr.is_coord_input = 1;
+                cr.call_idx = call_idx as u8;
+                cr.window_idx = w as u8;
+                cr.coord_kind = kind;
+                rows.push(cr);
+            }
 
-            // Y/Z/T lookup-coord rows (plain IsInput).
-            rows.push(boundary_input(fill_input(entry.y)));
-            rows.push(boundary_input(fill_input(entry.z)));
-            rows.push(boundary_input(fill_input(entry.t)));
-
-            // 18 FieldOp add rows for point_add(acc, entry).
+            // 18 FieldOp add rows for `acc' = acc + entry`.
             let q_sources = ExtendedPointSources {
-                x_source: anchor_row_id,
+                x_source: x_row_id,
                 y_source: y_row_id,
                 z_source: z_row_id,
                 t_source: t_row_id,
@@ -381,8 +326,6 @@ fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
             acc = new_acc;
             acc_sources = new_acc_sources;
         }
-        // `acc` now holds `k · G` in extended Edwards coords; binding
-        // it to the ECALL output is step 8 (deferred).
         let _ = acc;
         let _ = acc_sources;
     }
@@ -399,9 +342,7 @@ fn boundary_input(field: crate::chips::ristretto::witness::FieldOpRow) -> Consum
 }
 
 /// Walk the row stream and count downstream consumer references onto
-/// each producer row's `producer_multiplicity`.  Mirrors
-/// `SideNote::finalize_ristretto_multiplicities` plus the
-/// lookup-anchor's Y/Z/T cross-row consumer accounting.
+/// each producer row's `producer_multiplicity`.
 #[cfg(feature = "prover")]
 fn finalize_producer_multiplicities(rows: &mut [ConsumerRow]) {
     let n = rows.len();
@@ -424,7 +365,6 @@ fn finalize_producer_multiplicities(rows: &mut [ConsumerRow]) {
                     .expect("producer_multiplicity overflowed u16");
             }
         }
-        // Op rows additionally consume `b`.
         if row.field.is_input == 0 && row.field.is_output == 0 {
             let b_src = row.field.b_source_row as usize;
             if b_src < n {
@@ -435,25 +375,9 @@ fn finalize_producer_multiplicities(rows: &mut [ConsumerRow]) {
                     .expect("producer_multiplicity overflowed u16");
             }
         }
-        // Lookup-anchor rows additionally emit 3 cross-row consumer
-        // tuples (one per Y/Z/T coord) referencing rows +1/+2/+3.
-        if row.is_lookup_anchor != 0 {
-            for src in [row.y_src_row, row.z_src_row, row.t_src_row] {
-                let s = src as usize;
-                if s < n {
-                    rows[s].field.producer_multiplicity = rows[s]
-                        .field
-                        .producer_multiplicity
-                        .checked_add(1)
-                        .expect("producer_multiplicity overflowed u16");
-                }
-            }
-        }
     }
 }
 
-/// log_size for the chip's trace given the row count.  Pads up to the
-/// next power of two with a floor at LOG_N_LANES.
 #[cfg(feature = "prover")]
 fn log_size_for(n_rows: usize) -> u32 {
     if n_rows <= 1 {
@@ -468,7 +392,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = (
-        RistrettoCombLookupElements,
+        RistrettoCombCoordBoundaryLookupElements,
         RistrettoCombConsumerRegisterFileLookupElements,
     );
 
@@ -477,13 +401,13 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookup_elements: &(
-            RistrettoCombLookupElements,
+            RistrettoCombCoordBoundaryLookupElements,
             RistrettoCombConsumerRegisterFileLookupElements,
         ),
     ) {
-        let (comb_lookup, regfile_lookup) = lookup_elements;
+        let (coord_lookup, regfile_lookup) = lookup_elements;
 
-        // ── Column reads ──
+        // Column reads.
         let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
         let out = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
@@ -527,19 +451,10 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
         let b_src_lo = crate::trace::trace_eval!(trace_eval, Column::BSourceRowLo);
         let b_src_hi = crate::trace::trace_eval!(trace_eval, Column::BSourceRowHi);
 
-        let is_lookup_anchor = crate::trace::trace_eval!(trace_eval, Column::IsLookupAnchor);
+        let is_coord_input = crate::trace::trace_eval!(trace_eval, Column::IsCoordInput);
+        let call_idx = crate::trace::trace_eval!(trace_eval, Column::CallIdx);
         let window_idx = crate::trace::trace_eval!(trace_eval, Column::WindowIdx);
-        let scalar_window = crate::trace::trace_eval!(trace_eval, Column::ScalarWindow);
-        let x_col = crate::trace::trace_eval!(trace_eval, Column::X);
-        let y_col = crate::trace::trace_eval!(trace_eval, Column::Y);
-        let z_col = crate::trace::trace_eval!(trace_eval, Column::Z);
-        let t_col = crate::trace::trace_eval!(trace_eval, Column::T);
-        let y_src_lo = crate::trace::trace_eval!(trace_eval, Column::YSrcRowLo);
-        let y_src_hi = crate::trace::trace_eval!(trace_eval, Column::YSrcRowHi);
-        let z_src_lo = crate::trace::trace_eval!(trace_eval, Column::ZSrcRowLo);
-        let z_src_hi = crate::trace::trace_eval!(trace_eval, Column::ZSrcRowHi);
-        let t_src_lo = crate::trace::trace_eval!(trace_eval, Column::TSrcRowLo);
-        let t_src_hi = crate::trace::trace_eval!(trace_eval, Column::TSrcRowHi);
+        let coord_kind = crate::trace::trace_eval!(trace_eval, Column::CoordKind);
 
         let producer_mult = crate::trace::trace_eval!(trace_eval, Column::ProducerMultiplicity);
         let producer_emission_mult =
@@ -552,7 +467,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
         let byte_idx_pp =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
 
-        // ── R1c-3..R1c-5-b: shared FieldOp algebra ──
+        // Shared FieldOp algebra.
         field_op_constraints::add_field_op_constraints(
             eval,
             &field_op_constraints::FieldOpRefs {
@@ -596,49 +511,44 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
             },
         );
 
-        // ── IsLookupAnchor flag rules ──
+        // ── IsCoordInput flag rules ──
         // Boolean.
         eval.add_constraint(
-            is_lookup_anchor[0].clone() * (E::F::one() - is_lookup_anchor[0].clone()),
+            is_coord_input[0].clone() * (E::F::from(BaseField::from(1u32)) - is_coord_input[0].clone()),
         );
-        // Anchor rows must be real-input rows.
+        // IsCoordInput rows must be IsReal + IsInput.
         eval.add_constraint(
-            is_lookup_anchor[0].clone() * (E::F::one() - is_real[0].clone()),
+            is_coord_input[0].clone() * (E::F::from(BaseField::from(1u32)) - is_real[0].clone()),
         );
         eval.add_constraint(
-            is_lookup_anchor[0].clone() * (E::F::one() - is_input[0].clone()),
+            is_coord_input[0].clone() * (E::F::from(BaseField::from(1u32)) - is_input[0].clone()),
         );
-        // Anchor's `out` = X[k] per byte.
-        for k in 0..32 {
-            eval.add_constraint(
-                is_lookup_anchor[0].clone() * (out[k].clone() - x_col[k].clone()),
-            );
-        }
 
-        // ── Comb relation emission (gated by IsLookupAnchor) ──
-        let mut tuple: Vec<E::F> = Vec::with_capacity(1 + 1 + 32 * 4);
-        tuple.push(window_idx[0].clone());
-        tuple.push(scalar_window[0].clone());
-        tuple.extend(x_col.iter().cloned());
-        tuple.extend(y_col.iter().cloned());
-        tuple.extend(z_col.iter().cloned());
-        tuple.extend(t_col.iter().cloned());
-        eval.add_to_relation(RelationEntry::new(
-            comb_lookup,
-            is_lookup_anchor[0].clone().into(),
-            &tuple,
-        ));
-
-        // ── ProducerEmissionMult deg-flatten helper ──
-        // emission_mult = producer_gate_h * producer_multiplicity (deg 2).
+        // ProducerEmissionMult deg-flatten helper.
         eval.add_constraint(
             producer_emission_mult[0].clone()
                 - producer_gate_h[0].clone() * producer_mult[0].clone(),
         );
 
+        // ── Coord-boundary consumer emissions (gated by IsCoordInput) ──
+        // Per IsCoordInput row, 32 −1 contributions, one per byte.
+        for k in 0..32 {
+            eval.add_to_relation(RelationEntry::new(
+                coord_lookup,
+                (-is_coord_input[0].clone()).into(),
+                &[
+                    call_idx[0].clone(),
+                    window_idx[0].clone(),
+                    coord_kind[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+        }
+
         // ── Chip-local register-file producer + consumer A/B ──
         for k in 0..32 {
-            // Producer: emission_mult @ (row_id_lo, row_id_hi, byte_idx[k], out[k]).
+            // Producer.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
                 producer_emission_mult[0].clone().into(),
@@ -649,7 +559,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
                     out[k].clone(),
                 ],
             ));
-            // Consumer A: -consumer_a_gate_h @ (a_src, byte_idx, a[k]).
+            // Consumer A.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
                 (-consumer_a_gate_h[0].clone()).into(),
@@ -660,7 +570,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
                     a[k].clone(),
                 ],
             ));
-            // Consumer B: -consumer_b_gate_h @ (b_src, byte_idx, b[k]).
+            // Consumer B.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
                 (-consumer_b_gate_h[0].clone()).into(),
@@ -669,43 +579,6 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
                     b_src_hi[0].clone(),
                     byte_idx_pp[k].clone(),
                     b[k].clone(),
-                ],
-            ));
-        }
-
-        // ── Chip-local register-file: anchor's Y/Z/T cross-row consumers ──
-        for k in 0..32 {
-            // Y consumer.
-            eval.add_to_relation(RelationEntry::new(
-                regfile_lookup,
-                (-is_lookup_anchor[0].clone()).into(),
-                &[
-                    y_src_lo[0].clone(),
-                    y_src_hi[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    y_col[k].clone(),
-                ],
-            ));
-            // Z consumer.
-            eval.add_to_relation(RelationEntry::new(
-                regfile_lookup,
-                (-is_lookup_anchor[0].clone()).into(),
-                &[
-                    z_src_lo[0].clone(),
-                    z_src_hi[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    z_col[k].clone(),
-                ],
-            ));
-            // T consumer.
-            eval.add_to_relation(RelationEntry::new(
-                regfile_lookup,
-                (-is_lookup_anchor[0].clone()).into(),
-                &[
-                    t_src_lo[0].clone(),
-                    t_src_hi[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    t_col[k].clone(),
                 ],
             ));
         }
@@ -761,38 +634,19 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
         let log_size = component_trace.log_size();
         let mut logup = LogupTraceBuilder::new(log_size);
 
-        let comb: &RistrettoCombLookupElements = lookup_elements.as_ref();
+        let coord: &RistrettoCombCoordBoundaryLookupElements = lookup_elements.as_ref();
         let regfile: &RistrettoCombConsumerRegisterFileLookupElements =
             lookup_elements.as_ref();
 
-        // Comb-relation column reads.
-        let is_lookup_anchor =
-            crate::trace::original_base_column!(component_trace, Column::IsLookupAnchor);
+        let is_coord_input =
+            crate::trace::original_base_column!(component_trace, Column::IsCoordInput);
+        let call_idx =
+            crate::trace::original_base_column!(component_trace, Column::CallIdx);
         let window_idx =
             crate::trace::original_base_column!(component_trace, Column::WindowIdx);
-        let scalar_window =
-            crate::trace::original_base_column!(component_trace, Column::ScalarWindow);
-        let x_col = crate::trace::original_base_column!(component_trace, Column::X);
-        let y_col = crate::trace::original_base_column!(component_trace, Column::Y);
-        let z_col = crate::trace::original_base_column!(component_trace, Column::Z);
-        let t_col = crate::trace::original_base_column!(component_trace, Column::T);
+        let coord_kind =
+            crate::trace::original_base_column!(component_trace, Column::CoordKind);
 
-        let mut tuple: Vec<_> = Vec::with_capacity(1 + 1 + 32 * 4);
-        tuple.push(window_idx[0].clone());
-        tuple.push(scalar_window[0].clone());
-        tuple.extend(x_col.iter().cloned());
-        tuple.extend(y_col.iter().cloned());
-        tuple.extend(z_col.iter().cloned());
-        tuple.extend(t_col.iter().cloned());
-
-        logup.add_to_relation_with(
-            comb,
-            [is_lookup_anchor[0].clone()],
-            |[a]| a.into(),
-            &tuple,
-        );
-
-        // Chip-local register-file column reads.
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::RowIndexLo
@@ -828,21 +682,25 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
             crate::trace::original_base_column!(component_trace, Column::BSourceRowLo);
         let b_src_hi_col =
             crate::trace::original_base_column!(component_trace, Column::BSourceRowHi);
-        let y_src_lo_col =
-            crate::trace::original_base_column!(component_trace, Column::YSrcRowLo);
-        let y_src_hi_col =
-            crate::trace::original_base_column!(component_trace, Column::YSrcRowHi);
-        let z_src_lo_col =
-            crate::trace::original_base_column!(component_trace, Column::ZSrcRowLo);
-        let z_src_hi_col =
-            crate::trace::original_base_column!(component_trace, Column::ZSrcRowHi);
-        let t_src_lo_col =
-            crate::trace::original_base_column!(component_trace, Column::TSrcRowLo);
-        let t_src_hi_col =
-            crate::trace::original_base_column!(component_trace, Column::TSrcRowHi);
 
+        // Coord-boundary consumer emissions.
         for k in 0..32 {
-            // Producer.
+            logup.add_to_relation_with(
+                coord,
+                [is_coord_input[0].clone()],
+                |[g]| (-g).into(),
+                &[
+                    call_idx[0].clone(),
+                    window_idx[0].clone(),
+                    coord_kind[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
+                ],
+            );
+        }
+
+        // Chip-local register-file emissions.
+        for k in 0..32 {
             logup.add_to_relation_with(
                 regfile,
                 [producer_emission_mult[0].clone()],
@@ -854,7 +712,6 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
                     out_cols[k].clone(),
                 ],
             );
-            // Consumer A.
             logup.add_to_relation_with(
                 regfile,
                 [consumer_a_gate_h[0].clone()],
@@ -866,7 +723,6 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
                     a_cols[k].clone(),
                 ],
             );
-            // Consumer B.
             logup.add_to_relation_with(
                 regfile,
                 [consumer_b_gate_h[0].clone()],
@@ -876,43 +732,6 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
                     b_src_hi_col[0].clone(),
                     byte_idx_pp[k].clone(),
                     b_cols[k].clone(),
-                ],
-            );
-        }
-
-        // Anchor Y/Z/T cross-row consumers.
-        for k in 0..32 {
-            logup.add_to_relation_with(
-                regfile,
-                [is_lookup_anchor[0].clone()],
-                |[g]| (-g).into(),
-                &[
-                    y_src_lo_col[0].clone(),
-                    y_src_hi_col[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    y_col[k].clone(),
-                ],
-            );
-            logup.add_to_relation_with(
-                regfile,
-                [is_lookup_anchor[0].clone()],
-                |[g]| (-g).into(),
-                &[
-                    z_src_lo_col[0].clone(),
-                    z_src_hi_col[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    z_col[k].clone(),
-                ],
-            );
-            logup.add_to_relation_with(
-                regfile,
-                [is_lookup_anchor[0].clone()],
-                |[g]| (-g).into(),
-                &[
-                    t_src_lo_col[0].clone(),
-                    t_src_hi_col[0].clone(),
-                    byte_idx_pp[k].clone(),
-                    t_col[k].clone(),
                 ],
             );
         }
@@ -934,7 +753,7 @@ fn fill_consumer_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Consum
     use crate::chips::ristretto::witness::FieldOpRow;
     let r: FieldOpRow = cr.field;
 
-    // FieldOp witness columns (mirror RistrettoChip's trace fill).
+    // FieldOp witness columns.
     trace.fill_columns_bytes(row_i, &r.a, Column::FieldA);
     trace.fill_columns_bytes(row_i, &r.b, Column::FieldB);
     trace.fill_columns_bytes(row_i, &r.out, Column::FieldOut);
@@ -980,7 +799,7 @@ fn fill_consumer_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Consum
         Column::BSourceRowHi,
     );
 
-    // Phase I-ristretto deg-flatten helpers (mirror RistrettoChip).
+    // Phase I-ristretto deg-flatten helpers.
     let real_b = r.is_real != 0;
     let add_b = r.is_add != 0;
     let sub_b = r.is_sub != 0;
@@ -1008,20 +827,11 @@ fn fill_consumer_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Consum
     }
     trace.fill_columns_base_field(row_i, &psum, Column::MulPartialSum);
 
-    // Lookup-anchor specific columns.
-    trace.fill_columns(row_i, cr.is_lookup_anchor, Column::IsLookupAnchor);
+    // Coord-boundary metadata.
+    trace.fill_columns(row_i, cr.is_coord_input, Column::IsCoordInput);
+    trace.fill_columns(row_i, cr.call_idx, Column::CallIdx);
     trace.fill_columns(row_i, cr.window_idx, Column::WindowIdx);
-    trace.fill_columns(row_i, cr.scalar_window, Column::ScalarWindow);
-    trace.fill_columns_bytes(row_i, &cr.x, Column::X);
-    trace.fill_columns_bytes(row_i, &cr.y, Column::Y);
-    trace.fill_columns_bytes(row_i, &cr.z, Column::Z);
-    trace.fill_columns_bytes(row_i, &cr.t, Column::T);
-    trace.fill_columns(row_i, (cr.y_src_row & 0xff) as u8, Column::YSrcRowLo);
-    trace.fill_columns(row_i, ((cr.y_src_row >> 8) & 0xff) as u8, Column::YSrcRowHi);
-    trace.fill_columns(row_i, (cr.z_src_row & 0xff) as u8, Column::ZSrcRowLo);
-    trace.fill_columns(row_i, ((cr.z_src_row >> 8) & 0xff) as u8, Column::ZSrcRowHi);
-    trace.fill_columns(row_i, (cr.t_src_row & 0xff) as u8, Column::TSrcRowLo);
-    trace.fill_columns(row_i, ((cr.t_src_row >> 8) & 0xff) as u8, Column::TSrcRowHi);
+    trace.fill_columns(row_i, cr.coord_kind, Column::CoordKind);
 
     // Producer multiplicity + emission helper.
     let pm: u32 = r.producer_multiplicity as u32;

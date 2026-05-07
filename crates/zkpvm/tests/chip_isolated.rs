@@ -452,7 +452,9 @@ fn harness_ristretto_comb_table_unbalanced_rejected() {
 ///   output point.
 #[test]
 fn harness_ristretto_comb_balance() {
-    use zkpvm::chips::{RistrettoCombTableChip, RistrettoFixedBaseConsumerChip};
+    use zkpvm::chips::{
+        RistrettoCombAnchorChip, RistrettoCombTableChip, RistrettoFixedBaseConsumerChip,
+    };
     use zkpvm::side_note::RistrettoCombCall;
 
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
@@ -472,8 +474,11 @@ fn harness_ristretto_comb_balance() {
         lifting_log_size: None,
     };
 
-    let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombTableChip, &RistrettoFixedBaseConsumerChip];
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoFixedBaseConsumerChip,
+    ];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect("comb-balance harness: prove failed — relation or constraint regression");

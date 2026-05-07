@@ -248,6 +248,29 @@ stwo_constraint_framework::relation!(
     REL_RISTRETTO_COMB_LOOKUP_SIZE
 );
 
+// Session 2.1 column-shrink: anchor-chip↔consumer-chip coord binding.
+//
+// Tuple: (call_idx, window_idx, coord_kind ∈ {0=X,1=Y,2=Z,3=T},
+//         byte_idx, value).  5 limbs.
+//
+// Producer side (`RistrettoCombAnchorChip`): per anchor row, emits
+// 4 × 32 = 128 +1 contributions — one per (coord, byte).
+// Consumer side (`RistrettoFixedBaseConsumerChip`): per IsInput
+// coord row (4 per window), emits 32 −1 contributions matching the
+// row's specific (call, window, coord) at every byte offset.
+//
+// Forces consumer chip's IsInput coord rows' `out` columns to
+// equal the anchor chip's per-coord byte values.  Replaces the
+// previous chip-local trick where the consumer chip carried
+// X/Y/Z/T columns on a "lookup-anchor" row; splitting the anchor
+// metadata into a sibling chip drops ~137 columns from the
+// consumer chip's per-row width.
+const REL_RISTRETTO_COMB_COORD_BOUNDARY_SIZE: usize = 5;
+stwo_constraint_framework::relation!(
+    RistrettoCombCoordBoundaryLookupElements,
+    REL_RISTRETTO_COMB_COORD_BOUNDARY_SIZE
+);
+
 // Session 2.1 step 5(b): chip-local register-file relation for
 // RistrettoFixedBaseConsumerChip.  Same shape as RistrettoChip's
 // (row_id_lo, row_id_hi, byte_idx, value) but a separate type so the
