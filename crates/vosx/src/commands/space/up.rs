@@ -7,6 +7,7 @@
 //! `run_forever` (or `run` for `--once`).
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
@@ -59,12 +60,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    let mut node = VosNode::new();
+    // Attach a libp2p network when the entry declares listen
+    // addrs or bootnodes. Pure-local spaces (created via `space
+    // new` with no `--listen`) keep network attachment off and
+    // run as single-node.
+    let network = build_network_if_needed(&entry, &data_dir)?;
+
+    let mut node = match &network {
+        Some(net) => VosNode::with_prefix(net.local_prefix()),
+        None => VosNode::new(),
+    };
     let cfg = AgentConfig::new(blob)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
+
+    if let Some(net) = network {
+        node.attach_network(net);
+    }
 
     eprintln!(
         "vosx: space '{}' (id={}…) registry as {id}",
@@ -92,6 +106,53 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("{panics} pvm panics");
     }
     Ok(())
+}
+
+/// Build a libp2p network from the entry's listen + bootnodes
+/// fields when at least one is non-empty. Loads the per-space
+/// keypair from `data_dir/node.key`. Returns `None` for
+/// pure-local spaces.
+fn build_network_if_needed(
+    entry: &spaces_index::SpaceEntry,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<vos::network::Network>> {
+    if entry.listen.is_empty() && entry.bootnodes.is_empty() {
+        return Ok(None);
+    }
+    let parse = |s: &str, kind: &str| -> anyhow::Result<libp2p::Multiaddr> {
+        libp2p::Multiaddr::from_str(s)
+            .map_err(|e| anyhow::anyhow!("bad {kind} multiaddr '{s}': {e}"))
+    };
+    let listen: Vec<libp2p::Multiaddr> = entry
+        .listen
+        .iter()
+        .map(|s| parse(s, "listen"))
+        .collect::<anyhow::Result<_>>()?;
+    let bootstrap: Vec<libp2p::Multiaddr> = entry
+        .bootnodes
+        .iter()
+        .map(|s| parse(s, "bootnode"))
+        .collect::<anyhow::Result<_>>()?;
+
+    let key_path = data_dir.join("node.key");
+    let key_bytes = std::fs::read(&key_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", key_path.display()))?;
+    let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("decode keypair: {e}"))?;
+    let peer_id = libp2p::PeerId::from(keypair.public());
+    let local_prefix = vos::network::derive_node_prefix(&peer_id);
+    eprintln!(
+        "vosx: node identity {peer_id} (prefix {local_prefix:#06x})",
+    );
+
+    Ok(Some(vos::network::Network::start(
+        vos::network::NetworkConfig {
+            keypair,
+            local_prefix,
+            listen,
+            bootstrap,
+        },
+    )))
 }
 
 /// Per-space registry replication-id: blake2b("vos-space-registry/v1"

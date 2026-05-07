@@ -41,6 +41,10 @@ pub struct SpaceEntry {
     /// space has been initialized.
     #[serde(default)]
     pub registry_hash: String,
+    /// libp2p multiaddrs to dial on `space up`. Set by
+    /// `space join`; `space new` leaves it empty.
+    #[serde(default)]
+    pub bootnodes: Vec<String>,
 }
 
 impl SpaceEntry {
@@ -156,6 +160,7 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str, listen: Vec<String>) -> SpaceE
         listen,
         data_dir,
         registry_hash: String::new(),
+        bootnodes: Vec::new(),
     }
 }
 
@@ -229,6 +234,7 @@ mod tests {
                 listen: vec!["/ip4/127.0.0.1/tcp/4811".into()],
                 data_dir: "/tmp/data".into(),
                 registry_hash: String::new(),
+                bootnodes: Vec::new(),
             },
         );
         save_to(&idx, &p).unwrap();
@@ -251,6 +257,7 @@ mod tests {
                 listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
+                bootnodes: Vec::new(),
             },
         );
         upsert(
@@ -262,6 +269,7 @@ mod tests {
                 listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
+                bootnodes: Vec::new(),
             },
         );
         assert_eq!(idx.spaces.len(), 1);
@@ -281,6 +289,7 @@ mod tests {
                 listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
+                bootnodes: Vec::new(),
             },
         );
         assert_eq!(find(&idx, &id_a).unwrap().name, "alpha");

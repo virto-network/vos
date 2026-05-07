@@ -13,6 +13,7 @@ pub mod agents;
 pub mod export;
 pub mod info;
 pub mod install;
+pub mod join;
 pub mod list;
 pub mod members;
 pub mod new;
@@ -56,6 +57,27 @@ pub enum SpaceCommand {
         /// space whose `data_dir` matches the current directory
         /// when present, else errors.
         space: Option<String>,
+    },
+    /// Join a remote space — register it locally so
+    /// `space up` can dial the bootnode and start syncing.
+    Join {
+        /// `<space-id>@<bootnode-multiaddr>`. The space-id half
+        /// is 64 hex chars; the bootnode half is whatever
+        /// follows the `@`.
+        bootstrap: String,
+        /// Source for the space-registry actor blob.
+        #[arg(long, value_name = "SOURCE")]
+        registry: String,
+        /// Local short-name for the space. Defaults to a short
+        /// hex prefix of the space_id.
+        #[arg(long)]
+        name: Option<String>,
+        /// libp2p multiaddr to listen on (optional). Repeatable.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// Override the per-space data directory.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<std::path::PathBuf>,
     },
     /// Boot a saved space — load the registry from cache,
     /// register it as `ServiceId::REGISTRY`, run forever.
@@ -160,6 +182,19 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         }),
         SpaceCommand::List | SpaceCommand::Ls => list::run(),
         SpaceCommand::Info { space } => info::run(space.as_deref()),
+        SpaceCommand::Join {
+            bootstrap,
+            registry,
+            name,
+            listen,
+            data_dir,
+        } => join::run(join::Args {
+            bootstrap,
+            registry,
+            name,
+            listen,
+            data_dir,
+        }),
         SpaceCommand::Up { space, once } => up::run(up::Args { query: space, once }),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Publish {
