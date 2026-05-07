@@ -1,5 +1,29 @@
 # zkpvm — performance benchmarks
 
+## Latest — private tap-to-pay sub-second target hit (post B3 audit, no PGO)
+
+`tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
+is the canonical tap-to-pay bench: clerk-private-pay-bench actor
+(Pedersen + Schnorr + commitment + signing payload, ~24 K PVM
+steps).  Median of 5 trials, post Phase-I migration + B3
+helper-column audit, on the reference Intel Core Ultra 7 155H:
+
+| Config   | Prover entry point | Prove   | Proof size | Verify  |
+|---       |---                 |---      |---         |---      |
+| STANDARD | `prove()`          | 1.41 s  | 932 KB     | 45 ms   |
+| MOBILE   | `prove_mobile()`   | **0.71 s** | 1.5 MB  | 28 ms   |
+
+MOBILE comfortably under the 1-second target with margin.  PGO on
+top of MOBILE projects to ~0.58–0.62 s based on the documented
+−18% historical win (re-bench after `scripts/build-pgo.sh`).
+
+Verifier-side, MOBILE proofs require
+`verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)`
+(the default `verify()` enforces STANDARD policy and rejects
+MOBILE proofs).
+
+
+
 A snapshot of where zkpvm sits at branch tip `498733e` (post-
 Phase-54h/i/k + 56-audit), measured single-threaded on a desktop
 CPU.  Numbers are reproducible — see "Reproducing" at the bottom.
