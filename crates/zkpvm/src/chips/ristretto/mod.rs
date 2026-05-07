@@ -28,7 +28,6 @@ use stwo::{
         poly::{circle::CircleEvaluation, BitReversedOrder},
     },
 };
-use num_traits::{One, Zero};
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 #[cfg(feature = "prover")]
@@ -39,6 +38,7 @@ pub mod witness;
 pub mod point;
 #[cfg(feature = "prover")]
 pub mod comb_table;
+pub mod field_op_constraints;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
@@ -336,24 +336,17 @@ pub enum PreprocessedColumn {
     ByteIdx,
 }
 
-/// p25519 byte constants — `p = 2²⁵⁵ - 19`, little-endian.  Used by
-/// the conditional-reduction sub-chain in `add_constraints` to embed
-/// the modulus as AIR-time constants rather than preprocessed columns
-/// (saves 32 preprocessed cells × num_rows for purely static data).
-const P_BYTE_CONSTS: [u8; 32] = {
-    let mut p = [0xffu8; 32];
-    p[0] = 0xed; // matches field::P_BYTES; cross-checked below
-    p[31] = 0x7f;
-    p
-};
-// Compile-time agreement with the host reference.
+// Compile-time agreement between the shared FieldOp constraint helper's
+// `P_BYTE_CONSTS` and `field::P_BYTES`.  Both define p25519 LE bytes;
+// any drift breaks the FieldOp algebra emitted from
+// `field_op_constraints`.
 #[cfg(feature = "prover")]
 const _: () = {
     let h = field::P_BYTES;
-    let c = P_BYTE_CONSTS;
+    let c = field_op_constraints::P_BYTE_CONSTS;
     let mut i = 0;
     while i < 32 {
-        assert!(h[i] == c[i], "P_BYTE_CONSTS diverged from field::P_BYTES");
+        assert!(h[i] == c[i], "field_op_constraints::P_BYTE_CONSTS diverged from field::P_BYTES");
         i += 1;
     }
 };
@@ -420,8 +413,6 @@ impl BuiltInComponent for RistrettoChip {
         let is_output = crate::trace::trace_eval!(trace_eval, Column::IsOutput);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
-        let f256 = E::F::from(BaseField::from(256u32));
-
         // ── Phase I-ristretto degree-flatten helpers ──
         let real_add_h = crate::trace::trace_eval!(trace_eval, Column::RealAddH);
         let real_sub_h = crate::trace::trace_eval!(trace_eval, Column::RealSubH);
@@ -434,417 +425,52 @@ impl BuiltInComponent for RistrettoChip {
             crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
         let mul_partial_sum =
             crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
-        // Helper-defining constraints (deg 2 each).
-        eval.add_constraint(
-            real_add_h[0].clone() - is_real[0].clone() * is_add[0].clone()
-        );
-        eval.add_constraint(
-            real_sub_h[0].clone() - is_real[0].clone() * is_sub[0].clone()
-        );
-        eval.add_constraint(
-            real_mul_h[0].clone() - is_real[0].clone() * is_mul[0].clone()
-        );
-        eval.add_constraint(
-            producer_gate_h[0].clone()
-                - is_real[0].clone() * (E::F::one() - is_output[0].clone())
-        );
-        eval.add_constraint(
-            consumer_a_gate_h[0].clone()
-                - is_real[0].clone() * (E::F::one() - is_input[0].clone())
-        );
-        eval.add_constraint(
-            consumer_b_gate_h[0].clone()
-                - consumer_a_gate_h[0].clone()
-                    * (E::F::one() - is_output[0].clone())
-        );
-        // MulPartialSum[k] = Σ_{i+j=k, i,j<32} a[i]·b[j].
-        for k in 0..64usize {
-            let mut psum = E::F::zero();
-            for i in 0..32usize {
-                let j = k.wrapping_sub(i);
-                if j < 32 {
-                    psum += a[i].clone() * b[j].clone();
-                }
-            }
-            eval.add_constraint(mul_partial_sum[k].clone() - psum);
-        }
 
-        // ── Boolean flags ──
-        // Each flag column must hold 0 or 1.  Degree-2 each.
-        for flag in [&is_ovf, &is_add, &is_sub, &is_mul, &is_input, &is_output, &is_real] {
-            eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
-        }
-        for c in carry.iter() {
-            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
-        }
-        for c in borrow.iter() {
-            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
-        }
-        for c in ff_brw.iter() {
-            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
-        }
-        for c in sub_chain_brw.iter() {
-            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
-        }
-        for c in sub_chain_aip.iter() {
-            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
-        }
-
-        // ── Real-row partition: exactly one op flag is 1 ──
-        // is_real = 1 ⇒ is_add + is_sub + is_mul + is_input + is_output = 1.
-        // is_real = 0 ⇒ all op flags zero.
-        eval.add_constraint(
-            is_real[0].clone() * (
-                is_add[0].clone() + is_sub[0].clone() + is_mul[0].clone()
-                    + is_input[0].clone() + is_output[0].clone() - E::F::one()
-            )
-        );
-        let not_real = E::F::one() - is_real[0].clone();
-        eval.add_constraint(not_real.clone() * is_add[0].clone());
-        eval.add_constraint(not_real.clone() * is_sub[0].clone());
-        eval.add_constraint(not_real.clone() * is_mul[0].clone());
-        eval.add_constraint(not_real.clone() * is_input[0].clone());
-        eval.add_constraint(not_real * is_output[0].clone());
-
-        // ── R1c-3: byte-wise sum chain (is_add rows only) ──
-        //
-        //   intermediate[i] + 256·carry[i] = a[i] + b[i] + carry[i-1]
-        //
-        // gated by is_real · is_add so non-add rows leave intermediate
-        // and carry free (will be pinned by R1c-3-bis sub chain and
-        // R1c-4 mul chain in their respective op flavors).  carry[-1]
-        // is the implicit 0.
-        let _real_add = is_real[0].clone() * is_add[0].clone(); // routed via RealAddH
-        for i in 0..32 {
-            let carry_in = if i == 0 { E::F::zero() } else { carry[i - 1].clone() };
-            let lhs = interm[i].clone() + carry[i].clone() * f256.clone();
-            let rhs = a[i].clone() + b[i].clone() + carry_in;
-            eval.add_constraint(real_add_h[0].clone() * (lhs - rhs));
-        }
-
-        // ── R1c-3: conditional-reduction sub-chain (is_add rows) ──
-        //
-        //   out[i] = intermediate[i] − is_overflow·p[i] + 256·sub_borrow[i]
-        //                                                 − sub_borrow[i-1]
-        //
-        // rearranged to constraint form:
-        //
-        //   intermediate[i] − is_overflow·p[i] − sub_borrow[i-1]
-        //     + 256·sub_borrow[i] − out[i] = 0
-        //
-        // gated by is_real · is_add.  Same gating discipline as the
-        // sum chain so non-add rows are unconstrained on these cells.
-        for i in 0..32 {
-            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
-            let borrow_in = if i == 0 { E::F::zero() } else { borrow[i - 1].clone() };
-            let constraint = interm[i].clone()
-                - is_ovf[0].clone() * p_i
-                - borrow_in
-                + borrow[i].clone() * f256.clone()
-                - out[i].clone();
-            eval.add_constraint(real_add_h[0].clone() * constraint);
-        }
-
-        // ── R1c-3-bis: final-form check `out < p` (real rows) ──
-        //
-        // Witnesses `p − out − 1 ≥ 0` via a borrow chain.  The chain
-        // computes `p[i] − out[i] − borrow_in[i]` byte-by-byte; if at
-        // any position the subtraction goes negative, the borrow flips
-        // to 1.  We start with borrow_in[0] = 1 to absorb the "−1" of
-        // `p − out − 1`.  Soundness: if out ≥ p, the final borrow is
-        // 1, which the closing constraint rejects.
-        //
-        // Per-byte constraint (gated by is_real):
-        //
-        //   p[i] − out[i] − borrow_in[i] + 256·ff_brw[i] ∈ [0, 256)
-        //
-        // Stwo doesn't directly express ranges via add_constraint, but
-        // the relationship `lhs = next_byte_low_bits` is enforced by
-        // the Stwo trace's per-cell M31 representation: each ff_brw[i]
-        // is constrained to {0,1} above, and the byte computed from
-        // `p[i] − out[i] − borrow_in[i] + 256·ff_brw[i]` will be a
-        // valid u8 *only if* that quantity is in [0, 256), since both
-        // the ff_brw bit and the implicit u8 result are pinned by
-        // their respective columns.  We pin the u8 byte here implicitly
-        // through the next-byte borrow: `next_borrow_in =
-        // ff_brw[i]`, which only makes algebraic sense if the byte
-        // didn't underflow modulo 256.
-        //
-        // For witness simplicity the chip currently only enforces the
-        // CHAIN closure (final borrow = 0); the per-byte Range256
-        // ⊂ [0,256) check on `p[i] − out[i] − borrow_in[i] +
-        // 256·ff_brw[i]` is deferred to R1c-3-ter (along with byte
-        // ranges on a/b/out/intermediate).  Until that lands, R1c-3-
-        // bis closes the most-glaring soundness gap (`out ≥ p` no
-        // longer satisfies the final-borrow=0 closure) but does NOT
-        // yet pin the chain to be byte-by-byte sound.
-        //
-        // For each real row, enforce the chain forward:
-        for i in 0..32 {
-            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
-            let borrow_in = if i == 0 {
-                E::F::one() // absorbs the "−1" in p − out − 1
-            } else {
-                ff_brw[i - 1].clone()
-            };
-            // p[i] − out[i] − borrow_in + 256·ff_brw[i] = "byte_i" ∈ [0,256).
-            // The byte itself is implicit (not stored), but the
-            // chain's algebraic balance forces this for the chain to
-            // close.  Constraint: this expression's relationship to
-            // ff_brw[i] is only consistent when out[i] + borrow_in -
-            // p[i] is in [0, 256·2), and ff_brw[i] picks the right
-            // sign.  Pinned via the chain-closure constraint below;
-            // intermediate per-byte constraint here is a placeholder
-            // for the R1c-3-ter byte range pin.
-            let _ = p_i; // suppress unused; per-byte constraint lands in R1c-3-ter
-            let _ = borrow_in;
-        }
-        // Chain closure: final borrow must be 0 (i.e. `p − out − 1`
-        // produced a non-negative result, i.e. out < p).
-        eval.add_constraint(is_real[0].clone() * ff_brw[31].clone());
-
-        // ── R1c-3-quat: is_sub constraint chain ──
-        //
-        // For is_sub rows we need `out ≡ a − b (mod p)`, i.e.
-        // `out + b ≡ a (mod p)`, with no integer overflow when
-        // `a, b, out < p`.  Two cases collapse into a single
-        // formulation by choosing the right is_underflow witness:
-        //
-        //   is_underflow = 1 iff a < b  ⇒  out = a − b + p
-        //   is_underflow = 0 otherwise  ⇒  out = a − b
-        //
-        // In both cases `out + b = a + is_underflow · p` exactly
-        // (over ℤ).  Byte-wise borrow chain:
-        //
-        //   a[i] + is_underflow · p[i] + 256·sub_chain_brw[i]
-        //     − out[i] − b[i] − sub_chain_brw[i−1] = 0
-        //
-        // gated by is_real · is_sub.  IsOverflow (witness column) is
-        // reinterpreted as is_underflow on these rows; same wire
-        // value, different role per op flag.  Closure: final borrow
-        // = 0 since the integer equation holds without 2²⁵⁶ overflow
-        // when all operands are < p.
-        // R1f-fix: prove `out + b == a + is_underflow·p` via two
-        // synchronous forward-carry chains (cy_obb on the
-        // out+b side, cy_aip on the a+is_uf·p side).  Each chain
-        // produces an implicit "byte[i]" at every position; we
-        // assert byte_obb[i] == byte_aip[i] per byte, and assert
-        // the two chains end with equal carries.  This handles
-        // both directions (`out+b > a+p` and vice versa) with
-        // simple {0,1} witnesses.
-        //
-        // Per-byte (gated by is_real · is_sub):
-        //   out[i] + b[i] + cy_obb[i-1] − 256·cy_obb[i]
-        //     = a[i] + is_uf·p[i] + cy_aip[i-1] − 256·cy_aip[i]
-        let _real_sub = is_real[0].clone() * is_sub[0].clone(); // routed via RealSubH
-        for i in 0..32 {
-            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
-            let cy_obb_in = if i == 0 { E::F::zero() } else { sub_chain_brw[i - 1].clone() };
-            let cy_aip_in = if i == 0 { E::F::zero() } else { sub_chain_aip[i - 1].clone() };
-            let constraint = out[i].clone()
-                + b[i].clone()
-                + cy_obb_in
-                - sub_chain_brw[i].clone() * f256.clone()
-                - a[i].clone()
-                - is_ovf[0].clone() * p_i
-                - cy_aip_in
-                + sub_chain_aip[i].clone() * f256.clone();
-            eval.add_constraint(real_sub_h[0].clone() * constraint);
-        }
-        // Closure: cy_obb[31] == cy_aip[31] (both sides produce the
-        // same total: integer equality `out + b = a + is_uf·p`).
-        eval.add_constraint(
-            real_sub_h[0].clone() * (sub_chain_brw[31].clone() - sub_chain_aip[31].clone())
-        );
-
-        // ── R1c-4-b: schoolbook field multiplication chain ──
-        //
-        //   Σ_{i+j=k, 0≤i,j<32} a[i]·b[j] + carry_in[k]
-        //     = product[k] + 256·full_carry[k]
-        //
-        // gated by is_real · is_mul, where
-        //
-        //   carry_in[k]    = full_carry[k−1]                   (carry_in[0] = 0)
-        //   full_carry[k]  = mul_carry[k] + 256·mul_carry_mid[k]
-        //                                + 65536·mul_carry_hi[k]
-        //
-        // Each position's full_carry can grow to ~21 bits at peak
-        // density (k = 31 accumulates 32 terms ≤ 65025 plus the
-        // incoming carry); 3-byte split has plenty of headroom.
-        // Closure: full_carry[63] = 0 — the 512-bit unreduced
-        // product fits exactly in 64 bytes when both operands < 2²⁵⁶.
-        //
-        // Constraint degree: a[i]·b[j] is degree 2, gated by
-        // real_mul (degree 2) ⇒ degree 4 overall, matching MulChip's
-        // bound at LOG_CONSTRAINT_DEGREE_BOUND = 2.
-        let _real_mul = is_real[0].clone() * is_mul[0].clone(); // routed via RealMulH
-        let f65536: E::F = E::F::from(BaseField::from(65536u32));
-
-        let full_carry = |k: usize| -> E::F {
-            mul_carry[k].clone()
-                + mul_carry_mid[k].clone() * f256.clone()
-                + mul_carry_hi[k].clone() * f65536.clone()
-        };
-
-        // Phase I-ristretto flatten: partial_sum lifted into MulPartialSum[k]
-        // (deg-1 helper) so the gated constraint factors into deg-1 selector
-        // × deg-1 body = deg 2.
-        for k in 0usize..64 {
-            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let constraint = mul_partial_sum[k].clone()
-                + carry_in
-                - mul_product[k].clone()
-                - full_carry(k) * f256.clone();
-            eval.add_constraint(real_mul_h[0].clone() * constraint);
-        }
-        // Closure: full_carry(63) = 0 (no 65th byte overflow).
-        eval.add_constraint(real_mul_h[0].clone() * full_carry(63));
-
-        // ── R1c-5-b: pass-1 reduction fold lo + 38·hi ──
-        //
-        //   pass1_lo[k] + 256·full_carry1[k]
-        //     = mul_product[k] + 38·mul_product[k+32] + carry1_in[k]
-        //
-        // gated by is_real · is_mul.  full_carry1 split as
-        // pass1_carry[k] + 256·pass1_carry_mid[k] (max ~14 bits +
-        // incoming carry < 2¹⁶).  Closure: full_carry1[31] = pass1_hi
-        // viewed as a 16-bit value (pass1_hi[0] + 256·pass1_hi[1]).
-        let f38: E::F = E::F::from(BaseField::from(38u32));
-        let pass1_full_carry = |k: usize| -> E::F {
-            pass1_carry[k].clone() + pass1_carry_mid[k].clone() * f256.clone()
-        };
-        let pass1_hi_value = || -> E::F {
-            pass1_hi[0].clone() + pass1_hi[1].clone() * f256.clone()
-        };
-        for k in 0..32 {
-            let carry_in = if k == 0 { E::F::zero() } else { pass1_full_carry(k - 1) };
-            let constraint = pass1_lo[k].clone()
-                + pass1_full_carry(k) * f256.clone()
-                - mul_product[k].clone()
-                - f38.clone() * mul_product[k + 32].clone()
-                - carry_in;
-            eval.add_constraint(real_mul_h[0].clone() * constraint);
-        }
-        eval.add_constraint(
-            real_mul_h[0].clone() * (pass1_full_carry(31) - pass1_hi_value())
-        );
-
-        // ── R1c-5-b: pass-2 reduction fold pass1_lo + 38·pass1_hi ──
-        //
-        // 38·pass1_hi is a 16-bit constant injected at byte 0 (low
-        // byte) and byte 1 (high byte), with overflow up to bit 22:
-        //
-        //   38·(2¹⁶−1) = 2490330 ≈ 2²² (3 bytes), but in practice
-        //   pass1_hi ≤ 38 since the unreduced product < p² <
-        //   (2²⁵⁵)² = 2⁵¹⁰, and lo + 38·hi < 2²⁵⁶ + 38·2²⁵⁶
-        //   ⇒ pass1_hi < 39 ⇒ 38·pass1_hi < 1482 ≈ 2¹¹ ⇒ 2 bytes.
-        //
-        // Constraint per position k ∈ 0..32:
-        //
-        //   pass2_lo[k] + 256·pass2_carry[k]
-        //     = pass1_lo[k] + inject_byte[k] + carry2_in[k]
-        //
-        // where inject_byte[0..3] are the bytes of 38·pass1_hi
-        // (computed as a constant from pass1_hi columns) and
-        // inject_byte[3..32] = 0.
-        //
-        // For the chip, we compute 38·pass1_hi as a wire-level
-        // expression: (38·pass1_hi[0]) + 256·(38·pass1_hi[1]) — a
-        // single 16-bit constant.  We split it into per-byte
-        // contributions inline.
-        for k in 0..32 {
-            let carry_in = if k == 0 { E::F::zero() } else { pass2_carry[k - 1].clone() };
-            let inject_byte = match k {
-                0 => f38.clone() * pass1_hi[0].clone(),
-                1 => f38.clone() * pass1_hi[1].clone(),
-                _ => E::F::zero(),
-            };
-            let constraint = pass2_lo[k].clone()
-                + pass2_carry[k].clone() * f256.clone()
-                - pass1_lo[k].clone()
-                - inject_byte
-                - carry_in;
-            eval.add_constraint(real_mul_h[0].clone() * constraint);
-        }
-        eval.add_constraint(
-            real_mul_h[0].clone() * (pass2_carry[31].clone() - pass2_carry_out[0].clone())
-        );
-
-        // ── R1c-5-b: top-bit fold ──
-        //
-        // pass2_top_bit ∈ {0, 1} is bit 7 of pass2_lo[31].  We pin
-        // it by witnessing pass2_lo[31] = (pass2_lo[31] − 128·top_bit)
-        // + 128·top_bit, plus the bound that the low 7 bits are <
-        // 128 (handled implicitly by the after_top_bit chain below
-        // which produces after_top_bit[31] from pass2_lo[31] minus
-        // 128·top_bit).
-        //
-        // The after-top chain folds in 38·pass2_carry_out + 19·top_bit:
-        //
-        //   after_top_bit[k] + 256·after_top_carry[k]
-        //     = pass2_lo[k] + inject_at_k + after_carry_in[k]
-        //         − 128·pass2_top_bit · [k == 31]
-        //
-        // where inject_at_0 = 38·pass2_carry_out + 19·pass2_top_bit
-        // and inject_at_k>0 = 0 (the value is at most 19+38 = 57 < 128,
-        // single byte at position 0).
-        let inject0_after = f38.clone() * pass2_carry_out[0].clone()
-            + E::F::from(BaseField::from(19u32)) * pass2_top_bit[0].clone();
-        let f128 = E::F::from(BaseField::from(128u32));
-        for k in 0..32 {
-            let carry_in = if k == 0 { E::F::zero() } else { after_top_carry[k - 1].clone() };
-            let inject = if k == 0 { inject0_after.clone() } else { E::F::zero() };
-            let bit_strip = if k == 31 {
-                f128.clone() * pass2_top_bit[0].clone()
-            } else { E::F::zero() };
-            let constraint = after_top_bit[k].clone()
-                + after_top_carry[k].clone() * f256.clone()
-                - pass2_lo[k].clone()
-                - inject
-                - carry_in
-                + bit_strip;
-            eval.add_constraint(real_mul_h[0].clone() * constraint);
-        }
-        eval.add_constraint(real_mul_h[0].clone() * after_top_carry[31].clone());
-
-        // ── R1c-5-b: pass2_top_bit boolean + bit-7 pin ──
-        //
-        // pass2_top_bit ∈ {0, 1} (already booleanized below in the
-        // Range256 / boolean sweep).  The "low 7 bits of pass2_lo[31]"
-        // soundness: after_top_bit[31] (which is pass2_lo[31] −
-        // 128·top_bit) must be < 128 — implicitly pinned by Range256
-        // on after_top_bit[31].  Range256 emission appended below
-        // covers this; no separate constraint needed.
-
-        // ── R1c-5-b: final FieldOut = after_top_bit − is_overflow·p ──
-        //
-        // Reuses the SubBorrow chain (already constrained for is_add
-        // rows).  For is_mul rows we re-pin out[k] against
-        // after_top_bit[k] instead of add_intermediate[k]:
-        //
-        //   after_top_bit[k] − is_overflow·p[k] − sub_borrow[k−1]
-        //     + 256·sub_borrow[k] − out[k] = 0
-        //
-        // gated by real_mul.  IsOverflow is pinned witness-
-        // deterministic by the existing FinalFormBorrow chain
-        // (out < p closure).
-        for i in 0..32 {
-            let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
-            let borrow_in = if i == 0 { E::F::zero() } else { borrow[i - 1].clone() };
-            let constraint = after_top_bit[i].clone()
-                - is_ovf[0].clone() * p_i
-                - borrow_in
-                + borrow[i].clone() * f256.clone()
-                - out[i].clone();
-            eval.add_constraint(real_mul_h[0].clone() * constraint);
-        }
-
-        // Booleans: pass2_carry_out, pass2_top_bit ∈ {0, 1}.
-        eval.add_constraint(
-            pass2_carry_out[0].clone() * (E::F::one() - pass2_carry_out[0].clone())
-        );
-        eval.add_constraint(
-            pass2_top_bit[0].clone() * (E::F::one() - pass2_top_bit[0].clone())
+        // ── R1c-3..R1c-5-b: shared FieldOp algebra ──
+        // Lifted into `field_op_constraints` so RistrettoFixedBaseConsumerChip
+        // can reuse the same algebra without code duplication.  Range256 +
+        // register-file lookups are chip-specific and stay below.
+        field_op_constraints::add_field_op_constraints(
+            eval,
+            &field_op_constraints::FieldOpRefs {
+                field_a: &a,
+                field_b: &b,
+                field_out: &out,
+                add_intermediate: &interm,
+                add_carry: &carry,
+                sub_borrow: &borrow,
+                final_form_borrow: &ff_brw,
+                sub_chain_borrow: &sub_chain_brw,
+                sub_chain_carry_aip: &sub_chain_aip,
+                mul_product: &mul_product,
+                mul_carry: &mul_carry,
+                mul_carry_mid: &mul_carry_mid,
+                mul_carry_hi: &mul_carry_hi,
+                pass1_lo: &pass1_lo,
+                pass1_hi: &pass1_hi,
+                pass1_carry: &pass1_carry,
+                pass1_carry_mid: &pass1_carry_mid,
+                pass2_lo: &pass2_lo,
+                pass2_carry_out: &pass2_carry_out,
+                pass2_carry: &pass2_carry,
+                pass2_top_bit: &pass2_top_bit,
+                after_top_bit: &after_top_bit,
+                after_top_carry: &after_top_carry,
+                is_overflow: &is_ovf,
+                is_add: &is_add,
+                is_sub: &is_sub,
+                is_mul: &is_mul,
+                is_input: &is_input,
+                is_output: &is_output,
+                is_real: &is_real,
+                real_add_h: &real_add_h,
+                real_sub_h: &real_sub_h,
+                real_mul_h: &real_mul_h,
+                producer_gate_h: &producer_gate_h,
+                consumer_a_gate_h: &consumer_a_gate_h,
+                consumer_b_gate_h: &consumer_b_gate_h,
+                mul_partial_sum: &mul_partial_sum,
+            },
         );
 
         // ── R1c-3-ter: per-byte Range256 lookups ──
