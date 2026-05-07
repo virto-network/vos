@@ -100,18 +100,12 @@ fn harness_smoke_bound1_only() {
 /// - When the full migration completes and `prove_add64` runs through
 ///   the production path, lookup correctness is checked end-to-end.
 ///
-/// CURRENT STATE (post I-blake2b-1..6): chip algebra is FLATTENED to
-/// degree ≤ 2 — the OODS constraint check now passes cleanly.  The
-/// remaining failure mode is `index out of bounds` in stwo's
-/// `MerkleProverLifted::decommit` (column.rs:111) at the FRI
-/// decommitment phase, which is upstream/Merkle territory rather than
-/// chip-rewrite territory.  This panic appears parametric in trace
-/// shape but trips for every combination of (component slice, PcsConfig,
-/// number of Blake2bCalls) tried so far.
-///
-/// The harness gate is therefore deferred: once all 5 high-bound chips
-/// are flattened, `prove_add64` (production path with standard chip set)
-/// is the actual end-to-end validation.  Test stays `#[ignore]`'d.
+/// CURRENT STATE: chip algebra FLATTENED to degree ≤ 2; this harness
+/// passes (open-chain rejection at verify).  An upstream Stwo bug —
+/// `MerkleProverLifted::decommit` index OOB on mixed-width column
+/// traces — is documented in `STWO_MERKLE_LIFTED_OOB_ISSUE_DRAFT.md`
+/// (not filed; not blocking — bound-1 + this harness shape no longer
+/// trips it, and production paths never did).
 #[test]
 fn harness_blake2b_isolated() {
     use zkpvm::chips::Blake2bCall;

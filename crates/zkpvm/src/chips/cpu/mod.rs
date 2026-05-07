@@ -58,6 +58,10 @@ impl BuiltInComponent for CpuChip {
     /// declared at the end of `Column` (waves 1-7 across commits
     /// a5634b0..74e3184).  Stwo v2.x's lifted protocol enforces the
     /// declared bound; bound = 1 means actual algebraic degree ≤ 2.
+    ///
+    /// Same flatten applies to Blake2b/Mul/DivRem/Ristretto chips.
+    /// Upstream gap (lifted protocol rejecting bound ≥ 2) tracked in
+    /// `STWO_UPSTREAM_ISSUE_DRAFT.md` — not filed; not blocking.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
