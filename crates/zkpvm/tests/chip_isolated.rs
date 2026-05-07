@@ -202,6 +202,120 @@ fn harness_cpuchip_isolated_add64() {
         .expect("CpuChip-only prove failed — chip flatten regression");
 }
 
+/// RistrettoChip-isolated harness — Session 2.1 follow-up of the perf
+/// roadmap.  Prove `[&RistrettoChip]` alone with one
+/// `ECALL_RISTRETTO_SCALAR_MULT` step (the canonical 2·G test).
+///
+/// Expected green state:
+/// - prove SUCCEEDS (RistrettoChip's algebraic constraints all close
+///   on its own columns; register-file lookups self-balance via the
+///   chip's own producer/consumer rows).
+/// - verify REJECTS open-chain because the chip emits per-byte
+///   Range256 producer rows whose consumer (RangeMultiplicity256)
+///   isn't in the slice.
+///
+/// What this validates:
+/// - The `ScalarMultKind`/ECALL plumbing landed in `4efa343` doesn't
+///   regress the existing chip-isolated proving path.
+/// - Future fixed-base chip integration has a regression net: this
+///   harness keeps passing every commit until the comb-method path is
+///   wired in, at which point the test gets a sibling
+///   `harness_ristretto_fixed_basepoint_isolated` covering the new
+///   row class.
+#[test]
+fn harness_ristretto_isolated() {
+    use javm::interpreter::Interpreter;
+    use javm::instruction::Opcode;
+    use javm::PVM_REGISTER_COUNT;
+    use zkpvm::core::tracing::{TracingPvm, ECALL_RISTRETTO_SCALAR_MULT};
+
+    // Lay out 32-byte buffers in flat_mem at known addresses.
+    let scalar_addr: u64 = 0x1000;
+    let point_addr: u64 = 0x1020;
+    let output_addr: u64 = 0x1040;
+    let mut flat_mem = vec![0u8; 0x2000];
+    // scalar = 2
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes[0] = 2;
+    let point_bytes: [u8; 32] =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
+    flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
+
+    // ecalli 200, then trap.  5-byte ecalli + 1-byte trap = 6 bytes.
+    let imm = ECALL_RISTRETTO_SCALAR_MULT;
+    let code = vec![
+        Opcode::Ecalli as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[10] = scalar_addr;
+    regs[11] = point_addr;
+    regs[12] = output_addr;
+
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, flat_mem, 10_000, 25);
+    let mut tracing = TracingPvm::new(pvm);
+    let _exit = tracing.run_with_precompiles();
+    assert_eq!(tracing.ristretto_records.len(), 1);
+    // Confirm the ECALL detector classified the basepoint correctly —
+    // the Session 2.1 plumbing under test.
+    use zkpvm::core::tracing::ScalarMultKind;
+    assert_eq!(tracing.ristretto_records[0].kind, ScalarMultKind::FixedBasepoint);
+
+    let ristretto_records = std::mem::take(&mut tracing.ristretto_records);
+    let ristretto_mem_ops = std::mem::take(&mut tracing.ristretto_mem_ops);
+    let steps = tracing.into_trace();
+
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    side_note.ristretto_calls = ristretto_records;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ingest_ristretto_boundary();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::RistrettoChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("RistrettoChip-only prove failed — chip-flatten or witness regression");
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!("RistrettoChip harness: verify rejected for the wrong reason: {e:?}"),
+        Ok(()) => panic!(
+            "RistrettoChip harness: verify accepted unexpectedly — \
+             something is balancing the lookups that shouldn't be"
+        ),
+    }
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`
