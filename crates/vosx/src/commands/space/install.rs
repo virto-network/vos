@@ -79,6 +79,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         replication_id.to_vec(),
         consistency,
         install_args,
+        Vec::new(), // install_payloads — CLI install has no on_start
     ))
     .map_err(|e| anyhow::anyhow!("install() failed: {e}"))?;
 

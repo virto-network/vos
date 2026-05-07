@@ -72,6 +72,12 @@ pub struct AgentRow {
     /// the agent before its first message arrives. Empty when
     /// the agent was installed without init args.
     pub install_args: Vec<u8>,
+    /// Optional one-shot messages to dispatch when the agent
+    /// is first cold-started. rkyv-encoded `Vec<Vec<u8>>`
+    /// where each inner `Vec<u8>` is a `[TAG_DYNAMIC] + rkyv(Msg)`
+    /// payload. Reconciled from the manifest's `on_start = [{msg=…}]`
+    /// list. Empty when the agent has no on_start.
+    pub install_payloads: Vec<u8>,
 }
 
 // ── Members ──────────────────────────────────────────────────────
@@ -240,6 +246,7 @@ impl SpaceRegistry {
         replication_id: Vec<u8>,
         consistency: u8,
         install_args: Vec<u8>,
+        install_payloads: Vec<u8>,
     ) -> u8 {
         let Some(program_hash) = bytes_to_32(&program_hash) else { return STATUS_BAD_HASH; };
         let Some(replication_id) = bytes_to_32(&replication_id) else { return STATUS_BAD_HASH; };
@@ -280,6 +287,7 @@ impl SpaceRegistry {
                 replication_id,
                 consistency,
                 install_args,
+                install_payloads,
             },
         );
         STATUS_OK

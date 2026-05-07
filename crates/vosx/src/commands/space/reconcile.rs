@@ -73,6 +73,21 @@ pub struct AgentDef {
     /// `auto` (default) hashes `(name, blob_hash)`.
     #[serde(default)]
     pub replication_id: Option<String>,
+    /// One-shot messages dispatched when the agent first
+    /// cold-starts. Each entry is `{ msg = "name", … }`
+    /// where extra keys become `Msg::with` arguments.
+    #[serde(default)]
+    pub on_start: Vec<OnStartMsg>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct OnStartMsg {
+    /// Message handler name to invoke.
+    pub msg: String,
+    /// Remaining keys are typed args. `flatten` so the manifest
+    /// can write `{ msg = "set", val = 42 }` without nesting.
+    #[serde(flatten, default)]
+    pub args: BTreeMap<String, toml::Value>,
 }
 
 fn default_consistency() -> String {
@@ -224,6 +239,7 @@ fn reconcile_one(
     };
 
     let install_args = encode_init_args(&elf_bytes, &agent.init, name_ids)?;
+    let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     let status = vos::block_on(reg.install(
         &mut &*node,
@@ -234,6 +250,7 @@ fn reconcile_one(
         replication_id.to_vec(),
         consistency,
         install_args,
+        install_payloads,
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
 
@@ -269,6 +286,47 @@ fn encode_init_args(
     }
     Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
         .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
+        .to_vec())
+}
+
+/// Encode each `on_start` entry as a `[TAG_DYNAMIC] + rkyv(Msg)`
+/// payload, then rkyv-encode the full `Vec<Vec<u8>>` so it
+/// survives a single `Vec<u8>` field on `AgentRow`.
+/// `spawn_installed_agents` rkyv-decodes it back and hands the
+/// inner `Vec<Vec<u8>>` to `cfg.with_init_payloads`.
+fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> {
+    if on_start.is_empty() {
+        return Ok(Vec::new());
+    }
+    use vos::Encode;
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(on_start.len());
+    for entry in on_start {
+        let mut msg = vos::value::Msg::new(&entry.msg);
+        for (k, v) in &entry.args {
+            // Use the same heuristic as `space install --init`:
+            // numeric → u64, true/false → bool, else string.
+            // Manifest authors who want explicit typing can
+            // upgrade to typed init args once we have schemas.
+            match v {
+                toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
+                toml::Value::Boolean(b) => msg = msg.with(k, *b),
+                toml::Value::String(s) => msg = msg.with(k, s.clone()),
+                other => {
+                    anyhow::bail!(
+                        "on_start arg '{k}' has unsupported type {other:?}; \
+                         use string, integer, or boolean",
+                    );
+                }
+            }
+        }
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(vos::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        payloads.push(payload);
+    }
+    Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&payloads)
+        .map_err(|e| anyhow::anyhow!("encode on_start payloads: {e}"))?
         .to_vec())
 }
 

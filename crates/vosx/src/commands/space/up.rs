@@ -338,6 +338,29 @@ fn spawn_installed_agents(
             )]);
         }
 
+        // on_start payloads (from manifest reconciliation) get
+        // dispatched on cold start. Stored as rkyv-encoded
+        // `Vec<Vec<u8>>` on the agent row.
+        if !a.install_payloads.is_empty() {
+            let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(a.install_payloads.len());
+            av.extend_from_slice(&a.install_payloads);
+            let archived = unsafe {
+                vos::rkyv::access_unchecked::<<Vec<Vec<u8>> as vos::rkyv::Archive>::Archived>(&av)
+            };
+            match vos::rkyv::deserialize::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(archived) {
+                Ok(payloads) if !payloads.is_empty() => {
+                    cfg = cfg.with_init_payloads(payloads);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "vosx: agent '{}' has unparseable install_payloads, ignoring: {e}",
+                        a.instance_name,
+                    );
+                }
+            }
+        }
+
         let svc_id = vos::abi::service::ServiceId(derive_instance_svc_id(
             &a.instance_name,
             local_prefix,
