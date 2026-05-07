@@ -6,15 +6,23 @@ into discrete sessions a fresh agent can pick up cold.  Each item lists
 criteria*, and *risk* so the next session doesn't need conversation
 context from the migration sessions.
 
-## Current state (start of this roadmap)
+## Current state — Session 1 complete (2026-05-07)
 
-`tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
-on Intel Core Ultra 7 155H, native+LTO, no PGO, median of 5 trials:
+| Config   | Entry point     | Prove   | Proof   | Verify | Δ vs roadmap-start |
+|---       |---              |---      |---      |---     |---                 |
+| STANDARD | `prove()`       | 1.40 s  | 932 KB  | 45 ms  | unchanged          |
+| MOBILE   | `prove_mobile()`| **0.64 s** | 1.5 MB | 28 ms | −10% (0.71 → 0.64) |
+
+Session-1 deliverables landed:
+- 1.2 — parallel `generate_component_trace` (`56b1508`).  Producer/consumer split mirrors interaction-gen.  Saves ~6 ms trace_gen on MOBILE; sets up cleaner plumbing for the Session-3 chip-shrink work.
+- 1.1 — PGO bench refresh (`55cbe3b`).  `scripts/build-pgo.sh` trains on Add log10/12/14 + clerk-private-pay-bench-mobile.  MOBILE trace_gen 124 → 85 ms; total 698 → 639 ms.  STANDARD shape isn't trained (low-cost follow-up: add a STANDARD pass to the PGO script if STANDARD prove latency matters).
+
+Original roadmap-start state (for reference):
 
 | Config   | Entry point     | Prove   | Proof   | Verify | vs 0790eba baseline |
 |---       |---              |---      |---      |---     |---                  |
 | STANDARD | `prove()`       | 1.40 s  | 932 KB  | 45 ms  | 2.75× faster        |
-| MOBILE   | `prove_mobile()`| **0.71 s** | 1.5 MB | 28 ms  | 5.4× faster         |
+| MOBILE   | `prove_mobile()`| 0.71 s  | 1.5 MB  | 28 ms  | 5.4× faster         |
 
 Stage breakdown at MOBILE (median trial; FRI is the new dominant cost):
 
@@ -59,19 +67,28 @@ scalar-mults appear in any production workload.
 
 ---
 
-# Session 1 — Operational + parallel-trace
+# Session 1 — Operational + parallel-trace — DONE (2026-05-07)
 
-Estimated wall-clock: 2–4 days including bench + audit.
+## Item 1.1 — Run PGO — DONE (`55cbe3b`)
 
-## Item 1.1 — Run PGO
+* Re-ran `scripts/build-pgo.sh` on the post-parallel-trace tip.
+* MOBILE: 698 → 639 ms (~9% win, mostly from trace_gen 124 → 85 ms).
+* STANDARD: 1.34 → 1.40 s (no win — STANDARD shape isn't in the
+  training run).  Follow-up if STANDARD matters: add a
+  `profile_clerk_private_pay_bench` (non-mobile) pass to step 2 of
+  the PGO script.
+* The −18% historical projection didn't fully materialize — likely
+  because the parallel-trace + parallel-interaction paths are
+  harder for PGO to specialize across thread variants.
 
-* **Cost addressed**: documented −18% prove time win not yet captured on the post-B3 codebase.  Free (no code).
-* **What**: run `scripts/build-pgo.sh` (already extended in this session to train on the clerk-pay actor alongside synthetic Add benches).
-* **CPU note**: ~3 build cycles + training runs.  Pegs the machine for ~30–60 min on the reference desktop.  Schedule when the PC is otherwise free.
-* **Validation**: re-run the canonical bench and update `BENCHMARKS.md`.  Expected MOBILE: ~0.58–0.62 s.  STANDARD: ~1.15 s.
-* **Risk**: low.  Output binary is non-portable across CPUs (already true of `target-cpu=native`).
+## Item 1.2 — Parallelize `generate_component_trace` — DONE (`56b1508`)
 
-## Item 1.2 — Parallelize `generate_component_trace`
+* Producer/consumer split landed.  `IS_PRODUCER` defaults to `true` on `BuiltInProverComponent`; only `CpuChip` and `Blake2bChip` keep it.  17 consumer chips moved to `generate_main_trace_immut(&SideNote)` and the default `generate_main_trace` forwards.
+* `prove_impl_with_components` runs producers sequentially, then fans consumers across rayon with shared `&SideNote`.
+* Measured saving smaller than projected (130 → 124 ms on MOBILE pre-PGO; 124 → 85 ms post-PGO).  CpuChip dominates trace_gen wall-clock and stays in the sequential producer pass — the parallel pass only saves the ~30 ms of consumer-chip work.
+* Useful side benefit: clean trait-level distinction between producers and consumers.  Session-3 chip-shrink work (RegisterMemoryChip, MemoryChip) operates on consumers; the immut signature constrains the surface.
+
+(Original plan retained below for archival reference.)
 
 * **Cost addressed**: `trace_gen` at MOBILE is 19% of prove time (~130 ms), single-threaded today.  Parallel-interaction-gen already landed (`prove.rs` interaction-gen block uses `rayon::par_iter`); this is the same idea on the trace-gen side.
 
