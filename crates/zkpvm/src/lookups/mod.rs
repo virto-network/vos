@@ -28,6 +28,7 @@ pub use self::{
         PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements,
         RegisterMemoryLookupElements,
+        RistrettoCombLookupElements,
         RistrettoRegisterFileLookupElements,
     },
 };
@@ -52,6 +53,7 @@ macros::register_relation! {
         DivRemLookupElements,
         ByteToBitsLookupElements,
         RistrettoRegisterFileLookupElements,
+        RistrettoCombLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

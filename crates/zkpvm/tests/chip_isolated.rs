@@ -316,6 +316,107 @@ fn harness_ristretto_isolated() {
     }
 }
 
+/// RistrettoCombTableChip-isolated harness — Session 2.1 step 3 of the
+/// perf roadmap.  Validates the precomputed comb-table preprocessed
+/// columns (1024 rows of `T[i][j] = j · 2^(4·i) · G`) and the
+/// table-side lookup constraint emit cleanly under prove + verify.
+///
+/// All multiplicities default to zero — no consumer chip in scope yet
+/// (Session 2.1 step 5+).  Lookup contribution is `-0 = 0` per row,
+/// so the relation balance is trivially zero and verify accepts.
+///
+/// What this validates:
+/// - Preprocessed-table fill: 1024 rows × 130 columns (window_idx,
+///   scalar_window, x[32], y[32], z[32], t[32]) populated from
+///   `comb_table::CombTable::from_base(ed25519_basepoint_extended())`
+///   without panicking.
+/// - The 130-limb relation constraint compiles and runs at degree ≤ 2.
+/// - The chip's algebraic constraints (none today, only the relation)
+///   close cleanly on the new Stwo pin.
+#[test]
+fn harness_ristretto_comb_table_isolated() {
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::RistrettoCombTableChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("RistrettoCombTableChip-only prove failed — preprocessed-table fill regression");
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect("RistrettoCombTableChip-only verify failed — table closure regression");
+}
+
+/// Same chip but with a non-zero multiplicity injected on one row.
+/// The chip emits a `-1` lookup contribution with no producer, so
+/// verify must reject open-chain — same pattern as
+/// `harness_blake2b_isolated`.
+#[test]
+fn harness_ristretto_comb_table_unbalanced_rejected() {
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    // Bump multiplicity on row 0 (window_idx=0, scalar_window=0, which
+    // is the identity entry).  Any single non-zero entry breaks balance.
+    side_note.ristretto_comb_counts[0] = 1;
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::RistrettoCombTableChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("RistrettoCombTableChip prove with mult=1 failed — algebra regression");
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!("comb_table unbalanced harness: wrong rejection reason: {e:?}"),
+        Ok(()) => panic!(
+            "comb_table unbalanced harness: verify accepted unexpectedly — \
+             relation closed despite no consumer in scope"
+        ),
+    }
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`

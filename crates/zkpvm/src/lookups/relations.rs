@@ -232,3 +232,18 @@ stwo_constraint_framework::relation!(
     RistrettoRegisterFileLookupElements,
     REL_RISTRETTO_REGISTER_FILE_LOOKUP_SIZE
 );
+
+// Session 2.1: RistrettoCombTableChip lookup.  Producer: 1024 rows of
+// the precomputed comb table for the Ristretto255 / Ed25519 fixed
+// basepoint G; each row is `T[i][j] = j · 2^(4·i) · G` keyed by
+// `(window_idx, scalar_window)` in extended-Edwards bytes.  Consumer
+// (chip-side fixed-base mult path, deferred): 1 emission per scalar
+// mult window, binding the chip's running-sum row to the looked-up
+// table entry.
+//
+// Tuple: (window_idx, scalar_window, x[32], y[32], z[32], t[32]) — 130 limbs.
+const REL_RISTRETTO_COMB_LOOKUP_SIZE: usize = 1 + 1 + 32 * 4;
+stwo_constraint_framework::relation!(
+    RistrettoCombLookupElements,
+    REL_RISTRETTO_COMB_LOOKUP_SIZE
+);

@@ -32,6 +32,13 @@ pub struct SideNote {
     /// CpuChip's per-row flag-byte decomposition emissions in Phase 55b).
     /// In Phase 55a no consumers emit, so all entries are zero.
     pub byte_to_bits_counts: Vec<u32>,
+    /// Session 2.1: RistrettoCombTableChip multiplicity counts.
+    /// Indexed by `row = window_idx * 16 + scalar_window` (window_idx
+    /// ∈ 0..64, scalar_window ∈ 0..16 ⇒ 1024 rows).  Set by the
+    /// RistrettoChip fixed-base scalar-mult path (deferred — chip-side
+    /// consumer not yet wired); zero today, balancing the relation
+    /// trivially.
+    pub ristretto_comb_counts: Vec<u32>,
     /// Blake2b compression calls to prove via the Blake2bChip.
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// Per-byte memory operations for each blake2b ECALL (reads for h, m;
@@ -241,6 +248,7 @@ impl SideNote {
             popcount_counts: vec![0u32; 256],
             bitcount_counts: vec![0u32; 256],
             byte_to_bits_counts: vec![0u32; 256],
+            ristretto_comb_counts: vec![0u32; 1024],
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             ristretto_calls: Vec::new(),

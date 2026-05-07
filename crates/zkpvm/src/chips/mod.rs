@@ -18,6 +18,7 @@ pub mod range_multiplicity;
 pub mod register_memory;
 pub mod register_memory_boundary;
 pub mod ristretto;
+pub mod ristretto_comb;
 pub mod ristretto_ecall;
 
 pub use bitcount::BitcountChip;
@@ -40,4 +41,5 @@ pub use range_multiplicity::RangeMultiplicity256;
 pub use register_memory::RegisterMemoryChip;
 pub use register_memory_boundary::RegisterMemoryBoundaryChip;
 pub use ristretto::RistrettoChip;
+pub use ristretto_comb::RistrettoCombTableChip;
 pub use ristretto_ecall::RistrettoEcallChip;
