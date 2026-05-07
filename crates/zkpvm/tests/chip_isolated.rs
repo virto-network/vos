@@ -417,6 +417,74 @@ fn harness_ristretto_comb_table_unbalanced_rejected() {
     }
 }
 
+/// Session 2.1 step 5 — comb-method lookup-balance harness.
+///
+/// Proves `[&RistrettoCombTableChip, &RistrettoFixedBaseConsumerChip]`
+/// together with one synthetic scalar.  The consumer emits +1 per
+/// window (64 emissions); `populate_ristretto_comb_counts` matches
+/// each emission with a +1 in the table chip's Multiplicity column;
+/// the table chip's lookup contribution is −Multiplicity.  Sum is
+/// zero — relation balances cleanly and verify accepts.
+///
+/// What this validates:
+/// - The 130-limb `RistrettoCombLookupElements` relation closes
+///   end-to-end across producer + consumer.
+/// - `populate_ristretto_comb_counts` correctly walks each call's
+///   64 windows and bumps the table-chip multiplicity.
+/// - The consumer chip's IsReal flag, padding behaviour, and column
+///   layout coexist with the table chip's preprocessed table.
+///
+/// What this does NOT validate (deferred to step 8):
+/// - That the input scalar bytes match the ECALL boundary's scalar.
+/// - That the running sum (yet to land) hits the ECALL boundary's
+///   output point.
+#[test]
+fn harness_ristretto_comb_balance() {
+    use zkpvm::chips::{RistrettoCombTableChip, RistrettoFixedBaseConsumerChip};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    // One synthetic scalar.  Pick values that exercise both zero
+    // nibbles and non-zero nibbles so the lookup table is hit at
+    // multiple distinct rows (not just T[i][0] = identity).
+    let mut scalar = [0u8; 32];
+    for i in 0..32 {
+        scalar[i] = (i as u8).wrapping_mul(11);
+    }
+    side_note.ristretto_comb_calls.push(RistrettoCombCall { scalar });
+    side_note.populate_ristretto_comb_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] =
+        &[&RistrettoCombTableChip, &RistrettoFixedBaseConsumerChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("comb-balance harness: prove failed — relation or constraint regression");
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect("comb-balance harness: verify failed — relation didn't close end-to-end");
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`

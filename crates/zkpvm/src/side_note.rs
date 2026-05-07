@@ -34,11 +34,17 @@ pub struct SideNote {
     pub byte_to_bits_counts: Vec<u32>,
     /// Session 2.1: RistrettoCombTableChip multiplicity counts.
     /// Indexed by `row = window_idx * 16 + scalar_window` (window_idx
-    /// ∈ 0..64, scalar_window ∈ 0..16 ⇒ 1024 rows).  Set by the
-    /// RistrettoChip fixed-base scalar-mult path (deferred — chip-side
-    /// consumer not yet wired); zero today, balancing the relation
-    /// trivially.
+    /// ∈ 0..64, scalar_window ∈ 0..16 ⇒ 1024 rows).  Populated by
+    /// `populate_ristretto_comb_counts` walking each entry in
+    /// `ristretto_comb_calls` and bumping the entry hit by each of
+    /// its 64 windows.
     pub ristretto_comb_counts: Vec<u32>,
+    /// Session 2.1: per-call records driving the
+    /// `RistrettoFixedBaseConsumerChip` trace fill.  One entry per
+    /// fixed-basepoint scalar mult.  Empty today (consumer chip is a
+    /// chip-isolated POC; production ECALL routing via
+    /// `ScalarMultKind::FixedBasepoint` lands in step 8).
+    pub ristretto_comb_calls: Vec<RistrettoCombCall>,
     /// Blake2b compression calls to prove via the Blake2bChip.
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// Per-byte memory operations for each blake2b ECALL (reads for h, m;
@@ -234,6 +240,17 @@ pub struct MulEntry {
     pub is_32bit: bool,
 }
 
+/// Session 2.1: one fixed-base scalar-mult call driving the
+/// `RistrettoFixedBaseConsumerChip` trace.  Just the scalar bytes
+/// today — output binding to the ECALL boundary lands in step 8.
+#[derive(Clone, Debug)]
+pub struct RistrettoCombCall {
+    /// 32 LE bytes; the scalar `k` to multiply against the fixed
+    /// basepoint G.  Decomposes into 64 4-bit windows that drive the
+    /// per-window `RistrettoCombLookupElements` lookups.
+    pub scalar: [u8; 32],
+}
+
 impl SideNote {
     pub fn new(steps: Vec<PvmStep>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
         Self {
@@ -249,6 +266,7 @@ impl SideNote {
             bitcount_counts: vec![0u32; 256],
             byte_to_bits_counts: vec![0u32; 256],
             ristretto_comb_counts: vec![0u32; 1024],
+            ristretto_comb_calls: Vec::new(),
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             ristretto_calls: Vec::new(),
@@ -437,6 +455,27 @@ impl SideNote {
             self.add_ristretto_field_row(fill_output(rec.output, output_row));
         }
         self.ristretto_calls = calls;
+    }
+
+    /// Session 2.1: walk every entry in `ristretto_comb_calls` and bump
+    /// `ristretto_comb_counts[window_idx * 16 + scalar_window]` for each
+    /// of the call's 64 windows.  Idempotent only if called once after
+    /// all `ristretto_comb_calls` are populated; subsequent calls
+    /// double-count.
+    ///
+    /// Drives the lookup balance between the
+    /// `RistrettoFixedBaseConsumerChip` (emits +1 per window) and the
+    /// `RistrettoCombTableChip` (emits −multiplicity per row).
+    pub fn populate_ristretto_comb_counts(&mut self) {
+        for call in &self.ristretto_comb_calls {
+            for i in 0..64usize {
+                let byte = call.scalar[i / 2];
+                let nibble_idx = i % 2;
+                let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
+                let row = i * 16 + k_i;
+                self.ristretto_comb_counts[row] += 1;
+            }
+        }
     }
 
     pub fn add_bitwise_and(&mut self, a: u8, b: u8) {
