@@ -38,7 +38,14 @@ use crate::side_note::SideNote;
 /// Verifier-side dyn-safe wrapper around `BuiltInComponent`.  All methods
 /// here are verifier-side: column-size queries, lookup drawing, and the
 /// `Component` instantiation used by `core::verifier::verify`.
-pub trait MachineComponent {
+///
+/// `Sync` is required so `&dyn MachineComponent` / `&dyn
+/// MachineProverComponent` can be sent into rayon parallel iterators
+/// (used by `prove_impl_with_components` to parallelize per-chip
+/// interaction-trace generation).  Every concrete impl in
+/// `crate::chips` is already `Sync` — adding the supertrait just makes
+/// it expressible at the trait-object level.
+pub trait MachineComponent: Sync {
     fn max_constraint_log_degree_bound(&self, log_size: u32) -> u32;
     fn trace_sizes(&self, log_size: u32) -> TreeVec<Vec<u32>>;
     fn preprocessed_trace_sizes(&self, log_size: u32) -> Vec<u32>;
