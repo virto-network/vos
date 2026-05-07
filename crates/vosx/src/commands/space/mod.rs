@@ -102,6 +102,16 @@ pub enum SpaceCommand {
         /// runtime source of truth.
         #[arg(long, value_name = "FILE")]
         manifest: Option<std::path::PathBuf>,
+        /// libp2p multiaddr to listen on. Repeatable. Overrides
+        /// the saved `listen` field on the spaces.toml entry
+        /// for this run.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        /// Extends the saved `bootnodes` field on the
+        /// spaces.toml entry for this run.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
     },
     /// Query a space's registry and emit a round-trippable
     /// TOML manifest to stdout.
@@ -235,8 +245,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             listen,
             data_dir,
         }),
-        SpaceCommand::Up { space, once, manifest } => {
-            up::run(up::Args { query: space, once, manifest })
+        SpaceCommand::Up { space, once, manifest, listen, connect } => {
+            up::run(up::Args { query: space, once, manifest, listen, connect })
         }
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Publish {

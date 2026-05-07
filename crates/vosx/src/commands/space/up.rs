@@ -19,6 +19,8 @@ pub struct Args {
     pub query: String,
     pub once: bool,
     pub manifest: Option<PathBuf>,
+    pub listen: Vec<String>,
+    pub connect: Vec<String>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -110,7 +112,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
-    let network = build_network_for_daemon(&entry, &data_dir)?;
+    let network = build_network_for_daemon(&entry, &data_dir, &args.listen, &args.connect)?;
     let local_prefix = network.local_prefix();
 
     let mut node = VosNode::with_prefix(local_prefix);
@@ -183,16 +185,28 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// Build a Network for the daemon. Always attaches — local-only
 /// spaces get an auto-port loopback bind so clients have an
 /// endpoint to dial.
+///
+/// `--listen` overrides the entry's saved listen addrs entirely
+/// (so the user can run multiple daemons of the same space on
+/// different ports). `--connect` extends the entry's saved
+/// bootnodes (additive — the user can dial extra peers
+/// without losing the original).
 fn build_network_for_daemon(
     entry: &spaces_index::SpaceEntry,
     data_dir: &std::path::Path,
+    listen_override: &[String],
+    connect_extra: &[String],
 ) -> anyhow::Result<vos::network::Network> {
     let parse = |s: &str, kind: &str| -> anyhow::Result<libp2p::Multiaddr> {
         libp2p::Multiaddr::from_str(s)
             .map_err(|e| anyhow::anyhow!("bad {kind} multiaddr '{s}': {e}"))
     };
-    let mut listen: Vec<libp2p::Multiaddr> = entry
-        .listen
+    let listen_src: &[String] = if listen_override.is_empty() {
+        &entry.listen
+    } else {
+        listen_override
+    };
+    let mut listen: Vec<libp2p::Multiaddr> = listen_src
         .iter()
         .map(|s| parse(s, "listen"))
         .collect::<anyhow::Result<_>>()?;
@@ -201,11 +215,14 @@ fn build_network_for_daemon(
         // is captured into `.endpoint` once the swarm reports it.
         listen.push("/ip4/127.0.0.1/tcp/0".parse().unwrap());
     }
-    let bootstrap: Vec<libp2p::Multiaddr> = entry
+    let mut bootstrap: Vec<libp2p::Multiaddr> = entry
         .bootnodes
         .iter()
         .map(|s| parse(s, "bootnode"))
         .collect::<anyhow::Result<_>>()?;
+    for s in connect_extra {
+        bootstrap.push(parse(s, "connect")?);
+    }
 
     let key_path = data_dir.join("node.key");
     let key_bytes = std::fs::read(&key_path)
