@@ -149,15 +149,18 @@ scalar-mults appear in any production workload.
 
 # Session 2 — Ristretto fixed-base scalar-mult
 
-Estimated wall-clock: 3–7 days.  Steps 1–2 + 7 done; steps 3–6 + 8
-remain — schedule a dedicated session.
+Estimated wall-clock: 3–7 days.  Producer side fully landed
+(`91fa0d6`, `4efa343`, `0394ec2`); only the consumer-side chip
+integration remains.
 
 ## Item 2.1 — C8: comb method for fixed bases (G and H)
 
 * **Step 1 — DONE (`91fa0d6`)**: host-side `comb_table.rs` module, Ed25519 basepoint constants, `scalar_mult_via_comb` reference, 6 unit tests cross-checking against `point::scalar_mult_rows` for fixed + 5 random scalars.
-* **Step 7 + ECALL detection — DONE (`4efa343`)**: `ScalarMultKind { Variable, FixedBasepoint }` on `RistrettoRecord`, set at ECALL handler from `detect_scalar_mult_kind` (compares against `RISTRETTO_BASEPOINT_COMPRESSED`).  3 unit tests; chip side still treats every record as variable-base — plumbing only.
-* **Steps 2–6 OPEN**: chip-side integration: `PreprocessedColumn::CombTable*` variants, `RistrettoCombTableLookupElements` relation, `scalar_mult_rows_fixed_base` host emitter, `RistrettoChip::add_constraints` lookup binding, producer chip for the table.  This is the bulk of the work; ~3–5 days fresh.
-* **Step 8 OPEN**: route `ScalarMultKind::FixedBasepoint` → fixed-base witness path in the chip.  One-line dispatch once steps 2–6 land.
+* **Step 7 + ECALL detection — DONE (`4efa343`)**: `ScalarMultKind { Variable, FixedBasepoint }` on `RistrettoRecord`, set at ECALL handler from `detect_scalar_mult_kind` (compares against `RISTRETTO_BASEPOINT_COMPRESSED`).
+* **Steps 3, 4, 6 — DONE (`0394ec2`)**: `RistrettoCombLookupElements` 130-limb relation; `RistrettoCombTableChip` with preprocessed table (1024 rows × 130 cols, filled from `comb_table::CombTable::from_base(&G)`); `Multiplicity` main column read from `side_note.ristretto_comb_counts`; chip-isolated harness pair (zero-mult succeeds, non-zero rejects open-chain).
+* **Step 5 OPEN**: consumer side.  Either extend `RistrettoChip` with a new IS_FIXED_BASE_COMB row class (per-row: +1 to `RistrettoCombLookupElements`, accumulator add of looked-up entry to running sum) OR build a separate `RistrettoFixedBaseConsumerChip` that handles the entire fixed-base mult independently.  This is the architectural decision the next session has to make first; both paths are ~2–3 days from there.
+* **Step 8 OPEN**: route `ScalarMultKind::FixedBasepoint` → fixed-base witness path.  One-line dispatch in `ingest_ristretto_boundary` once step 5 lands.
+* **Activity gating OPEN**: `ChipActivity.ristretto_comb` + add `RistrettoCombTableChip` to `BASE_COMPONENTS`.  Both deferred until step 5 because adding the table chip alone unbalances the relation across the whole prover (only the chip-isolated harness sees zero counts).
 
 * **Why this is the right tap-to-pay win**: cipher-clerk's private-pay flow does:
   * Pedersen commit: `v · G + b · H` — 2 fixed-base scalar-mults.
