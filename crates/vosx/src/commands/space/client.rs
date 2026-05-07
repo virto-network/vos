@@ -117,6 +117,7 @@ impl DaemonClient {
     }
 
     /// The daemon's 16-bit identity prefix.
+    #[allow(dead_code)]
     pub fn daemon_prefix(&self) -> u16 {
         self.daemon_prefix
     }

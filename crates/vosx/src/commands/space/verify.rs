@@ -2,7 +2,7 @@
 //! commit matches the advertised space_id.
 //!
 //! After `space up` boots the registry, we expect either:
-//! - **Creator**: the genesis CrdtEvent (seq=1) is in the redb
+//! - **Creator**: the genesis CrdtEvent (seq=0) is in the redb
 //!   from `space new`. `derive_space_id(cid)` must match the
 //!   space_id we chose at creation, by definition.
 //! - **Joiner**: the gossipsub sync layer pulls the genesis
@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use redb::ReadableTable;
 
 const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
-const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum VerifyOutcome {
@@ -34,16 +33,6 @@ pub enum VerifyOutcome {
     /// No genesis CrdtEvent appeared in the wait window. The
     /// caller decides whether to keep going or bail.
     NoGenesisYet,
-}
-
-/// Poll the registry's redb for a seq=1 event whose CID
-/// derives back to `advertised_space_id`. Returns once any
-/// candidate matches, or after `wait` elapses with no match.
-pub fn verify_genesis(
-    registry_db_path: &Path,
-    advertised_space_id: &[u8; 32],
-) -> anyhow::Result<VerifyOutcome> {
-    verify_with_timeout(registry_db_path, advertised_space_id, DEFAULT_WAIT)
 }
 
 pub fn verify_with_timeout(
@@ -109,7 +98,10 @@ fn scan_for_genesis(
         let Some(event) = vos::effect_log::CrdtEvent::from_bytes(payload) else {
             continue;
         };
-        if event.seq != 1 {
+        // Per-origin seq counter starts at 0 (see
+        // `load_next_seq.unwrap_or(0)` in `vos::commit::CrdtCommit::open`),
+        // so the first commit's CrdtEvent has `seq == 0`.
+        if event.seq != 0 {
             continue;
         }
         let key_bytes: &[u8] = key.value();

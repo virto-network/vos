@@ -60,6 +60,52 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
+    // Verify the genesis CrdtEvent against the advertised
+    // space_id BEFORE registering the agent (which opens the
+    // redb exclusively). Creators pass immediately; joiners
+    // who haven't seen the genesis yet get a "trust on first
+    // use" warning and proceed — on the next `space up` after
+    // sync, verification activates.
+    let registry_db = data_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+    if registry_db.exists() {
+        match crate::commands::space::verify::verify_with_timeout(
+            &registry_db,
+            &space_id,
+            std::time::Duration::from_millis(0),
+        )? {
+            crate::commands::space::verify::VerifyOutcome::Verified { genesis_cid } => {
+                eprintln!(
+                    "vosx: genesis verified (root={})",
+                    hex::encode(genesis_cid),
+                );
+            }
+            crate::commands::space::verify::VerifyOutcome::Mismatch {
+                genesis_cid,
+                derived,
+                advertised,
+            } => {
+                anyhow::bail!(
+                    "genesis mismatch — local registry's seq=1 root {} \
+                     derives to space_id {} but the saved entry advertises {}. \
+                     The bootnode pointed us at a different space, or the \
+                     local data dir was tampered with.",
+                    hex::encode(genesis_cid),
+                    hex::encode(derived),
+                    hex::encode(advertised),
+                );
+            }
+            crate::commands::space::verify::VerifyOutcome::NoGenesisYet => {
+                eprintln!(
+                    "vosx: warning: registry redb has no seq=1 event yet — \
+                     trust-on-first-use until sync delivers genesis. \
+                     Verification activates on the next `space up`.",
+                );
+            }
+        }
+    }
+
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
