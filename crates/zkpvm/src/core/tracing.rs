@@ -448,12 +448,22 @@ impl TracingPvm {
     /// the canonical compressed-identity sentinel (`[0u8; 32]`) — the
     /// chip will accept this output as the malformed-input branch.
     fn handle_ristretto_scalar_mult_ecall(&mut self) {
-        let scalar_ptr_u = self.pvm.registers[10] as usize;
-        let point_ptr_u  = self.pvm.registers[11] as usize;
-        let output_ptr_u = self.pvm.registers[12] as usize;
-        let scalar_ptr = self.pvm.registers[10] as u32;
-        let point_ptr  = self.pvm.registers[11] as u32;
-        let output_ptr = self.pvm.registers[12] as u32;
+        // PVM register convention (matches grey-transpiler's RISC-V → PVM
+        // mapping in `riscv.rs::map_register`):
+        //   φ[7] = A0 (RISC-V x10), φ[8] = A1, φ[9] = A2.
+        // The zkpvm-precompiles shim's inline asm uses `in("a0") scalar_ptr`
+        // etc., which the transpiler routes to φ[7/8/9].  Earlier code read
+        // φ[10/11/12] (= A3/A4/A5) and silently saw zeros for transpiled
+        // actor traces — the bug that kept the comb-method path dormant in
+        // production.  Other ECALL handlers in this file still use
+        // φ[10/11/12] and have the same bug; they're left as-is here to
+        // keep this fix scoped to the comb path.
+        let scalar_ptr_u = self.pvm.registers[7] as usize;
+        let point_ptr_u  = self.pvm.registers[8] as usize;
+        let output_ptr_u = self.pvm.registers[9] as usize;
+        let scalar_ptr = self.pvm.registers[7] as u32;
+        let point_ptr  = self.pvm.registers[8] as u32;
+        let output_ptr = self.pvm.registers[9] as u32;
 
         let mut scalar_bytes = [0u8; 32];
         let mut point_bytes  = [0u8; 32];

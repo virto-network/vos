@@ -263,9 +263,12 @@ fn harness_ristretto_isolated() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[10] = scalar_addr;
-    regs[11] = point_addr;
-    regs[12] = output_addr;
+    // PVM φ[7] = A0 (RISC-V a0 / x10), φ[8] = A1, φ[9] = A2 — matches
+    // grey-transpiler's `map_register` and the host handler's reads after
+    // the φ[7/8/9] alignment fix in `tracing.rs`.
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
 
     let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, flat_mem, 10_000, 25);
     let mut tracing = TracingPvm::new(pvm);
