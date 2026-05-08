@@ -158,6 +158,18 @@ lint:
 check:
     cargo check --all-targets
 
+# Run all checks the pre-commit + pre-push hooks run, in one go
+verify:
+    cargo fmt --all -- --check
+    cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::result_unit_err -A clippy::manual_async_fn
+    cargo test --workspace --lib
+    just build-pvm
+
+# Point git at the in-repo hooks under .githooks/ (idempotent)
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "✓ git hooks installed (.githooks/pre-commit, .githooks/pre-push)"
+
 # Verify vos-raft builds on representative no_std + alloc embedded
 # targets. Catches regressions to the alloc-only code paths
 # (anything accidentally pulling in std::collections, std::time,

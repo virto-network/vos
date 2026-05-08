@@ -1,0 +1,23 @@
+#!/bin/sh
+# Heavier checks before pushing. Skip in emergencies with `git push --no-verify`.
+#
+# Install via: just install-hooks  (sets core.hooksPath = .githooks)
+set -e
+
+echo "→ pre-push: workspace tests"
+cargo test --workspace --lib --quiet
+
+echo "→ pre-push: build PVM actors"
+LOG=$(mktemp)
+trap 'rm -f "$LOG"' EXIT
+just build-pvm 2>&1 | tee "$LOG"
+
+# Guard the workspace warning we worked to silence by dropping `[[bin]]`
+# from every actor crate. If it comes back, a contributor likely added a
+# `main.rs` next to `lib.rs` again — reject the push.
+if grep -q 'found to be present in multiple build targets' "$LOG"; then
+    echo "✗ pre-push: cargo emitted the multi-target warning."
+    echo "  Some actor crate has both lib.rs and main.rs. Drop main.rs and"
+    echo "  use \`cargo rustc --lib --crate-type bin\` (see examples/actors/*/.cargo/config.toml)."
+    exit 1
+fi

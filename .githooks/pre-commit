@@ -1,0 +1,21 @@
+#!/bin/sh
+# Fast checks before each commit. Skip in emergencies with `git commit --no-verify`.
+#
+# Install via: just install-hooks  (sets core.hooksPath = .githooks)
+set -e
+
+echo "→ pre-commit: fmt"
+cargo fmt --all -- --check
+
+echo "→ pre-commit: clippy"
+# Deferred architectural warnings — silenced so unrelated commits aren't
+# gated on them. Address by reshaping the affected APIs (~7 sites total).
+cargo clippy --workspace --quiet -- \
+    -D warnings \
+    -A clippy::too_many_arguments \
+    -A clippy::type_complexity \
+    -A clippy::result_unit_err \
+    -A clippy::manual_async_fn
+
+echo "→ pre-commit: vosx tests"
+cargo test -p vosx --quiet

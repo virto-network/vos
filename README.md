@@ -205,3 +205,17 @@ let n = vos::block_on(counter.get(&mut &node))?;
 
 Compile with the `riscv64em-javm` target — see
 `examples/actors/counter/.cargo/config.toml`.
+
+### Development
+
+Install the in-repo git hooks once after cloning:
+
+```bash
+just install-hooks
+```
+
+This points `core.hooksPath` at `.githooks/`. Pre-commit gates on
+`cargo fmt --check`, `cargo clippy -D warnings`, and `vosx`'s unit
+tests; pre-push runs the full workspace test suite and `just build-pvm`
+(which also re-asserts the multi-target Cargo warning stays silenced).
+Run everything by hand with `just verify`.
