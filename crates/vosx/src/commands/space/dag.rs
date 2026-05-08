@@ -1,28 +1,35 @@
-//! `space dag` — read-only DAG diagnostic for an installed
-//! agent's CRDT redb.
+//! `space dag` — DAG diagnostic for an installed agent.
 //!
-//! Opens `<data_dir>/agents/<svc_id>.redb` directly and prints:
-//! - current roots (DAG tips after merge)
-//! - total node count
-//! - per-origin seq counters (one row per replica that's
-//!   committed something)
+//! Two modes, picked automatically based on whether the
+//! daemon's running:
 //!
-//! Limitation: the daemon holds the redb exclusively while
-//! `space up` is running, so `space dag` errors out with a
-//! "database already open" message in that case. Stop the
-//! daemon (or wait for it to exit) and re-run.
+//! - **Live** (daemon up): connects via `DaemonClient`, asks
+//!   the registry for the agent's replication_id, then fires
+//!   a libp2p `FetchHeads` at the daemon to read its current
+//!   roots. No node-count or per-origin breakdown — those
+//!   would need a full DAG walk via repeated `FetchNode` and
+//!   aren't worth the round-trips for a one-shot diagnostic.
+//! - **Offline** (no daemon): opens the redb directly and
+//!   prints roots, total node count, and per-origin
+//!   `(min_seq, max_seq)`. Errors if the redb is locked.
+//!
+//! `<agent>` is `registry` (well-known REGISTRY id) or any
+//! installed instance name.
 
 use std::path::Path;
+use std::time::Duration;
 
 use redb::ReadableTable;
 use vos::abi::service::ServiceId;
 
+use crate::commands::space::client::DaemonClient;
 use crate::commands::space::endpoint;
-use crate::spaces_index;
+use crate::spaces_index::{self, SpaceEntry};
 
 const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
 const STATE_TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("state");
 const ROOTS_KEY: &str = "crdt_roots";
+const FETCH_HEADS_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
     let index = spaces_index::load()?;
@@ -32,7 +39,92 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
         anyhow::bail!("data dir does not exist: {}", data_dir.display());
     }
 
-    let svc_id = resolve_svc_id(&data_dir, agent)?;
+    // Daemon up? Use the live path. Stale endpoint files (PID
+    // dead) fall back to the offline read since the redb is
+    // free.
+    let live = match endpoint::read(&data_dir)? {
+        Some(ep) if endpoint::is_alive(&ep) => true,
+        _ => false,
+    };
+
+    if live {
+        run_live(&entry, agent)
+    } else {
+        run_offline(&entry, &data_dir, agent)
+    }
+}
+
+/// Daemon's running — query roots over libp2p via the
+/// existing `FetchHeads` protocol.
+fn run_live(entry: &SpaceEntry, agent: &str) -> anyhow::Result<()> {
+    let client = DaemonClient::connect(&entry.name)?;
+    let net = client
+        .node()
+        .network()
+        .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
+
+    // Resolve the agent's replication_id. Special-case the
+    // registry — its replication_id is derived deterministically
+    // from space_id (see `up::derive_registry_replication_id`),
+    // not stored in the registry's own catalog.
+    let space_id = entry
+        .id_bytes()
+        .ok_or_else(|| anyhow::anyhow!("space id is not 32 bytes of hex"))?;
+    // Daemon endpoint info — peer_id we'll dial, prefix that
+    // owns this svc_id namespace.
+    let endpoint_data = endpoint::read(&std::path::PathBuf::from(&entry.data_dir))?
+        .ok_or_else(|| anyhow::anyhow!("endpoint disappeared"))?;
+    let daemon_peer: libp2p::PeerId = endpoint_data
+        .peer_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad daemon peer_id: {e}"))?;
+    let daemon_prefix = endpoint_data.prefix;
+
+    let (replication_id, svc_id) = if agent == "registry" {
+        (
+            crate::commands::space::up::derive_registry_replication_id(&space_id),
+            ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()),
+        )
+    } else {
+        let row = vos::block_on(client.registry().agent(&mut &*client.node(), agent.to_string()))
+            .map_err(|e| anyhow::anyhow!("registry.agent('{agent}'): {e}"))?
+            .ok_or_else(|| anyhow::anyhow!(
+                "no agent named '{agent}' is installed in this space",
+            ))?;
+        let svc_id = ServiceId(crate::commands::space::up::derive_instance_svc_id(
+            agent,
+            daemon_prefix,
+        ));
+        (row.replication_id, svc_id)
+    };
+
+    // FetchHeads: the daemon's NetworkService::sync_roots
+    // reads its slot's redb roots and returns them. Same
+    // protocol the CRDT sync ticker uses.
+    let rx = net.send_fetch_heads(daemon_peer, replication_id);
+    let roots = rx
+        .recv_timeout(FETCH_HEADS_TIMEOUT)
+        .map_err(|_| anyhow::anyhow!("FetchHeads from daemon timed out"))?;
+
+    println!("space '{}' — agent '{}' (svc:{:08x}) [LIVE]", entry.name, agent, svc_id.0);
+    println!("  replication_id: {}", hex::encode(replication_id));
+    println!();
+    println!("roots ({}):", roots.len());
+    for r in &roots {
+        println!("  {}", hex::encode(r));
+    }
+    println!();
+    println!("node count: <not queried — live mode prints roots only;");
+    println!("            stop the daemon and re-run for full node + origin stats>");
+
+    client.shutdown()
+}
+
+/// Daemon's down — read the redb directly. Fuller stats
+/// (node count, per-origin seq range) but requires the redb
+/// to be unlocked.
+fn run_offline(entry: &SpaceEntry, data_dir: &Path, agent: &str) -> anyhow::Result<()> {
+    let svc_id = resolve_svc_id_offline(data_dir, agent)?;
     let db_path = data_dir
         .join("agents")
         .join(format!("{:08x}.redb", svc_id.0));
@@ -45,8 +137,8 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
 
     let db = redb::Database::open(&db_path).map_err(|e| match e {
         redb::DatabaseError::DatabaseAlreadyOpen => anyhow::anyhow!(
-            "{} is already open — stop `space up` for this space first \
-             (the daemon owns the redb exclusively).",
+            "{} is already open — start `space up` to use the live mode, \
+             or stop it for full offline stats.",
             db_path.display(),
         ),
         other => anyhow::anyhow!("open {}: {other}", db_path.display()),
@@ -54,7 +146,6 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
 
     let txn = db.begin_read()?;
 
-    // ── Roots ────────────────────────────────────────────────
     let roots: Vec<[u8; 32]> = match txn.open_table(STATE_TABLE) {
         Ok(t) => match t.get(ROOTS_KEY)? {
             Some(v) => decode_roots(v.value()).unwrap_or_default(),
@@ -64,7 +155,6 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("open state table: {e}")),
     };
 
-    // ── DAG node iteration ──────────────────────────────────
     let mut node_count = 0usize;
     let mut origin_seq: std::collections::BTreeMap<[u8; 32], (u64, u64)> =
         std::collections::BTreeMap::new();
@@ -81,7 +171,7 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
         }
     }
 
-    println!("space '{}' — agent '{}' (svc:{:08x})", entry.name, agent, svc_id.0);
+    println!("space '{}' — agent '{}' (svc:{:08x}) [OFFLINE]", entry.name, agent, svc_id.0);
     println!("  data: {}", db_path.display());
     println!();
     println!("roots ({}):", roots.len());
@@ -92,7 +182,7 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
     println!("dag nodes: {node_count}");
     if !origin_seq.is_empty() {
         println!();
-        println!("by origin (one row per replica that has committed):");
+        println!("by origin:");
         println!("  {:<66}  {:<8}  {:<8}", "ORIGIN", "MIN_SEQ", "MAX_SEQ");
         for (origin, (lo, hi)) in &origin_seq {
             println!("  {:<66}  {:<8}  {:<8}", hex::encode(origin), lo, hi);
@@ -101,19 +191,10 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `agent` is `"registry"` (well-known REGISTRY id) or an
-/// installed instance name (svc_id derived via the same scheme
-/// `space up` uses to register agents — read the daemon's
-/// prefix from `.endpoint` if present, else fall back to 0).
-fn resolve_svc_id(data_dir: &Path, agent: &str) -> anyhow::Result<ServiceId> {
+fn resolve_svc_id_offline(data_dir: &Path, agent: &str) -> anyhow::Result<ServiceId> {
     if agent == "registry" {
         return Ok(ServiceId::REGISTRY);
     }
-    // Need the daemon's prefix to derive the svc_id. The
-    // .endpoint file has it; if it's missing (no daemon
-    // running ever / data corruption), fall back to prefix=0.
-    // Either way the lookup is local-disk-only — no daemon
-    // contact needed.
     let prefix = match endpoint::read(data_dir)? {
         Some(ep) => ep.prefix,
         None => 0,
@@ -122,8 +203,6 @@ fn resolve_svc_id(data_dir: &Path, agent: &str) -> anyhow::Result<ServiceId> {
     Ok(ServiceId(raw))
 }
 
-/// `DagNode` wire format: `[payload_len:u64 LE][payload][n_children:u64 LE][children...]`.
-/// Strip the header, decode the payload as a `CrdtEvent`.
 fn decode_crdt_event_from_dagnode(bytes: &[u8]) -> Option<vos::effect_log::CrdtEvent> {
     if bytes.len() < 8 {
         return None;
@@ -135,10 +214,6 @@ fn decode_crdt_event_from_dagnode(bytes: &[u8]) -> Option<vos::effect_log::CrdtE
     vos::effect_log::CrdtEvent::from_bytes(&bytes[8..8 + payload_len])
 }
 
-/// Decode the rkyv'd `Vec<Cid>` stored under
-/// `STATE_TABLE/crdt_roots`. Wire format mirrors
-/// `vos::commit::encode_roots`:
-/// `[count:u64 LE][cid_bytes (32 each)...]`.
 fn decode_roots(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
     if bytes.len() < 8 {
         return None;
