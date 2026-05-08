@@ -61,7 +61,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let data_dir = PathBuf::from(&entry.data_dir);
     if !data_dir.exists() {
         anyhow::bail!(
-            "data dir does not exist: {} (was the space deleted?)",
+            "data dir does not exist: {} (was the space forgotten?)",
             data_dir.display(),
         );
     }

@@ -1,9 +1,10 @@
-//! `space delete` — remove a local space.
+//! `space forget` — drop the local copy of a space.
 //!
 //! Wipes the per-space data directory and the spaces.toml
 //! entry. The shared blob cache is untouched (other spaces may
 //! reference the same blobs). The space stays alive on its
-//! peers — this is a *local* removal.
+//! peers — this is a *local* removal, hence the `forget` verb
+//! rather than `delete`.
 
 use std::io::{self, Write};
 

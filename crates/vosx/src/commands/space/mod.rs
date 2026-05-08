@@ -23,9 +23,9 @@ pub mod agents;
 pub mod call;
 pub mod client;
 pub mod common;
-pub mod delete;
 pub mod endpoint;
 pub mod export;
+pub mod forget;
 pub mod info;
 pub mod install;
 pub mod join;
@@ -201,9 +201,11 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<members::MembersCommand>,
     },
-    /// Remove a local space — wipes the per-space data dir and
-    /// the spaces.toml entry. The shared blob cache is kept.
-    Delete {
+    /// Drop the local copy of a space — wipes the per-space
+    /// data dir and the spaces.toml entry. The shared blob
+    /// cache is kept and the space stays alive on its peers;
+    /// this is purely a local operation.
+    Forget {
         space: String,
         /// Skip the confirmation prompt.
         #[arg(long)]
@@ -318,8 +320,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Members { space, command } => {
             members::run(members::Args { space, command })
         }
-        SpaceCommand::Delete { space, yes } => {
-            delete::run(delete::Args { space, yes })
+        SpaceCommand::Forget { space, yes } => {
+            forget::run(forget::Args { space, yes })
         }
         SpaceCommand::Call { space, target, method, args } => {
             call::run(call::Args { space, target, method, args })
