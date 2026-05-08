@@ -561,11 +561,20 @@ impl TracingPvm {
     /// back, capture the call.  Out-of-bounds buffers ⇒ all-zero
     /// output (canonical zero scalar).
     fn handle_scalar_reduce_wide_ecall(&mut self) {
-        // Same off-by-three bug as handle_blake2b_ecall.
-        let wide_ptr_u = self.pvm.registers[10] as usize;
-        let output_ptr_u = self.pvm.registers[11] as usize;
-        let wide_ptr = self.pvm.registers[10] as u32;
-        let output_ptr = self.pvm.registers[11] as u32;
+        // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM
+        // mapping (x10/x11 → φ[7/8]).  The zkpvm-precompiles shim
+        // uses `in("a0") wide_ptr, in("a1") output_ptr` so the
+        // pointers land in φ[7/8].  The previous handler read
+        // φ[10/11] (= a3/a4), part of the same off-by-three bug
+        // fixed for `handle_ristretto_scalar_mult_ecall` in `02922c4`.
+        // No CpuChip-side binding tuple for this ECALL, so the fix
+        // is purely host-side: ensures the host's reads + writes hit
+        // the correct PVM addresses, making the actor's downstream
+        // reads return the actual canonical scalar.
+        let wide_ptr_u = self.pvm.registers[7] as usize;
+        let output_ptr_u = self.pvm.registers[8] as usize;
+        let wide_ptr = self.pvm.registers[7] as u32;
+        let output_ptr = self.pvm.registers[8] as u32;
 
         let mut wide_bytes = [0u8; 64];
         let mem_len = self.pvm.flat_mem.len();

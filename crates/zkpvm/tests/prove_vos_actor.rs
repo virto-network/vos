@@ -2157,7 +2157,9 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = wide_addr; regs[11] = output_addr;
+    // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM mapping.
+    // Aligns with the post-fix handler reads.
+    regs[7] = wide_addr; regs[8] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
