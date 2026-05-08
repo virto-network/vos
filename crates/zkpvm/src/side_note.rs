@@ -499,6 +499,7 @@ impl SideNote {
             }
         }
         self.populate_ristretto_comb_counts();
+        self.populate_ristretto_compress_counts();
         self.ristretto_calls = calls;
     }
 
@@ -523,6 +524,46 @@ impl SideNote {
                 let row = i * 16 + k_i;
                 self.ristretto_comb_counts[row] += 1;
             }
+        }
+    }
+
+    /// R1e-bis Batch 3c: walk `ristretto_comb_calls` and bump
+    /// `byte_to_bits_counts` for every byte the compress chain
+    /// sign-checks.  Each fixed-base scalar mult emits 1 sign check
+    /// in Batch 3c (rotate, on `T·z_inv.bytes[0]`) and will grow to
+    /// 3 once Batches 3d/3e add the y_negate and s_neg checks.
+    ///
+    /// Mirrors `populate_ristretto_comb_counts`'s pattern: idempotent
+    /// (does NOT zero the counts, since CpuChip's Phase-55b
+    /// flag-byte decomposition also writes here — additive
+    /// bookkeeping) and called both from chip-isolated tests and
+    /// from `ingest_ristretto_boundary` for production traces.
+    #[cfg(feature = "prover")]
+    pub fn populate_ristretto_compress_counts(&mut self) {
+        use crate::chips::ristretto::compress::compute_compress_witness;
+        use crate::chips::ristretto::comb_table::{
+            ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
+        };
+        use crate::chips::ristretto::point::{point_add_rows, point_identity, ExtendedPoint};
+
+        let table = CombTable::from_base(&ed25519_basepoint_extended());
+        for call in &self.ristretto_comb_calls {
+            // Re-derive Acc = scalar · G via the comb-table walk
+            // (mirrors `RistrettoCombCompressChip::build_compress_rows`).
+            let mut acc = point_identity();
+            for w in 0..NUM_WINDOWS {
+                let byte = call.scalar[w / 2];
+                let nibble_idx = w % 2;
+                let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
+                let entry: ExtendedPoint = table.rows[w][k_i];
+                let (_r, new_acc) = point_add_rows(&acc, &entry);
+                acc = new_acc;
+            }
+            let w = compute_compress_witness(&acc);
+            // Rotate sign source: byte 0 of T·z_inv.
+            self.byte_to_bits_counts[w.t_z_inv[0] as usize] += 1;
+            // y_negate / s_neg sign sources will be added once
+            // Batches 3d/3e land their respective rows.
         }
     }
 

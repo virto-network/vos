@@ -78,7 +78,7 @@ use crate::trace::{
 
 use crate::chips::ristretto::field_op_constraints;
 use crate::framework::BuiltInComponent;
-use crate::lookups::RistrettoCombCompressRegFileLookupElements;
+use crate::lookups::{ByteToBitsLookupElements, RistrettoCombCompressRegFileLookupElements};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
@@ -102,7 +102,8 @@ const ROW_BD_INVSQRT_AMD: u16 = 1;
 ///   5..=16  — 12 algebra rows (rows 1-12 of the design sketch)
 ///  17..=20  — 4 algebra rows (sign-check prep): T·z_inv, iX, iY,
 ///             enchanted = i1·INVSQRT_A_MINUS_D
-pub const ROWS_PER_CALL: usize = 21;
+///      21   — IsSignWitness for `rotate` (sign of T·z_inv at +17)
+pub const ROWS_PER_CALL: usize = 22;
 
 // IsInput / algebra row offsets within a per-call block.
 // Some constants are unused in current batches but consumed by later
@@ -149,6 +150,7 @@ const ROW_IX: usize = 18;
 const ROW_IY: usize = 19;
 #[allow(dead_code)]
 const ROW_ENCHANTED: usize = 20;
+const ROW_SIGN_ROTATE: usize = 21;
 
 /// Per-row column layout.  Mirrors `RistrettoFixedBaseConsumerChip`'s
 /// FieldOp witness columns + source-row threading metadata.  No
@@ -252,6 +254,42 @@ pub enum Column {
     /// `producer_gate_h * producer_multiplicity` deg-flatten helper.
     #[size = 1]
     ProducerEmissionMult,
+
+    // ── Sign-check infrastructure (Path γ) ──
+    /// 1 iff this row is a sign-witness row (IsInput=1 plus
+    /// extra sign-check constraints + emissions).  Boolean.
+    /// On IsSignWitness rows, `FieldA` carries the source algebra
+    /// row's full 32-byte `out` (so the standard chip-local
+    /// register-file ConsumerA emission fires for ALL 32 bytes —
+    /// matches the source row's 32-byte producer multiplicity
+    /// without needing per-byte-index multiplicity differences).
+    /// `FieldA[0]` is the byte whose LSB is sign-witnessed.
+    #[size = 1]
+    IsSignWitness,
+    /// Deg-flatten helper: `consumer_a_gate_h + is_sign_witness`.
+    /// Drives the ConsumerA emission's multiplicity so sign-witness
+    /// rows (IsInput=1 ⇒ consumer_a_gate_h=0) still consume their
+    /// `a` bytes from the source row's producer.
+    #[size = 1]
+    EffectiveConsumerAGateH,
+    /// On IsSignWitness rows: bits 1..7 of `FieldA[0]`.  Bit 0
+    /// equals `FieldOut[0]` (the sign witness on this row).
+    /// Together with `FieldA[0]` and `FieldOut[0]` they form a
+    /// 9-limb `ByteToBitsLookupElements` consumer tuple.
+    #[size = 1]
+    SignBit1,
+    #[size = 1]
+    SignBit2,
+    #[size = 1]
+    SignBit3,
+    #[size = 1]
+    SignBit4,
+    #[size = 1]
+    SignBit5,
+    #[size = 1]
+    SignBit6,
+    #[size = 1]
+    SignBit7,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -281,6 +319,13 @@ pub enum PreprocessedColumn {
 #[derive(Clone, Copy, Debug)]
 struct CompressRow {
     field: crate::chips::ristretto::witness::FieldOpRow,
+    /// 1 iff this row carries the sign-witness extras (Path γ).
+    /// On sign-witness rows: `field.a` holds the source row's full
+    /// 32-byte `out`; `field.out` is `[sign, 0, ..., 0]`.
+    is_sign_witness: u8,
+    /// On sign-witness rows: bits 1..7 of `field.a[0]` (bit 0
+    /// equals `field.out[0]`).
+    sign_bits: [u8; 7],
 }
 
 #[cfg(feature = "prover")]
@@ -288,6 +333,8 @@ impl Default for CompressRow {
     fn default() -> Self {
         Self {
             field: crate::chips::ristretto::witness::FieldOpRow::default(),
+            is_sign_witness: 0,
+            sign_bits: [0u8; 7],
         }
     }
 }
@@ -317,8 +364,8 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
     // SQRT_M1 and INVSQRT_A_MINUS_D are constants used by every
     // call's iX/iY/enchanted rows.  Push them once at the trace's
     // start; per-call rows reference them by absolute row id.
-    rows.push(CompressRow { field: fill_input(*sqrt_m1()) });
-    rows.push(CompressRow { field: fill_input(*invsqrt_a_minus_d()) });
+    rows.push(CompressRow { field: fill_input(*sqrt_m1()), ..Default::default() });
+    rows.push(CompressRow { field: fill_input(*invsqrt_a_minus_d()), ..Default::default() });
     debug_assert_eq!(rows.len(), N_BOUNDARY_INPUTS);
 
     let table = CombTable::from_base(&ed25519_basepoint_extended());
@@ -356,11 +403,11 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         let r_i2t = base + ROW_I2_T as u16;
 
         // ── 5 IsInput rows ──
-        rows.push(CompressRow { field: fill_input(acc.x) });
-        rows.push(CompressRow { field: fill_input(acc.y) });
-        rows.push(CompressRow { field: fill_input(acc.z) });
-        rows.push(CompressRow { field: fill_input(acc.t) });
-        rows.push(CompressRow { field: fill_input(w.inv_sqrt) });
+        rows.push(CompressRow { field: fill_input(acc.x), ..Default::default() });
+        rows.push(CompressRow { field: fill_input(acc.y), ..Default::default() });
+        rows.push(CompressRow { field: fill_input(acc.z), ..Default::default() });
+        rows.push(CompressRow { field: fill_input(acc.t), ..Default::default() });
+        rows.push(CompressRow { field: fill_input(w.inv_sqrt), ..Default::default() });
 
         // ── Algebra rows 1-12 ──
         // row +5: Z + Y
@@ -368,49 +415,49 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_z;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.z_plus_y);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row +6: Z - Y
         let mut fr = fill_sub(acc.z, acc.y);
         fr.a_source_row = r_z;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.z_minus_y);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row +7: u1 = (Z+Y)·(Z-Y)
         let mut fr = fill_mul(w.z_plus_y, w.z_minus_y);
         fr.a_source_row = r_zpy;
         fr.b_source_row = r_zmy;
         debug_assert_eq!(fr.out, w.u1);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row +8: u2 = X·Y
         let mut fr = fill_mul(acc.x, acc.y);
         fr.a_source_row = r_x;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.u2);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row +9: u2² = u2·u2
         let mut fr = fill_mul(w.u2, w.u2);
         fr.a_source_row = r_u2;
         fr.b_source_row = r_u2;
         debug_assert_eq!(fr.out, w.u2_sq);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+10: tmp = u1·u2²
         let mut fr = fill_mul(w.u1, w.u2_sq);
         fr.a_source_row = r_u1;
         fr.b_source_row = r_u2sq;
         debug_assert_eq!(fr.out, w.u1_u2_sq);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+11: inv_sqrt²
         let mut fr = fill_mul(w.inv_sqrt, w.inv_sqrt);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_inv;
         debug_assert_eq!(fr.out, w.inv_sqrt_sq);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+12: inv_sqrt²·tmp (must equal 1; the unity-check
         // constraint on this row's `out` lands in a follow-up).
@@ -424,35 +471,35 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             o
         };
         debug_assert_eq!(fr.out, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+13: i1 = inv_sqrt·u1
         let mut fr = fill_mul(w.inv_sqrt, w.u1);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_u1;
         debug_assert_eq!(fr.out, w.i1);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+14: i2 = inv_sqrt·u2
         let mut fr = fill_mul(w.inv_sqrt, w.u2);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_u2;
         debug_assert_eq!(fr.out, w.i2);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+15: i2·T
         let mut fr = fill_mul(w.i2, acc.t);
         fr.a_source_row = r_i2;
         fr.b_source_row = r_t;
         debug_assert_eq!(fr.out, w.i2_t);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+16: z_inv = i1·(i2·T)
         let mut fr = fill_mul(w.i1, w.i2_t);
         fr.a_source_row = r_i1;
         fr.b_source_row = r_i2t;
         debug_assert_eq!(fr.out, w.z_inv);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
         let r_z_inv = base + ROW_Z_INV as u16;
 
         // row+17: T · z_inv (sign source — its byte 0 LSB feeds the
@@ -461,28 +508,55 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_t;
         fr.b_source_row = r_z_inv;
         debug_assert_eq!(fr.out, w.t_z_inv);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+18: iX = X · SQRT_M1
         let mut fr = fill_mul(acc.x, *sqrt_m1());
         fr.a_source_row = r_x;
         fr.b_source_row = ROW_BD_SQRT_M1;
         debug_assert_eq!(fr.out, w.i_x);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+19: iY = Y · SQRT_M1
         let mut fr = fill_mul(acc.y, *sqrt_m1());
         fr.a_source_row = r_y;
         fr.b_source_row = ROW_BD_SQRT_M1;
         debug_assert_eq!(fr.out, w.i_y);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
 
         // row+20: enchanted = i1 · INVSQRT_A_MINUS_D
         let mut fr = fill_mul(w.i1, *invsqrt_a_minus_d());
         fr.a_source_row = r_i1;
         fr.b_source_row = ROW_BD_INVSQRT_AMD;
         debug_assert_eq!(fr.out, w.enchanted_denominator);
-        rows.push(CompressRow { field: fr });
+        rows.push(CompressRow { field: fr, ..Default::default() });
+
+        // row+21: rotate sign witness — IsInput row carrying
+        // `out[0] = T·z_inv.bytes[0] & 1` with `out[1..32] = 0`.
+        // FieldA holds the source row's full 32-byte `out` so the
+        // standard 32-byte chip-local register-file ConsumerA
+        // emission balances against the source row's producer
+        // multiplicity at every byte_idx (no per-byte-index
+        // multiplicity asymmetry).  ByteToBits binds `FieldOut[0]`
+        // to bit 0 of `FieldA[0]`.
+        let r_t_z_inv = base + ROW_T_Z_INV as u16;
+        let mut sign_witness_bytes = [0u8; 32];
+        sign_witness_bytes[0] = w.rotate;
+        debug_assert_eq!(w.rotate, w.t_z_inv[0] & 1);
+        let mut fr = fill_input(sign_witness_bytes);
+        // FieldA = source row's `out` (so the 32-byte ConsumerA
+        // emission consumes from the source row's producer).
+        fr.a = w.t_z_inv;
+        fr.a_source_row = r_t_z_inv;
+        let mut sign_bits = [0u8; 7];
+        for k in 0..7 {
+            sign_bits[k] = (w.t_z_inv[0] >> (k + 1)) & 1;
+        }
+        rows.push(CompressRow {
+            field: fr,
+            is_sign_witness: 1,
+            sign_bits,
+        });
     }
 
     finalize_producer_multiplicities(&mut rows);
@@ -491,7 +565,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
 
 /// Walk the row stream and count downstream consumer references onto
 /// each producer row's `producer_multiplicity`.  Mirrors the consumer
-/// chip's algorithm.
+/// chip's algorithm — extended to also count sign-witness rows'
+/// ConsumerA references (Path γ: sign-witness rows are IsInput=1 but
+/// still emit ConsumerA via the chip's extended emission gate
+/// `consumer_a_gate_h + is_sign_witness`).
 #[cfg(feature = "prover")]
 fn finalize_producer_multiplicities(rows: &mut [CompressRow]) {
     let n = rows.len();
@@ -503,8 +580,11 @@ fn finalize_producer_multiplicities(rows: &mut [CompressRow]) {
         if row.field.is_real == 0 {
             continue;
         }
-        // Op + output rows consume `a` from a_source_row.
-        if row.field.is_input == 0 {
+        // ConsumerA refs:
+        //   - Algebra (IsAdd/IsSub/IsMul) + IsOutput rows (is_input=0).
+        //   - Sign-witness rows (is_sign_witness=1).
+        let consumes_a = row.field.is_input == 0 || row.is_sign_witness != 0;
+        if consumes_a {
             let a_src = row.field.a_source_row as usize;
             if a_src < n {
                 rows[a_src].field.producer_multiplicity = rows[a_src]
@@ -514,6 +594,8 @@ fn finalize_producer_multiplicities(rows: &mut [CompressRow]) {
                     .expect("producer_multiplicity overflowed u16");
             }
         }
+        // ConsumerB refs: only on IsAdd/IsSub/IsMul rows
+        // (input/output/sign-witness rows have no `b`).
         if row.field.is_input == 0 && row.field.is_output == 0 {
             let b_src = row.field.b_source_row as usize;
             if b_src < n {
@@ -555,14 +637,21 @@ fn compress_n_rows(side_note: &SideNote) -> usize {
 impl BuiltInComponent for RistrettoCombCompressChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = RistrettoCombCompressRegFileLookupElements;
+    type LookupElements = (
+        RistrettoCombCompressRegFileLookupElements,
+        ByteToBitsLookupElements,
+    );
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        regfile_lookup: &RistrettoCombCompressRegFileLookupElements,
+        lookup_elements: &(
+            RistrettoCombCompressRegFileLookupElements,
+            ByteToBitsLookupElements,
+        ),
     ) {
+        let (regfile_lookup, byte_to_bits_lookup) = lookup_elements;
         // Column reads.
         let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
@@ -610,6 +699,17 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         let producer_mult = crate::trace::trace_eval!(trace_eval, Column::ProducerMultiplicity);
         let producer_emission_mult =
             crate::trace::trace_eval!(trace_eval, Column::ProducerEmissionMult);
+
+        let is_sign_witness = crate::trace::trace_eval!(trace_eval, Column::IsSignWitness);
+        let effective_consumer_a_gate_h =
+            crate::trace::trace_eval!(trace_eval, Column::EffectiveConsumerAGateH);
+        let sign_bit1 = crate::trace::trace_eval!(trace_eval, Column::SignBit1);
+        let sign_bit2 = crate::trace::trace_eval!(trace_eval, Column::SignBit2);
+        let sign_bit3 = crate::trace::trace_eval!(trace_eval, Column::SignBit3);
+        let sign_bit4 = crate::trace::trace_eval!(trace_eval, Column::SignBit4);
+        let sign_bit5 = crate::trace::trace_eval!(trace_eval, Column::SignBit5);
+        let sign_bit6 = crate::trace::trace_eval!(trace_eval, Column::SignBit6);
+        let sign_bit7 = crate::trace::trace_eval!(trace_eval, Column::SignBit7);
 
         let row_idx_lo =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
@@ -686,6 +786,35 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             eval.add_constraint(is_unity_check[0].clone() * out[k].clone());
         }
 
+        // ── Sign-witness rows (Path γ) ──
+        // IsSignWitness ∈ {0, 1}.
+        eval.add_constraint(
+            is_sign_witness[0].clone()
+                * (E::F::from(BaseField::from(1u32)) - is_sign_witness[0].clone()),
+        );
+        // Sign-witness rows are also IsInput rows (so the FieldOp
+        // partition's `is_real · (is_input - 1) = 0` clause is
+        // satisfied without any helper changes).
+        eval.add_constraint(
+            is_sign_witness[0].clone()
+                * (E::F::from(BaseField::from(1u32)) - is_input[0].clone()),
+        );
+        // Higher bytes of `out` zero on sign-witness rows.  Together
+        // with `out[0] ∈ {0, 1}` (from the ByteToBits consumer), this
+        // ensures the row's `out` is a clean boolean field element.
+        for k in 1..32 {
+            eval.add_constraint(is_sign_witness[0].clone() * out[k].clone());
+        }
+        // EffectiveConsumerAGateH = consumer_a_gate_h + is_sign_witness.
+        // Both addends are boolean and mutually exclusive (sign-witness
+        // rows have is_input=1 ⇒ consumer_a_gate_h=0; algebra rows have
+        // is_sign_witness=0), so the sum is also boolean.
+        eval.add_constraint(
+            effective_consumer_a_gate_h[0].clone()
+                - consumer_a_gate_h[0].clone()
+                - is_sign_witness[0].clone(),
+        );
+
         // ── Chip-local register-file producer + consumer A/B ──
         for k in 0..32 {
             // Producer: emit `producer_emission_mult` × tuple per byte
@@ -700,11 +829,12 @@ impl BuiltInComponent for RistrettoCombCompressChip {
                     out[k].clone(),
                 ],
             ));
-            // Consumer A: emit `-consumer_a_gate_h` per byte on
-            // IsAdd / IsSub / IsMul rows.
+            // Consumer A: emit `-effective_consumer_a_gate_h` per
+            // byte.  Fires on IsAdd / IsSub / IsMul rows AND on
+            // sign-witness rows (Path γ extension).
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                (-consumer_a_gate_h[0].clone()).into(),
+                (-effective_consumer_a_gate_h[0].clone()).into(),
                 &[
                     a_src_lo[0].clone(),
                     a_src_hi[0].clone(),
@@ -726,6 +856,36 @@ impl BuiltInComponent for RistrettoCombCompressChip {
                 ],
             ));
         }
+
+        // ── Sign-witness emissions (Path γ) ──
+        // ByteToBits consumer: `(FieldA[0], FieldOut[0], SignBit1..7)`
+        // — multiplicity `+IsSignWitness` matches ByteToBitsChip's
+        // `-multiplicity[byte]` producer (ByteToBitsChip writes its
+        // multiplicity from `side_note.byte_to_bits_counts[byte]`,
+        // which `populate_ristretto_compress_counts` increments per
+        // sign-witness row).  Forces `FieldOut[0]` to equal bit 0 of
+        // `FieldA[0]` (and binds the higher bits to SignBit1..7,
+        // which we don't otherwise use — they stay as zeroed padding
+        // cells when IsSignWitness=0).  The
+        // 1-byte register-file consumer at byte_idx=0 is no longer
+        // needed: FieldA's bytes are already bound to the source
+        // row's `out` via the standard 32-byte ConsumerA emission
+        // (gated by `effective_consumer_a_gate_h`).
+        eval.add_to_relation(RelationEntry::new(
+            byte_to_bits_lookup,
+            is_sign_witness[0].clone().into(),
+            &[
+                a[0].clone(),
+                out[0].clone(),
+                sign_bit1[0].clone(),
+                sign_bit2[0].clone(),
+                sign_bit3[0].clone(),
+                sign_bit4[0].clone(),
+                sign_bit5[0].clone(),
+                sign_bit6[0].clone(),
+                sign_bit7[0].clone(),
+            ],
+        ));
 
         eval.finalize_logup_in_pairs();
     }
@@ -790,6 +950,7 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
 
         let regfile: &RistrettoCombCompressRegFileLookupElements =
             lookup_elements.as_ref();
+        let byte_to_bits: &ByteToBitsLookupElements = lookup_elements.as_ref();
 
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -827,6 +988,27 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let b_src_hi_col =
             crate::trace::original_base_column!(component_trace, Column::BSourceRowHi);
 
+        let is_sign_witness_col =
+            crate::trace::original_base_column!(component_trace, Column::IsSignWitness);
+        let effective_consumer_a_gate_h_col = crate::trace::original_base_column!(
+            component_trace,
+            Column::EffectiveConsumerAGateH
+        );
+        let sign_bit1_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit1);
+        let sign_bit2_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit2);
+        let sign_bit3_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit3);
+        let sign_bit4_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit4);
+        let sign_bit5_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit5);
+        let sign_bit6_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit6);
+        let sign_bit7_col =
+            crate::trace::original_base_column!(component_trace, Column::SignBit7);
+
         for k in 0..32 {
             logup.add_to_relation_with(
                 regfile,
@@ -841,7 +1023,7 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             );
             logup.add_to_relation_with(
                 regfile,
-                [consumer_a_gate_h[0].clone()],
+                [effective_consumer_a_gate_h_col[0].clone()],
                 |[g]| (-g).into(),
                 &[
                     a_src_lo_col[0].clone(),
@@ -862,6 +1044,27 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
                 ],
             );
         }
+
+        // ── Sign-witness emissions ──
+        // ByteToBits consumer: `(FieldA[0], FieldOut[0], SignBit1..7)`.
+        // Multiplicity +IsSignWitness; the 32-byte ConsumerA above
+        // already binds FieldA to the source row's `out`.
+        logup.add_to_relation_with(
+            byte_to_bits,
+            [is_sign_witness_col[0].clone()],
+            |[g]| g.into(),
+            &[
+                a_cols[0].clone(),
+                out_cols[0].clone(),
+                sign_bit1_col[0].clone(),
+                sign_bit2_col[0].clone(),
+                sign_bit3_col[0].clone(),
+                sign_bit4_col[0].clone(),
+                sign_bit5_col[0].clone(),
+                sign_bit6_col[0].clone(),
+                sign_bit7_col[0].clone(),
+            ],
+        );
 
         logup.finalize()
     }
@@ -951,4 +1154,22 @@ fn fill_compress_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Compre
     trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
     let emission = if real_b && !out_b { pm } else { 0 };
     trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
+
+    // Sign-witness columns (Path γ).
+    trace.fill_columns(row_i, cr.is_sign_witness, Column::IsSignWitness);
+    // EffectiveConsumerAGateH = consumer_a_gate_h + is_sign_witness.
+    // consumer_a_gate_h = real · (1 - is_input).
+    let consumer_a_gate = (real_b && !inp_b) as u8;
+    trace.fill_columns(
+        row_i,
+        consumer_a_gate + cr.is_sign_witness,
+        Column::EffectiveConsumerAGateH,
+    );
+    trace.fill_columns(row_i, cr.sign_bits[0], Column::SignBit1);
+    trace.fill_columns(row_i, cr.sign_bits[1], Column::SignBit2);
+    trace.fill_columns(row_i, cr.sign_bits[2], Column::SignBit3);
+    trace.fill_columns(row_i, cr.sign_bits[3], Column::SignBit4);
+    trace.fill_columns(row_i, cr.sign_bits[4], Column::SignBit5);
+    trace.fill_columns(row_i, cr.sign_bits[5], Column::SignBit6);
+    trace.fill_columns(row_i, cr.sign_bits[6], Column::SignBit7);
 }

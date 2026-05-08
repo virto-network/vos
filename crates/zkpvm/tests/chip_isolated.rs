@@ -946,7 +946,7 @@ fn harness_ristretto_consumer_isolated_empty() {
 /// (`claimed logup sum is not zero`).
 #[test]
 fn harness_ristretto_compress_algebra_only() {
-    use zkpvm::chips::RistrettoCombCompressChip;
+    use zkpvm::chips::{ByteToBitsChip, RistrettoCombCompressChip};
     use zkpvm::side_note::RistrettoCombCall;
 
     // One synthetic call — pick a non-trivial scalar so X/Y/Z/T are
@@ -964,6 +964,7 @@ fn harness_ristretto_compress_algebra_only() {
         .ristretto_comb_calls
         .push(RistrettoCombCall { scalar, out_bytes });
     side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
 
     let config = PcsConfig {
         pow_bits: 5,
@@ -972,7 +973,7 @@ fn harness_ristretto_compress_algebra_only() {
     };
 
     let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombCompressChip];
+        &[&RistrettoCombCompressChip, &ByteToBitsChip];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect(
@@ -1048,7 +1049,7 @@ fn harness_ristretto_compress_isolated_empty() {
 /// file imbalance).
 #[test]
 fn harness_ristretto_compress_three_calls() {
-    use zkpvm::chips::RistrettoCombCompressChip;
+    use zkpvm::chips::{ByteToBitsChip, RistrettoCombCompressChip};
     use zkpvm::side_note::RistrettoCombCall;
 
     let scalars: [u64; 3] = [7, 0x1234_5678, 0xdead_beef_cafe_babe];
@@ -1065,6 +1066,7 @@ fn harness_ristretto_compress_three_calls() {
             .push(RistrettoCombCall { scalar, out_bytes });
     }
     side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
 
     let config = PcsConfig {
         pow_bits: 5,
@@ -1073,7 +1075,7 @@ fn harness_ristretto_compress_three_calls() {
     };
 
     let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombCompressChip];
+        &[&RistrettoCombCompressChip, &ByteToBitsChip];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect(
