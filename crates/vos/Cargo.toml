@@ -41,12 +41,6 @@ javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03a
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-# Backs `vos::crypto::blake2b` on every non-riscv64 target —
-# host code, workers, wasm guests. PVM (riscv64) actors hit
-# the host via ECALL_BLAKE2B_COMPRESS instead and never link
-# this dep. `default-features = false` keeps it usable from
-# no_std builds (worker / wasm).
-blake2b_simd = { version = "1", default-features = false }
 pollster = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -66,6 +60,15 @@ async-trait = { version = "0.1", optional = true }
 # riscv guest.
 futures-executor = { version = "0.3", default-features = false, features = ["std"], optional = true }
 futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
+
+# Backs `vos::crypto::blake2b` on every non-riscv64 target —
+# host code, workers, wasm guests. PVM (riscv64) actors hit
+# the host via ECALL_BLAKE2B_COMPRESS and never link this dep.
+# Target-conditional so the riscv64 actor build doesn't even
+# compile blake2b_simd. `default-features = false` keeps it
+# usable from no_std (worker / wasm).
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+blake2b_simd = { version = "1", default-features = false }
 
 [dev-dependencies]
 # `default-features = false` so the `bin` feature stays off — host
