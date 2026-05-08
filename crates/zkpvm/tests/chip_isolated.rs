@@ -642,6 +642,135 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     );
 }
 
+/// Session 2.1 step 8 — soundness regression net for the scalar /
+/// PVM-memory binding.  Synthesizes a call whose
+/// `ristretto_comb_calls.scalar` (K1) and `ristretto_mem_ops.scalar_bytes`
+/// (K2 ≠ K1) disagree byte-for-byte; the actor's PVM memory holds K2,
+/// the comb chain consumes K1.  PROVE still succeeds (each chip's
+/// witness is internally consistent for its own scalar), but VERIFY
+/// must reject because:
+///   - `RistrettoCombScalarBoundaryChip` emits memory producers at
+///     `(Addr_i, K1[i], Ts, 0)`.
+///   - `MemoryChip`'s consumer side, fed by `mem_op.scalar_bytes = K2`
+///     and `initial_memory[scalar_ptr + i] = K2[i]`, holds tuples at
+///     `(Addr_i, K2[i], Ts, 0)`.
+///   - Tuples differ in the value limb, so the lookup balance is
+///     non-zero and verify returns `claimed logup sum is not zero`.
+///
+/// Without this test, a future regression that broke the value-side
+/// of the boundary tuple (e.g., emitted at the nibble byte_idx
+/// instead of the call's scalar byte index) could leave the chain
+/// looking balanced for any K1, making the binding cosmetic.
+#[test]
+fn harness_ristretto_scalar_memory_mismatch_rejected() {
+    use zkpvm::chips::{
+        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    let scalar_ptr: u32 = 0;
+    let point_ptr: u32 = 64;
+    let output_ptr: u32 = 128;
+    let ts: u64 = 1;
+
+    // K1: what the boundary chip walks via ristretto_comb_calls.
+    let k1_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_u64);
+    let k1 = k1_value.to_bytes();
+    // K2: what the actor's memory holds (≠ K1).
+    let k2_value = curve25519_dalek::scalar::Scalar::from(0xdeadbeefu64);
+    let k2 = k2_value.to_bytes();
+    assert_ne!(k1, k2, "test setup: K1 must differ from K2 byte-wise");
+
+    let basepoint =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    // out_bytes ties to K2 (actor's memory) for the EcallChip producer
+    // side of the output write.
+    let out_bytes = (k2_value
+        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        .compress()
+        .to_bytes();
+
+    let mut initial_memory = vec![0u8; 256];
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
+        .copy_from_slice(&k2);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32]
+        .copy_from_slice(&basepoint);
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note.initial_memory = initial_memory;
+    side_note.ristretto_mem_ops.push(RistrettoMemOp {
+        scalar_ptr,
+        point_ptr,
+        output_ptr,
+        ts,
+        scalar_bytes: k2,
+        point_bytes: basepoint,
+        out_bytes,
+        kind: ScalarMultKind::FixedBasepoint,
+    });
+    // Mismatch: comb_calls says K1, mem_ops says K2.
+    side_note
+        .ristretto_comb_calls
+        .push(RistrettoCombCall { scalar: k1 });
+    side_note.populate_ristretto_comb_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+    ];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect(
+            "scalar/memory mismatch harness: prove unexpectedly failed — \
+             constraints should still satisfy individually; verify is the \
+             gate that catches the lookup imbalance",
+        );
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!(
+            "scalar/memory mismatch harness: verify rejected for the wrong \
+             reason: {e:?}"
+        ),
+        Ok(()) => panic!(
+            "scalar/memory mismatch harness: verify accepted unexpectedly — \
+             scalar memory binding is structural only (regression)"
+        ),
+    }
+}
+
 /// Debug: ConsumerChip-isolated with EMPTY side_note (no calls).
 /// All cells zero, all gates zero, no real emissions.  Should prove +
 /// verify cleanly (open-chain trivially balanced at zero).  If this
