@@ -242,6 +242,15 @@ fn bench_security(log_size: u32, pow_bits: u32, log_blowup: u32, n_queries: usiz
 
     let config = PcsConfig { pow_bits, fri_config: FriConfig::new(0, log_blowup, n_queries, 1), lifting_log_size: None };
     let sec_bits = config.security_bits();
+    // Policy mirrors the under-test config so we exercise the algebraic
+    // verify path even on the dev-only / test-only sweeps (e.g.,
+    // pow_bits=5).  STANDARD policy would gate those out before the
+    // verifier sees the proof.
+    let policy = PcsPolicy {
+        min_pow_bits: config.pow_bits,
+        min_fri_queries: config.fri_config.n_queries,
+        min_fri_log_blowup: config.fri_config.log_blowup_factor,
+    };
 
     let t = std::time::Instant::now();
     let proof = prove_with_config(&mut side_note, config).expect("proving failed");
@@ -251,7 +260,7 @@ fn bench_security(log_size: u32, pow_bits: u32, log_blowup: u32, n_queries: usiz
     let proof_kb = proof_bytes.len() as f64 / 1024.0;
 
     let t = std::time::Instant::now();
-    verify(proof, &side_note).expect("verification failed");
+    verify_with_pcs_policy(proof, &side_note, &policy).expect("verification failed");
     let verify_time = t.elapsed();
 
     eprintln!(
