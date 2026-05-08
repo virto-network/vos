@@ -230,13 +230,13 @@ mod decode {
 
         // Constructor fields (optional — backward compat with old ELFs)
         let mut constructor = Vec::new();
-        if pos < data.len() {
-            if let Some(ctor_count) = read_u16(data, &mut pos) {
-                for _ in 0..ctor_count as usize {
-                    let fname = read_str(data, &mut pos)?;
-                    let fty = read_str(data, &mut pos)?;
-                    constructor.push(ParsedField { name: fname, ty: fty });
-                }
+        if pos < data.len()
+            && let Some(ctor_count) = read_u16(data, &mut pos)
+        {
+            for _ in 0..ctor_count as usize {
+                let fname = read_str(data, &mut pos)?;
+                let fty = read_str(data, &mut pos)?;
+                constructor.push(ParsedField { name: fname, ty: fty });
             }
         }
 

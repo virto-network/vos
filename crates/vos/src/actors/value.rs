@@ -106,14 +106,14 @@ impl From<Vec<String>> for Value { fn from(v: Vec<String>) -> Self { Value::List
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
-    Debug, Clone,
+    Debug, Clone, Default,
 )]
 #[rkyv(crate = rkyv)]
 pub struct Args(pub Vec<(String, Value)>);
 
 impl Args {
     pub fn new() -> Self {
-        Args(Vec::new())
+        Self::default()
     }
 
     pub fn with(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {

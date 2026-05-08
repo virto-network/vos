@@ -1297,10 +1297,10 @@ fn handle_swarm_event(
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "network: listening on");
-            if let Ok(mut v) = listen_addrs.lock() {
-                if !v.contains(&address) {
-                    v.push(address);
-                }
+            if let Ok(mut v) = listen_addrs.lock()
+                && !v.contains(&address)
+            {
+                v.push(address);
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -1752,29 +1752,26 @@ fn handle_gossipsub_event(
     event: gossipsub::Event,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
-    match event {
-        gossipsub::Event::Message { propagation_source, message, .. } => {
-            // Decode the published frame; expect Heads with a
-            // replication_id matching the topic. We use rep_id
-            // from the frame as the routing key (the topic's hex
-            // is derivable but the frame's bytes are
-            // authoritative).
-            let frame = match Frame::decode(&message.data) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(error = %e, "gossipsub: bad frame, dropping");
-                    return;
-                }
-            };
-            if let Frame::Heads { replication_id, .. } = frame {
-                if let Some(sender) = hint_senders.get(&replication_id) {
-                    let _ = sender.send(propagation_source);
-                }
-            } else {
-                warn!(?frame, "gossipsub: unexpected frame on sync topic");
+    if let gossipsub::Event::Message { propagation_source, message, .. } = event {
+        // Decode the published frame; expect Heads with a
+        // replication_id matching the topic. We use rep_id
+        // from the frame as the routing key (the topic's hex
+        // is derivable but the frame's bytes are
+        // authoritative).
+        let frame = match Frame::decode(&message.data) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "gossipsub: bad frame, dropping");
+                return;
             }
+        };
+        if let Frame::Heads { replication_id, .. } = frame {
+            if let Some(sender) = hint_senders.get(&replication_id) {
+                let _ = sender.send(propagation_source);
+            }
+        } else {
+            warn!(?frame, "gossipsub: unexpected frame on sync topic");
         }
-        _ => {}
     }
 }
 

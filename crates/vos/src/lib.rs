@@ -187,7 +187,7 @@ mod host_invoker {
         ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
             // Run the synchronous invoke up-front; the future just
             // wraps the already-resolved result.
-            let outcome = VosNode::invoke(*self, target, payload);
+            let outcome = VosNode::invoke(self, target, payload);
             async move {
                 match outcome {
                     Some(b) if b.is_empty() => Ok(Value::Unit),

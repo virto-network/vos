@@ -456,7 +456,7 @@ impl RaftRpcHandler for WorkerHandle {
                 leader_hint: snap.leader_hint,
             };
         }
-        if snap.members.iter().any(|p| *p == joiner_prefix) {
+        if snap.members.contains(&joiner_prefix) {
             // Already a voter — nothing to do; report the most
             // recent change as accepted with index 0 so the
             // caller doesn't loop. (`Accepted { joint_index = 0 }`

@@ -202,7 +202,7 @@ impl AgentConfig {
     }
 
     /// Convenience: derive a replication id from the agent's blob
-    /// + a logical name. Replicas with identical (blob, name)
+    /// plus a logical name. Replicas with identical (blob, name)
     /// automatically share an id without manifest coordination.
     pub fn auto_replication_id(mut self, name: &str) -> Self {
         let mut h = blake2b_simd::Params::new()

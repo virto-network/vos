@@ -1083,9 +1083,7 @@ where
     }
 
     async fn match_index_majority_floor(&self) -> Option<u64> {
-        if self.leader.is_none() {
-            return None;
-        }
+        self.leader.as_ref()?;
         // Score self by last_index (we replicate-to-self by
         // virtue of writing the log) and each peer by its
         // tracked match_index. The active config's
@@ -1169,14 +1167,14 @@ where
     // `active_config_index` to a compacted entry, so a future
     // joint auto-finalize requires a fresh leader-issued joint
     // ConfigChange.
-    if consult_persisted {
-        if let Some((current, joint_old)) = storage.active_config().await? {
-            return Ok(ConfigRecovery {
-                active: ActiveConfig { current, joint_old },
-                pending_joint: None,
-                active_config_index: None,
-            });
-        }
+    if consult_persisted
+        && let Some((current, joint_old)) = storage.active_config().await?
+    {
+        return Ok(ConfigRecovery {
+            active: ActiveConfig { current, joint_old },
+            pending_joint: None,
+            active_config_index: None,
+        });
     }
     Ok(ConfigRecovery {
         active: ActiveConfig::steady(cfg.members.clone()),
@@ -1381,13 +1379,13 @@ async fn handle_msg<N, S, T, C, R, A>(
             let _ = reply.send(WorkerSnapshot {
                 role: state.role,
                 current_term: state.meta.current_term,
-                voted_for: state.meta.voted_for.clone(),
+                voted_for: state.meta.voted_for,
                 last_log_index: state.storage.last_index(),
                 commit_index: state.meta.commit_index,
                 snap_last_index: state.storage.snap_last_index(),
                 members: state.effective_cfg.current.clone(),
                 joint_old: state.effective_cfg.joint_old.clone(),
-                leader_hint: state.seen_leader.clone(),
+                leader_hint: state.seen_leader,
             });
         }
         RaftMsg::Shutdown => unreachable!("handled in run_worker"),
@@ -1558,7 +1556,7 @@ where
     state.last_heartbeat_received = Some(state.clock.now());
     // Cache the leader for this term so a follower can redirect
     // misaddressed client requests via `WorkerSnapshot::leader_hint`.
-    state.seen_leader = Some(req.leader.clone());
+    state.seen_leader = Some(req.leader);
 
     let our_prev_term = match state.storage.term_at(req.prev_log_index).await {
         Ok(t) => t,
@@ -1793,18 +1791,17 @@ where
         meta_changed = true;
     }
 
-    if meta_changed {
-        if let Err(e) = state
+    if meta_changed
+        && let Err(e) = state
             .storage
             .commit_batch(WriteBatch {
                 meta: Some(state.meta.clone()),
                 ..Default::default()
             })
             .await
-        {
-            state.meta = meta_snapshot;
-            return Err(e);
-        }
+    {
+        state.meta = meta_snapshot;
+        return Err(e);
     }
 
     Ok(RequestVoteResp {
@@ -1916,7 +1913,7 @@ where
     state.last_heartbeat_received = Some(state.clock.now());
     // Treat the snapshot leader the same as an AppendEntries
     // sender — they're a current-term leader that just contacted us.
-    state.seen_leader = Some(req.leader.clone());
+    state.seen_leader = Some(req.leader);
 
     // Snapshot already covered by our local snap pointer — no-op.
     // Drop any in-flight buffer for it too.
@@ -2494,10 +2491,10 @@ async fn handle_read_index<N, S, T, C, R, A>(
     // against a prior-term commit_index, returning state from
     // before its election.
     let mut r = state.meta.commit_index;
-    if let Some(noop_idx) = state.current_term_first_index {
-        if noop_idx > r {
-            r = noop_idx;
-        }
+    if let Some(noop_idx) = state.current_term_first_index
+        && noop_idx > r
+    {
+        r = noop_idx;
     }
     state.pending_read_index.push((r, reply));
     // Trigger a fresh heartbeat round. The round's quorum-success
@@ -2601,7 +2598,7 @@ where
     // Self-as-leader: surface through `WorkerSnapshot::leader_hint`
     // so `vosx ps` and join-RPC handlers can answer "the leader
     // is us" without inspecting `role` separately.
-    state.seen_leader = Some(state.cfg.me.clone());
+    state.seen_leader = Some(state.cfg.me);
     // Remember the no-op's index so `read_index` blocks until
     // it commits — proves at least one current-term entry has
     // achieved quorum before any read can serve.
@@ -3189,7 +3186,7 @@ where
             .effective_cfg
             .joint_old
             .as_ref()
-            .map_or(true, |old| only_me_in(old))
+            .is_none_or(only_me_in)
 }
 
 #[cfg(test)]

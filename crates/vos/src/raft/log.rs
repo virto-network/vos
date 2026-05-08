@@ -325,6 +325,12 @@ impl RaftLog {
         }
     }
 
+    /// `true` when the log has zero entries on disk. Pairs with
+    /// [`len`] for the test assertions that need both.
+    pub fn is_empty(&self) -> Result<bool, CommitError> {
+        Ok(self.len()? == 0)
+    }
+
     /// Term of the entry at `index`, or `None` if the index is
     /// out of range. Index 0 is the implicit pre-log slot — both
     /// sides agree it has term 0, which lets a leader send the
