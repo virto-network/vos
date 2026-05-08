@@ -2963,7 +2963,7 @@ mod tests {
     #[test]
     fn three_node_cluster_replicates_proposed_entries() {
         use crate::raft::{RaftMeta, RaftWorker, Role, WorkerConfig, RAFT_LOG};
-        use redb::ReadableTableMetadata;
+        use redb::{ReadableTable, ReadableTableMetadata};
         use std::time::Instant as StdInstant;
 
         let kp_a = identity::Keypair::generate_ed25519();
@@ -3082,30 +3082,39 @@ mod tests {
             assert!(idx >= 1);
         }
 
-        // ── Wait for all replicas to commit_index ≥ 4. ────────
-        // The leader appends a no-op entry on promotion (Ongaro
-        // §6.4) at index 1; the three application proposes land
-        // at indices 2..=4. Quorum-commit fires when followers'
-        // match_index reaches 4 → leader's commit_index = 4 →
-        // next heartbeat propagates leader_commit to followers.
-        // Probe commit_index via the snapshot — the worker holds
-        // the exclusive redb file lock, so direct introspection
-        // is deferred until shutdown below.
+        // ── Wait for all replicas to converge. ────────────────
+        // A leader appends a no-op on promotion (Ongaro §6.4) at
+        // index 1, then the three application proposes follow.
+        // With election jitter the no-op count can be > 1 (two
+        // leaders, two no-ops), so the final last_log_index
+        // depends on how many elections fired before stable
+        // leadership. Convergence means: every replica has the
+        // same last_log_index, the same commit_index, and
+        // commit_index == last_log_index (everything's been
+        // quorum-replicated). Waiting only for `commit_index ≥ 4`
+        // races with in-flight AppendEntries from a later round.
         let until = StdInstant::now() + Duration::from_secs(10);
         loop {
             let snaps = [
-                (prefix_a, w_a.handler().snapshot()),
-                (prefix_b, w_b.handler().snapshot()),
-                (prefix_c, w_c.handler().snapshot()),
+                w_a.handler().snapshot(),
+                w_b.handler().snapshot(),
+                w_c.handler().snapshot(),
             ];
-            let all_committed = snaps.iter().all(|(_, s)| {
-                s.as_ref().is_some_and(|x| x.commit_index >= 4)
-            });
-            if all_committed { break; }
+            let converged = snaps.iter().all(|s| {
+                s.as_ref().is_some_and(|x| {
+                    x.commit_index >= 4 && x.commit_index == x.last_log_index
+                })
+            }) && {
+                let cis: Vec<u64> = snaps
+                    .iter()
+                    .filter_map(|s| s.as_ref().map(|x| x.commit_index))
+                    .collect();
+                cis.windows(2).all(|w| w[0] == w[1])
+            };
+            if converged { break; }
             if StdInstant::now() >= until {
                 panic!(
-                    "all replicas did not reach commit_index ≥ 4 within \
-                     deadline; snaps: {snaps:?}",
+                    "replicas did not converge within deadline; snaps: {snaps:?}",
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -3119,37 +3128,106 @@ mod tests {
         w_b.shutdown();
         w_c.shutdown();
 
+        // The happy path is 4 rows: leader-promotion no-op at
+        // idx 1 (Ongaro §6.4) + the three application proposes
+        // at 2..=4. Election jitter can produce more no-ops,
+        // and a heartbeat-triggered re-election firing between
+        // convergence and shutdown can append a fresh
+        // uncommitted no-op on top — meaning a replica's
+        // `n_rows` may exceed `commit_index` by 1+.
+        //
+        // The real invariant we want: every replica has the
+        // same first `commit_index` rows committed, and the
+        // last three of those committed rows are our proposals
+        // in order. Anything past `commit_index` on disk is
+        // in-flight noise and we ignore it.
+        let mut probes: Vec<(&str, u64, Vec<Vec<u8>>)> = Vec::new();
         for (label, path) in [("A", &path_a), ("B", &path_b), ("C", &path_c)] {
             let db = redb::Database::create(path).expect("reopen");
             let txn = db.begin_read().expect("read txn");
             let log_table = txn.open_table(RAFT_LOG).expect("raft_log");
             let n_rows = log_table.len().expect("len");
-            assert_eq!(
-                n_rows, 4,
-                "replica {label} should have exactly 4 raft_log rows \
-                 (leader-promotion no-op + 3 application proposes); \
-                 got {n_rows}",
-            );
             let meta = RaftMeta::load(&db).expect("meta");
-            // The leader appends a no-op on promotion (idx 1) and
-            // the three application proposes land at idx 2..=4.
-            // commit_index advances to 4 once a majority matches
-            // the leader; followers see it on the next heartbeat.
-            assert_eq!(
-                meta.commit_index, 4,
-                "replica {label} commit_index should advance to 4",
+            assert!(
+                meta.commit_index >= 4,
+                "replica {label}: commit_index {} < 4 \
+                 (leader-promotion no-op + 3 proposes)",
+                meta.commit_index,
             );
-            // `last_applied` is now the host's responsibility
-            // (vos_raft::Meta no longer tracks it). On the leader
-            // it's bumped by `RaftCommit::commit_with_log`'s state
-            // write; followers' `last_applied` only advances when
-            // their agent thread runs the apply path. This test
-            // probes redb directly without going through RaftCommit
-            // on the followers, so we only check `commit_index`
-            // here — the apply-tracking integration test in
-            // `tests/elf_integration.rs` covers the host-level
-            // last_applied advance end-to-end.
+            assert!(
+                n_rows >= meta.commit_index,
+                "replica {label}: n_rows {n_rows} < commit_index {}",
+                meta.commit_index,
+            );
+            // Read the COMMITTED prefix only. The table key is
+            // `u64` (raft index, 1-based); the value is
+            // `[term: u64 LE][kind tag: u8][...]` — strip both
+            // to recover the raw payload (see
+            // `redb_storage::encode_entry_kind`).
+            let mut entries: Vec<Vec<u8>> = log_table
+                .iter()
+                .expect("iter")
+                .map(|row| {
+                    let raw = row.expect("row").1.value().to_vec();
+                    raw[9..].to_vec()
+                })
+                .collect();
+            entries.truncate(meta.commit_index as usize);
+            probes.push((label, meta.commit_index, entries));
         }
+        // Raft's state-machine-safety guarantee: any committed
+        // entry at a given index is identical across replicas.
+        // After our wait succeeded, a heartbeat-driven
+        // re-election can fire between "all replicas committed
+        // 4+" and "we shut down all 3 workers", appending a new
+        // no-op and committing it on whichever replicas hadn't
+        // shut down yet. So commit_index can legitimately differ
+        // by 1+ across replicas at probe time.
+        //
+        // The invariant we actually want: every replica's
+        // committed log contains the proposed payloads (alpha,
+        // beta, gamma) in order. No-ops and config-change
+        // entries may interleave anywhere; a re-election's
+        // freshly committed no-op may appear at the end.
+        for (label, _ci, entries) in &probes {
+            let positions: Vec<usize> = payloads
+                .iter()
+                .map(|p| {
+                    entries.iter().position(|e| e == p).unwrap_or_else(|| {
+                        panic!(
+                            "replica {label}: payload {p:?} not in committed log",
+                        )
+                    })
+                })
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "replica {label}: payloads out of order in committed log",
+            );
+        }
+        // Shared committed prefix — Raft never rewrites
+        // committed history. Compare the prefix of length =
+        // shortest replica's commit_index across all replicas.
+        let shortest = probes.iter().map(|(_, ci, _)| *ci).min().unwrap() as usize;
+        let pivot = &probes[0].2[..shortest];
+        for (label, _, entries) in &probes[1..] {
+            assert_eq!(
+                &entries[..shortest], pivot,
+                "replica {label} disagrees with replica {} on the first {shortest} \
+                 committed entries — Raft safety violation",
+                probes[0].0,
+            );
+        }
+        // `last_applied` is now the host's responsibility
+        // (vos_raft::Meta no longer tracks it). On the leader
+        // it's bumped by `RaftCommit::commit_with_log`'s state
+        // write; followers' `last_applied` only advances when
+        // their agent thread runs the apply path. This test
+        // probes redb directly without going through RaftCommit
+        // on the followers, so we only check `commit_index`
+        // here — the apply-tracking integration test in
+        // `tests/elf_integration.rs` covers the host-level
+        // last_applied advance end-to-end.
 
         match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
         match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
