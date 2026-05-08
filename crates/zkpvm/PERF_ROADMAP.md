@@ -347,9 +347,30 @@ post-step-8 ~0.79 s MOBILE.
 
 **Effort estimate**: 3-5 days including audit + bench.  Multi-commit;
 natural batches:
-1. Add inv_sqrt + output_bytes witness columns to side_note +
-   consumer chip column layout.
-2. Implement compress chain rows 1-12 (the algebra prologue).
+1. **DONE (commit 14b9d69)** — side-note + host-side compress
+   reference.  `RistrettoCombCall.out_bytes` populated by
+   `ingest_ristretto_boundary` from `rec.output`.  New
+   `chips/ristretto/compress.rs` exposes `SQRT_M1`,
+   `INVSQRT_A_MINUS_D`, `compute_compress_witness(p) ->
+   CompressWitness`.  Cross-checked against
+   `RistrettoPoint::compress()` byte-for-byte (4 unit tests
+   GREEN).  `chip_isolated` 11/11 + `phase2_alu` 94/94 stay green
+   (no chip yet — this is pure scaffolding).
+2. Implement compress chain rows 1-12 (the algebra prologue) as
+   either an extension of `RistrettoFixedBaseConsumerChip` (Path A)
+   or a sibling `RistrettoCombCompressChip` (Path B).
+   `compute_compress_witness` already returns every intermediate
+   the chain needs to pin (`u1, u2, u2_sq, u1_u2_sq, inv_sqrt,
+   inv_sqrt_sq, i1, i2, i2_t, z_inv, t_z_inv, ...`); chip witness
+   fill consumes it.  **Inter-chip binding (consumer→compress)**:
+   need a new relation tying compress-chain row 1-4 IsInput
+   rows' `out` to the consumer chip's window-63 final-Acc rows
+   (the last 4 mul rows of window 63's 18-row add chain — i.e.
+   X3 = E·F, Y3 = G·H, T3 = E·H, Z3 = F·G).  The design sketch
+   above mistakenly calls these "IsInput coord rows for window
+   63" — those rows hold T[63][k_63] (the looked-up table entry),
+   NOT the running accumulator's final coords.  Final Acc lives
+   in the LAST 4 mul rows of the per-window 18-row add block.
 3. Implement sign-checks + conditional rows.
 4. Wire up output-byte memory producer + RistrettoEcallChip skip.
 5. Add chip-isolated harness + bench validation.
