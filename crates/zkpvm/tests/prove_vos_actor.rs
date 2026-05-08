@@ -593,7 +593,12 @@ fn debug_blake2s_prefix() {
     ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
     match zkpvm::prove_with_config(&mut sn, config) {
         Ok(proof) => {
-            verify(proof, &sn).expect("verify");
+            // Use a permissive policy matching the test config —
+            // STANDARD floor would trip on pow_bits=5 / fri_log_blowup=0.
+            let policy = zkpvm::PcsPolicy {
+                min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+            };
+            zkpvm::verify_with_pcs_policy(proof, &sn, &policy).expect("verify");
             eprintln!("  PASS!");
         }
         Err(e) => { eprintln!("  FAIL: {e}"); }
