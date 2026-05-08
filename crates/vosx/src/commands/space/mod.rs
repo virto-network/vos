@@ -70,8 +70,6 @@ pub enum SpaceCommand {
     },
     /// List spaces in the local index.
     List,
-    /// Alias of `list`.
-    Ls,
     /// Show details for a single space (by id-prefix or name).
     Info {
         /// Space id (full hex) or name. If omitted, shows the
@@ -267,7 +265,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             registry,
             data_dir,
         }),
-        SpaceCommand::List | SpaceCommand::Ls => list::run(),
+        SpaceCommand::List => list::run(),
         SpaceCommand::Info { space } => info::run(space.as_deref()),
         SpaceCommand::Join {
             bootstrap,
