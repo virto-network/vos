@@ -474,7 +474,10 @@ fn harness_ristretto_comb_balance() {
     for i in 0..32 {
         scalar[i] = (i as u8).wrapping_mul(11);
     }
-    side_note.ristretto_comb_calls.push(RistrettoCombCall { scalar });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar,
+        out_bytes: [0u8; 32],
+    });
     side_note.populate_ristretto_comb_counts();
 
     let config = PcsConfig {
@@ -596,7 +599,7 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     });
     side_note
         .ristretto_comb_calls
-        .push(RistrettoCombCall { scalar });
+        .push(RistrettoCombCall { scalar, out_bytes });
     side_note.populate_ristretto_comb_counts();
 
     let config = PcsConfig {
@@ -712,7 +715,7 @@ fn harness_ristretto_fixed_base_three_calls() {
         });
         side_note
             .ristretto_comb_calls
-            .push(RistrettoCombCall { scalar });
+            .push(RistrettoCombCall { scalar, out_bytes });
     }
     side_note.initial_memory = initial_memory;
     side_note.populate_ristretto_comb_counts();
@@ -833,7 +836,10 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
     // Mismatch: comb_calls says K1, mem_ops says K2.
     side_note
         .ristretto_comb_calls
-        .push(RistrettoCombCall { scalar: k1 });
+        .push(RistrettoCombCall {
+            scalar: k1,
+            out_bytes,
+        });
     side_note.populate_ristretto_comb_counts();
 
     let config = PcsConfig {

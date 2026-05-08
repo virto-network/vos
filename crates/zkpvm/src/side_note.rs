@@ -241,14 +241,29 @@ pub struct MulEntry {
 }
 
 /// Session 2.1: one fixed-base scalar-mult call driving the
-/// `RistrettoFixedBaseConsumerChip` trace.  Just the scalar bytes
-/// today — output binding to the ECALL boundary lands in step 8.
+/// `RistrettoFixedBaseConsumerChip` trace.
+///
+/// Step 8 (scalar binding): the `scalar` bytes are pinned to PVM
+/// memory by `RistrettoCombScalarBoundaryChip`.
+///
+/// R1e-bis (output binding, in progress): `out_bytes` will drive the
+/// compress chain's final-step memory producer once
+/// `RistrettoCombCompressChip` lands.  Today the field is captured at
+/// `ingest_ristretto_boundary` time but not yet consumed by any chip
+/// — populating it ahead of the compress chip's wiring keeps the
+/// public surface stable while the chip work proceeds in subsequent
+/// commits.
 #[derive(Clone, Debug)]
 pub struct RistrettoCombCall {
     /// 32 LE bytes; the scalar `k` to multiply against the fixed
     /// basepoint G.  Decomposes into 64 4-bit windows that drive the
     /// per-window `RistrettoCombLookupElements` lookups.
     pub scalar: [u8; 32],
+    /// 32 LE bytes; the canonical compressed Ristretto encoding of
+    /// `k · G`.  Equals `compress(k · G)` per RFC 9496.  Drives the
+    /// compress chip's memory producer at `(output_ptr+i, byte, ts,
+    /// is_write=1)` once R1e-bis lands.
+    pub out_bytes: [u8; 32],
 }
 
 impl SideNote {
@@ -465,7 +480,10 @@ impl SideNote {
             match rec.kind {
                 ScalarMultKind::FixedBasepoint => {
                     self.ristretto_comb_calls
-                        .push(RistrettoCombCall { scalar: rec.scalar });
+                        .push(RistrettoCombCall {
+                            scalar: rec.scalar,
+                            out_bytes: rec.output,
+                        });
                 }
                 ScalarMultKind::Variable => {
                     let scalar_row = self.ristretto_field_rows.len() as u16;

@@ -38,6 +38,8 @@ pub mod witness;
 pub mod point;
 #[cfg(feature = "prover")]
 pub mod comb_table;
+#[cfg(feature = "prover")]
+pub mod compress;
 pub mod field_op_constraints;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
