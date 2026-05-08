@@ -88,17 +88,25 @@ use crate::side_note::SideNote;
 
 pub struct RistrettoCombCompressChip;
 
+/// Chip-wide boundary input rows at the start of the trace.  Layout:
+///   0 — SQRT_M1 (used by iX, iY)
+///   1 — INVSQRT_A_MINUS_D (used by enchanted)
+pub const N_BOUNDARY_INPUTS: usize = 2;
+const ROW_BD_SQRT_M1: u16 = 0;
+const ROW_BD_INVSQRT_AMD: u16 = 1;
+
 /// Number of rows the chip lays down per fixed-basepoint scalar-mult
 /// call.  Layout (offsets within the call):
-///   0..=3  — IsInput X, Y, Z, T (final Acc)
-///       4  — IsInput inv_sqrt witness
-///   5..=16 — 12 algebra rows (rows 1-12 of the design sketch)
-pub const ROWS_PER_CALL: usize = 17;
+///   0..=3   — IsInput X, Y, Z, T (final Acc)
+///       4   — IsInput inv_sqrt witness
+///   5..=16  — 12 algebra rows (rows 1-12 of the design sketch)
+///  17..=20  — 4 algebra rows (sign-check prep): T·z_inv, iX, iY,
+///             enchanted = i1·INVSQRT_A_MINUS_D
+pub const ROWS_PER_CALL: usize = 21;
 
 // IsInput / algebra row offsets within a per-call block.
-// Some constants are unused in Batch 2 but consumed by later batches
-// (the unity check on row+12, the z_inv refs from rows 13+ that wire
-// against the sign-check chain in Batch 3).
+// Some constants are unused in current batches but consumed by later
+// ones (the conditional rows in Batch 3d/3e reference rows 17/18/19/20).
 #[allow(dead_code)]
 const ROW_IN_X: usize = 0;
 #[allow(dead_code)]
@@ -133,6 +141,14 @@ const ROW_I2: usize = 14;
 const ROW_I2_T: usize = 15;
 #[allow(dead_code)]
 const ROW_Z_INV: usize = 16;
+#[allow(dead_code)]
+const ROW_T_Z_INV: usize = 17;
+#[allow(dead_code)]
+const ROW_IX: usize = 18;
+#[allow(dead_code)]
+const ROW_IY: usize = 19;
+#[allow(dead_code)]
+const ROW_ENCHANTED: usize = 20;
 
 /// Per-row column layout.  Mirrors `RistrettoFixedBaseConsumerChip`'s
 /// FieldOp witness columns + source-row threading metadata.  No
@@ -289,11 +305,21 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
     use crate::chips::ristretto::comb_table::{
         ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
     };
-    use crate::chips::ristretto::compress::compute_compress_witness;
+    use crate::chips::ristretto::compress::{
+        compute_compress_witness, invsqrt_a_minus_d, sqrt_m1,
+    };
     use crate::chips::ristretto::point::{point_add_rows, point_identity, ExtendedPoint};
     use crate::chips::ristretto::witness::{fill_add, fill_input, fill_mul, fill_sub};
 
     let mut rows: Vec<CompressRow> = Vec::new();
+
+    // ── Chip-wide boundary inputs (rows 0..N_BOUNDARY_INPUTS) ──
+    // SQRT_M1 and INVSQRT_A_MINUS_D are constants used by every
+    // call's iX/iY/enchanted rows.  Push them once at the trace's
+    // start; per-call rows reference them by absolute row id.
+    rows.push(CompressRow { field: fill_input(*sqrt_m1()) });
+    rows.push(CompressRow { field: fill_input(*invsqrt_a_minus_d()) });
+    debug_assert_eq!(rows.len(), N_BOUNDARY_INPUTS);
 
     let table = CombTable::from_base(&ed25519_basepoint_extended());
 
@@ -427,6 +453,36 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.b_source_row = r_i2t;
         debug_assert_eq!(fr.out, w.z_inv);
         rows.push(CompressRow { field: fr });
+        let r_z_inv = base + ROW_Z_INV as u16;
+
+        // row+17: T · z_inv (sign source — its byte 0 LSB feeds the
+        // rotate flag witnessed by Batch 3c's first IsSignCheck row).
+        let mut fr = fill_mul(acc.t, w.z_inv);
+        fr.a_source_row = r_t;
+        fr.b_source_row = r_z_inv;
+        debug_assert_eq!(fr.out, w.t_z_inv);
+        rows.push(CompressRow { field: fr });
+
+        // row+18: iX = X · SQRT_M1
+        let mut fr = fill_mul(acc.x, *sqrt_m1());
+        fr.a_source_row = r_x;
+        fr.b_source_row = ROW_BD_SQRT_M1;
+        debug_assert_eq!(fr.out, w.i_x);
+        rows.push(CompressRow { field: fr });
+
+        // row+19: iY = Y · SQRT_M1
+        let mut fr = fill_mul(acc.y, *sqrt_m1());
+        fr.a_source_row = r_y;
+        fr.b_source_row = ROW_BD_SQRT_M1;
+        debug_assert_eq!(fr.out, w.i_y);
+        rows.push(CompressRow { field: fr });
+
+        // row+20: enchanted = i1 · INVSQRT_A_MINUS_D
+        let mut fr = fill_mul(w.i1, *invsqrt_a_minus_d());
+        fr.a_source_row = r_i1;
+        fr.b_source_row = ROW_BD_INVSQRT_AMD;
+        debug_assert_eq!(fr.out, w.enchanted_denominator);
+        rows.push(CompressRow { field: fr });
     }
 
     finalize_producer_multiplicities(&mut rows);
@@ -483,7 +539,17 @@ fn log_size_for(n_rows: usize) -> u32 {
 
 #[cfg(feature = "prover")]
 fn compress_n_rows(side_note: &SideNote) -> usize {
-    side_note.ristretto_comb_calls.len() * ROWS_PER_CALL
+    // Always emit the chip-wide boundary input rows, even with zero
+    // calls — the FieldOp algebra still pins their final-form < p
+    // closure and the chip-local register-file producer side keeps
+    // a deterministic shape (consumers from per-call rows
+    // 18/19 reference ROW_BD_SQRT_M1, etc.).  log_size_for handles
+    // the 0-call case via the LOG_N_LANES floor.
+    let n_calls = side_note.ristretto_comb_calls.len();
+    if n_calls == 0 {
+        return 0;
+    }
+    N_BOUNDARY_INPUTS + n_calls * ROWS_PER_CALL
 }
 
 impl BuiltInComponent for RistrettoCombCompressChip {
@@ -685,7 +751,14 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
             let byte_idx_arr: [u8; 32] = core::array::from_fn(|k| k as u8);
             trace.fill_columns_bytes(row, &byte_idx_arr, PreprocessedColumn::ByteIdx);
-            let is_unity = row < real_n_rows && row % ROWS_PER_CALL == ROW_UNITY;
+            // Per-call blocks start at offset N_BOUNDARY_INPUTS.  Row
+            // is a unity check iff it sits at the unity offset within
+            // a real per-call block — guards on (a) being beyond the
+            // boundary inputs, (b) within the real-row range, and
+            // (c) at the per-call-block-relative ROW_UNITY position.
+            let is_unity = row >= N_BOUNDARY_INPUTS
+                && row < real_n_rows
+                && (row - N_BOUNDARY_INPUTS) % ROWS_PER_CALL == ROW_UNITY;
             trace.fill_columns(row, is_unity as u8, PreprocessedColumn::IsUnityCheck);
         }
         trace.finalize_bit_reversed()
