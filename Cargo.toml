@@ -2,6 +2,12 @@
 resolver = "3"
 members = [
     "crates/*",
+    # zkpvm-{precompiles,derive,verifier} live nested inside the
+    # zkpvm crate's directory tree (the `crates/*` glob is one
+    # level deep).
+    "crates/zkpvm/precompiles",
+    "crates/zkpvm/derive",
+    "crates/zkpvm/verifier",
     "examples/workers/*",
 ]
 exclude = [
@@ -50,8 +56,8 @@ codegen-units = 1
 [workspace.dependencies]
 # Internal crates
 zkpvm = { path = "crates/zkpvm" }
-zkpvm-derive = { path = "crates/zkpvm-derive" }
-zkpvm-verifier = { path = "crates/zkpvm-verifier" }
+zkpvm-derive = { path = "crates/zkpvm/derive" }
+zkpvm-verifier = { path = "crates/zkpvm/verifier" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
 # Stwo — Phase G of the v2.x migration: pinned to upstream HEAD as of

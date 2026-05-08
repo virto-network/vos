@@ -17,7 +17,7 @@ blake2 = { version = "0.10", default-features = false }
 # Step 1 verification: depend on zkpvm-precompiles (no_std, no
 # host-fallback feature) so the on-target inline-asm path
 # compiles for riscv64em-javm.
-zkpvm-precompiles = { path = "../../../crates/zkpvm-precompiles" }
+zkpvm-precompiles = { path = "../../../crates/zkpvm/precompiles" }
 
 [profile.release]
 opt-level = "s"

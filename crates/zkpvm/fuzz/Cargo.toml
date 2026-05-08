@@ -18,7 +18,7 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 zkpvm = { path = ".." }
-zkpvm-verifier = { path = "../../zkpvm-verifier" }
+zkpvm-verifier = { path = "../verifier" }
 
 # Skip the test profile's default panic strategy override;
 # libfuzzer-sys requires panic=abort on its own targets.
