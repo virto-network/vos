@@ -954,6 +954,26 @@ fn handle_refine_hostcall(
             }
         }
         hostcall::OUTPUT | hostcall::CHECKPOINT => (error::HOST_OK, 0),
+        crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+            // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B
+            // in/out), a1=m_ptr (128B in), a2=t_low (counter low
+            // 64 bits), a3=f flag.
+            let h_ptr = a0 as u32;
+            let m_ptr = a1 as u32;
+            let t_low = a2;
+            let f_flag = a3 != 0;
+            let h_bytes = kread(kernel, h_ptr, 64);
+            let m_bytes = kread(kernel, m_ptr, 128);
+            if h_bytes.len() != 64 || m_bytes.len() != 128 {
+                (error::HOST_WHAT, 0)
+            } else {
+                let mut h: [u8; 64] = h_bytes.try_into().unwrap();
+                let m: [u8; 128] = m_bytes.try_into().unwrap();
+                crate::crypto::blake2b_compress(&mut h, &m, t_low as u128, f_flag);
+                kwrite(kernel, h_ptr, &h);
+                (error::HOST_OK, 0)
+            }
+        }
         hostcall::INVOKE => {
             let result = handle_invoke(
                 kernel,
