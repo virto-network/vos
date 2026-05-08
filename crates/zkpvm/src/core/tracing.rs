@@ -520,14 +520,19 @@ impl TracingPvm {
 
     /// Step 18: scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
     fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
-        // Same off-by-three bug as handle_blake2b_ecall.  Left as-is until
-        // a holistic fix.
-        let a_ptr_u = self.pvm.registers[10] as usize;
-        let b_ptr_u = self.pvm.registers[11] as usize;
-        let output_ptr_u = self.pvm.registers[12] as usize;
-        let a_ptr = self.pvm.registers[10] as u32;
-        let b_ptr = self.pvm.registers[11] as u32;
-        let output_ptr = self.pvm.registers[12] as u32;
+        // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  The
+        // shim's `in("a0") a_ptr, in("a1") b_ptr, in("a2") output_ptr`
+        // routes pointers to those PVM registers.  Pre-fix the handler
+        // read φ[10/11/12] (= a3/a4/a5) and saw shim's `in("a3") 0u64,
+        // in("a4") 0u64, in("a5") VOS_OBJECT_CAP` padding.  Same
+        // off-by-three pattern as the other ECALL handlers; no
+        // CpuChip-side binding tuple, so handler-only fix.
+        let a_ptr_u = self.pvm.registers[7] as usize;
+        let b_ptr_u = self.pvm.registers[8] as usize;
+        let output_ptr_u = self.pvm.registers[9] as usize;
+        let a_ptr = self.pvm.registers[7] as u32;
+        let b_ptr = self.pvm.registers[8] as u32;
+        let output_ptr = self.pvm.registers[9] as u32;
 
         let mut a_bytes = [0u8; 32];
         let mut b_bytes = [0u8; 32];

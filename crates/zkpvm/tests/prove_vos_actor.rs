@@ -2206,7 +2206,8 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = a_addr; regs[11] = b_addr; regs[12] = output_addr;
+    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    regs[7] = a_addr; regs[8] = b_addr; regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
@@ -2257,7 +2258,8 @@ fn prove_scalar_mul_then_add_mod_l() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = a_addr; regs[11] = b_addr; regs[12] = out_addr;
+    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    regs[7] = a_addr; regs[8] = b_addr; regs[9] = out_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
@@ -2411,7 +2413,8 @@ fn prove_scalar_mul_chained_add() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = a_addr; regs[11] = b_addr; regs[12] = out_addr;
+    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    regs[7] = a_addr; regs[8] = b_addr; regs[9] = out_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
