@@ -20,6 +20,9 @@ pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) query: String,
+    /// Lower-case header names paired with their values. Capped at
+    /// `limits::MAX_REQUEST_HEADERS` by the wire-side parser.
+    pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
 }
 

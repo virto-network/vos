@@ -1527,6 +1527,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "serde_urlencoded",
+ "subtle",
  "tokio",
  "vos",
 ]

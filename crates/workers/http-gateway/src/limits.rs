@@ -16,3 +16,9 @@ pub(crate) const MAX_CONCURRENT_CONNS: usize = 1024;
 /// connection tasks to the actor handler. Once full, connection tasks
 /// fail-fast with 503 (Retry-After) instead of growing memory.
 pub(crate) const JOB_QUEUE_CAP: usize = 256;
+
+/// Hard cap on the number of headers we copy out of an incoming
+/// request. Hyper / h3 already enforce per-header and total-size
+/// limits; this is a belt-and-suspenders guard against an attacker
+/// who somehow stuffs a many-header request through.
+pub(crate) const MAX_REQUEST_HEADERS: usize = 64;

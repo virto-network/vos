@@ -22,7 +22,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
-use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS};
+use crate::config;
+use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS};
 use crate::runtime;
 use crate::routing::handle_admin;
 use crate::state::Inner;
@@ -38,11 +39,12 @@ pub(crate) fn spawn(
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> IoResult<()> {
+    let bind = config::bind_ip();
     runtime::spawn_on_thread(format!("http-gateway-rt:{port}"), move |ready_tx| async move {
-        let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        let listener = match TcpListener::bind((bind, port)).await {
             Ok(l) => l,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("bind 0.0.0.0:{port}: {e}")));
+                let _ = ready_tx.send(Err(format!("bind {bind}:{port}: {e}")));
                 return;
             }
         };
@@ -110,6 +112,17 @@ async fn serve_request(
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .take(MAX_REQUEST_HEADERS)
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
 
     // `Limited` aborts the body stream once `MAX_BODY_BYTES` is
     // exceeded, so an attacker can't OOM us with a huge payload.
@@ -123,7 +136,7 @@ async fn serve_request(
         }
     };
 
-    let our_req = Request { method, path, query, body };
+    let our_req = Request { method, path, query, headers, body };
 
     if let Some(response) = handle_admin(&our_req, &inner) {
         return into_hyper(response);

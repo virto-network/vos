@@ -21,7 +21,8 @@ use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
 use crate::HttpGateway;
-use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS};
+use crate::config;
+use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS};
 use crate::routing::handle_admin;
 use crate::runtime::{self, serve_with};
 use crate::state::Inner;
@@ -40,14 +41,8 @@ fn spawn(
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> IoResult<()> {
+    let addr = SocketAddr::new(config::bind_ip(), port);
     runtime::spawn_on_thread(format!("http-gateway-h3:{port}"), move |ready_tx| async move {
-        let addr: SocketAddr = match format!("0.0.0.0:{port}").parse() {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("addr parse: {e}")));
-                return;
-            }
-        };
         let endpoint = match build_endpoint(addr) {
             Ok(ep) => ep,
             Err(e) => {
@@ -186,10 +181,22 @@ async fn handle_request(
     let response = if over_limit {
         Response::text(413, format!("body exceeds {MAX_BODY_BYTES} bytes"))
     } else {
+        let headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .take(MAX_REQUEST_HEADERS)
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+            })
+            .collect();
         let our_req = Request {
             method: req.method().as_str().to_string(),
             path: req.uri().path().to_string(),
             query: req.uri().query().unwrap_or("").to_string(),
+            headers,
             body,
         };
 

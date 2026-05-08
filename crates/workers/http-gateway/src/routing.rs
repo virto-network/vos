@@ -20,6 +20,7 @@ use vos::actors::context::ServiceId;
 use vos::actors::value::{Msg, Value};
 
 use crate::HttpGateway;
+use crate::config::{admin_token, auth_token, ct_eq, header_value};
 use crate::json::{parse_flat_json, value_to_json};
 use crate::state::{Inner, status_json};
 use crate::types::{Job, Request, Response};
@@ -46,6 +47,14 @@ pub(crate) async fn drain_jobs(
 }
 
 async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response {
+    if let Some(expected) = auth_token() {
+        let provided = header_value(&req.headers, "authorization")
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+        if !provided.is_some_and(|t| ct_eq(t.trim(), &expected)) {
+            return Response::text(401, "unauthorized");
+        }
+    }
+
     let Some((agent, method)) = split_path(&req.path) else {
         return Response::text(400, "expected /<agent>/<method>");
     };
@@ -70,11 +79,23 @@ async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response 
 /// Direct admin endpoints — bypass `ctx.ask` so they work even while
 /// `serve()` is the only message in flight on the worker.
 ///
+/// Auth: when `HTTP_GATEWAY_ADMIN_TOKEN` is unset, the gateway returns
+/// 404 for the entire `/__admin/*` namespace so its existence isn't
+/// even disclosed. When set, the request must carry a matching
+/// `X-Admin-Token` header (constant-time compared).
+///
 /// - `GET  /__admin/status` → JSON snapshot
 /// - `POST /__admin/stop`   → set the stop flag, reply 204
 pub(crate) fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
     if !req.path.starts_with("/__admin/") {
         return None;
+    }
+    let Some(expected) = admin_token() else {
+        return Some(Response::text(404, "not found"));
+    };
+    let provided = header_value(&req.headers, "x-admin-token");
+    if !provided.is_some_and(|t| ct_eq(t, &expected)) {
+        return Some(Response::text(401, "unauthorized"));
     }
     Some(match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/__admin/status") => Response::json(200, status_json(inner).into_bytes()),

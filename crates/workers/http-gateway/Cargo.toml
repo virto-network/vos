@@ -41,6 +41,9 @@ http-body-util = "0.1"
 bytes = "1"
 serde_json = "1"
 serde_urlencoded = "0.7"
+# Constant-time byte comparison for token checks. Tiny dep, also
+# in the transitive tree via rustls/ring on the http3 build.
+subtle = "2"
 # HTTP/3 stack — only pulled in when `feature = "http3"`. Pre-1.0
 # crates are exact about minor versions because the h3/quinn/rustls
 # trio is tightly coupled.

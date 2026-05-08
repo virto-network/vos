@@ -49,11 +49,28 @@
 //!   flight).
 //! - `GET /__admin/status` — JSON snapshot.
 //!
+//! Both admin routes require `X-Admin-Token` matching
+//! `HTTP_GATEWAY_ADMIN_TOKEN`; with the env var unset, the entire
+//! `/__admin/*` namespace returns 404.
+//!
 //! When vos exposes worker self-pumping, `serve*` can become a
 //! non-blocking bootstrap and the actor messages will work mid-flight.
+//!
+//! ## Operator config (env vars)
+//!
+//! | Var                          | Default      | Effect                                                            |
+//! |------------------------------|--------------|-------------------------------------------------------------------|
+//! | `HTTP_GATEWAY_BIND_ADDR`     | `127.0.0.1`  | Bind IP for both protocols. Set to `0.0.0.0` for public bind.     |
+//! | `HTTP_GATEWAY_AUTH_TOKEN`    | (unset)      | When set, every request needs `Authorization: Bearer <token>`.    |
+//! | `HTTP_GATEWAY_ADMIN_TOKEN`   | (unset)      | When set, `/__admin/*` requires `X-Admin-Token: <token>`. Else 404.|
+//!
+//! With both tokens unset and the default loopback bind, the gateway
+//! is reachable only from the local host and dispatch is open. A
+//! public deployment **must** set both tokens and the bind addr.
 
 use vos::prelude::*;
 
+mod config;
 mod hyper_io;
 mod json;
 mod limits;

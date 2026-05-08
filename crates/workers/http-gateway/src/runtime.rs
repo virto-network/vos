@@ -18,6 +18,7 @@ use std::thread;
 use vos::log;
 
 use crate::HttpGateway;
+use crate::config;
 use crate::limits::JOB_QUEUE_CAP;
 use crate::routing::drain_jobs;
 use crate::state::{Inner, inner, now_unix};
@@ -74,7 +75,7 @@ where
 
     let already = inner.bound_port.load(Ordering::Relaxed);
     if already != 0 {
-        return format!("already listening on 0.0.0.0:{already}");
+        return format!("already listening on port {already}");
     }
     inner.stop.store(false, Ordering::Relaxed);
 
@@ -85,7 +86,18 @@ where
     }
     inner.bound_port.store(port, Ordering::Relaxed);
     inner.started_unix.store(now_unix(), Ordering::Relaxed);
-    log::info!("http-gateway: listening on 0.0.0.0:{port} ({proto})");
+    let bind = config::bind_ip();
+    log::info!("http-gateway: listening on {bind}:{port} ({proto})");
+    if config::auth_token().is_none() {
+        log::warn!(
+            "http-gateway: HTTP_GATEWAY_AUTH_TOKEN not set — dispatch is open to anyone reachable on {bind}:{port}"
+        );
+    }
+    if config::admin_token().is_none() {
+        log::info!(
+            "http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled"
+        );
+    }
 
     let stop_msg = drain_jobs(&job_rx, &inner, ctx).await;
 
