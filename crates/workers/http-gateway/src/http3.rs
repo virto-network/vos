@@ -74,7 +74,7 @@ fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let (cert_chain, key_der) = match config::tls_paths() {
-        Some((cert_path, key_path)) => load_pem(&cert_path, &key_path)?,
+        Some((cert_path, key_path)) => load_pem(cert_path, key_path)?,
         None => {
             log::warn!(
                 "http-gateway: no HTTP_GATEWAY_TLS_CERT/KEY — using self-signed `localhost` cert (dev only)"

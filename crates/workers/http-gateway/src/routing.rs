@@ -50,7 +50,7 @@ async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response 
     if let Some(expected) = auth_token() {
         let provided = header_value(&req.headers, "authorization")
             .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
-        if !provided.is_some_and(|t| ct_eq(t.trim(), &expected)) {
+        if !provided.is_some_and(|t| ct_eq(t.trim(), expected)) {
             return Response::text(401, "unauthorized");
         }
     }
@@ -94,7 +94,7 @@ pub(crate) fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
         return Some(Response::text(404, "not found"));
     };
     let provided = header_value(&req.headers, "x-admin-token");
-    if !provided.is_some_and(|t| ct_eq(t, &expected)) {
+    if !provided.is_some_and(|t| ct_eq(t, expected)) {
         return Some(Response::text(401, "unauthorized"));
     }
     Some(match (req.method.as_str(), req.path.as_str()) {

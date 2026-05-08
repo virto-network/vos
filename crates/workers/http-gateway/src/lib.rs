@@ -56,17 +56,36 @@
 //! When vos exposes worker self-pumping, `serve*` can become a
 //! non-blocking bootstrap and the actor messages will work mid-flight.
 //!
-//! ## Operator config (env vars)
+//! ## Operator config (manifest init args)
 //!
-//! | Var                          | Default      | Effect                                                            |
-//! |------------------------------|--------------|-------------------------------------------------------------------|
-//! | `HTTP_GATEWAY_BIND_ADDR`     | `127.0.0.1`  | Bind IP for both protocols. Set to `0.0.0.0` for public bind.     |
-//! | `HTTP_GATEWAY_AUTH_TOKEN`    | (unset)      | When set, every request needs `Authorization: Bearer <token>`.    |
-//! | `HTTP_GATEWAY_ADMIN_TOKEN`   | (unset)      | When set, `/__admin/*` requires `X-Admin-Token: <token>`. Else 404.|
+//! Five `String` knobs are passed to the actor's constructor via the
+//! worker manifest. Each one is empty by default; an empty value
+//! means "use the in-code default":
 //!
-//! With both tokens unset and the default loopback bind, the gateway
-//! is reachable only from the local host and dispatch is open. A
-//! public deployment **must** set both tokens and the bind addr.
+//! ```toml
+//! [[worker]]
+//! name = "gateway"
+//! path = "target/release/libhttp_gateway.so"
+//! init = {
+//!     bind_addr   = "0.0.0.0",
+//!     auth_token  = "...",
+//!     admin_token = "...",
+//!     tls_cert    = "/etc/tls/cert.pem",
+//!     tls_key     = "/etc/tls/key.pem",
+//! }
+//! ```
+//!
+//! | Field         | Default                                       |
+//! |---------------|-----------------------------------------------|
+//! | `bind_addr`   | `127.0.0.1` (loopback)                        |
+//! | `auth_token`  | none — open dispatch + WARN at startup        |
+//! | `admin_token` | none — `/__admin/*` returns 404               |
+//! | `tls_cert`    | none — h3 self-signs `localhost` (dev only)   |
+//! | `tls_key`     | none — paired with `tls_cert`                 |
+//!
+//! Defaults make a bare deployment loopback-only with admin disabled
+//! and dispatch open. A public deployment **must** set both tokens
+//! and override `bind_addr`.
 
 use vos::prelude::*;
 
@@ -83,12 +102,36 @@ mod types;
 mod http3;
 
 #[actor]
-pub struct HttpGateway;
+pub struct HttpGateway {
+    cfg: config::GatewayConfig,
+}
 
 #[messages]
 impl HttpGateway {
-    fn new() -> Self {
-        HttpGateway
+    fn new(
+        bind_addr: String,
+        auth_token: String,
+        admin_token: String,
+        tls_cert: String,
+        tls_key: String,
+    ) -> Self {
+        HttpGateway {
+            cfg: config::GatewayConfig {
+                bind_addr,
+                auth_token,
+                admin_token,
+                tls_cert,
+                tls_key,
+            },
+        }
+    }
+
+    /// Lifecycle hook — runs on every cold create *and* warm restart
+    /// (after the actor's state is rkyv-restored). Installs the
+    /// per-process config singleton the connection tasks read.
+    #[msg]
+    async fn start(&mut self, _ctx: &mut Context<Self>) {
+        config::install(self.cfg.clone());
     }
 
     /// Bind h1+h2c on `port` and serve until stop. Returns the loop's

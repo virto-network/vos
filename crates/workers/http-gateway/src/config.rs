@@ -1,56 +1,111 @@
-//! Operator-controlled config, read from process env vars at runtime.
+//! Operator-controlled config carried as actor init args.
 //!
-//! Env-var keys:
+//! `GatewayConfig` is a field on the [`HttpGateway`](crate::HttpGateway)
+//! actor. The values come from the worker manifest's `init = { … }`
+//! table and survive across warm restarts via rkyv. The actor's
+//! `start` handler installs the live config into a process-global
+//! [`OnceLock`] so the connection tasks (which don't have access to
+//! the actor's `&self`) can read it.
 //!
-//! - `HTTP_GATEWAY_BIND_ADDR` — IP to bind both protocols. Default
-//!   `127.0.0.1` (loopback only). Set to `0.0.0.0` for public bind.
-//! - `HTTP_GATEWAY_ADMIN_TOKEN` — when set, the value of the
-//!   `X-Admin-Token` request header must match (constant-time) for
-//!   `/__admin/*` to respond. When unset, admin endpoints return 404
-//!   so the gateway doesn't even acknowledge their existence.
-//! - `HTTP_GATEWAY_AUTH_TOKEN` — when set, every non-admin request
-//!   must carry `Authorization: Bearer <token>` (constant-time
-//!   compared against the env value) or it's rejected with 401. When
-//!   unset, dispatch is open and a startup warning is logged.
+//! All five fields are typed as `String` because the macro-driven
+//! init-args extraction supports primitives + `String`. **Empty
+//! string means "use the default"**, which keeps the manifest concise
+//! for dev deployments — only override what you care about.
+//!
+//! ## Manifest example
+//!
+//! ```toml
+//! [[worker]]
+//! name = "gateway"
+//! path = "target/release/libhttp_gateway.so"
+//! init = {
+//!     bind_addr   = "0.0.0.0",
+//!     auth_token  = "abc123…",     # production: required for non-loopback
+//!     admin_token = "different…",  # production: required to expose /__admin
+//!     tls_cert    = "/etc/tls/cert.pem",
+//!     tls_key     = "/etc/tls/key.pem",
+//! }
+//! ```
+//!
+//! ## Defaults (when the field is empty)
+//!
+//! | Field         | Default                                   |
+//! |---------------|-------------------------------------------|
+//! | `bind_addr`   | `127.0.0.1`                                |
+//! | `auth_token`  | none (open dispatch + WARN at startup)    |
+//! | `admin_token` | none (`/__admin/*` returns 404)           |
+//! | `tls_cert`    | none (h3 self-signs `localhost`, dev only)|
+//! | `tls_key`    | none (paired with `tls_cert`)             |
 
-use std::env;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::OnceLock;
 
-pub(crate) const ENV_BIND_ADDR: &str = "HTTP_GATEWAY_BIND_ADDR";
-pub(crate) const ENV_ADMIN_TOKEN: &str = "HTTP_GATEWAY_ADMIN_TOKEN";
-pub(crate) const ENV_AUTH_TOKEN: &str = "HTTP_GATEWAY_AUTH_TOKEN";
-#[cfg(feature = "http3")]
-pub(crate) const ENV_TLS_CERT: &str = "HTTP_GATEWAY_TLS_CERT";
-#[cfg(feature = "http3")]
-pub(crate) const ENV_TLS_KEY: &str = "HTTP_GATEWAY_TLS_KEY";
+use vos::log;
 
-const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// Init-args carried into [`HttpGateway`](crate::HttpGateway). Auto-
+/// derives rkyv via the actor macro, so a warm restart restores the
+/// same config without re-reading the manifest.
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone, Default,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub(crate) struct GatewayConfig {
+    pub(crate) bind_addr: String,
+    pub(crate) auth_token: String,
+    pub(crate) admin_token: String,
+    pub(crate) tls_cert: String,
+    pub(crate) tls_key: String,
+}
 
-/// Parse the bind IP from `HTTP_GATEWAY_BIND_ADDR`; safe default
-/// `127.0.0.1` so a bare deployment never accidentally binds public.
+static CONFIG: OnceLock<GatewayConfig> = OnceLock::new();
+
+/// Install the actor-supplied config. Idempotent — subsequent calls
+/// are silently ignored so the `start` handler can run on every cold
+/// **and** warm restart without re-installing.
+pub(crate) fn install(cfg: GatewayConfig) {
+    if CONFIG.set(cfg).is_err() {
+        // Set-once semantics; second installer is the same actor on a
+        // warm restart, no need to log loudly.
+        log::debug!("http-gateway: config already installed; ignoring re-install");
+    }
+}
+
+fn current() -> &'static GatewayConfig {
+    CONFIG.get_or_init(GatewayConfig::default)
+}
+
+/// Bind IP. `127.0.0.1` when `bind_addr` is empty / unparseable.
 pub(crate) fn bind_ip() -> IpAddr {
-    env::var(ENV_BIND_ADDR)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_BIND)
+    let raw = current().bind_addr.as_str();
+    if raw.is_empty() {
+        return IpAddr::V4(Ipv4Addr::LOCALHOST);
+    }
+    raw.parse().unwrap_or_else(|_| {
+        log::warn!("http-gateway: bind_addr {raw:?} unparseable; falling back to 127.0.0.1");
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    })
 }
 
-pub(crate) fn admin_token() -> Option<String> {
-    env::var(ENV_ADMIN_TOKEN).ok().filter(|s| !s.is_empty())
+pub(crate) fn auth_token() -> Option<&'static str> {
+    let t = current().auth_token.as_str();
+    (!t.is_empty()).then_some(t)
 }
 
-pub(crate) fn auth_token() -> Option<String> {
-    env::var(ENV_AUTH_TOKEN).ok().filter(|s| !s.is_empty())
+pub(crate) fn admin_token() -> Option<&'static str> {
+    let t = current().admin_token.as_str();
+    (!t.is_empty()).then_some(t)
 }
 
-/// Both PEM paths for TLS — `(cert_chain_path, key_path)`. Returns
-/// `None` if either is unset/empty so callers fall back to a
-/// self-signed cert.
+/// Both PEM paths or `None`. Returns `None` if either is empty so
+/// callers fall back to a self-signed cert.
 #[cfg(feature = "http3")]
-pub(crate) fn tls_paths() -> Option<(String, String)> {
-    let cert = env::var(ENV_TLS_CERT).ok().filter(|s| !s.is_empty())?;
-    let key = env::var(ENV_TLS_KEY).ok().filter(|s| !s.is_empty())?;
-    Some((cert, key))
+pub(crate) fn tls_paths() -> Option<(&'static str, &'static str)> {
+    let cert = current().tls_cert.as_str();
+    let key = current().tls_key.as_str();
+    (!cert.is_empty() && !key.is_empty()).then_some((cert, key))
 }
 
 /// Constant-time equality check. Length differences leak (early
