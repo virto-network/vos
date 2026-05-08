@@ -278,30 +278,42 @@ pub enum Column {
     /// Blake2bChip forces this to be set correctly for every blake2b call.
     #[size = 1]
     IsBlakeEcall,
-    /// φ[10] at this step's regs_before (h_ptr).  Full u64 witnessed so the
-    /// upper 32 bits don't have to match anything; only low 4 bytes flow into
-    /// the Blake2bCall lookup tuple.
+    // ── Blake2b ECALL slot columns ──
+    //
+    // Naming note: these columns retain their pre-off-by-three-fix
+    // labels ("Phi10", "Phi11", "Phi12", "Phi7") for diff minimisation;
+    // their actual SOURCES were rewired in the fix (commit 7d20d4c) so
+    // each slot now holds the value of a *different* PVM register than
+    // its name implies.  See `chips/cpu/trace_fill.rs` Phase 8c block
+    // and `chips/cpu/{mod,interaction}.rs::ECALL_REG_IDXS` for the
+    // canonical slot ↔ register mapping.
+    //
+    /// h_ptr slot (sourced from φ[7]; low 4 bytes flow into the
+    /// Blake2bCall tuple as h_ptr).  Full u64 witnessed so the upper
+    /// 32 bits can hold whatever regs_before[7] held.
     #[size = 8]
     Phi10,
-    /// φ[11] at this step's regs_before (m_ptr).
+    /// m_ptr slot (sourced from φ[8]).  Low 4 bytes flow into the
+    /// Blake2bCall tuple as m_ptr.
     #[size = 8]
     Phi11,
-    /// φ[12] at this step's regs_before (t_low for blake2b_compress).
+    /// t_low slot (sourced from φ[9]).  Full 8 bytes flow into the
+    /// Blake2bCall tuple as T.
     #[size = 8]
     Phi12,
-    /// Full u64 value of φ[7] (8 LE bytes).  Used for the register-memory
-    /// producer at ECALL steps — the register ledger needs the raw value;
-    /// the Blake2bCall relation uses Phi7Bool for the finalise flag.
+    /// f_flag slot (sourced from φ[10] = a3).  Full u64 of regs_before[10].
+    /// Phi7Bool below is the boolean form `(regs_before[10] != 0)`,
+    /// which is what flows into the Blake2bCall tuple as F.
     #[size = 8]
     Phi7,
-    /// Inversion witness: if Phi7 (as field element) != 0, Phi7Inv =
-    /// 1 / Phi7_combined; else 0.  Used to constrain
-    /// Phi7Bool = (Phi7 != 0) in-circuit (Phase 9e).
+    /// Inversion witness for the f_flag slot: if Phi7 (as field
+    /// element) != 0, Phi7Inv = 1 / Phi7_combined; else 0.  Used to
+    /// constrain Phi7Bool = (Phi7 != 0) in-circuit (Phase 9e).
     #[size = 8]
     Phi7Inv,
-    /// Boolean version of φ[7] (finalise flag): 1 if regs_before[7] != 0.
-    /// The prover fills this and the lookup balance keeps it tied to the
-    /// Blake2bChip.F column at the matching compression.
+    /// Boolean form of the f_flag slot: 1 if regs_before[10] != 0.
+    /// The prover fills this and the lookup balance keeps it tied to
+    /// the Blake2bChip.F column at the matching compression.
     #[size = 1]
     Phi7Bool,
     // ── Register-memory binding (Phase 9d) ──
