@@ -210,11 +210,24 @@ integration remains.
     bytes from `ristretto_comb_calls` and decomposes them into
     nibbles.  Balance forces `ScalarWindow` per (call, window) to
     match the actor's i-th nibble.
-  - **side_note ↔ PVM memory**: STILL OPEN.  The boundary chip pulls
-    from side_note rather than from `MemoryAccessLookupElements`;
-    closing this needs `RistrettoEcallChip` to skip its scalar-byte
-    memory producers for FixedBasepoint records and have the
-    boundary chip emit them instead.
+  - **side_note ↔ PVM memory**: STILL OPEN.  Design sketch (attempted
+    in-session, reverted because the chip_isolated harness needs
+    significant restructure to drain the new memory producers): add
+    `kind: ScalarMultKind` field to `RistrettoMemOp`; have
+    `RistrettoEcallChip::collect_accesses` skip the scalar 32 bytes
+    when `op.kind == FixedBasepoint`; restructure
+    `RistrettoCombScalarBoundaryChip` to 32 rows per call (one per
+    scalar byte) carrying `(IsReal, CallIdx, ByteIdx, LowNibble,
+    HighNibble, ScalarByte, AddrBytes[4], TsBytes[8])`; add per-row
+    constraint `ScalarByte = LowNibble + 16·HighNibble`; emit two
+    `−IsReal` contributions to scalar boundary at `(call,
+    2*ByteIdx, LowNibble)` and `(call, 2*ByteIdx + 1, HighNibble)`
+    (replaces the current 64-rows-per-call layout); emit `+IsReal`
+    to `MemoryAccessLookupElements` at `(AddrBytes, ScalarByte,
+    TsBytes, is_write=0)`.  Chip-isolated harness needs MemoryChip +
+    ledger setup to balance the new memory producers; existing
+    `harness_ristretto_comb_balance` would need a parallel
+    `harness_..._with_memory` variant or to be extended.
   - **Final Acc ↔ output bytes**: STILL OPEN.  Needs the compress
     chain (R1e-bis, ~25 FieldOp rows per call) — the bigger chunk.
 
