@@ -1,7 +1,7 @@
+use crate::sync::{self, SyncError};
+use crate::{Cid, DagNode, Encode, Error, Hasher, MerkleClock, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use crate::{Cid, DagNode, Encode, Error, Hasher, MerkleClock, Store};
-use crate::sync::{self, SyncError};
 
 /// Trait for CRDT payloads carried by Merkle-CRDT nodes.
 ///
@@ -236,7 +236,11 @@ mod tests {
 
         // Rebuild state from scratch — must also be 18, not more
         alice.rebuild_state().unwrap();
-        assert_eq!(*alice.state(), 18, "rebuild_state double-applied operations!");
+        assert_eq!(
+            *alice.state(),
+            18,
+            "rebuild_state double-applied operations!"
+        );
     }
 
     #[test]
@@ -284,6 +288,10 @@ mod tests {
         for root in &old_roots {
             bob.sync(root, alice.store()).unwrap();
         }
-        assert_eq!(*bob.state(), 7, "syncing already-included root should be no-op");
+        assert_eq!(
+            *bob.state(),
+            7,
+            "syncing already-included root should be no-op"
+        );
     }
 }

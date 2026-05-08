@@ -60,10 +60,7 @@ fn arg_schema(arg: &Arg) -> ArgSchema {
         action,
         ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Help | ArgAction::Version,
     );
-    let repeatable = matches!(
-        action,
-        ArgAction::Append | ArgAction::Count,
-    );
+    let repeatable = matches!(action, ArgAction::Append | ArgAction::Count,);
     let value_names = arg
         .get_value_names()
         .map(|s| s.iter().map(ToString::to_string).collect())

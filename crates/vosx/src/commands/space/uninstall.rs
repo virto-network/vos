@@ -21,7 +21,9 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 // redbs into `<data_dir>/trash/` (see
                 // `up::sweep_orphan_redbs`).
                 if output::is_json() {
-                    output::print_json(&UninstalledView { instance_name: instance });
+                    output::print_json(&UninstalledView {
+                        instance_name: instance,
+                    });
                 } else {
                     println!("uninstalled {instance}");
                 }

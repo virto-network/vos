@@ -38,7 +38,9 @@ pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
 // ── Programs ──────────────────────────────────────────────────────
 
 /// One row in the program catalog.
-#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
 #[rkyv(crate = vos::rkyv)]
 pub struct ProgramRow {
     pub name: String,
@@ -49,7 +51,9 @@ pub struct ProgramRow {
 // ── Agents ────────────────────────────────────────────────────────
 
 /// One row in the agent (instance) catalog.
-#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
 #[rkyv(crate = vos::rkyv)]
 pub struct AgentRow {
     pub instance_name: String,
@@ -96,7 +100,9 @@ pub const PROOF_KIND_ZK: u8 = 1;
 /// One row in the member table — discriminated union over
 /// `Node` and `Identity` shapes flattened into a single record
 /// so the wire format stays a single `Vec<MemberRow>` query.
-#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
 #[rkyv(crate = vos::rkyv)]
 pub struct MemberRow {
     /// `MEMBER_KIND_NODE` or `MEMBER_KIND_IDENTITY`.
@@ -157,13 +163,10 @@ impl SpaceRegistry {
     /// `STATUS_TAG_CONFLICT` unless the existing hash matches
     /// (idempotent re-publish).
     #[msg]
-    async fn publish(
-        &mut self,
-        name: String,
-        version: String,
-        hash: Vec<u8>,
-    ) -> u8 {
-        let Some(hash) = bytes_to_32(&hash) else { return STATUS_BAD_HASH; };
+    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>) -> u8 {
+        let Some(hash) = bytes_to_32(&hash) else {
+            return STATUS_BAD_HASH;
+        };
         let mut idx = 0usize;
         while idx < self.programs.len() {
             let cur = &self.programs[idx];
@@ -179,7 +182,14 @@ impl SpaceRegistry {
             }
             idx += 1;
         }
-        self.programs.insert(idx, ProgramRow { name, version, hash });
+        self.programs.insert(
+            idx,
+            ProgramRow {
+                name,
+                version,
+                hash,
+            },
+        );
         STATUS_OK
     }
 
@@ -246,8 +256,12 @@ impl SpaceRegistry {
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
     ) -> u8 {
-        let Some(program_hash) = bytes_to_32(&program_hash) else { return STATUS_BAD_HASH; };
-        let Some(replication_id) = bytes_to_32(&replication_id) else { return STATUS_BAD_HASH; };
+        let Some(program_hash) = bytes_to_32(&program_hash) else {
+            return STATUS_BAD_HASH;
+        };
+        let Some(replication_id) = bytes_to_32(&replication_id) else {
+            return STATUS_BAD_HASH;
+        };
 
         // Verify program exists with the claimed hash.
         let mut found = false;
@@ -317,7 +331,9 @@ impl SpaceRegistry {
         new_program_version: String,
         new_program_hash: Vec<u8>,
     ) -> u8 {
-        let Some(new_program_hash) = bytes_to_32(&new_program_hash) else { return STATUS_BAD_HASH; };
+        let Some(new_program_hash) = bytes_to_32(&new_program_hash) else {
+            return STATUS_BAD_HASH;
+        };
 
         // Verify the target program exists.
         let mut found = false;
@@ -575,4 +591,3 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
     let local = (raw & 0x7FFF).max(0x100);
     ((prefix as u32) << 16) | (local as u32)
 }
-

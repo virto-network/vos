@@ -18,9 +18,11 @@ pub fn encode(payloads: &[Vec<u8>]) -> anyhow::Result<Vec<u8>> {
     if payloads.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&payloads.to_vec())
-        .map_err(|e| anyhow::anyhow!("rkyv encode install_payloads: {e}"))?
-        .to_vec())
+    Ok(
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&payloads.to_vec())
+            .map_err(|e| anyhow::anyhow!("rkyv encode install_payloads: {e}"))?
+            .to_vec(),
+    )
 }
 
 /// Decode the `install_payloads` field back into the inner

@@ -23,15 +23,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use space_registry::{ProgramRow, SpaceRegistryRef, STATUS_OK, STATUS_TAG_CONFLICT};
+use space_registry::{ProgramRow, STATUS_OK, STATUS_TAG_CONFLICT, SpaceRegistryRef};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::VosNode;
 
 use crate::blob_store;
-use crate::commands::space::common::{
-    auto_replication_id, instance_service_id, parse_consistency,
-};
+use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
 use crate::commands::space::payload_codec;
 
 /// Slim view of the manifest TOML — only the fields the
@@ -96,8 +94,7 @@ fn default_consistency() -> String {
 }
 
 pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     let manifest: Manifest = toml::from_str(std::str::from_utf8(&bytes)?)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     let dir = path
@@ -131,10 +128,16 @@ pub fn reconcile(
     // tripping through the registry.
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
     for a in flatten(&manifest.agents) {
-        name_ids.insert(a.name.clone(), instance_service_id(&a.name, daemon_prefix).0);
+        name_ids.insert(
+            a.name.clone(),
+            instance_service_id(&a.name, daemon_prefix).0,
+        );
     }
 
-    let reg = SpaceRegistryRef::at(ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()));
+    let reg = SpaceRegistryRef::at(ServiceId::new(
+        daemon_prefix,
+        ServiceId::REGISTRY.local_id(),
+    ));
 
     for agent in flatten(&manifest.agents) {
         reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids)?;
@@ -154,7 +157,11 @@ fn reconcile_one(
     // 1. Resolve and cache the agent's blob.
     let elf_path = manifest_dir.join(&agent.path);
     let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
-        anyhow::anyhow!("read {} for agent '{}': {e}", elf_path.display(), agent.name)
+        anyhow::anyhow!(
+            "read {} for agent '{}': {e}",
+            elf_path.display(),
+            agent.name
+        )
     })?;
     let hash = blob_store::cache_put(&elf_bytes)
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
@@ -164,12 +171,9 @@ fn reconcile_one(
     //    versions yet, so we use the literal "manifest" tag.
     let program_name = agent.name.clone();
     let program_version = "manifest".to_string();
-    let existing: Option<ProgramRow> = vos::block_on(reg.program(
-        &mut &*node,
-        program_name.clone(),
-        program_version.clone(),
-    ))
-    .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
+    let existing: Option<ProgramRow> =
+        vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
+            .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
     let program_hash = match existing {
         Some(p) if p.hash == hash.0 => {
             tracing::debug!("{program_name}:{program_version} already published");
@@ -227,8 +231,9 @@ fn reconcile_one(
         Some("auto") | None => auto_replication_id(&agent.name, &program_hash),
         Some("off") => [0u8; 32],
         Some(hex) => {
-            let v = hex::decode(hex.trim_start_matches("0x"))
-                .map_err(|_| anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name))?;
+            let v = hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
+                anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name)
+            })?;
             if v.len() != 32 {
                 anyhow::bail!("agent '{}': replication_id must be 32 bytes", agent.name);
             }
@@ -329,11 +334,7 @@ fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> 
     payload_codec::encode(&payloads)
 }
 
-fn toml_to_init_value(
-    val: &toml::Value,
-    ty: &str,
-    name_ids: &BTreeMap<String, u32>,
-) -> InitValue {
+fn toml_to_init_value(val: &toml::Value, ty: &str, name_ids: &BTreeMap<String, u32>) -> InitValue {
     match val {
         toml::Value::String(s) => match ty {
             "u64" | "u32" | "u16" | "u8" => s
@@ -352,9 +353,7 @@ fn toml_to_init_value(
             // declared type is `Vec<u32>`, resolve names →
             // ServiceIds via `name_ids`. Otherwise emit a
             // plain ListStr (or empty if mixed types).
-            if ty == "Vec<u32>"
-                && items.iter().all(|v| matches!(v, toml::Value::String(_)))
-            {
+            if ty == "Vec<u32>" && items.iter().all(|v| matches!(v, toml::Value::String(_))) {
                 let ids: Vec<u32> = items
                     .iter()
                     .filter_map(|v| {

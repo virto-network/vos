@@ -293,7 +293,10 @@ mod tests {
         let a = r.next_u64();
         let b = r.next_u64();
         let c = r.next_u64();
-        assert!(a != b || b != c, "xorshift sequence stuck on a single value");
+        assert!(
+            a != b || b != c,
+            "xorshift sequence stuck on a single value"
+        );
     }
 
     #[cfg(feature = "std")]

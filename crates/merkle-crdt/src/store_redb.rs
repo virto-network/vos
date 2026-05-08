@@ -6,8 +6,7 @@
 use crate::{Cid, DagNode, Decode, Encode, Hasher, Store};
 
 /// redb table: CID bytes → serialized DagNode.
-const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> =
-    redb::TableDefinition::new("dag");
+const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
 
 /// A merkle-crdt [`Store`] backed by a redb database.
 pub struct RedbStore<H: Hasher> {
@@ -66,19 +65,29 @@ impl core::fmt::Display for RedbStoreError {
 impl std::error::Error for RedbStoreError {}
 
 impl From<redb::DatabaseError> for RedbStoreError {
-    fn from(e: redb::DatabaseError) -> Self { Self::Db(e) }
+    fn from(e: redb::DatabaseError) -> Self {
+        Self::Db(e)
+    }
 }
 impl From<redb::TableError> for RedbStoreError {
-    fn from(e: redb::TableError) -> Self { Self::Table(e) }
+    fn from(e: redb::TableError) -> Self {
+        Self::Table(e)
+    }
 }
 impl From<redb::StorageError> for RedbStoreError {
-    fn from(e: redb::StorageError) -> Self { Self::Storage(e) }
+    fn from(e: redb::StorageError) -> Self {
+        Self::Storage(e)
+    }
 }
 impl From<redb::TransactionError> for RedbStoreError {
-    fn from(e: redb::TransactionError) -> Self { Self::Transaction(e) }
+    fn from(e: redb::TransactionError) -> Self {
+        Self::Transaction(e)
+    }
 }
 impl From<redb::CommitError> for RedbStoreError {
-    fn from(e: redb::CommitError) -> Self { Self::Commit(e) }
+    fn from(e: redb::CommitError) -> Self {
+        Self::Commit(e)
+    }
 }
 
 impl<H, P> Store<H, P> for RedbStore<H>
@@ -134,8 +143,8 @@ mod tests {
     use super::*;
     use crate::{MerkleCrdt, Payload};
     use alloc::collections::BTreeSet;
-    use alloc::string::String;
     use alloc::format;
+    use alloc::string::String;
 
     // Simple test hasher
     struct TestHash;

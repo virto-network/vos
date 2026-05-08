@@ -2,10 +2,8 @@
 //! installed agent.
 
 use serde::Serialize;
+use space_registry::{STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND};
 use vos::init::{InitArgs, InitValue};
-use space_registry::{
-    STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
-};
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_ref};
@@ -55,15 +53,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let install_args = encode_init_args(&args.init)?;
 
     DaemonClient::with_connect(&args.space, |client| {
-        let program = client.program(&program_name, &program_version)?
-            .ok_or_else(|| anyhow::anyhow!(
-                "program {program_name}:{program_version} not in catalog. publish it first.",
-            ))?;
+        let program = client
+            .program(&program_name, &program_version)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "program {program_name}:{program_version} not in catalog. publish it first.",
+                )
+            })?;
 
         let replication_id = match &args.replication_id {
-            Some(hex) => crate::blob_store::BlobHash::from_hex(hex)
-                .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
-                .0,
+            Some(hex) => {
+                crate::blob_store::BlobHash::from_hex(hex)
+                    .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
+                    .0
+            }
             None => auto_replication_id(&instance_name, &program.hash),
         };
 
@@ -101,9 +104,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             STATUS_INSTANCE_EXISTS => anyhow::bail!(
                 "an agent named '{instance_name}' is already installed; pass --name to disambiguate",
             ),
-            STATUS_PROGRAM_NOT_FOUND => anyhow::bail!(
-                "program {program_name}:{program_version} not in catalog (race?)",
-            ),
+            STATUS_PROGRAM_NOT_FOUND => {
+                anyhow::bail!("program {program_name}:{program_version} not in catalog (race?)",)
+            }
             other => anyhow::bail!("install returned status {other}"),
         }
     })
@@ -150,10 +153,7 @@ mod tests {
 
     #[test]
     fn nonempty_init_returns_nonempty() {
-        let bytes = encode_init_args(
-            &["n=42".into(), "ok=true".into(), "s=hello".into()],
-        )
-        .unwrap();
+        let bytes = encode_init_args(&["n=42".into(), "ok=true".into(), "s=hello".into()]).unwrap();
         assert!(!bytes.is_empty());
     }
 

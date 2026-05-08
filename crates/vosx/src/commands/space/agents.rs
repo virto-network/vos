@@ -1,9 +1,9 @@
 //! `space agents` — list installed agents.
 
-use serde::Serialize;
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{consistency_name, truncate};
 use crate::output;
+use serde::Serialize;
 
 #[derive(Serialize)]
 struct AgentView<'a> {

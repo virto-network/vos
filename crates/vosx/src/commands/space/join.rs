@@ -68,9 +68,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let name = args.name.unwrap_or(default_name);
 
     // Lay out the per-space data dir.
-    let space_dir = args
-        .data_dir
-        .unwrap_or_else(|| paths::space_dir(&space_id));
+    let space_dir = args.data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
     if space_dir.exists() {
         anyhow::bail!(
             "space data dir already exists: {} \
@@ -81,7 +79,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&space_dir)?;
     std::fs::create_dir_all(space_dir.join("agents"))?;
 
-    let key_bytes = keypair.to_protobuf_encoding()
+    let key_bytes = keypair
+        .to_protobuf_encoding()
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(space_dir.join("node.key"), key_bytes)?;
 
@@ -142,9 +141,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 fn parse_bootstrap(s: &str) -> anyhow::Result<([u8; 32], String)> {
     let trimmed = s.trim();
     let Some((id_str, addr_str)) = trimmed.split_once('@') else {
-        anyhow::bail!(
-            "bootstrap address must be '<space-id>@<bootnode-multiaddr>', got '{s}'"
-        );
+        anyhow::bail!("bootstrap address must be '<space-id>@<bootnode-multiaddr>', got '{s}'");
     };
     let id_str = id_str.trim();
     let addr_str = addr_str.trim();

@@ -55,9 +55,8 @@ pub(crate) fn encode_entry_kind(kind: &EntryKind<u16>) -> Vec<u8> {
             buf
         }
         EntryKind::ConfigChange { joint_old, members } => {
-            let cap = 1 + 1
-                + joint_old.as_ref().map_or(0, |v| 2 + 2 * v.len())
-                + 2 + 2 * members.len();
+            let cap =
+                1 + 1 + joint_old.as_ref().map_or(0, |v| 2 + 2 * v.len()) + 2 + 2 * members.len();
             let mut buf = Vec::with_capacity(cap);
             buf.push(ENTRY_KIND_CONFIG_CHANGE);
             match joint_old {
@@ -93,7 +92,9 @@ pub(crate) fn decode_entry_kind(bytes: &[u8]) -> Result<EntryKind<u16>, CommitEr
         CommitError::Config("raft_log entry: empty payload (missing kind tag)".into())
     })?;
     match *tag {
-        ENTRY_KIND_DATA => Ok(EntryKind::Data { payload: rest.to_vec() }),
+        ENTRY_KIND_DATA => Ok(EntryKind::Data {
+            payload: rest.to_vec(),
+        }),
         ENTRY_KIND_CONFIG_CHANGE => {
             let mut pos = 0;
             let joint_old_present = *rest.get(pos).ok_or_else(|| {
@@ -123,7 +124,7 @@ pub(crate) fn decode_entry_kind(bytes: &[u8]) -> Result<EntryKind<u16>, CommitEr
                 other => {
                     return Err(CommitError::Config(alloc::format!(
                         "raft_log ConfigChange: invalid joint_old flag {other}",
-                    )))
+                    )));
                 }
             };
             let len_bytes = rest.get(pos..pos + 2).ok_or_else(|| {
@@ -134,9 +135,7 @@ pub(crate) fn decode_entry_kind(bytes: &[u8]) -> Result<EntryKind<u16>, CommitEr
             let mut members = Vec::with_capacity(len);
             for _ in 0..len {
                 let b = rest.get(pos..pos + 2).ok_or_else(|| {
-                    CommitError::Config(
-                        "raft_log ConfigChange: truncated members prefix".into(),
-                    )
+                    CommitError::Config("raft_log ConfigChange: truncated members prefix".into())
                 })?;
                 pos += 2;
                 members.push(u16::from_le_bytes([b[0], b[1]]));
@@ -229,7 +228,11 @@ impl Storage<u16> for RedbStorage {
         let mut out = Vec::with_capacity(raw.len());
         for e in raw {
             let kind = decode_entry_kind(&e.payload)?;
-            out.push(LogEntry { index: e.index, term: e.term, kind });
+            out.push(LogEntry {
+                index: e.index,
+                term: e.term,
+                kind,
+            });
         }
         Ok(out)
     }
@@ -442,11 +445,7 @@ mod tests {
         let (db, dir) = temp_db();
         let mut s = RedbStorage::open(db.clone()).unwrap();
         block_on(s.commit_batch(WriteBatch {
-            appends: alloc::vec![
-                entry(1, 1, b"a"),
-                entry(2, 1, b"b"),
-                entry(3, 2, b"c"),
-            ],
+            appends: alloc::vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 2, b"c"),],
             ..Default::default()
         }))
         .unwrap();
@@ -480,10 +479,16 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
-        assert_eq!(block_on(s.read_state()).unwrap(), b"snapshot-after-first".to_vec());
+        assert_eq!(
+            block_on(s.read_state()).unwrap(),
+            b"snapshot-after-first".to_vec()
+        );
         assert_eq!(block_on(s.load_meta()).unwrap(), m);
         let s2 = RedbStorage::open(db).unwrap();
-        assert_eq!(block_on(s2.read_state()).unwrap(), b"snapshot-after-first".to_vec());
+        assert_eq!(
+            block_on(s2.read_state()).unwrap(),
+            b"snapshot-after-first".to_vec()
+        );
         assert_eq!(block_on(s2.load_meta()).unwrap(), m);
         assert_eq!(s2.last_index(), 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -545,7 +550,10 @@ mod tests {
         // Without the cache, `read_state` reflects the new on-disk
         // value immediately. (Pre-fix this returned the stale
         // `b"worker-v1"`.)
-        assert_eq!(block_on(s.read_state()).unwrap(), b"out-of-band-v2".to_vec());
+        assert_eq!(
+            block_on(s.read_state()).unwrap(),
+            b"out-of-band-v2".to_vec()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

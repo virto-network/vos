@@ -178,7 +178,11 @@ fn measure_rtt(query: &str) -> RttOutcome {
     let connect_started = Instant::now();
     let client = match DaemonClient::connect(query) {
         Ok(c) => c,
-        Err(e) => return RttOutcome::ConnectFailed { error: e.to_string() },
+        Err(e) => {
+            return RttOutcome::ConnectFailed {
+                error: e.to_string(),
+            };
+        }
     };
     let connect = connect_started.elapsed();
     let invoke_started = Instant::now();
@@ -187,7 +191,10 @@ fn measure_rtt(query: &str) -> RttOutcome {
     let _ = client.shutdown();
     match outcome {
         Ok(_) => RttOutcome::Ok { connect, invoke },
-        Err(e) => RttOutcome::InvokeFailed { connect, error: e.to_string() },
+        Err(e) => RttOutcome::InvokeFailed {
+            connect,
+            error: e.to_string(),
+        },
     }
 }
 
@@ -200,8 +207,9 @@ fn running_state(query: &str, ep: Endpoint) -> DaemonState {
             }),
             None,
         ),
-        RttOutcome::InvokeFailed { error, .. }
-        | RttOutcome::ConnectFailed { error } => (None, Some(error)),
+        RttOutcome::InvokeFailed { error, .. } | RttOutcome::ConnectFailed { error } => {
+            (None, Some(error))
+        }
     };
     DaemonState::Running {
         pid: ep.pid,

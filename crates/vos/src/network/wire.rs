@@ -124,7 +124,9 @@ const MAX_CHAIN_LEN: usize = 32;
 /// One frame on the wire. See module docs for tag layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    Hello { node_prefix: u16 },
+    Hello {
+        node_prefix: u16,
+    },
     Tell {
         from: u32,
         to: u32,
@@ -136,11 +138,15 @@ pub enum Frame {
         chain: Vec<u32>,
         msg: Vec<u8>,
     },
-    InvokeReply { payload: Vec<u8> },
+    InvokeReply {
+        payload: Vec<u8>,
+    },
     /// "What are your merkle-clock roots for this replication
     /// group?" Sent as a request; reply rides back as
     /// [`Frame::Heads`].
-    FetchHeads { replication_id: [u8; REPLICATION_ID_BYTES] },
+    FetchHeads {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+    },
     /// Reply to [`Frame::FetchHeads`].
     Heads {
         replication_id: [u8; REPLICATION_ID_BYTES],
@@ -155,7 +161,9 @@ pub enum Frame {
     /// Reply to [`Frame::FetchNode`]. `None` means the peer
     /// doesn't have the node — typically a transient state
     /// during sync, not an error.
-    NodeReply { node: Option<Vec<u8>> },
+    NodeReply {
+        node: Option<Vec<u8>>,
+    },
     /// Empty acknowledgement — used as the response slot for
     /// fire-and-forget `Tell` so the request_response behaviour
     /// has something to deliver.
@@ -189,7 +197,10 @@ pub enum Frame {
         last_log_term: u64,
     },
     /// Reply to [`Frame::RaftVoteReq`].
-    RaftVoteResp { term: u64, vote_granted: bool },
+    RaftVoteResp {
+        term: u64,
+        vote_granted: bool,
+    },
     /// Raft `InstallSnapshot` RPC — the leader hands a far-behind
     /// follower the actor state at `last_included_index`/term so
     /// the follower doesn't need a log replay it can no longer
@@ -207,7 +218,9 @@ pub enum Frame {
         snapshot: Vec<u8>,
     },
     /// Reply to [`Frame::RaftInstallSnapshotReq`].
-    RaftInstallSnapshotResp { term: u64 },
+    RaftInstallSnapshotResp {
+        term: u64,
+    },
     /// Cluster join request — a fresh node asks an existing
     /// replica of `replication_id` to add it as a voter via
     /// joint consensus. Receivers that aren't the leader respond
@@ -219,7 +232,9 @@ pub enum Frame {
         joiner_prefix: u16,
     },
     /// Reply to [`Frame::RaftJoinReq`].
-    RaftJoinResp { result: RaftJoinResult },
+    RaftJoinResp {
+        result: RaftJoinResult,
+    },
     /// Manifest fetch — joiner asks bootnode "what space.toml
     /// are you running, and what actor blobs do I need to match
     /// it?". No replication_id; one manifest per node.
@@ -331,11 +346,7 @@ impl RaftEntry {
     }
 
     /// Convenience — build a `ConfigChange` variant.
-    pub fn config_change(
-        term: u64,
-        joint_old: Option<Vec<u16>>,
-        members: Vec<u16>,
-    ) -> Self {
+    pub fn config_change(term: u64, joint_old: Option<Vec<u16>>, members: Vec<u16>) -> Self {
         Self {
             term,
             kind: RaftEntryKind::ConfigChange { joint_old, members },
@@ -358,7 +369,12 @@ impl Frame {
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
             }
-            Frame::InvokeRequest { from, to, chain, msg } => {
+            Frame::InvokeRequest {
+                from,
+                to,
+                chain,
+                msg,
+            } => {
                 out.push(TAG_INVOKE_REQ);
                 out.extend_from_slice(&from.to_le_bytes());
                 out.extend_from_slice(&to.to_le_bytes());
@@ -378,7 +394,10 @@ impl Frame {
                 out.push(TAG_FETCH_HEADS);
                 out.extend_from_slice(replication_id);
             }
-            Frame::Heads { replication_id, roots } => {
+            Frame::Heads {
+                replication_id,
+                roots,
+            } => {
                 out.push(TAG_HEADS);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(&(roots.len() as u32).to_le_bytes());
@@ -386,7 +405,10 @@ impl Frame {
                     out.extend_from_slice(cid);
                 }
             }
-            Frame::FetchNode { replication_id, cid } => {
+            Frame::FetchNode {
+                replication_id,
+                cid,
+            } => {
                 out.push(TAG_FETCH_NODE);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(cid);
@@ -452,7 +474,11 @@ impl Frame {
                     }
                 }
             }
-            Frame::RaftAppendResp { term, success, match_index } => {
+            Frame::RaftAppendResp {
+                term,
+                success,
+                match_index,
+            } => {
                 out.push(TAG_RAFT_APPEND_RESP);
                 out.extend_from_slice(&term.to_le_bytes());
                 out.push(if *success { 1 } else { 0 });
@@ -498,7 +524,10 @@ impl Frame {
                 out.push(TAG_RAFT_INSTALL_RESP);
                 out.extend_from_slice(&term.to_le_bytes());
             }
-            Frame::RaftJoinReq { replication_id, joiner_prefix } => {
+            Frame::RaftJoinReq {
+                replication_id,
+                joiner_prefix,
+            } => {
                 out.push(TAG_RAFT_JOIN_REQ);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(&joiner_prefix.to_le_bytes());
@@ -545,8 +574,13 @@ impl Frame {
                 out.extend_from_slice(replication_id);
             }
             Frame::RaftStatusResp {
-                present, role, current_term, commit_index, last_log_index,
-                members, leader_hint,
+                present,
+                role,
+                current_term,
+                commit_index,
+                last_log_index,
+                members,
+                leader_hint,
             } => {
                 out.push(TAG_RAFT_STATUS_RESP);
                 out.push(if *present { 1 } else { 0 });
@@ -594,7 +628,12 @@ impl Frame {
                     chain.push(r.u32()?);
                 }
                 let msg = r.bytes_with_len_prefix()?;
-                Frame::InvokeRequest { from, to, chain, msg }
+                Frame::InvokeRequest {
+                    from,
+                    to,
+                    chain,
+                    msg,
+                }
             }
             TAG_INVOKE_REPLY => Frame::InvokeReply {
                 payload: r.bytes_with_len_prefix()?,
@@ -612,7 +651,10 @@ impl Frame {
                 for _ in 0..count {
                     roots.push(r.fixed::<CID_BYTES>()?);
                 }
-                Frame::Heads { replication_id, roots }
+                Frame::Heads {
+                    replication_id,
+                    roots,
+                }
             }
             TAG_FETCH_NODE => Frame::FetchNode {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
@@ -677,7 +719,10 @@ impl Frame {
                         }
                         other => return Err(FrameError::BadRaftEntryKind(other)),
                     };
-                    entries.push(RaftEntry { term: entry_term, kind });
+                    entries.push(RaftEntry {
+                        term: entry_term,
+                        kind,
+                    });
                 }
                 Frame::RaftAppendReq {
                     replication_id,
@@ -697,7 +742,11 @@ impl Frame {
                     other => return Err(FrameError::BadOption(other)),
                 };
                 let match_index = r.u64()?;
-                Frame::RaftAppendResp { term, success, match_index }
+                Frame::RaftAppendResp {
+                    term,
+                    success,
+                    match_index,
+                }
             }
             TAG_RAFT_VOTE_REQ => Frame::RaftVoteReq {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
@@ -739,7 +788,9 @@ impl Frame {
             TAG_RAFT_JOIN_RESP => {
                 let variant = r.u8()?;
                 let result = match variant {
-                    0 => RaftJoinResult::Accepted { joint_index: r.u64()? },
+                    0 => RaftJoinResult::Accepted {
+                        joint_index: r.u64()?,
+                    },
                     1 => {
                         let leader_hint = match r.u8()? {
                             0 => None,
@@ -764,8 +815,8 @@ impl Frame {
                 let mut blobs = Vec::with_capacity(n_blobs);
                 for _ in 0..n_blobs {
                     let name_bytes = r.bytes_with_len_prefix()?;
-                    let name = String::from_utf8(name_bytes)
-                        .map_err(|_| FrameError::ManifestBadName)?;
+                    let name =
+                        String::from_utf8(name_bytes).map_err(|_| FrameError::ManifestBadName)?;
                     let blob = r.bytes_with_len_prefix()?;
                     blobs.push(ManifestBlob { name, blob });
                 }
@@ -798,8 +849,13 @@ impl Frame {
                     other => return Err(FrameError::BadOption(other)),
                 };
                 Frame::RaftStatusResp {
-                    present, role, current_term, commit_index, last_log_index,
-                    members, leader_hint,
+                    present,
+                    role,
+                    current_term,
+                    commit_index,
+                    last_log_index,
+                    members,
+                    leader_hint,
                 }
             }
             other => return Err(FrameError::UnknownTag(other)),
@@ -847,13 +903,19 @@ impl core::fmt::Display for FrameError {
                 write!(f, "raft entry count {n} exceeds cap {MAX_RAFT_ENTRIES}")
             }
             FrameError::RaftMembersTooMany(n) => {
-                write!(f, "raft member list length {n} exceeds cap {MAX_RAFT_MEMBERS}")
+                write!(
+                    f,
+                    "raft member list length {n} exceeds cap {MAX_RAFT_MEMBERS}"
+                )
             }
             FrameError::BadRaftEntryKind(b) => {
                 write!(f, "invalid raft entry kind discriminant {b}")
             }
             FrameError::ManifestTooManyBlobs(n) => {
-                write!(f, "manifest blob count {n} exceeds cap {MANIFEST_MAX_BLOBS}")
+                write!(
+                    f,
+                    "manifest blob count {n} exceeds cap {MANIFEST_MAX_BLOBS}"
+                )
             }
             FrameError::ManifestBadName => {
                 write!(f, "manifest blob name was not valid UTF-8")
@@ -931,9 +993,13 @@ mod tests {
 
     #[test]
     fn hello_roundtrip() {
-        roundtrip(Frame::Hello { node_prefix: 0x42AB });
+        roundtrip(Frame::Hello {
+            node_prefix: 0x42AB,
+        });
         roundtrip(Frame::Hello { node_prefix: 0 });
-        roundtrip(Frame::Hello { node_prefix: u16::MAX });
+        roundtrip(Frame::Hello {
+            node_prefix: u16::MAX,
+        });
     }
 
     #[test]
@@ -985,7 +1051,9 @@ mod tests {
             replication_id: [0u8; REPLICATION_ID_BYTES],
         });
         let mut id = [0u8; REPLICATION_ID_BYTES];
-        for (i, b) in id.iter_mut().enumerate() { *b = i as u8; }
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         roundtrip(Frame::FetchHeads { replication_id: id });
     }
 
@@ -1035,10 +1103,7 @@ mod tests {
         let mut bad = Vec::new();
         bad.push(TAG_NODE_REPLY);
         bad.push(2); // not 0 or 1
-        assert!(matches!(
-            Frame::decode(&bad),
-            Err(FrameError::BadOption(2))
-        ));
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
     }
 
     #[test]
@@ -1131,7 +1196,11 @@ mod tests {
                 RaftEntry::data(7, vec![0x99; 4096]),
                 // ConfigChange variant — joint phase carrying the
                 // previous member set + the new one.
-                RaftEntry::config_change(7, Some(vec![0xAAAA, 0xBBBB]), vec![0xAAAA, 0xBBBB, 0xCCCC]),
+                RaftEntry::config_change(
+                    7,
+                    Some(vec![0xAAAA, 0xBBBB]),
+                    vec![0xAAAA, 0xBBBB, 0xCCCC],
+                ),
                 // ConfigChange retire — joint_old=None, just the
                 // final members list.
                 RaftEntry::config_change(8, None, vec![0xAAAA, 0xBBBB, 0xCCCC]),
@@ -1166,8 +1235,14 @@ mod tests {
 
     #[test]
     fn raft_vote_resp_roundtrip() {
-        roundtrip(Frame::RaftVoteResp { term: 9, vote_granted: true });
-        roundtrip(Frame::RaftVoteResp { term: 9, vote_granted: false });
+        roundtrip(Frame::RaftVoteResp {
+            term: 9,
+            vote_granted: true,
+        });
+        roundtrip(Frame::RaftVoteResp {
+            term: 9,
+            vote_granted: false,
+        });
     }
 
     #[test]
@@ -1177,10 +1252,7 @@ mod tests {
         bad.extend_from_slice(&0u64.to_le_bytes()); // term
         bad.push(2); // not 0 or 1
         bad.extend_from_slice(&0u64.to_le_bytes()); // match_index
-        assert!(matches!(
-            Frame::decode(&bad),
-            Err(FrameError::BadOption(2))
-        ));
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
     }
 
     #[test]
@@ -1189,10 +1261,7 @@ mod tests {
         bad.push(TAG_RAFT_VOTE_RESP);
         bad.extend_from_slice(&0u64.to_le_bytes()); // term
         bad.push(7); // not 0 or 1
-        assert!(matches!(
-            Frame::decode(&bad),
-            Err(FrameError::BadOption(7))
-        ));
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(7))));
     }
 
     #[test]

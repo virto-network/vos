@@ -164,9 +164,8 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
 /// handrolled impl, just delegated to the `time` crate so the
 /// civil-date math doesn't live in vosx.
 fn now_iso8601() -> String {
-    const FORMAT: &[time::format_description::FormatItem<'_>] = time::macros::format_description!(
-        "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
-    );
+    const FORMAT: &[time::format_description::FormatItem<'_>] =
+        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
     time::OffsetDateTime::now_utc()
         .format(FORMAT)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())

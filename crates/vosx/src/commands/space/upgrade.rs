@@ -25,10 +25,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let (program_name, program_version) = parse_program_ref(&args.program_ref)?;
 
     DaemonClient::with_connect(&args.space, |client| {
-        let program = client.program(&program_name, &program_version)?
-            .ok_or_else(|| anyhow::anyhow!(
-                "program {program_name}:{program_version} not in catalog",
-            ))?;
+        let program = client
+            .program(&program_name, &program_version)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("program {program_name}:{program_version} not in catalog",)
+            })?;
 
         let status = client.upgrade(
             args.instance.clone(),

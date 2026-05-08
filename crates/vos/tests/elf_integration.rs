@@ -32,7 +32,15 @@ fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos::abi::service::Servic
 #[test]
 fn transpile_all_examples() {
     // Smoke test: all example ELFs transpile without error.
-    for name in &["greeter", "counter", "fizzbuzz", "hasher", "animation", "display", "pushy"] {
+    for name in &[
+        "greeter",
+        "counter",
+        "fizzbuzz",
+        "hasher",
+        "animation",
+        "display",
+        "pushy",
+    ] {
         let elf = example_elf(name);
         let blob = transpile_actor(&elf);
         assert!(!blob.is_empty(), "{name} produced empty blob");
@@ -43,7 +51,11 @@ fn transpile_all_examples() {
 fn greeter_pvm_blob_has_jump_header() {
     let elf = example_elf("greeter");
     let blob = transpile_actor(&elf);
-    assert!(blob.len() > 100, "greeter blob suspiciously small: {} bytes", blob.len());
+    assert!(
+        blob.len() > 100,
+        "greeter blob suspiciously small: {} bytes",
+        blob.len()
+    );
 }
 
 #[test]
@@ -56,7 +68,10 @@ fn greeter_metadata_from_elf() {
     };
 
     assert_eq!(meta.actor_name, "Greeter");
-    assert!(!meta.messages.is_empty(), "greeter should have at least one message");
+    assert!(
+        !meta.messages.is_empty(),
+        "greeter should have at least one message"
+    );
 }
 
 #[test]
@@ -80,8 +95,7 @@ fn agent_service_lifecycle() {
     let id = register_svc(&mut rt, blob);
 
     // Write init args (empty children list)
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![]));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
 
@@ -136,10 +150,13 @@ fn cooperative_loop_with_greeter() {
     let greeter_id = rt.register_service(greeter_blob_idx);
 
     // Write init args (children = [greeter_id])
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![greeter_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![greeter_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     // Kick-start agent
     rt.send_to(agent_id, Vec::new());
@@ -178,8 +195,7 @@ fn refine_completes_and_clears_continuation() {
     let mut rt = VosRuntime::new();
     let id = register_svc(&mut rt, blob);
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![]));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(id, vos::lifecycle::INIT_KEY, &encoded);
 
@@ -211,7 +227,7 @@ fn data_layer_roundtrip_via_runtime() {
     // `ctx.sleep()`. That's the test that exercises
     // `pvm_image::capture`/`restore` against a real PVM image.
     use vos::data_layer::{DataLayer, MemoryDataLayer};
-    use vos::pvm_image::{commit, ContinuationHeader};
+    use vos::pvm_image::{ContinuationHeader, commit};
 
     // Build a body + matching header, put the body in the data
     // layer, write the header into service storage, and verify the
@@ -223,7 +239,10 @@ fn data_layer_roundtrip_via_runtime() {
     assert!(!da.contains(&commitment));
     pollster::block_on(da.put(commitment, body.clone()));
     assert!(da.contains(&commitment));
-    assert_eq!(pollster::block_on(da.get(&commitment)).as_deref(), Some(&body[..]));
+    assert_eq!(
+        pollster::block_on(da.get(&commitment)).as_deref(),
+        Some(&body[..])
+    );
 
     let header = ContinuationHeader {
         pc: 0,
@@ -240,7 +259,8 @@ fn data_layer_roundtrip_via_runtime() {
     let mut rt = VosRuntime::with_data_layer(da);
     let id = vos::abi::service::ServiceId(42);
     assert!(!rt.is_suspended(id));
-    rt.storage.write(id, vos::lifecycle::CONTINUATION_HEADER_KEY, &encoded);
+    rt.storage
+        .write(id, vos::lifecycle::CONTINUATION_HEADER_KEY, &encoded);
     assert!(
         rt.is_suspended(id),
         "runtime should see the continuation header in service storage"
@@ -254,7 +274,7 @@ fn data_layer_survives_runtime_teardown() {
     // as suspended. This tests the plumbing: storage header + DA body
     // survive across runtime instances.
     use vos::data_layer::{DataLayer, MemoryDataLayer};
-    use vos::pvm_image::{commit, ContinuationHeader};
+    use vos::pvm_image::{ContinuationHeader, commit};
 
     let body = vec![0xBBu8; 128];
     let commitment = commit(&body);
@@ -278,7 +298,11 @@ fn data_layer_survives_runtime_teardown() {
     let blob = transpile_actor(&greeter_elf);
     let blob_idx = rt_a.register_service_blob(blob.clone());
     let svc_id = rt_a.register_service(blob_idx);
-    rt_a.storage.write(svc_id, vos::lifecycle::CONTINUATION_HEADER_KEY, &header.encode());
+    rt_a.storage.write(
+        svc_id,
+        vos::lifecycle::CONTINUATION_HEADER_KEY,
+        &header.encode(),
+    );
     assert!(rt_a.is_suspended(svc_id));
 
     // Move data layer and storage to runtime B.
@@ -310,15 +334,18 @@ fn greeter_as_top_level_service() {
     let mut rt = VosRuntime::new();
     let id = register_svc(&mut rt, blob);
 
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let encoded = Msg::new("start").encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
     rt.send_to(id, payload);
     rt.run_blocking();
-    assert_eq!(rt.panics, 0, "greeter panicked running directly as top-level service");
+    assert_eq!(
+        rt.panics, 0,
+        "greeter panicked running directly as top-level service"
+    );
 }
 
 #[test]
@@ -342,7 +369,11 @@ fn pvm_agent_invokes_worker_via_external_handler() {
     };
 
     let echo_so = {
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
         std::path::PathBuf::from(p)
     };
@@ -364,12 +395,14 @@ fn pvm_agent_invokes_worker_via_external_handler() {
     // Load the worker plugin for the external handler.
     // Leak the plugin so the WorkerInstance is 'static (test only).
     let plugin: &'static _ = Box::leak(Box::new(
-        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker"),
     ));
     let instance = std::sync::Mutex::new(plugin.create());
 
     rt.set_external_invoke(Box::new(move |target, msg| {
-        if target != worker_child_id { return None; }
+        if target != worker_child_id {
+            return None;
+        }
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
@@ -379,17 +412,26 @@ fn pvm_agent_invokes_worker_via_external_handler() {
     }));
 
     // Init scheduler with children = [99] (our worker)
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![worker_child_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.send_to(agent_id, Vec::new());
     rt.run_blocking();
 
-    assert_eq!(rt.panics, 0, "scheduler panicked when invoking worker child");
+    assert_eq!(
+        rt.panics, 0,
+        "scheduler panicked when invoking worker child"
+    );
     let invokes = invoke_count.load(Ordering::Relaxed);
-    assert!(invokes > 0, "external_invoke should have been called at least once, got {invokes}");
+    assert!(
+        invokes > 0,
+        "external_invoke should have been called at least once, got {invokes}"
+    );
     eprintln!("pvm_agent_invokes_worker: {invokes} invoke(s) routed to worker");
 }
 
@@ -415,7 +457,11 @@ fn recording_session_captures_invoke_replies() {
     };
 
     let echo_so = {
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
         std::path::PathBuf::from(p)
     };
@@ -433,12 +479,14 @@ fn recording_session_captures_invoke_replies() {
     let count_clone = invoke_count.clone();
 
     let plugin: &'static _ = Box::leak(Box::new(
-        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker"),
     ));
     let instance = std::sync::Mutex::new(plugin.create());
 
     rt.set_external_invoke(Box::new(move |target, msg| {
-        if target != worker_child_id { return None; }
+        if target != worker_child_id {
+            return None;
+        }
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
@@ -447,23 +495,32 @@ fn recording_session_captures_invoke_replies() {
         }
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![worker_child_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     // Begin a recording session before the dispatch. The msg bytes
     // here would normally be the incoming envelope payload; we pass
     // a tag so we can assert it came through.
     let dispatch_msg = b"test-dispatch".to_vec();
     rt.begin_recording(dispatch_msg.clone());
-    assert!(rt.is_recording(), "session should be active after begin_recording");
+    assert!(
+        rt.is_recording(),
+        "session should be active after begin_recording"
+    );
 
     rt.send_to(agent_id, Vec::new());
     rt.run_blocking();
 
     let log = rt.finish_recording().expect("session should be in flight");
-    assert!(!rt.is_recording(), "session should be cleared after finish_recording");
+    assert!(
+        !rt.is_recording(),
+        "session should be cleared after finish_recording"
+    );
 
     assert_eq!(rt.panics, 0, "scheduler panicked under recording");
     let invokes = invoke_count.load(Ordering::Relaxed);
@@ -512,7 +569,11 @@ fn replay_session_short_circuits_external_invoke() {
     };
 
     let echo_so = {
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
         std::path::PathBuf::from(p)
     };
@@ -529,7 +590,7 @@ fn replay_session_short_circuits_external_invoke() {
     let count_rec_clone = invoke_count_rec.clone();
 
     let plugin: &'static _ = Box::leak(Box::new(
-        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker"),
     ));
     let instance_rec = std::sync::Mutex::new(plugin.create());
 
@@ -538,7 +599,9 @@ fn replay_session_short_circuits_external_invoke() {
         let agent_id = register_svc(&mut rt, blob.clone());
 
         rt.set_external_invoke(Box::new(move |target, msg| {
-            if target != worker_child_id { return None; }
+            if target != worker_child_id {
+                return None;
+            }
             count_rec_clone.fetch_add(1, Ordering::Relaxed);
             let mut inst = instance_rec.lock().unwrap();
             match inst.dispatch_raw(msg) {
@@ -547,10 +610,13 @@ fn replay_session_short_circuits_external_invoke() {
             }
         }));
 
-        let args = vos::init::InitArgs::new()
-            .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+        let args = vos::init::InitArgs::new().with(
+            "children",
+            vos::init::InitValue::ListU32(vec![worker_child_id.0]),
+        );
         let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-        rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+        rt.storage
+            .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
         rt.begin_recording(Vec::new());
         rt.send_to(agent_id, Vec::new());
@@ -563,7 +629,8 @@ fn replay_session_short_circuits_external_invoke() {
     let rec_invokes = invoke_count_rec.load(Ordering::Relaxed);
     assert!(rec_invokes > 0, "recording run should have invoked");
     assert_eq!(
-        recorded_log.reply_count() as u32, rec_invokes,
+        recorded_log.reply_count() as u32,
+        rec_invokes,
         "log should have one entry per top-level invoke",
     );
 
@@ -582,10 +649,13 @@ fn replay_session_short_circuits_external_invoke() {
         Some(vos::runtime::ExternalInvokeReply::done(alloc_bogus_reply()))
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![worker_child_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.begin_replay(recorded_log);
     assert!(rt.is_replaying());
@@ -604,7 +674,8 @@ fn replay_session_short_circuits_external_invoke() {
     assert!(
         replay.is_complete(),
         "replay should consume all recorded replies (pos={}, exhausted={})",
-        replay.position(), replay.was_exhausted(),
+        replay.position(),
+        replay.was_exhausted(),
     );
 }
 
@@ -653,7 +724,12 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 
     assert_eq!(results.len(), 1);
     let r = &results[0];
-    assert!(r.error.is_some(), "expected fatal error, got result: panics={}, error={:?}", r.panics, r.error);
+    assert!(
+        r.error.is_some(),
+        "expected fatal error, got result: panics={}, error={:?}",
+        r.panics,
+        r.error
+    );
     let err = r.error.as_ref().unwrap();
     assert!(
         err.contains("Crdt") && err.contains("data_dir"),
@@ -687,7 +763,9 @@ fn crdt_consistency_without_replication_id_fails_loud() {
         "vos_crdt_no_repid_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -704,7 +782,12 @@ fn crdt_consistency_without_replication_id_fails_loud() {
 
     assert_eq!(results.len(), 1);
     let r = &results[0];
-    assert!(r.error.is_some(), "expected fatal error, got: panics={}, error={:?}", r.panics, r.error);
+    assert!(
+        r.error.is_some(),
+        "expected fatal error, got: panics={}, error={:?}",
+        r.panics,
+        r.error
+    );
     let err = r.error.as_ref().unwrap();
     assert!(
         err.contains("replication_id"),
@@ -746,8 +829,8 @@ fn cross_agent_invoke_returns_typed_reply() {
 
     // Build the invoke wire payload: TAG_DYNAMIC + rkyv-encoded
     // Msg::new("add").with("a", 2).with("b", 3).
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let msg = Msg::new("add").with("a", 2u64).with("b", 3u64);
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -770,7 +853,9 @@ fn cross_agent_invoke_returns_typed_reply() {
         assert!(
             r.is_ok(),
             "agent {} failed: panics={} error={:?}",
-            r.id, r.panics, r.error,
+            r.id,
+            r.panics,
+            r.error,
         );
     }
 }
@@ -793,8 +878,8 @@ fn pushy_vec_push_grows_correctly() {
     let mut node = VosNode::new();
     let pushy_id = node.register(AgentConfig::new(pushy_blob));
 
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let dyn_payload = |m: Msg| -> Vec<u8> {
         let encoded = m.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -811,7 +896,10 @@ fn pushy_vec_push_grows_correctly() {
         .invoke(pushy_id, dyn_payload(Msg::new("get")))
         .expect("get() failed");
     let value: vos::value::Value = vos::Decode::decode(&bytes);
-    let items = value.as_list_u32().expect("get() reply not a ListU32").to_vec();
+    let items = value
+        .as_list_u32()
+        .expect("get() reply not a ListU32")
+        .to_vec();
     assert_eq!(
         items,
         vec![11u32, 22u32, 33u32],
@@ -832,7 +920,10 @@ fn pushy_vec_push_grows_correctly() {
         .invoke(pushy_id, dyn_payload(Msg::new("get")))
         .expect("get() failed");
     let value: vos::value::Value = vos::Decode::decode(&bytes);
-    let items = value.as_list_u32().expect("get() reply not a ListU32").to_vec();
+    let items = value
+        .as_list_u32()
+        .expect("get() reply not a ListU32")
+        .to_vec();
 
     node.shutdown();
     let results = node.collect();
@@ -840,7 +931,9 @@ fn pushy_vec_push_grows_correctly() {
         assert!(
             r.is_ok(),
             "agent {} failed: panics={} error={:?}",
-            r.id, r.panics, r.error,
+            r.id,
+            r.panics,
+            r.error,
         );
     }
 
@@ -902,8 +995,10 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
     // SCHEDULER is the CRDT actor whose DAG we're inspecting.
     let greeter_id = node.register(AgentConfig::new(greeter_blob));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![greeter_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![greeter_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
         .unwrap()
         .to_vec();
@@ -928,14 +1023,17 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
     let db_path = data_dir
         .join("agents")
         .join(format!("{:08x}.redb", scheduler_id.0));
-    assert!(db_path.exists(), "scheduler's redb missing: {}", db_path.display());
+    assert!(
+        db_path.exists(),
+        "scheduler's redb missing: {}",
+        db_path.display()
+    );
 
     let db = redb::Database::open(&db_path).unwrap();
     let txn = db.begin_read().unwrap();
 
     use redb::{ReadableTable, ReadableTableMetadata};
-    const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> =
-        redb::TableDefinition::new("dag");
+    const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
     let dag_table = txn.open_table(DAG_TABLE).unwrap();
     let dag_count = dag_table.len().unwrap();
     assert!(
@@ -954,8 +1052,8 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
         // DagNode wire format: [payload_len:u64 LE][payload][n_children:u64 LE][children...]
         let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let payload_bytes = &bytes[8..8 + payload_len];
-        let event = vos::effect_log::CrdtEvent::from_bytes(payload_bytes)
-            .expect("decode CrdtEvent");
+        let event =
+            vos::effect_log::CrdtEvent::from_bytes(payload_bytes).expect("decode CrdtEvent");
         total_replies += event.log.reply_count();
     }
     assert!(
@@ -1031,7 +1129,9 @@ fn cross_agent_invoke_routes_through_node() {
         assert!(
             r.is_ok(),
             "agent {} failed: panics={} error={:?}",
-            r.id, r.panics, r.error,
+            r.id,
+            r.panics,
+            r.error,
         );
     }
 
@@ -1061,7 +1161,11 @@ fn recording_cap_truncates_oversized_invoke_output() {
     };
 
     let echo_so = {
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let p = format!("{}/../../target/{profile}/libecho_worker.so", workspace);
         std::path::PathBuf::from(p)
     };
@@ -1079,12 +1183,14 @@ fn recording_cap_truncates_oversized_invoke_output() {
     let count_clone = invoke_count.clone();
 
     let plugin: &'static _ = Box::leak(Box::new(
-        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker"),
     ));
     let instance = std::sync::Mutex::new(plugin.create());
 
     rt.set_external_invoke(Box::new(move |target, msg| {
-        if target != worker_child_id { return None; }
+        if target != worker_child_id {
+            return None;
+        }
         count_clone.fetch_add(1, Ordering::Relaxed);
         let mut inst = instance.lock().unwrap();
         match inst.dispatch_raw(msg) {
@@ -1093,10 +1199,13 @@ fn recording_cap_truncates_oversized_invoke_output() {
         }
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![worker_child_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![worker_child_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     // Recording with an absurdly small cap (1 byte) — every invoke
     // wire frame is at least 1 status byte plus state_len, so any
@@ -1109,7 +1218,8 @@ fn recording_cap_truncates_oversized_invoke_output() {
     let invokes = invoke_count.load(Ordering::Relaxed);
     assert!(invokes > 0, "scheduler should have invoked at least once");
     assert_eq!(
-        log.reply_count() as u32, invokes,
+        log.reply_count() as u32,
+        invokes,
         "every top-level invoke is logged",
     );
     for (i, reply) in log.replies.iter().enumerate() {
@@ -1128,8 +1238,8 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     // holds both a materialized state entry and at least one DAG
     // node. This exercises the agent_thread → runtime →
     // record_and_write_invoke → commit_with_log path.
-    use vos::node::{AgentConfig, Consistency, Envelope, VosNode};
     use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, Envelope, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
@@ -1159,8 +1269,8 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     // Scheduler needs its `children` init arg in storage before
     // dispatch — an empty list is fine, we're just proving the
     // CRDT wire-up fires.
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(Vec::new()));
+    let args =
+        vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(Vec::new()));
     let init_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
         .unwrap()
         .to_vec();
@@ -1177,14 +1287,24 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     node.run();
     let results = node.collect();
     for r in &results {
-        assert!(r.is_ok(), "agent {} failed: panics={} error={:?}", r.id, r.panics, r.error);
+        assert!(
+            r.is_ok(),
+            "agent {} failed: panics={} error={:?}",
+            r.id,
+            r.panics,
+            r.error
+        );
     }
 
     // Verify the redb file exists at the expected path.
     let db_path = data_dir
         .join("agents")
         .join(format!("{:08x}.redb", agent_id.0));
-    assert!(db_path.exists(), "CRDT redb not created at {}", db_path.display());
+    assert!(
+        db_path.exists(),
+        "CRDT redb not created at {}",
+        db_path.display()
+    );
 
     // Open the db and check both tables.
     let db = redb::Database::open(&db_path).expect("open db");
@@ -1234,7 +1354,11 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
 
     // Silence unused warnings for ids that aren't otherwise used here.
     let _ = ServiceId(0);
-    let _ = Envelope { from: agent_id, to: agent_id, payload: Vec::new() };
+    let _ = Envelope {
+        from: agent_id,
+        to: agent_id,
+        payload: Vec::new(),
+    };
 
     // ── Second run: reuse the same data-dir. The agent_thread
     //    should hit the restore fast path and the existing DAG
@@ -1252,8 +1376,8 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
 
     let blob2 = grey_transpiler::link_elf(&agent_data).expect("transpile");
     let init_bytes2 = {
-        let args = vos::init::InitArgs::new()
-            .with("children", vos::init::InitValue::ListU32(Vec::new()));
+        let args =
+            vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(Vec::new()));
         vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
             .unwrap()
             .to_vec()
@@ -1270,7 +1394,13 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     node2.run();
     let results2 = node2.collect();
     for r in &results2 {
-        assert!(r.is_ok(), "agent {} failed on restart: panics={} error={:?}", r.id, r.panics, r.error);
+        assert!(
+            r.is_ok(),
+            "agent {} failed on restart: panics={} error={:?}",
+            r.id,
+            r.panics,
+            r.error
+        );
     }
 
     let dag_count_after_second = {
@@ -1308,8 +1438,8 @@ fn display_multiple_vec_renders() {
     let mut rt = VosRuntime::new();
     let id = register_svc(&mut rt, blob);
 
-    use vos::value::{Msg, Value, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
 
     // Send two render messages with Vec<u8> payloads in separate ticks.
     // Each gets its own kernel invocation so both must independently
@@ -1347,9 +1477,9 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // counter never sees `inc()`, count stays 0.
     // Post-fix: the message arrives, dispatches, count goes to 1.
     use crdt_counter::CrdtCounterRef;
+    use vos::Encode;
     use vos::node::{AgentConfig, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -1358,7 +1488,10 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -1430,7 +1563,10 @@ fn crdt_counter_local_invoke_smoke() {
     );
     let data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter not built");
+            return;
+        }
     };
     let blob = grey_transpiler::link_elf(&data).expect("transpile");
     let mut node = VosNode::new();
@@ -1451,9 +1587,9 @@ fn crdt_counter_init_payloads_dispatch() {
     // Smoke test the on_start manifest path: register a CRDT
     // counter with an init_payload that encodes inc() and
     // verify the count went up to 1 by the time we invoke get().
+    use vos::Encode;
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -1462,7 +1598,10 @@ fn crdt_counter_init_payloads_dispatch() {
     );
     let data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter not built");
+            return;
+        }
     };
     let blob = grey_transpiler::link_elf(&data).expect("transpile");
 
@@ -1470,7 +1609,9 @@ fn crdt_counter_init_payloads_dispatch() {
         "vos_init_payload_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -1540,11 +1681,11 @@ fn crdt_counter_converges_across_nodes_live() {
     // Replication of the same actor across nodes is the headline
     // feature kunekt's CRDT machinery is for; this is the first
     // test that drives it through a real PVM actor end-to-end.
+    use vos::Encode;
     use vos::abi::service::ServiceId;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -1567,7 +1708,8 @@ fn crdt_counter_converges_across_nodes_live() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir_root = std::env::temp_dir().join(format!("vos_crdt_e2e_{}_{}", std::process::id(), stamp));
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_crdt_e2e_{}_{}", std::process::id(), stamp));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -1605,7 +1747,8 @@ fn crdt_counter_converges_across_nodes_live() {
         std::time::Duration::from_secs(5),
     )
     .expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
     let net_b = Network::start(NetworkConfig {
         keypair: kp_b,
@@ -1707,8 +1850,16 @@ fn crdt_counter_converges_across_nodes_live() {
         },
         std::time::Duration::from_secs(8),
     );
-    assert_eq!(count_a, Some(2), "A did not converge to count=2 within deadline");
-    assert_eq!(count_b, Some(2), "B did not converge to count=2 within deadline");
+    assert_eq!(
+        count_a,
+        Some(2),
+        "A did not converge to count=2 within deadline"
+    );
+    assert_eq!(
+        count_b,
+        Some(2),
+        "B did not converge to count=2 within deadline"
+    );
 
     let _ = node_a.collect();
     let _ = node_b.collect();
@@ -1747,11 +1898,11 @@ fn crdt_scheduler_install_propagates_across_nodes() {
     //      `id` we pick is intentionally not registered on either
     //      side, so install's `invoke_child` reply is NotFound on
     //      A and the same recorded NotFound on B's replay.
+    use vos::Encode;
     use vos::abi::service::ServiceId;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
@@ -1771,9 +1922,8 @@ fn crdt_scheduler_install_propagates_across_nodes() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir_root = std::env::temp_dir().join(format!(
-        "vos_crdt_sched_{}_{}", std::process::id(), stamp,
-    ));
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_crdt_sched_{}_{}", std::process::id(), stamp,));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -1796,23 +1946,28 @@ fn crdt_scheduler_install_propagates_across_nodes() {
     let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let net_a = Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         std::time::Duration::from_secs(5),
-    ).expect("net_a binds");
+    )
+    .expect("net_a binds");
     let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
     let net_b = Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen], bootstrap: vec![a_dial],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
     });
 
     // Empty initial children so install(N) is the only state
     // mutation we need to observe.
-    let init_args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(Vec::new()));
+    let init_args =
+        vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(Vec::new()));
     let init_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args)
         .unwrap()
         .to_vec();
@@ -1820,7 +1975,10 @@ fn crdt_scheduler_install_propagates_across_nodes() {
     let mut node_a = VosNode::with_prefix(prefix_a);
     let scheduler_a = node_a.register(
         AgentConfig::new(scheduler_blob.clone())
-            .with_storage(vec![(vos::lifecycle::INIT_KEY.to_vec(), init_bytes.clone())])
+            .with_storage(vec![(
+                vos::lifecycle::INIT_KEY.to_vec(),
+                init_bytes.clone(),
+            )])
             .with_consistency(Consistency::Crdt)
             .persist(&dir_a)
             .with_replication_id(rep_id),
@@ -1842,10 +2000,14 @@ fn crdt_scheduler_install_propagates_across_nodes() {
     let net_a_arc = node_a.network().expect("net_a");
     let net_b_arc = node_b.network().expect("net_b");
     wait_for(
-        || (net_a_arc.peer_for_prefix(prefix_b).is_some()
-                && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
         std::time::Duration::from_secs(10),
-    ).expect("Hello completes");
+    )
+    .expect("Hello completes");
 
     // Drive install(0xC0DE) on A only. The id isn't registered as a
     // service anywhere, so scheduler's `invoke_child` inside install
@@ -1859,7 +2021,9 @@ fn crdt_scheduler_install_propagates_across_nodes() {
         p.extend_from_slice(&encoded);
         p
     };
-    let _ = node_a.invoke(scheduler_a, install_payload).expect("install on A");
+    let _ = node_a
+        .invoke(scheduler_a, install_payload)
+        .expect("install on A");
 
     // Probe both replicas. A sees the change immediately; B has to
     // catch up via the sync ticker (cycle-3) then a soft-restart
@@ -1920,11 +2084,11 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     //     (silent dedup → undercount on convergence)
     //   - the BFS from FetchHeads stopping mid-fetch and
     //     leaving the merged DAG short of a few nodes
+    use vos::Encode;
     use vos::abi::service::ServiceId;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -1933,7 +2097,10 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -1941,10 +2108,11 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     const EXPECTED: u64 = (PER_SIDE as u64) * 2;
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir_root = std::env::temp_dir().join(format!(
-        "vos_crdt_burst_{}_{}", std::process::id(), stamp,
-    ));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_crdt_burst_{}_{}", std::process::id(), stamp,));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -1967,19 +2135,24 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
     let net_a = Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         std::time::Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_listen
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
     let net_b = Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen], bootstrap: vec![a_dial],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
     });
 
     let mut node_a = VosNode::with_prefix(prefix_a);
@@ -2003,10 +2176,14 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     let net_a_arc = node_a.network().expect("net_a attached");
     let net_b_arc = node_b.network().expect("net_b attached");
     wait_for(
-        || (net_a_arc.peer_for_prefix(prefix_b).is_some()
-                && net_b_arc.peer_for_prefix(prefix_a).is_some()).then_some(()),
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
         std::time::Duration::from_secs(10),
-    ).expect("Hello completes");
+    )
+    .expect("Hello completes");
 
     let inc_payload = || -> Vec<u8> {
         let m = Msg::new("inc");
@@ -2066,11 +2243,13 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     let observed_a = read_count(&node_a, counter_a);
     let observed_b = read_count(&node_b, counter_b);
     assert_eq!(
-        final_a, Some(EXPECTED),
+        final_a,
+        Some(EXPECTED),
         "A did not converge to {EXPECTED} within deadline; last observed = {observed_a:?}",
     );
     assert_eq!(
-        final_b, Some(EXPECTED),
+        final_b,
+        Some(EXPECTED),
         "B did not converge to {EXPECTED} within deadline; last observed = {observed_b:?}",
     );
 
@@ -2080,10 +2259,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
 }
 
 #[cfg(feature = "network")]
-fn wait_for<T>(
-    mut probe: impl FnMut() -> Option<T>,
-    deadline: std::time::Duration,
-) -> Option<T> {
+fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, deadline: std::time::Duration) -> Option<T> {
     let until = std::time::Instant::now() + deadline;
     loop {
         if let Some(v) = probe() {
@@ -2124,7 +2300,10 @@ fn crdt_counter_restart_replays_state_from_disk() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -2132,7 +2311,9 @@ fn crdt_counter_restart_replays_state_from_disk() {
         "vos_restart_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2164,7 +2345,10 @@ fn crdt_counter_restart_replays_state_from_disk() {
         vos::block_on(counter.inc(&mut &node)).expect("inc 1");
         vos::block_on(counter.inc(&mut &node)).expect("inc 2");
         vos::block_on(counter.inc(&mut &node)).expect("inc 3");
-        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
+        assert_eq!(
+            vos::block_on(counter.get(&mut &node)).expect("get pre-restart"),
+            3
+        );
 
         node.shutdown();
         let _ = node.collect();
@@ -2213,7 +2397,10 @@ fn crdt_counter_restart_replays_state_from_disk() {
         // state isn't a frozen snapshot, the actor really is
         // alive and writable on the same DAG.
         vos::block_on(counter.inc(&mut &node)).expect("inc post-restart");
-        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
+        assert_eq!(
+            vos::block_on(counter.get(&mut &node)).expect("get final"),
+            4
+        );
 
         node.shutdown();
         let _ = node.collect();
@@ -2254,7 +2441,10 @@ fn crdt_counter_survives_corrupted_persisted_state() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -2262,7 +2452,9 @@ fn crdt_counter_survives_corrupted_persisted_state() {
         "vos_corrupt_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2300,11 +2492,16 @@ fn crdt_counter_survives_corrupted_persisted_state() {
     // redb file, find the `state` table, replace the `actor`
     // row with random bytes that won't deserialize.
     {
-        let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
-        assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+        let db_path = dir
+            .join("agents")
+            .join(format!("{:08x}.redb", counter_id.0));
+        assert!(
+            db_path.exists(),
+            "redb at {} should exist",
+            db_path.display()
+        );
         let db = redb::Database::create(&db_path).expect("open redb for corruption");
-        let table_def: redb::TableDefinition<'_, &str, &[u8]> =
-            redb::TableDefinition::new("state");
+        let table_def: redb::TableDefinition<'_, &str, &[u8]> = redb::TableDefinition::new("state");
         let txn = db.begin_write().expect("write txn");
         {
             let mut table = txn.open_table(table_def).expect("open state table");
@@ -2312,8 +2509,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
             // state. rkyv's archive format is highly
             // specific; a short pile of zeros tends to fail
             // alignment / pointer checks.
-            table.insert("actor", &[0u8][..])
-                .expect("write garbage");
+            table.insert("actor", &[0u8][..]).expect("write garbage");
         }
         txn.commit().expect("commit corruption");
     }
@@ -2395,7 +2591,10 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
     };
     let blob = transpile_actor(&agent_data);
 
@@ -2410,15 +2609,20 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     // caller's 4 KiB invoke output buffer. The bytes themselves
     // don't matter; what's interesting is the *length*.
     rt.set_external_invoke(Box::new(move |target, _msg| {
-        if target != oversized_target { return None; }
+        if target != oversized_target {
+            return None;
+        }
         invokes_clone.fetch_add(1, Ordering::Relaxed);
         Some(vos::runtime::ExternalInvokeReply::done(vec![0u8; 5_000]))
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![oversized_target.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![oversized_target.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.send_to(agent_id, Vec::new());
     // The runtime must terminate (panicked agent or otherwise) —
@@ -2427,7 +2631,10 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     rt.run_blocking();
 
     let n = invokes.load(Ordering::Relaxed);
-    assert!(n > 0, "external_invoke handler should have been called at least once");
+    assert!(
+        n > 0,
+        "external_invoke handler should have been called at least once"
+    );
 
     // Post-fix behaviour: the runtime sees output.len()=5005 >
     // output_buf_len=4096 and substitutes a single-byte
@@ -2441,7 +2648,8 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
         "after the ABI fix the runtime must trap the over-write \
          instead of letting the guest panic on its own bounds \
          check; rt.panics = {} means an oversized reply is still \
-         reaching guest memory unbounded", rt.panics,
+         reaching guest memory unbounded",
+        rt.panics,
     );
 }
 
@@ -2467,7 +2675,10 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -2475,7 +2686,9 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
         "vos_panic_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2503,7 +2716,10 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // post-panic.
     vos::block_on(counter.inc(&mut &node)).expect("inc 1");
     vos::block_on(counter.inc(&mut &node)).expect("inc 2");
-    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-boom"), 2);
+    assert_eq!(
+        vos::block_on(counter.get(&mut &node)).expect("get pre-boom"),
+        2
+    );
 
     // Trigger the panic. The macro-generated Ref returns
     // `ClientError::Unreachable` because `node.invoke` returns
@@ -2530,13 +2746,19 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
     // that fails loudest if the agent thread died on the panic
     // (the invoke would time out / return Unreachable).
     vos::block_on(counter.inc(&mut &node)).expect("inc post-boom must succeed");
-    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 3);
+    assert_eq!(
+        vos::block_on(counter.get(&mut &node)).expect("get final"),
+        3
+    );
 
     // Hit boom a second time — exercises the recovery path
     // twice in case the first survival was a fluke.
     let _ = vos::block_on(counter.boom(&mut &node));
     vos::block_on(counter.inc(&mut &node)).expect("inc after second boom");
-    assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final-final"), 4);
+    assert_eq!(
+        vos::block_on(counter.get(&mut &node)).expect("get final-final"),
+        4
+    );
 
     node.shutdown();
     let _ = node.collect();
@@ -2570,7 +2792,10 @@ fn crdt_counter_shutdown_under_active_load() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -2578,7 +2803,9 @@ fn crdt_counter_shutdown_under_active_load() {
         "vos_shut_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2610,8 +2837,8 @@ fn crdt_counter_shutdown_under_active_load() {
     let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let count_clone = count.clone();
 
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let inc_payload = || -> Vec<u8> {
         let m = Msg::new("inc");
         let encoded = m.encode();
@@ -2625,7 +2852,9 @@ fn crdt_counter_shutdown_under_active_load() {
     let burst = std::thread::spawn(move || {
         while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
             match handle.invoke_with_timeout(counter_id, inc_payload(), one_sec) {
-                Some(_) => { count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                Some(_) => {
+                    count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 None => break,
             }
         }
@@ -2657,7 +2886,10 @@ fn crdt_counter_shutdown_under_active_load() {
          leaked a blocked thread (sync tick? worker dispatch loop?)",
     );
     let landed = count.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(landed > 0, "expected at least one inc to land before shutdown");
+    assert!(
+        landed > 0,
+        "expected at least one inc to land before shutdown"
+    );
 
     // Reboot at the same data_dir. The redb file must be unlocked
     // — the regression we're guarding against is a sync thread
@@ -2672,8 +2904,8 @@ fn crdt_counter_shutdown_under_active_load() {
         );
         assert_eq!(id2, counter_id, "service id should be stable across boots");
         let counter2 = CrdtCounterRef::at(id2);
-        let count_after = vos::block_on(counter2.get(&mut &node2))
-            .expect("get must work after reboot");
+        let count_after =
+            vos::block_on(counter2.get(&mut &node2)).expect("get must work after reboot");
         assert_eq!(
             count_after, landed as u64,
             "post-reboot count must match the number of inc() calls that returned \
@@ -2706,11 +2938,11 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
     //  2. Sync recovery: A doesn't have to "re-do" the work
     //     it missed; the EffectLogs B accumulated propagate
     //     over libp2p once A reconnects.
+    use vos::Encode;
     use vos::abi::service::ServiceId;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
     use vos::value::{Msg, TAG_DYNAMIC};
-    use vos::Encode;
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
@@ -2719,14 +2951,22 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir_root = std::env::temp_dir()
-        .join(format!("vos_crdt_offline_restart_{}_{}", std::process::id(), stamp));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_crdt_offline_restart_{}_{}",
+        std::process::id(),
+        stamp
+    ));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -2767,17 +3007,22 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     // ── Phase 1: bring A and B up, converge to count=2 ─────────
     let net_a = Network::start(NetworkConfig {
-        keypair: kp_a.clone(), local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a.clone(),
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         std::time::Duration::from_secs(5),
-    ).expect("net_a binds");
+    )
+    .expect("net_a binds");
     let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
     let net_b = Network::start(NetworkConfig {
-        keypair: kp_b.clone(), local_prefix: prefix_b,
-        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+        keypair: kp_b.clone(),
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![a_dial.clone()],
     });
     // Snapshot B's bound address now so A's restart can dial
     // it directly — without that, A2 would only discover B
@@ -2785,7 +3030,8 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
     let b_listen = wait_for(
         || net_b.listen_addrs().into_iter().next(),
         std::time::Duration::from_secs(5),
-    ).expect("net_b binds");
+    )
+    .expect("net_b binds");
     let b_dial = b_listen.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
 
     let mut node_a = VosNode::with_prefix(prefix_a);
@@ -2808,19 +3054,49 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     let net_a_arc = node_a.network().expect("net_a");
     let net_b_arc = node_b.network().expect("net_b");
-    wait_for(|| {
-        if net_a_arc.peer_for_prefix(prefix_b).is_some()
-            && net_b_arc.peer_for_prefix(prefix_a).is_some()
-        { Some(()) } else { None }
-    }, std::time::Duration::from_secs(10)).expect("Hello completes");
+    wait_for(
+        || {
+            if net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .expect("Hello completes");
 
-    let _ = node_a.invoke(counter_a, dyn_payload(Msg::new("inc"))).expect("inc A");
-    let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc"))).expect("inc B");
+    let _ = node_a
+        .invoke(counter_a, dyn_payload(Msg::new("inc")))
+        .expect("inc A");
+    let _ = node_b
+        .invoke(counter_b, dyn_payload(Msg::new("inc")))
+        .expect("inc B");
 
-    wait_for(|| if read_count(&node_a, counter_a) == Some(2) { Some(()) } else { None },
-        std::time::Duration::from_secs(8)).expect("A converges to 2");
-    wait_for(|| if read_count(&node_b, counter_b) == Some(2) { Some(()) } else { None },
-        std::time::Duration::from_secs(8)).expect("B converges to 2");
+    wait_for(
+        || {
+            if read_count(&node_a, counter_a) == Some(2) {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(8),
+    )
+    .expect("A converges to 2");
+    wait_for(
+        || {
+            if read_count(&node_b, counter_b) == Some(2) {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(8),
+    )
+    .expect("B converges to 2");
 
     // ── Phase 2: A goes offline, B drives more incs ────────────
     let _ = node_a.collect();
@@ -2828,16 +3104,28 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     // While A is offline, give B a few more incs.
     for _ in 3u32..=5 {
-        let _ = node_b.invoke(counter_b, dyn_payload(Msg::new("inc")))
+        let _ = node_b
+            .invoke(counter_b, dyn_payload(Msg::new("inc")))
             .expect("inc on B while A offline");
     }
-    wait_for(|| if read_count(&node_b, counter_b) == Some(5) { Some(()) } else { None },
-        std::time::Duration::from_secs(2)).expect("B reaches 5 alone");
+    wait_for(
+        || {
+            if read_count(&node_b, counter_b) == Some(5) {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .expect("B reaches 5 alone");
 
     // ── Phase 3: A comes back, must catch up to 5 ──────────────
     let net_a2 = Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen], bootstrap: vec![b_dial],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen],
+        bootstrap: vec![b_dial],
     });
 
     let mut node_a2 = VosNode::with_prefix(prefix_a);
@@ -2847,22 +3135,40 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
             .persist(&dir_a)
             .with_replication_id(rep_id),
     );
-    assert_eq!(counter_a2, counter_a, "restarted A must reuse the same ServiceId");
+    assert_eq!(
+        counter_a2, counter_a,
+        "restarted A must reuse the same ServiceId"
+    );
     node_a2.attach_network(net_a2);
 
     let net_a2_arc = node_a2.network().expect("net_a2");
-    wait_for(|| {
-        if net_a2_arc.peer_for_prefix(prefix_b).is_some()
-            && net_b_arc.peer_for_prefix(prefix_a).is_some()
-        { Some(()) } else { None }
-    }, std::time::Duration::from_secs(10)).expect("A re-Hellos B");
+    wait_for(
+        || {
+            if net_a2_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .expect("A re-Hellos B");
 
     // Catch-up window: A's CRDT layer should pull B's three
     // missed incs and replay; final count is 5.
     wait_for(
-        || if read_count(&node_a2, counter_a2) == Some(5) { Some(()) } else { None },
+        || {
+            if read_count(&node_a2, counter_a2) == Some(5) {
+                Some(())
+            } else {
+                None
+            }
+        },
         std::time::Duration::from_secs(15),
-    ).expect("A catches up to 5 after restart");
+    )
+    .expect("A catches up to 5 after restart");
     assert_eq!(read_count(&node_b, counter_b), Some(5));
 
     let _ = node_a2.collect();
@@ -2896,13 +3202,26 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
     };
     let echo_so = {
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        std::path::PathBuf::from(format!("{}/../../target/{profile}/libecho_worker.so", workspace))
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        std::path::PathBuf::from(format!(
+            "{}/../../target/{profile}/libecho_worker.so",
+            workspace
+        ))
     };
-    if !echo_so.exists() { eprintln!("SKIP: echo-worker not built"); return; }
+    if !echo_so.exists() {
+        eprintln!("SKIP: echo-worker not built");
+        return;
+    }
 
     let blob = transpile_actor(&agent_data);
     let mut rt = VosRuntime::new();
@@ -2920,7 +3239,7 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
     let ib = invokes_b.clone();
 
     let plugin: &'static _ = Box::leak(Box::new(
-        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker")
+        unsafe { vos::worker::WorkerPlugin::load(&echo_so) }.expect("load echo worker"),
     ));
     let instance = std::sync::Mutex::new(plugin.create());
 
@@ -2929,41 +3248,57 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
             t if t == good_a => {
                 ia.fetch_add(1, Ordering::Relaxed);
                 let mut inst = instance.lock().unwrap();
-                inst.dispatch_raw(msg).map(vos::runtime::ExternalInvokeReply::done).ok()
+                inst.dispatch_raw(msg)
+                    .map(vos::runtime::ExternalInvokeReply::done)
+                    .ok()
                     .or(Some(vos::runtime::ExternalInvokeReply::done(Vec::new())))
             }
             t if t == good_b => {
                 ib.fetch_add(1, Ordering::Relaxed);
                 let mut inst = instance.lock().unwrap();
-                inst.dispatch_raw(msg).map(vos::runtime::ExternalInvokeReply::done).ok()
+                inst.dispatch_raw(msg)
+                    .map(vos::runtime::ExternalInvokeReply::done)
+                    .ok()
                     .or(Some(vos::runtime::ExternalInvokeReply::done(Vec::new())))
             }
             t if t == missing => {
                 im.fetch_add(1, Ordering::Relaxed);
-                None  // → runtime emits STATUS_NOT_FOUND to caller
+                None // → runtime emits STATUS_NOT_FOUND to caller
             }
             _ => None,
         }
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(
-            vec![good_a.0, missing.0, good_b.0],
-        ));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![good_a.0, missing.0, good_b.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.send_to(agent_id, Vec::new());
     rt.run_blocking();
 
-    assert_eq!(rt.panics, 0,
-        "scheduler must not panic when one of its children is NOT_FOUND");
+    assert_eq!(
+        rt.panics, 0,
+        "scheduler must not panic when one of its children is NOT_FOUND"
+    );
     let na = invokes_a.load(Ordering::Relaxed);
     let nm = invokes_missing.load(Ordering::Relaxed);
     let nb = invokes_b.load(Ordering::Relaxed);
-    assert!(na > 0, "good child A (99) should have been invoked at least once, got {na}");
-    assert!(nb > 0, "good child B (101) should have been invoked at least once, got {nb}");
-    assert!(nm > 0, "missing child (100) should have been *attempted* at least once, got {nm}");
+    assert!(
+        na > 0,
+        "good child A (99) should have been invoked at least once, got {na}"
+    );
+    assert!(
+        nb > 0,
+        "good child B (101) should have been invoked at least once, got {nb}"
+    );
+    assert!(
+        nm > 0,
+        "missing child (100) should have been *attempted* at least once, got {nm}"
+    );
 
     // The scheduler's tick re-queues yielded children but drops
     // NOT_FOUND ones. Across all ticks the missing child should
@@ -3004,7 +3339,10 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -3012,7 +3350,9 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         "vos_dag_growth_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -3056,8 +3396,14 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         let _ = node.collect();
     }
 
-    let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
-    assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+    let db_path = dir
+        .join("agents")
+        .join(format!("{:08x}.redb", counter_id.0));
+    assert!(
+        db_path.exists(),
+        "redb at {} should exist",
+        db_path.display()
+    );
     let after_one_inc = count_dag_rows(&db_path);
     assert_eq!(
         after_one_inc, 1,
@@ -3076,7 +3422,10 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         assert_eq!(id, counter_id);
         let counter = CrdtCounterRef::at(id);
         for _ in 0..50 {
-            assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get during read-burst"), 1);
+            assert_eq!(
+                vos::block_on(counter.get(&mut &node)).expect("get during read-burst"),
+                1
+            );
         }
         node.shutdown();
         let _ = node.collect();
@@ -3101,7 +3450,10 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
         assert_eq!(id, counter_id);
         let counter = CrdtCounterRef::at(id);
         vos::block_on(counter.inc(&mut &node)).expect("inc 2");
-        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get post-inc"), 2);
+        assert_eq!(
+            vos::block_on(counter.get(&mut &node)).expect("get post-inc"),
+            2
+        );
         node.shutdown();
         let _ = node.collect();
     }
@@ -3141,7 +3493,10 @@ fn raft_counter_single_node_replays_log_after_restart() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
@@ -3149,7 +3504,9 @@ fn raft_counter_single_node_replays_log_after_restart() {
         "vos_raft_phase1_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -3169,15 +3526,24 @@ fn raft_counter_single_node_replays_log_after_restart() {
         vos::block_on(counter.inc(&mut &node)).expect("inc 3");
         // Sanity reads — must NOT bloat the log.
         for _ in 0..5 {
-            assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get pre-restart"), 3);
+            assert_eq!(
+                vos::block_on(counter.get(&mut &node)).expect("get pre-restart"),
+                3
+            );
         }
         node.shutdown();
         let _ = node.collect();
     }
 
     // ── Probe: exactly 3 raft_log rows on disk, last_applied=3.
-    let db_path = dir.join("agents").join(format!("{:08x}.redb", counter_id.0));
-    assert!(db_path.exists(), "redb at {} should exist", db_path.display());
+    let db_path = dir
+        .join("agents")
+        .join(format!("{:08x}.redb", counter_id.0));
+    assert!(
+        db_path.exists(),
+        "redb at {} should exist",
+        db_path.display()
+    );
     {
         use redb::ReadableTableMetadata;
         let db = redb::Database::create(&db_path).expect("open redb");
@@ -3214,7 +3580,10 @@ fn raft_counter_single_node_replays_log_after_restart() {
         );
         // One more inc: log appends a fourth entry post-restart.
         vos::block_on(counter.inc(&mut &node)).expect("inc post-restart");
-        assert_eq!(vos::block_on(counter.get(&mut &node)).expect("get final"), 4);
+        assert_eq!(
+            vos::block_on(counter.get(&mut &node)).expect("get final"),
+            4
+        );
         node.shutdown();
         let _ = node.collect();
     }
@@ -3259,7 +3628,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     use crdt_counter::CrdtCounterRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -3269,19 +3638,25 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir_root = std::env::temp_dir().join(format!(
-        "vos_raft_e2e_{}_{}", std::process::id(), stamp,
-    ));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_raft_e2e_{}_{}", std::process::id(), stamp,));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     let dir_c = dir_root.join("c");
-    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+    for p in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(p).unwrap();
+    }
 
     let rep_id: [u8; 32] = {
         let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
@@ -3305,28 +3680,36 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     }
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let net_a = Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_listen
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
     let net_b = Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![a_dial.clone()],
     });
     let b_listen = wait_for(
         || net_b.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_b binds");
-    let b_dial: libp2p::Multiaddr = b_listen
-        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+    )
+    .expect("net_b binds");
+    let b_dial: libp2p::Multiaddr =
+        b_listen.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
     let net_c = Network::start(NetworkConfig {
-        keypair: kp_c, local_prefix: prefix_c,
-        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+        keypair: kp_c,
+        local_prefix: prefix_c,
+        listen: vec![listen],
+        bootstrap: vec![a_dial, b_dial],
     });
 
     // ── Three VosNodes. ──────────────────────────────────────
@@ -3342,15 +3725,19 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
     let net_a_arc = node_a.network().expect("net_a");
     let net_b_arc = node_b.network().expect("net_b");
     let net_c_arc = node_c.network().expect("net_c");
-    wait_for(|| {
-        let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
-              && net_b_arc.peer_for_prefix(prefix_a).is_some();
-        let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
-              && net_c_arc.peer_for_prefix(prefix_a).is_some();
-        let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
-              && net_c_arc.peer_for_prefix(prefix_b).is_some();
-        (ab && ac && bc).then_some(())
-    }, Duration::from_secs(15)).expect("Hello triangle");
+    wait_for(
+        || {
+            let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some();
+            let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
+                && net_c_arc.peer_for_prefix(prefix_a).is_some();
+            let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
+                && net_c_arc.peer_for_prefix(prefix_b).is_some();
+            (ab && ac && bc).then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("Hello triangle");
 
     // Register the actor on every node.
     let members = vec![prefix_a, prefix_b, prefix_c];
@@ -3396,7 +3783,9 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
                     return true;
                 }
             }
-            if std::time::Instant::now() >= until { return false; }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     };
@@ -3426,12 +3815,24 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         || (read_count(&node_c, counter_c) == Some(3)).then_some(3u64),
         Duration::from_secs(15),
     );
-    assert_eq!(final_a, Some(3),
-        "node A should converge to 3; last={:?}", read_count(&node_a, counter_a));
-    assert_eq!(final_b, Some(3),
-        "node B should converge to 3; last={:?}", read_count(&node_b, counter_b));
-    assert_eq!(final_c, Some(3),
-        "node C should converge to 3; last={:?}", read_count(&node_c, counter_c));
+    assert_eq!(
+        final_a,
+        Some(3),
+        "node A should converge to 3; last={:?}",
+        read_count(&node_a, counter_a)
+    );
+    assert_eq!(
+        final_b,
+        Some(3),
+        "node B should converge to 3; last={:?}",
+        read_count(&node_b, counter_b)
+    );
+    assert_eq!(
+        final_c,
+        Some(3),
+        "node C should converge to 3; last={:?}",
+        read_count(&node_c, counter_c)
+    );
 
     // Capture the redb paths before collecting (which drops the
     // VosNode and frees the DB exclusive lock). The check below
@@ -3504,7 +3905,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     // reaches 64.
     use crdt_counter::CrdtCounterRef;
     use std::time::{Duration, Instant};
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -3514,19 +3915,25 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     );
     let counter_data = match std::fs::read(&counter_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: crdt-counter actor not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
     };
     let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir_root = std::env::temp_dir().join(format!(
-        "vos_raft_compact_{}_{}", std::process::id(), stamp,
-    ));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_raft_compact_{}_{}", std::process::id(), stamp,));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     let dir_c = dir_root.join("c");
-    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+    for p in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(p).unwrap();
+    }
 
     let rep_id: [u8; 32] = {
         let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
@@ -3549,28 +3956,36 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     }
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let net_a = Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_listen
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
     let net_b = Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![a_dial.clone()],
     });
     let b_listen = wait_for(
         || net_b.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_b binds");
-    let b_dial: libp2p::Multiaddr = b_listen
-        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+    )
+    .expect("net_b binds");
+    let b_dial: libp2p::Multiaddr =
+        b_listen.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
     let net_c = Network::start(NetworkConfig {
-        keypair: kp_c, local_prefix: prefix_c,
-        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+        keypair: kp_c,
+        local_prefix: prefix_c,
+        listen: vec![listen],
+        bootstrap: vec![a_dial, b_dial],
     });
 
     let mut node_a = VosNode::with_prefix(prefix_a);
@@ -3583,15 +3998,19 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     let net_a_arc = node_a.network().expect("net_a");
     let net_b_arc = node_b.network().expect("net_b");
     let net_c_arc = node_c.network().expect("net_c");
-    wait_for(|| {
-        let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
-              && net_b_arc.peer_for_prefix(prefix_a).is_some();
-        let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
-              && net_c_arc.peer_for_prefix(prefix_a).is_some();
-        let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
-              && net_c_arc.peer_for_prefix(prefix_b).is_some();
-        (ab && ac && bc).then_some(())
-    }, Duration::from_secs(15)).expect("Hello triangle");
+    wait_for(
+        || {
+            let ab = net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some();
+            let ac = net_a_arc.peer_for_prefix(prefix_c).is_some()
+                && net_c_arc.peer_for_prefix(prefix_a).is_some();
+            let bc = net_b_arc.peer_for_prefix(prefix_c).is_some()
+                && net_c_arc.peer_for_prefix(prefix_b).is_some();
+            (ab && ac && bc).then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("Hello triangle");
 
     let members = vec![prefix_a, prefix_b, prefix_c];
     let counter_a = node_a.register(
@@ -3635,7 +4054,9 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
                     return true;
                 }
             }
-            if Instant::now() >= until { return false; }
+            if Instant::now() >= until {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     };
@@ -3658,9 +4079,24 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
     std::thread::sleep(Duration::from_millis(500));
 
     let paths = [
-        ("A", dir_a.join("agents").join(format!("{:08x}.redb", counter_a.0))),
-        ("B", dir_b.join("agents").join(format!("{:08x}.redb", counter_b.0))),
-        ("C", dir_c.join("agents").join(format!("{:08x}.redb", counter_c.0))),
+        (
+            "A",
+            dir_a
+                .join("agents")
+                .join(format!("{:08x}.redb", counter_a.0)),
+        ),
+        (
+            "B",
+            dir_b
+                .join("agents")
+                .join(format!("{:08x}.redb", counter_b.0)),
+        ),
+        (
+            "C",
+            dir_c
+                .join("agents")
+                .join(format!("{:08x}.redb", counter_c.0)),
+        ),
     ];
 
     // Shut down the workers so we can open the redb files.
@@ -3677,12 +4113,17 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         let n = log_table.len().expect("len");
         eprintln!("replica {label}: {n} raft_log rows");
         let meta = vos::raft::RaftMeta::load(&db).expect("meta");
-        eprintln!("replica {label}: snap_last_index={} commit_index={}",
-            meta.snap_last_index, meta.commit_index);
+        eprintln!(
+            "replica {label}: snap_last_index={} commit_index={}",
+            meta.snap_last_index, meta.commit_index
+        );
         // Every replica's commit_index should reach N_INCS once
         // replication propagates.
-        assert!(meta.commit_index >= N_INCS as u64,
-            "replica {label} commit_index={} < {N_INCS}", meta.commit_index);
+        assert!(
+            meta.commit_index >= N_INCS as u64,
+            "replica {label} commit_index={} < {N_INCS}",
+            meta.commit_index
+        );
         min_rows = min_rows.min(n);
     }
     // The leader's log must have been compacted: rows ≪ N_INCS.
@@ -3694,7 +4135,6 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
 
     let _ = std::fs::remove_dir_all(&dir_root);
 }
-
 
 #[test]
 fn external_invoke_yielded_surfaces_as_invoke_yielded() {
@@ -3724,7 +4164,10 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
     };
 
     let blob = transpile_actor(&agent_data);
@@ -3736,7 +4179,9 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
     let invokes_clone = invokes.clone();
 
     rt.set_external_invoke(Box::new(move |target, _msg| {
-        if target != synthetic_target { return None; }
+        if target != synthetic_target {
+            return None;
+        }
         invokes_clone.fetch_add(1, Ordering::Relaxed);
         // Pretend the target yielded with a 4-byte u32 state,
         // matching counter's wire shape. As long as STATUS_YIELDED
@@ -3748,10 +4193,13 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
         })
     }));
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![synthetic_target.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![synthetic_target.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.send_to(agent_id, Vec::new());
     // A small handful of outer ticks suffices: the scheduler
@@ -3759,7 +4207,9 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
     // times per outer tick, each one producing one invoke of
     // the synthetic target.
     for _ in 0..3 {
-        if !rt.has_work() { break; }
+        if !rt.has_work() {
+            break;
+        }
         rt.tick_blocking();
     }
 
@@ -3801,7 +4251,10 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     );
     let agent_data = match std::fs::read(&agent_path) {
         Ok(d) => d,
-        Err(_) => { eprintln!("SKIP: scheduler agent not built"); return; }
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
     };
 
     let counter_elf = example_elf("counter");
@@ -3812,10 +4265,13 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     let agent_id = register_svc(&mut rt, agent_blob);
     let counter_id = register_svc(&mut rt, counter_blob);
 
-    let args = vos::init::InitArgs::new()
-        .with("children", vos::init::InitValue::ListU32(vec![counter_id.0]));
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![counter_id.0]),
+    );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(agent_id, vos::lifecycle::INIT_KEY, &encoded);
 
     rt.send_to(agent_id, Vec::new());
 
@@ -3824,12 +4280,15 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     // outer tick, so each call to `tick_blocking` advances the
     // counter many times.
     for _ in 0..3 {
-        if !rt.has_work() { break; }
+        if !rt.has_work() {
+            break;
+        }
         rt.tick_blocking();
     }
 
     // Counter encodes `count: u32` as a 4-byte rkyv payload.
-    let raw = rt.storage
+    let raw = rt
+        .storage
         .read(counter_id, vos::lifecycle::STATE_KEY_BYTES)
         .expect("counter STATE_KEY persisted")
         .to_vec();
@@ -3842,7 +4301,6 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     );
     assert_eq!(rt.panics, 0, "no service should have panicked");
 }
-
 
 #[test]
 #[cfg(feature = "network")]
@@ -3869,31 +4327,32 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
     // use for an auto-join CLI on top of this API.
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::raft::{RaftWorker, Role, WorkerConfig};
 
-    fn wait_for_role_at(
-        h: &vos::raft::WorkerHandle,
-        want: Role,
-        max: Duration,
-    ) -> bool {
+    fn wait_for_role_at(h: &vos::raft::WorkerHandle, want: Role, max: Duration) -> bool {
         let deadline = Instant::now() + max;
         while Instant::now() < deadline {
-            if h.role() == want { return true; }
+            if h.role() == want {
+                return true;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         false
     }
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir_root = std::env::temp_dir().join(format!(
-        "vos_raft_join_{}_{}", std::process::id(), stamp,
-    ));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_raft_join_{}_{}", std::process::id(), stamp,));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     let dir_c = dir_root.join("c");
-    for p in [&dir_a, &dir_b, &dir_c] { std::fs::create_dir_all(p).unwrap(); }
+    for p in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(p).unwrap();
+    }
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
@@ -3909,15 +4368,17 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
 
     // ── Node A — solo cluster, listening for joiners. ─────────
     let net_a = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_addr
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
     let db_a = Arc::new(redb::Database::create(dir_a.join("raft.redb")).unwrap());
     let rep_id = [0xC3u8; 32];
@@ -3935,27 +4396,35 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
     );
     net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
     let h_a = worker_a.handler();
-    assert!(wait_for_role_at(&h_a, Role::Leader, Duration::from_secs(5)),
-        "solo node A self-elects");
+    assert!(
+        wait_for_role_at(&h_a, Role::Leader, Duration::from_secs(5)),
+        "solo node A self-elects"
+    );
 
     // ── Node B — joins via A. ─────────────────────────────────
     let net_b = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen.clone()], bootstrap: vec![a_dial.clone()],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![a_dial.clone()],
     }));
     let b_addr = wait_for(
         || net_b.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_b binds");
-    let b_dial: libp2p::Multiaddr = b_addr
-        .with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+    )
+    .expect("net_b binds");
+    let b_dial: libp2p::Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
 
     // Wait for the Hello handshake so A's VosTransport can route
     // AppendEntries to B once the membership change commits.
-    wait_for(|| (
-        net_a.peer_for_prefix(prefix_b).is_some()
-        && net_b.peer_for_prefix(prefix_a).is_some()
-    ).then_some(()), Duration::from_secs(15)).expect("A↔B Hello");
+    wait_for(
+        || {
+            (net_a.peer_for_prefix(prefix_b).is_some() && net_b.peer_for_prefix(prefix_a).is_some())
+                .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("A↔B Hello");
 
     let db_b = Arc::new(redb::Database::create(dir_b.join("raft.redb")).unwrap());
     let worker_b = RaftWorker::spawn(
@@ -3978,32 +4447,44 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
     // A: change_membership([A, B]) — joint-consensus joint entry
     // commits via {A}'s self-quorum, then the retire entry needs
     // {A, B} quorum and replicates to B.
-    let join_idx = h_a.change_membership(vec![prefix_a, prefix_b])
+    let join_idx = h_a
+        .change_membership(vec![prefix_a, prefix_b])
         .expect("A: change_membership([A, B])");
     assert!(join_idx >= 1, "joint entry must have a real index");
 
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(snap_b) = worker_b.handler().snapshot() {
-            if snap_b.commit_index >= join_idx + 1 { break; }
+            if snap_b.commit_index >= join_idx + 1 {
+                break;
+            }
         }
-        assert!(Instant::now() < until,
+        assert!(
+            Instant::now() < until,
             "B did not catch up to commit_index >= {} within 15s",
-            join_idx + 1);
+            join_idx + 1
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     // ── Node C — joins via A and B. ───────────────────────────
     let net_c = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_c, local_prefix: prefix_c,
-        listen: vec![listen], bootstrap: vec![a_dial, b_dial],
+        keypair: kp_c,
+        local_prefix: prefix_c,
+        listen: vec![listen],
+        bootstrap: vec![a_dial, b_dial],
     }));
-    wait_for(|| (
-        net_a.peer_for_prefix(prefix_c).is_some()
-        && net_c.peer_for_prefix(prefix_a).is_some()
-        && net_b.peer_for_prefix(prefix_c).is_some()
-        && net_c.peer_for_prefix(prefix_b).is_some()
-    ).then_some(()), Duration::from_secs(15)).expect("A↔C, B↔C Hello");
+    wait_for(
+        || {
+            (net_a.peer_for_prefix(prefix_c).is_some()
+                && net_c.peer_for_prefix(prefix_a).is_some()
+                && net_b.peer_for_prefix(prefix_c).is_some()
+                && net_c.peer_for_prefix(prefix_b).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("A↔C, B↔C Hello");
 
     let db_c = Arc::new(redb::Database::create(dir_c.join("raft.redb")).unwrap());
     let worker_c = RaftWorker::spawn(
@@ -4020,17 +4501,23 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
     );
     net_c.register_raft_handler(rep_id, Arc::new(worker_c.handler()));
 
-    let join_idx2 = h_a.change_membership(vec![prefix_a, prefix_b, prefix_c])
+    let join_idx2 = h_a
+        .change_membership(vec![prefix_a, prefix_b, prefix_c])
         .expect("A: change_membership([A, B, C])");
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         let snap_c = worker_c.handler().snapshot();
-        if snap_c.as_ref().is_some_and(|s| s.commit_index >= join_idx2 + 1) {
+        if snap_c
+            .as_ref()
+            .is_some_and(|s| s.commit_index >= join_idx2 + 1)
+        {
             break;
         }
-        assert!(Instant::now() < until,
+        assert!(
+            Instant::now() < until,
             "C did not catch up to commit_index >= {} within 15s",
-            join_idx2 + 1);
+            join_idx2 + 1
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -4046,23 +4533,32 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
         let s_b = worker_b.handler().snapshot();
         let s_c = worker_c.handler().snapshot();
         if let (Some(a), Some(b), Some(c)) = (s_a, s_b, s_c) {
-            if a.commit_index >= p2
-                && b.commit_index >= p2
-                && c.commit_index >= p2 {
+            if a.commit_index >= p2 && b.commit_index >= p2 && c.commit_index >= p2 {
                 break;
             }
         }
-        assert!(Instant::now() < until,
-            "post-join replicas didn't converge on commit_index >= {p2}");
+        assert!(
+            Instant::now() < until,
+            "post-join replicas didn't converge on commit_index >= {p2}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     worker_a.shutdown();
     worker_b.shutdown();
     worker_c.shutdown();
-    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
-    match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_a) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
+    match Arc::try_unwrap(net_b) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
+    match Arc::try_unwrap(net_c) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
 
     let _ = std::fs::remove_dir_all(&dir_root);
 }
@@ -4079,44 +4575,56 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // change_membership, B becomes a voter.
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vos::network::{derive_node_prefix, Network, NetworkConfig, RaftJoinResult};
+    use vos::network::{Network, NetworkConfig, RaftJoinResult, derive_node_prefix};
     use vos::raft::{RaftWorker, Role, WorkerConfig};
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
     let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
     let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
-    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    if prefix_a == prefix_b {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "vos_raft_join_wire_{}_{}", std::process::id(), stamp,
+        "vos_raft_join_wire_{}_{}",
+        std::process::id(),
+        stamp,
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let rep_id = [0xC4u8; 32];
 
     // ── Node A (solo bootstrap, leader). ──────────────────────
     let net_a = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_addr
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
     let db_a = Arc::new(redb::Database::create(dir.join("a.redb")).unwrap());
     let worker_a = RaftWorker::spawn(
-        db_a, WorkerConfig {
-            me: prefix_a, members: vec![prefix_a],
+        db_a,
+        WorkerConfig {
+            me: prefix_a,
+            members: vec![prefix_a],
             replication_id: rep_id,
             election_timeout_ms: (50, 150),
             heartbeat_interval_ms: 20,
         },
-        Some(net_a.clone()), None,
+        Some(net_a.clone()),
+        None,
     );
     net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
     let h_a = worker_a.handler();
@@ -4128,13 +4636,19 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
 
     // ── Node B (joiner). ──────────────────────────────────────
     let net_b = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen], bootstrap: vec![a_dial],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
     }));
-    wait_for(|| (
-        net_a.peer_for_prefix(prefix_b).is_some()
-        && net_b.peer_for_prefix(prefix_a).is_some()
-    ).then_some(()), Duration::from_secs(15)).expect("Hello");
+    wait_for(
+        || {
+            (net_a.peer_for_prefix(prefix_b).is_some() && net_b.peer_for_prefix(prefix_a).is_some())
+                .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("Hello");
 
     // ── Send the join request OVER THE WIRE. ──────────────────
     // This is the critical bit — exercises Network's
@@ -4142,7 +4656,8 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // dispatch through `handle_join`, and the Accepted response.
     let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
     let rx = net_b.send_raft_join_req(target_a, rep_id, prefix_b);
-    let result = rx.recv_timeout(Duration::from_secs(5))
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
         .expect("join RPC reply");
     let joint_index = match result {
         RaftJoinResult::Accepted { joint_index } => {
@@ -4155,13 +4670,16 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // ── Spawn B's worker with the (post-join) member set. ────
     let db_b = Arc::new(redb::Database::create(dir.join("b.redb")).unwrap());
     let worker_b = RaftWorker::spawn(
-        db_b, WorkerConfig {
-            me: prefix_b, members: vec![prefix_a, prefix_b],
+        db_b,
+        WorkerConfig {
+            me: prefix_b,
+            members: vec![prefix_a, prefix_b],
             replication_id: rep_id,
             election_timeout_ms: (5_000, 10_000),
             heartbeat_interval_ms: 1_000,
         },
-        Some(net_b.clone()), None,
+        Some(net_b.clone()),
+        None,
     );
     net_b.register_raft_handler(rep_id, Arc::new(worker_b.handler()));
 
@@ -4169,26 +4687,41 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(snap) = worker_b.handler().snapshot() {
-            if snap.commit_index >= joint_index + 1 { break; }
+            if snap.commit_index >= joint_index + 1 {
+                break;
+            }
         }
-        assert!(Instant::now() < until,
-            "B didn't reach commit_index >= {} within 15s", joint_index + 1);
+        assert!(
+            Instant::now() < until,
+            "B didn't reach commit_index >= {} within 15s",
+            joint_index + 1
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     // ── Status RPC over the wire reports the same state. ────
     let rx = net_b.send_raft_status_req(target_a, rep_id);
-    let status = rx.recv_timeout(Duration::from_secs(2))
+    let status = rx
+        .recv_timeout(Duration::from_secs(2))
         .expect("status RPC reply");
     assert!(status.present, "A hosts the group");
     assert_eq!(status.role, vos::network::RaftRole::Leader);
-    assert!(status.members.contains(&prefix_a) && status.members.contains(&prefix_b),
-        "post-join member set should contain both replicas; got {:?}", status.members);
+    assert!(
+        status.members.contains(&prefix_a) && status.members.contains(&prefix_b),
+        "post-join member set should contain both replicas; got {:?}",
+        status.members
+    );
 
     worker_a.shutdown();
     worker_b.shutdown();
-    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_a) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
+    match Arc::try_unwrap(net_b) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4201,54 +4734,68 @@ fn raft_status_req_returns_absent_for_unknown_group() {
     // skip them cleanly. This test forces that path.
     use std::sync::Arc;
     use std::time::Duration;
-    use vos::network::{derive_node_prefix, Network, NetworkConfig};
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::raft::{RaftWorker, WorkerConfig};
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
     let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
     let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
-    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    if prefix_a == prefix_b {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
     let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "vos_raft_status_{}_{}", std::process::id(), stamp,
-    ));
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("vos_raft_status_{}_{}", std::process::id(), stamp,));
     std::fs::create_dir_all(&dir).unwrap();
 
     let net_a = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_addr
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
     // A hosts group X; B doesn't host any group.
     let group_x = [0xAAu8; 32];
     let db_a = Arc::new(redb::Database::create(dir.join("a.redb")).unwrap());
     let worker_a = RaftWorker::spawn(
-        db_a, WorkerConfig {
-            me: prefix_a, members: vec![prefix_a],
+        db_a,
+        WorkerConfig {
+            me: prefix_a,
+            members: vec![prefix_a],
             replication_id: group_x,
             election_timeout_ms: (5_000, 10_000),
             heartbeat_interval_ms: 1_000,
         },
-        Some(net_a.clone()), None,
+        Some(net_a.clone()),
+        None,
     );
     net_a.register_raft_handler(group_x, Arc::new(worker_a.handler()));
 
     let net_b = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen], bootstrap: vec![a_dial],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
     }));
-    wait_for(|| net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
-        Duration::from_secs(15)).expect("Hello");
+    wait_for(
+        || net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
+        Duration::from_secs(15),
+    )
+    .expect("Hello");
     let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
 
     // Group A hosts → present = true.
@@ -4261,12 +4808,21 @@ fn raft_status_req_returns_absent_for_unknown_group() {
     let group_y = [0xBBu8; 32];
     let rx = net_b.send_raft_status_req(target_a, group_y);
     let status = rx.recv_timeout(Duration::from_secs(2)).expect("status");
-    assert!(!status.present, "A shouldn't report present for unknown group");
+    assert!(
+        !status.present,
+        "A shouldn't report present for unknown group"
+    );
     assert!(status.leader_hint.is_none());
 
     worker_a.shutdown();
-    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_a) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
+    match Arc::try_unwrap(net_b) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4289,8 +4845,7 @@ fn manifest_req_returns_installed_provider_payload() {
     use std::sync::Arc;
     use std::time::Duration;
     use vos::network::{
-        derive_node_prefix, ManifestBlob, ManifestReply,
-        Network, NetworkConfig, NetworkService,
+        ManifestBlob, ManifestReply, Network, NetworkConfig, NetworkService, derive_node_prefix,
     };
 
     struct StubManifest {
@@ -4306,38 +4861,57 @@ fn manifest_req_returns_installed_provider_payload() {
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
     let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
     let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
-    if prefix_a == prefix_b { eprintln!("SKIP: prefix collision"); return; }
+    if prefix_a == prefix_b {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
     let net_a = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_a, local_prefix: prefix_a,
-        listen: vec![listen.clone()], bootstrap: vec![],
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
         Duration::from_secs(5),
-    ).expect("net_a binds");
-    let a_dial: libp2p::Multiaddr = a_addr
-        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
     let toml = br#"space = "demo"
 version = "0.1.0"
 "#
     .to_vec();
     let blobs = vec![
-        ManifestBlob { name: "ledger".into(), blob: vec![0xAA; 64] },
-        ManifestBlob { name: "scheduler".into(), blob: vec![0xBB; 32] },
+        ManifestBlob {
+            name: "ledger".into(),
+            blob: vec![0xAA; 64],
+        },
+        ManifestBlob {
+            name: "scheduler".into(),
+            blob: vec![0xBB; 32],
+        },
     ];
     net_a.set_service(Arc::new(StubManifest {
-        reply: ManifestReply { toml: toml.clone(), blobs: blobs.clone() },
+        reply: ManifestReply {
+            toml: toml.clone(),
+            blobs: blobs.clone(),
+        },
     }));
 
     let net_b = Arc::new(Network::start(NetworkConfig {
-        keypair: kp_b, local_prefix: prefix_b,
-        listen: vec![listen], bootstrap: vec![a_dial],
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
     }));
-    wait_for(|| net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
-        Duration::from_secs(15)).expect("Hello");
+    wait_for(
+        || net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
+        Duration::from_secs(15),
+    )
+    .expect("Hello");
     let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
 
     let rx = net_b.send_manifest_req(target_a);
@@ -4348,7 +4922,12 @@ version = "0.1.0"
     assert_eq!(got.toml, toml, "toml bytes round-trip");
     assert_eq!(got.blobs, blobs, "blobs round-trip");
 
-    match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-    match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
+    match Arc::try_unwrap(net_a) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
+    match Arc::try_unwrap(net_b) {
+        Ok(n) => n.join(),
+        Err(_) => {}
+    }
 }
-

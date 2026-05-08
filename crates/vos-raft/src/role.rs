@@ -63,7 +63,12 @@ mod tests {
 
     #[test]
     fn role_round_trips_through_u8() {
-        for r in [Role::Follower, Role::PreCandidate, Role::Candidate, Role::Leader] {
+        for r in [
+            Role::Follower,
+            Role::PreCandidate,
+            Role::Candidate,
+            Role::Leader,
+        ] {
             assert_eq!(Role::from_u8(r.as_u8()), r);
         }
     }

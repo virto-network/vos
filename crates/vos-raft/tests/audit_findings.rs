@@ -96,11 +96,7 @@ impl Storage<u16> for SharedStorage {
         }
         Ok(g.log.get(&index).map(|e| e.term))
     }
-    async fn entries(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<Vec<LogEntry<u16>>, Self::Error> {
+    async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
         let g = self.inner.lock().unwrap();
         if start > end {
             return Ok(Vec::new());
@@ -114,9 +110,7 @@ impl Storage<u16> for SharedStorage {
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
         Ok(self.inner.lock().unwrap().meta.clone())
     }
-    async fn active_config(
-        &self,
-    ) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+    async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
         Ok(self.inner.lock().unwrap().active_config.clone())
     }
     async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
@@ -216,10 +210,8 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     // live-log CC entry at idx=1 (term=1) that produced it.
     storage.with_inner(|g| {
         g.active_config = Some((vec![1u16, 2, 3, 4], None));
-        g.log.insert(
-            1,
-            LogEntry::config_change(1, 1, None, vec![1u16, 2, 3, 4]),
-        );
+        g.log
+            .insert(1, LogEntry::config_change(1, 1, None, vec![1u16, 2, 3, 4]));
         g.meta = Meta {
             current_term: 1,
             voted_for: None,
@@ -230,10 +222,7 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     });
 
     // Sanity: persisted view round-trips.
-    assert_eq!(
-        storage.read_active_config(),
-        Some((vec![1, 2, 3, 4], None)),
-    );
+    assert_eq!(storage.read_active_config(), Some((vec![1, 2, 3, 4], None)),);
 
     let storage_handle = storage.clone();
 
@@ -391,10 +380,7 @@ fn stale_append_entries_does_not_regress_follower_log() {
             prev_log_index: 0,
             prev_log_term: 0,
             leader_commit: 0,
-            entries: vec![
-                LogEntry::data(1, 5, vec![1]),
-                LogEntry::data(2, 5, vec![2]),
-            ],
+            entries: vec![LogEntry::data(1, 5, vec![1]), LogEntry::data(2, 5, vec![2])],
         },
     ));
     assert!(r2.success);
@@ -433,7 +419,9 @@ fn stale_append_entries_does_not_regress_follower_log() {
 #[test]
 fn snap_last_index_never_exceeds_commit_index_in_a_running_cluster() {
     use std::sync::Mutex as StdMutex;
-    use vos_raft::{AppendEntriesResp, InstallSnapshotResp, PreVoteReq, PreVoteResp, RequestVoteResp};
+    use vos_raft::{
+        AppendEntriesResp, InstallSnapshotResp, PreVoteReq, PreVoteResp, RequestVoteResp,
+    };
 
     type Routes = Arc<StdMutex<BTreeMap<u16, vos_raft::WorkerHandle<u16>>>>;
 
@@ -457,9 +445,7 @@ fn snap_last_index_never_exceeds_commit_index_in_a_running_cluster() {
             peer: u16,
             req: AppendEntriesReq<u16>,
         ) -> Result<AppendEntriesResp, E> {
-            let h = {
-                self.routes.lock().unwrap().get(&peer).cloned()
-            };
+            let h = { self.routes.lock().unwrap().get(&peer).cloned() };
             match h {
                 Some(h) => Ok(h.handle_inbound_append(req.leader, req).await),
                 None => Err(E),
@@ -470,22 +456,14 @@ fn snap_last_index_never_exceeds_commit_index_in_a_running_cluster() {
             peer: u16,
             req: RequestVoteReq<u16>,
         ) -> Result<RequestVoteResp, E> {
-            let h = {
-                self.routes.lock().unwrap().get(&peer).cloned()
-            };
+            let h = { self.routes.lock().unwrap().get(&peer).cloned() };
             match h {
                 Some(h) => Ok(h.handle_inbound_vote(req.candidate, req).await),
                 None => Err(E),
             }
         }
-        async fn send_prevote(
-            &self,
-            peer: u16,
-            req: PreVoteReq<u16>,
-        ) -> Result<PreVoteResp, E> {
-            let h = {
-                self.routes.lock().unwrap().get(&peer).cloned()
-            };
+        async fn send_prevote(&self, peer: u16, req: PreVoteReq<u16>) -> Result<PreVoteResp, E> {
+            let h = { self.routes.lock().unwrap().get(&peer).cloned() };
             match h {
                 Some(h) => Ok(h.handle_inbound_prevote(req.candidate, req).await),
                 None => Err(E),
@@ -496,9 +474,7 @@ fn snap_last_index_never_exceeds_commit_index_in_a_running_cluster() {
             peer: u16,
             req: InstallSnapshotReq<u16>,
         ) -> Result<InstallSnapshotResp, E> {
-            let h = {
-                self.routes.lock().unwrap().get(&peer).cloned()
-            };
+            let h = { self.routes.lock().unwrap().get(&peer).cloned() };
             match h {
                 Some(h) => Ok(h.handle_inbound_install(req.leader, req).await),
                 None => Err(E),
@@ -668,11 +644,7 @@ fn no_op_append_failure_keeps_us_out_of_leader_role() {
         async fn term_at(&self, index: u64) -> Result<Option<u64>, Self::Error> {
             Ok(self.inner.term_at(index).await.unwrap())
         }
-        async fn entries(
-            &self,
-            start: u64,
-            end: u64,
-        ) -> Result<Vec<LogEntry<u16>>, Self::Error> {
+        async fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry<u16>>, Self::Error> {
             Ok(self.inner.entries(start, end).await.unwrap())
         }
         async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
@@ -681,15 +653,10 @@ fn no_op_append_failure_keeps_us_out_of_leader_role() {
         async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
             Ok(self.inner.load_meta().await.unwrap())
         }
-        async fn active_config(
-            &self,
-        ) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+        async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
             Ok(self.inner.active_config().await.unwrap())
         }
-        async fn commit_batch(
-            &mut self,
-            batch: WriteBatch<u16>,
-        ) -> Result<(), Self::Error> {
+        async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
             let is_no_op = batch.appends.len() == 1
                 && batch.appends[0].payload().is_some_and(|p| p.is_empty())
                 && batch.compact_to.is_none()
@@ -705,10 +672,7 @@ fn no_op_append_failure_keeps_us_out_of_leader_role() {
             {
                 return Err(E);
             }
-            self.inner
-                .commit_batch(batch)
-                .await
-                .map_err(|_| E)
+            self.inner.commit_batch(batch).await.map_err(|_| E)
         }
     }
 

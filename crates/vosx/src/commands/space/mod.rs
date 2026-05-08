@@ -147,9 +147,7 @@ pub enum SpaceCommand {
         program_ref: String,
     },
     /// List programs in the catalog.
-    Programs {
-        space: String,
-    },
+    Programs { space: String },
     /// Instantiate a published program as an installed agent.
     Install {
         /// Space id or name.
@@ -175,10 +173,7 @@ pub enum SpaceCommand {
         replication_id: Option<String>,
     },
     /// Tombstone an installed agent.
-    Uninstall {
-        space: String,
-        instance: String,
-    },
+    Uninstall { space: String, instance: String },
     /// Repoint an installed agent at a different program
     /// version. State is preserved (same replication_id, same
     /// redb); replicas restart on next sync.
@@ -189,9 +184,7 @@ pub enum SpaceCommand {
         program_ref: String,
     },
     /// List installed agents.
-    Agents {
-        space: String,
-    },
+    Agents { space: String },
     /// Manage Node + Identity members. Subcommands: list,
     /// add-node, remove-node, add-identity, remove-identity.
     /// Bare `space members <space>` lists.
@@ -264,9 +257,19 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             listen,
             data_dir,
         }),
-        SpaceCommand::Up { space, once, manifest, listen, connect } => {
-            up::run(up::Args { query: space, once, manifest, listen, connect })
-        }
+        SpaceCommand::Up {
+            space,
+            once,
+            manifest,
+            listen,
+            connect,
+        } => up::run(up::Args {
+            query: space,
+            once,
+            manifest,
+            listen,
+            connect,
+        }),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Publish {
             space,
@@ -277,13 +280,9 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             program_ref,
             source,
         }),
-        SpaceCommand::Unpublish {
-            space,
-            program_ref,
-        } => unpublish::run(unpublish::Args {
-            space,
-            program_ref,
-        }),
+        SpaceCommand::Unpublish { space, program_ref } => {
+            unpublish::run(unpublish::Args { space, program_ref })
+        }
         SpaceCommand::Programs { space } => programs::run(&space),
         SpaceCommand::Install {
             space,
@@ -311,15 +310,19 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             program_ref,
         }),
         SpaceCommand::Agents { space } => agents::run(&space),
-        SpaceCommand::Members { space, command } => {
-            members::run(members::Args { space, command })
-        }
-        SpaceCommand::Forget { space, yes } => {
-            forget::run(forget::Args { space, yes })
-        }
-        SpaceCommand::Call { space, target, method, args } => {
-            call::run(call::Args { space, target, method, args })
-        }
+        SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
+        SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),
+        SpaceCommand::Call {
+            space,
+            target,
+            method,
+            args,
+        } => call::run(call::Args {
+            space,
+            target,
+            method,
+            args,
+        }),
         SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
     }
 }

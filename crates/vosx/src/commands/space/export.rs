@@ -6,9 +6,7 @@
 //! formats the result as TOML to stdout. Same model as every
 //! other `space *` command — the daemon is the source of truth.
 
-use space_registry::{
-    AgentRow, MemberRow, ProgramRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE,
-};
+use space_registry::{AgentRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberRow, ProgramRow};
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::consistency_name;
@@ -50,7 +48,10 @@ fn print_manifest(
     for a in agents {
         println!("[[agent]]");
         println!("name           = {:?}", a.instance_name);
-        println!("program        = {:?}", format!("{}:{}", a.program_name, a.program_version));
+        println!(
+            "program        = {:?}",
+            format!("{}:{}", a.program_name, a.program_version)
+        );
         println!("program_hash   = {:?}", hex::encode(a.program_hash));
         println!("replication_id = {:?}", hex::encode(a.replication_id));
         println!("consistency    = {:?}", consistency_name(a.consistency));

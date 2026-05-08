@@ -47,7 +47,8 @@ impl Fetcher {
         body: String,
         ctx: &mut Context<Self>,
     ) -> String {
-        let resp = ctx.fetch(url)
+        let resp = ctx
+            .fetch(url)
             .post()
             .header("Authorization", format!("Bearer {token}"))
             .json(body)

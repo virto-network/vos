@@ -35,16 +35,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         match client.unpublish(n.clone(), v.clone())? {
             STATUS_OK => {
                 if output::is_json() {
-                    output::print_json(&UnpublishedView { name: &n, version: &v });
+                    output::print_json(&UnpublishedView {
+                        name: &n,
+                        version: &v,
+                    });
                 } else {
                     println!("unpublished {n}:{v}");
                 }
                 Ok(())
             }
             STATUS_NOT_FOUND => anyhow::bail!("{n}:{v} not in catalog"),
-            STATUS_IN_USE => anyhow::bail!(
-                "{n}:{v} is referenced by an installed agent — uninstall first",
-            ),
+            STATUS_IN_USE => {
+                anyhow::bail!("{n}:{v} is referenced by an installed agent — uninstall first",)
+            }
             other => anyhow::bail!("unpublish returned status {other}"),
         }
     })

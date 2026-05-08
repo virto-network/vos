@@ -45,7 +45,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => anyhow::bail!(
             "registry blob {} not in local cache. Re-fetch with \
              `vosx space pull-blob {}` once that command lands.",
-            hash, hash,
+            hash,
+            hash,
         ),
     };
     // Cache stores raw ELF bytes (hash addresses the source); the
@@ -249,11 +250,7 @@ fn build_network_for_daemon(
 
 /// Wait briefly for the swarm to bind, then write the endpoint
 /// descriptor so clients can find us.
-fn publish_endpoint(
-    node: &VosNode,
-    data_dir: &std::path::Path,
-    prefix: u16,
-) -> anyhow::Result<()> {
+fn publish_endpoint(node: &VosNode, data_dir: &std::path::Path, prefix: u16) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     let net = node
@@ -300,8 +297,7 @@ fn spawn_installed_agents(
     use space_registry::SpaceRegistryRef;
     use std::collections::HashSet;
 
-    let local_cfg = crate::commands::space::subscriptions::load(data_dir)
-        .unwrap_or_default();
+    let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
     if local_cfg.is_filtering() {
         tracing::info!(
             "subscriptions filter active — {} agent(s)",
@@ -310,8 +306,8 @@ fn spawn_installed_agents(
     }
 
     let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
-    let agents = vos::block_on(reg.agents(&mut &*node))
-        .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+    let agents =
+        vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
     // Set of svc_ids the catalog knows about — used at the
     // end to sweep orphaned redbs into trash. We add to this
@@ -354,7 +350,10 @@ fn spawn_installed_agents(
         };
 
         let mut cfg = AgentConfig::new(blob).with_consistency(consistency);
-        if matches!(consistency, Consistency::Local | Consistency::Crdt | Consistency::Raft) {
+        if matches!(
+            consistency,
+            Consistency::Local | Consistency::Crdt | Consistency::Raft
+        ) {
             cfg = cfg.persist(data_dir);
         }
         if matches!(consistency, Consistency::Crdt | Consistency::Raft) {
@@ -416,9 +415,15 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
     let trash = data_dir.join("trash");
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
-        let Some(stem) = name_str.strip_suffix(".redb") else { continue };
-        let Ok(svc_id) = u32::from_str_radix(stem, 16) else { continue };
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name_str.strip_suffix(".redb") else {
+            continue;
+        };
+        let Ok(svc_id) = u32::from_str_radix(stem, 16) else {
+            continue;
+        };
         if live.contains(&svc_id) {
             continue;
         }
@@ -438,4 +443,3 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
         }
     }
 }
-

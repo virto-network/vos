@@ -36,8 +36,8 @@ use core::time::Duration;
 
 use futures_channel::mpsc as fmpsc;
 use futures_channel::oneshot;
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::clock::{ApplySink, Clock, Rng};
 use crate::config::{Config, NodeId};
@@ -45,8 +45,8 @@ use crate::log_entry::LogEntry;
 use crate::meta::Meta;
 use crate::role::Role;
 use crate::rpc::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
+    PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 use crate::storage::{Storage, WriteBatch};
 use crate::transport::Transport;
@@ -238,9 +238,7 @@ impl<N: NodeId> Inbox<N> {
     /// Send a message into the worker. `Err` only if the worker
     /// has shut down (the receiver has been dropped).
     pub fn send(&self, msg: RaftMsg<N>) -> Result<(), RaftMsg<N>> {
-        self.inner
-            .unbounded_send(msg)
-            .map_err(|e| e.into_inner())
+        self.inner.unbounded_send(msg).map_err(|e| e.into_inner())
     }
 }
 
@@ -536,9 +534,7 @@ impl<N: NodeId> WorkerHandle<N> {
     /// `None` if the worker is shut down.
     pub async fn snapshot(&self) -> Option<WorkerSnapshot<N>> {
         let (tx, rx) = oneshot::channel();
-        self.inbox
-            .send(RaftMsg::QueryState { reply: tx })
-            .ok()?;
+        self.inbox.send(RaftMsg::QueryState { reply: tx }).ok()?;
         rx.await.ok()
     }
 
@@ -621,7 +617,10 @@ impl<N: NodeId> WorkerHandle<N> {
     ) -> Result<u64, ChangeMembershipError> {
         let (tx, rx) = oneshot::channel();
         self.inbox
-            .send(RaftMsg::ChangeMembership { new_members, reply: tx })
+            .send(RaftMsg::ChangeMembership {
+                new_members,
+                reply: tx,
+            })
             .map_err(|_| ChangeMembershipError::NotLeader)?;
         rx.await.unwrap_or(Err(ChangeMembershipError::NotLeader))
     }
@@ -636,7 +635,11 @@ impl<N: NodeId> WorkerHandle<N> {
         let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::AppendEntries { from, req, reply: tx })
+            .send(RaftMsg::AppendEntries {
+                from,
+                req,
+                reply: tx,
+            })
             .is_err()
         {
             return AppendEntriesResp {
@@ -653,16 +656,16 @@ impl<N: NodeId> WorkerHandle<N> {
     }
 
     /// Inbound `RequestVote` from a peer.
-    pub async fn handle_inbound_vote(
-        &self,
-        from: N,
-        req: RequestVoteReq<N>,
-    ) -> RequestVoteResp {
+    pub async fn handle_inbound_vote(&self, from: N, req: RequestVoteReq<N>) -> RequestVoteResp {
         let (tx, rx) = oneshot::channel();
         let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::RequestVote { from, req, reply: tx })
+            .send(RaftMsg::RequestVote {
+                from,
+                req,
+                reply: tx,
+            })
             .is_err()
         {
             return RequestVoteResp {
@@ -681,21 +684,27 @@ impl<N: NodeId> WorkerHandle<N> {
     /// stale as the requester's claimed log AND we haven't
     /// heard from a leader recently. Does NOT mutate
     /// `voted_for` or `current_term`.
-    pub async fn handle_inbound_prevote(
-        &self,
-        from: N,
-        req: PreVoteReq<N>,
-    ) -> PreVoteResp {
+    pub async fn handle_inbound_prevote(&self, from: N, req: PreVoteReq<N>) -> PreVoteResp {
         let (tx, rx) = oneshot::channel();
         let term = req.next_term;
         if self
             .inbox
-            .send(RaftMsg::PreVote { from, req, reply: tx })
+            .send(RaftMsg::PreVote {
+                from,
+                req,
+                reply: tx,
+            })
             .is_err()
         {
-            return PreVoteResp { term, vote_granted: false };
+            return PreVoteResp {
+                term,
+                vote_granted: false,
+            };
         }
-        rx.await.unwrap_or(PreVoteResp { term, vote_granted: false })
+        rx.await.unwrap_or(PreVoteResp {
+            term,
+            vote_granted: false,
+        })
     }
 
     /// Inbound `InstallSnapshot` from a peer.
@@ -708,12 +717,22 @@ impl<N: NodeId> WorkerHandle<N> {
         let term = req.term;
         if self
             .inbox
-            .send(RaftMsg::InstallSnapshot { from, req, reply: tx })
+            .send(RaftMsg::InstallSnapshot {
+                from,
+                req,
+                reply: tx,
+            })
             .is_err()
         {
-            return InstallSnapshotResp { term, bytes_received: 0 };
+            return InstallSnapshotResp {
+                term,
+                bytes_received: 0,
+            };
         }
-        rx.await.unwrap_or(InstallSnapshotResp { term, bytes_received: 0 })
+        rx.await.unwrap_or(InstallSnapshotResp {
+            term,
+            bytes_received: 0,
+        })
     }
 }
 
@@ -768,7 +787,10 @@ struct ActiveConfig<N: NodeId> {
 
 impl<N: NodeId> ActiveConfig<N> {
     fn steady(members: Vec<N>) -> Self {
-        Self { current: members, joint_old: None }
+        Self {
+            current: members,
+            joint_old: None,
+        }
     }
 
     fn is_joint(&self) -> bool {
@@ -1017,8 +1039,7 @@ where
     A: ApplySink,
 {
     fn publish_role(&self) {
-        self.role_atomic
-            .store(self.role.as_u8(), Ordering::Relaxed);
+        self.role_atomic.store(self.role.as_u8(), Ordering::Relaxed);
     }
 
     fn set_role(&mut self, role: Role) {
@@ -1151,7 +1172,11 @@ where
                     current: members.clone(),
                     joint_old: joint_old.clone(),
                 };
-                let pending_joint = if active.is_joint() { Some(e.index) } else { None };
+                let pending_joint = if active.is_joint() {
+                    Some(e.index)
+                } else {
+                    None
+                };
                 return Ok(ConfigRecovery {
                     active,
                     pending_joint,
@@ -1167,9 +1192,7 @@ where
     // `active_config_index` to a compacted entry, so a future
     // joint auto-finalize requires a fresh leader-issued joint
     // ConfigChange.
-    if consult_persisted
-        && let Some((current, joint_old)) = storage.active_config().await?
-    {
+    if consult_persisted && let Some((current, joint_old)) = storage.active_config().await? {
         return Ok(ConfigRecovery {
             active: ActiveConfig { current, joint_old },
             pending_joint: None,
@@ -1665,7 +1688,11 @@ where
                     current: members.clone(),
                     joint_old: joint_old.clone(),
                 };
-                let pending = if active.is_joint() { Some(entry_index) } else { None };
+                let pending = if active.is_joint() {
+                    Some(entry_index)
+                } else {
+                    None
+                };
                 active_config_for_batch = Some((members.clone(), joint_old.clone()));
                 post_active_view = Some((active, Some(entry_index), pending));
                 break;
@@ -1673,8 +1700,8 @@ where
         }
     } else if truncate_invalidated_cfg {
         let snap = state.storage.snap_last_index();
-        let scan_end = truncate_after
-            .expect("truncate_invalidated_cfg implies Some(truncate_after)");
+        let scan_end =
+            truncate_after.expect("truncate_invalidated_cfg implies Some(truncate_after)");
         let mut found: Option<(u64, Option<Vec<N>>, Vec<N>)> = None;
         if scan_end > snap {
             let surviving = match state.storage.entries(snap + 1, scan_end).await {
@@ -1685,9 +1712,7 @@ where
                 }
             };
             for e in surviving.iter().rev() {
-                if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } =
-                    &e.kind
-                {
+                if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
                     found = Some((e.index, joint_old.clone(), members.clone()));
                     break;
                 }
@@ -1779,10 +1804,7 @@ where
     let our_last_index = state.storage.last_index();
     let candidate_up_to_date = (req.last_log_term > our_last_term)
         || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
-    let already_voted_otherwise = state
-        .meta
-        .voted_for
-        .is_some_and(|v| v != req.candidate);
+    let already_voted_otherwise = state.meta.voted_for.is_some_and(|v| v != req.candidate);
     let granted = !already_voted_otherwise && candidate_up_to_date;
 
     if granted {
@@ -1956,10 +1978,7 @@ where
         });
     }
 
-    let buf = state
-        .incoming_snapshot
-        .as_mut()
-        .expect("set above");
+    let buf = state.incoming_snapshot.as_mut().expect("set above");
     let current_len = buf.buffer.len() as u64;
 
     // Out-of-order or duplicate chunk handling:
@@ -2005,11 +2024,7 @@ where
     }
 
     // Final chunk — commit the assembled snapshot atomically.
-    let snapshot = state
-        .incoming_snapshot
-        .take()
-        .expect("set above")
-        .buffer;
+    let snapshot = state.incoming_snapshot.take().expect("set above").buffer;
 
     state.meta.snap_last_index = req.last_included_index;
     state.meta.snap_last_term = req.last_included_term;
@@ -2283,9 +2298,7 @@ where
         return Ok(());
     }
     // Stale next_term or wrong role.
-    if state.role != Role::PreCandidate
-        || next_term != state.meta.current_term + 1
-    {
+    if state.role != Role::PreCandidate || next_term != state.meta.current_term + 1 {
         return Ok(());
     }
     if resp.vote_granted {
@@ -2507,9 +2520,8 @@ async fn handle_read_index<N, S, T, C, R, A>(
 /// Drain `pending_read_index` entries whose captured commit
 /// index is now ≤ `match_index_majority_floor`. Each drained
 /// entry is replied with `Ok(R)`.
-async fn try_resolve_pending_reads<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) where
+async fn try_resolve_pending_reads<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
+where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
@@ -2537,9 +2549,8 @@ async fn try_resolve_pending_reads<N, S, T, C, R, A>(
 
 /// Drain every pending read-index entry with a `LeaderStepped`
 /// error. Called by `step_down`.
-fn drain_pending_reads_on_step_down<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) where
+fn drain_pending_reads_on_step_down<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
+where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
@@ -2842,10 +2853,7 @@ where
                 .leader
                 .as_ref()
                 .and_then(|l| l.snapshot_send.get(&peer).copied())
-                .filter(|s| {
-                    s.last_included_index == snap_idx
-                        && s.last_included_term == snap_term
-                })
+                .filter(|s| s.last_included_index == snap_idx && s.last_included_term == snap_term)
                 .map(|s| s.offset)
                 .unwrap_or(0);
 
@@ -2854,10 +2862,7 @@ where
             // Cap chunk size, but never produce a 0-byte non-final
             // chunk (would loop forever). For an empty snapshot
             // we send a single done=true chunk with zero bytes.
-            let chunk_max = state
-                .cfg
-                .install_snapshot_chunk_bytes
-                .max(1);
+            let chunk_max = state.cfg.install_snapshot_chunk_bytes.max(1);
             let start = resume_offset.min(total_len) as usize;
             let end = (start + chunk_max).min(snapshot.len());
             let chunk: Vec<u8> = snapshot[start..end].to_vec();
@@ -2917,11 +2922,7 @@ where
         }
 
         let prev_log_index = next_idx.saturating_sub(1);
-        let prev_log_term = state
-            .storage
-            .term_at(prev_log_index)
-            .await?
-            .unwrap_or(0);
+        let prev_log_term = state.storage.term_at(prev_log_index).await?.unwrap_or(0);
         let entries = if next_idx <= leader_last_index {
             state.storage.entries(next_idx, leader_last_index).await?
         } else {
@@ -2946,9 +2947,10 @@ where
     let _ = try_compact(state).await;
 
     // Schedule the next heartbeat.
-    state.election_deadline = state
-        .clock
-        .add(state.clock.now(), Duration::from_millis(state.cfg.heartbeat_interval_ms));
+    state.election_deadline = state.clock.add(
+        state.clock.now(),
+        Duration::from_millis(state.cfg.heartbeat_interval_ms),
+    );
     Ok(())
 }
 
@@ -3194,8 +3196,8 @@ mod tests {
     use super::*;
     use crate::clock::{StdClock, StdRng};
     use crate::storage::MemStorage;
-    use crate::transport::test_helpers::RecordingTransport;
     use crate::testutil::block_on;
+    use crate::transport::test_helpers::RecordingTransport;
 
     fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
         let mut c = Config::new(me, members, [0u8; 32]);
@@ -3341,8 +3343,7 @@ mod tests {
         // election timer 10s so it doesn't fire during measurement,
         // and `pending` stays empty (no outbound RPCs queued) for
         // the whole window.
-        let mut cfg_idle =
-            Config::new(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC], [0u8; 32]);
+        let mut cfg_idle = Config::new(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC], [0u8; 32]);
         cfg_idle.election_timeout_ms = (10_000, 10_000);
         cfg_idle.heartbeat_interval_ms = 1_000;
 
@@ -3537,7 +3538,10 @@ mod tests {
                 last_log_term: 5,
             },
         ));
-        assert!(!r.vote_granted, "shorter-log-same-term candidate must be refused");
+        assert!(
+            !r.vote_granted,
+            "shorter-log-same-term candidate must be refused"
+        );
         worker.shutdown();
     }
 

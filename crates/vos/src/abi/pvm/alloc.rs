@@ -107,20 +107,28 @@ unsafe impl GlobalAlloc for FreeListHeap {
                 if prev.is_null() {
                     *head = leftover;
                 } else {
-                    unsafe { (*prev).next = leftover; }
+                    unsafe {
+                        (*prev).next = leftover;
+                    }
                 }
             } else {
                 // Use entire block (no split).
                 if prev.is_null() {
                     *head = next;
                 } else {
-                    unsafe { (*prev).next = next; }
+                    unsafe {
+                        (*prev).next = next;
+                    }
                 }
             }
 
             // Write header immediately before the payload.
             let header = (payload_addr - HEADER_SIZE) as *mut AllocHeader;
-            let actual_block_size = if remainder >= MIN_BLOCK { used } else { block_size };
+            let actual_block_size = if remainder >= MIN_BLOCK {
+                used
+            } else {
+                block_size
+            };
             unsafe {
                 (*header).block_start = block;
                 (*header).block_size = actual_block_size;
@@ -161,7 +169,9 @@ unsafe impl GlobalAlloc for FreeListHeap {
         if prev.is_null() {
             *head = node;
         } else {
-            unsafe { (*prev).next = node; }
+            unsafe {
+                (*prev).next = node;
+            }
         }
 
         // Coalesce with next neighbour.

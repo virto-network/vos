@@ -24,8 +24,8 @@
 
 #![cfg(feature = "std")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_executor::block_on;
@@ -275,8 +275,7 @@ fn append_entries_returns_no_reply_on_storage_failure() {
     // the fallback in `WorkerHandle::handle_inbound_append` when
     // the inbox send fails OR the oneshot's sender drops without
     // sending — the latter is what we trigger here.
-    let resp =
-        run_with_timeout(fut, Duration::from_millis(200)).expect("handle returned");
+    let resp = run_with_timeout(fut, Duration::from_millis(200)).expect("handle returned");
 
     assert!(
         !resp.success,
@@ -372,7 +371,10 @@ fn propose_storage_failure_surfaces_to_caller_and_worker_recovers() {
     // the fault budget is exhausted.
     fail.store(0, Ordering::Relaxed);
     let r2 = block_on(h.propose(b"will-succeed".to_vec()));
-    assert!(r2.is_ok(), "second propose after fault must succeed: got {r2:?}");
+    assert!(
+        r2.is_ok(),
+        "second propose after fault must succeed: got {r2:?}"
+    );
 
     worker.shutdown();
 }
@@ -487,8 +489,7 @@ fn term_at_failure_during_consistency_check() {
             entries: vec![],
         },
     );
-    let resp = run_with_timeout(fut, Duration::from_millis(200))
-        .expect("handle returned");
+    let resp = run_with_timeout(fut, Duration::from_millis(200)).expect("handle returned");
     assert!(
         !resp.success,
         "follower must report failure when term_at lookup fails",
@@ -507,7 +508,10 @@ fn term_at_failure_during_consistency_check() {
             entries: vec![],
         },
     ));
-    assert!(resp2.success, "second call must succeed once term_at faults clear");
+    assert!(
+        resp2.success,
+        "second call must succeed once term_at faults clear"
+    );
     worker.shutdown();
 }
 
@@ -517,10 +521,7 @@ fn term_at_failure_during_consistency_check() {
 /// future doesn't resolve in time. Drives the future on a
 /// `LocalPool` and steps until either it's ready or the
 /// deadline passes — no separate thread, so no `'static` bound.
-fn run_with_timeout<F: core::future::Future>(
-    fut: F,
-    timeout: Duration,
-) -> Option<F::Output> {
+fn run_with_timeout<F: core::future::Future>(fut: F, timeout: Duration) -> Option<F::Output> {
     use core::pin::pin;
     use core::task::{Context, Poll};
     use futures_executor::LocalPool;

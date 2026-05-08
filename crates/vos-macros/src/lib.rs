@@ -5,7 +5,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType};
+use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
 /// Makes a struct a VOS actor.
 ///
@@ -241,10 +241,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             continue;
                         }
                         if let Pat::Ident(pat) = pat_type.pat.as_ref() {
-                            constructor_params.push((
-                                pat.ident.clone(),
-                                pat_type.ty.as_ref().clone(),
-                            ));
+                            constructor_params
+                                .push((pat.ident.clone(), pat_type.ty.as_ref().clone()));
                         }
                     }
                 }
@@ -261,10 +259,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 ReturnType::Type(_, ty) => result_ok_type(ty).is_some(),
             };
         }
-        let struct_name = format_ident!(
-            "{}",
-            to_pascal_case(&method_name.to_string())
-        );
+        let struct_name = format_ident!("{}", to_pascal_case(&method_name.to_string()));
 
         // Detect &self vs &mut self
         let is_query = match method.sig.inputs.first() {
@@ -403,12 +398,23 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         } else {
-            let ty_str = success_after_result.as_ref()
+            let ty_str = success_after_result
+                .as_ref()
                 .map(|t| quote!(#t).to_string().replace(' ', ""))
                 .unwrap_or_else(|| "()".to_string());
             const PRIMITIVES: &[&str] = &[
-                "()", "bool", "u8", "u16", "u32", "u64", "i32", "i64",
-                "String", "Vec<u8>", "Vec<u32>", "Vec<String>",
+                "()",
+                "bool",
+                "u8",
+                "u16",
+                "u32",
+                "u64",
+                "i32",
+                "i64",
+                "String",
+                "Vec<u8>",
+                "Vec<u32>",
+                "Vec<String>",
             ];
             if PRIMITIVES.contains(&ty_str.as_str()) {
                 quote! { reply.into() }
@@ -482,13 +488,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let from_msg_body = if field_names.is_empty() {
             quote! { Some(#enum_name::#struct_name(#struct_name)) }
         } else {
-            let extractions: Vec<_> = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-                let name_str = name.to_string();
-                let accessor = type_to_accessor(ty);
-                quote! {
-                    let #name: #ty = msg.args.#accessor(#name_str)?;
-                }
-            }).collect();
+            let extractions: Vec<_> = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, ty)| {
+                    let name_str = name.to_string();
+                    let accessor = type_to_accessor(ty);
+                    quote! {
+                        let #name: #ty = msg.args.#accessor(#name_str)?;
+                    }
+                })
+                .collect();
             quote! {
                 #( #extractions )*
                 Some(#enum_name::#struct_name(#struct_name { #( #field_names ),* }))
@@ -535,16 +545,19 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Constructor field metadata
-    let ctor_field_metas: Vec<_> = constructor_params.iter().map(|(name, ty)| {
-        let name_str = name.to_string();
-        let ty_str = quote!(#ty).to_string();
-        quote! {
-            vos::metadata::FieldMeta {
-                name: #name_str,
-                ty: #ty_str,
+    let ctor_field_metas: Vec<_> = constructor_params
+        .iter()
+        .map(|(name, ty)| {
+            let name_str = name.to_string();
+            let ty_str = quote!(#ty).to_string();
+            quote! {
+                vos::metadata::FieldMeta {
+                    name: #name_str,
+                    ty: #ty_str,
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
@@ -624,14 +637,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else {
-        let extractions: Vec<_> = constructor_params.iter().map(|(name, ty)| {
-            let name_str = name.to_string();
-            let accessor = type_to_accessor(ty);
-            quote! {
-                let #name: #ty = args.#accessor(#name_str)
-                    .expect(concat!("missing init arg '", #name_str, "'"));
-            }
-        }).collect();
+        let extractions: Vec<_> = constructor_params
+            .iter()
+            .map(|(name, ty)| {
+                let name_str = name.to_string();
+                let accessor = type_to_accessor(ty);
+                quote! {
+                    let #name: #ty = args.#accessor(#name_str)
+                        .expect(concat!("missing init arg '", #name_str, "'"));
+                }
+            })
+            .collect();
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
         // PVM service path reads init args from storage. Worker/WASM
         // builds receive args via __vos_create_with_args; bare create()
@@ -670,14 +686,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else {
-        let extractions: Vec<_> = constructor_params.iter().map(|(name, ty)| {
-            let name_str = name.to_string();
-            let accessor = type_to_accessor(ty);
-            quote! {
-                let #name: #ty = args.#accessor(#name_str)
-                    .expect(concat!("missing init arg '", #name_str, "'"));
-            }
-        }).collect();
+        let extractions: Vec<_> = constructor_params
+            .iter()
+            .map(|(name, ty)| {
+                let name_str = name.to_string();
+                let accessor = type_to_accessor(ty);
+                quote! {
+                    let #name: #ty = args.#accessor(#name_str)
+                        .expect(concat!("missing init arg '", #name_str, "'"));
+                }
+            })
+            .collect();
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
         quote! {
             fn __vos_create_with_args(args_bytes: &[u8]) -> Self {
@@ -776,7 +795,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         vos::__vos_emit_worker_glue!(#actor_name, #enum_name);
     };
 
-
     // WASM cdylib entry points (`vos_wasm_*` extern fns). Same
     // bin-gating shape as worker_entries — the gate lives inside
     // the decl-macro so the surrounding scope sees the right
@@ -798,41 +816,52 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // takes `&mut impl Invoker` as its first parameter. Methods
     // are `async`; host callers wrap them with `vos::block_on`.
     let ref_struct_name = format_ident!("{}Ref", actor_name);
-    let ref_methods_emit: Vec<proc_macro2::TokenStream> = client_methods.iter().map(|m| {
-        let method_ident = &m.wire_name;
-        let wire_name = m.wire_name.to_string();
-        let arg_decls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, t)| {
-            quote! { #n: #t }
-        }).collect();
-        let with_calls: Vec<proc_macro2::TokenStream> = m.args.iter().map(|(n, _)| {
-            let n_str = n.to_string();
-            quote! { .with(#n_str, #n) }
-        }).collect();
-        let return_ty: proc_macro2::TokenStream = match &m.success_ty {
-            None => quote! { () },
-            Some(t) => quote! { #t },
-        };
-        let value_ident = format_ident!("__value");
-        let decode = client_decode_body(&m.success_ty, &value_ident);
-        quote! {
-            pub async fn #method_ident<__I: vos::actors::client::Invoker>(
-                &self,
-                __inv: &mut __I,
-                #( #arg_decls ),*
-            ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                use vos::Encode;
-                let __msg = vos::value::Msg::new(#wire_name)
-                    #( #with_calls )*;
-                let __encoded = __msg.encode();
-                let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                __payload.push(vos::value::TAG_DYNAMIC);
-                __payload.extend_from_slice(&__encoded);
-                let #value_ident: vos::value::Value =
-                    __inv.invoke(self.target, __payload).await?;
-                #decode
+    let ref_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
+        .iter()
+        .map(|m| {
+            let method_ident = &m.wire_name;
+            let wire_name = m.wire_name.to_string();
+            let arg_decls: Vec<proc_macro2::TokenStream> = m
+                .args
+                .iter()
+                .map(|(n, t)| {
+                    quote! { #n: #t }
+                })
+                .collect();
+            let with_calls: Vec<proc_macro2::TokenStream> = m
+                .args
+                .iter()
+                .map(|(n, _)| {
+                    let n_str = n.to_string();
+                    quote! { .with(#n_str, #n) }
+                })
+                .collect();
+            let return_ty: proc_macro2::TokenStream = match &m.success_ty {
+                None => quote! { () },
+                Some(t) => quote! { #t },
+            };
+            let value_ident = format_ident!("__value");
+            let decode = client_decode_body(&m.success_ty, &value_ident);
+            quote! {
+                pub async fn #method_ident<__I: vos::actors::client::Invoker>(
+                    &self,
+                    __inv: &mut __I,
+                    #( #arg_decls ),*
+                ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                    use vos::Encode;
+                    let __msg = vos::value::Msg::new(#wire_name)
+                        #( #with_calls )*;
+                    let __encoded = __msg.encode();
+                    let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                    __payload.push(vos::value::TAG_DYNAMIC);
+                    __payload.extend_from_slice(&__encoded);
+                    let #value_ident: vos::value::Value =
+                        __inv.invoke(self.target, __payload).await?;
+                    #decode
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     let ref_emission = quote! {
         #[derive(Copy, Clone)]
@@ -875,9 +904,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 fn is_context_type(ty: &syn::Type) -> bool {
     if let syn::Type::Reference(r) = ty {
         return match r.elem.as_ref() {
-            syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| {
-                s.ident == "Context" || s.ident == "PureContext"
-            }),
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "Context" || s.ident == "PureContext"),
             _ => false,
         };
     }

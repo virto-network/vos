@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use futures_executor::block_on;
 use proptest::prelude::*;
 use vos_raft::{
-    AppendEntriesReq, InstallSnapshotReq, LogEntry, Meta, RequestVoteReq, Storage,
-    StdClock, Worker, WriteBatch,
+    AppendEntriesReq, InstallSnapshotReq, LogEntry, Meta, RequestVoteReq, StdClock, Storage,
+    Worker, WriteBatch,
 };
 
 /// Operations the test can issue against a single worker.
@@ -78,16 +78,26 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     let idx = 0u64..30;
     let n = 0u8..3;
     prop_oneof![
-        (peers.clone(), term.clone(), idx.clone(), term.clone(), idx.clone(), n).prop_map(
-            |(from, term, prev_log_index, prev_log_term, leader_commit, n_entries)| Op::Append {
-                from,
-                term,
-                prev_log_index,
-                prev_log_term,
-                leader_commit,
-                n_entries,
-            },
-        ),
+        (
+            peers.clone(),
+            term.clone(),
+            idx.clone(),
+            term.clone(),
+            idx.clone(),
+            n
+        )
+            .prop_map(
+                |(from, term, prev_log_index, prev_log_term, leader_commit, n_entries)| {
+                    Op::Append {
+                        from,
+                        term,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                        n_entries,
+                    }
+                },
+            ),
         (peers.clone(), term.clone(), idx.clone(), term.clone()).prop_map(
             |(from, term, last_log_index, last_log_term)| Op::Vote {
                 from,
@@ -185,7 +195,10 @@ impl Storage<u16> for SharedStorage {
             return Ok(Vec::new());
         }
         let eff_start = start.max(m.meta.snap_last_index + 1);
-        Ok(m.entries.range(eff_start..=end).map(|(_, v)| v.clone()).collect())
+        Ok(m.entries
+            .range(eff_start..=end)
+            .map(|(_, v)| v.clone())
+            .collect())
     }
     async fn read_state(&self) -> Result<Vec<u8>, Self::Error> {
         Ok(self.mirror.lock().unwrap().state.clone())
@@ -221,11 +234,7 @@ fn make_worker(seed: u64) -> (Worker<u16>, Arc<Mutex<StorageMirror>>) {
     let storage = SharedStorage {
         mirror: mirror.clone(),
     };
-    let mut cfg = vos_raft::Config::new(
-        0xAAAA,
-        vec![0xAAAA, 0xBBBB, 0xCCCC],
-        [0xC0; 32],
-    );
+    let mut cfg = vos_raft::Config::new(0xAAAA, vec![0xAAAA, 0xBBBB, 0xCCCC], [0xC0; 32]);
     // Long enough that no spontaneous election fires during the
     // property test — we want to observe *only* the random RPC
     // sequence's effect on state.

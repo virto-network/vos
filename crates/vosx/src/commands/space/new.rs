@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use space_registry::{NODE_ROLE_VOTER, STATUS_OK, SpaceRegistryRef};
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
-use space_registry::{NODE_ROLE_VOTER, SpaceRegistryRef, STATUS_OK};
 
 use crate::blob_store::{self, BlobSource};
 use crate::output;
@@ -121,20 +121,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // 8. Move temp dir to the canonical location. Disarm the
     //    guard once the rename succeeds — the destination dir
     //    is now legitimate state, not a temp leftover.
-    let final_dir = args
-        .data_dir
-        .unwrap_or_else(|| paths::space_dir(&space_id));
+    let final_dir = args.data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
     if final_dir.exists() {
-        anyhow::bail!(
-            "space data dir already exists: {}",
-            final_dir.display(),
-        );
+        anyhow::bail!("space data dir already exists: {}", final_dir.display(),);
     }
     if let Some(parent) = final_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(&temp_dir, &final_dir)
-        .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", temp_dir.display(), final_dir.display()))?;
+    std::fs::rename(&temp_dir, &final_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "rename {} → {}: {e}",
+            temp_dir.display(),
+            final_dir.display()
+        )
+    })?;
     temp_guard.disarm();
 
     // 9. Persist the keypair under the final dir.
@@ -176,7 +176,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         println!();
         println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
         println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
-        println!("printed by `space info {}` once the daemon's running.", args.name);
+        println!(
+            "printed by `space info {}` once the daemon's running.",
+            args.name
+        );
     }
 
     Ok(())
@@ -191,8 +194,8 @@ pub fn resolve_registry_source(
 ) -> anyhow::Result<(blob_store::BlobHash, Vec<u8>, String)> {
     if let Some(s) = registry {
         let source = BlobSource::parse(s);
-        let (hash, bytes) = blob_store::resolve(&source)
-            .map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
+        let (hash, bytes) =
+            blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("registry blob: {e}"))?;
         return Ok((hash, bytes, s.to_string()));
     }
     match crate::bundled::registry_elf() {
@@ -237,8 +240,7 @@ impl Drop for TempDirGuard {
 fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     let db = redb::Database::open(db_path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", db_path.display()))?;
-    let roots = vos::commit::read_roots(&db)
-        .map_err(|e| anyhow::anyhow!("read roots: {e}"))?;
+    let roots = vos::commit::read_roots(&db).map_err(|e| anyhow::anyhow!("read roots: {e}"))?;
     drop(db);
     roots
         .into_iter()

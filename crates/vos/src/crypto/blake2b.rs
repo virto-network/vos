@@ -86,27 +86,24 @@ fn hash_via_ecall<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
     let mut buf_len = 0usize;
     let mut t: u128 = 0;
 
-    let feed = |bytes: &[u8],
-                buf: &mut [u8; 128],
-                buf_len: &mut usize,
-                h: &mut [u8; 64],
-                t: &mut u128| {
-        let mut i = 0;
-        while i < bytes.len() {
-            // Compress only when the buffer is FULL and there's at
-            // least one more byte to come — the final block needs
-            // the finalize flag, set below.
-            if *buf_len == 128 {
-                *t += 128;
-                ecall_compress(h, buf, *t, false);
-                *buf_len = 0;
+    let feed =
+        |bytes: &[u8], buf: &mut [u8; 128], buf_len: &mut usize, h: &mut [u8; 64], t: &mut u128| {
+            let mut i = 0;
+            while i < bytes.len() {
+                // Compress only when the buffer is FULL and there's at
+                // least one more byte to come — the final block needs
+                // the finalize flag, set below.
+                if *buf_len == 128 {
+                    *t += 128;
+                    ecall_compress(h, buf, *t, false);
+                    *buf_len = 0;
+                }
+                let take = (128 - *buf_len).min(bytes.len() - i);
+                buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i + take]);
+                *buf_len += take;
+                i += take;
             }
-            let take = (128 - *buf_len).min(bytes.len() - i);
-            buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i + take]);
-            *buf_len += take;
-            i += take;
-        }
-    };
+        };
 
     feed(domain, &mut buf, &mut buf_len, &mut h, &mut t);
     for p in parts {
@@ -262,7 +259,10 @@ fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blake2::digest::{consts::{U32, U64}, Digest};
+    use blake2::digest::{
+        Digest,
+        consts::{U32, U64},
+    };
 
     type Blake2b512 = blake2::Blake2b<U64>;
     type Blake2b256 = blake2::Blake2b<U32>;

@@ -26,8 +26,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // Resolve and cache the blob bytes locally.
     let source = BlobSource::parse(&args.source);
-    let (hash, _bytes) = blob_store::resolve(&source)
-        .map_err(|e| anyhow::anyhow!("blob: {e}"))?;
+    let (hash, _bytes) = blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
 
     DaemonClient::with_connect(&args.space, |client| {
         let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
@@ -53,4 +52,3 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     })
 }
-

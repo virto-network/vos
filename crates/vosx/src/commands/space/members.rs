@@ -9,9 +9,8 @@
 use clap::Subcommand;
 
 use space_registry::{
-    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER,
-    NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, STATUS_NOT_FOUND,
-    STATUS_OK,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER,
+    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, STATUS_NOT_FOUND, STATUS_OK,
 };
 
 use serde::Serialize;
@@ -97,25 +96,28 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     match args.command.unwrap_or(MembersCommand::List) {
         MembersCommand::List => list(&args.space),
-        MembersCommand::AddNode { peer_id, prefix, role } => {
-            add_node(&args.space, &peer_id, prefix, &role)
-        }
+        MembersCommand::AddNode {
+            peer_id,
+            prefix,
+            role,
+        } => add_node(&args.space, &peer_id, prefix, &role),
         MembersCommand::RemoveNode { prefix } => remove_node(&args.space, prefix),
         MembersCommand::AddIdentity {
             public_key,
             proof_kind,
             proof_data,
         } => add_identity(&args.space, &public_key, &proof_kind, proof_data.as_deref()),
-        MembersCommand::RemoveIdentity { public_key } => {
-            remove_identity(&args.space, &public_key)
-        }
+        MembersCommand::RemoveIdentity { public_key } => remove_identity(&args.space, &public_key),
     }
 }
 
 fn list(space: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         let members = client.members()?;
-        let nodes: Vec<_> = members.iter().filter(|m| m.kind == MEMBER_KIND_NODE).collect();
+        let nodes: Vec<_> = members
+            .iter()
+            .filter(|m| m.kind == MEMBER_KIND_NODE)
+            .collect();
         let identities: Vec<_> = members
             .iter()
             .filter(|m| m.kind == MEMBER_KIND_IDENTITY)
@@ -163,7 +165,9 @@ fn list(space: &str) -> anyhow::Result<()> {
             }
         }
         if nodes.is_empty() && identities.is_empty() {
-            println!("no members. add one with `vosx space members add-node …` or `add-identity …`.");
+            println!(
+                "no members. add one with `vosx space members add-node …` or `add-identity …`."
+            );
         }
         Ok(())
     })
@@ -194,8 +198,8 @@ fn add_node(
     let peer_id = peer_id_str
         .parse::<libp2p::PeerId>()
         .map_err(|e| anyhow::anyhow!("parse peer_id: {e}"))?;
-    let prefix = prefix_override
-        .unwrap_or_else(|| vos::network::derive_node_prefix(&peer_id) as u32);
+    let prefix =
+        prefix_override.unwrap_or_else(|| vos::network::derive_node_prefix(&peer_id) as u32);
     let role = match role_str {
         "voter" => NODE_ROLE_VOTER,
         "observer" => NODE_ROLE_OBSERVER,
@@ -213,7 +217,10 @@ fn add_node(
                 prefix: u16,
                 role: &'a str,
             }
-            output::print_json(&V { prefix: prefix as u16, role: role_str });
+            output::print_json(&V {
+                prefix: prefix as u16,
+                role: role_str,
+            });
         } else {
             println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
         }
@@ -222,23 +229,23 @@ fn add_node(
 }
 
 fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
-    DaemonClient::with_connect(space, |client| {
-        match client.remove_node(prefix)? {
-            STATUS_OK => {
-                if output::is_json() {
-                    #[derive(Serialize)]
-                    struct V {
-                        prefix: u16,
-                    }
-                    output::print_json(&V { prefix: prefix as u16 });
-                } else {
-                    println!("removed node prefix=0x{:04x}", prefix as u16);
+    DaemonClient::with_connect(space, |client| match client.remove_node(prefix)? {
+        STATUS_OK => {
+            if output::is_json() {
+                #[derive(Serialize)]
+                struct V {
+                    prefix: u16,
                 }
-                Ok(())
+                output::print_json(&V {
+                    prefix: prefix as u16,
+                });
+            } else {
+                println!("removed node prefix=0x{:04x}", prefix as u16);
             }
-            STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
-            other => anyhow::bail!("remove_node returned status {other}"),
+            Ok(())
         }
+        STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
+        other => anyhow::bail!("remove_node returned status {other}"),
     })
 }
 
@@ -297,7 +304,9 @@ fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
                     struct V {
                         public_key: String,
                     }
-                    output::print_json(&V { public_key: hex::encode(&pubkey) });
+                    output::print_json(&V {
+                        public_key: hex::encode(&pubkey),
+                    });
                 } else {
                     println!("removed identity");
                 }

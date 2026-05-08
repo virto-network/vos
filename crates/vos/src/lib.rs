@@ -51,12 +51,12 @@ pub use ::log;
 ///
 /// Each actor lib.rs typically only needs this single line.
 pub mod prelude {
+    pub use crate::lifecycle;
+    pub use crate::value::Msg;
+    pub use crate::{Decode, Encode};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
     pub use ::log;
-    pub use crate::value::Msg;
-    pub use crate::lifecycle;
-    pub use crate::{Encode, Decode};
 }
 
 // --- ABI (hostcall IDs, error codes, ecall wrappers) ---
@@ -69,8 +69,8 @@ pub mod crypto;
 pub mod actors;
 pub mod refine_payload;
 
-pub mod effects;
 pub mod effect_log;
+pub mod effects;
 pub mod worker;
 // Auto-installed `log::Log` impl for PVM builds. Worker- and
 // wasm-side log impls live in the user crate (emitted by the
@@ -108,19 +108,24 @@ pub mod data_layer;
 pub mod pvm_image;
 
 // Re-export core actor types at crate root for `use vos::*`
-pub use actors::{Actor, Message, Context, WorkerActor, WorkerCtx, Yield, Ask, RunResult, try_poll, run_blocking, metadata};
-pub use actors::{Encode, Decode};
-pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
 pub use actors::InvokeError;
 pub use actors::init;
 pub use actors::lifecycle;
-pub use actors::value;
-#[cfg(feature = "macros")]
-pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "pvm")]
 pub use actors::run_refine;
+pub use actors::value;
+pub use actors::{
+    Actor, Ask, Context, Message, RunResult, WorkerActor, WorkerCtx, Yield, metadata, run_blocking,
+    try_poll,
+};
+pub use actors::{Decode, Encode};
+pub use actors::{
+    STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED, service_code_hash,
+};
 #[cfg(feature = "pvm")]
-pub use actors::{run_refine_entry, run_accumulate_entry};
+pub use actors::{run_accumulate_entry, run_refine_entry};
+#[cfg(feature = "macros")]
+pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
@@ -166,11 +171,11 @@ pub fn block_on<F: core::future::Future>(fut: F) -> F::Output {
 
 #[cfg(feature = "std")]
 mod host_invoker {
+    use crate::Decode;
     use crate::actors::client::{ClientError, Invoker};
     use crate::actors::context::ServiceId;
     use crate::actors::value::Value;
     use crate::node::VosNode;
-    use crate::Decode;
     use alloc::vec::Vec;
     use core::future::Future;
 
@@ -277,15 +282,15 @@ macro_rules! __vos_emit_worker_glue {
                 let (src, len) = _VOS_META_ENCODED;
                 let mut out = [0u8; _VOS_META_ENCODED.1];
                 let mut i = 0;
-                while i < len { out[i] = src[i]; i += 1; }
+                while i < len {
+                    out[i] = src[i];
+                    i += 1;
+                }
                 out
             };
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_meta(
-                out_ptr: *mut *const u8,
-                out_len: *mut usize,
-            ) {
+            pub extern "C" fn vos_worker_meta(out_ptr: *mut *const u8, out_len: *mut usize) {
                 unsafe {
                     *out_ptr = _VOS_WORKER_META.as_ptr();
                     *out_len = _VOS_WORKER_META.len();
@@ -304,7 +309,9 @@ macro_rules! __vos_emit_worker_glue {
             // direct dep.
             struct __VosWorkerLogger;
             impl $crate::log::Log for __VosWorkerLogger {
-                fn enabled(&self, _: &$crate::log::Metadata<'_>) -> bool { true }
+                fn enabled(&self, _: &$crate::log::Metadata<'_>) -> bool {
+                    true
+                }
                 fn log(&self, record: &$crate::log::Record<'_>) {
                     use std::io::Write as _;
                     let _ = writeln!(
@@ -323,10 +330,7 @@ macro_rules! __vos_emit_worker_glue {
             static __VOS_WORKER_LOGGER: __VosWorkerLogger = __VosWorkerLogger;
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_create(
-                args_ptr: *const u8,
-                args_len: usize,
-            ) -> *mut () {
+            pub extern "C" fn vos_worker_create(args_ptr: *const u8, args_len: usize) -> *mut () {
                 // Install the worker logger on first create.
                 // Idempotent — subsequent calls are no-ops.
                 let _ = $crate::log::set_logger(&__VOS_WORKER_LOGGER);
@@ -336,14 +340,11 @@ macro_rules! __vos_emit_worker_glue {
                 let mut actor = if args_ptr.is_null() || args_len == 0 {
                     <$actor_name as $crate::Actor>::create()
                 } else {
-                    let args_bytes = unsafe {
-                        core::slice::from_raw_parts(args_ptr, args_len)
-                    };
+                    let args_bytes = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
                     <$actor_name>::__vos_create_with_args(args_bytes)
                 };
-                let mut ctx = $crate::Context::<$actor_name>::new(
-                    $crate::actors::context::ServiceId(0),
-                );
+                let mut ctx =
+                    $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut ctx));
                 let state = Box::new(WorkerState {
                     actor,
@@ -383,9 +384,7 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_poll(
-                state: *mut (),
-            ) -> $crate::worker::WorkerPollResult {
+            pub extern "C" fn vos_worker_poll(state: *mut ()) -> $crate::worker::WorkerPollResult {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
                 let Some(future) = ws.in_flight.as_mut() else {
                     return $crate::worker::WorkerPollResult::error(
@@ -405,9 +404,7 @@ macro_rules! __vos_emit_worker_glue {
                             $crate::worker::WorkerPollResult::ready(reply_bytes)
                         }
                     }
-                    core::task::Poll::Pending => {
-                        $crate::worker::WorkerPollResult::pending()
-                    }
+                    core::task::Poll::Pending => $crate::worker::WorkerPollResult::pending(),
                 }
             }
 
@@ -461,19 +458,13 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_load(
-                state_ptr: *const u8,
-                state_len: usize,
-            ) -> *mut () {
+            pub extern "C" fn vos_worker_load(state_ptr: *const u8, state_len: usize) -> *mut () {
                 use $crate::Actor as _;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(state_ptr, state_len)
-                };
+                let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
                 let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
                     .unwrap_or_else(<$actor_name as $crate::Actor>::create);
-                let mut ctx = $crate::Context::<$actor_name>::new(
-                    $crate::actors::context::ServiceId(0),
-                );
+                let mut ctx =
+                    $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut ctx));
                 let state = Box::new(WorkerState {
                     actor,
@@ -538,7 +529,10 @@ macro_rules! __vos_emit_wasm_glue {
                 let (src, len) = _VOS_META_ENCODED;
                 let mut out = [0u8; _VOS_META_ENCODED.1];
                 let mut i = 0;
-                while i < len { out[i] = src[i]; i += 1; }
+                while i < len {
+                    out[i] = src[i];
+                    i += 1;
+                }
                 out
             };
 
@@ -549,16 +543,15 @@ macro_rules! __vos_emit_wasm_glue {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_meta() -> u64 {
-                pack_buf(
-                    _VOS_WASM_META.as_ptr() as u32,
-                    _VOS_WASM_META.len() as u32,
-                )
+                pack_buf(_VOS_WASM_META.as_ptr() as u32, _VOS_WASM_META.len() as u32)
             }
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_alloc(size: u32) -> u32 {
                 let mut buf: Vec<u8> = Vec::with_capacity(size as usize);
-                unsafe { buf.set_len(size as usize); }
+                unsafe {
+                    buf.set_len(size as usize);
+                }
                 let ptr = buf.as_mut_ptr() as u32;
                 core::mem::forget(buf);
                 ptr
@@ -588,9 +581,8 @@ macro_rules! __vos_emit_wasm_glue {
                     };
                     <$actor_name>::__vos_create_with_args(args_bytes)
                 };
-                let mut ctx = $crate::Context::<$actor_name>::new(
-                    $crate::actors::context::ServiceId(0),
-                );
+                let mut ctx =
+                    $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut ctx));
                 let state = Box::new(WasmState {
                     actor,
@@ -604,9 +596,8 @@ macro_rules! __vos_emit_wasm_glue {
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_dispatch(state: u32, msg_ptr: u32, msg_len: u32) {
                 let ws = unsafe { &mut *(state as *mut WasmState) };
-                let raw = unsafe {
-                    core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize)
-                };
+                let raw =
+                    unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize) };
 
                 let msg = if !raw.is_empty() && raw[0] == $crate::value::TAG_DYNAMIC {
                     let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
@@ -678,9 +669,7 @@ macro_rules! __vos_emit_wasm_glue {
                 let result = if ptr == 0 || len == 0 {
                     Vec::new()
                 } else {
-                    unsafe {
-                        core::slice::from_raw_parts(ptr as *const u8, len as usize)
-                    }.to_vec()
+                    unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec()
                 };
                 ws.ctx.set_host_io_result(result);
             }
@@ -700,9 +689,8 @@ macro_rules! __vos_emit_wasm_glue {
                 };
                 let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
                     .unwrap_or_else(<$actor_name as $crate::Actor>::create);
-                let mut ctx = $crate::Context::<$actor_name>::new(
-                    $crate::actors::context::ServiceId(0),
-                );
+                let mut ctx =
+                    $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut ctx));
                 let state = Box::new(WasmState {
                     actor,
@@ -727,7 +715,9 @@ macro_rules! __vos_emit_wasm_glue {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_encode_msg(desc_ptr: u32, desc_len: u32) -> u64 {
-                if desc_ptr == 0 || desc_len == 0 { return 0; }
+                if desc_ptr == 0 || desc_len == 0 {
+                    return 0;
+                }
                 let desc = unsafe {
                     core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
                 };

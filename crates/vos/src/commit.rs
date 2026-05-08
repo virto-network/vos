@@ -51,19 +51,29 @@ mod from_redb {
     use super::CommitError;
 
     impl From<redb::DatabaseError> for CommitError {
-        fn from(e: redb::DatabaseError) -> Self { Self::Backend(Box::new(e)) }
+        fn from(e: redb::DatabaseError) -> Self {
+            Self::Backend(Box::new(e))
+        }
     }
     impl From<redb::TableError> for CommitError {
-        fn from(e: redb::TableError) -> Self { Self::Backend(Box::new(e)) }
+        fn from(e: redb::TableError) -> Self {
+            Self::Backend(Box::new(e))
+        }
     }
     impl From<redb::StorageError> for CommitError {
-        fn from(e: redb::StorageError) -> Self { Self::Backend(Box::new(e)) }
+        fn from(e: redb::StorageError) -> Self {
+            Self::Backend(Box::new(e))
+        }
     }
     impl From<redb::TransactionError> for CommitError {
-        fn from(e: redb::TransactionError) -> Self { Self::Backend(Box::new(e)) }
+        fn from(e: redb::TransactionError) -> Self {
+            Self::Backend(Box::new(e))
+        }
     }
     impl From<redb::CommitError> for CommitError {
-        fn from(e: redb::CommitError) -> Self { Self::Backend(Box::new(e)) }
+        fn from(e: redb::CommitError) -> Self {
+            Self::Backend(Box::new(e))
+        }
     }
 }
 
@@ -173,8 +183,7 @@ mod local {
     use super::*;
 
     /// redb table holding the materialized actor state.
-    pub const STATE_TABLE: redb::TableDefinition<&str, &[u8]> =
-        redb::TableDefinition::new("state");
+    pub const STATE_TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("state");
 
     /// Row key within [`STATE_TABLE`] for the actor's state blob.
     /// Shared with [`crdt::CrdtCommit`] so both strategies write to
@@ -192,7 +201,10 @@ mod local {
         /// Open (or create) the redb database at `path`.
         pub fn open(path: &Path) -> Result<Self, CommitError> {
             let db = redb::Database::create(path)?;
-            Ok(Self { db, last: Vec::new() })
+            Ok(Self {
+                db,
+                last: Vec::new(),
+            })
         }
 
         /// Borrow the underlying redb handle. Used when a higher-
@@ -236,7 +248,7 @@ mod crdt {
     use crate::effect_log::{CrdtEvent, EffectLog};
     use alloc::collections::{BTreeMap, BTreeSet};
     use alloc::vec::Vec;
-    use merkle_crdt::{Cid, DagNode, Encode as McEncode, Decode as McDecode, Hasher, MerkleClock};
+    use merkle_crdt::{Cid, DagNode, Decode as McDecode, Encode as McEncode, Hasher, MerkleClock};
     use std::collections::VecDeque;
 
     /// blake2b-256 hasher for CRDT CIDs. Uses blake2b_simd (already a
@@ -285,8 +297,7 @@ mod crdt {
     /// redb table holding merkle-DAG nodes keyed by CID bytes.
     /// Uses the same name as [`merkle_crdt::RedbStore`] so a
     /// `RedbStore` opened against this database sees the same nodes.
-    pub const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> =
-        redb::TableDefinition::new("dag");
+    pub const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
 
     /// Row key in [`STATE_TABLE`](super::STATE_TABLE) for the
     /// serialized Merkle-Clock roots.
@@ -348,10 +359,7 @@ mod crdt {
         /// — pick it from the host's identity (e.g. node prefix or
         /// libp2p peer-id hash); the replication-group id is the wrong
         /// choice because every replica in a group shares it.
-        pub fn open(
-            path: &std::path::Path,
-            replica_origin: [u8; 32],
-        ) -> Result<Self, CommitError> {
+        pub fn open(path: &std::path::Path, replica_origin: [u8; 32]) -> Result<Self, CommitError> {
             let db = alloc::sync::Arc::new(redb::Database::create(path)?);
             Ok(Self::with_state(
                 db,
@@ -371,10 +379,7 @@ mod crdt {
         /// lock; use [`from_db_arc_locked`](Self::from_db_arc_locked)
         /// when multiple `CrdtCommit`s over the same db need to
         /// serialize their writes (agent thread + sync ticker).
-        pub fn from_db_arc(
-            db: alloc::sync::Arc<redb::Database>,
-            replica_origin: [u8; 32],
-        ) -> Self {
+        pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>, replica_origin: [u8; 32]) -> Self {
             Self::with_state(
                 db,
                 alloc::sync::Arc::new(std::sync::Mutex::new(())),
@@ -436,20 +441,13 @@ mod crdt {
         /// Current root CIDs as raw 32-byte arrays — the wire
         /// format `Frame::Heads` uses.
         pub fn root_bytes(&self) -> Vec<[u8; 32]> {
-            self.clock
-                .roots()
-                .iter()
-                .map(|cid| cid.0)
-                .collect()
+            self.clock.roots().iter().map(|cid| cid.0).collect()
         }
 
         /// Read a single DAG node's serialized bytes from the
         /// store. `Ok(None)` means the CID isn't in the local
         /// DAG (typical during sync — peer has nodes we don't).
-        pub fn get_node_bytes(
-            &self,
-            cid: &[u8; 32],
-        ) -> Result<Option<Vec<u8>>, CommitError> {
+        pub fn get_node_bytes(&self, cid: &[u8; 32]) -> Result<Option<Vec<u8>>, CommitError> {
             read_dag_node(&self.db, cid)
         }
 
@@ -531,8 +529,8 @@ mod crdt {
                 let Some(val) = table.get(cid.as_ref())? else {
                     continue;
                 };
-                let node: DagNode<Blake2b, CrdtEvent> =
-                    DagNode::from_bytes(val.value()).ok_or_else(|| {
+                let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(val.value())
+                    .ok_or_else(|| {
                         CommitError::Config(alloc::format!(
                             "compact_roots: node {cid:?} could not be decoded",
                         ))
@@ -631,11 +629,7 @@ mod crdt {
             self.write_atomic(state, None)
         }
 
-        fn commit_with_log(
-            &mut self,
-            state: &[u8],
-            log: &EffectLog,
-        ) -> Result<(), CommitError> {
+        fn commit_with_log(&mut self, state: &[u8], log: &EffectLog) -> Result<(), CommitError> {
             self.write_atomic(state, Some(log))
         }
 
@@ -662,10 +656,8 @@ mod crdt {
             // which only cares about the dispatch + replies.
             // `(origin, seq)` stay on disk — replays don't
             // re-stamp them.
-            let mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, CrdtEvent>> =
-                BTreeMap::new();
-            let mut stack: Vec<Cid<Blake2b>> =
-                self.clock.roots().iter().cloned().collect();
+            let mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, CrdtEvent>> = BTreeMap::new();
+            let mut stack: Vec<Cid<Blake2b>> = self.clock.roots().iter().cloned().collect();
 
             let txn = self.db.begin_read()?;
             let table = match txn.open_table(DAG_TABLE) {
@@ -678,16 +670,14 @@ mod crdt {
                 if nodes.contains_key(&cid) {
                     continue;
                 }
-                let val = table
-                    .get(cid.as_ref())?
-                    .ok_or_else(|| {
-                        CommitError::Config(alloc::format!(
-                            "DAG node {cid:?} reachable from roots is missing from the dag table",
-                        ))
-                    })?;
+                let val = table.get(cid.as_ref())?.ok_or_else(|| {
+                    CommitError::Config(alloc::format!(
+                        "DAG node {cid:?} reachable from roots is missing from the dag table",
+                    ))
+                })?;
                 let bytes = val.value();
-                let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(bytes)
-                    .ok_or_else(|| {
+                let node: DagNode<Blake2b, CrdtEvent> =
+                    DagNode::from_bytes(bytes).ok_or_else(|| {
                         CommitError::Config(alloc::format!(
                             "DAG node {cid:?} could not be decoded — db corruption",
                         ))
@@ -747,11 +737,7 @@ mod crdt {
             // the resulting CID is globally unique even when other
             // replicas commit byte-identical EffectLogs concurrently.
             let new_cid_bytes_seq = log.map(|log| {
-                let event = CrdtEvent::new(
-                    self.replica_origin,
-                    self.next_seq,
-                    log.clone(),
-                );
+                let event = CrdtEvent::new(self.replica_origin, self.next_seq, log.clone());
                 let children = self.clock.roots().clone();
                 let node = DagNode::new(event, children);
                 let cid = node.cid();
@@ -776,10 +762,7 @@ mod crdt {
                 let mut state_table = txn.open_table(STATE_TABLE)?;
                 state_table.insert(STATE_KEY, state)?;
                 state_table.insert(ROOTS_KEY, roots_bytes.as_slice())?;
-                state_table.insert(
-                    NEXT_SEQ_KEY,
-                    next_seq_after.to_le_bytes().as_slice(),
-                )?;
+                state_table.insert(NEXT_SEQ_KEY, next_seq_after.to_le_bytes().as_slice())?;
 
                 if let Some((cid, bytes, _)) = &new_cid_bytes_seq {
                     let mut dag_table = txn.open_table(DAG_TABLE)?;
@@ -1067,8 +1050,8 @@ mod tests {
         // verify B converges (same roots, replay_logs returns the
         // same logs in the same order).
         use crate::effect_log::{CrdtEvent, EffectLog};
-        use std::collections::BTreeSet;
         use merkle_crdt::DagNode;
+        use std::collections::BTreeSet;
 
         let path_a = temp_db_path("crdt_sync_a");
         let path_b = temp_db_path("crdt_sync_b");
@@ -1095,15 +1078,11 @@ mod tests {
             if !seen.insert(cid) {
                 continue;
             }
-            let bytes = a
-                .get_node_bytes(&cid)
-                .unwrap()
-                .expect("A has the node");
+            let bytes = a.get_node_bytes(&cid).unwrap().expect("A has the node");
             let was_new = b.insert_node(&cid, &bytes).unwrap();
             assert!(was_new);
             // Children to walk next
-            let node: DagNode<Blake2b, CrdtEvent> =
-                DagNode::from_bytes(&bytes).unwrap();
+            let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(&bytes).unwrap();
             for child in node.children {
                 frontier.push(child.0);
             }

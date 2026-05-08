@@ -53,14 +53,21 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     // actor name
     let name = meta.actor_name.as_bytes();
     let [lo, hi] = (name.len() as u16).to_le_bytes();
-    buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
     let mut i = 0;
-    while i < name.len() { buf[pos + i] = name[i]; i += 1; }
+    while i < name.len() {
+        buf[pos + i] = name[i];
+        i += 1;
+    }
     pos += name.len();
 
     // messages
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
-    buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
 
     let mut m = 0;
     while m < meta.messages.len() {
@@ -68,31 +75,49 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         // name
         let n = msg.name.as_bytes();
         let [lo, hi] = (n.len() as u16).to_le_bytes();
-        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
         let mut i = 0;
-        while i < n.len() { buf[pos + i] = n[i]; i += 1; }
+        while i < n.len() {
+            buf[pos + i] = n[i];
+            i += 1;
+        }
         pos += n.len();
         // is_query
-        buf[pos] = msg.is_query as u8; pos += 1;
+        buf[pos] = msg.is_query as u8;
+        pos += 1;
         // fields
         let [lo, hi] = (msg.fields.len() as u16).to_le_bytes();
-        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
         let mut f = 0;
         while f < msg.fields.len() {
             let field = &msg.fields[f];
             // field name
             let fn_bytes = field.name.as_bytes();
             let [lo, hi] = (fn_bytes.len() as u16).to_le_bytes();
-            buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+            buf[pos] = lo;
+            buf[pos + 1] = hi;
+            pos += 2;
             let mut i = 0;
-            while i < fn_bytes.len() { buf[pos + i] = fn_bytes[i]; i += 1; }
+            while i < fn_bytes.len() {
+                buf[pos + i] = fn_bytes[i];
+                i += 1;
+            }
             pos += fn_bytes.len();
             // field type
             let ft_bytes = field.ty.as_bytes();
             let [lo, hi] = (ft_bytes.len() as u16).to_le_bytes();
-            buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+            buf[pos] = lo;
+            buf[pos + 1] = hi;
+            pos += 2;
             let mut i = 0;
-            while i < ft_bytes.len() { buf[pos + i] = ft_bytes[i]; i += 1; }
+            while i < ft_bytes.len() {
+                buf[pos + i] = ft_bytes[i];
+                i += 1;
+            }
             pos += ft_bytes.len();
             f += 1;
         }
@@ -101,7 +126,9 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
 
     // constructor fields
     let [lo, hi] = (meta.constructor.len() as u16).to_le_bytes();
-    buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
 
     let mut c = 0;
     while c < meta.constructor.len() {
@@ -109,16 +136,26 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         // field name
         let fn_bytes = field.name.as_bytes();
         let [lo, hi] = (fn_bytes.len() as u16).to_le_bytes();
-        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
         let mut i = 0;
-        while i < fn_bytes.len() { buf[pos + i] = fn_bytes[i]; i += 1; }
+        while i < fn_bytes.len() {
+            buf[pos + i] = fn_bytes[i];
+            i += 1;
+        }
         pos += fn_bytes.len();
         // field type
         let ft_bytes = field.ty.as_bytes();
         let [lo, hi] = (ft_bytes.len() as u16).to_le_bytes();
-        buf[pos] = lo; buf[pos + 1] = hi; pos += 2;
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
         let mut i = 0;
-        while i < ft_bytes.len() { buf[pos + i] = ft_bytes[i]; i += 1; }
+        while i < ft_bytes.len() {
+            buf[pos + i] = ft_bytes[i];
+            i += 1;
+        }
         pos += ft_bytes.len();
         c += 1;
     }
@@ -148,14 +185,16 @@ mod tests {
                 MessageMeta {
                     name: "status",
                     is_query: true,
-                    fields: &[
-                        FieldMeta { name: "verbose", ty: "bool" },
-                    ],
+                    fields: &[FieldMeta {
+                        name: "verbose",
+                        ty: "bool",
+                    }],
                 },
             ],
-            constructor: &[
-                FieldMeta { name: "start", ty: "u32" },
-            ],
+            constructor: &[FieldMeta {
+                name: "start",
+                ty: "u32",
+            }],
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -223,9 +262,16 @@ mod decode {
             for _ in 0..field_count {
                 let fname = read_str(data, &mut pos)?;
                 let fty = read_str(data, &mut pos)?;
-                fields.push(ParsedField { name: fname, ty: fty });
+                fields.push(ParsedField {
+                    name: fname,
+                    ty: fty,
+                });
             }
-            messages.push(ParsedMessage { name, is_query, fields });
+            messages.push(ParsedMessage {
+                name,
+                is_query,
+                fields,
+            });
         }
 
         // Constructor fields (optional — backward compat with old ELFs)
@@ -236,15 +282,24 @@ mod decode {
             for _ in 0..ctor_count as usize {
                 let fname = read_str(data, &mut pos)?;
                 let fty = read_str(data, &mut pos)?;
-                constructor.push(ParsedField { name: fname, ty: fty });
+                constructor.push(ParsedField {
+                    name: fname,
+                    ty: fty,
+                });
             }
         }
 
-        Some(ParsedMeta { actor_name, messages, constructor })
+        Some(ParsedMeta {
+            actor_name,
+            messages,
+            constructor,
+        })
     }
 
     fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
-        if *pos + 2 > data.len() { return None; }
+        if *pos + 2 > data.len() {
+            return None;
+        }
         let val = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
         *pos += 2;
         Some(val)
@@ -252,7 +307,9 @@ mod decode {
 
     fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
         let len = read_u16(data, pos)? as usize;
-        if *pos + len > data.len() { return None; }
+        if *pos + len > data.len() {
+            return None;
+        }
         let s = core::str::from_utf8(&data[*pos..*pos + len]).ok()?;
         *pos += len;
         Some(s.into())
@@ -267,34 +324,54 @@ mod decode {
 
     /// Find a named section in a 64-bit little-endian ELF.
     fn find_elf_section<'a>(elf: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-        if elf.len() < 64 { return None; }
+        if elf.len() < 64 {
+            return None;
+        }
         // Verify ELF magic
-        if &elf[0..4] != b"\x7fELF" { return None; }
+        if &elf[0..4] != b"\x7fELF" {
+            return None;
+        }
         // 64-bit little-endian
-        if elf[4] != 2 || elf[5] != 1 { return None; }
+        if elf[4] != 2 || elf[5] != 1 {
+            return None;
+        }
 
         let shoff = u64::from_le_bytes(elf[40..48].try_into().ok()?) as usize;
         let shentsize = u16::from_le_bytes(elf[58..60].try_into().ok()?) as usize;
         let shnum = u16::from_le_bytes(elf[60..62].try_into().ok()?) as usize;
         let shstrndx = u16::from_le_bytes(elf[62..64].try_into().ok()?) as usize;
 
-        if shoff == 0 || shentsize < 64 || shnum == 0 { return None; }
-        if shstrndx >= shnum { return None; }
+        if shoff == 0 || shentsize < 64 || shnum == 0 {
+            return None;
+        }
+        if shstrndx >= shnum {
+            return None;
+        }
 
         // Read section header string table
         let strtab_hdr = shoff + shstrndx * shentsize;
-        if strtab_hdr + 64 > elf.len() { return None; }
-        let strtab_off = u64::from_le_bytes(elf[strtab_hdr+24..strtab_hdr+32].try_into().ok()?) as usize;
-        let strtab_size = u64::from_le_bytes(elf[strtab_hdr+32..strtab_hdr+40].try_into().ok()?) as usize;
-        if strtab_off + strtab_size > elf.len() { return None; }
+        if strtab_hdr + 64 > elf.len() {
+            return None;
+        }
+        let strtab_off =
+            u64::from_le_bytes(elf[strtab_hdr + 24..strtab_hdr + 32].try_into().ok()?) as usize;
+        let strtab_size =
+            u64::from_le_bytes(elf[strtab_hdr + 32..strtab_hdr + 40].try_into().ok()?) as usize;
+        if strtab_off + strtab_size > elf.len() {
+            return None;
+        }
         let strtab = &elf[strtab_off..strtab_off + strtab_size];
 
         // Scan section headers for matching name
         for i in 0..shnum {
             let hdr = shoff + i * shentsize;
-            if hdr + 64 > elf.len() { continue; }
-            let name_off = u32::from_le_bytes(elf[hdr..hdr+4].try_into().ok()?) as usize;
-            if name_off >= strtab.len() { continue; }
+            if hdr + 64 > elf.len() {
+                continue;
+            }
+            let name_off = u32::from_le_bytes(elf[hdr..hdr + 4].try_into().ok()?) as usize;
+            if name_off >= strtab.len() {
+                continue;
+            }
 
             // Compare section name
             let sec_name = &strtab[name_off..];
@@ -302,8 +379,8 @@ mod decode {
                 && &sec_name[..name.len()] == name
                 && (sec_name.len() == name.len() || sec_name[name.len()] == 0)
             {
-                let off = u64::from_le_bytes(elf[hdr+24..hdr+32].try_into().ok()?) as usize;
-                let size = u64::from_le_bytes(elf[hdr+32..hdr+40].try_into().ok()?) as usize;
+                let off = u64::from_le_bytes(elf[hdr + 24..hdr + 32].try_into().ok()?) as usize;
+                let size = u64::from_le_bytes(elf[hdr + 32..hdr + 40].try_into().ok()?) as usize;
                 if off + size <= elf.len() {
                     return Some(&elf[off..off + size]);
                 }

@@ -46,7 +46,10 @@ pub struct EffectLog {
 impl EffectLog {
     /// Start a new log wrapping the given incoming dispatch message.
     pub fn for_msg(msg: Vec<u8>) -> Self {
-        Self { msg, replies: Vec::new() }
+        Self {
+            msg,
+            replies: Vec::new(),
+        }
     }
 
     /// Append the next reply captured during dispatch.
@@ -67,7 +70,10 @@ impl EffectLog {
 
     /// Start a cursor for replaying the recorded replies in order.
     pub fn replay(&self) -> EffectCursor<'_> {
-        EffectCursor { replies: &self.replies, pos: 0 }
+        EffectCursor {
+            replies: &self.replies,
+            pos: 0,
+        }
     }
 
     /// Serialize to bytes for storage in a merkle-crdt DAG node.
@@ -83,8 +89,7 @@ impl EffectLog {
     /// (and thus the same CID) without coordination.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            16 + self.msg.len()
-                + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
+            16 + self.msg.len() + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
         );
         buf.extend_from_slice(&(self.msg.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.msg);
@@ -313,7 +318,11 @@ pub struct EffectReplay {
 impl EffectReplay {
     /// Wrap a stored [`EffectLog`] for replay.
     pub fn new(log: EffectLog) -> Self {
-        Self { log, pos: 0, exhausted: false }
+        Self {
+            log,
+            pos: 0,
+            exhausted: false,
+        }
     }
 
     /// The incoming dispatch message associated with this log.

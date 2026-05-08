@@ -169,7 +169,10 @@ mod tests {
 
     #[test]
     fn consistency_from_u8_round_trips_known_codes() {
-        assert!(matches!(consistency_from_u8(0), Some(Consistency::Ephemeral)));
+        assert!(matches!(
+            consistency_from_u8(0),
+            Some(Consistency::Ephemeral)
+        ));
         assert!(matches!(consistency_from_u8(1), Some(Consistency::Local)));
         assert!(matches!(consistency_from_u8(2), Some(Consistency::Crdt)));
         assert!(matches!(consistency_from_u8(3), Some(Consistency::Raft)));

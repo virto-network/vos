@@ -94,8 +94,8 @@ pub fn load(data_dir: &Path) -> anyhow::Result<LocalConfig> {
 
 pub fn save(data_dir: &Path, cfg: &LocalConfig) -> anyhow::Result<()> {
     let p = path(data_dir);
-    let body = toml::to_string_pretty(cfg)
-        .map_err(|e| anyhow::anyhow!("encode local.toml: {e}"))?;
+    let body =
+        toml::to_string_pretty(cfg).map_err(|e| anyhow::anyhow!("encode local.toml: {e}"))?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -179,9 +179,16 @@ fn run_list(space: &str) -> anyhow::Result<()> {
             "space '{}': no filter — syncing all installed agents.",
             entry.name,
         );
-        println!("subscribe to a subset with `vosx space subs {} add <agent>`.", entry.name);
+        println!(
+            "subscribe to a subset with `vosx space subs {} add <agent>`.",
+            entry.name
+        );
     } else {
-        println!("space '{}' subscriptions ({}):", entry.name, cfg.subscriptions.len());
+        println!(
+            "space '{}' subscriptions ({}):",
+            entry.name,
+            cfg.subscriptions.len()
+        );
         for s in &cfg.subscriptions {
             println!("  - {s}");
         }
@@ -236,10 +243,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_default() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vosx-subs-missing-{}",
-            std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("vosx-subs-missing-{}", std::process::id(),));
         // Don't create the dir — load should still succeed
         // with default config.
         let cfg = load(&tmp).unwrap();

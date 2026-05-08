@@ -69,9 +69,7 @@ pub fn verify_with_timeout(
 /// Scan the DAG table for a CrdtEvent with seq=1, return its
 /// CID + the space_id it derives to. None if no such event
 /// (yet).
-fn scan_for_genesis(
-    registry_db_path: &Path,
-) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
+fn scan_for_genesis(registry_db_path: &Path) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
     let db = redb::Database::open(registry_db_path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", registry_db_path.display()))?;
     let txn = db

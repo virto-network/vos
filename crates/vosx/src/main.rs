@@ -119,7 +119,12 @@ fn main() {
     output::set(cli.format);
 
     match cli.command {
-        Some(Command::Run { program, payload, hex, gas }) => {
+        Some(Command::Run {
+            program,
+            payload,
+            hex,
+            gas,
+        }) => {
             commands::run::run(&program, &payload, &hex, gas);
         }
         Some(Command::Space { command }) => {

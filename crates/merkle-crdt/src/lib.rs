@@ -80,7 +80,7 @@ pub mod sync;
 pub use cid::Cid;
 pub use clock::MerkleClock;
 pub use crdt::{MerkleCrdt, Payload};
-pub use encode::{Encode, Decode};
+pub use encode::{Decode, Encode};
 pub use hasher::Hasher;
 pub use node::DagNode;
 pub use store::{MemStore, Store};

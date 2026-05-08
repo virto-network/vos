@@ -26,8 +26,8 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use vos_raft::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    RequestVoteReq, RequestVoteResp, Transport,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, RequestVoteReq,
+    RequestVoteResp, Transport,
 };
 
 use crate::network::{Network, RaftEntry, RaftEntryKind};
@@ -108,20 +108,24 @@ impl Transport<u16> for VosTransport {
             .entries
             .into_iter()
             .map(|e| match e.kind {
-                vos_raft::EntryKind::Data { payload } => {
-                    RaftEntry { term: e.term, kind: RaftEntryKind::Data { payload } }
-                }
-                vos_raft::EntryKind::ConfigChange { joint_old, members } => {
-                    RaftEntry {
-                        term: e.term,
-                        kind: RaftEntryKind::ConfigChange { joint_old, members },
-                    }
-                }
+                vos_raft::EntryKind::Data { payload } => RaftEntry {
+                    term: e.term,
+                    kind: RaftEntryKind::Data { payload },
+                },
+                vos_raft::EntryKind::ConfigChange { joint_old, members } => RaftEntry {
+                    term: e.term,
+                    kind: RaftEntryKind::ConfigChange { joint_old, members },
+                },
                 // Future EntryKind variants — degrade to an empty
                 // `Data` blob on the wire so older peers don't
                 // choke on a tag they can't parse. The receiver's
                 // host apply-path skips empty payloads anyway.
-                _ => RaftEntry { term: e.term, kind: RaftEntryKind::Data { payload: alloc::vec![] } },
+                _ => RaftEntry {
+                    term: e.term,
+                    kind: RaftEntryKind::Data {
+                        payload: alloc::vec![],
+                    },
+                },
             })
             .collect();
         let rx = self.network.send_raft_append(

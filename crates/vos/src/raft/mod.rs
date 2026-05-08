@@ -36,7 +36,7 @@ pub mod vos_transport;
 pub mod worker;
 
 #[cfg(feature = "storage")]
-pub use log::{LogEntry, RaftLog, RaftMeta, RAFT_LOG, RAFT_META};
+pub use log::{LogEntry, RAFT_LOG, RAFT_META, RaftLog, RaftMeta};
 #[cfg(feature = "storage")]
 pub use redb_storage::RedbStorage;
 #[cfg(feature = "storage")]

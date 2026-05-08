@@ -22,7 +22,11 @@ pub fn run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
 
     let mut items: Vec<Vec<u8>> = Vec::new();
     for p in payloads {
-        items.push(if p.as_os_str() == "-" { read_stdin() } else { load_file(p) });
+        items.push(if p.as_os_str() == "-" {
+            read_stdin()
+        } else {
+            load_file(p)
+        });
     }
     for h in hex {
         items.push(hex_decode(h).unwrap_or_else(|| die(&format!("invalid hex '{h}'"))));

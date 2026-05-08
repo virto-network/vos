@@ -19,16 +19,14 @@ use crate::commit::CommitError;
 
 /// Per-entry: `[term: u64 LE][payload: EffectLog::to_bytes()]`.
 /// Index is the redb key, so range scans get it for free.
-pub const RAFT_LOG: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("raft_log");
+pub const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 
 /// Meta scalars table — one row per scalar, key is the scalar name.
 ///
 /// Phase 1 keys: `"current_term"`, `"voted_for"`, `"commit_index"`,
 /// `"last_applied"`. Phase 6 adds `"snap_last_index"` /
 /// `"snap_last_term"`.
-pub const RAFT_META: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("raft_meta");
+pub const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
 const META_TERM: &str = "current_term";
 const META_VOTED_FOR: &str = "voted_for";
@@ -129,8 +127,14 @@ impl RaftLog {
         // to thread it through.
         let (snap_last_index, snap_last_term) = match txn.open_table(RAFT_META) {
             Ok(t) => {
-                let snap_idx = t.get(META_SNAP_INDEX)?.map(|v| u64_le(v.value())).unwrap_or(0);
-                let snap_term = t.get(META_SNAP_TERM)?.map(|v| u64_le(v.value())).unwrap_or(0);
+                let snap_idx = t
+                    .get(META_SNAP_INDEX)?
+                    .map(|v| u64_le(v.value()))
+                    .unwrap_or(0);
+                let snap_term = t
+                    .get(META_SNAP_TERM)?
+                    .map(|v| u64_le(v.value()))
+                    .unwrap_or(0);
                 (snap_idx, snap_term)
             }
             Err(redb::TableError::TableDoesNotExist(_)) => (0, 0),
@@ -216,8 +220,7 @@ impl RaftLog {
             payload: payload.to_vec(),
         }
         .encode();
-        txn.open_table(RAFT_LOG)?
-            .insert(index, value.as_slice())?;
+        txn.open_table(RAFT_LOG)?.insert(index, value.as_slice())?;
         self.last_index = index;
         self.last_term = term;
         Ok(index)
@@ -394,14 +397,16 @@ impl RaftLog {
         } else {
             let table = txn.open_table(RAFT_LOG)?;
             match table.get(from_index)? {
-                Some(row) => LogEntry::decode(from_index, row.value())
-                    .ok_or_else(|| {
-                        CommitError::Config(alloc::format!(
-                            "raft_log truncate: row at index {from_index} \
+                Some(row) => {
+                    LogEntry::decode(from_index, row.value())
+                        .ok_or_else(|| {
+                            CommitError::Config(alloc::format!(
+                                "raft_log truncate: row at index {from_index} \
                              failed to decode",
-                        ))
-                    })?
-                    .term,
+                            ))
+                        })?
+                        .term
+                }
                 None => {
                     return Err(CommitError::Config(alloc::format!(
                         "raft_log truncate: row at index {from_index} \
@@ -586,9 +591,7 @@ mod tests {
             for i in 1..=3 {
                 let txn = db.begin_write().unwrap();
                 let payload = alloc::format!("entry-{i}");
-                let idx = log
-                    .append_in_txn(&txn, 1, payload.as_bytes())
-                    .unwrap();
+                let idx = log.append_in_txn(&txn, 1, payload.as_bytes()).unwrap();
                 txn.commit().unwrap();
                 assert_eq!(idx, i);
             }
@@ -645,18 +648,27 @@ mod tests {
         // term_at on the boundary still returns Some(2); below
         // returns None; above reads the table normally.
         assert_eq!(log.term_at(0).unwrap(), Some(0));
-        assert_eq!(log.term_at(2).unwrap(), None,
-            "compacted-away entry must report None");
-        assert_eq!(log.term_at(3).unwrap(), Some(2),
-            "snap boundary returns snap_last_term");
+        assert_eq!(
+            log.term_at(2).unwrap(),
+            None,
+            "compacted-away entry must report None"
+        );
+        assert_eq!(
+            log.term_at(3).unwrap(),
+            Some(2),
+            "snap boundary returns snap_last_term"
+        );
         assert_eq!(log.term_at(4).unwrap(), Some(2));
         assert_eq!(log.term_at(5).unwrap(), Some(3));
         assert_eq!(log.term_at(6).unwrap(), None);
 
         // Range read silently skips compacted entries.
         let entries = log.entries(1, 5).unwrap();
-        assert_eq!(entries.len(), 2,
-            "only entries 4 and 5 survive the compaction");
+        assert_eq!(
+            entries.len(),
+            2,
+            "only entries 4 and 5 survive the compaction"
+        );
         assert_eq!(entries[0].index, 4);
         assert_eq!(entries[1].index, 5);
 
@@ -726,8 +738,10 @@ mod tests {
             drop(txn);
             log.cache_snapshot()
         };
-        assert_ne!(drifted.last_index, snap.last_index,
-            "cache must move ahead of disk after an uncommitted *_in_txn");
+        assert_ne!(
+            drifted.last_index, snap.last_index,
+            "cache must move ahead of disk after an uncommitted *_in_txn"
+        );
 
         log.cache_restore(snap);
         let restored = log.cache_snapshot();

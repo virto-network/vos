@@ -23,8 +23,8 @@ use core::fmt::Debug;
 
 use crate::config::NodeId;
 use crate::rpc::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
+    PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 
 /// Transport for one replication group.
@@ -165,7 +165,10 @@ pub(crate) mod test_helpers {
         ) -> Result<InstallSnapshotResp, Self::Error> {
             let term = self.canned_term.load(Ordering::Relaxed);
             self.installs.lock().unwrap().push((peer, req));
-            Ok(InstallSnapshotResp { term, bytes_received: 0 })
+            Ok(InstallSnapshotResp {
+                term,
+                bytes_received: 0,
+            })
         }
         async fn send_prevote(
             &self,

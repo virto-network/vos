@@ -133,7 +133,9 @@ impl_encode_tuple!(0 A, 1 B, 2 C, 3 D);
 // ── Decode impls ────────────────────────────────────────────────────
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
-    if *pos + n > buf.len() { return None; }
+    if *pos + n > buf.len() {
+        return None;
+    }
     let s = &buf[*pos..*pos + n];
     *pos += n;
     Some(s)
@@ -145,7 +147,9 @@ fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 impl Decode for () {
-    fn decode_from(_buf: &[u8], _pos: &mut usize) -> Option<Self> { Some(()) }
+    fn decode_from(_buf: &[u8], _pos: &mut usize) -> Option<Self> {
+        Some(())
+    }
 }
 
 impl Decode for bool {
@@ -189,7 +193,9 @@ impl<T: Decode> Decode for Vec<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
         let count = read_u64(buf, pos)? as usize;
         let mut v = Vec::with_capacity(count);
-        for _ in 0..count { v.push(T::decode_from(buf, pos)?); }
+        for _ in 0..count {
+            v.push(T::decode_from(buf, pos)?);
+        }
         Some(v)
     }
 }
@@ -198,7 +204,9 @@ impl<T: Decode + Ord> Decode for alloc::collections::BTreeSet<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
         let count = read_u64(buf, pos)? as usize;
         let mut s = alloc::collections::BTreeSet::new();
-        for _ in 0..count { s.insert(T::decode_from(buf, pos)?); }
+        for _ in 0..count {
+            s.insert(T::decode_from(buf, pos)?);
+        }
         Some(s)
     }
 }

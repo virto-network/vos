@@ -103,7 +103,10 @@ impl BlobSource {
 pub enum BlobError {
     Io(io::Error),
     NotInCache(BlobHash),
-    HashMismatch { expected: BlobHash, actual: BlobHash },
+    HashMismatch {
+        expected: BlobHash,
+        actual: BlobHash,
+    },
     BadHashHex,
     NetworkSourceUnsupported,
 }
@@ -118,7 +121,10 @@ impl core::fmt::Display for BlobError {
             }
             BlobError::BadHashHex => write!(f, "blob hash must be 64 hex chars"),
             BlobError::NetworkSourceUnsupported => {
-                write!(f, "network blob sources (cid / url) are not yet implemented")
+                write!(
+                    f,
+                    "network blob sources (cid / url) are not yet implemented"
+                )
             }
         }
     }
@@ -251,11 +257,17 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let prev = std::env::var_os("XDG_CACHE_HOME");
         // SAFETY: tests serialize on ENV_LOCK above.
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &tmp);
+        }
         let out = f(&tmp);
         match prev {
-            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v); },
-            None => unsafe { std::env::remove_var("XDG_CACHE_HOME"); },
+            Some(v) => unsafe {
+                std::env::set_var("XDG_CACHE_HOME", v);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_CACHE_HOME");
+            },
         }
         let _ = std::fs::remove_dir_all(&tmp);
         out

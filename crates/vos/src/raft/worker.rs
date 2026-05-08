@@ -31,8 +31,8 @@ use redb::Database;
 
 use crate::commit::CommitError;
 use crate::network::{
-    Network, RaftAppendResult, RaftEntry, RaftEntryKind, RaftInstallSnapshotResult,
-    RaftJoinResult, RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
+    Network, RaftAppendResult, RaftEntry, RaftEntryKind, RaftInstallSnapshotResult, RaftJoinResult,
+    RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
 };
 
 use super::redb_storage::RedbStorage;
@@ -312,15 +312,18 @@ impl WorkerHandle {
     /// include its `node_prefix` in the list. To remove it,
     /// omit it — the leader will step down once the final
     /// non-joint entry commits.
-    pub fn change_membership(
-        &self,
-        new_members: Vec<u16>,
-    ) -> Result<u64, ChangeMembershipError> {
+    pub fn change_membership(&self, new_members: Vec<u16>) -> Result<u64, ChangeMembershipError> {
         match block_on(self.inner.change_membership(new_members)) {
             Ok(idx) => Ok(idx),
-            Err(vos_raft::ChangeMembershipError::NotLeader) => Err(ChangeMembershipError::NotLeader),
-            Err(vos_raft::ChangeMembershipError::InProgress) => Err(ChangeMembershipError::InProgress),
-            Err(vos_raft::ChangeMembershipError::EmptyConfig) => Err(ChangeMembershipError::EmptyConfig),
+            Err(vos_raft::ChangeMembershipError::NotLeader) => {
+                Err(ChangeMembershipError::NotLeader)
+            }
+            Err(vos_raft::ChangeMembershipError::InProgress) => {
+                Err(ChangeMembershipError::InProgress)
+            }
+            Err(vos_raft::ChangeMembershipError::EmptyConfig) => {
+                Err(ChangeMembershipError::EmptyConfig)
+            }
             Err(_) => Err(ChangeMembershipError::Storage(CommitError::Config(
                 "raft change_membership: storage write failed".into(),
             ))),
@@ -375,9 +378,7 @@ impl RaftRpcHandler for WorkerHandle {
                 // We fill `index = 0` here — the worker assigns
                 // the right index before append.
                 .map(|e| match e.kind {
-                    RaftEntryKind::Data { payload } => {
-                        vos_raft::LogEntry::data(0, e.term, payload)
-                    }
+                    RaftEntryKind::Data { payload } => vos_raft::LogEntry::data(0, e.term, payload),
                     RaftEntryKind::ConfigChange { joint_old, members } => {
                         vos_raft::LogEntry::config_change(0, e.term, joint_old, members)
                     }
@@ -438,11 +439,7 @@ impl RaftRpcHandler for WorkerHandle {
         }
     }
 
-    fn handle_join(
-        &self,
-        _replication_id: &[u8; 32],
-        joiner_prefix: u16,
-    ) -> RaftJoinResult {
+    fn handle_join(&self, _replication_id: &[u8; 32], joiner_prefix: u16) -> RaftJoinResult {
         // Snapshot the worker's current state — gives us the
         // active member list AND the leader hint we redirect
         // followers with. Snapshot is cheap (one round-trip
@@ -668,7 +665,12 @@ mod tests {
         // Leader claims `prev_log_index=5` exists at term 3, but
         // our log is empty. Refuse.
         let resp = h.append_entries(
-            &[0xC0; 32], 0xBBBB, 3, 5, 3, 0,
+            &[0xC0; 32],
+            0xBBBB,
+            3,
+            5,
+            3,
+            0,
             alloc::vec![RaftEntry::data(3, b"x".to_vec())],
         );
         assert!(!resp.success);
@@ -773,8 +775,10 @@ mod tests {
         };
         let worker = RaftWorker::spawn(db, cfg, None, None);
         let h = worker.handler();
-        assert!(wait_for_role(&h, Role::Leader, Duration::from_secs(5)),
-            "solo cluster must self-elect to leader");
+        assert!(
+            wait_for_role(&h, Role::Leader, Duration::from_secs(5)),
+            "solo cluster must self-elect to leader"
+        );
         worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -810,7 +814,8 @@ mod tests {
             let mut log = RaftLog::open(db.clone()).unwrap();
             for _ in 0..5 {
                 let txn = db.begin_write().unwrap();
-                log.append_in_txn(&txn, 1, &[0u8, b'o', b'l', b'd']).unwrap();
+                log.append_in_txn(&txn, 1, &[0u8, b'o', b'l', b'd'])
+                    .unwrap();
                 txn.commit().unwrap();
             }
         }
@@ -818,20 +823,18 @@ mod tests {
         let h = worker.handler();
 
         let snapshot_bytes = b"actor-state-at-index-3".to_vec();
-        let resp = h.install_snapshot(
-            &[0xC0; 32],
-            0xBBBB,
-            7,
-            3,
-            2,
-            snapshot_bytes.clone(),
-        );
+        let resp = h.install_snapshot(&[0xC0; 32], 0xBBBB, 7, 3, 2, snapshot_bytes.clone());
         assert_eq!(resp.term, 7);
         worker.shutdown();
 
         let txn = db.begin_read().unwrap();
         let state_table = txn.open_table(STATE_TABLE).unwrap();
-        let state = state_table.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+        let state = state_table
+            .get(STATE_KEY)
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
         assert_eq!(state, snapshot_bytes);
 
         let meta = RaftMeta::load(&db).unwrap();
@@ -859,17 +862,15 @@ mod tests {
         let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
 
-        let _ = h.install_snapshot(
-            &[0xC0; 32], 0xBBBB, 1, 5, 1, b"v1".to_vec(),
-        );
-        let _ = h.install_snapshot(
-            &[0xC0; 32], 0xBBBB, 1, 3, 1, b"v2".to_vec(),
-        );
+        let _ = h.install_snapshot(&[0xC0; 32], 0xBBBB, 1, 5, 1, b"v1".to_vec());
+        let _ = h.install_snapshot(&[0xC0; 32], 0xBBBB, 1, 3, 1, b"v2".to_vec());
 
         worker.shutdown();
         let meta = RaftMeta::load(&db).unwrap();
-        assert_eq!(meta.snap_last_index, 5,
-            "lower-index install must not regress the snap pointer");
+        assert_eq!(
+            meta.snap_last_index, 5,
+            "lower-index install must not regress the snap pointer"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -904,8 +905,11 @@ mod tests {
         // the leader-promotion no-op (kind=Data, empty body =
         // single 0 byte); entries 2 and 3 carry "first" / "second"
         // as the kind-prefixed body.
-        assert_eq!(entries[0].payload, [0u8],
-            "entry 1 should be the no-op (kind=Data + empty body)");
+        assert_eq!(
+            entries[0].payload,
+            [0u8],
+            "entry 1 should be the no-op (kind=Data + empty body)"
+        );
         assert_eq!(entries[1].payload, [&[0u8][..], b"first"].concat());
         assert_eq!(entries[2].payload, [&[0u8][..], b"second"].concat());
         assert_eq!(entries[0].term, entries[1].term);

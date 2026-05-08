@@ -1,7 +1,7 @@
+use crate::{Cid, DagNode, Encode, Error, Hasher, Store};
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::{Cid, DagNode, Encode, Error, Hasher, Store};
 
 /// A Merkle-Clock: a logical clock implemented as a Merkle-DAG.
 ///
@@ -112,10 +112,7 @@ impl<H: Hasher> MerkleClock<H> {
                     if candidates.contains(child) && subsumed.insert(child.clone()) {
                         // Early exit: found all but one
                         if subsumed.len() >= target_count - 1 {
-                            self.roots = candidates
-                                .difference(&subsumed)
-                                .cloned()
-                                .collect();
+                            self.roots = candidates.difference(&subsumed).cloned().collect();
                             return Ok(());
                         }
                     }

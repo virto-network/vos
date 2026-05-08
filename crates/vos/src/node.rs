@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,6 @@ pub enum Consistency {
     /// in later phases.
     Raft,
 }
-
 
 /// Configuration for registering an agent in the node.
 pub struct AgentConfig {
@@ -205,9 +204,7 @@ impl AgentConfig {
     /// plus a logical name. Replicas with identical (blob, name)
     /// automatically share an id without manifest coordination.
     pub fn auto_replication_id(mut self, name: &str) -> Self {
-        let mut h = blake2b_simd::Params::new()
-            .hash_length(32)
-            .to_state();
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
         h.update(name.as_bytes());
         h.update(&[0u8]); // delimiter so name||blob ≠ shifted variants
         h.update(&self.blob);
@@ -245,7 +242,11 @@ pub struct WorkerConfig {
 impl WorkerConfig {
     /// Build a config with no init args and no persistence.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into(), init_args: Vec::new(), data_dir: None }
+        Self {
+            path: path.into(),
+            init_args: Vec::new(),
+            data_dir: None,
+        }
     }
 
     /// Build a config with rkyv-encoded init args.
@@ -253,7 +254,11 @@ impl WorkerConfig {
         let bytes = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(args)
             .expect("rkyv encode Args")
             .to_vec();
-        Self { path: path.into(), init_args: bytes, data_dir: None }
+        Self {
+            path: path.into(),
+            init_args: bytes,
+            data_dir: None,
+        }
     }
 
     /// Enable state persistence under the given data directory.
@@ -268,7 +273,9 @@ impl WorkerConfig {
     #[cfg(feature = "storage")]
     fn db_path(&self) -> Option<std::path::PathBuf> {
         let data_dir = self.data_dir.as_ref()?;
-        let name = self.path.file_stem()
+        let name = self
+            .path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("worker")
             .trim_start_matches("lib");
@@ -469,7 +476,12 @@ impl InvokeHandle {
         };
         let tx = tx?;
         let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(InvokeRequest { msg, reply_tx, chain: Vec::new() }).ok()?;
+        tx.send(InvokeRequest {
+            msg,
+            reply_tx,
+            chain: Vec::new(),
+        })
+        .ok()?;
         // Strip the cross-thread invoke envelope down to reply
         // bytes for host-side callers — see `VosNode::invoke`.
         reply_rx
@@ -513,13 +525,7 @@ struct NodeService {
 
 #[cfg(feature = "network")]
 impl crate::network::NetworkService for NodeService {
-    fn dispatch_invoke(
-        &self,
-        _from: u32,
-        to: u32,
-        chain: Vec<u32>,
-        msg: Vec<u8>,
-    ) -> Vec<u8> {
+    fn dispatch_invoke(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
         // The chain arrived already including the original caller's
         // ID (the remote peer's agent). The receiver's own
         // external_invoke prepends *this* agent's ID when dispatching
@@ -534,16 +540,24 @@ impl crate::network::NetworkService for NodeService {
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
         let tx = self.invoke_routes.lock().ok().and_then(|m| {
-            m.get(&to)
-                .cloned()
-                .or_else(|| if to != to_unscoped { m.get(&to_unscoped).cloned() } else { None })
+            m.get(&to).cloned().or_else(|| {
+                if to != to_unscoped {
+                    m.get(&to_unscoped).cloned()
+                } else {
+                    None
+                }
+            })
         });
         let Some(tx) = tx else {
             return Vec::new();
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         if tx
-            .send(InvokeRequest { msg, reply_tx, chain })
+            .send(InvokeRequest {
+                msg,
+                reply_tx,
+                chain,
+            })
             .is_err()
         {
             return Vec::new();
@@ -566,11 +580,7 @@ impl crate::network::NetworkService for NodeService {
     }
 
     #[cfg(feature = "storage")]
-    fn sync_get_node(
-        &self,
-        replication_id: &[u8; 32],
-        cid: &[u8; 32],
-    ) -> Option<Vec<u8>> {
+    fn sync_get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
     }
@@ -605,9 +615,7 @@ fn replay_dag_into_runtime(
         // External transfers emitted during replay had their
         // original effects at record time; we don't re-issue them.
         let _ = runtime.drain_external_transfers(svc_id);
-        let replay = runtime
-            .finish_replay()
-            .expect("replay was active");
+        let replay = runtime.finish_replay().expect("replay was active");
         if !replay.is_complete() {
             return Err(format!(
                 "replay diverged at log #{i} (pos={}, exhausted={}); \
@@ -732,8 +740,11 @@ fn sync_loop(
             subscribed = true;
         }
         let local = net.peer_id();
-        let connected: HashSet<libp2p::PeerId> =
-            net.connected_peers().into_iter().filter(|p| p != &local).collect();
+        let connected: HashSet<libp2p::PeerId> = net
+            .connected_peers()
+            .into_iter()
+            .filter(|p| p != &local)
+            .collect();
         // Drop peers that disconnected since our last tick.
         confirmed.retain(|p| connected.contains(p));
 
@@ -783,9 +794,7 @@ fn sync_loop(
                 Err(e) => warn!(error = %e, "sync: per-peer cycle failed"),
             }
         }
-        if any_inserted
-            && let Some(n) = &notifier
-        {
+        if any_inserted && let Some(n) = &notifier {
             let _ = n.send(());
         }
     }
@@ -830,11 +839,8 @@ fn sync_with_peer(
     // CrdtCommits over the same redb agree on origin if they ever
     // both write.
     let replica_origin = derive_replica_origin(rep_id, net.local_prefix());
-    let mut cc = CrdtCommit::from_db_arc_locked(
-        slot.db.clone(),
-        slot.commit_lock.clone(),
-        replica_origin,
-    );
+    let mut cc =
+        CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone(), replica_origin);
     let mut frontier: Vec<[u8; 32]> = heads.clone();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut inserted_any = false;
@@ -869,7 +875,9 @@ fn sync_with_peer(
     if inserted_any {
         cc.compact_roots()?;
     }
-    Ok(SyncOutcome::PeerHasGroup { inserted: inserted_any })
+    Ok(SyncOutcome::PeerHasGroup {
+        inserted: inserted_any,
+    })
 }
 
 /// Shared "last activity" instant, bumped on every dispatch. The
@@ -1053,9 +1061,7 @@ impl VosNode {
                     }
                 }
             })
-        } else if config.consistency == Consistency::Raft
-            && config.members.len() > 1
-        {
+        } else if config.consistency == Consistency::Raft && config.members.len() > 1 {
             // Multi-mode Raft: spawn a worker, install it as the
             // network's RaftRpcHandler, and bridge the worker's
             // apply notifications into both (a) the agent's
@@ -1065,7 +1071,10 @@ impl VosNode {
             // proposed entry commits).
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
             let rep_id = config.replication_id.unwrap_or([0u8; 32]);
-            match config.db_path(id).map(|p| (p, redb::Database::create(config.db_path(id).unwrap()))) {
+            match config
+                .db_path(id)
+                .map(|p| (p, redb::Database::create(config.db_path(id).unwrap())))
+            {
                 Some((_path, Ok(db))) => {
                     let db = Arc::new(db);
                     config.pre_opened_db = Some(db.clone());
@@ -1125,9 +1134,18 @@ impl VosNode {
 
         let join = thread::spawn(move || {
             agent_thread(
-                id, config, rx, invoke_rx, outbox, invoke_routes, shutdown, activity,
-                #[cfg(feature = "network")] shared_network,
-                #[cfg(all(feature = "network", feature = "storage"))] sync_rx,
+                id,
+                config,
+                rx,
+                invoke_rx,
+                outbox,
+                invoke_routes,
+                shutdown,
+                activity,
+                #[cfg(feature = "network")]
+                shared_network,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                sync_rx,
             )
         });
 
@@ -1185,10 +1203,13 @@ impl VosNode {
                     // If every agent has already exited (e.g.
                     // they all errored at startup), there's no
                     // point waiting out the threshold.
-                    let all_done = self.agents.iter().all(|h| {
-                        h.join.as_ref().is_none_or(|j| j.is_finished())
-                    });
-                    if all_done { break; }
+                    let all_done = self
+                        .agents
+                        .iter()
+                        .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    if all_done {
+                        break;
+                    }
 
                     let idle = self.last_activity.lock().unwrap().elapsed();
                     if idle >= threshold {
@@ -1215,10 +1236,13 @@ impl VosNode {
                     if self.shutdown.load(Ordering::Relaxed) {
                         break;
                     }
-                    let all_done = self.agents.iter().all(|h| {
-                        h.join.as_ref().is_none_or(|j| j.is_finished())
-                    });
-                    if all_done { break; }
+                    let all_done = self
+                        .agents
+                        .iter()
+                        .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    if all_done {
+                        break;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -1327,7 +1351,8 @@ impl VosNode {
     ) {
         let shared_network = self.shared_network.clone();
         let shutdown = self.shutdown.clone();
-        let join = thread::spawn(move || sync_loop(rep_id, shared_network, slot, shutdown, notifier));
+        let join =
+            thread::spawn(move || sync_loop(rep_id, shared_network, slot, shutdown, notifier));
         self.sync_threads.push(join);
     }
 
@@ -1349,9 +1374,7 @@ impl VosNode {
                 // Test responders never yield — pack as DONE so
                 // the reply parses as `InvokeResult::Done` on the
                 // caller side, matching real worker/agent shape.
-                let envelope = encode_invoke_envelope(
-                    crate::actors::run::STATUS_DONE, &[], &reply,
-                );
+                let envelope = encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
                 let _ = req.reply_tx.send(envelope);
             }
         });
@@ -1438,13 +1461,8 @@ impl VosNode {
                 {
                     // `from = 0` because this is host-side; it
                     // never participates in chain detection.
-                    let reply_rx = net.send_invoke(
-                        peer,
-                        ServiceId::REGISTRY.0,
-                        target.0,
-                        Vec::new(),
-                        msg,
-                    );
+                    let reply_rx =
+                        net.send_invoke(peer, ServiceId::REGISTRY.0, target.0, Vec::new(), msg);
                     // Daemon's `dispatch_invoke` already strips
                     // the envelope back to raw reply bytes, so
                     // we just forward them.
@@ -1559,8 +1577,7 @@ fn agent_thread(
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
-    #[cfg(all(feature = "network", feature = "storage"))]
-    sync_rx: Option<mpsc::Receiver<()>>,
+    #[cfg(all(feature = "network", feature = "storage"))] sync_rx: Option<mpsc::Receiver<()>>,
 ) -> AgentResult {
     use std::collections::VecDeque;
 
@@ -1650,20 +1667,12 @@ fn agent_thread(
         #[cfg(feature = "network")]
         {
             if !target.is_on_node(local_prefix) && !target.is_local() {
-                let net = shared_network_for_ext
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone());
+                let net = shared_network_for_ext.lock().ok().and_then(|g| g.clone());
                 if let Some(net) = net {
                     let prefix = target.node_prefix();
                     if let Some(peer) = net.peer_for_prefix(prefix) {
-                        let reply_rx = net.send_invoke(
-                            peer,
-                            id.0,
-                            target.0,
-                            chain_snapshot,
-                            msg.to_vec(),
-                        );
+                        let reply_rx =
+                            net.send_invoke(peer, id.0, target.0, chain_snapshot, msg.to_vec());
                         return reply_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
                             .ok()
@@ -1681,10 +1690,7 @@ fn agent_thread(
     // strategy needs to replay deterministically on cold start.
     // Both replicating strategies want it; the non-replicating ones
     // ignore the log if handed.
-    let recording_enabled = matches!(
-        consistency,
-        Consistency::Crdt | Consistency::Raft,
-    );
+    let recording_enabled = matches!(consistency, Consistency::Crdt | Consistency::Raft,);
     // Capture rep_id up front — config is consumed below.
     #[cfg(all(feature = "network", feature = "storage"))]
     let agent_rep_id: Option<[u8; 32]> = config.replication_id;
@@ -1727,7 +1733,11 @@ fn agent_thread(
             Err(e) => {
                 let err = format!("strategy build failed: {e}");
                 error!(%id, "{err}");
-                return AgentResult { id, panics: 0, error: Some(err) };
+                return AgentResult {
+                    id,
+                    panics: 0,
+                    error: Some(err),
+                };
             }
         },
     };
@@ -1811,7 +1821,9 @@ fn agent_thread(
     // idle heuristic — the node is the source of truth for "are
     // we done."
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Priority 1 — drain pending invoke requests. The caller's
         // PVM is suspended at the ecall waiting for a reply, so
@@ -1832,23 +1844,28 @@ fn agent_thread(
                         chain.push(id.0);
                     }
                     let outcome = handle_invoke_request(
-                        &mut runtime, svc_id, &outbox, id, req,
-                        strategy.as_mut(), recording_enabled,
+                        &mut runtime,
+                        svc_id,
+                        &outbox,
+                        id,
+                        req,
+                        strategy.as_mut(),
+                        recording_enabled,
                     );
                     if let Err(e) = outcome {
                         fatal_error = Some(format!("commit failed during invoke: {e}"));
                         break;
                     }
                     #[cfg(all(feature = "network", feature = "storage"))]
-                    publish_heads_if_replicated(
-                        &shared_network, agent_rep_id, strategy.as_ref(),
-                    );
+                    publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        if fatal_error.is_some() { break; }
+        if fatal_error.is_some() {
+            break;
+        }
         if serviced_invoke {
             continue;
         }
@@ -1891,24 +1908,30 @@ fn agent_thread(
             // again. Including `is_suspended` here would busy-spin
             // on yielded children.
             // Keep the chain set by the dispatch that produced it.
-            if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, None,
-                strategy.as_mut(), recording_enabled) {
+            if let Err(e) = dispatch_once(
+                &mut runtime,
+                svc_id,
+                &outbox,
+                id,
+                None,
+                strategy.as_mut(),
+                recording_enabled,
+            ) {
                 // On a Raft follower the commit can return
                 // NotLeader. Log, soft-restart to bring the runtime
                 // back in sync, continue. CRDT failures are still
                 // unexpected but the same recovery applies.
                 warn!(%id, error = %e, "residual-work commit failed; soft-restarting");
                 #[cfg(all(feature = "network", feature = "storage"))]
-                if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {
+                if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut())
+                {
                     fatal_error = Some(format!("residual soft restart: {restart_err}"));
                     break;
                 }
                 continue;
             }
             #[cfg(all(feature = "network", feature = "storage"))]
-            publish_heads_if_replicated(
-                &shared_network, agent_rep_id, strategy.as_ref(),
-            );
+            publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
             continue;
         } else {
             // Short blocking wait on inbox so we re-check the
@@ -1923,8 +1946,15 @@ fn agent_thread(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
-        if let Err(e) = dispatch_once(&mut runtime, svc_id, &outbox, id, Some(msg),
-            strategy.as_mut(), recording_enabled) {
+        if let Err(e) = dispatch_once(
+            &mut runtime,
+            svc_id,
+            &outbox,
+            id,
+            Some(msg),
+            strategy.as_mut(),
+            recording_enabled,
+        ) {
             // Tell-style dispatch on a follower will return
             // NotLeader. Soft-restart and continue rather than
             // killing the agent; the message is effectively
@@ -1939,15 +1969,17 @@ fn agent_thread(
             continue;
         }
         #[cfg(all(feature = "network", feature = "storage"))]
-        publish_heads_if_replicated(
-            &shared_network, agent_rep_id, strategy.as_ref(),
-        );
+        publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
     }
 
     if let Some(err) = &fatal_error {
         error!(%id, "{err}");
     }
-    AgentResult { id, panics: runtime.panics, error: fatal_error }
+    AgentResult {
+        id,
+        panics: runtime.panics,
+        error: fatal_error,
+    }
 }
 
 /// Publish the strategy's current roots on the gossipsub topic
@@ -1960,8 +1992,12 @@ fn publish_heads_if_replicated(
     rep_id: Option<[u8; 32]>,
     strategy: &dyn crate::commit::CommitStrategy,
 ) {
-    let Some(rep_id) = rep_id else { return; };
-    let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else { return; };
+    let Some(rep_id) = rep_id else {
+        return;
+    };
+    let Some(net) = shared_network.lock().ok().and_then(|g| g.clone()) else {
+        return;
+    };
     let roots = strategy.roots();
     if roots.is_empty() {
         return;
@@ -2054,7 +2090,10 @@ fn handle_invoke_request(
     // `reply_tx`, which surfaces upstream as `InvokeError::Panicked`.
     let reply = match runtime.take_last_reply(svc_id) {
         Some(bytes) => bytes,
-        None => { drop(req.reply_tx); return Ok(()); }
+        None => {
+            drop(req.reply_tx);
+            return Ok(());
+        }
     };
     let status = if runtime.is_suspended(svc_id) {
         crate::actors::run::STATUS_YIELDED
@@ -2087,12 +2126,15 @@ fn encode_invoke_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
 /// the handler's return value. A short envelope (just a status byte
 /// from `STATUS_NOT_FOUND` / `STATUS_PANICKED`) decodes as `None`.
 fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
-    if envelope.len() < 5 { return None; }
-    let state_len = u32::from_le_bytes([
-        envelope[1], envelope[2], envelope[3], envelope[4],
-    ]) as usize;
+    if envelope.len() < 5 {
+        return None;
+    }
+    let state_len =
+        u32::from_le_bytes([envelope[1], envelope[2], envelope[3], envelope[4]]) as usize;
     let reply_start = 5 + state_len;
-    if reply_start > envelope.len() { return None; }
+    if reply_start > envelope.len() {
+        return None;
+    }
     Some(envelope[reply_start..].to_vec())
 }
 
@@ -2108,13 +2150,16 @@ fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
 fn decode_invoke_envelope(envelope: &[u8]) -> Option<crate::runtime::ExternalInvokeReply> {
     use crate::actors::run::{STATUS_DONE, STATUS_YIELDED};
     use crate::runtime::ExternalInvokeReply;
-    if envelope.len() < 5 { return None; }
+    if envelope.len() < 5 {
+        return None;
+    }
     let status = envelope[0];
-    let state_len = u32::from_le_bytes([
-        envelope[1], envelope[2], envelope[3], envelope[4],
-    ]) as usize;
+    let state_len =
+        u32::from_le_bytes([envelope[1], envelope[2], envelope[3], envelope[4]]) as usize;
     let state_end = 5 + state_len;
-    if state_end > envelope.len() { return None; }
+    if state_end > envelope.len() {
+        return None;
+    }
     let state = envelope[5..state_end].to_vec();
     let reply = envelope[state_end..].to_vec();
     match status {
@@ -2241,13 +2286,11 @@ fn build_agent_strategy(
                 let replication_id = config.replication_id.ok_or_else(|| {
                     crate::commit::CommitError::Config(
                         "Crdt consistency requires AgentConfig::replication_id; \
-                         set one explicitly or use `auto_replication_id(name)`".into(),
+                         set one explicitly or use `auto_replication_id(name)`"
+                            .into(),
                     )
                 })?;
-                let replica_origin = derive_replica_origin(
-                    &replication_id,
-                    self_node_prefix,
-                );
+                let replica_origin = derive_replica_origin(&replication_id, self_node_prefix);
                 if let Some(arc) = &config.pre_opened_db {
                     let cc = match &config.pre_opened_lock {
                         Some(lock) => crate::commit::CrdtCommit::from_db_arc_locked(
@@ -2255,10 +2298,7 @@ fn build_agent_strategy(
                             lock.clone(),
                             replica_origin,
                         ),
-                        None => crate::commit::CrdtCommit::from_db_arc(
-                            arc.clone(),
-                            replica_origin,
-                        ),
+                        None => crate::commit::CrdtCommit::from_db_arc(arc.clone(), replica_origin),
                     };
                     return Ok(Box::new(cc));
                 }
@@ -2267,7 +2307,10 @@ fn build_agent_strategy(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
-                Ok(Box::new(crate::commit::CrdtCommit::open(&path, replica_origin)?))
+                Ok(Box::new(crate::commit::CrdtCommit::open(
+                    &path,
+                    replica_origin,
+                )?))
             }
             Consistency::Raft => {
                 // Single-node-only path: agent_thread handles the
@@ -2324,7 +2367,11 @@ fn worker_thread(
         Err(e) => {
             let err = format!("failed to load worker plugin: {e}");
             error!(%id, "worker: {err}");
-            return AgentResult { id, panics: 1, error: Some(err) };
+            return AgentResult {
+                id,
+                panics: 1,
+                error: Some(err),
+            };
         }
     };
 
@@ -2336,8 +2383,7 @@ fn worker_thread(
     // when a data directory is configured, NoCommit otherwise;
     // replication strategies (CRDT, Raft) are not available to
     // workers since they live outside the deterministic universe.
-    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        build_worker_strategy(&config, id);
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> = build_worker_strategy(&config, id);
     let saved_state = strategy.restore();
 
     let mut instance = match saved_state {
@@ -2354,7 +2400,9 @@ fn worker_thread(
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Process up to a few invoke requests per iteration to avoid
         // starving the regular inbox.
@@ -2362,13 +2410,19 @@ fn worker_thread(
             match invoke_rx.try_recv() {
                 Ok(req) => {
                     bump();
-                    let reply = dispatch_and_poll(&mut instance, &req.msg, &inbox, &outbox, id, &mut deferred);
+                    let reply = dispatch_and_poll(
+                        &mut instance,
+                        &req.msg,
+                        &inbox,
+                        &outbox,
+                        id,
+                        &mut deferred,
+                    );
                     // Workers don't yield — pack as DONE with no
                     // state so the caller's invoke_raw decodes
                     // `InvokeResult::Done { state: empty, reply }`.
-                    let envelope = encode_invoke_envelope(
-                        crate::actors::run::STATUS_DONE, &[], &reply,
-                    );
+                    let envelope =
+                        encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
                     send_reply_capped(req.reply_tx, envelope, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
@@ -2382,15 +2436,22 @@ fn worker_thread(
             e
         } else {
             match inbox.recv_timeout(Duration::from_millis(50)) {
-                Ok(e) => { bump(); e }
+                Ok(e) => {
+                    bump();
+                    e
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
 
         let reply = dispatch_and_poll(
-            &mut instance, &envelope.payload,
-            &inbox, &outbox, id, &mut deferred,
+            &mut instance,
+            &envelope.payload,
+            &inbox,
+            &outbox,
+            id,
+            &mut deferred,
         );
         if !reply.is_empty() {
             let _ = outbox.send(Envelope {
@@ -2402,7 +2463,11 @@ fn worker_thread(
         persist(strategy.as_mut(), &instance, id);
     }
 
-    AgentResult { id, panics: 0, error: None }
+    AgentResult {
+        id,
+        panics: 0,
+        error: None,
+    }
 }
 
 /// Dispatch a message to a worker instance and poll to completion.
@@ -2415,7 +2480,7 @@ fn dispatch_and_poll(
     worker_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
 ) -> Vec<u8> {
-    use crate::worker::{POLL_READY, POLL_PENDING};
+    use crate::worker::{POLL_PENDING, POLL_READY};
 
     instance.dispatch_start(msg);
 
@@ -2424,9 +2489,7 @@ fn dispatch_and_poll(
         match result.status {
             POLL_READY => {
                 let reply = if !result.ptr.is_null() && result.len > 0 {
-                    unsafe {
-                        std::slice::from_raw_parts(result.ptr, result.len)
-                    }.to_vec()
+                    unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec()
                 } else {
                     Vec::new()
                 };
@@ -2465,7 +2528,9 @@ fn handle_effect(
     match tag {
         EFFECT_ASK => {
             // [target:u32 LE][payload...]
-            if rest.len() < 4 { return Vec::new(); }
+            if rest.len() < 4 {
+                return Vec::new();
+            }
             let target_id = u32::from_le_bytes(rest[..4].try_into().unwrap());
             let payload = rest[4..].to_vec();
             let _ = outbox.send(Envelope {
@@ -2484,8 +2549,9 @@ fn handle_effect(
             {
                 let _ = rest;
                 crate::effects::FetchResponse::host_error(
-                    "vos: built without 'http' feature — EFFECT_FETCH unavailable"
-                ).encode()
+                    "vos: built without 'http' feature — EFFECT_FETCH unavailable",
+                )
+                .encode()
             }
         }
         other => {
@@ -2547,7 +2613,11 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
         .collect();
     let mut body = Vec::new();
     let _ = std::io::Read::read_to_end(&mut r.into_reader(), &mut body);
-    FetchResponse { status, headers, body }
+    FetchResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 // ── State persistence ───────────────────────────────────────────────
@@ -2570,7 +2640,9 @@ fn build_worker_strategy(
         if let Some(path) = config.db_path() {
             match crate::commit::LocalCommit::open(&path) {
                 Ok(lc) => return Box::new(lc),
-                Err(e) => warn!(%id, error = %e, "worker: failed to open storage; continuing without persistence"),
+                Err(e) => {
+                    warn!(%id, error = %e, "worker: failed to open storage; continuing without persistence")
+                }
             }
         }
     }
@@ -2667,7 +2739,10 @@ mod tests {
         // Sender dropped without sending → recv yields Err(Disconnected).
         // External_invoke maps that to None, surfacing as
         // InvokeError::NotFound at the caller's PVM.
-        assert!(rx.recv().is_err(), "tx should have been dropped without a send");
+        assert!(
+            rx.recv().is_err(),
+            "tx should have been dropped without a send"
+        );
     }
 
     #[test]
@@ -2731,23 +2806,32 @@ mod tests {
         // Run the worker, send a few messages, shut down. Restart with
         // the same redb path — the count should resume where it left off.
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        let echo_path = workspace.join("target").join(profile).join("libecho_worker.so");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_worker.so");
         if !echo_path.exists() {
             eprintln!("skipping: build echo-worker first");
             return;
         }
 
         // Use a temp data directory
-        let data_dir = std::env::temp_dir().join(format!(
-            "vos_test_persist_{}",
-            std::process::id()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("vos_test_persist_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
 
-        use crate::actors::value::Msg;
         use crate::actors::codec::Encode;
+        use crate::actors::value::Msg;
         let send_echo = |node: &VosNode, target: ServiceId, text: &str| {
             let msg = Msg::new("echo").with("text", text);
             let encoded = msg.encode();
@@ -2755,16 +2839,19 @@ mod tests {
             payload.push(crate::actors::value::TAG_DYNAMIC);
             payload.extend_from_slice(&encoded);
             if let Some(tx) = node.routes.get(&target.0) {
-                tx.send(Envelope { from: ServiceId(0), to: target, payload }).unwrap();
+                tx.send(Envelope {
+                    from: ServiceId(0),
+                    to: target,
+                    payload,
+                })
+                .unwrap();
             }
         };
 
         // ── First run: send 2 echoes ────────────────────────────────
         {
             let mut node = VosNode::new();
-            let id = node.register_worker(
-                WorkerConfig::new(echo_path.clone()).persist(&data_dir)
-            );
+            let id = node.register_worker(WorkerConfig::new(echo_path.clone()).persist(&data_dir));
             send_echo(&node, id, "first");
             send_echo(&node, id, "second");
             node.run();
@@ -2774,9 +2861,7 @@ mod tests {
         // ── Second run: state should be restored, count starts at 2 ──
         {
             let mut node = VosNode::new();
-            let id = node.register_worker(
-                WorkerConfig::new(echo_path).persist(&data_dir)
-            );
+            let id = node.register_worker(WorkerConfig::new(echo_path).persist(&data_dir));
             send_echo(&node, id, "third");
             node.run();
             let _ = node.collect();
@@ -2788,7 +2873,12 @@ mod tests {
         let db = redb::Database::open(&db_path).expect("open db");
         let txn = db.begin_read().unwrap();
         let table = txn.open_table(STATE_TABLE).unwrap();
-        let bytes = table.get("actor").unwrap().expect("state present").value().to_vec();
+        let bytes = table
+            .get("actor")
+            .unwrap()
+            .expect("state present")
+            .value()
+            .to_vec();
 
         // EchoWorker has a single u32 `count` field — rkyv packs it to
         // exactly 4 bytes. After 3 echoes, count = 3.
@@ -2805,9 +2895,20 @@ mod tests {
         // Loads fetcher-worker and asks it to GET a URL.
         // Uses example.com which is stable and small. Skips on no network.
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        let path = workspace.join("target").join(profile).join("libfetcher_worker.so");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let path = workspace
+            .join("target")
+            .join(profile)
+            .join("libfetcher_worker.so");
         if !path.exists() {
             eprintln!("skipping worker_does_http_fetch: build fetcher-worker first");
             return;
@@ -2816,8 +2917,8 @@ mod tests {
         let mut node = VosNode::new();
         let fetcher_id = node.register_worker(WorkerConfig::new(path));
 
-        use crate::actors::value::Msg;
         use crate::actors::codec::Encode;
+        use crate::actors::value::Msg;
         let msg = Msg::new("status").with("url", "https://example.com");
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -2825,7 +2926,12 @@ mod tests {
         payload.extend_from_slice(&encoded);
 
         if let Some(tx) = node.routes.get(&fetcher_id.0) {
-            tx.send(Envelope { from: ServiceId(0), to: fetcher_id, payload }).unwrap();
+            tx.send(Envelope {
+                from: ServiceId(0),
+                to: fetcher_id,
+                payload,
+            })
+            .unwrap();
         }
 
         node.run();
@@ -2840,10 +2946,24 @@ mod tests {
         // This test requires both echo-worker and proxy-worker to be built.
         // Run: cargo build -p echo-worker -p proxy-worker
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        let echo_path = workspace.join("target").join(profile).join("libecho_worker.so");
-        let proxy_path = workspace.join("target").join(profile).join("libproxy_worker.so");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_worker.so");
+        let proxy_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libproxy_worker.so");
 
         if !echo_path.exists() || !proxy_path.exists() {
             eprintln!("skipping worker_to_worker_ask: build workers first");
@@ -2856,17 +2976,14 @@ mod tests {
         let echo_id = node.register_worker(WorkerConfig::new(echo_path));
 
         // Build init args for proxy: target = echo's ServiceId
-        use crate::actors::value::{Args, Msg};
         use crate::actors::codec::Encode;
+        use crate::actors::value::{Args, Msg};
         let proxy_args = Args::new().with("target", echo_id.0);
-        let proxy_id = node.register_worker(
-            WorkerConfig::with_args(proxy_path, &proxy_args),
-        );
+        let proxy_id = node.register_worker(WorkerConfig::with_args(proxy_path, &proxy_args));
 
         // Send a "proxy" message to the proxy worker (no target arg now —
         // the proxy already knows its target from init args)
-        let msg = Msg::new("proxy")
-            .with("text", "hello via proxy");
+        let msg = Msg::new("proxy").with("text", "hello via proxy");
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(crate::actors::value::TAG_DYNAMIC);
@@ -2878,7 +2995,8 @@ mod tests {
                 from: ServiceId(0), // pretend it's from the registry
                 to: proxy_id,
                 payload,
-            }).unwrap();
+            })
+            .unwrap();
         }
 
         // Run the node — proxy asks echo, echo replies, proxy replies back

@@ -213,7 +213,9 @@ impl RaftCommit {
         // single-node and multi-node on-disk formats agree —
         // `RaftCommit::replay_logs` decodes the same kind-tag
         // shape on both paths.
-        let kind = vos_raft::EntryKind::Data { payload: payload.to_vec() };
+        let kind = vos_raft::EntryKind::Data {
+            payload: payload.to_vec(),
+        };
         let on_disk = super::redb_storage::encode_entry_kind(&kind);
         let new_index = self.log.append_in_txn(&txn, term, &on_disk)?;
         self.meta.commit_index = new_index;
@@ -274,11 +276,7 @@ impl CommitStrategy for RaftCommit {
         Ok(())
     }
 
-    fn commit_with_log(
-        &mut self,
-        state: &[u8],
-        log: &EffectLog,
-    ) -> Result<(), CommitError> {
+    fn commit_with_log(&mut self, state: &[u8], log: &EffectLog) -> Result<(), CommitError> {
         // Skip-on-unchanged — pure reads must not bloat the log.
         // Even stronger here than for CRDT because every Raft
         // entry costs an RTT under multi-node mode.
@@ -569,7 +567,9 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(snap) = h.snapshot() {
-                if snap.role == super::super::worker::Role::Leader { break; }
+                if snap.role == super::super::worker::Role::Leader {
+                    break;
+                }
             }
             assert!(std::time::Instant::now() < deadline, "no leadership");
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -590,7 +590,8 @@ mod tests {
         assert_eq!(s.last_applied(), 2);
 
         // Second propose: state=v2.
-        s.commit_with_log(b"state-v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
+        s.commit_with_log(b"state-v2", &EffectLog::for_msg(b"second".to_vec()))
+            .unwrap();
         assert_eq!(s.restore(), Some(b"state-v2".to_vec()));
         assert_eq!(s.last_applied(), 3);
 
@@ -604,11 +605,8 @@ mod tests {
         {
             let mut s = RaftCommit::open(&path, cfg()).unwrap();
             for i in 0..3u8 {
-                s.commit_with_log(
-                    &alloc::vec![i; 8],
-                    &EffectLog::for_msg(alloc::vec![i; 4]),
-                )
-                .unwrap();
+                s.commit_with_log(&alloc::vec![i; 8], &EffectLog::for_msg(alloc::vec![i; 4]))
+                    .unwrap();
             }
             assert_eq!(s.last_applied(), 3);
         }

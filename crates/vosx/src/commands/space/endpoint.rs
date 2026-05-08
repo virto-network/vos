@@ -36,10 +36,9 @@ pub fn path(data_dir: &Path) -> std::path::PathBuf {
 
 pub fn write(data_dir: &Path, endpoint: &Endpoint) -> anyhow::Result<()> {
     let p = path(data_dir);
-    let body = toml::to_string_pretty(endpoint)
-        .map_err(|e| anyhow::anyhow!("encode endpoint: {e}"))?;
-    std::fs::write(&p, body)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", p.display()))?;
+    let body =
+        toml::to_string_pretty(endpoint).map_err(|e| anyhow::anyhow!("encode endpoint: {e}"))?;
+    std::fs::write(&p, body).map_err(|e| anyhow::anyhow!("write {}: {e}", p.display()))?;
     Ok(())
 }
 
@@ -51,8 +50,8 @@ pub fn read(data_dir: &Path) -> anyhow::Result<Option<Endpoint>> {
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", p.display())),
     };
     let s = String::from_utf8_lossy(&bytes);
-    let ep: Endpoint = toml::from_str(&s)
-        .map_err(|e| anyhow::anyhow!("decode {}: {e}", p.display()))?;
+    let ep: Endpoint =
+        toml::from_str(&s).map_err(|e| anyhow::anyhow!("decode {}: {e}", p.display()))?;
     Ok(Some(ep))
 }
 

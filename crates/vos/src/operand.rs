@@ -237,13 +237,7 @@ mod tests {
     #[test]
     fn encode_error_operands_have_no_data_field() {
         let header = OperandHeader::default();
-        let digest = WorkDigest::off_chain(
-            ServiceId(1),
-            [0u8; 32],
-            0,
-            WorkResult::OutOfGas,
-            0,
-        );
+        let digest = WorkDigest::off_chain(ServiceId(1), [0u8; 32], 0, WorkResult::OutOfGas, 0);
         let bytes = encode_operand(&header, &digest);
         // 128 + 8 + 1 + 4 = 141 (no data length, no data)
         assert_eq!(bytes.len(), 141);

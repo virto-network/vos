@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use futures_executor::block_on;
 use vos_raft::{
     AppendEntriesReq, AppendEntriesResp, Config, InstallSnapshotReq, InstallSnapshotResp,
-    MemStorage, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock,
-    StdRng, Transport, Worker, WorkerHandle,
+    MemStorage, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock, StdRng,
+    Transport, Worker, WorkerHandle,
 };
 
 /// Inbox lookup. Each peer's `WorkerHandle` is registered here
@@ -64,9 +64,22 @@ struct MockTransport {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum RpcRecord {
-    Append { from: u16, to: u16, term: u64, count: usize },
-    Vote { from: u16, to: u16, term: u64 },
-    Install { from: u16, to: u16, last_idx: u64 },
+    Append {
+        from: u16,
+        to: u16,
+        term: u64,
+        count: usize,
+    },
+    Vote {
+        from: u16,
+        to: u16,
+        term: u64,
+    },
+    Install {
+        from: u16,
+        to: u16,
+        last_idx: u64,
+    },
 }
 
 impl MockTransport {
@@ -88,10 +101,7 @@ impl MockTransport {
     }
 
     fn is_duplicated(&self, from: u16, to: u16) -> bool {
-        self.duplicated_edges
-            .lock()
-            .unwrap()
-            .contains(&(from, to))
+        self.duplicated_edges.lock().unwrap().contains(&(from, to))
     }
 
     /// Drop every outbound RPC `from → to`.
@@ -120,10 +130,7 @@ impl MockTransport {
     }
 
     fn is_dropped(&self, from: u16, to: u16) -> bool {
-        self.dropped_edges
-            .lock()
-            .unwrap()
-            .contains(&(from, to))
+        self.dropped_edges.lock().unwrap().contains(&(from, to))
     }
 }
 
@@ -199,9 +206,7 @@ impl Transport<u16> for MockTransport {
             Some(h) => Ok(h.handle_inbound_vote(from, req).await),
             None => Err(MockError),
         };
-        if dup
-            && let Some(h) = handle
-        {
+        if dup && let Some(h) = handle {
             let _ = h.handle_inbound_vote(from, dup_req).await;
         }
         result
@@ -296,10 +301,7 @@ fn three_node_cluster_elects_a_leader() {
             StdClock,
             StdRng::from_entropy(),
         );
-        routes
-            .lock()
-            .unwrap()
-            .insert(me, worker.handler());
+        routes.lock().unwrap().insert(me, worker.handler());
         workers.push(worker);
     }
 
@@ -360,7 +362,10 @@ fn leader_replicates_proposals_to_followers() {
     for n in 1..=3u8 {
         last_idx = block_on(leader_handle.propose(vec![n])).expect("propose");
     }
-    assert!(last_idx >= 4, "expected last_idx >= 4 (1 no-op + 3), got {last_idx}");
+    assert!(
+        last_idx >= 4,
+        "expected last_idx >= 4 (1 no-op + 3), got {last_idx}"
+    );
 
     // Wait for all replicas to report commit_index ≥ last_idx.
     wait_until(
@@ -628,7 +633,10 @@ impl Transport<u16> for BumpTermTransport {
         _peer: u16,
         _req: InstallSnapshotReq<u16>,
     ) -> Result<InstallSnapshotResp, Self::Error> {
-        Ok(InstallSnapshotResp { term: self.bumped_term, bytes_received: 0 })
+        Ok(InstallSnapshotResp {
+            term: self.bumped_term,
+            bytes_received: 0,
+        })
     }
     async fn send_prevote(
         &self,
@@ -709,13 +717,12 @@ fn leader_steps_down_on_higher_term_append_response() {
             _peer: u16,
             _req: InstallSnapshotReq<u16>,
         ) -> Result<InstallSnapshotResp, E> {
-            Ok(InstallSnapshotResp { term: self.bumped_term, bytes_received: 0 })
+            Ok(InstallSnapshotResp {
+                term: self.bumped_term,
+                bytes_received: 0,
+            })
         }
-        async fn send_prevote(
-            &self,
-            _peer: u16,
-            req: PreVoteReq<u16>,
-        ) -> Result<PreVoteResp, E> {
+        async fn send_prevote(&self, _peer: u16, req: PreVoteReq<u16>) -> Result<PreVoteResp, E> {
             // Same shape as the BumpTermTransport version but
             // gated by the `bumped` flag.
             let granted = !self.bumped.load(AO::Relaxed);
@@ -970,8 +977,7 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     // before the partition began and the leader-check window
     // expired before isolation took full effect — but
     // pre-vote should keep it pinned.)
-    let isolated_snap = block_on(workers[&isolated].handler().snapshot())
-        .expect("isolated alive");
+    let isolated_snap = block_on(workers[&isolated].handler().snapshot()).expect("isolated alive");
     let drift = isolated_snap.current_term.saturating_sub(leader_term);
     assert!(
         drift <= 1,
@@ -984,8 +990,8 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     // requests from the isolated node never reached it (and
     // even if they had, pre-vote doesn't bump the responder's
     // term).
-    let leader_snap_after = block_on(workers[&leader_id].handler().snapshot())
-        .expect("leader alive");
+    let leader_snap_after =
+        block_on(workers[&leader_id].handler().snapshot()).expect("leader alive");
     assert_eq!(
         leader_snap_after.current_term, leader_term,
         "leader's term must not have advanced during the partition",
@@ -1198,9 +1204,7 @@ fn read_index_returns_leader_stepped_on_partition_step_down() {
     // To exercise the LeaderStepped path, we instead inject a
     // higher-term AppendEntries to the leader from outside,
     // which forces step-down via handle_append_entries.
-    let result_thread = std::thread::spawn(move || {
-        block_on(leader_handle_for_call.read_index())
-    });
+    let result_thread = std::thread::spawn(move || block_on(leader_handle_for_call.read_index()));
     // Give the thread a moment to enqueue.
     std::thread::sleep(Duration::from_millis(50));
     // Inject a higher-term heartbeat that forces step-down.
@@ -1345,9 +1349,7 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
     // Build a 100 KiB snapshot. With the default chunk size of
     // 32 KiB we'll need 4 chunks (32 + 32 + 32 + 4 KiB).
     let total_bytes = 100 * 1024;
-    let snapshot: Vec<u8> = (0..total_bytes)
-        .map(|i| (i & 0xFF) as u8)
-        .collect();
+    let snapshot: Vec<u8> = (0..total_bytes).map(|i| (i & 0xFF) as u8).collect();
     let chunk_size = 32 * 1024;
 
     let mut offset = 0u64;
@@ -1374,8 +1376,7 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
         chunks_sent += 1;
         assert_eq!(resp.term, 1);
         assert_eq!(
-            resp.bytes_received as usize,
-            end,
+            resp.bytes_received as usize, end,
             "chunk {chunks_sent}: follower must have received {end} bytes",
         );
 
@@ -1561,14 +1562,7 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
     // Tight cap: 32 bytes.
     let mut c = cfg(me, alloc_members(&[me, leader, 0xCCCC]));
     c.max_snapshot_bytes = 32;
-    let worker = Worker::spawn_with(
-        storage,
-        transport,
-        c,
-        (),
-        StdClock,
-        StdRng::from_entropy(),
-    );
+    let worker = Worker::spawn_with(storage, transport, c, (), StdClock, StdRng::from_entropy());
     let h = worker.handler();
 
     // First chunk: 24 bytes — fits.
@@ -1700,10 +1694,7 @@ fn change_membership_grows_cluster_via_joint_consensus() {
         StdClock,
         StdRng::from_entropy(),
     );
-    routes
-        .lock()
-        .unwrap()
-        .insert(new_member, worker4.handler());
+    routes.lock().unwrap().insert(new_member, worker4.handler());
     workers.insert(new_member, worker4);
     let leader_id = *initial
         .iter()
@@ -1712,9 +1703,8 @@ fn change_membership_grows_cluster_via_joint_consensus() {
     let leader_handle = workers[&leader_id].handler();
 
     // Issue the membership change.
-    let joint_index =
-        block_on(leader_handle.change_membership(new_full.clone()))
-            .expect("change_membership accepted");
+    let joint_index = block_on(leader_handle.change_membership(new_full.clone()))
+        .expect("change_membership accepted");
 
     // The leader must reject a concurrent change while the
     // joint phase is in flight.
@@ -1804,7 +1794,11 @@ fn change_membership_removing_leader_makes_it_step_down() {
     );
 
     wait_until(
-        || new_members.iter().any(|p| workers[p].role() == Role::Leader),
+        || {
+            new_members
+                .iter()
+                .any(|p| workers[p].role() == Role::Leader)
+        },
         Duration::from_secs(10),
         "new leader emerges from the post-transition set",
     );
@@ -1848,7 +1842,11 @@ fn change_membership_on_follower_returns_not_leader() {
         .expect("leader exists");
     let follower_id = *members.iter().find(|p| **p != leader_id).unwrap();
 
-    let r = block_on(workers[&follower_id].handler().change_membership(members.clone()));
+    let r = block_on(
+        workers[&follower_id]
+            .handler()
+            .change_membership(members.clone()),
+    );
     assert!(
         matches!(r, Err(ChangeMembershipError::NotLeader)),
         "follower change_membership must return NotLeader, got {r:?}",
@@ -1944,14 +1942,7 @@ fn cross_snapshot_membership_recovery_via_persisted_view() {
     // didn't spawn — for this test we only care about the
     // boot-time recovered view, not election dynamics.
     c.pre_vote = false;
-    let worker = Worker::spawn_with(
-        storage,
-        transport,
-        c,
-        (),
-        StdClock,
-        StdRng::from_entropy(),
-    );
+    let worker = Worker::spawn_with(storage, transport, c, (), StdClock, StdRng::from_entropy());
     worker.wait_init().expect("init succeeds");
 
     // The worker's recovered view should reflect the persisted

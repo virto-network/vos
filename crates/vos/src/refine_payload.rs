@@ -115,7 +115,9 @@ impl RefinePayload {
         let mut out = Vec::new();
         out.push(REFINE_PAYLOAD_VERSION);
         let mut flags: u8 = 0;
-        if self.continue_next { flags |= FLAG_CONTINUE_NEXT; }
+        if self.continue_next {
+            flags |= FLAG_CONTINUE_NEXT;
+        }
         out.push(flags);
         push_u32(&mut out, self.state.len() as u32);
         out.extend_from_slice(&self.state);
@@ -146,7 +148,12 @@ impl RefinePayload {
         for _ in 0..effects_count {
             effects.push(decode_effect(&mut c)?);
         }
-        Some(RefinePayload { state, reply, effects, continue_next })
+        Some(RefinePayload {
+            state,
+            reply,
+            effects,
+            continue_next,
+        })
     }
 }
 
@@ -296,9 +303,18 @@ mod tests {
             state: vec![],
             reply: vec![],
             effects: vec![
-                Effect::Write { key: b"k1".to_vec(), value: vec![1, 2, 3] },
-                Effect::Transfer { target: 42, memo: b"hello".to_vec() },
-                Effect::Provide { hash: [9; 32], data: vec![0xFF, 0xEE] },
+                Effect::Write {
+                    key: b"k1".to_vec(),
+                    value: vec![1, 2, 3],
+                },
+                Effect::Transfer {
+                    target: 42,
+                    memo: b"hello".to_vec(),
+                },
+                Effect::Provide {
+                    hash: [9; 32],
+                    data: vec![0xFF, 0xEE],
+                },
                 Effect::New { code_hash: [7; 32] },
             ],
             continue_next: false,

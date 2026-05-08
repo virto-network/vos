@@ -22,31 +22,41 @@ pub mod run;
 pub mod value;
 
 pub use actor::{Actor, Message};
-pub use codec::{Encode, Decode};
+pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, WorkerActor, WorkerCtx};
-pub use run::{Yield, Ask, HostIo, RunResult, try_poll, run_blocking, noop_waker, service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
-pub use value::InvokeError;
-#[cfg(feature = "service")]
-pub use run::{run_refine_service, run_accumulate_service};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
+pub use run::{
+    Ask, HostIo, RunResult, STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+    STATUS_YIELDED, Yield, noop_waker, run_blocking, service_code_hash, try_poll,
+};
+#[cfg(feature = "service")]
+pub use run::{run_accumulate_service, run_refine_service};
+pub use value::InvokeError;
 
 /// JAM refine entry (PC=0). Always uses the service lifecycle so
 /// actors can run both standalone (`vosx run actor.elf -s`) and as
 /// invoked children. State is read from storage on cold start; FETCH
 /// items are treated as messages.
 #[cfg(feature = "service")]
-pub fn run_refine_entry<A: Actor>() { run::run_refine_service::<A>() }
+pub fn run_refine_entry<A: Actor>() {
+    run::run_refine_service::<A>()
+}
 #[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_refine_entry<A: Actor>() { run::run_refine::<A>() }
+pub fn run_refine_entry<A: Actor>() {
+    run::run_refine::<A>()
+}
 
 /// JAM accumulate entry (PC=5). Services replay refine effects via
 /// real hostcalls. Not meaningful for invoked actors.
 #[cfg(feature = "service")]
-pub fn run_accumulate_entry<A: Actor>() { run::run_accumulate_service::<A>() }
+pub fn run_accumulate_entry<A: Actor>() {
+    run::run_accumulate_service::<A>()
+}
 #[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */ }
+pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */
+}
 
 // --- Guest panic handler ---
 //

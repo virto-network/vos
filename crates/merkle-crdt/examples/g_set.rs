@@ -102,7 +102,19 @@ fn main() {
 
     // Show DAG structure
     println!("\nDAG stats:");
-    println!("  Alice: {} roots, {} nodes", alice.roots().len(), alice.store().len());
-    println!("  Bob:   {} roots, {} nodes", bob.roots().len(), bob.store().len());
-    println!("  Carol: {} roots, {} nodes", carol.roots().len(), carol.store().len());
+    println!(
+        "  Alice: {} roots, {} nodes",
+        alice.roots().len(),
+        alice.store().len()
+    );
+    println!(
+        "  Bob:   {} roots, {} nodes",
+        bob.roots().len(),
+        bob.store().len()
+    );
+    println!(
+        "  Carol: {} roots, {} nodes",
+        carol.roots().len(),
+        carol.store().len()
+    );
 }

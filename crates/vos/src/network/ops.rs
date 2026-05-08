@@ -19,9 +19,7 @@ use std::sync::mpsc as std_mpsc;
 
 use libp2p::PeerId;
 
-use super::{
-    ManifestReply, Network, NetworkCmd, RaftJoinResult, RaftStatusReply,
-};
+use super::{ManifestReply, Network, NetworkCmd, RaftJoinResult, RaftStatusReply};
 
 impl Network {
     /// Send a [`Frame::RaftJoinReq`] to a bootnode. The receiver
@@ -59,10 +57,7 @@ impl Network {
     /// originates this — it has its own copy.
     ///
     /// [`Frame::ManifestReq`]: super::Frame::ManifestReq
-    pub fn send_manifest_req(
-        &self,
-        target_peer: PeerId,
-    ) -> std_mpsc::Receiver<ManifestReply> {
+    pub fn send_manifest_req(&self, target_peer: PeerId) -> std_mpsc::Receiver<ManifestReply> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendManifestReq {
             target_peer,

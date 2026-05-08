@@ -34,12 +34,11 @@ mod ops;
 mod wire;
 
 pub use wire::{
-    Frame, FrameError, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
-    MAX_FRAME_BYTES,
+    Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
 };
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -47,11 +46,11 @@ use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, identity, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, identity, mdns, noise, ping, tcp, yamux};
 use tokio::sync::mpsc as async_mpsc;
 use tracing::{debug, error, info, warn};
 
-use codec::{VosCodec, PROTOCOL};
+use codec::{PROTOCOL, VosCodec};
 
 /// Combined libp2p behaviour.
 #[derive(NetworkBehaviour)]
@@ -231,13 +230,7 @@ pub trait NetworkService: Send + Sync {
     /// vos::node impl dispatches against its invoke-route table
     /// and blocks on the agent's reply (called from
     /// `tokio::task::spawn_blocking`, so blocking is safe).
-    fn dispatch_invoke(
-        &self,
-        _from: u32,
-        _to: u32,
-        _chain: Vec<u32>,
-        _msg: Vec<u8>,
-    ) -> Vec<u8> {
+    fn dispatch_invoke(&self, _from: u32, _to: u32, _chain: Vec<u32>, _msg: Vec<u8>) -> Vec<u8> {
         Vec::new()
     }
 
@@ -250,11 +243,7 @@ pub trait NetworkService: Send + Sync {
 
     /// Inbound `Frame::FetchNode` for one DAG node within a
     /// replication group. Default returns `None`.
-    fn sync_get_node(
-        &self,
-        _replication_id: &[u8; 32],
-        _cid: &[u8; 32],
-    ) -> Option<Vec<u8>> {
+    fn sync_get_node(&self, _replication_id: &[u8; 32], _cid: &[u8; 32]) -> Option<Vec<u8>> {
         None
     }
 
@@ -329,11 +318,7 @@ pub trait RaftRpcHandler: Send + Sync {
     /// {joiner}`, and (c) call `change_membership(...)`. On
     /// success, return `Accepted { joint_index }` so the joiner
     /// can poll for `commit_index >= joint_index + 1`.
-    fn handle_join(
-        &self,
-        _replication_id: &[u8; 32],
-        _joiner_prefix: u16,
-    ) -> RaftJoinResult {
+    fn handle_join(&self, _replication_id: &[u8; 32], _joiner_prefix: u16) -> RaftJoinResult {
         RaftJoinResult::NotLeader { leader_hint: None }
     }
 
@@ -443,7 +428,9 @@ pub(in crate::network) enum NetworkCmd {
     },
     /// Subscribe the local node to the gossipsub topic for a
     /// replication group. Idempotent — re-subscribing is a no-op.
-    SubscribeRep { replication_id: [u8; 32] },
+    SubscribeRep {
+        replication_id: [u8; 32],
+    },
     /// Publish a head announcement for a replication group on
     /// its gossipsub topic. Subscribers schedule an immediate
     /// fetch from the publisher rather than waiting for the
@@ -540,8 +527,7 @@ impl Network {
         let local_prefix = config.local_prefix;
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
-        let service: Arc<OnceLock<Arc<dyn NetworkService>>> =
-            Arc::new(OnceLock::new());
+        let service: Arc<OnceLock<Arc<dyn NetworkService>>> = Arc::new(OnceLock::new());
         let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
@@ -789,7 +775,9 @@ impl Network {
     /// use [`join_replication`](Self::join_replication) instead —
     /// otherwise inbound head announcements arrive but go nowhere.
     pub fn subscribe_rep(&self, replication_id: [u8; 32]) {
-        let _ = self.cmd_tx.send(NetworkCmd::SubscribeRep { replication_id });
+        let _ = self
+            .cmd_tx
+            .send(NetworkCmd::SubscribeRep { replication_id });
     }
 
     /// Publish a head announcement for a replication group.
@@ -797,7 +785,10 @@ impl Network {
     /// can pull the new state without waiting for the next 250ms
     /// sync tick.
     pub fn publish_heads(&self, replication_id: [u8; 32], roots: Vec<[u8; 32]>) {
-        let _ = self.cmd_tx.send(NetworkCmd::PublishHeads { replication_id, roots });
+        let _ = self.cmd_tx.send(NetworkCmd::PublishHeads {
+            replication_id,
+            roots,
+        });
     }
 
     /// Synchronously invoke a service on a remote peer. Returns a
@@ -968,10 +959,8 @@ async fn network_main(
     // to the caller. One map for invoke + sync because each
     // RequestId is unique across all outbound traffic on the
     // behaviour.
-    let mut outbound_replies: HashMap<
-        request_response::OutboundRequestId,
-        OutboundReply,
-    > = HashMap::new();
+    let mut outbound_replies: HashMap<request_response::OutboundRequestId, OutboundReply> =
+        HashMap::new();
 
     // Inbound dispatch path: blocking tasks complete asynchronously
     // and need to push (response_channel, frame) back to the swarm
@@ -1237,13 +1226,14 @@ fn build_swarm(
         )?
         .with_behaviour(|key| {
             let mdns_cfg = mdns::Config::default();
-            let mdns = mdns::tokio::Behaviour::new(mdns_cfg, local_peer_id)
-                .map_err::<Box<dyn std::error::Error + Send + Sync>, _>(|e| Box::new(e))?;
+            let mdns = mdns::tokio::Behaviour::new(mdns_cfg, local_peer_id).map_err::<Box<
+                dyn std::error::Error + Send + Sync,
+            >, _>(
+                |e| Box::new(e)
+            )?;
             let ping = ping::Behaviour::default();
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/vos/0.1.0".into(),
-                key.public(),
-            ));
+            let identify =
+                identify::Behaviour::new(identify::Config::new("/vos/0.1.0".into(), key.public()));
             let req_resp = request_response::Behaviour::with_codec(
                 VosCodec,
                 std::iter::once((PROTOCOL, ProtocolSupport::Full)),
@@ -1303,7 +1293,9 @@ fn handle_swarm_event(
                 v.push(address);
             }
         }
-        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
             info!(%peer_id, ?endpoint, "network: peer connected");
             // Initiate the Hello handshake from the dialer side.
             // The listener's reply rides back as the response, so
@@ -1313,7 +1305,9 @@ fn handle_swarm_event(
             if endpoint.is_dialer() {
                 let _ = swarm.behaviour_mut().req_resp.send_request(
                     &peer_id,
-                    Frame::Hello { node_prefix: local_prefix },
+                    Frame::Hello {
+                        node_prefix: local_prefix,
+                    },
                 );
             }
         }
@@ -1334,13 +1328,24 @@ fn handle_swarm_event(
                 debug!(%peer_id, "network: mDNS peer expired");
             }
         }
-        SwarmEvent::Behaviour(VosBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+        SwarmEvent::Behaviour(VosBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
             debug!(%peer_id, agent = %info.agent_version, "network: identify received");
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::ReqResp(rr_event)) => {
             handle_req_resp(
-                swarm, rr_event, local_prefix, prefix_map, inbox,
-                outbound_replies, service, raft_handlers, response_tx,
+                swarm,
+                rr_event,
+                local_prefix,
+                prefix_map,
+                inbox,
+                outbound_replies,
+                service,
+                raft_handlers,
+                response_tx,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {
@@ -1365,13 +1370,17 @@ fn handle_req_resp(
 
     match event {
         Event::Message { peer, message, .. } => match message {
-            Message::Request { request, channel, .. } => {
+            Message::Request {
+                request, channel, ..
+            } => {
                 match request {
                     Frame::Hello { node_prefix } => {
                         record_prefix(prefix_map, node_prefix, peer);
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
-                            Frame::Hello { node_prefix: local_prefix },
+                            Frame::Hello {
+                                node_prefix: local_prefix,
+                            },
                         );
                     }
                     Frame::Tell { from, to, payload } => {
@@ -1383,7 +1392,12 @@ fn handle_req_resp(
                             .req_resp
                             .send_response(channel, Frame::Ack);
                     }
-                    Frame::InvokeRequest { from, to, chain, msg } => {
+                    Frame::InvokeRequest {
+                        from,
+                        to,
+                        chain,
+                        msg,
+                    } => {
                         // Hand off to a blocking task: the dispatcher's
                         // reply channel uses std::sync::mpsc, which would
                         // park the runtime if awaited inline. The task
@@ -1396,15 +1410,15 @@ fn handle_req_resp(
                                 Some(s) => s.dispatch_invoke(from, to, chain, msg),
                                 None => {
                                     warn!(
-                                        from, to,
+                                        from,
+                                        to,
                                         "network: inbound InvokeRequest with no \
                                          service installed; replying empty",
                                     );
                                     Vec::new()
                                 }
                             };
-                            let _ = response_tx
-                                .send((channel, Frame::InvokeReply { payload }));
+                            let _ = response_tx.send((channel, Frame::InvokeReply { payload }));
                         });
                     }
                     Frame::FetchHeads { replication_id } => {
@@ -1416,10 +1430,16 @@ fn handle_req_resp(
                             .unwrap_or_default();
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
-                            Frame::Heads { replication_id, roots },
+                            Frame::Heads {
+                                replication_id,
+                                roots,
+                            },
                         );
                     }
-                    Frame::FetchNode { replication_id, cid } => {
+                    Frame::FetchNode {
+                        replication_id,
+                        cid,
+                    } => {
                         let node = service
                             .get()
                             .and_then(|s| s.sync_get_node(&replication_id, &cid));
@@ -1464,7 +1484,10 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         leader_prefix,
-                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
                                         "network: inbound RaftAppendReq for unknown \
                                          replication group; replying success=false",
                                     );
@@ -1512,7 +1535,10 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         candidate_prefix,
-                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
                                         "network: inbound RaftVoteReq for unknown \
                                          replication group; vote_granted=false",
                                     );
@@ -1562,7 +1588,10 @@ fn handle_req_resp(
                                 None => {
                                     warn!(
                                         leader_prefix,
-                                        rep_id = format!("{:02x}{:02x}..", replication_id[0], replication_id[1]),
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
                                         "network: inbound RaftInstallSnapshotReq for unknown \
                                          replication group; replying with our term",
                                     );
@@ -1575,7 +1604,10 @@ fn handle_req_resp(
                             ));
                         });
                     }
-                    Frame::RaftJoinReq { replication_id, joiner_prefix } => {
+                    Frame::RaftJoinReq {
+                        replication_id,
+                        joiner_prefix,
+                    } => {
                         // Join requests can call `change_membership`,
                         // which writes the joint-config redb row. Off
                         // the swarm thread.
@@ -1589,22 +1621,18 @@ fn handle_req_resp(
                                 Some(h) => h.handle_join(&replication_id, joiner_prefix),
                                 None => RaftJoinResult::UnknownGroup,
                             };
-                            let _ = response_tx.send((
-                                channel,
-                                Frame::RaftJoinResp { result },
-                            ));
+                            let _ = response_tx.send((channel, Frame::RaftJoinResp { result }));
                         });
                     }
                     Frame::ManifestReq => {
                         // Manifest handler just reads in-memory
                         // bytes; serve inline.
-                        let reply = service
-                            .get()
-                            .and_then(|s| s.manifest())
-                            .unwrap_or_else(|| ManifestReply {
+                        let reply = service.get().and_then(|s| s.manifest()).unwrap_or_else(|| {
+                            ManifestReply {
                                 toml: Vec::new(),
                                 blobs: Vec::new(),
-                            });
+                            }
+                        });
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
                             Frame::ManifestResp {
@@ -1650,7 +1678,11 @@ fn handle_req_resp(
                     }
                 }
             }
-            Message::Response { response, request_id, .. } => {
+            Message::Response {
+                response,
+                request_id,
+                ..
+            } => {
                 let pending = outbound_replies.remove(&request_id);
                 match (response, pending) {
                     (Frame::Hello { node_prefix }, _) => {
@@ -1669,7 +1701,11 @@ fn handle_req_resp(
                         let _ = tx.send(node);
                     }
                     (
-                        Frame::RaftAppendResp { term, success, match_index },
+                        Frame::RaftAppendResp {
+                            term,
+                            success,
+                            match_index,
+                        },
                         Some(OutboundReply::RaftAppend(tx)),
                     ) => {
                         let _ = tx.send(RaftAppendResult {
@@ -1690,22 +1726,27 @@ fn handle_req_resp(
                     ) => {
                         let _ = tx.send(RaftInstallSnapshotResult { term });
                     }
-                    (
-                        Frame::RaftJoinResp { result },
-                        Some(OutboundReply::RaftJoin(tx)),
-                    ) => {
+                    (Frame::RaftJoinResp { result }, Some(OutboundReply::RaftJoin(tx))) => {
                         let _ = tx.send(result);
                     }
                     (
                         Frame::ManifestResp { toml_bytes, blobs },
                         Some(OutboundReply::Manifest(tx)),
                     ) => {
-                        let _ = tx.send(ManifestReply { toml: toml_bytes, blobs });
+                        let _ = tx.send(ManifestReply {
+                            toml: toml_bytes,
+                            blobs,
+                        });
                     }
                     (
                         Frame::RaftStatusResp {
-                            present, role, current_term, commit_index,
-                            last_log_index, members, leader_hint,
+                            present,
+                            role,
+                            current_term,
+                            commit_index,
+                            last_log_index,
+                            members,
+                            leader_hint,
                         },
                         Some(OutboundReply::RaftStatus(tx)),
                     ) => {
@@ -1725,7 +1766,12 @@ fn handle_req_resp(
                 }
             }
         },
-        Event::OutboundFailure { peer, request_id, error, .. } => {
+        Event::OutboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        } => {
             warn!(%peer, error = %error, "network: outbound request failed");
             // Drop the reply Sender so the caller's recv yields
             // Disconnected — surfaces as None / NotFound.
@@ -1752,7 +1798,12 @@ fn handle_gossipsub_event(
     event: gossipsub::Event,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
-    if let gossipsub::Event::Message { propagation_source, message, .. } = event {
+    if let gossipsub::Event::Message {
+        propagation_source,
+        message,
+        ..
+    } = event
+    {
         // Decode the published frame; expect Heads with a
         // replication_id matching the topic. We use rep_id
         // from the frame as the routing key (the topic's hex
@@ -1842,7 +1893,11 @@ mod tests {
             seen.insert(derive_node_prefix(&pid));
         }
         // 16 random u16s collide vanishingly rarely.
-        assert!(seen.len() >= 15, "got {} unique prefixes from 16 keys", seen.len());
+        assert!(
+            seen.len() >= 15,
+            "got {} unique prefixes from 16 keys",
+            seen.len()
+        );
     }
 
     #[test]
@@ -1876,8 +1931,11 @@ mod tests {
 
         // Wait until A reports a bound address — without this, B
         // has nothing to dial.
-        let a_addr = wait_for(|| net_a.listen_addrs().into_iter().next(), Duration::from_secs(5))
-            .expect("net_a should have bound a listen address");
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a should have bound a listen address");
         let a_peer_id = net_a.peer_id();
         let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(a_peer_id));
 
@@ -2005,7 +2063,11 @@ mod tests {
         let log1 = EffectLog::for_msg(b"first".to_vec());
         let log2 = EffectLog::for_msg(b"second".to_vec());
         {
-            let mut cc_a = CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id);
+            let mut cc_a = CrdtCommit::from_db_arc_locked(
+                slot_a.db.clone(),
+                slot_a.commit_lock.clone(),
+                rep_id,
+            );
             cc_a.commit_with_log(b"v1", &log1).unwrap();
             cc_a.commit_with_log(b"v2", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
@@ -2026,7 +2088,11 @@ mod tests {
                 // roots. The sync ticker writes through the same
                 // redb file, so a fresh CrdtCommit picks up the
                 // merged state.
-                let cc = CrdtCommit::from_db_arc_locked(slot_b.db.clone(), slot_b.commit_lock.clone(), rep_id);
+                let cc = CrdtCommit::from_db_arc_locked(
+                    slot_b.db.clone(),
+                    slot_b.commit_lock.clone(),
+                    rep_id,
+                );
                 if cc.root_bytes().is_empty() {
                     None
                 } else {
@@ -2044,7 +2110,8 @@ mod tests {
         assert_eq!(logs[1], log2);
 
         // Roots match too.
-        let cc_a = CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id);
+        let cc_a =
+            CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id);
         assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
 
         let _ = node_a.collect();
@@ -2112,9 +2179,12 @@ mod tests {
             .get(&rep_id)
             .cloned()
             .unwrap();
-        let mut cc = CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
-        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec())).unwrap();
-        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
+        let mut cc =
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
+        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
+            .unwrap();
+        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec()))
+            .unwrap();
         let expected_root = cc.root_bytes()[0];
         let expected_node_bytes = cc.get_node_bytes(&expected_root).unwrap().unwrap();
         drop(cc);
@@ -2335,9 +2405,14 @@ mod tests {
         }
 
         impl NetworkService for RecordingDispatcher {
-            fn dispatch_invoke(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
-                *self.seen.lock().unwrap() =
-                    Some((from, to, chain.clone(), msg));
+            fn dispatch_invoke(
+                &self,
+                from: u32,
+                to: u32,
+                chain: Vec<u32>,
+                msg: Vec<u8>,
+            ) -> Vec<u8> {
+                *self.seen.lock().unwrap() = Some((from, to, chain.clone(), msg));
                 self.reply.clone()
             }
         }
@@ -2376,17 +2451,14 @@ mod tests {
             reply: b"the answer".to_vec(),
         }));
 
-        wait_for(
-            || net_a.peer_for_prefix(prefix_b),
-            Duration::from_secs(10),
-        )
-        .expect("Hello completes");
+        wait_for(|| net_a.peer_for_prefix(prefix_b), Duration::from_secs(10))
+            .expect("Hello completes");
 
         let target_peer = net_a.peer_for_prefix(prefix_b).unwrap();
         let reply_rx = net_a.send_invoke(
             target_peer,
-            0x00010002, // from
-            0xBBBB0007, // to (B's local id 7)
+            0x00010002,       // from
+            0xBBBB0007,       // to (B's local id 7)
             vec![0x00010002], // chain
             b"please reply".to_vec(),
         );
@@ -2396,7 +2468,11 @@ mod tests {
             .expect("invoke reply");
         assert_eq!(payload, b"the answer");
 
-        let seen = seen.lock().unwrap().clone().expect("dispatcher saw the call");
+        let seen = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("dispatcher saw the call");
         assert_eq!(seen.0, 0x00010002);
         assert_eq!(seen.1, 0xBBBB0007);
         assert_eq!(seen.2, vec![0x00010002]);
@@ -2587,7 +2663,7 @@ mod tests {
         let _ = join_b.join();
     }
 
-/// Phase-2 boundary for Raft: the wire frames + libp2p plumbing
+    /// Phase-2 boundary for Raft: the wire frames + libp2p plumbing
     /// route an outbound `AppendEntries` / `RequestVote` to the
     /// remote peer, the stub handler observes the call, and the
     /// canned response makes it back through the caller's channel.
@@ -2595,8 +2671,8 @@ mod tests {
     /// phase 3+ — but every wire bit is.
     #[test]
     fn raft_rpcs_route_through_libp2p_to_handler_and_back() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         // Stub handler: record the inbound RPC params and reply
         // with deterministic canned values so the caller's
@@ -2678,7 +2754,8 @@ mod tests {
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
             Duration::from_secs(5),
-        ).expect("net_a binds");
+        )
+        .expect("net_a binds");
         let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
         let net_b = Network::start(NetworkConfig {
@@ -2694,10 +2771,14 @@ mod tests {
         net_b.register_raft_handler(rep_id, handler.clone());
 
         // Wait for the Hello handshake so A has a PeerId for B.
-        wait_for(|| {
-            (net_a.peer_for_prefix(prefix_b).is_some()
-                && net_b.peer_for_prefix(prefix_a).is_some()).then_some(())
-        }, Duration::from_secs(10))
+        wait_for(
+            || {
+                (net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some())
+                .then_some(())
+            },
+            Duration::from_secs(10),
+        )
         .expect("Hello completes");
         let target_b = net_a.peer_for_prefix(prefix_b).unwrap();
 
@@ -2707,15 +2788,15 @@ mod tests {
             RaftEntry::data(8, b"second".to_vec()),
         ];
         let rx = net_a.send_raft_append(
-            target_b, rep_id,
-            8,                  // term
-            prefix_a,           // leader_prefix
-            10,                 // prev_log_index
-            7,                  // prev_log_term
-            10,                 // leader_commit
+            target_b, rep_id, 8,        // term
+            prefix_a, // leader_prefix
+            10,       // prev_log_index
+            7,        // prev_log_term
+            10,       // leader_commit
             entries,
         );
-        let resp = rx.recv_timeout(Duration::from_secs(5))
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("AppendEntries response");
         assert_eq!(resp.term, 7, "stub returned its own term");
         assert!(resp.success, "term=8 >= local 7 → success");
@@ -2733,13 +2814,13 @@ mod tests {
 
         // ── RequestVote: term 9 with up-to-date log. ──────────
         let rx = net_a.send_raft_vote(
-            target_b, rep_id,
-            9,                  // term
-            prefix_a,           // candidate_prefix
-            12,                 // last_log_index
-            8,                  // last_log_term
+            target_b, rep_id, 9,        // term
+            prefix_a, // candidate_prefix
+            12,       // last_log_index
+            8,        // last_log_term
         );
-        let resp = rx.recv_timeout(Duration::from_secs(5))
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("RequestVote response");
         assert_eq!(resp.term, 7);
         assert!(resp.vote_granted, "term=9 >= local 7 → granted");
@@ -2753,10 +2834,9 @@ mod tests {
         // returns success=false / vote_granted=false (not a hang). ──
         // Reverse the direction: B asks A, but A has no handler.
         let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
-        let rx = net_b.send_raft_append(
-            target_a, rep_id, 1, prefix_b, 0, 0, 0, vec![],
-        );
-        let resp = rx.recv_timeout(Duration::from_secs(5))
+        let rx = net_b.send_raft_append(target_a, rep_id, 1, prefix_b, 0, 0, 0, vec![]);
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("no-handler response");
         assert!(!resp.success, "no handler installed → success=false");
         assert_eq!(resp.match_index, 0);
@@ -2792,18 +2872,23 @@ mod tests {
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         let net_a = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_a, local_prefix: prefix_a,
-            listen: vec![listen_addr.clone()], bootstrap: vec![],
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
         }));
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
             Duration::from_secs(5),
-        ).expect("net_a binds");
+        )
+        .expect("net_a binds");
         let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
         let net_b = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_b, local_prefix: prefix_b,
-            listen: vec![listen_addr.clone()], bootstrap: vec![a_dial.clone()],
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![a_dial.clone()],
         }));
         // Wait for B's listen addr so C can bootstrap to both A
         // and B — without an explicit dial between B and C the
@@ -2811,24 +2896,30 @@ mod tests {
         let b_addr = wait_for(
             || net_b.listen_addrs().into_iter().next(),
             Duration::from_secs(5),
-        ).expect("net_b binds");
+        )
+        .expect("net_b binds");
         let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
 
         let net_c = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_c, local_prefix: prefix_c,
-            listen: vec![listen_addr], bootstrap: vec![a_dial, b_dial],
+            keypair: kp_c,
+            local_prefix: prefix_c,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial, b_dial],
         }));
 
         // Wait for the Hello triangle to close.
-        wait_for(|| {
-            let ab = net_a.peer_for_prefix(prefix_b).is_some()
-                  && net_b.peer_for_prefix(prefix_a).is_some();
-            let ac = net_a.peer_for_prefix(prefix_c).is_some()
-                  && net_c.peer_for_prefix(prefix_a).is_some();
-            let bc = net_b.peer_for_prefix(prefix_c).is_some()
-                  && net_c.peer_for_prefix(prefix_b).is_some();
-            (ab && ac && bc).then_some(())
-        }, Duration::from_secs(15))
+        wait_for(
+            || {
+                let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some();
+                let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_a).is_some();
+                let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_b).is_some();
+                (ab && ac && bc).then_some(())
+            },
+            Duration::from_secs(15),
+        )
         .expect("3-node Hello mesh forms");
 
         // Each node gets its own redb file + worker.
@@ -2836,7 +2927,9 @@ mod tests {
             "vos_raft_election_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let mk_worker = |me, network: Arc<Network>, db_name: &str| {
@@ -2886,13 +2979,18 @@ mod tests {
                 if let Some(snap) = s {
                     if snap.role == Role::Leader && snap.current_term >= 1 {
                         observed = Some((*p, snap.current_term));
-                        assert_eq!(snap.voted_for, Some(*p),
-                            "a Leader voted for itself this term");
+                        assert_eq!(
+                            snap.voted_for,
+                            Some(*p),
+                            "a Leader voted for itself this term"
+                        );
                         break;
                     }
                 }
             }
-            if observed.is_some() { break; }
+            if observed.is_some() {
+                break;
+            }
             if StdInstant::now() >= until {
                 panic!(
                     "no Leader observed within deadline; \
@@ -2917,22 +3015,30 @@ mod tests {
             _ => w_c.handler(),
         };
         let snap_leader = leader_handle.snapshot().expect("leader alive");
-        assert_eq!(snap_leader.role, Role::Leader,
+        assert_eq!(
+            snap_leader.role,
+            Role::Leader,
             "phase 3.3: heartbeats must keep the leader from getting demoted; \
-             snap = {snap_leader:?}");
-        assert_eq!(snap_leader.current_term, leader_term,
-            "phase 3.3: term must not drift while the leader is heartbeating");
+             snap = {snap_leader:?}"
+        );
+        assert_eq!(
+            snap_leader.current_term, leader_term,
+            "phase 3.3: term must not drift while the leader is heartbeating"
+        );
 
-        let other_snaps: Vec<_> = [(prefix_a, w_a.handler()),
-                                   (prefix_b, w_b.handler()),
-                                   (prefix_c, w_c.handler())]
-            .into_iter()
-            .filter(|(p, _)| *p != leader_prefix)
-            .map(|(p, h)| (p, h.snapshot().expect("follower alive")))
-            .collect();
+        let other_snaps: Vec<_> = [
+            (prefix_a, w_a.handler()),
+            (prefix_b, w_b.handler()),
+            (prefix_c, w_c.handler()),
+        ]
+        .into_iter()
+        .filter(|(p, _)| *p != leader_prefix)
+        .map(|(p, h)| (p, h.snapshot().expect("follower alive")))
+        .collect();
         for (p, snap) in &other_snaps {
             assert_eq!(
-                snap.role, Role::Follower,
+                snap.role,
+                Role::Follower,
                 "follower at {p:#06x} must not have re-elected; snap = {snap:?}",
             );
             assert_eq!(
@@ -2946,9 +3052,18 @@ mod tests {
         w_a.shutdown();
         w_b.shutdown();
         w_c.shutdown();
-        match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-        match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
-        match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_a) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_b) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_c) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2962,7 +3077,7 @@ mod tests {
     /// `commit_index == 4`.
     #[test]
     fn three_node_cluster_replicates_proposed_entries() {
-        use crate::raft::{RaftMeta, RaftWorker, Role, WorkerConfig, RAFT_LOG};
+        use crate::raft::{RAFT_LOG, RaftMeta, RaftWorker, Role, WorkerConfig};
         use redb::{ReadableTable, ReadableTableMetadata};
         use std::time::Instant as StdInstant;
 
@@ -2979,46 +3094,59 @@ mod tests {
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         let net_a = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_a, local_prefix: prefix_a,
-            listen: vec![listen_addr.clone()], bootstrap: vec![],
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
         }));
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
             Duration::from_secs(5),
-        ).expect("net_a binds");
+        )
+        .expect("net_a binds");
         let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
 
         let net_b = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_b, local_prefix: prefix_b,
-            listen: vec![listen_addr.clone()], bootstrap: vec![a_dial.clone()],
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![a_dial.clone()],
         }));
         let b_addr = wait_for(
             || net_b.listen_addrs().into_iter().next(),
             Duration::from_secs(5),
-        ).expect("net_b binds");
+        )
+        .expect("net_b binds");
         let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
 
         let net_c = Arc::new(Network::start(NetworkConfig {
-            keypair: kp_c, local_prefix: prefix_c,
-            listen: vec![listen_addr], bootstrap: vec![a_dial, b_dial],
+            keypair: kp_c,
+            local_prefix: prefix_c,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial, b_dial],
         }));
 
-        wait_for(|| {
-            let ab = net_a.peer_for_prefix(prefix_b).is_some()
-                  && net_b.peer_for_prefix(prefix_a).is_some();
-            let ac = net_a.peer_for_prefix(prefix_c).is_some()
-                  && net_c.peer_for_prefix(prefix_a).is_some();
-            let bc = net_b.peer_for_prefix(prefix_c).is_some()
-                  && net_c.peer_for_prefix(prefix_b).is_some();
-            (ab && ac && bc).then_some(())
-        }, Duration::from_secs(15))
+        wait_for(
+            || {
+                let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some();
+                let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_a).is_some();
+                let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_b).is_some();
+                (ab && ac && bc).then_some(())
+            },
+            Duration::from_secs(15),
+        )
         .expect("3-node Hello mesh forms");
 
         let dir = std::env::temp_dir().join(format!(
             "vos_raft_replicate_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let mk_worker = |me, network: Arc<Network>, db_name: &str| {
@@ -3064,7 +3192,9 @@ mod tests {
                     }
                 }
             }
-            if leader.is_some() { break; }
+            if leader.is_some() {
+                break;
+            }
             assert!(StdInstant::now() < until, "no leader within deadline");
             std::thread::sleep(Duration::from_millis(15));
         }
@@ -3101,9 +3231,8 @@ mod tests {
                 w_c.handler().snapshot(),
             ];
             let converged = snaps.iter().all(|s| {
-                s.as_ref().is_some_and(|x| {
-                    x.commit_index >= 4 && x.commit_index == x.last_log_index
-                })
+                s.as_ref()
+                    .is_some_and(|x| x.commit_index >= 4 && x.commit_index == x.last_log_index)
             }) && {
                 let cis: Vec<u64> = snaps
                     .iter()
@@ -3111,11 +3240,11 @@ mod tests {
                     .collect();
                 cis.windows(2).all(|w| w[0] == w[1])
             };
-            if converged { break; }
+            if converged {
+                break;
+            }
             if StdInstant::now() >= until {
-                panic!(
-                    "replicas did not converge within deadline; snaps: {snaps:?}",
-                );
+                panic!("replicas did not converge within deadline; snaps: {snaps:?}",);
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -3194,9 +3323,7 @@ mod tests {
                 .iter()
                 .map(|p| {
                     entries.iter().position(|e| e == p).unwrap_or_else(|| {
-                        panic!(
-                            "replica {label}: payload {p:?} not in committed log",
-                        )
+                        panic!("replica {label}: payload {p:?} not in committed log",)
                     })
                 })
                 .collect();
@@ -3212,7 +3339,8 @@ mod tests {
         let pivot = &probes[0].2[..shortest];
         for (label, _, entries) in &probes[1..] {
             assert_eq!(
-                &entries[..shortest], pivot,
+                &entries[..shortest],
+                pivot,
                 "replica {label} disagrees with replica {} on the first {shortest} \
                  committed entries — Raft safety violation",
                 probes[0].0,
@@ -3229,9 +3357,18 @@ mod tests {
         // `tests/elf_integration.rs` covers the host-level
         // last_applied advance end-to-end.
 
-        match Arc::try_unwrap(net_a) { Ok(n) => n.join(), Err(_) => {} }
-        match Arc::try_unwrap(net_b) { Ok(n) => n.join(), Err(_) => {} }
-        match Arc::try_unwrap(net_c) { Ok(n) => n.join(), Err(_) => {} }
+        match Arc::try_unwrap(net_a) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_b) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_c) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

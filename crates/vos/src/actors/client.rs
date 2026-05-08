@@ -12,10 +12,10 @@
 //! are cheap to construct — keep them as locals next to the call
 //! site, or as fields on a long-lived host struct.
 
-use alloc::{string::String, vec::Vec};
-use core::future::Future;
 use super::context::ServiceId;
 use super::value::Value;
+use alloc::{string::String, vec::Vec};
+use core::future::Future;
 
 /// Error returned by every macro-generated host client method.
 #[derive(Debug)]

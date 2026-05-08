@@ -91,18 +91,18 @@ pub(crate) mod testutil;
 #[cfg(feature = "std")]
 pub mod worker;
 
+#[cfg(feature = "tokio")]
+pub use clock::TokioClock;
 pub use clock::{ApplySink, Clock, Rng};
 #[cfg(feature = "std")]
 pub use clock::{StdClock, StdRng};
-#[cfg(feature = "tokio")]
-pub use clock::TokioClock;
 pub use config::{Config, NodeId};
 pub use log_entry::{EntryKind, LogEntry};
 pub use meta::Meta;
 pub use role::Role;
 pub use rpc::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
-    PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
+    PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 pub use storage::{MemStorage, Storage, WriteBatch};
 pub use transport::Transport;

@@ -53,5 +53,8 @@ fn main() {
 
     // Force re-run when the elf appears or changes.
     println!("cargo:rerun-if-changed={}", elf_path.display());
-    println!("cargo:rustc-env=VOSX_BUNDLED_REGISTRY_ELF={}", dest.display());
+    println!(
+        "cargo:rustc-env=VOSX_BUNDLED_REGISTRY_ELF={}",
+        dest.display()
+    );
 }

@@ -147,15 +147,12 @@ pub trait Storage<N: NodeId>: Send + 'static {
 
     /// Read the snapshot row. Empty `Vec` when no snapshot has
     /// been installed.
-    fn read_state(
-        &self,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send;
+    fn read_state(&self)
+    -> impl core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send;
 
     /// Read all durable scalars. Default for a fresh log:
     /// `Meta::default()`.
-    fn load_meta(
-        &self,
-    ) -> impl core::future::Future<Output = Result<Meta<N>, Self::Error>> + Send;
+    fn load_meta(&self) -> impl core::future::Future<Output = Result<Meta<N>, Self::Error>> + Send;
 
     /// Read the persisted active cluster configuration, if the
     /// backend supports cross-snapshot membership recovery.
@@ -175,9 +172,8 @@ pub trait Storage<N: NodeId>: Send + 'static {
     /// view to `cfg.members`.
     fn active_config(
         &self,
-    ) -> impl core::future::Future<
-        Output = Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error>,
-    > + Send {
+    ) -> impl core::future::Future<Output = Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error>> + Send
+    {
         async { Ok(None) }
     }
 
@@ -283,9 +279,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.meta.clone())
     }
 
-    async fn active_config(
-        &self,
-    ) -> Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error> {
+    async fn active_config(&self) -> Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error> {
         Ok(self.active_config.clone())
     }
 
@@ -321,8 +315,8 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
     use crate::testutil::block_on;
+    use alloc::vec;
 
     type Mem = MemStorage<u16>;
 
@@ -398,13 +392,22 @@ mod tests {
             .unwrap();
             assert_eq!(s.snap_last_index(), 2);
             assert_eq!(s.snap_last_term(), 1);
-            assert_eq!(s.term_at(1).await.unwrap(), None,
-                "compacted entry returns None");
-            assert_eq!(s.term_at(2).await.unwrap(), Some(1),
-                "snap boundary returns snap_last_term");
+            assert_eq!(
+                s.term_at(1).await.unwrap(),
+                None,
+                "compacted entry returns None"
+            );
+            assert_eq!(
+                s.term_at(2).await.unwrap(),
+                Some(1),
+                "snap boundary returns snap_last_term"
+            );
             assert_eq!(s.term_at(3).await.unwrap(), Some(2));
-            assert_eq!(s.entries(1, 5).await.unwrap().len(), 1,
-                "only entry 3 survives compaction");
+            assert_eq!(
+                s.entries(1, 5).await.unwrap().len(),
+                1,
+                "only entry 3 survives compaction"
+            );
         });
     }
 }

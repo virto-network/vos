@@ -44,12 +44,13 @@ impl DaemonClient {
         let entry = spaces_index::find(&index, query)?.clone();
         let data_dir = std::path::PathBuf::from(&entry.data_dir);
 
-        let ep = endpoint::read(&data_dir)?
-            .ok_or_else(|| anyhow::anyhow!(
+        let ep = endpoint::read(&data_dir)?.ok_or_else(|| {
+            anyhow::anyhow!(
                 "no daemon running for space '{}'. Start it with `vosx space up {}`.",
                 entry.name,
                 entry.name,
-            ))?;
+            )
+        })?;
         if !endpoint::is_alive(&ep) {
             anyhow::bail!(
                 "stale endpoint file (pid {} not running). \
@@ -95,7 +96,9 @@ impl DaemonClient {
             let _ = node.collect();
             anyhow::bail!(
                 "couldn't reach daemon (prefix {:#06x}) at {} within {:?}",
-                ep.prefix, bootstrap_str, CONNECT_TIMEOUT,
+                ep.prefix,
+                bootstrap_str,
+                CONNECT_TIMEOUT,
             );
         }
 
@@ -126,7 +129,10 @@ impl DaemonClient {
             }
         }
         let guard = Guard(Some(Self::connect(query)?));
-        let client = guard.0.as_ref().expect("guard always holds Some after connect");
+        let client = guard
+            .0
+            .as_ref()
+            .expect("guard always holds Some after connect");
         f(client)
     }
 
@@ -163,10 +169,12 @@ impl DaemonClient {
                 .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
             return Ok(ServiceId(raw));
         }
-        let agent = self.agent(target)?.ok_or_else(|| anyhow::anyhow!(
-            "no agent named '{target}' is installed in this space \
+        let agent = self.agent(target)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no agent named '{target}' is installed in this space \
              (use `vosx space agents <space>` to list)",
-        ))?;
+            )
+        })?;
         debug_assert_eq!(agent.instance_name, target);
         Ok(instance_service_id(target, self.daemon_prefix))
     }
@@ -186,11 +194,15 @@ impl DaemonClient {
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
-        let reply = self.node.invoke_with_timeout(target, payload, INVOKE_TIMEOUT)
-            .ok_or_else(|| anyhow::anyhow!(
-                "daemon at {target} didn't reply within {:?} (target unreachable or timed out)",
-                INVOKE_TIMEOUT,
-            ))?;
+        let reply = self
+            .node
+            .invoke_with_timeout(target, payload, INVOKE_TIMEOUT)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "daemon at {target} didn't reply within {:?} (target unreachable or timed out)",
+                    INVOKE_TIMEOUT,
+                )
+            })?;
         if reply.is_empty() {
             return Ok(vos::value::Value::Unit);
         }
@@ -218,11 +230,7 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))
     }
 
-    pub fn program(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> anyhow::Result<Option<ProgramRow>> {
+    pub fn program(&self, name: &str, version: &str) -> anyhow::Result<Option<ProgramRow>> {
         vos::block_on(self.registry().program(
             &mut &self.node,
             name.to_string(),
@@ -237,8 +245,11 @@ impl DaemonClient {
     }
 
     pub fn agent(&self, instance_name: &str) -> anyhow::Result<Option<AgentRow>> {
-        vos::block_on(self.registry().agent(&mut &self.node, instance_name.to_string()))
-            .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
+        vos::block_on(
+            self.registry()
+                .agent(&mut &self.node, instance_name.to_string()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
     }
 
     pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
@@ -246,14 +257,12 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
     }
 
-    pub fn publish(
-        &self,
-        name: String,
-        version: String,
-        hash: Vec<u8>,
-    ) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().publish(&mut &self.node, name, version, hash))
-            .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
+    pub fn publish(&self, name: String, version: String, hash: Vec<u8>) -> anyhow::Result<u8> {
+        vos::block_on(
+            self.registry()
+                .publish(&mut &self.node, name, version, hash),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 
     pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<u8> {
@@ -309,14 +318,12 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.uninstall(): {e}"))
     }
 
-    pub fn add_node(
-        &self,
-        prefix: u32,
-        peer_id: Vec<u8>,
-        role: u8,
-    ) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().add_node(&mut &self.node, prefix, peer_id, role))
-            .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
+    pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
+        vos::block_on(
+            self.registry()
+                .add_node(&mut &self.node, prefix, peer_id, role),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
     }
 
     pub fn remove_node(&self, prefix: u32) -> anyhow::Result<u8> {

@@ -66,4 +66,3 @@ impl CrdtCounter {
         id
     }
 }
-

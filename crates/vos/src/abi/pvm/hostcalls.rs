@@ -4,8 +4,8 @@
 //! discipline (which calls are legal in refine vs accumulate) is enforced
 //! by the host runtime, not the ID namespace.
 
-use crate::abi::hostcall;
 use super::ecall::*;
+use crate::abi::hostcall;
 
 // --- Shared across phases ---
 
@@ -24,7 +24,11 @@ pub fn grow_heap(pages: u32) -> u64 {
 /// Write debug output. vosx prints to stderr.
 #[inline]
 pub fn debug_write(data: &[u8]) -> u64 {
-    ecall2(hostcall::DEBUG_WRITE, data.as_ptr() as u64, data.len() as u64)
+    ecall2(
+        hostcall::DEBUG_WRITE,
+        data.as_ptr() as u64,
+        data.len() as u64,
+    )
 }
 
 // --- Refine-legal ---
@@ -55,14 +59,8 @@ pub fn peek(key: &[u8], value_buf: &mut [u8]) -> u64 {
 /// "legacy / no cap" so older PVM blobs that predate this ABI
 /// extension keep their previous behaviour (unsafe but unchanged).
 #[inline]
-pub fn invoke(
-    code_hash: &[u8; 32],
-    input: &[u8],
-    gas_limit: u64,
-    output: &mut [u8],
-) -> u64 {
-    let output_packed = (output.as_mut_ptr() as u64)
-        | ((output.len() as u64) << 32);
+pub fn invoke(code_hash: &[u8; 32], input: &[u8], gas_limit: u64, output: &mut [u8]) -> u64 {
+    let output_packed = (output.as_mut_ptr() as u64) | ((output.len() as u64) << 32);
     ecall5(
         hostcall::INVOKE,
         code_hash.as_ptr() as u64,
@@ -139,7 +137,12 @@ pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]
-pub fn transfer(target: crate::abi::service::ServiceId, amount: u64, gas_limit: u64, memo: &[u8]) -> u64 {
+pub fn transfer(
+    target: crate::abi::service::ServiceId,
+    amount: u64,
+    gas_limit: u64,
+    memo: &[u8],
+) -> u64 {
     ecall5(
         hostcall::TRANSFER,
         target.0 as u64,

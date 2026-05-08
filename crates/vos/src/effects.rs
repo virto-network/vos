@@ -77,11 +77,21 @@ pub struct FetchRequest {
 
 impl FetchRequest {
     pub fn get(url: impl Into<String>) -> Self {
-        Self { method: HttpMethod::Get, url: url.into(), headers: Vec::new(), body: Vec::new() }
+        Self {
+            method: HttpMethod::Get,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
     }
 
     pub fn post(url: impl Into<String>) -> Self {
-        Self { method: HttpMethod::Post, url: url.into(), headers: Vec::new(), body: Vec::new() }
+        Self {
+            method: HttpMethod::Post,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
     }
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -130,7 +140,12 @@ impl FetchRequest {
         }
         let body_len = c.u32()? as usize;
         let body = c.take(body_len)?.to_vec();
-        Some(FetchRequest { method, url, headers, body })
+        Some(FetchRequest {
+            method,
+            url,
+            headers,
+            body,
+        })
     }
 }
 
@@ -176,39 +191,61 @@ impl FetchResponse {
         }
         let body_len = c.u32()? as usize;
         let body = c.take(body_len)?.to_vec();
-        Some(FetchResponse { status, headers, body })
+        Some(FetchResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Error response with status 0 and an error message in the body.
     pub fn host_error(msg: impl Into<String>) -> Self {
-        Self { status: 0, headers: Vec::new(), body: msg.into().into_bytes() }
+        Self {
+            status: 0,
+            headers: Vec::new(),
+            body: msg.into().into_bytes(),
+        }
     }
 }
 
 // ── Codec helpers ───────────────────────────────────────────────────
 
-fn write_u16(out: &mut Vec<u8>, v: u16) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_le_bytes()); }
+fn write_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn write_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
 fn write_str(out: &mut Vec<u8>, s: &str) {
     write_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
 
-struct Cursor<'a> { buf: &'a [u8], pos: usize }
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos + n > self.buf.len() { return None; }
+        if self.pos + n > self.buf.len() {
+            return None;
+        }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Some(s)
     }
-    fn u8(&mut self) -> Option<u8> { self.take(1).map(|b| b[0]) }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
     fn u16(&mut self) -> Option<u16> {
         self.take(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
     }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        self.take(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn str(&mut self) -> Option<String> {
         let len = self.u32()? as usize;
@@ -232,7 +269,13 @@ mod tests {
         assert_eq!(decoded.method, HttpMethod::Post);
         assert_eq!(decoded.url, "https://example.com/api");
         assert_eq!(decoded.headers.len(), 2);
-        assert_eq!(decoded.headers[0], (String::from("Content-Type"), String::from("application/json")));
+        assert_eq!(
+            decoded.headers[0],
+            (
+                String::from("Content-Type"),
+                String::from("application/json")
+            )
+        );
         assert_eq!(decoded.body, b"{\"key\":\"value\"}");
     }
 

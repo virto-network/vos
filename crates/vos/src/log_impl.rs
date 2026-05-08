@@ -21,8 +21,8 @@
 
 mod pvm {
     use crate::abi::pvm::hostcalls::debug_write;
-    use core::fmt::Write;
     use ::log::{Level, LevelFilter, Log, Metadata, Record};
+    use core::fmt::Write;
 
     /// Per-record formatting buffer cap. Records longer than this
     /// are truncated; `DEBUG_WRITE` is best-effort diagnostics, not
@@ -42,7 +42,10 @@ mod pvm {
         fn log(&self, record: &Record<'_>) {
             let mut buf = [0u8; FMT_CAP];
             let pos = {
-                let mut w = StackWriter { buf: &mut buf, pos: 0 };
+                let mut w = StackWriter {
+                    buf: &mut buf,
+                    pos: 0,
+                };
                 // Format: `[LEVEL target] message\n`. Target defaults
                 // to module path which is informative without being
                 // verbose.

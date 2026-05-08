@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use vos_raft::{
-    AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, RequestVoteReq, Role,
-    StdRng, TokioClock, Transport, Worker,
+    AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, RequestVoteReq, Role, StdRng,
+    TokioClock, Transport, Worker,
 };
 
 struct NoopT;

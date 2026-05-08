@@ -32,7 +32,9 @@ pub fn space_id_hex(id: &[u8; 32]) -> String {
 fn xdg_root(env_var: &str, home_relative: &[&str]) -> PathBuf {
     let from_home = || {
         std::env::var_os("HOME").map(|h| {
-            home_relative.iter().fold(PathBuf::from(h), |p, s| p.join(s))
+            home_relative
+                .iter()
+                .fold(PathBuf::from(h), |p, s| p.join(s))
         })
     };
     let base = std::env::var_os(env_var)
