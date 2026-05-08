@@ -1950,7 +1950,15 @@ impl BuiltInComponent for CpuChip {
             let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11);
             let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
 
-            const ECALL_REG_IDXS: [u32; 4] = [7, 10, 11, 12];
+            // Slot → PVM register index for the ECALL register-read
+            // producer.  The `Column::Phi*` names retain their pre-fix
+            // labels for diff minimisation; their actual sources are:
+            //   Phi7  ← φ[10] (f_flag)
+            //   Phi10 ← φ[7]  (h_ptr)
+            //   Phi11 ← φ[8]  (m_ptr)
+            //   Phi12 ← φ[9]  (t_low)
+            // See `trace_fill.rs` Phase 8c block for the full mapping.
+            const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
             let phi_cols: [&[E::F]; 4] = [&phi7, &phi10, &phi11, &phi12];
             for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
                 let mut tuple: Vec<E::F> = Vec::with_capacity(17);

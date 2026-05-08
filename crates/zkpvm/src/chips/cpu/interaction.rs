@@ -311,17 +311,21 @@ pub(super) fn generate_interaction_trace(
             );
         }
 
-        // ── Phase 9e: blake2b ECALL register reads (φ[7], [10], [11], [12]) ──
+        // ── Phase 9e: blake2b ECALL register reads (φ[7], [8], [9], [10]) ──
         // 4 extra register-memory producers emitted only at blake2b ECALL
-        // steps.  Values come from the dedicated Phi7/Phi10/Phi11/Phi12
-        // columns; indices are hardcoded constants.
+        // steps.  Per the off-by-three fix, the actor's a0/a1/a2/a3 map
+        // to PVM φ[7/8/9/10].  The `Column::Phi*` names are kept as
+        // pre-fix slot labels (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12,
+        // f_flag=Phi7) — see `mod.rs::ECALL_REG_IDXS` for the
+        // slot-to-register mapping that aligns with `trace_fill.rs`'s
+        // sources.
         let is_blake_ecall = crate::trace::original_base_column!(component_trace, Column::IsBlakeEcall);
         let phi7 = crate::trace::original_base_column!(component_trace, Column::Phi7);
         let phi10 = crate::trace::original_base_column!(component_trace, Column::Phi10);
         let phi11 = crate::trace::original_base_column!(component_trace, Column::Phi11);
         let phi12 = crate::trace::original_base_column!(component_trace, Column::Phi12);
         use stwo::prover::backend::simd::m31::PackedBaseField;
-        const ECALL_REG_IDXS: [u32; 4] = [7, 10, 11, 12];
+        const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
         let phi_cols: [_; 4] = [
             phi7.clone(),
             phi10.clone(),

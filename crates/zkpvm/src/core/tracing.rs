@@ -395,31 +395,23 @@ impl TracingPvm {
     }
 
     fn handle_blake2b_ecall(&mut self) {
-        // Read h (64 bytes) from memory at address in φ[10].
-        // NOTE: this handler reads φ[10/11/12/7] but the zkpvm-precompiles
-        // shim transpiles RISC-V a0/a1/a2/a3 to PVM φ[7/8/9/10] (per
-        // grey-transpiler's `map_register`).  This is the same off-by-three
-        // pattern that was fixed for `handle_ristretto_scalar_mult_ecall`
-        // (commit 02922c4) and the simpler precompiles
-        // (`handle_scalar_reduce_wide_ecall`, `handle_scalar_binop_ecall`,
-        // `handle_ristretto_point_add_ecall`).  Blake2b is the LAST holdout
-        // because the fix is non-local: `CpuChip` emits a
-        // `Blake2bCallLookupElements` tuple `(phi10[4], phi11[4], phi12[8],
-        // phi7_bool, ts[8])` consumed by `Blake2bChip`.  Aligning the
-        // handler requires also rewiring CpuChip's tuple to use
-        // `(phi7[4], phi8[4], phi9[8], phi10_bool, ts[8])` plus introducing
-        // `Phi8`/`Phi9` columns and renaming `Phi7Bool` → `Phi10Bool` (or
-        // adding a new bool column for φ[10]) to track the f flag.  In
-        // practice the bug is invisible to the prover/verifier (both sides
-        // are consistent in the lie) but the actor's downstream blake2b
-        // output reads return uninitialized bytes instead of the
-        // compression result.  Holistic fix is the next-larger deliverable.
-        let h_ptr_u = self.pvm.registers[10] as usize;
-        let m_ptr_u = self.pvm.registers[11] as usize;
-        let h_ptr = self.pvm.registers[10] as u32;
-        let m_ptr = self.pvm.registers[11] as u32;
-        let t_low = self.pvm.registers[12];
-        let f = self.pvm.registers[7] != 0; // φ[7] as finalization flag
+        // Read h (64 bytes) from memory at address in φ[7] (a0).
+        //
+        // Register convention: zkpvm-precompiles shim emits a0/a1/a2/a3
+        // → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler maps to PVM
+        // φ[7/8/9/10].  Same off-by-three alignment as the other
+        // precompile handlers (commit 02922c4 + this session's
+        // 5339d38/1cc1296/8c3a9ff for ristretto_scalar_mult /
+        // scalar_reduce_wide / scalar_binop / ristretto_point_add).
+        // Blake2b additionally requires CpuChip-side rewiring (the
+        // `Blake2bCallLookupElements` tuple's slot-to-register-index
+        // mapping is updated in `chips/cpu/{trace_fill,mod,interaction}.rs`).
+        let h_ptr_u = self.pvm.registers[7] as usize;
+        let m_ptr_u = self.pvm.registers[8] as usize;
+        let h_ptr = self.pvm.registers[7] as u32;
+        let m_ptr = self.pvm.registers[8] as u32;
+        let t_low = self.pvm.registers[9];
+        let f = self.pvm.registers[10] != 0; // a3 (= x13 = φ[10]) holds f_flag
 
         let mut h = [0u64; 8];
         let mut m = [0u64; 16];

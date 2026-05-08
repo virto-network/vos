@@ -1090,16 +1090,32 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
 
             // ── Blake2b ECALL binding (Phase 8c) ──
             // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
-            // regs_before values that the precompile reads (φ[10], [11], [12])
-            // plus the derived boolean form of φ[7].
+            // regs_before values that the precompile reads.
+            //
+            // Register convention (post off-by-three fix): the
+            // zkpvm-precompiles shim puts a0/a1/a2/a3 → h_ptr/m_ptr/t_low/f_flag,
+            // which grey-transpiler maps to PVM φ[7/8/9/10].  The
+            // `Column::Phi*` names below are semantic slot labels for
+            // the Blake2bCall lookup tuple — Phi10 holds h_ptr (sourced
+            // from φ[7]), Phi11 holds m_ptr (φ[8]), Phi12 holds t_low
+            // (φ[9]), and Phi7 holds the full u64 of f_flag (φ[10]).
+            // The slot-to-register-index re-routing happens in the
+            // ECALL_REG_IDXS array on the producer side; keeping the
+            // legacy column names minimises the cross-file diff at the
+            // cost of a little local confusion (the column comments
+            // below carry the slot's actual semantic meaning).
             let is_blake_ecall = matches!(step.opcode,
                     crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall)
                 && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
             trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
-            trace.fill_columns(row, step.regs_before[10], Column::Phi10);
-            trace.fill_columns(row, step.regs_before[11], Column::Phi11);
-            trace.fill_columns(row, step.regs_before[12], Column::Phi12);
-            let phi7_u64 = step.regs_before[7];
+            // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
+            trace.fill_columns(row, step.regs_before[7], Column::Phi10);
+            // Phi11 slot ← m_ptr (a1 = x11 = PVM φ[8]).
+            trace.fill_columns(row, step.regs_before[8], Column::Phi11);
+            // Phi12 slot ← t_low (a2 = x12 = PVM φ[9]).
+            trace.fill_columns(row, step.regs_before[9], Column::Phi12);
+            // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
+            let phi7_u64 = step.regs_before[10];
             trace.fill_columns(row, phi7_u64, Column::Phi7);
             let phi7_bool: u8 = if phi7_u64 != 0 { 1 } else { 0 };
             trace.fill_columns(row, phi7_bool, Column::Phi7Bool);

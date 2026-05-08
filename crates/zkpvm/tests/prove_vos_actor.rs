@@ -769,10 +769,11 @@ fn prove_blake2b_precompile() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = h_addr;
-    regs[11] = m_addr;
-    regs[12] = 0;
-    regs[7] = 1;
+    // PVM A0/A1/A2/A3 = φ[7/8/9/10] post off-by-three fix.
+    regs[7] = h_addr;
+    regs[8] = m_addr;
+    regs[9] = 0;
+    regs[10] = 1;
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25,
@@ -795,7 +796,8 @@ fn prove_blake2b_precompile() {
 
     let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
-    verify(proof, &side_note).expect("blake2b verification failed");
+    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("blake2b verification failed");
     eprintln!("Blake2b precompile: PROVED!");
 }
 
@@ -1994,10 +1996,14 @@ fn prove_blake2b_via_ecall() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[10] = h_addr;  // φ[10] = h pointer
-    regs[11] = m_addr;  // φ[11] = m pointer
-    regs[12] = 0;       // φ[12] = t (counter)
-    regs[7] = 1;        // φ[7] = f (finalize flag)
+    // PVM A0/A1/A2/A3 = φ[7/8/9/10] post off-by-three fix.  The
+    // zkpvm-precompiles shim's `in("a0") h_ptr, in("a1") m_ptr,
+    // in("a2") t_low, in("a3") f_flag` lands the actor's blake2b
+    // arguments in φ[7/8/9/10], where the host handler now reads them.
+    regs[7] = h_addr;  // a0 = h pointer
+    regs[8] = m_addr;  // a1 = m pointer
+    regs[9] = 0;       // a2 = t (counter)
+    regs[10] = 1;      // a3 = f (finalize flag)
 
     let pvm = javm::interpreter::Interpreter::new(
         code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25
@@ -2027,7 +2033,12 @@ fn prove_blake2b_via_ecall() {
 
     let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("proving failed");
-    verify(proof, &side_note).expect("verification failed");
+    // Test config uses pow_bits=5 / fri_log_blowup=0, well below the
+    // STANDARD policy floor.  Use a permissive policy so the verify
+    // step exercises the algebraic check, not the policy gate.  This
+    // was a pre-existing failure mode; pure-test fix.
+    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verification failed");
     eprintln!("Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
         side_note.steps.len(), blake2b_records.len() * 96);
 }

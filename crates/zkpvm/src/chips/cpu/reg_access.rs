@@ -83,16 +83,21 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
         None
     };
     let result_write = step.reg_write.map(|idx| (idx as u8, step.regs_after[idx]));
-    // Phase 9e: blake2b ECALL reads φ[7], φ[10], φ[11], φ[12] at this step's ts.
+    // Phase 9e: blake2b ECALL reads φ[7], φ[8], φ[9], φ[10] at this step's
+    // ts.  Post off-by-three fix: the actor's a0/a1/a2/a3 (h_ptr/m_ptr/
+    // t_low/f_flag) map to PVM φ[7/8/9/10] via grey-transpiler's
+    // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in `mod.rs` and
+    // `interaction.rs`) emits register-file producers at [10, 7, 8, 9]
+    // — matching this ledger consumer per blake2b ECALL step.
     let is_blake_ecall = matches!(step.opcode,
             crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall)
         && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
     let ecall_reads = if is_blake_ecall {
         vec![
             (7u8, step.regs_before[7]),
+            (8u8, step.regs_before[8]),
+            (9u8, step.regs_before[9]),
             (10u8, step.regs_before[10]),
-            (11u8, step.regs_before[11]),
-            (12u8, step.regs_before[12]),
         ]
     } else {
         Vec::new()
