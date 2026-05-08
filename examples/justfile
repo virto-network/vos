@@ -1,15 +1,22 @@
+# Per-actor PVM builds. Each actor's `.cargo/config.toml`
+# defines `cargo actor` as `cargo build -Zbuild-std=core,alloc,compiler_builtins
+# --release --target riscv64em-javm.json`. Plain `cargo build`
+# can't substitute — actors only declare their `vos` dep
+# under `[target.'cfg(target_arch = "riscv64")']`, so a host
+# build sees no vos and the imports fail.
+
 build:
-    cd agents/scheduler && cargo build --release
-    cd actors/greeter && cargo build --release
-    cd actors/counter && cargo build --release
-    cd actors/fizzbuzz && cargo build --release
-    cd actors/hasher && cargo build --release
-    cd actors/display && cargo build --release
-    cd actors/animation && cargo build --release
-    cd actors/math && cargo build --release
-    cd actors/pipeline && cargo build --release
-    cd actors/crdt-counter && cargo build --release
-    cd actors/pushy && cargo build --release
+    cd agents/scheduler && cargo actor
+    cd actors/greeter && cargo actor
+    cd actors/counter && cargo actor
+    cd actors/fizzbuzz && cargo actor
+    cd actors/hasher && cargo actor
+    cd actors/display && cargo actor
+    cd actors/animation && cargo actor
+    cd actors/math && cargo actor
+    cd actors/pipeline && cargo actor
+    cd actors/crdt-counter && cargo actor
+    cd actors/pushy && cargo actor
 
 run: build
     cargo run --manifest-path ../Cargo.toml -p vosx -- start space.toml --no-persist
