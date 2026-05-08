@@ -1,0 +1,28 @@
+[package]
+name = "http-gateway"
+description = "HTTP gateway worker — exposes other actors over GET/POST routes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# `bin` enables the cdylib's `vos_worker_*` extern-fn exports.
+# Default-on so a plain `cargo build` produces a loadable
+# worker .so. Cross-actor lib deps disable default features.
+default = ["bin"]
+bin = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../vos", default-features = false, features = ["worker"] }
+# Connection-side I/O runs on tokio so the worker can accept many
+# clients concurrently. Dispatch through `ctx.ask` is still serial
+# (the actor's `ctx` is single-threaded), but accept/parse/write
+# parallelizes across the runtime's worker tasks.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "sync", "time", "macros"] }

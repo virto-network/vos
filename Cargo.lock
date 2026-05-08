@@ -1478,6 +1478,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-gateway"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "vos",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

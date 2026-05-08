@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/*",
+    "crates/workers/http-gateway",
     "examples/workers/*",
 ]
 exclude = [
@@ -15,6 +16,9 @@ exclude = [
     # it up as a workspace member.
     "crates/actors",
     "crates/actors/space-registry",
+    # `crates/workers` is a parent directory holding worker
+    # plugins; each sub-crate is listed in `members` explicitly.
+    "crates/workers",
 ]
 
 [workspace.package]
