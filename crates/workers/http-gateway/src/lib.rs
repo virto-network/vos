@@ -577,11 +577,7 @@ async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response 
         }
         "POST" | "PUT" | "PATCH" => {
             if !req.body.is_empty() {
-                let body_str = match std::str::from_utf8(&req.body) {
-                    Ok(s) => s,
-                    Err(_) => return Response::text(400, "body is not valid utf-8"),
-                };
-                match parse_flat_json(body_str) {
+                match parse_flat_json(&req.body) {
                     Ok(pairs) => {
                         for (k, v) in pairs {
                             msg = msg.with(k, v);
@@ -656,198 +652,105 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-// ── Tiny JSON ───────────────────────────────────────────────────────
+// ── JSON ⇄ Value ────────────────────────────────────────────────────
 //
-// Both directions are deliberately minimal:
+// Parsing covers a top-level JSON object whose values are scalars,
+// strings, or null. Arrays land as `ListStr` when every element is a
+// string and `ListU32` when every element is a non-negative integer
+// fitting in u32 — that matches what `vos::Value` can carry.
+// Anything richer (nested objects, mixed-type arrays, floats) is
+// rejected with a 400; the URL contract is "method name + flat
+// argument map", and a richer arg form belongs in a future iteration.
 //
-// - `parse_flat_json` only accepts a top-level object whose values
-//   are strings/numbers/bools/null. That matches the URL convention
-//   (one method-name + a flat arg map) and keeps the worker free of
-//   a real JSON dep for now.
-// - `value_to_json` renders the whole `Value` enum, including list
-//   variants, so callers see structured replies instead of opaque
-//   debug formatting.
+// Serialization renders the whole `Value` enum. `Bytes` becomes a
+// base16 string — we're not optimizing for blob transfer over JSON.
 
-fn parse_flat_json(input: &str) -> IoResult<Vec<(String, Value)>> {
-    let mut p = JsonParser::new(input);
-    p.skip_ws();
-    p.expect(b'{')?;
-    p.skip_ws();
-    let mut out = Vec::new();
-    if p.peek() == Some(b'}') {
-        p.bump();
-        return Ok(out);
-    }
-    loop {
-        p.skip_ws();
-        let key = p.parse_string()?;
-        p.skip_ws();
-        p.expect(b':')?;
-        p.skip_ws();
-        let value = p.parse_value()?;
-        out.push((key, value));
-        p.skip_ws();
-        match p.peek() {
-            Some(b',') => { p.bump(); }
-            Some(b'}') => { p.bump(); return Ok(out); }
-            _ => return Err("expected ',' or '}'".into()),
-        }
-    }
+fn parse_flat_json(body: &[u8]) -> IoResult<Vec<(String, Value)>> {
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("{e}"))?;
+    let serde_json::Value::Object(map) = json else {
+        return Err("expected a top-level JSON object".into());
+    };
+    map.into_iter()
+        .map(|(k, v)| Ok((k, json_to_value(v)?)))
+        .collect()
 }
 
-struct JsonParser<'a> {
-    src: &'a [u8],
-    pos: usize,
+fn json_to_value(j: serde_json::Value) -> IoResult<Value> {
+    use serde_json::Value as J;
+    Ok(match j {
+        J::Null => Value::Unit,
+        J::Bool(b) => Value::Bool(b),
+        J::Number(n) => json_number_to_value(n)?,
+        J::String(s) => Value::Str(s),
+        J::Array(xs) => json_array_to_value(xs)?,
+        J::Object(_) => return Err("nested objects are not supported".into()),
+    })
 }
 
-impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self { Self { src: s.as_bytes(), pos: 0 } }
-    fn peek(&self) -> Option<u8> { self.src.get(self.pos).copied() }
-    fn bump(&mut self) -> Option<u8> { let b = self.peek()?; self.pos += 1; Some(b) }
-    fn expect(&mut self, b: u8) -> IoResult<()> {
-        match self.bump() {
-            Some(c) if c == b => Ok(()),
-            Some(c) => Err(format!("expected {:?}, got {:?}", b as char, c as char)),
-            None => Err(format!("expected {:?}, got EOF", b as char)),
-        }
-    }
-    fn skip_ws(&mut self) {
-        while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' { self.pos += 1; } else { break; }
-        }
-    }
-    fn parse_string(&mut self) -> IoResult<String> {
-        self.expect(b'"')?;
-        let mut out = Vec::new();
-        loop {
-            match self.bump() {
-                None => return Err("unterminated string".into()),
-                Some(b'"') => break,
-                Some(b'\\') => match self.bump() {
-                    Some(b'"') => out.push(b'"'),
-                    Some(b'\\') => out.push(b'\\'),
-                    Some(b'/') => out.push(b'/'),
-                    Some(b'n') => out.push(b'\n'),
-                    Some(b't') => out.push(b'\t'),
-                    Some(b'r') => out.push(b'\r'),
-                    Some(c) => out.push(c),
-                    None => return Err("unterminated escape".into()),
-                }
-                Some(b) => out.push(b),
-            }
-        }
-        String::from_utf8(out).map_err(|_| "invalid utf-8 in string".into())
-    }
-    fn parse_value(&mut self) -> IoResult<Value> {
-        match self.peek() {
-            Some(b'"') => self.parse_string().map(Value::Str),
-            Some(b't') => { self.consume(b"true")?; Ok(Value::Bool(true)) }
-            Some(b'f') => { self.consume(b"false")?; Ok(Value::Bool(false)) }
-            Some(b'n') => { self.consume(b"null")?; Ok(Value::Unit) }
-            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            Some(c) => Err(format!("unexpected token {:?}", c as char)),
-            None => Err("unexpected EOF".into()),
-        }
-    }
-    fn consume(&mut self, lit: &[u8]) -> IoResult<()> {
-        for &b in lit {
-            self.expect(b)?;
-        }
-        Ok(())
-    }
-    fn parse_number(&mut self) -> IoResult<Value> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') { self.pos += 1; }
-        while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
-        let mut is_float = false;
-        if self.peek() == Some(b'.') {
-            is_float = true;
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            is_float = true;
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) { self.pos += 1; }
-            while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
-        }
-        let slice = &self.src[start..self.pos];
-        let s = std::str::from_utf8(slice).map_err(|_| "non-utf8 number".to_string())?;
-        if is_float {
-            // The Value enum has no float variant — store as string for now.
-            // Receivers that want floats should parse from string until we
-            // extend Value.
-            Ok(Value::Str(s.to_string()))
-        } else if let Ok(v) = s.parse::<i64>() {
-            if v >= 0 && v <= u32::MAX as i64 { Ok(Value::U32(v as u32)) }
-            else { Ok(Value::I64(v)) }
+fn json_number_to_value(n: serde_json::Number) -> IoResult<Value> {
+    if let Some(u) = n.as_u64() {
+        return Ok(if u <= u32::MAX as u64 {
+            Value::U32(u as u32)
         } else {
-            Err(format!("invalid number {s}"))
-        }
+            Value::U64(u)
+        });
     }
+    if let Some(i) = n.as_i64() {
+        return Ok(Value::I64(i));
+    }
+    // Floats land as strings — `vos::Value` has no float variant.
+    Err(format!("non-integer number {n} unsupported"))
 }
 
-fn value_to_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_value(&mut out, value);
-    out
+fn json_array_to_value(xs: Vec<serde_json::Value>) -> IoResult<Value> {
+    if xs.is_empty() {
+        return Ok(Value::ListStr(Vec::new()));
+    }
+    if xs.iter().all(|v| v.is_string()) {
+        let strings = xs
+            .into_iter()
+            .map(|v| v.as_str().expect("checked").to_string())
+            .collect();
+        return Ok(Value::ListStr(strings));
+    }
+    if xs.iter().all(|v| v.as_u64().is_some_and(|u| u <= u32::MAX as u64)) {
+        let nums = xs
+            .into_iter()
+            .map(|v| v.as_u64().expect("checked") as u32)
+            .collect();
+        return Ok(Value::ListU32(nums));
+    }
+    Err("array elements must all be strings or all be non-negative u32-fitting integers".into())
 }
 
-fn write_value(out: &mut String, value: &Value) {
-    use std::fmt::Write as _;
-    match value {
-        Value::Unit => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::U8(v) => { let _ = write!(out, "{v}"); }
-        Value::U16(v) => { let _ = write!(out, "{v}"); }
-        Value::U32(v) => { let _ = write!(out, "{v}"); }
-        Value::U64(v) => { let _ = write!(out, "{v}"); }
-        Value::I32(v) => { let _ = write!(out, "{v}"); }
-        Value::I64(v) => { let _ = write!(out, "{v}"); }
-        Value::Str(s) => write_json_string(out, s),
+fn value_to_json(v: &Value) -> String {
+    serde_json::to_string(&value_to_json_value(v)).unwrap_or_else(|_| "null".into())
+}
+
+fn value_to_json_value(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Unit => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::U8(v) => (*v).into(),
+        Value::U16(v) => (*v).into(),
+        Value::U32(v) => (*v).into(),
+        Value::U64(v) => (*v).into(),
+        Value::I32(v) => (*v).into(),
+        Value::I64(v) => (*v).into(),
+        Value::Str(s) => J::String(s.clone()),
+        // Bytes → hex string. Same posture as before — JSON isn't a
+        // good blob transport, so we surface them as inspectable text.
         Value::Bytes(b) => {
-            // Rendered as a base16 string for now — the gateway is
-            // about API surfaces, not raw blob transfer.
-            out.push('"');
+            let mut s = String::with_capacity(b.len() * 2);
             for byte in b {
-                let _ = write!(out, "{byte:02x}");
-            }
-            out.push('"');
-        }
-        Value::ListU32(xs) => {
-            out.push('[');
-            for (i, v) in xs.iter().enumerate() {
-                if i > 0 { out.push(','); }
-                let _ = write!(out, "{v}");
-            }
-            out.push(']');
-        }
-        Value::ListStr(xs) => {
-            out.push('[');
-            for (i, s) in xs.iter().enumerate() {
-                if i > 0 { out.push(','); }
-                write_json_string(out, s);
-            }
-            out.push(']');
-        }
-    }
-}
-
-fn write_json_string(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
                 use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                let _ = write!(s, "{byte:02x}");
             }
-            c => out.push(c),
+            J::String(s)
         }
+        Value::ListU32(xs) => J::Array(xs.iter().map(|x| (*x).into()).collect()),
+        Value::ListStr(xs) => J::Array(xs.iter().map(|s| J::String(s.clone())).collect()),
     }
-    out.push('"');
 }
