@@ -18,19 +18,13 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(&args.query)?;
-    let entry = client.entry.clone();
-    let reg = client.registry();
-
-    let programs = vos::block_on(reg.programs(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("programs() failed: {e}"))?;
-    let agents = vos::block_on(reg.agents(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("agents() failed: {e}"))?;
-    let members = vos::block_on(reg.members(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("members() failed: {e}"))?;
-
-    print_manifest(&entry, &programs, &agents, &members);
-    client.shutdown()
+    DaemonClient::with_connect(&args.query, |client| {
+        let programs = client.programs()?;
+        let agents = client.agents()?;
+        let members = client.members()?;
+        print_manifest(&client.entry, &programs, &agents, &members);
+        Ok(())
+    })
 }
 
 fn print_manifest(

@@ -85,50 +85,48 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn list(space: &str) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let members = vos::block_on(reg.members(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("members() failed: {e}"))?;
+    DaemonClient::with_connect(space, |client| {
+        let members = client.members()?;
+        let nodes: Vec<_> = members.iter().filter(|m| m.kind == MEMBER_KIND_NODE).collect();
+        let identities: Vec<_> = members
+            .iter()
+            .filter(|m| m.kind == MEMBER_KIND_IDENTITY)
+            .collect();
 
-    let nodes: Vec<_> = members.iter().filter(|m| m.kind == MEMBER_KIND_NODE).collect();
-    let identities: Vec<_> = members
-        .iter()
-        .filter(|m| m.kind == MEMBER_KIND_IDENTITY)
-        .collect();
-
-    if !nodes.is_empty() {
-        println!("# nodes");
-        println!("{:<8}  {:<10}  PEER_ID", "PREFIX", "ROLE");
-        for n in &nodes {
-            let role = match n.role {
-                NODE_ROLE_VOTER => "voter",
-                NODE_ROLE_OBSERVER => "observer",
-                _ => "?",
-            };
-            let short_pid: String = hex::encode(&n.key).chars().take(20).collect();
-            println!("{:<8}  {:<10}  {short_pid}…", n.prefix, role);
-        }
-    }
-    if !identities.is_empty() {
         if !nodes.is_empty() {
-            println!();
+            println!("# nodes");
+            println!("{:<8}  {:<10}  PEER_ID", "PREFIX", "ROLE");
+            for n in &nodes {
+                let role = match n.role {
+                    NODE_ROLE_VOTER => "voter",
+                    NODE_ROLE_OBSERVER => "observer",
+                    _ => "?",
+                };
+                let short_pid: String = hex::encode(&n.key).chars().take(20).collect();
+                println!("{:<8}  {:<10}  {short_pid}…", n.prefix, role);
+            }
         }
-        println!("# identities");
-        println!("{:<10}  PUBLIC_KEY", "PROOF");
-        for i in &identities {
-            let proof = match i.proof_kind {
-                PROOF_KIND_MERKLE_INCLUSION => "merkle",
-                PROOF_KIND_ZK => "zk",
-                _ => "?",
-            };
-            let short_pk: String = hex::encode(&i.key).chars().take(20).collect();
-            println!("{:<10}  {short_pk}…", proof);
+        if !identities.is_empty() {
+            if !nodes.is_empty() {
+                println!();
+            }
+            println!("# identities");
+            println!("{:<10}  PUBLIC_KEY", "PROOF");
+            for i in &identities {
+                let proof = match i.proof_kind {
+                    PROOF_KIND_MERKLE_INCLUSION => "merkle",
+                    PROOF_KIND_ZK => "zk",
+                    _ => "?",
+                };
+                let short_pk: String = hex::encode(&i.key).chars().take(20).collect();
+                println!("{:<10}  {short_pk}…", proof);
+            }
         }
-    }
-    if nodes.is_empty() && identities.is_empty() {
-        println!("no members. add one with `vosx space members add-node …` or `add-identity …`.");
-    }
-    client.shutdown()
+        if nodes.is_empty() && identities.is_empty() {
+            println!("no members. add one with `vosx space members add-node …` or `add-identity …`.");
+        }
+        Ok(())
+    })
 }
 
 fn add_node(
@@ -148,34 +146,27 @@ fn add_node(
         other => anyhow::bail!("unknown role '{other}', expected voter|observer"),
     };
 
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let status = vos::block_on(reg.add_node(
-        &mut &*client.node(),
-        prefix,
-        peer_id.to_bytes(),
-        role,
-    ))
-    .map_err(|e| anyhow::anyhow!("add_node() failed: {e}"))?;
-
-    if status != STATUS_OK {
-        anyhow::bail!("add_node returned status {status}");
-    }
-    println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
-    client.shutdown()
+    DaemonClient::with_connect(space, |client| {
+        let status = client.add_node(prefix, peer_id.to_bytes(), role)?;
+        if status != STATUS_OK {
+            anyhow::bail!("add_node returned status {status}");
+        }
+        println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
+        Ok(())
+    })
 }
 
 fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let status = vos::block_on(reg.remove_node(&mut &*client.node(), prefix))
-        .map_err(|e| anyhow::anyhow!("remove_node() failed: {e}"))?;
-    match status {
-        STATUS_OK => println!("removed node prefix=0x{:04x}", prefix as u16),
-        STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
-        other => anyhow::bail!("remove_node returned status {other}"),
-    }
-    client.shutdown()
+    DaemonClient::with_connect(space, |client| {
+        match client.remove_node(prefix)? {
+            STATUS_OK => {
+                println!("removed node prefix=0x{:04x}", prefix as u16);
+                Ok(())
+            }
+            STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
+            other => anyhow::bail!("remove_node returned status {other}"),
+        }
+    })
 }
 
 fn add_identity(
@@ -197,36 +188,30 @@ fn add_identity(
         None => Vec::new(),
     };
 
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let status = vos::block_on(reg.add_identity(
-        &mut &*client.node(),
-        pubkey.clone(),
-        proof_kind,
-        proof_data,
-    ))
-    .map_err(|e| anyhow::anyhow!("add_identity() failed: {e}"))?;
-    if status != STATUS_OK {
-        anyhow::bail!("add_identity returned status {status}");
-    }
-    println!(
-        "added identity {} (proof={proof_kind_str})",
-        &hex::encode(&pubkey)[..20.min(pubkey.len() * 2)],
-    );
-    client.shutdown()
+    DaemonClient::with_connect(space, |client| {
+        let status = client.add_identity(pubkey.clone(), proof_kind, proof_data)?;
+        if status != STATUS_OK {
+            anyhow::bail!("add_identity returned status {status}");
+        }
+        println!(
+            "added identity {} (proof={proof_kind_str})",
+            &hex::encode(&pubkey)[..20.min(pubkey.len() * 2)],
+        );
+        Ok(())
+    })
 }
 
 fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
     let pubkey = hex::decode(pubkey_hex.trim_start_matches("0x"))
         .map_err(|_| anyhow::anyhow!("public_key must be hex"))?;
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let status = vos::block_on(reg.remove_identity(&mut &*client.node(), pubkey))
-        .map_err(|e| anyhow::anyhow!("remove_identity() failed: {e}"))?;
-    match status {
-        STATUS_OK => println!("removed identity"),
-        STATUS_NOT_FOUND => anyhow::bail!("no identity with that public key"),
-        other => anyhow::bail!("remove_identity returned status {other}"),
-    }
-    client.shutdown()
+    DaemonClient::with_connect(space, |client| {
+        match client.remove_identity(pubkey)? {
+            STATUS_OK => {
+                println!("removed identity");
+                Ok(())
+            }
+            STATUS_NOT_FOUND => anyhow::bail!("no identity with that public key"),
+            other => anyhow::bail!("remove_identity returned status {other}"),
+        }
+    })
 }

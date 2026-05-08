@@ -7,16 +7,16 @@
 //! every other `space *` command is a one-shot client that
 //! sends a single libp2p invoke and exits.
 //!
-//! Use `DaemonClient::connect(query)` to get a handle, then
-//! `client.registry()` for the macro-generated typed `Ref`
-//! pointed at the daemon's `(daemon_prefix, REGISTRY)`. Same
-//! call shape as `TransientRegistry`; only the wire path
-//! differs (libp2p invoke instead of in-process dispatch).
+//! Use `DaemonClient::with_connect(query, |c| …)` for the common
+//! "connect, do one thing, shut down" shape — shutdown runs
+//! on both the success and error paths. The typed wrappers
+//! (`programs`, `agents`, `publish`, …) hide the
+//! `vos::block_on(reg.X(&mut &node))` boilerplate.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use space_registry::SpaceRegistryRef;
+use space_registry::{AgentRow, MemberRow, ProgramRow, SpaceRegistryRef};
 use vos::abi::service::ServiceId;
 use vos::node::VosNode;
 
@@ -106,6 +106,19 @@ impl DaemonClient {
         })
     }
 
+    /// Connect, run `f`, shut down — even on error. The common
+    /// shape of every client subcommand: a single registry
+    /// round-trip wrapped in a connect/shutdown pair.
+    pub fn with_connect<T, F>(query: &str, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Self) -> anyhow::Result<T>,
+    {
+        let client = Self::connect(query)?;
+        let result = f(&client);
+        let _ = client.shutdown();
+        result
+    }
+
     /// Macro-generated typed `Ref` pointed at the daemon's
     /// registry. Use as `vos::block_on(client.registry().publish(&mut &*client.node(), ...))`.
     pub fn registry(&self) -> SpaceRegistryRef {
@@ -127,7 +140,7 @@ impl DaemonClient {
     /// - `"registry"` — the well-known per-space registry.
     /// - `"<instance_name>"` — looks the agent up in the daemon's
     ///   registry, then derives its per-node ServiceId via
-    ///   `derive_instance_svc_id` (the same function `space up`
+    ///   `instance_service_id` (the same function `space up`
     ///   uses to register installed agents, so the derived id
     ///   matches the actual registration).
     /// - `"0xHEX"` / 8-hex-chars — bare 32-bit ServiceId. The
@@ -142,21 +155,10 @@ impl DaemonClient {
                 .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
             return Ok(ServiceId(raw));
         }
-        // Otherwise an installed-agent instance name. Ask the
-        // daemon's registry whether such an agent exists; if
-        // yes, derive the daemon-local svc_id from the name +
-        // daemon prefix.
-        let reg = self.registry();
-        let agent = vos::block_on(reg.agent(&mut &self.node, target.to_string()))
-            .map_err(|e| anyhow::anyhow!("registry.agent('{target}'): {e}"))?
-            .ok_or_else(|| anyhow::anyhow!(
-                "no agent named '{target}' is installed in this space \
-                 (use `vosx space agents <space>` to list)",
-            ))?;
-        // Sanity-check the lookup: the agent's name on the
-        // wire should match what we asked for. If a malicious
-        // bootnode ever returned a different agent we'd want
-        // to know.
+        let agent = self.agent(target)?.ok_or_else(|| anyhow::anyhow!(
+            "no agent named '{target}' is installed in this space \
+             (use `vosx space agents <space>` to list)",
+        ))?;
         debug_assert_eq!(agent.instance_name, target);
         Ok(instance_service_id(target, self.daemon_prefix))
     }
@@ -188,10 +190,149 @@ impl DaemonClient {
     }
 
     /// Tear down the libp2p peer. Always call before exiting
-    /// so background threads drain cleanly.
+    /// so background threads drain cleanly. Most callers go
+    /// through `with_connect`, which calls this for them.
     pub fn shutdown(self) -> anyhow::Result<()> {
         self.node.shutdown();
         let _ = self.node.collect();
         Ok(())
+    }
+
+    // ── Typed registry wrappers ──────────────────────────────
+    //
+    // Each is a one-line wrapper around
+    // `vos::block_on(reg.X(&mut &self.node, ...))` that converts
+    // the registry's error type into `anyhow` with a recognisable
+    // prefix. Per-command status decoding stays at the call site.
+
+    pub fn programs(&self) -> anyhow::Result<Vec<ProgramRow>> {
+        vos::block_on(self.registry().programs(&mut &self.node))
+            .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))
+    }
+
+    pub fn program(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> anyhow::Result<Option<ProgramRow>> {
+        vos::block_on(self.registry().program(
+            &mut &self.node,
+            name.to_string(),
+            version.to_string(),
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.program('{name}:{version}'): {e}"))
+    }
+
+    pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
+        vos::block_on(self.registry().agents(&mut &self.node))
+            .map_err(|e| anyhow::anyhow!("registry.agents(): {e}"))
+    }
+
+    pub fn agent(&self, instance_name: &str) -> anyhow::Result<Option<AgentRow>> {
+        vos::block_on(self.registry().agent(&mut &self.node, instance_name.to_string()))
+            .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
+    }
+
+    pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
+        vos::block_on(self.registry().members(&mut &self.node))
+            .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
+    }
+
+    pub fn publish(
+        &self,
+        name: String,
+        version: String,
+        hash: Vec<u8>,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().publish(&mut &self.node, name, version, hash))
+            .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
+    }
+
+    pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().unpublish(&mut &self.node, name, version))
+            .map_err(|e| anyhow::anyhow!("registry.unpublish(): {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn install(
+        &self,
+        instance_name: String,
+        program_name: String,
+        program_version: String,
+        program_hash: Vec<u8>,
+        replication_id: Vec<u8>,
+        consistency: u8,
+        install_args: Vec<u8>,
+        install_payloads: Vec<u8>,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().install(
+            &mut &self.node,
+            instance_name,
+            program_name,
+            program_version,
+            program_hash,
+            replication_id,
+            consistency,
+            install_args,
+            install_payloads,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.install(): {e}"))
+    }
+
+    pub fn upgrade(
+        &self,
+        instance_name: String,
+        program_name: String,
+        program_version: String,
+        program_hash: Vec<u8>,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().upgrade(
+            &mut &self.node,
+            instance_name,
+            program_name,
+            program_version,
+            program_hash,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.upgrade(): {e}"))
+    }
+
+    pub fn uninstall(&self, instance_name: String) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().uninstall(&mut &self.node, instance_name))
+            .map_err(|e| anyhow::anyhow!("registry.uninstall(): {e}"))
+    }
+
+    pub fn add_node(
+        &self,
+        prefix: u32,
+        peer_id: Vec<u8>,
+        role: u8,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().add_node(&mut &self.node, prefix, peer_id, role))
+            .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
+    }
+
+    pub fn remove_node(&self, prefix: u32) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().remove_node(&mut &self.node, prefix))
+            .map_err(|e| anyhow::anyhow!("registry.remove_node(): {e}"))
+    }
+
+    pub fn add_identity(
+        &self,
+        public_key: Vec<u8>,
+        proof_kind: u8,
+        proof_data: Vec<u8>,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().add_identity(
+            &mut &self.node,
+            public_key,
+            proof_kind,
+            proof_data,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.add_identity(): {e}"))
+    }
+
+    pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().remove_identity(&mut &self.node, public_key))
+            .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
 }

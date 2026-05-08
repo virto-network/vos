@@ -50,58 +50,48 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .to_vec()
     };
 
-    let client = DaemonClient::connect(&args.space)?;
-    let reg = client.registry();
+    DaemonClient::with_connect(&args.space, |client| {
+        let program = client.program(&program_name, &program_version)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "program {program_name}:{program_version} not in catalog. publish it first.",
+            ))?;
 
-    // Look up the program so we know its hash to pin against.
-    let program = vos::block_on(reg.program(
-        &mut &*client.node(),
-        program_name.clone(),
-        program_version.clone(),
-    ))
-    .map_err(|e| anyhow::anyhow!("program() failed: {e}"))?
-    .ok_or_else(|| {
-        anyhow::anyhow!("program {program_name}:{program_version} not in catalog. publish it first.")
-    })?;
+        let replication_id = match &args.replication_id {
+            Some(hex) => crate::blob_store::BlobHash::from_hex(hex)
+                .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
+                .0,
+            None => auto_replication_id(&instance_name, &program.hash),
+        };
 
-    let replication_id = match &args.replication_id {
-        Some(hex) => crate::blob_store::BlobHash::from_hex(hex)
-            .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
-            .0,
-        None => auto_replication_id(&instance_name, &program.hash),
-    };
+        let status = client.install(
+            instance_name.clone(),
+            program_name.clone(),
+            program_version.clone(),
+            program.hash.to_vec(),
+            replication_id.to_vec(),
+            consistency,
+            install_args,
+            Vec::new(), // install_payloads — CLI install has no on_start
+        )?;
 
-    let status = vos::block_on(reg.install(
-        &mut &*client.node(),
-        instance_name.clone(),
-        program_name.clone(),
-        program_version.clone(),
-        program.hash.to_vec(),
-        replication_id.to_vec(),
-        consistency,
-        install_args,
-        Vec::new(), // install_payloads — CLI install has no on_start
-    ))
-    .map_err(|e| anyhow::anyhow!("install() failed: {e}"))?;
-
-    match status {
-        STATUS_OK => {
-            println!("installed {instance_name}");
-            println!("  program        = {program_name}:{program_version}");
-            println!("  program_hash   = {}", hex::encode(program.hash));
-            println!("  replication_id = {}", hex::encode(replication_id));
-            println!("  consistency    = {}", args.consistency);
+        match status {
+            STATUS_OK => {
+                println!("installed {instance_name}");
+                println!("  program        = {program_name}:{program_version}");
+                println!("  program_hash   = {}", hex::encode(program.hash));
+                println!("  replication_id = {}", hex::encode(replication_id));
+                println!("  consistency    = {}", args.consistency);
+                Ok(())
+            }
+            STATUS_INSTANCE_EXISTS => anyhow::bail!(
+                "an agent named '{instance_name}' is already installed; pass --name to disambiguate",
+            ),
+            STATUS_PROGRAM_NOT_FOUND => anyhow::bail!(
+                "program {program_name}:{program_version} not in catalog (race?)",
+            ),
+            other => anyhow::bail!("install returned status {other}"),
         }
-        STATUS_INSTANCE_EXISTS => anyhow::bail!(
-            "an agent named '{instance_name}' is already installed; pass --name to disambiguate",
-        ),
-        STATUS_PROGRAM_NOT_FOUND => anyhow::bail!(
-            "program {program_name}:{program_version} not in catalog (race?)",
-        ),
-        other => anyhow::bail!("install returned status {other}"),
-    }
-
-    client.shutdown()
+    })
 }
 
 fn parse_init_args(pairs: &[String]) -> anyhow::Result<InitArgs> {

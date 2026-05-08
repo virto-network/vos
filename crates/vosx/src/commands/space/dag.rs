@@ -58,21 +58,9 @@ pub fn run(space: &str, agent: &str) -> anyhow::Result<()> {
 /// Daemon's running — query roots over libp2p via the
 /// existing `FetchHeads` protocol.
 fn run_live(entry: &SpaceEntry, agent: &str) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(&entry.name)?;
-    let net = client
-        .node()
-        .network()
-        .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
-
-    // Resolve the agent's replication_id. Special-case the
-    // registry — its replication_id is derived deterministically
-    // from space_id (see `up::derive_registry_replication_id`),
-    // not stored in the registry's own catalog.
     let space_id = entry
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("space id is not 32 bytes of hex"))?;
-    // Daemon endpoint info — peer_id we'll dial, prefix that
-    // owns this svc_id namespace.
     let endpoint_data = endpoint::read(&std::path::PathBuf::from(&entry.data_dir))?
         .ok_or_else(|| anyhow::anyhow!("endpoint disappeared"))?;
     let daemon_peer: libp2p::PeerId = endpoint_data
@@ -81,40 +69,48 @@ fn run_live(entry: &SpaceEntry, agent: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("bad daemon peer_id: {e}"))?;
     let daemon_prefix = endpoint_data.prefix;
 
-    let (replication_id, svc_id) = if agent == "registry" {
-        (
-            registry_replication_id(&space_id),
-            ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()),
-        )
-    } else {
-        let row = vos::block_on(client.registry().agent(&mut &*client.node(), agent.to_string()))
-            .map_err(|e| anyhow::anyhow!("registry.agent('{agent}'): {e}"))?
-            .ok_or_else(|| anyhow::anyhow!(
+    DaemonClient::with_connect(&entry.name, |client| {
+        let net = client
+            .node()
+            .network()
+            .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
+
+        // Resolve the agent's replication_id. The registry's id
+        // is derived deterministically from space_id (it isn't
+        // stored in its own catalog); installed agents carry it
+        // on their AgentRow.
+        let (replication_id, svc_id) = if agent == "registry" {
+            (
+                registry_replication_id(&space_id),
+                ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()),
+            )
+        } else {
+            let row = client.agent(agent)?.ok_or_else(|| anyhow::anyhow!(
                 "no agent named '{agent}' is installed in this space",
             ))?;
-        (row.replication_id, instance_service_id(agent, daemon_prefix))
-    };
+            (row.replication_id, instance_service_id(agent, daemon_prefix))
+        };
 
-    // FetchHeads: the daemon's NetworkService::sync_roots
-    // reads its slot's redb roots and returns them. Same
-    // protocol the CRDT sync ticker uses.
-    let rx = net.send_fetch_heads(daemon_peer, replication_id);
-    let roots = rx
-        .recv_timeout(FETCH_HEADS_TIMEOUT)
-        .map_err(|_| anyhow::anyhow!("FetchHeads from daemon timed out"))?;
+        // FetchHeads: the daemon's NetworkService::sync_roots
+        // reads its slot's redb roots and returns them. Same
+        // protocol the CRDT sync ticker uses.
+        let rx = net.send_fetch_heads(daemon_peer, replication_id);
+        let roots = rx
+            .recv_timeout(FETCH_HEADS_TIMEOUT)
+            .map_err(|_| anyhow::anyhow!("FetchHeads from daemon timed out"))?;
 
-    println!("space '{}' — agent '{}' (svc:{:08x}) [LIVE]", entry.name, agent, svc_id.0);
-    println!("  replication_id: {}", hex::encode(replication_id));
-    println!();
-    println!("roots ({}):", roots.len());
-    for r in &roots {
-        println!("  {}", hex::encode(r));
-    }
-    println!();
-    println!("node count: <not queried — live mode prints roots only;");
-    println!("            stop the daemon and re-run for full node + origin stats>");
-
-    client.shutdown()
+        println!("space '{}' — agent '{}' (svc:{:08x}) [LIVE]", entry.name, agent, svc_id.0);
+        println!("  replication_id: {}", hex::encode(replication_id));
+        println!();
+        println!("roots ({}):", roots.len());
+        for r in &roots {
+            println!("  {}", hex::encode(r));
+        }
+        println!();
+        println!("node count: <not queried — live mode prints roots only;");
+        println!("            stop the daemon and re-run for full node + origin stats>");
+        Ok(())
+    })
 }
 
 /// Daemon's down — read the redb directly. Fuller stats

@@ -29,18 +29,16 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(&args.space)?;
-    let target_id = client.resolve_target(&args.target)?;
-
-    let msg = build_msg(&args.method, &args.args)?;
-    eprintln!("vosx: invoking {} on {target_id}", args.method);
-
-    let reply = client.invoke_dyn(target_id, &msg)?;
-    match reply {
-        Value::Unit => println!("()"),
-        other => println!("{other:?}"),
-    }
-    client.shutdown()
+    DaemonClient::with_connect(&args.space, |client| {
+        let target_id = client.resolve_target(&args.target)?;
+        let msg = build_msg(&args.method, &args.args)?;
+        eprintln!("vosx: invoking {} on {target_id}", args.method);
+        match client.invoke_dyn(target_id, &msg)? {
+            Value::Unit => println!("()"),
+            other => println!("{other:?}"),
+        }
+        Ok(())
+    })
 }
 
 /// Parse `key=value` strings into a typed `Msg`. Heuristics:

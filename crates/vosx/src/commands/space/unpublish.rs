@@ -21,25 +21,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if n.is_empty() || v.is_empty() {
         anyhow::bail!("name and version must both be non-empty");
     }
+    let (n, v) = (n.to_string(), v.to_string());
 
-    let client = DaemonClient::connect(&args.space)?;
-    let reg = client.registry();
-
-    let status = vos::block_on(reg.unpublish(
-        &mut &*client.node(),
-        n.to_string(),
-        v.to_string(),
-    ))
-    .map_err(|e| anyhow::anyhow!("unpublish() failed: {e}"))?;
-
-    match status {
-        STATUS_OK => println!("unpublished {n}:{v}"),
-        STATUS_NOT_FOUND => anyhow::bail!("{n}:{v} not in catalog"),
-        STATUS_IN_USE => anyhow::bail!(
-            "{n}:{v} is referenced by an installed agent — uninstall first",
-        ),
-        other => anyhow::bail!("unpublish returned status {other}"),
-    }
-
-    client.shutdown()
+    DaemonClient::with_connect(&args.space, |client| {
+        match client.unpublish(n.clone(), v.clone())? {
+            STATUS_OK => {
+                println!("unpublished {n}:{v}");
+                Ok(())
+            }
+            STATUS_NOT_FOUND => anyhow::bail!("{n}:{v} not in catalog"),
+            STATUS_IN_USE => anyhow::bail!(
+                "{n}:{v} is referenced by an installed agent — uninstall first",
+            ),
+            other => anyhow::bail!("unpublish returned status {other}"),
+        }
+    })
 }

@@ -14,37 +14,32 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let (program_name, program_version) = parse_program_ref(&args.program_ref)?;
 
-    let client = DaemonClient::connect(&args.space)?;
-    let reg = client.registry();
+    DaemonClient::with_connect(&args.space, |client| {
+        let program = client.program(&program_name, &program_version)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "program {program_name}:{program_version} not in catalog",
+            ))?;
 
-    let program = vos::block_on(reg.program(
-        &mut &*client.node(),
-        program_name.clone(),
-        program_version.clone(),
-    ))
-    .map_err(|e| anyhow::anyhow!("program() failed: {e}"))?
-    .ok_or_else(|| anyhow::anyhow!("program {program_name}:{program_version} not in catalog"))?;
+        let status = client.upgrade(
+            args.instance.clone(),
+            program_name.clone(),
+            program_version.clone(),
+            program.hash.to_vec(),
+        )?;
 
-    let status = vos::block_on(reg.upgrade(
-        &mut &*client.node(),
-        args.instance.clone(),
-        program_name.clone(),
-        program_version.clone(),
-        program.hash.to_vec(),
-    ))
-    .map_err(|e| anyhow::anyhow!("upgrade() failed: {e}"))?;
-
-    match status {
-        STATUS_OK => println!(
-            "upgraded {} → {program_name}:{program_version}",
-            args.instance,
-        ),
-        STATUS_NOT_FOUND => anyhow::bail!("no agent named '{}' installed", args.instance),
-        STATUS_PROGRAM_NOT_FOUND => {
-            anyhow::bail!("program {program_name}:{program_version} not in catalog")
+        match status {
+            STATUS_OK => {
+                println!(
+                    "upgraded {} → {program_name}:{program_version}",
+                    args.instance,
+                );
+                Ok(())
+            }
+            STATUS_NOT_FOUND => anyhow::bail!("no agent named '{}' installed", args.instance),
+            STATUS_PROGRAM_NOT_FOUND => {
+                anyhow::bail!("program {program_name}:{program_version} not in catalog")
+            }
+            other => anyhow::bail!("upgrade returned status {other}"),
         }
-        other => anyhow::bail!("upgrade returned status {other}"),
-    }
-
-    client.shutdown()
+    })
 }

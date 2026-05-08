@@ -6,14 +6,12 @@ use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::truncate;
 
 pub fn run(space: &str) -> anyhow::Result<()> {
-    let client = DaemonClient::connect(space)?;
-    let reg = client.registry();
-    let agents = vos::block_on(reg.agents(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("agents() failed: {e}"))?;
-
-    if agents.is_empty() {
-        println!("no agents installed. install one with `vosx space install <program>`.");
-    } else {
+    DaemonClient::with_connect(space, |client| {
+        let agents = client.agents()?;
+        if agents.is_empty() {
+            println!("no agents installed. install one with `vosx space install <program>`.");
+            return Ok(());
+        }
         println!(
             "{:<20}  {:<20}  {:<10}  REPLICATION",
             "NAME", "PROGRAM", "MODE",
@@ -28,7 +26,6 @@ pub fn run(space: &str) -> anyhow::Result<()> {
                 consistency_name(a.consistency),
             );
         }
-    }
-
-    client.shutdown()
+        Ok(())
+    })
 }

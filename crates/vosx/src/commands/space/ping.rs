@@ -20,12 +20,11 @@ pub fn run(space: &str) -> anyhow::Result<()> {
     let connected = started.elapsed();
 
     let invoke_start = Instant::now();
-    let _ = vos::block_on(client.registry().programs(&mut &*client.node()))
-        .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))?;
+    let _ = client.programs()?;
     let invoke = invoke_start.elapsed();
 
     println!("daemon reachable for space '{}'", client.entry.name);
-    println!("  connect (incl. libp2p Hello): {:?}", connected);
-    println!("  invoke (registry.programs):    {:?}", invoke);
+    println!("  connect (incl. libp2p Hello): {connected:?}");
+    println!("  invoke (registry.programs):    {invoke:?}");
     client.shutdown()
 }

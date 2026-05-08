@@ -20,29 +20,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let (hash, _bytes) = blob_store::resolve(&source)
         .map_err(|e| anyhow::anyhow!("blob: {e}"))?;
 
-    let client = DaemonClient::connect(&args.space)?;
-
-    let reg = client.registry();
-    let status = vos::block_on(reg.publish(
-        &mut &*client.node(),
-        name.clone(),
-        version.clone(),
-        hash.0.to_vec(),
-    ))
-    .map_err(|e| anyhow::anyhow!("publish() failed: {e}"))?;
-
-    match status {
-        STATUS_OK => {
-            println!("published {name}:{version}");
-            println!("  hash = {hash}");
+    DaemonClient::with_connect(&args.space, |client| {
+        let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
+        match status {
+            STATUS_OK => {
+                println!("published {name}:{version}");
+                println!("  hash = {hash}");
+                Ok(())
+            }
+            STATUS_TAG_CONFLICT => anyhow::bail!(
+                "{name}:{version} already exists in the catalog with a different hash; \
+                 tags are immutable",
+            ),
+            other => anyhow::bail!("publish returned status {other}"),
         }
-        STATUS_TAG_CONFLICT => anyhow::bail!(
-            "{name}:{version} already exists in the catalog with a different hash; \
-             tags are immutable",
-        ),
-        other => anyhow::bail!("publish returned status {other}"),
-    }
-
-    client.shutdown()
+    })
 }
 
