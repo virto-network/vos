@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use vos::actors::context::ServiceId;
 use vos::actors::value::{Msg, Value};
+use vos::log;
 
 use crate::HttpGateway;
 use crate::config::{admin_token, auth_token, ct_eq, header_value};
@@ -132,8 +133,13 @@ fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Respons
         }
         "POST" | "PUT" | "PATCH" => {
             if !req.body.is_empty() {
-                let pairs = parse_flat_json(&req.body)
-                    .map_err(|e| Response::text(400, format!("invalid JSON: {e}")))?;
+                let pairs = parse_flat_json(&req.body).map_err(|e| {
+                    // Detail (line/column, offending token) goes to logs;
+                    // clients see a generic 400 so server internals don't
+                    // leak via crafted-input probing.
+                    log::debug!("http-gateway: invalid JSON body: {e}");
+                    Response::text(400, "invalid JSON body")
+                })?;
                 for (k, v) in pairs {
                     msg = msg.with(k, Value::from(v));
                 }
@@ -148,4 +154,68 @@ fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Respons
 /// + plus decoding handled by `serde_urlencoded`.
 fn parse_query(query: &str) -> Vec<(String, String)> {
     serde_urlencoded::from_str(query).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_path_happy() {
+        assert_eq!(
+            split_path("/agent/method"),
+            Some(("agent".into(), "method".into()))
+        );
+    }
+
+    #[test]
+    fn split_path_no_leading_slash() {
+        assert_eq!(
+            split_path("agent/method"),
+            Some(("agent".into(), "method".into()))
+        );
+    }
+
+    #[test]
+    fn split_path_extra_segments_kept_in_method() {
+        // `<method>` carries the rest of the path verbatim — no
+        // escaping or slash-handling beyond the first split.
+        assert_eq!(
+            split_path("/agent/method/extra"),
+            Some(("agent".into(), "method/extra".into()))
+        );
+    }
+
+    #[test]
+    fn split_path_rejects_empty_segments() {
+        assert!(split_path("/").is_none());
+        assert!(split_path("/agent").is_none());
+        assert!(split_path("/agent/").is_none());
+        assert!(split_path("//method").is_none());
+    }
+
+    #[test]
+    fn parse_query_empty() {
+        assert!(parse_query("").is_empty());
+    }
+
+    #[test]
+    fn parse_query_simple_pairs() {
+        assert_eq!(
+            parse_query("a=1&b=hi"),
+            vec![("a".into(), "1".into()), ("b".into(), "hi".into())],
+        );
+    }
+
+    #[test]
+    fn parse_query_handles_percent_and_plus() {
+        // serde_urlencoded -> form_urlencoded percent + `+` decoding.
+        assert_eq!(
+            parse_query("name=hello+world&q=%26"),
+            vec![
+                ("name".into(), "hello world".into()),
+                ("q".into(), "&".into()),
+            ],
+        );
+    }
 }

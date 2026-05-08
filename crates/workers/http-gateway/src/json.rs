@@ -98,3 +98,118 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(b: &[u8]) -> Vec<(String, Value)> {
+        parse_flat_json(b).expect("parse")
+    }
+
+    #[test]
+    fn parse_empty_object() {
+        assert!(v(b"{}").is_empty());
+    }
+
+    #[test]
+    fn parse_string() {
+        assert_eq!(v(br#"{"k":"hello"}"#), vec![("k".into(), Value::Str("hello".into()))]);
+    }
+
+    #[test]
+    fn parse_bool_null() {
+        let pairs = v(br#"{"a":true,"b":false,"c":null}"#);
+        assert_eq!(pairs.len(), 3);
+        assert!(matches!(pairs[0].1, Value::Bool(true)));
+        assert!(matches!(pairs[1].1, Value::Bool(false)));
+        assert!(matches!(pairs[2].1, Value::Unit));
+    }
+
+    #[test]
+    fn parse_numbers_narrow_to_smallest_fitting() {
+        // serde_json's `Map` is BTreeMap-backed by default, so input
+        // order isn't preserved; look up by key.
+        let pairs = v(br#"{"u32":42,"u64":5000000000,"neg":-7}"#);
+        let by_key = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert!(matches!(by_key("u32"), Some(Value::U32(42))));
+        assert!(matches!(by_key("u64"), Some(Value::U64(5_000_000_000))));
+        assert!(matches!(by_key("neg"), Some(Value::I64(-7))));
+    }
+
+    #[test]
+    fn parse_string_array() {
+        let pairs = v(br#"{"xs":["a","b"]}"#);
+        match &pairs[0].1 {
+            Value::ListStr(xs) => assert_eq!(xs, &vec!["a".to_string(), "b".to_string()]),
+            other => panic!("expected ListStr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_u32_array() {
+        let pairs = v(br#"{"xs":[1,2,3]}"#);
+        match &pairs[0].1 {
+            Value::ListU32(xs) => assert_eq!(xs, &vec![1u32, 2, 3]),
+            other => panic!("expected ListU32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_non_object_root() {
+        assert!(parse_flat_json(b"[1,2]").is_err());
+        assert!(parse_flat_json(br#""hi""#).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_nested_object() {
+        assert!(parse_flat_json(br#"{"k":{"x":1}}"#).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_floats() {
+        assert!(parse_flat_json(br#"{"k":1.5}"#).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_mixed_array() {
+        assert!(parse_flat_json(br#"{"xs":[1,"a"]}"#).is_err());
+    }
+
+    #[test]
+    fn render_primitives() {
+        assert_eq!(value_to_json(&Value::Unit), b"null");
+        assert_eq!(value_to_json(&Value::Bool(true)), b"true");
+        assert_eq!(value_to_json(&Value::U32(42)), b"42");
+        assert_eq!(value_to_json(&Value::I64(-1)), b"-1");
+        assert_eq!(value_to_json(&Value::Str("hi".into())), br#""hi""#);
+    }
+
+    #[test]
+    fn render_bytes_as_hex_string() {
+        assert_eq!(value_to_json(&Value::Bytes(vec![0xde, 0xad])), br#""dead""#);
+    }
+
+    #[test]
+    fn render_lists() {
+        assert_eq!(
+            value_to_json(&Value::ListU32(vec![1, 2, 3])),
+            b"[1,2,3]"
+        );
+        assert_eq!(
+            value_to_json(&Value::ListStr(vec!["a".into(), "b".into()])),
+            br#"["a","b"]"#
+        );
+    }
+
+    #[test]
+    fn parse_keeps_all_keys() {
+        // Order isn't part of the contract (serde_json::Map is
+        // BTreeMap-backed by default), so just check the set.
+        let pairs = v(br#"{"alpha":"a","beta":42}"#);
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(pairs.len(), 2);
+        assert!(keys.contains(&"alpha"));
+        assert!(keys.contains(&"beta"));
+    }
+}

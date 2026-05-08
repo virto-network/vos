@@ -130,3 +130,51 @@ pub(crate) fn header_value<'a>(
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches() {
+        assert!(ct_eq("abc", "abc"));
+    }
+
+    #[test]
+    fn ct_eq_differs_same_length() {
+        assert!(!ct_eq("abc", "abd"));
+    }
+
+    #[test]
+    fn ct_eq_differs_length() {
+        assert!(!ct_eq("abc", "abcd"));
+        assert!(!ct_eq("", "x"));
+        assert!(ct_eq("", ""));
+    }
+
+    #[test]
+    fn header_value_case_insensitive_name() {
+        let headers = vec![
+            ("authorization".into(), "Bearer abc".into()),
+            ("x-foo".into(), "bar".into()),
+        ];
+        assert_eq!(header_value(&headers, "Authorization"), Some("Bearer abc"));
+        assert_eq!(header_value(&headers, "AUTHORIZATION"), Some("Bearer abc"));
+        assert_eq!(header_value(&headers, "x-FOO"), Some("bar"));
+    }
+
+    #[test]
+    fn header_value_missing_returns_none() {
+        let headers: Vec<(String, String)> = vec![];
+        assert_eq!(header_value(&headers, "x"), None);
+    }
+
+    #[test]
+    fn header_value_returns_first_match() {
+        let headers = vec![
+            ("x".into(), "first".into()),
+            ("x".into(), "second".into()),
+        ];
+        assert_eq!(header_value(&headers, "x"), Some("first"));
+    }
+}
