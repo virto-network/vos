@@ -201,7 +201,22 @@ integration remains.
 
   **Register-mapping bug found and fixed (`02922c4`)**: the host's tracing handler for `ECALL_RISTRETTO_SCALAR_MULT` was reading PVM φ[10/11/12] expecting RISC-V `a0/a1/a2` — but grey-transpiler's `map_register` routes RISC-V x10/x11/x12 → PVM φ[7/8/9] (φ[10/11/12] are a3/a4/a5).  For transpiled actor traces, scalar_ptr/point_ptr/output_ptr were silently 0/0/65 (= VOS_OBJECT_CAP), so the host read junk bytes from PVM memory at address 0 and `detect_scalar_mult_kind` never matched the basepoint.  Fix: read φ[7/8/9] in the scalar_mult handler and update `harness_ristretto_isolated` to put pointers in regs[7/8/9].  **Other ECALL handlers (Blake2b, point_add, scalar_reduce, scalar_binop) have the same off-by-three bug** — they produce incorrect host-side outputs but no current test validates correctness so the regression is invisible.  Aligning all handlers to PVM A0/A1/A2 = φ[7/8/9] is a follow-up.
 
-  **Soundness binding still deferred**: the consumer chip's per-window `k_i` nibbles are NOT yet tied to the ECALL's input scalar bytes, and the chip's final extended-Edwards Acc is NOT yet tied to the output's compressed Ristretto bytes (compress chain R1e-bis is the next-larger deliverable).
+  **Soundness binding** — partial (commit `005dc59`):
+  - **Scalar nibbles ↔ side_note.scalar**: NEW
+    `RistrettoCombScalarBoundaryLookupElements` (3-limb tuple,
+    `(call, window, k_value)`) bound between the anchor chip's
+    +IsReal emission per row and a new
+    `RistrettoCombScalarBoundaryChip` that reads the actor's scalar
+    bytes from `ristretto_comb_calls` and decomposes them into
+    nibbles.  Balance forces `ScalarWindow` per (call, window) to
+    match the actor's i-th nibble.
+  - **side_note ↔ PVM memory**: STILL OPEN.  The boundary chip pulls
+    from side_note rather than from `MemoryAccessLookupElements`;
+    closing this needs `RistrettoEcallChip` to skip its scalar-byte
+    memory producers for FixedBasepoint records and have the
+    boundary chip emit them instead.
+  - **Final Acc ↔ output bytes**: STILL OPEN.  Needs the compress
+    chain (R1e-bis, ~25 FieldOp rows per call) — the bigger chunk.
 
   **Bench numbers**: ~0.81s MOBILE (5-trial median), a 14% regression vs the 0.71s pre-PGO baseline.  The regression is the cost of moving from "chip emits boundary attestations only" (RistrettoChip's previous loose-soundness state, log_size=6) to "comb chip's per-row FieldOp algebra runs end-to-end" (RistrettoFixedBaseConsumerChip log_size=13, ~988 cols × 8192 rows ≈ 8M cells).  PGO retraining + boundary binding are the next steps to claw back perf and close remaining soundness gaps.
 * **Activity gating — DONE (`daaff55`)**: `ChipActivity.ristretto_comb` (true iff `!ristretto_comb_calls.is_empty()`) gates `RistrettoCombTableChip` (idx 21) + `RistrettoFixedBaseConsumerChip` (idx 22) in `BASE_COMPONENTS`.
