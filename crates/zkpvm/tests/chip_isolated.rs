@@ -477,6 +477,8 @@ fn harness_ristretto_comb_balance() {
     side_note.ristretto_comb_calls.push(RistrettoCombCall {
         scalar,
         out_bytes: [0u8; 32],
+        output_ptr: 0,
+        ts: 0,
     });
     side_note.populate_ristretto_comb_counts();
 
@@ -545,7 +547,8 @@ fn harness_ristretto_comb_balance() {
 #[test]
 fn harness_ristretto_fixed_base_e2e_with_memory() {
     use zkpvm::chips::{
-        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
         RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
         RistrettoFixedBaseConsumerChip,
     };
@@ -599,8 +602,14 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     });
     side_note
         .ristretto_comb_calls
-        .push(RistrettoCombCall { scalar, out_bytes });
+        .push(RistrettoCombCall {
+            scalar,
+            out_bytes,
+            output_ptr,
+            ts,
+        });
     side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
 
     let config = PcsConfig {
         pow_bits: 5,
@@ -616,6 +625,9 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
         &RistrettoCombAnchorChip,
         &RistrettoCombScalarBoundaryChip,
         &RistrettoFixedBaseConsumerChip,
+        &RistrettoCombCompressChip,
+        &RistrettoCombCompressOutputChip,
+        &ByteToBitsChip,
     ];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
@@ -668,7 +680,8 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
 #[test]
 fn harness_ristretto_fixed_base_three_calls() {
     use zkpvm::chips::{
-        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
         RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
         RistrettoFixedBaseConsumerChip,
     };
@@ -715,10 +728,16 @@ fn harness_ristretto_fixed_base_three_calls() {
         });
         side_note
             .ristretto_comb_calls
-            .push(RistrettoCombCall { scalar, out_bytes });
+            .push(RistrettoCombCall {
+                scalar,
+                out_bytes,
+                output_ptr,
+                ts,
+            });
     }
     side_note.initial_memory = initial_memory;
     side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
 
     let config = PcsConfig {
         pow_bits: 5,
@@ -734,6 +753,9 @@ fn harness_ristretto_fixed_base_three_calls() {
         &RistrettoCombAnchorChip,
         &RistrettoCombScalarBoundaryChip,
         &RistrettoFixedBaseConsumerChip,
+        &RistrettoCombCompressChip,
+        &RistrettoCombCompressOutputChip,
+        &ByteToBitsChip,
     ];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
@@ -839,6 +861,8 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
         .push(RistrettoCombCall {
             scalar: k1,
             out_bytes,
+            output_ptr,
+            ts,
         });
     side_note.populate_ristretto_comb_counts();
 
@@ -919,92 +943,6 @@ fn harness_ristretto_consumer_isolated_empty() {
         .expect("consumer-empty harness: prove failed");
 }
 
-/// R1e-bis Batch 2 — `RistrettoCombCompressChip` in isolation,
-/// exercising the algebra prologue (rows 1-12 of the compress chain)
-/// for one synthetic FixedBasepoint scalar-mult call.
-///
-/// The chip lays down 17 rows per call: 4 IsInput rows holding the
-/// running accumulator's X/Y/Z/T (re-derived from the comb-table
-/// walk), 1 IsInput row for the host-witnessed `inv_sqrt`, and 12
-/// algebra rows (Z+Y, Z-Y, u1, u2, u2², tmp=u1·u2², inv_sqrt²,
-/// inv_sqrt²·tmp, i1, i2, i2·T, z_inv).
-///
-/// Validates:
-///   - The shared `field_op_constraints` algebra holds across every
-///     IsAdd / IsSub / IsMul row (byte-wise mod-p25519 carry chains
-///     close, final-form < p check passes, etc.).
-///   - The chip-local register-file relation balances internally —
-///     every consumer A/B emission finds the matching producer
-///     emission from a prior IsInput / algebra row.
-///   - `compute_compress_witness` provides intermediates that the
-///     chip's `fill_*` witness builders accept without
-///     debug-assertion panics.
-///
-/// A regression that breaks any of these (e.g., wrong source-row
-/// threading, off-by-one row IDs, FieldOp helper drift) surfaces as
-/// either a `prove` panic (constraint failure) or a `verify` reject
-/// (`claimed logup sum is not zero`).
-#[test]
-fn harness_ristretto_compress_algebra_only() {
-    use zkpvm::chips::{ByteToBitsChip, RistrettoCombCompressChip};
-    use zkpvm::side_note::RistrettoCombCall;
-
-    // One synthetic call — pick a non-trivial scalar so X/Y/Z/T are
-    // a non-identity Edwards point, and the algebra rows hit the
-    // mul/add chains' generic paths (not zero-special-cases).
-    let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_9abc_def0_u64);
-    let scalar = scalar_value.to_bytes();
-    let out_bytes = (scalar_value
-        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
-        .compress()
-        .to_bytes();
-
-    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
-    side_note
-        .ristretto_comb_calls
-        .push(RistrettoCombCall { scalar, out_bytes });
-    side_note.populate_ristretto_comb_counts();
-    side_note.populate_ristretto_compress_counts();
-
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-
-    let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombCompressChip, &ByteToBitsChip];
-
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect(
-            "compress-algebra harness: prove failed — likely a FieldOp \
-             algebra regression, source-row threading bug, or \
-             compress-witness divergence vs dalek",
-        );
-
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
-        .iter()
-        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
-        .collect();
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    )
-    .expect(
-        "compress-algebra harness: verify failed — chip-local \
-         register-file relation didn't close (consumer/producer \
-         imbalance somewhere in the algebra chain)",
-    );
-}
-
 /// `RistrettoCombCompressChip` with EMPTY side_note (no calls).
 /// All cells zero, no emissions.  Should prove + verify cleanly.
 /// Catches structural bugs separately from data-dependent ones.
@@ -1025,85 +963,6 @@ fn harness_ristretto_compress_isolated_empty() {
 
     let _proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect("compress-empty harness: prove failed");
-}
-
-/// R1e-bis — multi-call coverage for `RistrettoCombCompressChip`.
-/// Synthesizes 3 distinct FixedBasepoint scalar mults in one trace
-/// and proves the compress chip in isolation.  Validates:
-///   - The chip-local register-file relation balances across
-///     multiple per-call blocks (each call's chain is internally
-///     closed; the relation doesn't accidentally bridge between
-///     calls).
-///   - The unity check fires on row +12 of EACH call (3 unity
-///     constraints active simultaneously).
-///   - `IsUnityCheck` preprocessed-column witness is correct for
-///     n_calls > 1 (specifically: 1 only on rows 12, 29, 46 of the
-///     trace, 0 elsewhere).
-///   - log_size growth (3 calls × 17 rows = 51 rows ⇒ log_size 6)
-///     plays nicely with the chip's preprocessed + main trace fill.
-///
-/// A regression in any per-call indexing surfaces as either a
-/// `prove` panic (constraint failure on a unity row whose `out`
-/// isn't 1, OR a FieldOp algebra failure) or a `verify` reject
-/// (`claimed logup sum is not zero` from a chip-local register
-/// file imbalance).
-#[test]
-fn harness_ristretto_compress_three_calls() {
-    use zkpvm::chips::{ByteToBitsChip, RistrettoCombCompressChip};
-    use zkpvm::side_note::RistrettoCombCall;
-
-    let scalars: [u64; 3] = [7, 0x1234_5678, 0xdead_beef_cafe_babe];
-    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
-    for &k in &scalars {
-        let scalar_value = curve25519_dalek::scalar::Scalar::from(k);
-        let scalar = scalar_value.to_bytes();
-        let out_bytes = (scalar_value
-            * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
-            .compress()
-            .to_bytes();
-        side_note
-            .ristretto_comb_calls
-            .push(RistrettoCombCall { scalar, out_bytes });
-    }
-    side_note.populate_ristretto_comb_counts();
-    side_note.populate_ristretto_compress_counts();
-
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-
-    let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombCompressChip, &ByteToBitsChip];
-
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect(
-            "compress 3-call harness: prove failed — likely a per-call \
-             indexing or unity-check IsReal-vs-padding regression",
-        );
-
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
-        .iter()
-        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
-        .collect();
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    )
-    .expect(
-        "compress 3-call harness: verify failed — chip-local \
-         register-file imbalance OR a unity-check rejection \
-         under multi-call",
-    );
 }
 
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.

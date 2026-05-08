@@ -241,18 +241,19 @@ pub struct MulEntry {
 }
 
 /// Session 2.1: one fixed-base scalar-mult call driving the
-/// `RistrettoFixedBaseConsumerChip` trace.
+/// `RistrettoFixedBaseConsumerChip` + `RistrettoCombCompressChip`
+/// + `RistrettoCombCompressOutputChip` trio.
 ///
 /// Step 8 (scalar binding): the `scalar` bytes are pinned to PVM
 /// memory by `RistrettoCombScalarBoundaryChip`.
 ///
-/// R1e-bis (output binding, in progress): `out_bytes` will drive the
-/// compress chain's final-step memory producer once
-/// `RistrettoCombCompressChip` lands.  Today the field is captured at
-/// `ingest_ristretto_boundary` time but not yet consumed by any chip
-/// — populating it ahead of the compress chip's wiring keeps the
-/// public surface stable while the chip work proceeds in subsequent
-/// commits.
+/// R1e-bis Batch 4a (output binding): `out_bytes` are produced by
+/// `RistrettoCombCompressChip`'s row +43 (canonical s_can) and
+/// emitted as memory producers by
+/// `RistrettoCombCompressOutputChip`'s 32 rows per call at
+/// `(output_ptr + i, byte, ts, is_write=1)`.  `output_ptr` and
+/// `ts` come straight from the actor's ECALL-step register
+/// snapshot via `ingest_ristretto_boundary`.
 #[derive(Clone, Debug)]
 pub struct RistrettoCombCall {
     /// 32 LE bytes; the scalar `k` to multiply against the fixed
@@ -261,9 +262,16 @@ pub struct RistrettoCombCall {
     pub scalar: [u8; 32],
     /// 32 LE bytes; the canonical compressed Ristretto encoding of
     /// `k · G`.  Equals `compress(k · G)` per RFC 9496.  Drives the
-    /// compress chip's memory producer at `(output_ptr+i, byte, ts,
-    /// is_write=1)` once R1e-bis lands.
+    /// output chip's memory producer at `(output_ptr+i, byte, ts,
+    /// is_write=1)`.
     pub out_bytes: [u8; 32],
+    /// `output_ptr` register value at the ECALL step — base of the
+    /// 32-byte output buffer in PVM memory.  Drives the output
+    /// chip's per-byte memory address.
+    pub output_ptr: u32,
+    /// ECALL step timestamp.  Same `ts` as the matching
+    /// `RistrettoMemOp`; used by the output chip's memory producer.
+    pub ts: u64,
 }
 
 impl SideNote {
@@ -459,6 +467,19 @@ impl SideNote {
         use crate::chips::ristretto::witness::{fill_input, fill_output};
         use crate::core::tracing::ScalarMultKind;
         let calls = std::mem::take(&mut self.ristretto_calls);
+        // RistrettoCombCall.output_ptr / .ts come from the parallel
+        // ristretto_mem_ops record (same per-call order — every
+        // RistrettoRecord has exactly one matching RistrettoMemOp,
+        // produced together by `TracingPvm::run_with_precompiles`).
+        // Collect the (output_ptr, ts) pairs upfront so the mutable
+        // borrow of `ristretto_comb_calls` below doesn't conflict
+        // with an immutable borrow of `ristretto_mem_ops`.
+        let mem_op_data: Vec<(u32, u64)> = self
+            .ristretto_mem_ops
+            .iter()
+            .map(|op| (op.output_ptr, op.ts))
+            .collect();
+        let mut mem_iter = mem_op_data.iter();
         for rec in &calls {
             // Session 2.1 step 8 (partial): route fixed-basepoint
             // records onto the comb-method path (RistrettoCombTableChip
@@ -477,12 +498,21 @@ impl SideNote {
             // fixed-base records to realize the perf win.  The chip
             // gates off (activity.ristretto stays false if no field
             // rows accumulate) freeing the trace's row budget.
+            // Step the mem-op iterator in lockstep with the call
+            // iterator so each FixedBasepoint call gets its matching
+            // (output_ptr, ts) pair.
+            let mem_op = mem_iter.next().copied();
             match rec.kind {
                 ScalarMultKind::FixedBasepoint => {
+                    let (output_ptr, ts) = mem_op.expect(
+                        "ristretto_mem_ops length must match ristretto_calls",
+                    );
                     self.ristretto_comb_calls
                         .push(RistrettoCombCall {
                             scalar: rec.scalar,
                             out_bytes: rec.output,
+                            output_ptr,
+                            ts,
                         });
                 }
                 ScalarMultKind::Variable => {

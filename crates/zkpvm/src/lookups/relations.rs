@@ -345,3 +345,28 @@ stwo_constraint_framework::relation!(
     RistrettoCombCompressRegFileLookupElements,
     REL_RISTRETTO_COMB_COMPRESS_REGFILE_SIZE
 );
+
+// R1e-bis Batch 4a: cross-chip relation tying compress chain's
+// row +43 (s_can canonical compressed bytes) to the output memory
+// producer chip.
+//
+// Tuple: (call_idx, byte_idx, value) — 3 limbs.
+//
+// PRODUCER (`RistrettoCombCompressChip`): per fixed-base call, the
+// row at offset +43 emits 32 tuples (one per byte_idx ∈ 0..32) at
+// (call_idx, byte_idx, s_can[byte_idx]) with multiplicity
+// `+IsOutputProducer` (preprocessed; 1 on row +43 of real
+// per-call blocks, 0 elsewhere).
+//
+// CONSUMER (`RistrettoCombCompressOutputChip`): per call, 32 rows
+// (one per output byte) emit tuples at (call_idx, byte_idx, value)
+// with multiplicity `-IsReal`.  Balance forces each row's `value`
+// column to equal the compress chain's `s_can[byte_idx]` for that
+// call — i.e., binds the output memory producer's byte payload to
+// the canonically-compressed Ristretto bytes the compress chain
+// derived in-circuit.
+const REL_RISTRETTO_COMB_COMPRESS_OUTPUT_SIZE: usize = 3;
+stwo_constraint_framework::relation!(
+    RistrettoCombCompressOutputLookupElements,
+    REL_RISTRETTO_COMB_COMPRESS_OUTPUT_SIZE
+);

@@ -78,7 +78,10 @@ use crate::trace::{
 
 use crate::chips::ristretto::field_op_constraints;
 use crate::framework::BuiltInComponent;
-use crate::lookups::{ByteToBitsLookupElements, RistrettoCombCompressRegFileLookupElements};
+use crate::lookups::{
+    ByteToBitsLookupElements, RistrettoCombCompressOutputLookupElements,
+    RistrettoCombCompressRegFileLookupElements,
+};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
@@ -374,6 +377,20 @@ pub enum PreprocessedColumn {
     /// constraints are trivially satisfied there.
     #[size = 1]
     IsUnityCheck,
+    /// 1 iff this row is row +43 of a *real* per-call block —
+    /// the canonical-s row whose `out` (32 bytes) is the chip's
+    /// final compressed Ristretto output.  Drives 32 producer
+    /// emissions to `RistrettoCombCompressOutputLookupElements` so
+    /// the sibling output chip can consume the bytes for memory
+    /// emission.  Padding rows have IsOutputProducer = 0.
+    #[size = 1]
+    IsOutputProducer,
+    /// Per-row call index — for row r in a real per-call block,
+    /// `(r - N_BOUNDARY_INPUTS) / ROWS_PER_CALL`.  Boundary input
+    /// rows + padding have CallIdx = 0.  Drives the call_idx limb
+    /// of the output-binding relation tuple.
+    #[size = 1]
+    CallIdx,
 }
 
 #[cfg(feature = "prover")]
@@ -910,6 +927,7 @@ impl BuiltInComponent for RistrettoCombCompressChip {
     type LookupElements = (
         RistrettoCombCompressRegFileLookupElements,
         ByteToBitsLookupElements,
+        RistrettoCombCompressOutputLookupElements,
     );
 
     fn add_constraints<E: EvalAtRow>(
@@ -919,9 +937,10 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         lookup_elements: &(
             RistrettoCombCompressRegFileLookupElements,
             ByteToBitsLookupElements,
+            RistrettoCombCompressOutputLookupElements,
         ),
     ) {
-        let (regfile_lookup, byte_to_bits_lookup) = lookup_elements;
+        let (regfile_lookup, byte_to_bits_lookup, output_lookup) = lookup_elements;
         // Column reads.
         let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
@@ -989,6 +1008,12 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
         let is_unity_check =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsUnityCheck);
+        let is_output_producer = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::IsOutputProducer
+        );
+        let call_idx_pp =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::CallIdx);
 
         // Shared FieldOp algebra.
         field_op_constraints::add_field_op_constraints(
@@ -1157,6 +1182,28 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             ],
         ));
 
+        // ── Output producer emissions (Batch 4a) ──
+        // On row +43 of every real per-call block (gated by
+        // IsOutputProducer), emit 32 producer tuples
+        // `(call_idx, byte_idx, out[k])` to the new
+        // `RistrettoCombCompressOutputLookupElements` relation.
+        // The sibling `RistrettoCombCompressOutputChip` consumes
+        // these tuples (one per byte) and re-emits the byte values
+        // as MemoryAccess producers at `(output_ptr+k, byte, ts,
+        // is_write=1)`, binding the actor's PVM-memory output to
+        // the canonical s_can computed in-circuit.
+        for k in 0..32 {
+            eval.add_to_relation(RelationEntry::new(
+                output_lookup,
+                is_output_producer[0].clone().into(),
+                &[
+                    call_idx_pp[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -1186,10 +1233,26 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             // a real per-call block — guards on (a) being beyond the
             // boundary inputs, (b) within the real-row range, and
             // (c) at the per-call-block-relative ROW_UNITY position.
-            let is_unity = row >= N_BOUNDARY_INPUTS
-                && row < real_n_rows
-                && (row - N_BOUNDARY_INPUTS) % ROWS_PER_CALL == ROW_UNITY;
+            let in_call_block = row >= N_BOUNDARY_INPUTS && row < real_n_rows;
+            let per_call_offset = if in_call_block {
+                Some((row - N_BOUNDARY_INPUTS) % ROWS_PER_CALL)
+            } else {
+                None
+            };
+            let is_unity = per_call_offset == Some(ROW_UNITY);
             trace.fill_columns(row, is_unity as u8, PreprocessedColumn::IsUnityCheck);
+            let is_output_producer = per_call_offset == Some(ROW_S_CAN);
+            trace.fill_columns(
+                row,
+                is_output_producer as u8,
+                PreprocessedColumn::IsOutputProducer,
+            );
+            let call_idx = if in_call_block {
+                ((row - N_BOUNDARY_INPUTS) / ROWS_PER_CALL) as u8
+            } else {
+                0
+            };
+            trace.fill_columns(row, call_idx, PreprocessedColumn::CallIdx);
         }
         trace.finalize_bit_reversed()
     }
@@ -1221,10 +1284,20 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let regfile: &RistrettoCombCompressRegFileLookupElements =
             lookup_elements.as_ref();
         let byte_to_bits: &ByteToBitsLookupElements = lookup_elements.as_ref();
+        let output_relation: &RistrettoCombCompressOutputLookupElements =
+            lookup_elements.as_ref();
 
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::RowIndexLo
+        );
+        let is_output_producer_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::IsOutputProducer
+        );
+        let call_idx_pp_col = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::CallIdx
         );
         let row_idx_hi_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -1335,6 +1408,20 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
                 sign_bit7_col[0].clone(),
             ],
         );
+
+        // ── Output producer emissions ──
+        for k in 0..32 {
+            logup.add_to_relation_with(
+                output_relation,
+                [is_output_producer_pp[0].clone()],
+                |[g]| g.into(),
+                &[
+                    call_idx_pp_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
+                ],
+            );
+        }
 
         logup.finalize()
     }

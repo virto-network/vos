@@ -122,14 +122,17 @@ impl BuiltInComponent for RistrettoEcallChip {
 #[cfg(feature = "prover")]
 fn ristretto_ecall_log_size(side_note: &SideNote) -> u32 {
     use crate::core::tracing::ScalarMultKind;
-    // FixedBasepoint scalar mults skip the 32-byte scalar producer
-    // here — `RistrettoCombScalarBoundaryChip` emits those memory
-    // producers instead so the ledger pins the scalar to PVM memory.
+    // FixedBasepoint scalar mults skip BOTH:
+    //   - 32-byte scalar producers (handled by
+    //     RistrettoCombScalarBoundaryChip; Batch 8).
+    //   - 32-byte output producers (handled by
+    //     RistrettoCombCompressOutputChip; Batch 4a).
+    // Only the 32-byte INPUT POINT producers stay here.
     let n_scalar: usize = side_note
         .ristretto_mem_ops
         .iter()
         .map(|op| match op.kind {
-            ScalarMultKind::FixedBasepoint => 64, // point + output only
+            ScalarMultKind::FixedBasepoint => 32, // point only
             ScalarMultKind::Variable => 96,
         })
         .sum();
@@ -173,12 +176,18 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
                 ts: op.ts, is_write: false,
             });
         }
-        for i in 0..32u32 {
-            out.push(ByteAccess {
-                addr: op.output_ptr + i,
-                value: op.out_bytes[i as usize],
-                ts: op.ts, is_write: true,
-            });
+        // Output-byte producers: skipped for FixedBasepoint records —
+        // `RistrettoCombCompressOutputChip` produces those tuples
+        // (Batch 4a) bound to the canonical s_can derived in-circuit
+        // by the compress chain.
+        if op.kind != ScalarMultKind::FixedBasepoint {
+            for i in 0..32u32 {
+                out.push(ByteAccess {
+                    addr: op.output_ptr + i,
+                    value: op.out_bytes[i as usize],
+                    ts: op.ts, is_write: true,
+                });
+            }
         }
     }
     for op in &side_note.ristretto_add_mem_ops {
