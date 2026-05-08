@@ -179,3 +179,11 @@ install-hooks:
 check-no-std:
     cargo build -p vos-raft --no-default-features --target thumbv7em-none-eabihf
     cargo build -p vos-raft --no-default-features --target riscv32imc-unknown-none-elf
+
+# Run cargo-deny across the workspace (license / advisory / bans /
+# sources). Requires `cargo install cargo-deny` once. Wire this into
+# CI before any release that ships outside the trusted-internal
+# bucket — without it, RustSec advisories on hyper / quinn / rustls /
+# ring won't get caught.
+deny:
+    cargo deny --all-features check
