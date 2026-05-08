@@ -22,6 +22,7 @@ use std::path::PathBuf;
 pub mod agents;
 pub mod call;
 pub mod client;
+pub mod dag;
 pub mod delete;
 pub mod endpoint;
 pub mod export;
@@ -31,6 +32,7 @@ pub mod join;
 pub mod list;
 pub mod members;
 pub mod new;
+pub mod ping;
 pub mod programs;
 pub mod publish;
 pub mod reconcile;
@@ -228,6 +230,19 @@ pub enum SpaceCommand {
     Subscriptions {
         space: String,
     },
+    /// Round-trip the daemon to verify it's reachable. Times
+    /// the libp2p connect + an empty registry query.
+    Ping {
+        space: String,
+    },
+    /// Read-only DAG diagnostic for an installed agent's
+    /// CRDT redb. `<agent>` is `registry` or any installed
+    /// instance name. The daemon must NOT be running (redb
+    /// is exclusively locked while `space up` holds it).
+    Dag {
+        space: String,
+        agent: String,
+    },
     /// Invoke any agent on the running daemon. Generic floor
     /// primitive; `publish` / `install` / etc. are typed sugar
     /// wrappers around the same plumbing.
@@ -338,5 +353,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             subscriptions::run_unsubscribe(&space, &agent)
         }
         SpaceCommand::Subscriptions { space } => subscriptions::run_list(&space),
+        SpaceCommand::Ping { space } => ping::run(&space),
+        SpaceCommand::Dag { space, agent } => dag::run(&space, &agent),
     }
 }
