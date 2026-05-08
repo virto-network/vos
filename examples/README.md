@@ -1,128 +1,90 @@
 # VOS examples
 
-This directory contains a runnable collection of example actors and agents you
-can use to explore VOS, the actor runtime at the core of Kunekt.
+Runnable actors, agents, and TOML manifests for exploring VOS.
 
 ```
 examples/
-├── space.toml     # space manifest: agents (with optional child actors) + workers
-├── justfile       # build and run recipes
-├── agents/        # orchestrators (services that drive actors)
-│   ├── scheduler/   — invokes children each round, re-runs on yield
-│   ├── router/      — stateless message forwarder
-│   └── nushell/     — stub for a nu-style scripting agent
-└── actors/        # guest actors hosted by an agent
-    ├── greeter/     — one-shot "hello" actor
-    ├── counter/     — counts ticks in persistent state
-    ├── fizzbuzz/    — cooperative loop with yield
-    ├── hasher/      — uses preimage hostcalls
-    ├── math/        — stateless compute service (add, multiply)
-    ├── display/     — virtual framebuffer + tick accumulator
-    ├── animation/   — draws a spinner via the display actor
-    └── pipeline/    — multi-step computation across math
+├── space.toml          # full manifest (scheduler + nested actors + workers)
+├── space-crdt-{a,b}.toml  # two-process CRDT convergence demo
+├── space-raft.toml     # Raft cluster template
+├── justfile            # build recipes (cargo actor, cargo wasm, cargo worker)
+├── agents/             # services that orchestrate actors (scheduler/, …)
+└── actors/             # leaf actors (greeter/, counter/, crdt-counter/, …)
 ```
 
 ## What is VOS?
 
-VOS is a small actor framework built on the JAR JAVM. An **actor** is a Rust
-struct whose methods are message handlers. To you as an author, an actor looks
-like a long-running program: you can write `loop { ... }`, `await` other
-actors, sleep, and hold local variables across those awaits.
+A small actor framework that compiles Rust to a JAM-aligned PVM
+(RISC-V) target and runs it inside a deterministic host. Each
+actor is a Rust struct whose `#[msg]`-tagged methods are message
+handlers. Replicas of the same actor under the same
+`replication_id` converge automatically via merkle-CRDT (or Raft).
 
-Under the hood, each service runs inside a PVM (a minimal RISC-V virtual
-machine). Every tick follows the JAM **refine→accumulate** split:
+Each tick follows the JAM **refine→accumulate** split:
 
-- **Refine** (PC=0, pure): reads state, dispatches messages, buffers side
-  effects, and halts with a `RefinePayload` containing the new actor state
-  and queued effects. Cannot mutate storage.
-- **Accumulate** (commit): replays the buffered effects — storage writes,
-  transfers to other services, preimage provides — making them permanent.
+- **Refine** (PC=0, pure): dispatches messages, buffers writes
+  + transfers, halts with a `RefinePayload`. Cannot mutate
+  storage directly.
+- **Accumulate**: replays the buffered effects. Storage writes
+  and cross-actor transfers become permanent here.
 
-When a handler calls `ctx.yield_now()`, the framework sets `continue_next`
-in the refine output. The accumulate stage persists the serialized actor
-state to storage and issues a self-directed transfer so the service is
-re-ticked. On the next tick, refine reads the persisted state and the actor
-picks up where it left off. This continuation protocol is JAM-compatible:
-it relies only on standard `READ`, `WRITE`, and `TRANSFER` hostcalls, so
-services work on any conformant host without special runtime support.
-
-VOS adds a transparent optimization on top: when a service yields, the
-runtime also captures the PVM's flat memory image. On the next tick the
-kernel is warm-started with that image, so the actor's heap and statics
-survive without a serialize/deserialize round-trip.
-
-**Agents** are services that orchestrate actors. The `scheduler` agent keeps a
-list of children, sends each of them a `start` message on startup, and
-re-invokes any that yielded so cooperative loops can make progress.
-
-### Execution flow
-
-```
-vosx up space.toml
-  └─ load manifest, transpile ELFs to PVM blobs
-  └─ register workers, then each [[agent]]'s child actors,
-     then the agent itself, on the multi-threaded VosNode
-  └─ kick-start every registered service
-     │
-     ▼
-  scheduler (refine, PC=0)
-     ├─ fetch "start" message
-     ├─ for each child: invoke(child, Msg::new("start"))
-     │     │
-     │     ▼
-     │  actor (refine, PC=0)
-     │     ├─ read persisted state (or create fresh)
-     │     ├─ fetch + dispatch messages
-     │     │    (may ctx.ask() → synchronous INVOKE hostcall)
-     │     │    (may ctx.yield_now() → sets continue_next flag)
-     │     └─ halt with RefinePayload(state, effects, reply)
-     │
-     ├─ accumulate: replay effects (writes, transfers)
-     ├─ if continue_next: persist state + self-transfer
-     └─ repeat until no yielded children remain
-```
-
-Handlers get an `&mut Context` that offers:
-
-- `ctx.tell(target, &Msg::new("foo"))` — fire-and-forget transfer
-- `ctx.ask(target, &Msg::new("foo").with("a", 1)).await` — synchronous query via `INVOKE` hostcall, returns `Result<Value, InvokeError>`
-- `ctx.yield_now().await` — checkpoint state and let other actors run
-- `ctx.sleep(n).await` — sleep for N ticks
-- `ctx.store(key, value)` — queue a storage write (applied in accumulate)
-
-`ask()` is synchronous: the host suspends the caller's PVM at the `INVOKE`
-ecall, runs the child to completion, and resumes the caller with the reply
-already in hand. No snapshots, no replay — just a nested PVM invocation.
+`ctx.yield_now().await` checkpoints across ticks — accumulate
+persists state and self-transfers, refine resumes on the next
+tick. JAM-pure (only standard `READ`/`WRITE`/`TRANSFER`
+hostcalls). VOS adds a flat-memory warm-restart on top so
+heap + statics survive without serialize/deserialize.
 
 ## Running
 
-```sh
-# build everything and start the example space
-just run
+`vosx space *` is the operator surface. The TOML manifests in
+this dir are reconciled into a space's registry on startup —
+they're devhelpers, not the runtime source of truth.
 
-# list actors and their messages without running
-just list
-
-# just build, don't run
+```bash
+# Build all the example actors (riscv64em-javm target)
 just build
 
-# run a single actor without a manifest
-cargo run -p vos --bin vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.elf
+# Single-actor smoke test, no manifest, no networking
+cargo run -p vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.elf
+
+# Run the full example space (scheduler + greeter + counter + fizzbuzz)
+vosx space new --name demo
+vosx space up demo --manifest examples/space.toml &
+
+# Then: list state, query agents, exercise handlers
+vosx space agents demo
+vosx space call demo counter inc
+vosx space export demo
+
+# Two-process CRDT convergence
+just -f ../justfile demo-crdt-procs
 ```
 
-The `space.toml` manifest is the structural unit: one `vosx up` =
-one space. See `space.toml` itself for the full schema (agents,
-nested actors, workers, `provides` roles, optional `[node]` block).
+## `Context` API
 
-You'll need [`just`](https://github.com/casey/just) and a recent nightly Rust
-toolchain. The example crates compile to RISC-V via a custom `riscv64em-javm`
-target (configured per-crate in `.cargo/config.toml`).
+Handlers get `&mut Context`:
 
-## Where to look next
+- `ctx.tell(target, &Msg::new("foo"))` — fire-and-forget transfer
+- `ctx.ask(target, &Msg::new("foo").with("a", 1)).await` —
+  synchronous query, returns `Result<Value, InvokeError>`. Host
+  suspends the caller's PVM at the `INVOKE` ecall, runs the
+  child to completion, resumes the caller with the reply.
+- `ctx.yield_now().await` — checkpoint state, let other actors
+  run; refine resumes on next tick.
+- `ctx.sleep(n).await` — sleep for N ticks.
+- `ctx.store(key, value)` — queue a storage write (applied
+  in accumulate).
 
-- **`actors/greeter`** — the smallest possible actor
-- **`actors/counter`** — persistent state across invocations
-- **`actors/pipeline`** — chained `ctx.ask()` calls to another actor
-- **`agents/scheduler`** — how an agent drives children via `lifecycle::invoke`
-- **`../crates/vos/src/actors/run.rs`** — service entry points (`run_refine_service`, `run_accumulate_service`)
-- **`../crates/vos/src/runtime.rs`** — host-side runtime, journal, continuation wiring
+## Where to look
+
+- `actors/greeter` — smallest possible actor
+- `actors/counter` — persistent state across invocations
+- `actors/crdt-counter` — minimal CRDT-replicated state
+- `actors/pipeline` — chained `ctx.ask()` calls
+- `agents/scheduler` — agent driving children via `lifecycle::invoke`
+- `../crates/vos/src/actors/run.rs` — refine/accumulate entry points
+- `../crates/vos/src/runtime.rs` — host journal + continuation wiring
+
+You'll need [`just`](https://github.com/casey/just) and the nightly
+Rust toolchain (per-crate `riscv64em-javm` target spec via
+`.cargo/config.toml`).

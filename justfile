@@ -135,27 +135,9 @@ demo-crdt-procs: build-crdt-counter build-crates
 
 # ── Run ─────────────────────────────────────────────────────────────
 
-# Run vosx with the example space manifest
-run-manifest: build build-pvm
-    cargo run --bin vosx -- start examples/space.toml --no-persist
-
-# Run a single PVM actor
+# Run a single PVM actor as a one-shot, no space, no networking.
 run-actor name="greeter": build-pvm
     cargo run --bin vosx -- run examples/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
-
-# Run a worker standalone
-run-worker name="echo": build-workers
-    cargo run --bin vosx -- node --worker target/debug/lib{{name}}_worker.so
-
-# Run two workers together (proxy can ask echo)
-run-workers: build-workers
-    cargo run --bin vosx -- node \
-        --worker target/debug/libecho_worker.so \
-        --worker target/debug/libproxy_worker.so
-
-# List metadata of actors in a manifest
-list manifest="examples/space.toml": build-pvm
-    cargo run --bin vosx -- list {{manifest}}
 
 # ── Maintenance ─────────────────────────────────────────────────────
 

@@ -85,31 +85,51 @@ The protocol has three layers:
 
 ## Trying it out
 
-This repo includes **VOS**, a working actor runtime that implements the
-sync + persistence layers. Actors are written as ordinary Rust, compiled
+This repo includes **VOS**, a working actor runtime, and `vosx`, the
+operator-facing CLI. Actors are written as ordinary Rust, compiled
 to a JAM-aligned PVM (RISC-V) target, and run inside a deterministic
 host so two replicas of the same actor under the same `replication_id`
 converge automatically.
 
-The `vosx` CLI is the operator-facing entry point. Recipes are in
-`justfile`; run `just --list` to see them all. The fastest demos:
+`vosx` has two commands: `vosx run <elf>` for raw one-shot PVM
+execution, and `vosx space *` for everything space-related. A space
+is a per-collaboration root identified by a content-addressed
+`space_id` (= `blake2b("vos-space-id/v1" || genesis_dag_root)`).
+
+Quick start:
 
 ```bash
-# Run the example space (scheduler + greeter + counter + fizzbuzz)
-just run-manifest
+# Create a space. Generates per-space identity, runs the bundled
+# space-registry briefly to commit a genesis CrdtEvent, derives
+# space_id from the resulting DAG root.
+vosx space new --name demo
 
-# Live cross-node CRDT convergence demo. Two `vosx up` processes
-# join the same hyperspace, each fires `inc()` on its local replica,
-# both converge to count=2 within a couple of sync ticks.
-just demo-crdt-procs
+# Run the daemon. Owns the redb, listens on libp2p (auto-port
+# loopback by default; pass --listen for a routable addr).
+# `--manifest` reconciles a TOML into the registry on startup
+# (publishes blobs, installs agents, fires their `on_start`).
+vosx space up demo --manifest examples/space-crdt-a.toml &
 
-# In-process two-node convergence test (faster, no separate processes)
-just demo-crdt-sync
+# Talk to it. `space call` is the floor primitive — any agent,
+# any handler. `space publish/install/agents/etc.` are typed
+# sugar on top.
+vosx space call demo counter inc
+vosx space agents demo
+vosx space ping demo                    # daemon-reachable + RTT
+vosx space dag demo counter             # DAG roots (live via libp2p)
+vosx space export demo > snapshot.toml  # round-trip back to TOML
+```
+
+Two-process CRDT convergence demo (one shell):
+
+```bash
+just demo-crdt-procs   # creates + dials two daemons, both reach count=2
+just demo-crdt-sync    # in-process variant, no separate processes
 ```
 
 ### Consistency modes
 
-Each actor in `space.toml` picks a `consistency` mode:
+Each `[[agent]]` in a manifest picks a `consistency` mode:
 
 | Mode | Replication | Read-from-any-replica | Writes block on |
 |---|---|---|---|
@@ -118,40 +138,41 @@ Each actor in `space.toml` picks a `consistency` mode:
 | `crdt` | merkle-CRDT, eventual | yes | local commit |
 | `raft` | Raft consensus, strict | leader only (today) | quorum ack |
 
-CRDT is the right pick when state is commutative (counters, sets,
-LWW maps, append-only logs) and reads-from-anywhere matter. Raft
-is the right pick when the actor's state is strictly sequenced
-and divergence is unacceptable (a ledger, a registry of unique
-names, anything where two concurrent writers each "winning"
-locally would corrupt the model). The `Consistency` enum is
-per-actor — different actors in the same space can mix modes
-freely.
+CRDT fits commutative state (counters, sets, LWW maps,
+append-only logs) where reads-from-anywhere matter. Raft fits
+strictly sequenced state where divergence corrupts (ledgers,
+unique-name registries). Modes mix freely per-agent.
 
 Raft requires a cluster membership list (every replica's
-`node_prefix`). See `examples/space-raft.toml` for a documented
-template.
-
-The full integration suite (43 tests covering agent dispatch, CRDT
-replication, Raft election + replication + compaction +
-snapshot install, registry sync, restart determinism, panic
-recovery, and cold-bootstrap catch-up) runs with:
+`node_prefix`). See `examples/space-raft.toml`.
 
 ```bash
-cargo test --all -- --test-threads=1
+cargo test --all -- --test-threads=1   # full integration suite
 ```
 
-`vosx status [<manifest>] --connect <multiaddr>` joins a running
-hyperspace as a transient peer and prints the local identity, connected
-peers, and the registry's contents. `vosx call <name> <msg>
-[--arg k=v]` sends a typed message to any actor by name.
+### Multi-node
+
+```bash
+# host A
+vosx space new --name a
+vosx space up a --manifest space-crdt-a.toml --listen /ip4/0.0.0.0/tcp/4811 &
+vosx space info a            # prints the bootnode hint:
+                             #   <space_id>@/ip4/.../tcp/4811/p2p/<peer-id>
+
+# host B (paste the bootnode hint)
+vosx space join "<bootnode-hint>" --name b
+vosx space up b --manifest space-crdt-b.toml --connect /ip4/.../tcp/4811/p2p/<peer-id> &
+```
+
+The TOML manifest is a devhelper, not the runtime source of
+truth — the registry is. `space export` re-derives a manifest
+from the live registry; `space up --manifest` is idempotent
+reconciliation.
 
 ### Writing an actor
 
-Actors are normal Rust:
-
 ```rust
-use vos::{actor, messages};
-use vos::{print, println};  // guest println!, panic-propagating
+use vos::prelude::*;
 
 #[actor]
 pub struct Counter { count: u64 }
@@ -161,28 +182,27 @@ impl Counter {
     fn new() -> Self { Counter { count: 0 } }
 
     #[msg]
-    async fn inc(&mut self, tag: u32) { self.count += 1; }
+    async fn inc(&mut self) { self.count += 1; }
 
     #[msg]
     async fn get(&self) -> u64 { self.count }
 }
-
-vos::pvm_main!(Counter);  // emits PVM `_start` / `accumulate`
 ```
 
-Compile with the riscv64em-javm target (see
-`examples/actors/crdt-counter/.cargo/config.toml`), declare in a
-manifest, and `vosx up space.toml`. Hosts get a typed
-`CounterClient` for free via `#[messages]`:
+`#[actor]` emits the PVM `_start` / `accumulate` entry points.
+`#[messages]` generates the per-handler message types and a
+typed `CounterRef` for host-side calls:
 
 ```rust
 use vos::node::{AgentConfig, VosNode};
-use crdt_counter::CrdtCounterClient;
+use counter::CounterRef;
 
 let mut node = VosNode::new();
 let id = node.register(AgentConfig::new(blob));
-let counter = CrdtCounterClient::at(&node, id);
-counter.inc(1)?;
-counter.inc(2)?;
-assert_eq!(counter.get()?, 2);
+let counter = CounterRef::at(id);
+vos::block_on(counter.inc(&mut &node))?;
+let n = vos::block_on(counter.get(&mut &node))?;
 ```
+
+Compile with the `riscv64em-javm` target — see
+`examples/actors/counter/.cargo/config.toml`.
