@@ -14,12 +14,13 @@
 //! `space up --manifest <path>` (declarative reconciliation
 //! of a manifest into a space's registry) is a future addition.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod blob_store;
 mod bundled;
 mod commands;
+mod help_schema;
 mod output;
 mod paths;
 mod spaces_index;
@@ -66,6 +67,12 @@ enum Command {
         #[command(subcommand)]
         command: commands::space::SpaceCommand,
     },
+    /// Emit the full CLI schema as pretty-printed JSON. Walks
+    /// every subcommand + argument from clap's introspection,
+    /// so the dump always matches what the binary accepts.
+    /// Designed for LLM and tooling consumption — pipe into
+    /// `jq '.subcommands[] | .name'` to enumerate verbs.
+    HelpSchema,
 }
 
 /// Initialize the global tracing subscriber from `RUST_LOG`,
@@ -93,6 +100,16 @@ fn main() {
             if let Err(e) = commands::space::run(command) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::HelpSchema) => {
+            let schema = help_schema::build(&Cli::command());
+            match serde_json::to_string_pretty(&schema) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         None => match cli.file {
