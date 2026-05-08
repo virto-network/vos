@@ -223,10 +223,14 @@ impl Future for HostIo {
 
 /// Future returned by [`super::context::Context::resolve`].
 ///
-/// Wraps a registry `Ask`, decoding the reply into a u32. Any
-/// non-`Value::U32` reply (or invoke error) collapses to 0 —
-/// callers treat 0 as "not found", matching the registry's
-/// own protocol.
+/// Wraps a registry `Ask`, decoding the reply into a u32.
+/// Returns 0 for **both** "not installed" and any failure path
+/// (invoke error, unexpected reply variant) — callers can't
+/// distinguish them from the return value alone. Failure paths
+/// emit a `log::warn!` so the cause is visible in actor logs;
+/// callers that need to branch on the error should use
+/// [`super::context::Context::ask`] against `ServiceId::REGISTRY`
+/// directly.
 pub struct Resolve {
     ask: Ask,
 }
@@ -245,7 +249,18 @@ impl Future for Resolve {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
         match Pin::new(&mut self.ask).poll(cx) {
             Poll::Ready(Ok(super::value::Value::U32(n))) => Poll::Ready(n),
-            Poll::Ready(_) => Poll::Ready(0),
+            Poll::Ready(Ok(other)) => {
+                crate::log::warn!(
+                    "Context::resolve: registry returned non-U32 reply ({other:?}); treating as not-found",
+                );
+                Poll::Ready(0)
+            }
+            Poll::Ready(Err(e)) => {
+                crate::log::warn!(
+                    "Context::resolve: registry invoke failed: {e}; treating as not-found",
+                );
+                Poll::Ready(0)
+            }
             Poll::Pending => Poll::Pending,
         }
     }

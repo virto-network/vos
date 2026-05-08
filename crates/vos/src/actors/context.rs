@@ -165,13 +165,25 @@ impl<A: Actor> Context<A> {
     /// Resolve an installed agent's name to its node-local
     /// `ServiceId` (packed as u32) by asking the well-known
     /// `ServiceId::REGISTRY` service. Returns 0 when no agent
-    /// with that name is installed.
+    /// with that name is installed **or** when the registry
+    /// invoke fails for any reason — the two cases are
+    /// indistinguishable from the return value alone, so
+    /// failures emit a `log::warn!` for debugging. Callers that
+    /// need explicit error handling should use
+    /// [`Context::ask`] against `ServiceId::REGISTRY` directly.
     ///
     /// Thin convenience over `ctx.ask(REGISTRY, Msg::new("resolve")…)`
     /// so actor crates don't need to depend on the registry's
     /// typed Ref to use it. The returned id is dispatchable via
     /// `ctx.tell` / `ctx.send` — same formula `space up` uses
     /// when registering installed agents on this node.
+    ///
+    /// **Eventual consistency**: if the local registry replica
+    /// hasn't yet seen a fresh `install` from another node
+    /// (CRDT replication lag), `resolve` returns 0 transiently
+    /// even though the agent exists in the space. Callers that
+    /// need stronger semantics should retry, or watch for the
+    /// agent's appearance via subscriptions.
     ///
     /// ```ignore
     /// let counter = ctx.resolve("counter").await;
