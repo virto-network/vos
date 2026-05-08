@@ -4,7 +4,7 @@
 //! the old `space ping` exposed).
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -159,25 +159,49 @@ fn print_text(
     Ok(())
 }
 
-/// Connect to the daemon, time a registry round-trip, and pack
-/// the outcome into the JSON `Running` variant. Errors are
-/// surfaced via `rtt_error` rather than failing the whole call,
-/// matching the text path's best-effort behavior.
-fn running_state(query: &str, ep: Endpoint) -> DaemonState {
+/// Outcome of probing the daemon's reachability via a single
+/// registry round-trip. The text and JSON paths share the
+/// timing logic and just format this differently.
+enum RttOutcome {
+    /// Both connect and invoke succeeded.
+    Ok { connect: Duration, invoke: Duration },
+    /// Connected, but the registry call didn't return.
+    InvokeFailed { connect: Duration, error: String },
+    /// Couldn't even establish a libp2p connection.
+    ConnectFailed { error: String },
+}
+
+/// Connect to the daemon, time an empty registry call, and
+/// hand the timings (or error) back. Best-effort — caller
+/// decides what to do with the result.
+fn measure_rtt(query: &str) -> RttOutcome {
     let connect_started = Instant::now();
-    let (rtt, rtt_error) = match DaemonClient::connect(query) {
-        Ok(client) => {
-            let connect_us = connect_started.elapsed().as_micros();
-            let invoke_started = Instant::now();
-            let outcome = client.programs();
-            let invoke_us = invoke_started.elapsed().as_micros();
-            let _ = client.shutdown();
-            match outcome {
-                Ok(_) => (Some(RttView { connect_us, invoke_us }), None),
-                Err(e) => (None, Some(e.to_string())),
-            }
-        }
-        Err(e) => (None, Some(e.to_string())),
+    let client = match DaemonClient::connect(query) {
+        Ok(c) => c,
+        Err(e) => return RttOutcome::ConnectFailed { error: e.to_string() },
+    };
+    let connect = connect_started.elapsed();
+    let invoke_started = Instant::now();
+    let outcome = client.programs();
+    let invoke = invoke_started.elapsed();
+    let _ = client.shutdown();
+    match outcome {
+        Ok(_) => RttOutcome::Ok { connect, invoke },
+        Err(e) => RttOutcome::InvokeFailed { connect, error: e.to_string() },
+    }
+}
+
+fn running_state(query: &str, ep: Endpoint) -> DaemonState {
+    let (rtt, rtt_error) = match measure_rtt(query) {
+        RttOutcome::Ok { connect, invoke } => (
+            Some(RttView {
+                connect_us: connect.as_micros(),
+                invoke_us: invoke.as_micros(),
+            }),
+            None,
+        ),
+        RttOutcome::InvokeFailed { error, .. }
+        | RttOutcome::ConnectFailed { error } => (None, Some(error)),
     };
     DaemonState::Running {
         pid: ep.pid,
@@ -188,26 +212,16 @@ fn running_state(query: &str, ep: Endpoint) -> DaemonState {
     }
 }
 
-/// Connect to the daemon and time a single registry round-trip.
-/// Prints `rtt` lines on success, or a one-line failure
-/// explanation if the connect / invoke didn't go through.
-/// Errors don't propagate — `info` is best-effort.
 fn print_rtt(query: &str) {
-    let connect_started = Instant::now();
-    let client = match DaemonClient::connect(query) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("rtt         libp2p connect failed: {e}");
-            return;
+    match measure_rtt(query) {
+        RttOutcome::Ok { connect, invoke } => {
+            println!("rtt         connect={connect:?}, invoke={invoke:?}");
         }
-    };
-    let connected = connect_started.elapsed();
-    let invoke_started = Instant::now();
-    let outcome = client.programs();
-    let invoke = invoke_started.elapsed();
-    let _ = client.shutdown();
-    match outcome {
-        Ok(_) => println!("rtt         connect={connected:?}, invoke={invoke:?}"),
-        Err(e) => println!("rtt         invoke failed (connect={connected:?}): {e}"),
+        RttOutcome::InvokeFailed { connect, error } => {
+            println!("rtt         invoke failed (connect={connect:?}): {error}");
+        }
+        RttOutcome::ConnectFailed { error } => {
+            println!("rtt         libp2p connect failed: {error}");
+        }
     }
 }
