@@ -354,26 +354,58 @@ natural batches:
    `INVSQRT_A_MINUS_D`, `compute_compress_witness(p) ->
    CompressWitness`.  Cross-checked against
    `RistrettoPoint::compress()` byte-for-byte (4 unit tests
-   GREEN).  `chip_isolated` 11/11 + `phase2_alu` 94/94 stay green
-   (no chip yet — this is pure scaffolding).
-2. Implement compress chain rows 1-12 (the algebra prologue) as
-   either an extension of `RistrettoFixedBaseConsumerChip` (Path A)
-   or a sibling `RistrettoCombCompressChip` (Path B).
-   `compute_compress_witness` already returns every intermediate
-   the chain needs to pin (`u1, u2, u2_sq, u1_u2_sq, inv_sqrt,
-   inv_sqrt_sq, i1, i2, i2_t, z_inv, t_z_inv, ...`); chip witness
-   fill consumes it.  **Inter-chip binding (consumer→compress)**:
-   need a new relation tying compress-chain row 1-4 IsInput
-   rows' `out` to the consumer chip's window-63 final-Acc rows
-   (the last 4 mul rows of window 63's 18-row add chain — i.e.
-   X3 = E·F, Y3 = G·H, T3 = E·H, Z3 = F·G).  The design sketch
-   above mistakenly calls these "IsInput coord rows for window
-   63" — those rows hold T[63][k_63] (the looked-up table entry),
-   NOT the running accumulator's final coords.  Final Acc lives
-   in the LAST 4 mul rows of the per-window 18-row add block.
-3. Implement sign-checks + conditional rows.
-4. Wire up output-byte memory producer + RistrettoEcallChip skip.
-5. Add chip-isolated harness + bench validation.
+   GREEN).
+2. **DONE (commit 4c0b6db)** — compress chain algebra prologue
+   (rows 1-12) via Path B sibling chip
+   `RistrettoCombCompressChip`.  Per call: 5 IsInput rows
+   (X/Y/Z/T/inv_sqrt) + 12 algebra rows (Z+Y, Z-Y, u1, u2, u2²,
+   tmp, inv_sqrt², inv_sqrt²·tmp, i1, i2, i2·T, z_inv).  Reuses
+   `field_op_constraints` for per-row mod-p25519 algebra.  New
+   chip-local register-file relation
+   `RistrettoCombCompressRegFileLookupElements` for source-row
+   threading — distinct from the consumer chip's relation so
+   chip-local row IDs don't collide.  Two chip-isolated harnesses
+   GREEN (`harness_ristretto_compress_algebra_only` exercises a
+   real FixedBasepoint call; `harness_ristretto_compress_isolated_empty`
+   is the structural smoke test).  `chip_isolated` 13/13 +
+   `phase2_alu` 94/94 stay green.
+3. Sign-checks + conditional select/negate rows (rows 13/14, 18,
+   19/20, 21, 23/24, 25).  Each needs a new row class beyond the
+   FieldOp partition; lands as additional IsSignCheck / IsSelect /
+   IsNegate flag columns + extra constraints in
+   `RistrettoCombCompressChip::add_constraints`.  Sign-check
+   semantics: Ristretto element `s` is "negative" iff
+   `s.bytes[0] & 1 == 1`; emit a `ByteToBitsLookupElements`
+   consumer on byte 0 to bind the sign witness.  Conditional
+   select `out = flag·a + (1-flag)·b`: 3 mul/add subrows OR a
+   single new row class with a 32-byte equality constraint
+   `flag·(a - b) + b - out = 0` (degree-2 with helpers).
+   Conditional negate similarly.  Includes the
+   `inv_sqrt²·tmp = 1` unity check on row +12 (constrain
+   `out[0] = 1, out[1..32] = 0`).
+4. Output-byte memory producer + RistrettoEcallChip skip + the
+   inter-chip X/Y/Z/T boundary binding.  Compress chain's row +25
+   `out` (32 bytes of canonical s) emits +IsReal
+   `MemoryAccessLookupElements` producers at
+   `(output_ptr + i, byte, ts, is_write=1)` for i=0..32; mirror
+   `RistrettoCombScalarBoundaryChip`'s pattern (commit 82f893d).
+   Update `RistrettoEcallChip::collect_accesses` to skip the
+   32-byte output block when `op.kind == FixedBasepoint`.  New
+   relation tying compress chain's row 0-3 IsInput X/Y/Z/T to
+   consumer chip's window-63 last 4 mul rows — those produce the
+   final Acc bytes (NOT the IsInput coord rows of window 63,
+   which hold the looked-up table entry T[63][k_63] — see the
+   design-sketch correction above).  Producer side on the
+   consumer chip needs a new flag column "IsFinalAcc" gating the
+   emission.
+5. Activity gating (`ChipActivity.ristretto_comb` already covers
+   the new chip — just add idx 25 to the gate); BASE_COMPONENTS
+   wiring; chip-isolated end-to-end harness covering the full
+   chain (includes a soundness regression test mirroring
+   `harness_ristretto_scalar_memory_mismatch_rejected`: feed
+   `out_bytes ≠ compress(scalar · G)` and assert verify rejects
+   with `claimed logup sum is not zero`); bench validation
+   targeting MOBILE ≤ 0.85 s vs ~0.79 s baseline.
 
 ### Step 5 design tree
 
