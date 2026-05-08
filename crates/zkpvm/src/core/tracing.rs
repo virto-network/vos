@@ -398,16 +398,22 @@ impl TracingPvm {
         // Read h (64 bytes) from memory at address in φ[10].
         // NOTE: this handler reads φ[10/11/12/7] but the zkpvm-precompiles
         // shim transpiles RISC-V a0/a1/a2/a3 to PVM φ[7/8/9/10] (per
-        // grey-transpiler's `map_register`).  The off-by-three is a known
-        // bug — fixed only on `handle_ristretto_scalar_mult_ecall`
-        // (commit 02922c4).  Aligning the other handlers changes the
-        // trace shape in ways that break lookup balance for the existing
-        // prove_blake2b_via_ecall etc. tests; a holistic fix (handler +
-        // lookup-emission alignment + test rewrites) is a separate
-        // session's work.  In practice these handlers produce wrong
-        // host-side outputs but the actor's behaviour is determined by
-        // RISC-V semantics, not by what the host writes back, so the
-        // bench prove + verify still close.
+        // grey-transpiler's `map_register`).  This is the same off-by-three
+        // pattern that was fixed for `handle_ristretto_scalar_mult_ecall`
+        // (commit 02922c4) and the simpler precompiles
+        // (`handle_scalar_reduce_wide_ecall`, `handle_scalar_binop_ecall`,
+        // `handle_ristretto_point_add_ecall`).  Blake2b is the LAST holdout
+        // because the fix is non-local: `CpuChip` emits a
+        // `Blake2bCallLookupElements` tuple `(phi10[4], phi11[4], phi12[8],
+        // phi7_bool, ts[8])` consumed by `Blake2bChip`.  Aligning the
+        // handler requires also rewiring CpuChip's tuple to use
+        // `(phi7[4], phi8[4], phi9[8], phi10_bool, ts[8])` plus introducing
+        // `Phi8`/`Phi9` columns and renaming `Phi7Bool` → `Phi10Bool` (or
+        // adding a new bool column for φ[10]) to track the f flag.  In
+        // practice the bug is invisible to the prover/verifier (both sides
+        // are consistent in the lie) but the actor's downstream blake2b
+        // output reads return uninitialized bytes instead of the
+        // compression result.  Holistic fix is the next-larger deliverable.
         let h_ptr_u = self.pvm.registers[10] as usize;
         let m_ptr_u = self.pvm.registers[11] as usize;
         let h_ptr = self.pvm.registers[10] as u32;
