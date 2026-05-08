@@ -51,7 +51,7 @@ where
         assert!(!bytes.is_empty(), "Decode::decode called with empty bytes");
         // Ensure alignment — rkyv requires the buffer to be aligned
         // to access archived data. Input from FETCH/socket may not be.
-        let aligned = if (bytes.as_ptr() as usize) % core::mem::align_of::<T::Archived>() != 0 {
+        let aligned = if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T::Archived>()) {
             let mut av = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
             av.extend_from_slice(bytes);
             let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&av) };
@@ -70,9 +70,7 @@ where
         // or schema-drifted bytes return Err here instead of decoding
         // to garbage like access_unchecked would.
         let aligned;
-        let slice: &[u8] = if (bytes.as_ptr() as usize)
-            % core::mem::align_of::<T::Archived>() != 0
-        {
+        let slice: &[u8] = if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T::Archived>()) {
             let mut av = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
             av.extend_from_slice(bytes);
             aligned = av;

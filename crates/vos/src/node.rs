@@ -56,10 +56,11 @@ impl AgentResult {
 }
 
 /// Replication / persistence semantics selected per agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Consistency {
     /// In-memory only — state is lost when the agent exits. The
     /// default; matches the pre-persistence behaviour.
+    #[default]
     Ephemeral,
     /// redb-backed local persistence (no replication, no log).
     Local,
@@ -76,11 +77,6 @@ pub enum Consistency {
     Raft,
 }
 
-impl Default for Consistency {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
-}
 
 /// Configuration for registering an agent in the node.
 pub struct AgentConfig {
@@ -755,7 +751,7 @@ fn sync_loop(
         // confirmed members yet) hit every connected peer to
         // find new group hosts. Otherwise stick to the cache
         // plus any hinted peers from the gossipsub side.
-        let reprobe = tick % SYNC_REPROBE_EVERY == 0 || confirmed.is_empty();
+        let reprobe = tick.is_multiple_of(SYNC_REPROBE_EVERY) || confirmed.is_empty();
         tick = tick.wrapping_add(1);
 
         let mut targets: Vec<libp2p::PeerId> = if reprobe {
@@ -787,10 +783,10 @@ fn sync_loop(
                 Err(e) => warn!(error = %e, "sync: per-peer cycle failed"),
             }
         }
-        if any_inserted {
-            if let Some(n) = &notifier {
-                let _ = n.send(());
-            }
+        if any_inserted
+            && let Some(n) = &notifier
+        {
+            let _ = n.send(());
         }
     }
 }
@@ -1069,7 +1065,7 @@ impl VosNode {
             // proposed entry commits).
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
             let rep_id = config.replication_id.unwrap_or([0u8; 32]);
-            match config.db_path(id).map(|p| (p, redb::Database::create(&config.db_path(id).unwrap()))) {
+            match config.db_path(id).map(|p| (p, redb::Database::create(config.db_path(id).unwrap()))) {
                 Some((_path, Ok(db))) => {
                     let db = Arc::new(db);
                     config.pre_opened_db = Some(db.clone());
@@ -1190,7 +1186,7 @@ impl VosNode {
                     // they all errored at startup), there's no
                     // point waiting out the threshold.
                     let all_done = self.agents.iter().all(|h| {
-                        h.join.as_ref().map_or(true, |j| j.is_finished())
+                        h.join.as_ref().is_none_or(|j| j.is_finished())
                     });
                     if all_done { break; }
 
@@ -1220,7 +1216,7 @@ impl VosNode {
                         break;
                     }
                     let all_done = self.agents.iter().all(|h| {
-                        h.join.as_ref().map_or(true, |j| j.is_finished())
+                        h.join.as_ref().is_none_or(|j| j.is_finished())
                     });
                     if all_done { break; }
                 }
@@ -1437,22 +1433,22 @@ impl VosNode {
         {
             if !target.is_on_node(self.node_prefix) && !target.is_local() {
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone());
-                if let Some(net) = net {
-                    if let Some(peer) = net.peer_for_prefix(target.node_prefix()) {
-                        // `from = 0` because this is host-side; it
-                        // never participates in chain detection.
-                        let reply_rx = net.send_invoke(
-                            peer,
-                            ServiceId::REGISTRY.0,
-                            target.0,
-                            Vec::new(),
-                            msg,
-                        );
-                        // Daemon's `dispatch_invoke` already strips
-                        // the envelope back to raw reply bytes, so
-                        // we just forward them.
-                        return reply_rx.recv_timeout(timeout).ok();
-                    }
+                if let Some(net) = net
+                    && let Some(peer) = net.peer_for_prefix(target.node_prefix())
+                {
+                    // `from = 0` because this is host-side; it
+                    // never participates in chain detection.
+                    let reply_rx = net.send_invoke(
+                        peer,
+                        ServiceId::REGISTRY.0,
+                        target.0,
+                        Vec::new(),
+                        msg,
+                    );
+                    // Daemon's `dispatch_invoke` already strips
+                    // the envelope back to raw reply bytes, so
+                    // we just forward them.
+                    return reply_rx.recv_timeout(timeout).ok();
                 }
             }
         }
@@ -1772,16 +1768,16 @@ fn agent_thread(
                     .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
-                if !state.is_empty() {
-                    if let Err(e) = strategy.commit(&state) {
-                        let err = format!("post-replay commit failed: {e}");
-                        error!(%id, "{err}");
-                        return AgentResult {
-                            id,
-                            panics: runtime.panics,
-                            error: Some(err),
-                        };
-                    }
+                if !state.is_empty()
+                    && let Err(e) = strategy.commit(&state)
+                {
+                    let err = format!("post-replay commit failed: {e}");
+                    error!(%id, "{err}");
+                    return AgentResult {
+                        id,
+                        panics: runtime.panics,
+                        error: Some(err),
+                    };
                 }
             }
             Ok(_) => {}

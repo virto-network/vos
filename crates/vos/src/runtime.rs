@@ -719,8 +719,8 @@ impl<D: DataLayer> VosRuntime<D> {
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);
             }
-            new_transfers.extend(journal.transfers.drain(..));
-            new_services_to_register.extend(journal.new_services.drain(..));
+            new_transfers.append(&mut journal.transfers);
+            new_services_to_register.append(&mut journal.new_services);
         }
 
         // Register services created via NEW during this tick.
@@ -1042,25 +1042,25 @@ fn record_and_write_invoke(
     // same observation.
     if output_buf_len > 0 && output.len() > output_buf_len {
         let truncated = alloc::vec![STATUS_PANICKED];
-        if depth == 1 {
-            if let crate::effect_log::EffectMode::Recording(s) = mode {
-                s.record(truncated.clone());
-            }
+        if depth == 1
+            && let crate::effect_log::EffectMode::Recording(s) = mode
+        {
+            s.record(truncated.clone());
         }
         kwrite(caller, output_ptr, &truncated);
         return truncated.len() as u64;
     }
 
-    if depth == 1 {
-        if let crate::effect_log::EffectMode::Recording(s) = mode {
-            if output.len() > s.cap() {
-                let truncated = alloc::vec![STATUS_PANICKED];
-                s.record(truncated.clone());
-                kwrite(caller, output_ptr, &truncated);
-                return truncated.len() as u64;
-            }
-            s.record(output.to_vec());
+    if depth == 1
+        && let crate::effect_log::EffectMode::Recording(s) = mode
+    {
+        if output.len() > s.cap() {
+            let truncated = alloc::vec![STATUS_PANICKED];
+            s.record(truncated.clone());
+            kwrite(caller, output_ptr, &truncated);
+            return truncated.len() as u64;
         }
+        s.record(output.to_vec());
     }
     kwrite(caller, output_ptr, output);
     output.len() as u64
@@ -1105,15 +1105,15 @@ fn handle_invoke(
     // — the handler has become non-deterministic (asking more than
     // we recorded), and the caller should treat the whole rebuild
     // as a failure.
-    if depth == 1 {
-        if let crate::effect_log::EffectMode::Replaying(replay) = mode {
-            let out: alloc::vec::Vec<u8> = match replay.next_reply() {
-                Some(bytes) => bytes.to_vec(),
-                None => alloc::vec![STATUS_PANICKED],
-            };
-            kwrite(caller, output_ptr, &out);
-            return out.len() as u64;
-        }
+    if depth == 1
+        && let crate::effect_log::EffectMode::Replaying(replay) = mode
+    {
+        let out: alloc::vec::Vec<u8> = match replay.next_reply() {
+            Some(bytes) => bytes.to_vec(),
+            None => alloc::vec![STATUS_PANICKED],
+        };
+        kwrite(caller, output_ptr, &out);
+        return out.len() as u64;
     }
 
     if depth >= MAX_INVOKE_DEPTH {

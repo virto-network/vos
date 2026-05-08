@@ -212,8 +212,10 @@ impl CrdtEvent {
 ///
 /// The runtime holds one of these per tick and threads a
 /// mutable reference down through the refine/invoke call chain.
+#[derive(Default)]
 pub enum EffectMode {
     /// No recording or replay — the default.
+    #[default]
     Inactive,
     /// The host captures every top-level invoke output so the
     /// finished log can be attached to the commit.
@@ -222,12 +224,6 @@ pub enum EffectMode {
     /// the observed output bytes from the log instead of running
     /// the child.
     Replaying(EffectReplay),
-}
-
-impl Default for EffectMode {
-    fn default() -> Self {
-        EffectMode::Inactive
-    }
 }
 
 impl EffectMode {
