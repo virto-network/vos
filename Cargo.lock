@@ -1526,6 +1526,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
  "vos",
 ]
@@ -3250,6 +3251,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "scale"
 version = "0.1.0"
 source = "git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6#e8861917c03d8f277a03ad8c079acf95c531b3d6"
@@ -3329,6 +3336,18 @@ version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
  "serde",
 ]
 

@@ -1,0 +1,130 @@
+//! Request routing.
+//!
+//! `handle` resolves the URL's `<agent>` segment through the registry
+//! actor, builds a dynamic `Msg` from query params (GET) or JSON body
+//! (POST/PUT/PATCH), dispatches via `ctx.ask`, and returns the reply
+//! as a JSON `Response`.
+//!
+//! `handle_admin` short-circuits the `/__admin/*` routes — they're
+//! served entirely by the tokio side, so they preempt a busy `serve()`.
+//!
+//! `drain_jobs` is the actor-side serve loop: pull a `Job` off the
+//! mpsc, run `handle`, return the response on the oneshot, repeat
+//! until the stop flag flips.
+
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use vos::actors::context::ServiceId;
+use vos::actors::value::{Msg, Value};
+
+use crate::HttpGateway;
+use crate::json::{parse_flat_json, value_to_json};
+use crate::state::{Inner, status_json};
+use crate::types::{Job, Request, Response};
+
+pub(crate) async fn drain_jobs(
+    job_rx: &mpsc::Receiver<Job>,
+    inner: &Inner,
+    ctx: &mut vos::Context<HttpGateway>,
+) -> String {
+    loop {
+        if inner.stop.load(Ordering::Relaxed) {
+            return "stopped".into();
+        }
+        match job_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(job) => {
+                let response = handle(&job.request, ctx).await;
+                inner.requests.fetch_add(1, Ordering::Relaxed);
+                let _ = job.resp_tx.send(response);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return "job channel closed".into(),
+        }
+    }
+}
+
+async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response {
+    let Some((agent, method)) = split_path(&req.path) else {
+        return Response::text(400, "expected /<agent>/<method>");
+    };
+
+    let target = match resolve(ctx, &agent).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Response::text(404, format!("unknown agent '{agent}'")),
+        Err(e) => return Response::text(502, format!("registry: {e}")),
+    };
+
+    let msg = match build_msg(method, req) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+
+    match ctx.ask(target, &msg).await {
+        Ok(value) => Response::json(200, value_to_json(&value)),
+        Err(e) => Response::text(502, format!("upstream error: {e}")),
+    }
+}
+
+/// Direct admin endpoints — bypass `ctx.ask` so they work even while
+/// `serve()` is the only message in flight on the worker.
+///
+/// - `GET  /__admin/status` → JSON snapshot
+/// - `POST /__admin/stop`   → set the stop flag, reply 204
+pub(crate) fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
+    if !req.path.starts_with("/__admin/") {
+        return None;
+    }
+    Some(match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/__admin/status") => Response::json(200, status_json(inner).into_bytes()),
+        ("POST", "/__admin/stop") => {
+            inner.stop.store(true, Ordering::Relaxed);
+            Response::empty(204)
+        }
+        _ => Response::text(404, format!("unknown admin route {} {}", req.method, req.path)),
+    })
+}
+
+fn split_path(path: &str) -> Option<(String, String)> {
+    let trimmed = path.trim_start_matches('/');
+    let (agent, method) = trimmed.split_once('/')?;
+    (!agent.is_empty() && !method.is_empty()).then(|| (agent.to_string(), method.to_string()))
+}
+
+async fn resolve(
+    ctx: &mut vos::Context<HttpGateway>,
+    name: &str,
+) -> core::result::Result<Option<ServiceId>, vos::actors::value::InvokeError> {
+    let msg = Msg::new("resolve").with("name", name.to_string());
+    let id = ctx.ask(ServiceId::REGISTRY, &msg).await?.as_u32().unwrap_or(0);
+    Ok((id != 0).then(|| ServiceId(id)))
+}
+
+fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Response> {
+    let mut msg = Msg::new(method);
+    match req.method.as_str() {
+        "GET" => {
+            for (k, v) in parse_query(&req.query) {
+                msg = msg.with(k, v);
+            }
+        }
+        "POST" | "PUT" | "PATCH" => {
+            if !req.body.is_empty() {
+                let pairs = parse_flat_json(&req.body)
+                    .map_err(|e| Response::text(400, format!("invalid JSON: {e}")))?;
+                for (k, v) in pairs {
+                    msg = msg.with(k, Value::from(v));
+                }
+            }
+        }
+        other => return Err(Response::text(405, format!("method {other} not allowed"))),
+    }
+    Ok(msg)
+}
+
+/// Parse `a=1&b=hello+world` into key-value pairs, with proper percent
+/// + plus decoding handled by `serde_urlencoded`.
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    serde_urlencoded::from_str(query).unwrap_or_default()
+}

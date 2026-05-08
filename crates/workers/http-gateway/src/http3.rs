@@ -9,6 +9,7 @@
 //! `rcgen` for `localhost`. A future iteration will accept PEM paths
 //! (or ACME) once we have an operator story.
 
+use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -19,24 +20,54 @@ use bytes::{Buf, Bytes};
 use tokio::sync::oneshot;
 use vos::log;
 
-use crate::{handle_admin, IoResult, Inner, Job, Request, Response};
+use crate::HttpGateway;
+use crate::routing::handle_admin;
+use crate::runtime::{self, serve_with};
+use crate::state::Inner;
+use crate::types::{IoResult, Job, Request, Response};
+
+/// Actor-side entry for `serve_h3` when the feature is on.
+pub(crate) async fn serve_h3_impl(
+    port: u16,
+    ctx: &mut vos::Context<HttpGateway>,
+) -> String {
+    serve_with(port, "udp/h3", spawn, ctx).await
+}
+
+fn spawn(port: u16, job_tx: mpsc::Sender<Job>, inner: Arc<Inner>) -> IoResult<()> {
+    runtime::spawn_on_thread(format!("http-gateway-h3:{port}"), move |ready_tx| async move {
+        let addr: SocketAddr = match format!("0.0.0.0:{port}").parse() {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("addr parse: {e}")));
+                return;
+            }
+        };
+        let endpoint = match build_endpoint(addr) {
+            Ok(ep) => ep,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        let _ = ready_tx.send(Ok(()));
+        accept_loop(endpoint, job_tx, inner).await;
+    })
+}
 
 /// Build a QUIC endpoint listening on `addr` with a freshly-minted
 /// self-signed cert for `localhost`. ALPN advertises `h3`.
-pub(crate) fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
+fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
     // rustls 0.23 with the ring provider needs the global crypto
-    // provider installed before any cert work. Idempotent — safe
-    // to call repeatedly.
+    // provider installed before any cert work. Idempotent — safe to
+    // call repeatedly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .map_err(|e| format!("rcgen self-signed cert: {e}"))?;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| format!("rcgen self-signed cert: {e}"))?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(
-            cert.key_pair.serialize_der(),
-        ),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
     );
 
     let mut tls_config = rustls::ServerConfig::builder()
@@ -53,38 +84,28 @@ pub(crate) fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
         .map_err(|e| format!("quinn endpoint bind {addr}: {e}"))
 }
 
-/// Accept loop. Runs inside the gateway's tokio runtime; one tokio
-/// task per QUIC connection, one task per request stream.
-pub(crate) async fn accept_loop(
+async fn accept_loop(
     endpoint: quinn::Endpoint,
     job_tx: mpsc::Sender<Job>,
     inner: Arc<Inner>,
 ) {
-    loop {
-        if inner.stop.load(Ordering::Relaxed) {
-            endpoint.close(0u32.into(), b"gateway-stop");
-            return;
-        }
-        let accept =
-            tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await;
+    while !inner.stop.load(Ordering::Relaxed) {
+        let accept = tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await;
         let incoming = match accept {
             Ok(Some(i)) => i,
-            Ok(None) => return, // endpoint closed
+            Ok(None) => break, // endpoint closed
             Err(_) => continue, // timeout — re-check stop
         };
         let job_tx = job_tx.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
-                    log::debug!("http-gateway: h3 handshake: {e}");
-                    return;
-                }
-            };
-            handle_connection(conn, job_tx, inner).await;
+            match incoming.await {
+                Ok(conn) => handle_connection(conn, job_tx, inner).await,
+                Err(e) => log::debug!("http-gateway: h3 handshake: {e}"),
+            }
         });
     }
+    endpoint.close(0u32.into(), b"gateway-stop");
 }
 
 async fn handle_connection(
@@ -111,10 +132,10 @@ async fn handle_connection(
                     }
                 });
             }
+            // ConnectionError variants include peer-initiated graceful
+            // shutdown — debug logging only.
             Ok(None) => break,
             Err(e) => {
-                // ConnectionError flavors include peer-initiated graceful
-                // shutdown — debug-only logging.
                 log::debug!("http-gateway: h3 accept: {e}");
                 break;
             }
@@ -126,16 +147,12 @@ async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     job_tx: mpsc::Sender<Job>,
     inner: Arc<Inner>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (req, mut stream) = resolver.resolve_request().await?;
 
-    // Drain the request body. h3 hands us `impl Buf` chunks, which we
-    // copy into a Vec<u8>. Bounded only by client behavior — same
-    // posture as the hyper side.
     let mut body = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await? {
-        let remaining = chunk.remaining();
-        let mut buf = vec![0u8; remaining];
+        let mut buf = vec![0u8; chunk.remaining()];
         chunk.copy_to_slice(&mut buf);
         body.extend_from_slice(&buf);
     }
@@ -154,9 +171,7 @@ async fn handle_request(
         if job_tx.send(Job { request: our_req, resp_tx }).is_err() {
             Response::text(503, "gateway stopped")
         } else {
-            resp_rx
-                .await
-                .unwrap_or_else(|_| Response::text(500, "no response from actor"))
+            resp_rx.await.unwrap_or_else(|_| Response::text(500, "no response from actor"))
         }
     };
 
