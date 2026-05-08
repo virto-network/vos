@@ -46,7 +46,11 @@ pub mod verify;
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
     /// Create a new space — scaffold identity, initial data
-    /// dir, and add to the local spaces index.
+    /// dir, and add to the local spaces index. Doesn't run
+    /// any daemon; `space up` is what binds a network. Set
+    /// the daemon's persistent listen addrs by editing the
+    /// per-space `local.toml`'s `listen = […]`, or pass
+    /// `--listen` to `space up` per-run.
     New {
         /// Short name for the space. Used in listings and as the
         /// default lookup key.
@@ -58,9 +62,6 @@ pub enum SpaceCommand {
         /// blob bundled into the vosx binary at build time.
         #[arg(long, value_name = "SOURCE")]
         registry: Option<String>,
-        /// libp2p multiaddr to listen on. Repeatable.
-        #[arg(long, value_name = "MULTIADDR")]
-        listen: Vec<String>,
         /// Override the per-space data directory (default:
         /// `~/.local/share/vosx/<space_id>`).
         #[arg(long, value_name = "DIR")]
@@ -267,12 +268,10 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::New {
             name,
             registry,
-            listen,
             data_dir,
         } => new::run(new::Args {
             name,
             registry,
-            listen,
             data_dir,
         }),
         SpaceCommand::List | SpaceCommand::Ls => list::run(),

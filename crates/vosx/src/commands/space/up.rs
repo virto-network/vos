@@ -185,11 +185,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// spaces get an auto-port loopback bind so clients have an
 /// endpoint to dial.
 ///
-/// `--listen` overrides the entry's saved listen addrs entirely
-/// (so the user can run multiple daemons of the same space on
-/// different ports). `--connect` extends the entry's saved
-/// bootnodes (additive — the user can dial extra peers
-/// without losing the original).
+/// Listen-addr resolution order (first non-empty wins):
+///   1. `--listen` flag(s) on this `space up` invocation
+///   2. `local.toml`'s `listen = [...]` (per-space user pref)
+///   3. default `/ip4/127.0.0.1/tcp/0` (loopback auto-port)
+///
+/// `--connect` extends the entry's saved bootnodes additively
+/// — the user can dial extra peers without losing the
+/// original join target.
 fn build_network_for_daemon(
     entry: &spaces_index::SpaceEntry,
     data_dir: &std::path::Path,
@@ -200,10 +203,13 @@ fn build_network_for_daemon(
         libp2p::Multiaddr::from_str(s)
             .map_err(|e| anyhow::anyhow!("bad {kind} multiaddr '{s}': {e}"))
     };
-    let listen_src: &[String] = if listen_override.is_empty() {
-        &entry.listen
-    } else {
+    let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
+    let listen_src: &[String] = if !listen_override.is_empty() {
         listen_override
+    } else if !local_cfg.listen.is_empty() {
+        &local_cfg.listen
+    } else {
+        &[]
     };
     let mut listen: Vec<libp2p::Multiaddr> = listen_src
         .iter()

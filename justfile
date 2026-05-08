@@ -85,17 +85,17 @@ demo-crdt-procs: build-crdt-counter build-crates
     rm -rf $A $B
     mkdir -p $A/{data,config,cache} $B/{data,config,cache}
 
-    echo "→ host A: create space (listens on :4811)..."
+    echo "→ host A: create space..."
     XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
-      ./target/debug/vosx space new --name demo \
-        --listen /ip4/127.0.0.1/tcp/4811 > /dev/null
+      ./target/debug/vosx space new --name demo > /dev/null
     SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
     echo "  space_id=$SPACE_ID"
 
-    echo "→ host A: starting daemon, reconciling space-crdt-a.toml..."
+    echo "→ host A: starting daemon on :4811, reconciling space-crdt-a.toml..."
     XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
     RUST_LOG=info ./target/debug/vosx space up demo \
         --manifest examples/space-crdt-a.toml \
+        --listen /ip4/127.0.0.1/tcp/4811 \
         > /tmp/vosx-a.log 2>&1 &
     PID_A=$!
 

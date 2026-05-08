@@ -23,7 +23,6 @@ use crate::spaces_index::{self, SpacesIndex};
 pub struct Args {
     pub name: String,
     pub registry: Option<String>,
-    pub listen: Vec<String>,
     pub data_dir: Option<PathBuf>,
 }
 
@@ -136,7 +135,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // 10. Append to the spaces index.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
-    let mut entry = spaces_index::entry_for(&space_id, &args.name, args.listen.clone());
+    let mut entry = spaces_index::entry_for(&space_id, &args.name, Vec::new());
     entry.data_dir = final_dir.to_string_lossy().to_string();
     entry.registry_hash = registry_hash.to_hex();
     spaces_index::upsert(&mut index, entry);
@@ -150,17 +149,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     println!("  data_dir     = {}", final_dir.display());
     println!("  node.key     = {}", key_path.display());
     println!("  registry     = {registry_label} ({registry_hash})");
-    if !args.listen.is_empty() {
-        println!("  listen       =");
-        for addr in &args.listen {
-            println!("    {addr}");
-        }
-        println!("  bootnode hint:");
-        println!(
-            "    {space_id_hex}@{}/p2p/{peer_id}",
-            args.listen[0],
-        );
-    }
+    println!("  peer_id      = {peer_id}");
+    println!();
+    println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
+    println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
+    println!("printed by `space info {}` once the daemon's running.", args.name);
 
     Ok(())
 }

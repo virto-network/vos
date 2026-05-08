@@ -26,6 +26,12 @@ pub struct LocalConfig {
     /// only the listed instance names.
     #[serde(default)]
     pub subscriptions: Vec<String>,
+    /// libp2p multiaddrs the daemon should bind on every
+    /// `space up`. Empty (default) = bind a loopback auto-port
+    /// for local-only client commands. `--listen` on
+    /// `space up` overrides for one run.
+    #[serde(default)]
+    pub listen: Vec<String>,
 }
 
 impl LocalConfig {
@@ -153,6 +159,7 @@ mod tests {
     fn non_empty_config_filters() {
         let cfg = LocalConfig {
             subscriptions: vec!["counter".into(), "chat".into()],
+            listen: vec![],
         };
         assert!(cfg.is_filtering());
         assert!(cfg.should_spawn("counter"));
@@ -173,10 +180,12 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg = LocalConfig {
             subscriptions: vec!["a".into(), "b".into()],
+            listen: vec!["/ip4/0.0.0.0/tcp/4811".into()],
         };
         save(&tmp, &cfg).unwrap();
         let back = load(&tmp).unwrap();
         assert_eq!(back.subscriptions, cfg.subscriptions);
+        assert_eq!(back.listen, cfg.listen);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
