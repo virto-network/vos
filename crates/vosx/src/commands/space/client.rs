@@ -106,17 +106,28 @@ impl DaemonClient {
         })
     }
 
-    /// Connect, run `f`, shut down — even on error. The common
-    /// shape of every client subcommand: a single registry
-    /// round-trip wrapped in a connect/shutdown pair.
+    /// Connect, run `f`, shut down — even on error or panic.
+    /// The common shape of every client subcommand: a single
+    /// registry round-trip wrapped in a connect/shutdown pair.
+    ///
+    /// Shutdown runs inside an RAII guard's `Drop`, so a panic
+    /// inside `f` still tears down the libp2p peer cleanly
+    /// rather than leaking the network thread.
     pub fn with_connect<T, F>(query: &str, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Self) -> anyhow::Result<T>,
     {
-        let client = Self::connect(query)?;
-        let result = f(&client);
-        let _ = client.shutdown();
-        result
+        struct Guard(Option<DaemonClient>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(c) = self.0.take() {
+                    let _ = c.shutdown();
+                }
+            }
+        }
+        let guard = Guard(Some(Self::connect(query)?));
+        let client = guard.0.as_ref().expect("guard always holds Some after connect");
+        f(client)
     }
 
     /// Macro-generated typed `Ref` pointed at the daemon's
