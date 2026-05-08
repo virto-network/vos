@@ -20,7 +20,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::Semaphore;
 use vos::log;
 
 use crate::config;
@@ -28,7 +28,7 @@ use crate::limits::{
     HEADER_READ_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
 };
 use crate::runtime::{self, InFlightGuard, drain_in_flight};
-use crate::routing::handle_admin;
+use crate::routing::{Policy, dispatch_request};
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
 
@@ -149,25 +149,11 @@ async fn serve_request(
     };
 
     let our_req = Request { method, path, query, headers, body };
-
-    if let Some(response) = handle_admin(&our_req, &inner) {
-        return into_hyper(response);
-    }
-
-    let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-    match job_tx.try_send(Job { request: our_req, resp_tx }) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(_)) => {
-            return into_hyper(Response::text(503, "gateway saturated; retry"));
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            return into_hyper(Response::text(503, "gateway stopped"));
-        }
-    }
-
-    let response = resp_rx
-        .await
-        .unwrap_or_else(|_| Response::text(500, "no response from actor"));
+    let policy = Policy {
+        admin_token: config::admin_token(),
+        auth_token: config::auth_token(),
+    };
+    let response = dispatch_request(our_req, &job_tx, &inner, policy).await;
     into_hyper(response)
 }
 

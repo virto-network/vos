@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::Semaphore;
 use vos::log;
 
 use crate::HttpGateway;
@@ -30,7 +30,7 @@ use crate::limits::{
     H3_BODY_CHUNK_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
     MAX_STREAMS_PER_CONN,
 };
-use crate::routing::handle_admin;
+use crate::routing::{Policy, dispatch_request};
 use crate::runtime::{self, InFlightGuard, drain_in_flight, serve_with};
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
@@ -270,23 +270,11 @@ async fn handle_request(
             headers,
             body,
         };
-
-        if let Some(r) = handle_admin(&our_req, &inner) {
-            r
-        } else {
-            let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-            match job_tx.try_send(Job { request: our_req, resp_tx }) {
-                Ok(()) => resp_rx
-                    .await
-                    .unwrap_or_else(|_| Response::text(500, "no response from actor")),
-                Err(mpsc::TrySendError::Full(_)) => {
-                    Response::text(503, "gateway saturated; retry")
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    Response::text(503, "gateway stopped")
-                }
-            }
-        }
+        let policy = Policy {
+            admin_token: config::admin_token(),
+            auth_token: config::auth_token(),
+        };
+        dispatch_request(our_req, &job_tx, &inner, policy).await
     };
 
     let h3_resp = http::Response::builder()
