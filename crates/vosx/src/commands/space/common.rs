@@ -9,6 +9,7 @@
 //!   `up`, `dag`, `reconcile`, `client`.
 
 use vos::abi::service::ServiceId;
+use vos::node::Consistency;
 
 /// Parse `name` or `name:version`. Bare `name` ⇒ `name:latest`.
 /// Empty halves (`":1.0"`, `"foo:"`) are rejected.
@@ -48,6 +49,22 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
     let raw = u16::from_le_bytes([buf[0], buf[1]]);
     let local = (raw & 0x7FFF).max(0x100);
     ServiceId(((prefix as u32) << 16) | (local as u32))
+}
+
+/// Map a registry-stored `consistency` u8 to the host enum.
+/// `space_registry` defines the numeric assignments (Ephemeral
+/// = 0, Local = 1, Crdt = 2, Raft = 3); `vos::node::Consistency`
+/// is the host-side enum the runtime spawns agents with. Returns
+/// `None` for any unrecognised value so callers can decide
+/// whether to skip-and-warn or hard-fail.
+pub fn consistency_from_u8(c: u8) -> Option<Consistency> {
+    match c {
+        0 => Some(Consistency::Ephemeral),
+        1 => Some(Consistency::Local),
+        2 => Some(Consistency::Crdt),
+        3 => Some(Consistency::Raft),
+        _ => None,
+    }
 }
 
 /// Per-space registry replication-id: blake2b("vos-space-registry/v1"
@@ -117,6 +134,16 @@ mod tests {
             let local = (id.0 & 0xFFFF) as u16;
             assert!(local >= 0x100 && local < 0x8000, "got 0x{local:04x}");
         }
+    }
+
+    #[test]
+    fn consistency_from_u8_round_trips_known_codes() {
+        assert!(matches!(consistency_from_u8(0), Some(Consistency::Ephemeral)));
+        assert!(matches!(consistency_from_u8(1), Some(Consistency::Local)));
+        assert!(matches!(consistency_from_u8(2), Some(Consistency::Crdt)));
+        assert!(matches!(consistency_from_u8(3), Some(Consistency::Raft)));
+        assert!(consistency_from_u8(4).is_none());
+        assert!(consistency_from_u8(255).is_none());
     }
 
     #[test]

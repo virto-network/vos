@@ -33,6 +33,7 @@ use vos::node::VosNode;
 
 use crate::blob_store;
 use crate::commands::space::common::instance_service_id;
+use crate::commands::space::payload_codec;
 
 /// Slim view of the manifest TOML — only the fields the
 /// reconciler cares about. Extra fields are silently ignored
@@ -290,23 +291,20 @@ fn encode_init_args(
 }
 
 /// Encode each `on_start` entry as a `[TAG_DYNAMIC] + rkyv(Msg)`
-/// payload, then rkyv-encode the full `Vec<Vec<u8>>` so it
-/// survives a single `Vec<u8>` field on `AgentRow`.
-/// `spawn_installed_agents` rkyv-decodes it back and hands the
-/// inner `Vec<Vec<u8>>` to `cfg.with_init_payloads`.
+/// payload, then hand the resulting `Vec<Vec<u8>>` to
+/// `payload_codec::encode` so the registry can store it as a
+/// single `Vec<u8>` field on `AgentRow`. `spawn_installed_agents`
+/// reverses both layers on cold start.
 fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> {
-    if on_start.is_empty() {
-        return Ok(Vec::new());
-    }
     use vos::Encode;
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(on_start.len());
     for entry in on_start {
         let mut msg = vos::value::Msg::new(&entry.msg);
         for (k, v) in &entry.args {
-            // Use the same heuristic as `space install --init`:
-            // numeric → u64, true/false → bool, else string.
-            // Manifest authors who want explicit typing can
-            // upgrade to typed init args once we have schemas.
+            // Same heuristic as `space install --init`: numeric
+            // → u64, true/false → bool, else string. Manifest
+            // authors who want explicit typing can upgrade to
+            // typed init args once we have schemas.
             match v {
                 toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
                 toml::Value::Boolean(b) => msg = msg.with(k, *b),
@@ -325,9 +323,7 @@ fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> 
         payload.extend_from_slice(&encoded);
         payloads.push(payload);
     }
-    Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&payloads)
-        .map_err(|e| anyhow::anyhow!("encode on_start payloads: {e}"))?
-        .to_vec())
+    payload_codec::encode(&payloads)
 }
 
 fn toml_to_init_value(

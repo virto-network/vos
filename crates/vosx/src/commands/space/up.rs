@@ -13,7 +13,10 @@ use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobHash};
-use crate::commands::space::common::{instance_service_id, registry_replication_id};
+use crate::commands::space::common::{
+    consistency_from_u8, instance_service_id, registry_replication_id,
+};
+use crate::commands::space::payload_codec;
 use crate::spaces_index;
 
 pub struct Args {
@@ -336,18 +339,12 @@ fn spawn_installed_agents(
         let blob = grey_transpiler::link_elf(&elf)
             .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
 
-        let consistency = match a.consistency {
-            0 => Consistency::Ephemeral,
-            1 => Consistency::Local,
-            2 => Consistency::Crdt,
-            3 => Consistency::Raft,
-            other => {
-                eprintln!(
-                    "vosx: skipping agent '{}' — unknown consistency {other}",
-                    a.instance_name,
-                );
-                continue;
-            }
+        let Some(consistency) = consistency_from_u8(a.consistency) else {
+            eprintln!(
+                "vosx: skipping agent '{}' — unknown consistency {}",
+                a.instance_name, a.consistency,
+            );
+            continue;
         };
 
         let mut cfg = AgentConfig::new(blob).with_consistency(consistency);
@@ -367,23 +364,16 @@ fn spawn_installed_agents(
         // on_start payloads (from manifest reconciliation) get
         // dispatched on cold start. Stored as rkyv-encoded
         // `Vec<Vec<u8>>` on the agent row.
-        if !a.install_payloads.is_empty() {
-            let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(a.install_payloads.len());
-            av.extend_from_slice(&a.install_payloads);
-            let archived = unsafe {
-                vos::rkyv::access_unchecked::<<Vec<Vec<u8>> as vos::rkyv::Archive>::Archived>(&av)
-            };
-            match vos::rkyv::deserialize::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(archived) {
-                Ok(payloads) if !payloads.is_empty() => {
-                    cfg = cfg.with_init_payloads(payloads);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "vosx: agent '{}' has unparseable install_payloads, ignoring: {e}",
-                        a.instance_name,
-                    );
-                }
+        match payload_codec::decode(&a.install_payloads) {
+            Ok(payloads) if !payloads.is_empty() => {
+                cfg = cfg.with_init_payloads(payloads);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "vosx: agent '{}' has unparseable install_payloads, ignoring: {e}",
+                    a.instance_name,
+                );
             }
         }
 

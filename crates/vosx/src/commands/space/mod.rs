@@ -33,6 +33,7 @@ pub mod join;
 pub mod list;
 pub mod members;
 pub mod new;
+pub mod payload_codec;
 pub mod ping;
 pub mod programs;
 pub mod publish;
