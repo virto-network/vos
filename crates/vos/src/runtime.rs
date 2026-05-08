@@ -957,7 +957,10 @@ fn handle_refine_hostcall(
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
             // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B
             // in/out), a1=m_ptr (128B in), a2=t_low (counter low
-            // 64 bits), a3=f flag.
+            // 64 bits), a3=f flag. The compress primitive itself
+            // lives inside vos::crypto as `host_compress_block`
+            // — `blake2b_simd` doesn't expose a public single-
+            // block API, so this glue stays in-tree.
             let h_ptr = a0 as u32;
             let m_ptr = a1 as u32;
             let t_low = a2;
@@ -969,7 +972,7 @@ fn handle_refine_hostcall(
             } else {
                 let mut h: [u8; 64] = h_bytes.try_into().unwrap();
                 let m: [u8; 128] = m_bytes.try_into().unwrap();
-                crate::crypto::blake2b_compress(&mut h, &m, t_low as u128, f_flag);
+                crate::crypto::blake2b::host_compress_block(&mut h, &m, t_low as u128, f_flag);
                 kwrite(kernel, h_ptr, &h);
                 (error::HOST_OK, 0)
             }

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -41,7 +41,12 @@ javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03a
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-blake2b_simd = { version = "1", optional = true }
+# Backs `vos::crypto::blake2b` on every non-riscv64 target —
+# host code, workers, wasm guests. PVM (riscv64) actors hit
+# the host via ECALL_BLAKE2B_COMPRESS instead and never link
+# this dep. `default-features = false` keeps it usable from
+# no_std builds (worker / wasm).
+blake2b_simd = { version = "1", default-features = false }
 pollster = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

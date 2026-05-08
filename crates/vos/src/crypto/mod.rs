@@ -13,4 +13,4 @@
 
 pub mod blake2b;
 
-pub use blake2b::{blake2b_compress, blake2b_hash, ECALL_BLAKE2B_COMPRESS};
+pub use blake2b::{blake2b_hash, ECALL_BLAKE2B_COMPRESS};

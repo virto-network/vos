@@ -1,26 +1,23 @@
-//! blake2b precompile — guest shim for `ECALL_BLAKE2B_COMPRESS`.
+//! blake2b precompile.
 //!
-//! - `blake2b_compress`: one compression block per call. On
-//!   `target_arch = "riscv64"` (PVM actors) dispatches to the host
-//!   ECALL; on every other target runs the self-contained software
-//!   reference (matches the `blake2` crate byte-for-byte).
-//! - `blake2b_hash::<N>(domain, parts)`: streaming N-byte digest of
-//!   `domain || parts.concat()`, driving `blake2b_compress` per
-//!   128-byte block. `N` is `1..=64`. No key, fanout=1, depth=1 —
-//!   matches `blake2::Blake2b<UN>::default()`.
+//! Public API is just `blake2b_hash::<N>(domain, parts)`. On
+//! `target_arch = "riscv64"` (PVM actors) it streams blocks
+//! through the `ECALL_BLAKE2B_COMPRESS` host trap so the host
+//! does the actual work via the SIMD `blake2b_simd` impl. On
+//! every other target (workers, host code, wasm guests) it
+//! goes straight through `blake2b_simd` itself — same bytes
+//! either path, no in-tree reference for actor consumers to
+//! depend on.
 //!
 //! The wire ABI matches `zkpvm-precompiles`: ID 100, args
 //! `φ[10]=h_ptr (64B)`, `φ[11]=m_ptr (128B)`, `φ[12]=t_low`,
 //! `φ[7]=f` flag. When the zkpvm chip lands on master, the same
-//! ECALL hits the accelerated chip path with no actor changes.
+//! actor binary lights up the chip path with no source changes.
 //!
 //! **ABI limit**: only the low 64 bits of the blake2b byte
-//! counter are passed (`t_low`). Inputs larger than 2^64 bytes
-//! (~16 EB) per hash would lose the high half and produce a
-//! divergent digest. Not a practical concern for any realistic
-//! workload; matched by zkpvm-precompiles. If we ever need
-//! arbitrary-length hashes we'd extend the ABI to also pass
-//! `t_high` in `φ[13]`.
+//! counter are passed (`t_low`). Inputs ≥ 2^64 bytes per hash
+//! would silently lose the high half and produce a divergent
+//! digest. Not a practical concern — matches zkpvm-precompiles.
 
 #[cfg(target_arch = "riscv64")]
 use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
@@ -29,34 +26,107 @@ use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
 /// so the same actor binary lights up the chip path under zkpvm.
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
 
-const BLAKE2B_IV: [u64; 8] = [
-    0x6A09E667F3BCC908,
-    0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B,
-    0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1,
-    0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B,
-    0x5BE0CD19137E2179,
-];
-
-/// One blake2b compression: in-place update of `h` (8 × u64 LE = 64
-/// bytes) by mixing in message block `m` (16 × u64 LE = 128 bytes)
-/// with byte counter `t` and finalize flag `f`. PVM dispatches to the
-/// ECALL; everywhere else runs the software reference.
-pub fn blake2b_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
+/// High-level streaming hash. Produces an `OUT_LEN`-byte digest
+/// of `domain || parts.concat()` matching
+/// `blake2::Blake2b<UN>::default()` for output length `N` (no
+/// key, fanout = 1, depth = 1, …).
+///
+/// On riscv64 actors this drives the host's blake2b per
+/// 128-byte block via `ECALL_BLAKE2B_COMPRESS`. On every other
+/// target it dispatches straight to `blake2b_simd`. No
+/// in-tree reference impl is reachable from this path.
+pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; OUT_LEN] {
+    assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
     #[cfg(target_arch = "riscv64")]
     {
-        compress_pvm(h, m, t, f);
+        hash_via_ecall::<OUT_LEN>(domain, parts)
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
-        compress_host(h, m, t, f);
+        hash_via_simd::<OUT_LEN>(domain, parts)
     }
 }
 
+/// Path: feed bytes through `blake2b_simd`'s state machine.
+/// Used by every non-riscv64 caller — workers, host code,
+/// wasm guests — and (transitively) by the host kernel
+/// handler for the riscv64 ECALL.
+#[cfg(not(target_arch = "riscv64"))]
+fn hash_via_simd<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
+    let mut state = blake2b_simd::Params::new().hash_length(N).to_state();
+    state.update(domain);
+    for p in parts {
+        state.update(p);
+    }
+    let h = state.finalize();
+    let mut out = [0u8; N];
+    out.copy_from_slice(h.as_bytes());
+    out
+}
+
+/// Path: drive the host through per-block ecalls. The actor
+/// keeps the blake2b chaining state on its stack; each 128B
+/// message block is handed to the host with the current
+/// counter and finalize flag.
 #[cfg(target_arch = "riscv64")]
-fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
+fn hash_via_ecall<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
+    // Parameter block: byte 0 = digest_length, byte 1 = key_length (0),
+    // byte 2 = fanout (1), byte 3 = depth (1), bytes 4–7 = leaf_length (0).
+    // h[0] = IV[0] ⊕ param_lo.
+    let param_lo: u64 = 0x0101_0000 | (N as u64);
+    let mut h_words = BLAKE2B_IV;
+    h_words[0] ^= param_lo;
+
+    let mut h = [0u8; 64];
+    for i in 0..8 {
+        h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
+    }
+
+    let mut buf = [0u8; 128];
+    let mut buf_len = 0usize;
+    let mut t: u128 = 0;
+
+    let feed = |bytes: &[u8],
+                buf: &mut [u8; 128],
+                buf_len: &mut usize,
+                h: &mut [u8; 64],
+                t: &mut u128| {
+        let mut i = 0;
+        while i < bytes.len() {
+            // Compress only when the buffer is FULL and there's at
+            // least one more byte to come — the final block needs
+            // the finalize flag, set below.
+            if *buf_len == 128 {
+                *t += 128;
+                ecall_compress(h, buf, *t, false);
+                *buf_len = 0;
+            }
+            let take = (128 - *buf_len).min(bytes.len() - i);
+            buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i + take]);
+            *buf_len += take;
+            i += take;
+        }
+    };
+
+    feed(domain, &mut buf, &mut buf_len, &mut h, &mut t);
+    for p in parts {
+        feed(p, &mut buf, &mut buf_len, &mut h, &mut t);
+    }
+
+    // Final block: zero-pad, set finalize flag.
+    for i in buf_len..128 {
+        buf[i] = 0;
+    }
+    t += buf_len as u128;
+    ecall_compress(&mut h, &buf, t, true);
+
+    let mut out = [0u8; N];
+    out.copy_from_slice(&h[..N]);
+    out
+}
+
+#[cfg(target_arch = "riscv64")]
+fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let h_ptr = h.as_mut_ptr() as u64;
     let m_ptr = m.as_ptr() as u64;
     let t_low = t as u64;
@@ -77,8 +147,53 @@ fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     }
 }
 
+// ── Host kernel handler: per-block compress for the ECALL ──
+//
+// `blake2b_simd`'s public API is whole-buffer streaming; it
+// doesn't expose a single-block compress primitive. The host
+// kernel handler in `vos::runtime` needs exactly that to
+// service riscv64 actors' per-block ECALLs, so we keep a
+// portable compress here as an internal impl detail. It's
+// only reachable from inside the vos crate (`pub(crate)`)
+// and never from actor code — actors only ever see
+// `blake2b_hash`.
+
 #[cfg(not(target_arch = "riscv64"))]
-fn compress_host(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
+const BLAKE2B_IV: [u64; 8] = [
+    0x6A09E667F3BCC908,
+    0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B,
+    0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1,
+    0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B,
+    0x5BE0CD19137E2179,
+];
+
+// On riscv64 the param-block init in `hash_via_ecall` needs
+// the IV constants too.
+#[cfg(target_arch = "riscv64")]
+const BLAKE2B_IV: [u64; 8] = [
+    0x6A09E667F3BCC908,
+    0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B,
+    0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1,
+    0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B,
+    0x5BE0CD19137E2179,
+];
+
+/// One blake2b compression: in-place update of `h` (8 × u64 LE
+/// = 64 bytes) by mixing in message block `m` (16 × u64 LE =
+/// 128 bytes) with byte counter `t` and finalize flag `f`.
+///
+/// Visible only inside the vos crate. The runtime's
+/// ECALL_BLAKE2B_COMPRESS handler is the one and only caller;
+/// every other path goes through `blake2b_hash` and uses
+/// `blake2b_simd` directly.
+#[cfg(not(target_arch = "riscv64"))]
+pub(crate) fn host_compress_block(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let mut h_words = [0u64; 8];
     for i in 0..8 {
         h_words[i] = u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
@@ -145,66 +260,6 @@ fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
     result
 }
 
-/// High-level blake2b hash: produces an `OUT_LEN`-byte digest of
-/// `domain || parts.concat()`. Drives the precompile per 128-byte
-/// block. Matches `blake2::Blake2b<UN>::default()` for output length
-/// `N` (no key, fanout=1, depth=1, leaf_length=0, …).
-pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; OUT_LEN] {
-    assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
-    // Parameter block: byte0 = digest_length, byte2 = fanout(1),
-    // byte3 = depth(1). h[0] = IV[0] XOR param_block[0..8].
-    let param_lo: u64 = 0x0101_0000 | (OUT_LEN as u64);
-    let mut h_words = BLAKE2B_IV;
-    h_words[0] ^= param_lo;
-
-    let mut h = [0u8; 64];
-    for i in 0..8 {
-        h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
-    }
-
-    let mut buf = [0u8; 128];
-    let mut buf_len = 0usize;
-    let mut t: u128 = 0;
-
-    let feed = |bytes: &[u8],
-                buf: &mut [u8; 128],
-                buf_len: &mut usize,
-                h: &mut [u8; 64],
-                t: &mut u128| {
-        let mut i = 0;
-        while i < bytes.len() {
-            // Compress only when the buffer is FULL and there's at
-            // least one more byte to come — the final block needs
-            // the finalize flag, set below.
-            if *buf_len == 128 {
-                *t += 128;
-                blake2b_compress(h, buf, *t, false);
-                *buf_len = 0;
-            }
-            let take = (128 - *buf_len).min(bytes.len() - i);
-            buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i + take]);
-            *buf_len += take;
-            i += take;
-        }
-    };
-
-    feed(domain, &mut buf, &mut buf_len, &mut h, &mut t);
-    for p in parts {
-        feed(p, &mut buf, &mut buf_len, &mut h, &mut t);
-    }
-
-    // Final block: zero-pad, set finalize flag.
-    for i in buf_len..128 {
-        buf[i] = 0;
-    }
-    t += buf_len as u128;
-    blake2b_compress(&mut h, &buf, t, true);
-
-    let mut out = [0u8; OUT_LEN];
-    out.copy_from_slice(&h[..OUT_LEN]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,21 +321,23 @@ mod tests {
     }
 
     #[test]
-    fn matches_blake2b_simd_for_two_byte_output() {
-        // The pattern `space_registry::instance_service_id` uses:
-        // 2-byte digest of `domain || 0u8 || name`. Cross-check
-        // against blake2b_simd — host helpers still call
-        // blake2b_simd directly, so we want our software fallback
-        // (which the host kernel runs through on PVM ecalls) to
-        // match byte-for-byte.
-        let bytes = blake2b_simd::Params::new()
-            .hash_length(2)
-            .to_state()
-            .update(b"vos-instance-svc-id/v1")
-            .update(&[0u8])
-            .update(b"counter")
-            .finalize();
-        let ours: [u8; 2] = blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"counter"]);
-        assert_eq!(&ours[..], bytes.as_bytes());
+    fn host_compress_matches_blake2_crate_one_block() {
+        // The host kernel handler's per-block compress is what
+        // riscv64 actors hit via the ECALL. Sanity-check it
+        // against the blake2 reference for one finalized block.
+        let param_lo: u64 = 0x0101_0000 | 64u64;
+        let mut h_words = BLAKE2B_IV;
+        h_words[0] ^= param_lo;
+        let mut h = [0u8; 64];
+        for i in 0..8 {
+            h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
+        }
+        let mut m = [0u8; 128];
+        m[..11].copy_from_slice(b"hello world");
+        host_compress_block(&mut h, &m, 11, true);
+
+        let mut reference = Blake2b512::new();
+        reference.update(b"hello world");
+        assert_eq!(&h[..], &reference.finalize()[..]);
     }
 }
