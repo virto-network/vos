@@ -250,6 +250,15 @@ pub enum PreprocessedColumn {
     /// `ByteIdx[k] = k` for k=0..32.
     #[size = 32]
     ByteIdx,
+    /// 1 iff this row is row +12 of a *real* per-call block — i.e.,
+    /// `row_idx % ROWS_PER_CALL == ROW_UNITY` AND
+    /// `row_idx < n_calls × ROWS_PER_CALL`.  Drives the
+    /// `inv_sqrt² · (u1·u2²) = 1` integrity check whose
+    /// out-byte equality is `out[0] = 1, out[1..32] = 0`.
+    /// Padding rows have IsUnityCheck = 0 so the unity-check
+    /// constraints are trivially satisfied there.
+    #[size = 1]
+    IsUnityCheck,
 }
 
 #[cfg(feature = "prover")]
@@ -542,6 +551,8 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
         let byte_idx_pp =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
+        let is_unity_check =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsUnityCheck);
 
         // Shared FieldOp algebra.
         field_op_constraints::add_field_op_constraints(
@@ -592,6 +603,22 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             producer_emission_mult[0].clone()
                 - producer_gate_h[0].clone() * producer_mult[0].clone(),
         );
+
+        // ── Unity check on row +12 (`inv_sqrt² · (u1·u2²) = 1`) ──
+        // The compress chain pins `inv_sqrt`'s correctness via this
+        // single equality.  IsUnityCheck = 1 selects row +12 of every
+        // *real* per-call block (preprocessed; padding rows have 0).
+        // Constraint set: `out[0] = 1, out[1..32] = 0` mod p25519.
+        // Output of an IsMul row is already canonical ∈ [0, p) by the
+        // FieldOp helper's final-form < p chain, so the bytewise
+        // equality with [1, 0, ..., 0] uniquely identifies the field
+        // element 1.
+        eval.add_constraint(
+            is_unity_check[0].clone() * (out[0].clone() - E::F::from(BaseField::from(1u32))),
+        );
+        for k in 1..32 {
+            eval.add_constraint(is_unity_check[0].clone() * out[k].clone());
+        }
 
         // ── Chip-local register-file producer + consumer A/B ──
         for k in 0..32 {
@@ -650,6 +677,7 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let log_size = log_size_for(compress_n_rows(side_note));
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
+        let real_n_rows = compress_n_rows(side_note);
         for row in 0..num_rows {
             let row_lo = (row & 0xff) as u8;
             let row_hi = ((row >> 8) & 0xff) as u8;
@@ -657,6 +685,8 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
             let byte_idx_arr: [u8; 32] = core::array::from_fn(|k| k as u8);
             trace.fill_columns_bytes(row, &byte_idx_arr, PreprocessedColumn::ByteIdx);
+            let is_unity = row < real_n_rows && row % ROWS_PER_CALL == ROW_UNITY;
+            trace.fill_columns(row, is_unity as u8, PreprocessedColumn::IsUnityCheck);
         }
         trace.finalize_bit_reversed()
     }
