@@ -642,6 +642,125 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     );
 }
 
+/// Session 2.1 step 8 — multi-call coverage for the comb chip pair.
+///
+/// Synthesizes 3 distinct FixedBasepoint scalar mult calls in one
+/// trace, with three different scalars at three different memory
+/// regions and timestamps.  Verifies that:
+///   - `RistrettoCombScalarBoundaryChip`'s `CallIdx` column correctly
+///     enumerates 0/1/2 across the 96 rows.
+///   - The chip's parallel walk over `ristretto_comb_calls` and the
+///     FixedBasepoint-filtered `ristretto_mem_ops` aligns each
+///     scalar's bytes to the right `(scalar_ptr, ts)` pair.
+///   - `RistrettoEcallChip` emits memory producers for point + output
+///     bytes (96-32=64 per call) at the correct distinct addresses.
+///   - `RistrettoCombAnchorChip`'s 64 ScalarWindow emissions per call
+///     are balanced by 32 rows × 2 nibbles per call from the boundary
+///     chip, across all 3 calls.
+///
+/// A regression in any per-call indexing (e.g., the boundary chip
+/// reusing the wrong mem_op for a later call, or the anchor chip's
+/// CallIdx fill being off-by-one) would surface as `claimed logup
+/// sum is not zero` here.
+#[test]
+fn harness_ristretto_fixed_base_three_calls() {
+    use zkpvm::chips::{
+        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    // Three calls with distinct scalars + non-overlapping memory regions.
+    let calls: [(curve25519_dalek::scalar::Scalar, u32, u32, u32, u64); 3] = [
+        (curve25519_dalek::scalar::Scalar::from(7u64), 0x000, 0x040, 0x080, 1),
+        (
+            curve25519_dalek::scalar::Scalar::from(0x1234_5678u64),
+            0x100, 0x140, 0x180, 5,
+        ),
+        (
+            curve25519_dalek::scalar::Scalar::from(0xdead_beef_cafe_babe_u64),
+            0x200, 0x240, 0x280, 11,
+        ),
+    ];
+
+    let basepoint =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let mut initial_memory = vec![0u8; 1024];
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    for &(scalar_value, scalar_ptr, point_ptr, output_ptr, ts) in &calls {
+        let scalar = scalar_value.to_bytes();
+        let out_bytes = (scalar_value
+            * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+            .compress()
+            .to_bytes();
+        initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
+            .copy_from_slice(&scalar);
+        initial_memory[point_ptr as usize..point_ptr as usize + 32]
+            .copy_from_slice(&basepoint);
+        side_note.ristretto_mem_ops.push(RistrettoMemOp {
+            scalar_ptr,
+            point_ptr,
+            output_ptr,
+            ts,
+            scalar_bytes: scalar,
+            point_bytes: basepoint,
+            out_bytes,
+            kind: ScalarMultKind::FixedBasepoint,
+        });
+        side_note
+            .ristretto_comb_calls
+            .push(RistrettoCombCall { scalar });
+    }
+    side_note.initial_memory = initial_memory;
+    side_note.populate_ristretto_comb_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+    ];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect(
+            "3-call harness: prove failed — likely a per-call indexing or \
+             trace-fill misalignment regression",
+        );
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect(
+        "3-call harness: verify failed — comb-chain or memory ledger \
+         imbalance under multi-call",
+    );
+}
+
 /// Session 2.1 step 8 — soundness regression net for the scalar /
 /// PVM-memory binding.  Synthesizes a call whose
 /// `ristretto_comb_calls.scalar` (K1) and `ristretto_mem_ops.scalar_bytes`
