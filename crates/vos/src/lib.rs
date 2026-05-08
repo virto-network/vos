@@ -62,6 +62,7 @@ pub mod prelude {
 // --- ABI (hostcall IDs, error codes, ecall wrappers) ---
 
 pub mod abi;
+pub mod crypto;
 
 // --- Actor framework (always available, no_std compatible) ---
 

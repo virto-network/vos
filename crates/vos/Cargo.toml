@@ -79,3 +79,7 @@ crdt-counter = { path = "../../examples/actors/crdt-counter", default-features =
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"
+# Reference blake2b implementation for cross-checking the
+# vos::crypto software fallback. Dev-only; the in-tree fallback
+# is self-contained.
+blake2 = "0.10"
