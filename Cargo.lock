@@ -3385,7 +3385,6 @@ dependencies = [
 name = "space-registry"
 version = "0.1.0"
 dependencies = [
- "blake2b_simd",
  "serde",
  "vos",
 ]

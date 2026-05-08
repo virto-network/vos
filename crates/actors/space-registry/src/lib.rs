@@ -538,13 +538,7 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
 /// verifiable by any joiner that fetches the genesis snapshot.
 #[cfg(feature = "host")]
 pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(SPACE_ID_DOMAIN_TAG);
-    h.update(&[0u8]);
-    h.update(genesis_dag_root);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+    vos::crypto::blake2b_hash::<32>(SPACE_ID_DOMAIN_TAG, &[&[0u8], genesis_dag_root])
 }
 
 /// Auto-derive a `replication_id` for an installed agent.
@@ -553,15 +547,10 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 /// `instance_name` auto-discover each other.
 #[cfg(feature = "host")]
 pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-replication-id/v1");
-    h.update(&[0u8]);
-    h.update(instance_name.as_bytes());
-    h.update(&[0u8]);
-    h.update(program_hash);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+    vos::crypto::blake2b_hash::<32>(
+        b"vos-replication-id/v1",
+        &[&[0u8], instance_name.as_bytes(), &[0u8], program_hash],
+    )
 }
 
 #[cfg(feature = "host")]
