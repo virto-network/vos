@@ -120,8 +120,8 @@ pub fn reconcile(
     if manifest.agents.is_empty() {
         return Ok(());
     }
-    crate::progress!(
-        "vosx: reconciling manifest ({} agent definition(s))",
+    tracing::info!(
+        "reconciling manifest ({} agent definition(s))",
         flat_count(&manifest.agents),
     );
 
@@ -172,7 +172,7 @@ fn reconcile_one(
     .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
     let program_hash = match existing {
         Some(p) if p.hash == hash.0 => {
-            crate::progress!("vosx:   {program_name}:{program_version} (already published)");
+            tracing::debug!("{program_name}:{program_version} already published");
             p.hash
         }
         Some(_) => {
@@ -196,7 +196,7 @@ fn reconcile_one(
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
             match status {
                 STATUS_OK => {
-                    crate::progress!("vosx:   {program_name}:{program_version} (published)");
+                    tracing::info!("published {program_name}:{program_version}");
                 }
                 STATUS_TAG_CONFLICT => {
                     anyhow::bail!("publish conflict on {program_name}:{program_version}");
@@ -211,7 +211,7 @@ fn reconcile_one(
     let already_installed = vos::block_on(reg.agent(&mut &*node, agent.name.clone()))
         .map_err(|e| anyhow::anyhow!("registry.agent('{}'): {e}", agent.name))?;
     if already_installed.is_some() {
-        crate::progress!("vosx:   {} (already installed)", agent.name);
+        tracing::debug!("{} already installed", agent.name);
         return Ok(());
     }
 
@@ -257,7 +257,11 @@ fn reconcile_one(
     if status != STATUS_OK {
         anyhow::bail!("install '{}' returned status {}", agent.name, status);
     }
-    crate::progress!("vosx:   {} (installed, consistency={})", agent.name, agent.consistency);
+    tracing::info!(
+        "installed {} (consistency={})",
+        agent.name,
+        agent.consistency,
+    );
     Ok(())
 }
 

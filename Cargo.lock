@@ -3931,6 +3931,7 @@ dependencies = [
  "space-registry",
  "toml",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "vos",
 ]

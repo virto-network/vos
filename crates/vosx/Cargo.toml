@@ -40,6 +40,10 @@ toml = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Bridges the `log` facade (vos's actor-side `vos::log::*` calls
+# such as the warnings inside `Context::resolve`) into tracing
+# so they surface through the same subscriber.
+tracing-log = "0.2"
 
 # libp2p multiaddr parsing for `--listen` / `--connect`. The
 # rest of the network plumbing is owned by `vos::network`.

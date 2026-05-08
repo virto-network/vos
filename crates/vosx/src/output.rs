@@ -5,6 +5,10 @@
 //! by individual commands. A static `OnceLock` is the simplest
 //! way to thread the flag through every `run()` without
 //! plumbing it into 20-odd signatures.
+//!
+//! Verbosity is **not** here — `-v` maps to a tracing filter
+//! level in `init_tracing`, so progress chatter goes through
+//! `tracing::info!` / `tracing::debug!` like any other event.
 
 use std::sync::OnceLock;
 
@@ -22,14 +26,9 @@ pub enum Format {
 }
 
 static FORMAT: OnceLock<Format> = OnceLock::new();
-static VERBOSE: OnceLock<bool> = OnceLock::new();
 
 pub fn set(format: Format) {
     let _ = FORMAT.set(format);
-}
-
-pub fn set_verbose(v: bool) {
-    let _ = VERBOSE.set(v);
 }
 
 pub fn current() -> Format {
@@ -38,24 +37,6 @@ pub fn current() -> Format {
 
 pub fn is_json() -> bool {
     matches!(current(), Format::Json)
-}
-
-pub fn is_verbose() -> bool {
-    VERBOSE.get().copied().unwrap_or(false)
-}
-
-/// Emit a `vosx:` prefixed progress line on stderr — but only
-/// when `-v`/`--verbose` is set. Use for "what I'm about to
-/// do" / "I just did X" chatter that's useful for debugging
-/// but noise during normal use. Real warnings and errors
-/// should go through plain `eprintln!`.
-#[macro_export]
-macro_rules! progress {
-    ($($arg:tt)*) => {{
-        if $crate::output::is_verbose() {
-            eprintln!($($arg)*);
-        }
-    }};
 }
 
 /// Serialize `value` to a single-line JSON string and print it

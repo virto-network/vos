@@ -82,10 +82,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             std::time::Duration::from_millis(0),
         )? {
             crate::commands::space::verify::VerifyOutcome::Verified { genesis_cid } => {
-                crate::progress!(
-                    "vosx: genesis verified (root={})",
-                    hex::encode(genesis_cid),
-                );
+                tracing::info!("genesis verified (root={})", hex::encode(genesis_cid));
             }
             crate::commands::space::verify::VerifyOutcome::Mismatch {
                 genesis_cid,
@@ -103,10 +100,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 );
             }
             crate::commands::space::verify::VerifyOutcome::NoGenesisYet => {
-                eprintln!(
-                    "vosx: warning: registry redb has no seq=1 event yet — \
-                     trust-on-first-use until sync delivers genesis. \
-                     Verification activates on the next `space up`.",
+                tracing::warn!(
+                    "registry redb has no seq=1 event yet — trust-on-first-use \
+                     until sync delivers genesis; verification activates on the \
+                     next `space up`",
                 );
             }
         }
@@ -127,8 +124,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     node.attach_network(network);
 
-    crate::progress!(
-        "vosx: space '{}' (id={}…) registry as {id}",
+    tracing::info!(
+        "space '{}' (id={}…) registry as {id}",
         entry.name,
         &entry.id[..12],
     );
@@ -158,10 +155,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     publish_endpoint(&node, &data_dir, local_prefix)?;
 
     if args.once {
-        crate::progress!("vosx: --once — exiting once registry goes idle");
+        tracing::info!("--once: exiting when registry goes idle");
         node.run();
     } else {
-        crate::progress!("vosx: running until shutdown (Ctrl-C)");
+        tracing::info!("running until shutdown (Ctrl-C)");
         node.run_forever();
     }
 
@@ -170,7 +167,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     for r in &results {
         panics += r.panics;
         if let Some(err) = &r.error {
-            eprintln!("vosx: agent {} error: {err}", r.id);
+            tracing::error!("agent {} error: {err}", r.id);
         }
     }
 
@@ -240,9 +237,7 @@ fn build_network_for_daemon(
         .map_err(|e| anyhow::anyhow!("decode keypair: {e}"))?;
     let peer_id = libp2p::PeerId::from(keypair.public());
     let local_prefix = vos::network::derive_node_prefix(&peer_id);
-    crate::progress!(
-        "vosx: node identity {peer_id} (prefix {local_prefix:#06x})",
-    );
+    tracing::info!("node identity {peer_id} (prefix {local_prefix:#06x})");
 
     Ok(vos::network::Network::start(vos::network::NetworkConfig {
         keypair,
@@ -284,9 +279,9 @@ fn publish_endpoint(
         pid: std::process::id(),
     };
     crate::commands::space::endpoint::write(data_dir, &ep)?;
-    crate::progress!("vosx: endpoint published");
+    tracing::info!("endpoint published on {} address(es)", multiaddrs.len());
     for a in &multiaddrs {
-        crate::progress!("  {a}");
+        tracing::info!("  {a}");
     }
     Ok(())
 }
@@ -307,8 +302,8 @@ fn spawn_installed_agents(
     let local_cfg = crate::commands::space::subscriptions::load(data_dir)
         .unwrap_or_default();
     if local_cfg.is_filtering() {
-        crate::progress!(
-            "vosx: subscriptions filter active — {} agent(s)",
+        tracing::info!(
+            "subscriptions filter active — {} agent(s)",
             local_cfg.subscriptions.len(),
         );
     }
@@ -319,18 +314,15 @@ fn spawn_installed_agents(
 
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
-            crate::progress!(
-                "vosx:   skipping '{}' (not subscribed)",
-                a.instance_name,
-            );
+            tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
         }
         let program_hash = BlobHash(a.program_hash);
         let elf = match blob_store::cache_get(&program_hash)? {
             Some(b) => b,
             None => {
-                eprintln!(
-                    "vosx: skipping agent '{}' — program blob {program_hash} not in local cache",
+                tracing::warn!(
+                    "skipping agent '{}' — program blob {program_hash} not in local cache",
                     a.instance_name,
                 );
                 continue;
@@ -340,9 +332,10 @@ fn spawn_installed_agents(
             .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
 
         let Some(consistency) = consistency_from_u8(a.consistency) else {
-            eprintln!(
-                "vosx: skipping agent '{}' — unknown consistency {}",
-                a.instance_name, a.consistency,
+            tracing::warn!(
+                "skipping agent '{}' — unknown consistency {}",
+                a.instance_name,
+                a.consistency,
             );
             continue;
         };
@@ -370,8 +363,8 @@ fn spawn_installed_agents(
             }
             Ok(_) => {}
             Err(e) => {
-                eprintln!(
-                    "vosx: agent '{}' has unparseable install_payloads, ignoring: {e}",
+                tracing::warn!(
+                    "agent '{}' has unparseable install_payloads, ignoring: {e}",
                     a.instance_name,
                 );
             }
@@ -379,8 +372,8 @@ fn spawn_installed_agents(
 
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         let id = node.register_at_id(cfg, svc_id);
-        crate::progress!(
-            "vosx:   agent '{}' as {id} ({})",
+        tracing::info!(
+            "agent '{}' as {id} ({})",
             a.instance_name,
             crate::commands::space::common::consistency_name(a.consistency),
         );

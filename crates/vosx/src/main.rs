@@ -96,23 +96,27 @@ enum Command {
     HelpSchema,
 }
 
-/// Initialize the global tracing subscriber from `RUST_LOG`,
-/// defaulting to `warn`. Idempotent — multiple calls are no-ops.
-fn init_tracing() {
+/// Initialize the global tracing subscriber. Default level is
+/// `warn` (quiet); `-v` raises it to `info` for one-time state
+/// changes; `RUST_LOG` overrides everything for power users
+/// who want `debug` or per-target filtering. Also bridges the
+/// `log` facade so vos's actor-side `log::*` calls reach the
+/// same subscriber.
+fn init_tracing(verbose: bool) {
+    let default_level = if verbose { "info" } else { "warn" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+    let _ = tracing_log::LogTracer::init();
 }
 
 fn main() {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
     output::set(cli.format);
-    output::set_verbose(cli.verbose);
 
     match cli.command {
         Some(Command::Run { program, payload, hex, gas }) => {
