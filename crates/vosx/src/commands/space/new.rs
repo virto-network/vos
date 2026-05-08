@@ -107,7 +107,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&temp_dir);
         e
     })?;
-    let space_id = space_registry::derive_space_id(&genesis_root);
+    let space_id = crate::commands::space::common::derive_space_id(&genesis_root);
 
     // 8. Move temp dir to the canonical location.
     let final_dir = args

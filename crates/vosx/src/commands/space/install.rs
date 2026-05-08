@@ -3,12 +3,11 @@
 
 use vos::init::{InitArgs, InitValue};
 use space_registry::{
-    auto_replication_id, parse_consistency, STATUS_INSTANCE_EXISTS,
-    STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
+    STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
 };
 
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::parse_program_ref;
+use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_ref};
 
 pub struct Args {
     pub space: String,

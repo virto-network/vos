@@ -382,7 +382,7 @@ fn spawn_installed_agents(
         crate::progress!(
             "vosx:   agent '{}' as {id} ({})",
             a.instance_name,
-            space_registry::consistency_name(a.consistency),
+            crate::commands::space::common::consistency_name(a.consistency),
         );
     }
     Ok(())

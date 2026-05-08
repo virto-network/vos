@@ -23,16 +23,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use space_registry::{
-    auto_replication_id, parse_consistency, ProgramRow, SpaceRegistryRef, STATUS_OK,
-    STATUS_TAG_CONFLICT,
-};
+use space_registry::{ProgramRow, SpaceRegistryRef, STATUS_OK, STATUS_TAG_CONFLICT};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::VosNode;
 
 use crate::blob_store;
-use crate::commands::space::common::instance_service_id;
+use crate::commands::space::common::{
+    auto_replication_id, instance_service_id, parse_consistency,
+};
 use crate::commands::space::payload_codec;
 
 /// Slim view of the manifest TOML — only the fields the

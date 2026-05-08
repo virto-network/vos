@@ -1,12 +1,10 @@
 //! Shared helpers for `vosx space *` commands.
 //!
-//! - `parse_program_ref` — splits `name[:version]`, defaulting
-//!   bare names to `:latest`. Used by publish / install / upgrade.
-//! - `truncate` — left-truncate a string to a column width for
-//!   tabular output.
-//! - `instance_service_id` / `registry_replication_id` — the two
-//!   deterministic id derivations that need to agree across
-//!   `up`, `reconcile`, `client`.
+//! Mostly host-side concerns: CLI string parsing, tabular
+//! formatting, and the blake2b derivations that vosx needs
+//! before the daemon is even up. The cross-target
+//! `instance_service_id` lives in the space-registry crate
+//! since the actor's `resolve` handler also needs it.
 
 use vos::abi::service::ServiceId;
 use vos::node::Consistency;
@@ -68,6 +66,63 @@ pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(h.finalize().as_bytes());
     out
+}
+
+/// Compute a space's id from the registry's genesis DAG root.
+/// Stable for the lifetime of the space and verifiable by any
+/// joiner that fetches the genesis snapshot. Host-only
+/// (called before any daemon is up).
+pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(space_registry::SPACE_ID_DOMAIN_TAG);
+    h.update(&[0u8]);
+    h.update(genesis_dag_root);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Auto-derive a `replication_id` for an installed agent.
+/// `blake2b("vos-replication-id/v1" || instance_name || 0 || program_hash)`.
+/// Two replicas that install the same program with the same
+/// `instance_name` auto-discover each other on the gossipsub
+/// topic this id maps to. Host-only — set at install time
+/// from vosx and stored on the registry's `AgentRow`.
+pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"vos-replication-id/v1");
+    h.update(&[0u8]);
+    h.update(instance_name.as_bytes());
+    h.update(&[0u8]);
+    h.update(program_hash);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Render a registry-stored consistency u8 as the canonical
+/// CLI string. Inverse of `parse_consistency`.
+pub fn consistency_name(c: u8) -> &'static str {
+    match c {
+        0 => "ephemeral",
+        1 => "local",
+        2 => "crdt",
+        3 => "raft",
+        _ => "unknown",
+    }
+}
+
+/// Parse a CLI consistency string to the registry-stored u8.
+/// Inverse of `consistency_name`. Returns `None` for unknown
+/// inputs so callers can surface a usage error.
+pub fn parse_consistency(name: &str) -> Option<u8> {
+    match name {
+        "ephemeral" => Some(0),
+        "local" => Some(1),
+        "crdt" => Some(2),
+        "raft" => Some(3),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +197,34 @@ mod tests {
         let s2 = [2u8; 32];
         assert_eq!(registry_replication_id(&s1), registry_replication_id(&s1));
         assert_ne!(registry_replication_id(&s1), registry_replication_id(&s2));
+    }
+
+    #[test]
+    fn space_id_is_domain_tagged() {
+        let root = [0xABu8; 32];
+        let id = derive_space_id(&root);
+        assert_eq!(id, derive_space_id(&root));
+        let mut other = root;
+        other[0] = 0xAC;
+        assert_ne!(id, derive_space_id(&other));
+        assert_ne!(id, [0u8; 32]);
+    }
+
+    #[test]
+    fn replication_id_includes_instance_name() {
+        let h = [0xCDu8; 32];
+        let a = auto_replication_id("alpha", &h);
+        let b = auto_replication_id("beta", &h);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn consistency_roundtrip() {
+        for d in 0u8..=3 {
+            let name = consistency_name(d);
+            assert_eq!(parse_consistency(name), Some(d));
+        }
+        assert_eq!(consistency_name(99), "unknown");
+        assert_eq!(parse_consistency("nonsense"), None);
     }
 }

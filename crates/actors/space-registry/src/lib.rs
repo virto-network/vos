@@ -551,7 +551,7 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
     }
 }
 
-// ── Common helpers (host + actor) ────────────────────────────────
+// ── Cross-target helpers (host + actor) ───────────────────────────
 
 /// Deterministic per-node `ServiceId` (packed as u32) for an
 /// installed agent named `instance_name` on a node with the
@@ -563,9 +563,11 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
 /// Stable across restarts of the same node so each instance's
 /// redb path persists.
 ///
-/// On riscv64 (PVM actors) the blake2b dispatches to the host
-/// ECALL precompile; on host targets it runs the in-tree
-/// software fallback. Both paths produce the same bytes.
+/// Cross-target by design — the actor's `resolve` handler and
+/// `vosx`'s host code both call this with the same bytes coming
+/// out. On riscv64 the blake2b dispatches to the host ECALL
+/// precompile; on every other target it runs through
+/// `vos::crypto::blake2b_hash` → `blake2b_simd`.
 pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
     let raw_bytes: [u8; 2] = vos::crypto::blake2b_hash(
         b"vos-instance-svc-id/v1",
@@ -576,97 +578,3 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
     ((prefix as u32) << 16) | (local as u32)
 }
 
-// ── Host helpers (`host` feature) ────────────────────────────────
-
-/// Compute the `space_id` from the registry's genesis DAG root.
-/// The space_id is stable for the lifetime of the space and
-/// verifiable by any joiner that fetches the genesis snapshot.
-///
-/// Host-only — uses `blake2b_simd` directly for the SIMD-accelerated
-/// path. Actor-side derivations that need the same primitive route
-/// through `vos::crypto::blake2b_hash` (which the host kernel
-/// handler runs through this same path on PVM ecalls).
-#[cfg(feature = "host")]
-pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(SPACE_ID_DOMAIN_TAG);
-    h.update(&[0u8]);
-    h.update(genesis_dag_root);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
-}
-
-/// Auto-derive a `replication_id` for an installed agent.
-/// `blake2b("vos-replication-id/v1" || instance_name || 0 || program_hash)`.
-/// Two replicas that install the same program with the same
-/// `instance_name` auto-discover each other. Host-only — see
-/// `derive_space_id` for the host-vs-actor blake2b convention.
-#[cfg(feature = "host")]
-pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-replication-id/v1");
-    h.update(&[0u8]);
-    h.update(instance_name.as_bytes());
-    h.update(&[0u8]);
-    h.update(program_hash);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
-}
-
-#[cfg(feature = "host")]
-pub fn consistency_name(c: u8) -> &'static str {
-    match c {
-        0 => "ephemeral",
-        1 => "local",
-        2 => "crdt",
-        3 => "raft",
-        _ => "unknown",
-    }
-}
-
-#[cfg(feature = "host")]
-pub fn parse_consistency(name: &str) -> Option<u8> {
-    match name {
-        "ephemeral" => Some(0),
-        "local" => Some(1),
-        "crdt" => Some(2),
-        "raft" => Some(3),
-        _ => None,
-    }
-}
-
-#[cfg(all(test, feature = "host"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn space_id_is_domain_tagged() {
-        let root = [0xABu8; 32];
-        let id = derive_space_id(&root);
-        assert_eq!(id, derive_space_id(&root));
-        let mut other = root;
-        other[0] = 0xAC;
-        assert_ne!(id, derive_space_id(&other));
-        assert_ne!(id, [0u8; 32]);
-    }
-
-    #[test]
-    fn replication_id_includes_instance_name() {
-        let h = [0xCDu8; 32];
-        let a = auto_replication_id("alpha", &h);
-        let b = auto_replication_id("beta", &h);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn consistency_roundtrip() {
-        for d in 0u8..=3 {
-            let name = consistency_name(d);
-            assert_eq!(parse_consistency(name), Some(d));
-        }
-        assert_eq!(consistency_name(99), "unknown");
-        assert_eq!(parse_consistency("nonsense"), None);
-    }
-}

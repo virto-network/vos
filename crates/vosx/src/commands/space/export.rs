@@ -7,10 +7,11 @@
 //! other `space *` command — the daemon is the source of truth.
 
 use space_registry::{
-    consistency_name, AgentRow, MemberRow, ProgramRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE,
+    AgentRow, MemberRow, ProgramRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE,
 };
 
 use crate::commands::space::client::DaemonClient;
+use crate::commands::space::common::consistency_name;
 use crate::spaces_index::SpaceEntry;
 
 pub struct Args {

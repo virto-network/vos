@@ -110,7 +110,7 @@ fn scan_for_genesis(
         }
         let mut cid = [0u8; 32];
         cid.copy_from_slice(key_bytes);
-        let derived = space_registry::derive_space_id(&cid);
+        let derived = crate::commands::space::common::derive_space_id(&cid);
         return Ok(Some((cid, derived)));
     }
     Ok(None)
