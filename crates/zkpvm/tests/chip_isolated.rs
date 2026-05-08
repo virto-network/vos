@@ -524,6 +524,124 @@ fn harness_ristretto_comb_balance() {
     }
 }
 
+/// Session 2.1 step 8 — fully-closed soundness chain for a synthesized
+/// FixedBasepoint scalar mult call.  Drains every relation the chip
+/// pair touches by including `MemoryChip` + `MemoryBoundaryChip` +
+/// `RistrettoEcallChip` alongside the comb chips.
+///
+/// What this validates that `harness_ristretto_comb_balance` cannot:
+/// - The scalar-boundary chip's `MemoryAccessLookupElements` producer
+///   pairs cleanly with `MemoryChip`'s consumer for each scalar byte
+///   address — no off-by-one or addr/ts witness divergence.
+/// - The skip-scalar-bytes branch in `RistrettoEcallChip::collect_accesses`
+///   keeps the ledger balanced (32 byte producers move from EcallChip
+///   to ScalarBoundaryChip; total emissions per call unchanged).
+/// - `MemoryBoundaryChip` injects matching initial-write tuples at
+///   ts=0 for the scalar's first reads, drawing from
+///   `side_note.initial_memory`.
+#[test]
+fn harness_ristretto_fixed_base_e2e_with_memory() {
+    use zkpvm::chips::{
+        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    // Memory layout for the synthesized call.  Pick non-zero bytes
+    // for the scalar so the comb chain hits non-identity table rows.
+    let scalar_ptr: u32 = 0;
+    let point_ptr: u32 = 64;
+    let output_ptr: u32 = 128;
+    let ts: u64 = 1;
+
+    // Canonical scalar with non-zero bytes in the first half so the
+    // comb chain hits non-identity table rows on the first ~16 windows
+    // (rest stay at T[i][0] = identity).  Higher-order bytes stay zero
+    // to keep the scalar within the curve25519 group order.
+    let scalar_value = curve25519_dalek::scalar::Scalar::from(
+        0x1234_5678_9abc_def0_u64,
+    );
+    let scalar = scalar_value.to_bytes();
+    let basepoint =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let out_bytes = (scalar_value
+        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        .compress()
+        .to_bytes();
+
+    // initial_memory must contain the scalar + point bytes so
+    // MemoryBoundaryChip's ts=0 producers carry the actor-observed
+    // values (the prev_value chain in MemoryChip bottoms out at the
+    // initial-memory byte).  Output region needs no initial value
+    // since its first access is a write.
+    let mut initial_memory = vec![0u8; 256];
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
+        .copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32]
+        .copy_from_slice(&basepoint);
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note.initial_memory = initial_memory;
+    side_note.ristretto_mem_ops.push(RistrettoMemOp {
+        scalar_ptr,
+        point_ptr,
+        output_ptr,
+        ts,
+        scalar_bytes: scalar,
+        point_bytes: basepoint,
+        out_bytes,
+        kind: ScalarMultKind::FixedBasepoint,
+    });
+    side_note
+        .ristretto_comb_calls
+        .push(RistrettoCombCall { scalar });
+    side_note.populate_ristretto_comb_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+    ];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect(
+            "fixed-base e2e harness: prove failed — chip algebra or witness regression",
+        );
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect(
+        "fixed-base e2e harness: verify failed — memory ledger or comb-chain \
+         lookup balance regression",
+    );
+}
+
 /// Debug: ConsumerChip-isolated with EMPTY side_note (no calls).
 /// All cells zero, all gates zero, no real emissions.  Should prove +
 /// verify cleanly (open-chain trivially balanced at zero).  If this
