@@ -1,27 +1,70 @@
 # zkpvm — performance benchmarks
 
-## Latest — Session 2.1 column-shrink + step 5(b)+8 (comb chip pair active)
+## Latest — Session 2.1 step 8 (scalar memory binding closed)
 
 `profile_clerk_private_pay_bench_mobile`, on the reference Intel Core
-Ultra 7 155H, after the column-shrink that split lookup-anchor
-metadata into `RistrettoCombAnchorChip`:
+Ultra 7 155H, after step 8's scalar memory binding landed
+(`82f893d` + `0218a41` + `c60b447`):
+
+| Build       | Trials | Median  | Min     | Max     |
+|---          |---     |---      |---      |---      |
+| no-PGO      | 4      | **0.76 s** | 737 ms  | 782 ms  |
+
+(Trials 2–5 of a 5-trial run; trial 1 cold-start outlier discarded
+per the standard protocol.)
+
+Slightly improved vs the 0.79 s pre-step-8 baseline — the EcallChip
+96→64 byte shrink per fixed-base call (32 scalar bytes producer
+moves to the boundary chip) more than offsets the boundary chip's
++320 cells/call growth.  Net: soundness tightens at near-zero perf
+cost.
+
+Architecture (post step 8):
+
+- `RistrettoCombScalarBoundaryChip` rebuilt at 32 rows/call (was 64)
+  carrying `(IsReal, CallIdx, LowNibble, HighNibble, ScalarByte,
+  Addr[4], Ts[8])` plus two preprocessed window-index columns
+  `WindowEven=2k`, `WindowOdd=2k+1`.  Per-row constraint
+  `IsReal · (ScalarByte − LowNibble − 16·HighNibble) = 0` ties the
+  byte to its decomposition.  3 emissions per row: 2 −IsReal to the
+  scalar-boundary relation (low + high nibbles, drains anchor's 64
+  +IsReal) + 1 +IsReal `MemoryAccessLookupElements` producer pinning
+  the byte to `(scalar_ptr+i, ts)` in PVM memory.
+- `RistrettoEcallChip::collect_accesses` now skips the 32-byte
+  scalar block when `op.kind == FixedBasepoint`; the boundary chip
+  takes over that producer responsibility.
+- New `harness_ristretto_fixed_base_e2e_with_memory` exercises the
+  full chain (MemoryChip + MemoryBoundaryChip + RistrettoEcallChip
+  + comb chip pair); `harness_ristretto_scalar_memory_mismatch_rejected`
+  is the soundness regression net (verifies a K1≠K2 mismatch is
+  caught at verify with `claimed logup sum is not zero`).
+
+Soundness chain (now closed for the scalar):
+  PVM mem ledger → memory-access relation → scalar-boundary chip's
+  byte producer → nibble decomposition → scalar-boundary relation →
+  anchor's `ScalarWindow` → comb relation → consumer's IsInput coord
+  rows → FieldOp add chain.
+
+**Output binding still open** — the chip's final extended-Edwards
+Acc is not yet tied to the output's compressed Ristretto bytes.
+Compress chain (R1e-bis) is the next-larger deliverable.
+
+Still ~21% slower than the 0.63 s post-PGO boundary-only baseline
+below; the residual cost is the consumer chip's per-row FieldOp
+algebra which RistrettoChip wasn't running before.
+
+## Earlier — Session 2.1 column-shrink + step 5(b) (comb chip pair active)
+
+`profile_clerk_private_pay_bench_mobile`, after the column-shrink
+that split lookup-anchor metadata into `RistrettoCombAnchorChip`:
 
 | Build       | Trials | Median  | Min     | Max     |
 |---          |---     |---      |---      |---      |
 | no-PGO      | 9      | **0.77 s** | 0.75 s  | 0.79 s  |
 
-vs ~0.84 s pre-shrink — an 8% improvement.  The shrink dropped the
-consumer chip's per-row width from 988 → 855 cells (saved ~1.1 M cells
-at log_size=13) and added ~69 K cells in the new anchor chip
-(135 cells × 512 rows at log_size=9).
-
-Still ~22% slower than the 0.63 s post-PGO boundary-only baseline
-below; the residual cost is the consumer chip's per-row FieldOp
-algebra (855 cols × 8192 rows ≈ 7.0 M cells) which RistrettoChip
-wasn't running before.  Closing the actor↔chip soundness binding
-(Step 8 scalar/output binding) is the remaining open piece — it'll
-add ~tens of rows but enables eventually retiring RistrettoChip's
-boundary attestation entirely.
+The shrink dropped the consumer chip's per-row width from 988 → 855
+cells (saved ~1.1 M cells at log_size=13) and added ~69 K cells in
+the new anchor chip (135 cells × 512 rows at log_size=9).
 
 The column-shrink architecture:
 
