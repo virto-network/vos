@@ -52,7 +52,7 @@ test-one name: build-workers
 
 # Build just the crdt-counter actor (cycle-5 example)
 build-crdt-counter:
-    cd examples/actors/crdt-counter && cargo +nightly -Zjson-target-spec build --release
+    cd examples/actors/crdt-counter && cargo actor
 
 # Build the hyperspace registry actor — built-in PVM actor that
 # lives under crates/actors/ alongside the workspace crates.
@@ -68,37 +68,63 @@ demo-crdt-sync: build-crdt-counter
     cargo test -p vos --features network --test elf_integration \
         crdt_counter_converges_across_nodes_live -- --nocapture
 
-# Two-process CRDT demo using real `vosx up` instances. Each
-# process owns its own data dir + libp2p identity; both run the
-# crdt-counter actor under the same replication_id (auto-derived
-# from blob+name). On startup each side fires `inc(tag=N)` with
-# N differing per host so the two EffectLogs hash to distinct
-# DAG nodes. Cycle-3 sync pulls each replica's node into the
-# other's redb; cycle-4 soft restart replays both logs; the
-# println in the actor reports `count=2` on each side once
-# convergence completes.
+# Two-process CRDT demo using real `vosx space up` daemons.
+# Each process gets its own isolated XDG state tree (so
+# `~/.config/vosx/spaces.toml` doesn't collide between them)
+# and reconciles the same crdt-counter agent from
+# `examples/space-crdt-{a,b}.toml`. Both manifests' `on_start`
+# fires one inc per replica; the EffectLogs hash to distinct
+# DAG nodes (different `(origin, seq)` per replica), gossipsub
+# carries them to the other side, soft-restart replays both
+# logs, and `count=2` shows up on each side once convergence
+# completes (~6s end-to-end).
 demo-crdt-procs: build-crdt-counter build-crates
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf /tmp/vosx-a /tmp/vosx-b
-    mkdir -p /tmp/vosx-a /tmp/vosx-b
-    echo "→ starting host A (listens on :4811)..."
-    RUST_LOG=info ./target/debug/vosx up examples/space-crdt-a.toml \
-        --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811 \
+    A=/tmp/vosx-a; B=/tmp/vosx-b
+    rm -rf $A $B
+    mkdir -p $A/{data,config,cache} $B/{data,config,cache}
+
+    echo "→ host A: create space (listens on :4811)..."
+    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
+      ./target/debug/vosx space new --name demo \
+        --listen /ip4/127.0.0.1/tcp/4811 > /dev/null
+    SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
+    echo "  space_id=$SPACE_ID"
+
+    echo "→ host A: starting daemon, reconciling space-crdt-a.toml..."
+    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
+    RUST_LOG=info ./target/debug/vosx space up demo \
+        --manifest examples/space-crdt-a.toml \
         > /tmp/vosx-a.log 2>&1 &
     PID_A=$!
-    sleep 1
-    echo "→ starting host B (dials A)..."
-    RUST_LOG=info ./target/debug/vosx up examples/space-crdt-b.toml \
-        --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811 \
+
+    # Wait for A's swarm to bind and write its endpoint, then
+    # extract the peer-id so B can dial it.
+    for _ in $(seq 1 50); do
+        [ -f "$A/data/vosx/$SPACE_ID/.endpoint" ] && break
+        sleep 0.1
+    done
+    PEER_A=$(grep peer_id "$A/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
+    BOOTNODE="/ip4/127.0.0.1/tcp/4811/p2p/$PEER_A"
+    echo "  bootnode=$BOOTNODE"
+
+    echo "→ host B: join + start (dials A)..."
+    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
+      ./target/debug/vosx space join "$SPACE_ID@$BOOTNODE" --name demo > /dev/null
+    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
+    RUST_LOG=info ./target/debug/vosx space up demo \
+        --manifest examples/space-crdt-b.toml \
+        --connect "$BOOTNODE" \
         > /tmp/vosx-b.log 2>&1 &
     PID_B=$!
+
     sleep 6
     echo ""
-    echo "── host A inc log ─────────────────────────────────────────"
+    echo "── host A counter log ─────────────────────────────────────"
     grep "crdt-counter:" /tmp/vosx-a.log || echo "(no actor output)"
     echo ""
-    echo "── host B inc log ─────────────────────────────────────────"
+    echo "── host B counter log ─────────────────────────────────────"
     grep "crdt-counter:" /tmp/vosx-b.log || echo "(no actor output)"
     echo ""
     echo "→ shutting down..."
