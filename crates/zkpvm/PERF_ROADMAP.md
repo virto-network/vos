@@ -374,21 +374,57 @@ natural batches:
      `IsUnityCheck · out[k] = 0` for k=1..31.  Padding rows have
      IsUnityCheck = 0 so the constraint is trivially satisfied
      there — no IsReal gating helper needed.
-   - **3b** (next): chip-wide boundary inputs for `SQRT_M1` and
-     `INVSQRT_A_MINUS_D` (currently held by `chips::ristretto::compress`
-     module via OnceLock); add 2 IsInput rows at the chip's start
-     (row 0 = SQRT_M1, row 1 = INVSQRT_A_MINUS_D), shift per-call
-     row offsets by N_BOUNDARY_INPUTS = 2.  Algebra rows: T·z_inv
-     (sign source #1), iX = X·SQRT_M1, iY = Y·SQRT_M1, enchanted =
-     i1·INVSQRT_A_MINUS_D — 4 mul rows.
-   - **3c**: sign-check infrastructure.  Each sign check is a row
-     with `IsSignCheck = 1` whose `out` carries the boolean
-     witness (out[0] ∈ {0, 1}, out[1..32] = 0).  Constraint:
-     `IsSignCheck · out[0] · (1 - out[0]) = 0` (boolean) AND
-     `IsSignCheck · out[k] = 0` (k=1..31).  Plus a
-     `ByteToBitsLookupElements` consumer on the source row's
-     `out[0]` binding the LSB to `out[0]` here.  Three sign
-     checks: rotate (T·z_inv), y_negate (X'·z_inv), s_neg (s).
+   - **3b — DONE (commit 57c4e05)**: chip-wide boundary inputs for
+     `SQRT_M1` and `INVSQRT_A_MINUS_D` at trace rows 0/1; per-call
+     blocks shifted by `N_BOUNDARY_INPUTS = 2`.  Per-call ROWS
+     grow 17 → 21 with 4 new sign-prep mul rows: T·z_inv (sign
+     source #1), iX, iY, enchanted = i1·INVSQRT_A_MINUS_D.
+     `chip_isolated` 14/14 stays green.
+   - **3c**: sign-check infrastructure.  Architectural decision
+     needed — three viable paths and their trade-offs:
+     * **Path α (new IsSignCheck row class)**: minimally
+       extends `field_op_constraints` to add `is_sign_check` to
+       the `is_add+is_sub+is_mul+is_input+is_output = is_real`
+       partition.  Adds new constraint block for sign-check rows
+       (boolean `out[0]`, zero bytes 1..31, ByteToBits consumer
+       on source row's byte 0 binding bit 0 to `out[0]`).  Cross-
+       chip impact: every chip using `field_op_constraints` would
+       need to wire up a (potentially zero) `is_sign_check`
+       column.  Cleanest constraint-level integration but bigger
+       blast radius.
+     * **Path β (IsAlgebra split-flag)**: sign-check rows have
+       `IsReal=1, IsInput=0, IsAlgebra=0, IsSignCheck=1`.  Pass
+       `IsAlgebra` as `is_real` to `field_op_constraints` so its
+       partition + final-form checks skip sign-check rows.
+       Producer/consumer emissions (chip-local register-file) gate
+       on actual `IsReal` so sign-check rows still produce/consume.
+       Requires: new `IsAlgebra` column wired into the helper's
+       `is_real` slot; the helper's `consumer_a_gate_h` constraint
+       (`= is_real · (1 - is_input)`) still binds correctly for
+       sign-check rows because they have `IsAlgebra=0` ⇒
+       `consumer_a_gate_h=0` from the helper's view.  But then we
+       need a SEPARATE consumer-A emission path for sign-check
+       rows that consumes just byte 0 of the source row.  Smaller
+       constraint-helper blast radius but requires a new
+       narrower-than-32-byte consumer emission.
+     * **Path γ (sign-check via IsInput repurpose)**: sign-witness
+       row is `IsInput=1` with `out[0] ∈ {0,1}, out[1..32] = 0`.
+       Add per-row `IsSignWitness` boolean column gating: (a) an
+       extra `out[0]·(1-out[0])=0` boolean constraint on these
+       rows, (b) zero-bytes constraints `out[k]=0` for k=1..31,
+       (c) ByteToBits consumer on a NEW dedicated `SourceByte`
+       column on the IsSignWitness row, plus a separate
+       single-byte consumer emission to the chip-local register-
+       file at `(source_row_id, byte_idx=0, SourceByte)`.  Reuses
+       IsInput row class so the FieldOp partition stays
+       unchanged; smallest constraint-helper change.  Cost: a new
+       SourceByte column + a 1-byte register-file consumer
+       emission gated by IsSignWitness.
+     **Recommended: Path γ** — smallest blast radius on
+     `field_op_constraints` (zero changes), clean IsInput
+     repurpose, new column count low.  Three sign checks: rotate
+     (T·z_inv at row+17), y_negate (X'·z_inv at row TBD),
+     s_neg (s at row TBD).
    - **3d**: conditional select rows (X', Y', den_inv) — 3 selects.
      Each can decompose to 3 algebra rows (flag·a, (1-flag)·b,
      sum) using existing IsMul + IsAdd, OR add a new IsSelect row
