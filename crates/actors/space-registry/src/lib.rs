@@ -581,21 +581,38 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
 /// Compute the `space_id` from the registry's genesis DAG root.
 /// The space_id is stable for the lifetime of the space and
 /// verifiable by any joiner that fetches the genesis snapshot.
+///
+/// Host-only — uses `blake2b_simd` directly for the SIMD-accelerated
+/// path. Actor-side derivations that need the same primitive route
+/// through `vos::crypto::blake2b_hash` (which the host kernel
+/// handler runs through this same path on PVM ecalls).
 #[cfg(feature = "host")]
 pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(SPACE_ID_DOMAIN_TAG, &[&[0u8], genesis_dag_root])
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(SPACE_ID_DOMAIN_TAG);
+    h.update(&[0u8]);
+    h.update(genesis_dag_root);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
 }
 
 /// Auto-derive a `replication_id` for an installed agent.
 /// `blake2b("vos-replication-id/v1" || instance_name || 0 || program_hash)`.
 /// Two replicas that install the same program with the same
-/// `instance_name` auto-discover each other.
+/// `instance_name` auto-discover each other. Host-only — see
+/// `derive_space_id` for the host-vs-actor blake2b convention.
 #[cfg(feature = "host")]
 pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(
-        b"vos-replication-id/v1",
-        &[&[0u8], instance_name.as_bytes(), &[0u8], program_hash],
-    )
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"vos-replication-id/v1");
+    h.update(&[0u8]);
+    h.update(instance_name.as_bytes());
+    h.update(&[0u8]);
+    h.update(program_hash);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
 }
 
 #[cfg(feature = "host")]

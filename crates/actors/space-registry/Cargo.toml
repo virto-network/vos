@@ -8,7 +8,7 @@ edition = "2024"
 [features]
 default = ["bin"]
 bin = []
-host = ["dep:serde"]
+host = ["dep:blake2b_simd", "dep:serde"]
 
 [lib]
 name = "space_registry"
@@ -30,6 +30,7 @@ serde = { version = "1", optional = true, default-features = false }
 
 [target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "worker"] }
+blake2b_simd = { version = "1", optional = true, default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [profile.release]
