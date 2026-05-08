@@ -22,9 +22,6 @@ mod bundled;
 mod commands;
 mod paths;
 mod spaces_index;
-mod util;
-
-use util::init_tracing;
 
 #[derive(Parser)]
 #[command(name = "vosx", about = "JAM-aligned PVM executor + space orchestrator")]
@@ -60,6 +57,18 @@ enum Command {
         #[command(subcommand)]
         command: commands::space::SpaceCommand,
     },
+}
+
+/// Initialize the global tracing subscriber from `RUST_LOG`,
+/// defaulting to `warn`. Idempotent — multiple calls are no-ops.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn main() {

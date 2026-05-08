@@ -133,11 +133,7 @@ impl From<io::Error> for BlobError {
 /// Resolve the cache directory: `$XDG_CACHE_HOME/vosx/blobs` or
 /// `~/.cache/vosx/blobs`.
 pub fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(".cache"));
-    base.join("vosx").join("blobs")
+    crate::paths::blob_cache_dir()
 }
 
 /// Path inside the cache for a given hash.

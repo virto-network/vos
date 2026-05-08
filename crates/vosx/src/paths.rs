@@ -25,14 +25,27 @@ pub fn space_id_hex(id: &[u8; 32]) -> String {
     hex::encode(id)
 }
 
+/// Resolve `$<env_var>/vosx` if the env var is set, else
+/// `$HOME/<home_relative>/vosx`, else fall back to a relative
+/// path. Used by the XDG-style `data_root` / `config_root` /
+/// `cache_root` helpers below.
+fn xdg_root(env_var: &str, home_relative: &[&str]) -> PathBuf {
+    let from_home = || {
+        std::env::var_os("HOME").map(|h| {
+            home_relative.iter().fold(PathBuf::from(h), |p, s| p.join(s))
+        })
+    };
+    let base = std::env::var_os(env_var)
+        .map(PathBuf::from)
+        .or_else(from_home)
+        .unwrap_or_else(|| home_relative.iter().fold(PathBuf::new(), |p, s| p.join(s)));
+    base.join("vosx")
+}
+
 /// Base data directory: `$XDG_DATA_HOME/vosx` or
 /// `~/.local/share/vosx`.
 pub fn data_root() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from(".local").join("share"));
-    base.join("vosx")
+    xdg_root("XDG_DATA_HOME", &[".local", "share"])
 }
 
 /// Per-space data directory.
@@ -71,11 +84,19 @@ pub fn local_config_path(space_id: &[u8; 32]) -> PathBuf {
 
 /// Config directory: `$XDG_CONFIG_HOME/vosx` or `~/.config/vosx`.
 pub fn config_root() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("vosx")
+    xdg_root("XDG_CONFIG_HOME", &[".config"])
+}
+
+/// Cache directory: `$XDG_CACHE_HOME/vosx` or `~/.cache/vosx`.
+/// The blob store extends this further with `/blobs`.
+pub fn cache_root() -> PathBuf {
+    xdg_root("XDG_CACHE_HOME", &[".cache"])
+}
+
+/// Blob cache: `cache_root()/blobs`. Cross-space — two spaces
+/// installing the same program share storage.
+pub fn blob_cache_dir() -> PathBuf {
+    cache_root().join("blobs")
 }
 
 /// Known-spaces index: TOML file listing every space the user

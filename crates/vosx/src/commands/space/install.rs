@@ -41,14 +41,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )
     })?;
 
-    let init_args = parse_init_args(&args.init)?;
-    let install_args = if init_args_is_empty(&init_args) {
-        Vec::new()
-    } else {
-        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args)
-            .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
-            .to_vec()
-    };
+    let install_args = encode_init_args(&args.init)?;
 
     DaemonClient::with_connect(&args.space, |client| {
         let program = client.program(&program_name, &program_version)?
@@ -94,16 +87,23 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })
 }
 
-fn parse_init_args(pairs: &[String]) -> anyhow::Result<InitArgs> {
+/// Build the rkyv-encoded `install_args` blob from a list of
+/// `key=value` strings. Empty input returns empty bytes — the
+/// registry treats empty `install_args` as "no init args" and
+/// the daemon skips populating `INIT_KEY` storage.
+fn encode_init_args(pairs: &[String]) -> anyhow::Result<Vec<u8>> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut args = InitArgs::new();
     for pair in pairs {
         let (k, v) = pair
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--init expects key=value, got '{pair}'"))?;
         // Try numeric first so `--init n=42` types as u64; fall
-        // back to string. The InitValue carrying string is fine
-        // for actors whose `new()` takes a `String`, and the
-        // numeric path covers the common counter/size cases.
+        // back to string. InitValue carrying a string is fine
+        // for actors whose `new()` takes a `String`; the numeric
+        // path covers the common counter/size cases.
         if let Ok(n) = v.parse::<u64>() {
             args = args.with(k, InitValue::U64(n));
         } else if let Ok(b) = v.parse::<bool>() {
@@ -112,21 +112,9 @@ fn parse_init_args(pairs: &[String]) -> anyhow::Result<InitArgs> {
             args = args.with(k, InitValue::Str(v.to_string()));
         }
     }
-    Ok(args)
-}
-
-/// `InitArgs` doesn't expose `is_empty()` and we don't want to
-/// reach into its internals — sniff via the encoded length
-/// instead. An empty InitArgs serializes to a fixed marker
-/// shorter than ~10 bytes.
-fn init_args_is_empty(args: &InitArgs) -> bool {
-    let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(args)
-        .map(|av| av.to_vec())
-        .unwrap_or_default();
-    let empty_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&InitArgs::new())
-        .map(|av| av.to_vec())
-        .unwrap_or_default();
-    bytes == empty_bytes
+    Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
+        .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -134,16 +122,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_init_typed_numbers_first() {
-        let args = parse_init_args(&["n=42".into(), "ok=true".into(), "s=hello".into()]).unwrap();
-        // Just verify we can re-encode without panicking; the
-        // typed dispatch is exercised inside `with`.
-        assert!(!init_args_is_empty(&args));
+    fn empty_init_returns_empty() {
+        assert!(encode_init_args(&[]).unwrap().is_empty());
     }
 
     #[test]
-    fn empty_init_returns_empty() {
-        let args = parse_init_args(&[]).unwrap();
-        assert!(init_args_is_empty(&args));
+    fn nonempty_init_returns_nonempty() {
+        let bytes = encode_init_args(
+            &["n=42".into(), "ok=true".into(), "s=hello".into()],
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn rejects_pairs_without_eq() {
+        assert!(encode_init_args(&["bare".into()]).is_err());
     }
 }
