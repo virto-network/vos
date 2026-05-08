@@ -1,7 +1,12 @@
-//! `space info` — show metadata for a single space.
+//! `space info` — show metadata + daemon liveness for a single
+//! space. When the daemon is up, also round-trips a registry
+//! call to confirm reachability and report RTT (the diagnostic
+//! the old `space ping` exposed).
 
 use std::path::PathBuf;
+use std::time::Instant;
 
+use crate::commands::space::client::DaemonClient;
 use crate::commands::space::endpoint;
 use crate::commands::space::subscriptions;
 use crate::spaces_index;
@@ -61,6 +66,10 @@ pub fn run(query: &str) -> anyhow::Result<()> {
                 println!("bootnode hint:");
                 println!("  {}@{first}/p2p/{}", entry.id, ep.peer_id);
             }
+            // PID is alive but the libp2p path could still be
+            // wedged (consensus hang, registry stuck). A real
+            // round-trip is the only honest liveness check.
+            print_rtt(query);
         }
         Some(ep) => {
             println!();
@@ -80,4 +89,28 @@ pub fn run(query: &str) -> anyhow::Result<()> {
     println!("agents      {count} on disk (in {})", agents_dir.display());
 
     Ok(())
+}
+
+/// Connect to the daemon and time a single registry round-trip.
+/// Prints `rtt` lines on success, or a one-line failure
+/// explanation if the connect / invoke didn't go through.
+/// Errors don't propagate — `info` is best-effort.
+fn print_rtt(query: &str) {
+    let connect_started = Instant::now();
+    let client = match DaemonClient::connect(query) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("rtt         libp2p connect failed: {e}");
+            return;
+        }
+    };
+    let connected = connect_started.elapsed();
+    let invoke_started = Instant::now();
+    let outcome = client.programs();
+    let invoke = invoke_started.elapsed();
+    let _ = client.shutdown();
+    match outcome {
+        Ok(_) => println!("rtt         connect={connected:?}, invoke={invoke:?}"),
+        Err(e) => println!("rtt         invoke failed (connect={connected:?}): {e}"),
+    }
 }

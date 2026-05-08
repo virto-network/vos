@@ -33,7 +33,6 @@ pub mod list;
 pub mod members;
 pub mod new;
 pub mod payload_codec;
-pub mod ping;
 pub mod programs;
 pub mod publish;
 pub mod reconcile;
@@ -220,11 +219,6 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<subscriptions::SubsCommand>,
     },
-    /// Round-trip the daemon to verify it's reachable. Times
-    /// the libp2p connect + an empty registry query.
-    Ping {
-        space: String,
-    },
     /// Invoke any agent on the running daemon. Generic floor
     /// primitive; `publish` / `install` / etc. are typed sugar
     /// wrappers around the same plumbing.
@@ -327,6 +321,5 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             call::run(call::Args { space, target, method, args })
         }
         SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
-        SpaceCommand::Ping { space } => ping::run(&space),
     }
 }

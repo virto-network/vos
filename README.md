@@ -115,7 +115,7 @@ vosx space up demo --manifest examples/space-crdt-a.toml &
 # sugar on top.
 vosx space call demo counter inc
 vosx space agents demo
-vosx space ping demo                    # daemon-reachable + RTT
+vosx space info demo                    # metadata + daemon liveness + RTT
 vosx space export demo > snapshot.toml  # round-trip back to TOML
 ```
 
