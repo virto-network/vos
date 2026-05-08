@@ -13,6 +13,7 @@ use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobHash};
+use crate::commands::space::common::{instance_service_id, registry_replication_id};
 use crate::spaces_index;
 
 pub struct Args {
@@ -52,7 +53,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let space_id = entry
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
-    let replication_id = derive_registry_replication_id(&space_id);
+    let replication_id = registry_replication_id(&space_id);
 
     let data_dir = PathBuf::from(&entry.data_dir);
     if !data_dir.exists() {
@@ -386,10 +387,7 @@ fn spawn_installed_agents(
             }
         }
 
-        let svc_id = vos::abi::service::ServiceId(derive_instance_svc_id(
-            &a.instance_name,
-            local_prefix,
-        ));
+        let svc_id = instance_service_id(&a.instance_name, local_prefix);
         let id = node.register_at_id(cfg, svc_id);
         eprintln!(
             "vosx:   agent '{}' as {id} ({})",
@@ -400,37 +398,3 @@ fn spawn_installed_agents(
     Ok(())
 }
 
-/// Deterministic per-node ServiceId for an installed agent.
-/// `local_prefix` is the node's 16-bit identity prefix; the
-/// low 16 bits are derived from `instance_name` and clamped to
-/// `[0x100, 0x7FFF]` so it can't collide with `ServiceId::REGISTRY`
-/// (= 0) or any reserved low system ids. Stable across restarts
-/// of the same node so each instance's redb path persists.
-///
-/// Public so `DaemonClient::resolve_target` can compute the
-/// same value when resolving an instance name to a ServiceId
-/// for `space call`.
-pub fn derive_instance_svc_id(instance_name: &str, local_prefix: u16) -> u32 {
-    let mut h = blake2b_simd::Params::new().hash_length(2).to_state();
-    h.update(b"vos-instance-svc-id/v1");
-    h.update(&[0u8]);
-    h.update(instance_name.as_bytes());
-    let bytes = h.finalize();
-    let buf = bytes.as_bytes();
-    let raw = u16::from_le_bytes([buf[0], buf[1]]);
-    let local = (raw & 0x7FFF).max(0x100);
-    ((local_prefix as u32) << 16) | (local as u32)
-}
-
-/// Per-space registry replication-id: blake2b("vos-space-registry/v1"
-/// || space_id). Deterministic from space_id so any two replicas
-/// of the same space subscribe to the same gossipsub topic.
-pub fn derive_registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-space-registry/v1");
-    h.update(&[0u8]);
-    h.update(space_id);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
-}

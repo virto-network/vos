@@ -3,6 +3,7 @@
 use space_registry::{STATUS_NOT_FOUND, STATUS_OK, STATUS_PROGRAM_NOT_FOUND};
 
 use crate::commands::space::client::DaemonClient;
+use crate::commands::space::common::parse_program_ref;
 
 pub struct Args {
     pub space: String,
@@ -46,15 +47,4 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     client.shutdown()
-}
-
-fn parse_program_ref(s: &str) -> anyhow::Result<(String, String)> {
-    if let Some((n, v)) = s.split_once(':') {
-        if n.is_empty() || v.is_empty() {
-            anyhow::bail!("program ref '{s}' must be 'name' or 'name:version'");
-        }
-        Ok((n.to_string(), v.to_string()))
-    } else {
-        Ok((s.to_string(), "latest".to_string()))
-    }
 }

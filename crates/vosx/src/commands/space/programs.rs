@@ -1,8 +1,7 @@
 //! `space programs` — list the program catalog.
 
-
-
 use crate::commands::space::client::DaemonClient;
+use crate::commands::space::common::truncate;
 
 pub fn run(space: &str) -> anyhow::Result<()> {
     let client = DaemonClient::connect(space)?;
@@ -21,12 +20,4 @@ pub fn run(space: &str) -> anyhow::Result<()> {
     }
 
     client.shutdown()
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
 }

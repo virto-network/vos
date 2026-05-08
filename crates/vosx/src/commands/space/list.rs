@@ -1,5 +1,6 @@
 //! `space list` — print known spaces.
 
+use crate::commands::space::common::truncate;
 use crate::spaces_index;
 
 pub fn run() -> anyhow::Result<()> {
@@ -20,12 +21,4 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
 }

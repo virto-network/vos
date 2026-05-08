@@ -32,6 +32,7 @@ use vos::init::{InitArgs, InitValue};
 use vos::node::VosNode;
 
 use crate::blob_store;
+use crate::commands::space::common::instance_service_id;
 
 /// Slim view of the manifest TOML — only the fields the
 /// reconciler cares about. Extra fields are silently ignored
@@ -130,8 +131,7 @@ pub fn reconcile(
     // tripping through the registry.
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
     for a in flatten(&manifest.agents) {
-        let raw = crate::commands::space::up::derive_instance_svc_id(&a.name, daemon_prefix);
-        name_ids.insert(a.name.clone(), raw);
+        name_ids.insert(a.name.clone(), instance_service_id(&a.name, daemon_prefix).0);
     }
 
     let reg = SpaceRegistryRef::at(ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()));

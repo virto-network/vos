@@ -20,6 +20,7 @@ use space_registry::SpaceRegistryRef;
 use vos::abi::service::ServiceId;
 use vos::node::VosNode;
 
+use crate::commands::space::common::instance_service_id;
 use crate::commands::space::endpoint;
 use crate::spaces_index::{self, SpaceEntry};
 
@@ -157,8 +158,7 @@ impl DaemonClient {
         // bootnode ever returned a different agent we'd want
         // to know.
         debug_assert_eq!(agent.instance_name, target);
-        let raw = crate::commands::space::up::derive_instance_svc_id(target, self.daemon_prefix);
-        Ok(ServiceId(raw))
+        Ok(instance_service_id(target, self.daemon_prefix))
     }
 
     /// Generic invoke — send `msg` to `target` on the daemon

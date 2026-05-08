@@ -22,6 +22,7 @@ use std::path::PathBuf;
 pub mod agents;
 pub mod call;
 pub mod client;
+pub mod common;
 pub mod dag;
 pub mod delete;
 pub mod endpoint;

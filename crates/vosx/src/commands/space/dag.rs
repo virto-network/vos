@@ -23,6 +23,7 @@ use redb::ReadableTable;
 use vos::abi::service::ServiceId;
 
 use crate::commands::space::client::DaemonClient;
+use crate::commands::space::common::{instance_service_id, registry_replication_id};
 use crate::commands::space::endpoint;
 use crate::spaces_index::{self, SpaceEntry};
 
@@ -82,7 +83,7 @@ fn run_live(entry: &SpaceEntry, agent: &str) -> anyhow::Result<()> {
 
     let (replication_id, svc_id) = if agent == "registry" {
         (
-            crate::commands::space::up::derive_registry_replication_id(&space_id),
+            registry_replication_id(&space_id),
             ServiceId::new(daemon_prefix, ServiceId::REGISTRY.local_id()),
         )
     } else {
@@ -91,11 +92,7 @@ fn run_live(entry: &SpaceEntry, agent: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 "no agent named '{agent}' is installed in this space",
             ))?;
-        let svc_id = ServiceId(crate::commands::space::up::derive_instance_svc_id(
-            agent,
-            daemon_prefix,
-        ));
-        (row.replication_id, svc_id)
+        (row.replication_id, instance_service_id(agent, daemon_prefix))
     };
 
     // FetchHeads: the daemon's NetworkService::sync_roots
@@ -195,12 +192,8 @@ fn resolve_svc_id_offline(data_dir: &Path, agent: &str) -> anyhow::Result<Servic
     if agent == "registry" {
         return Ok(ServiceId::REGISTRY);
     }
-    let prefix = match endpoint::read(data_dir)? {
-        Some(ep) => ep.prefix,
-        None => 0,
-    };
-    let raw = crate::commands::space::up::derive_instance_svc_id(agent, prefix);
-    Ok(ServiceId(raw))
+    let prefix = endpoint::read(data_dir)?.map(|ep| ep.prefix).unwrap_or(0);
+    Ok(instance_service_id(agent, prefix))
 }
 
 fn decode_crdt_event_from_dagnode(bytes: &[u8]) -> Option<vos::effect_log::CrdtEvent> {
