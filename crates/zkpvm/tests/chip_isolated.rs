@@ -965,6 +965,158 @@ fn harness_ristretto_compress_isolated_empty() {
         .expect("compress-empty harness: prove failed");
 }
 
+/// R1e-bis Batch 5 — soundness regression for the OUTPUT BINDING.
+/// Synthesizes a FixedBasepoint call where:
+///   - The compress chain runs honestly on `scalar · G` and produces
+///     the canonical `compress(scalar·G)` bytes (B1).
+///   - The actor's PVM-memory `out_bytes` claim a DIFFERENT 32 bytes
+///     (B2 ≠ B1).
+///
+/// PROVE still succeeds (each chip's witness is internally consistent
+/// for its own view of the output).  VERIFY MUST reject because:
+///   - The output chip emits memory producers at `(output_ptr+i,
+///     B2[i], ts, write=1)` (drawn from `RistrettoCombCall.out_bytes
+///     = B2`).
+///   - The compress chip's row +43 emits output-relation producers
+///     `(call_idx, byte_idx, B1[i])` (B1 derived in-circuit from
+///     `scalar · G`).
+///   - The output chip consumes the output relation at `(call_idx,
+///     byte_idx, B2[i])`.
+///   - Tuples differ in the value limb ⇒ output relation imbalanced
+///     ⇒ verify rejects with `claimed logup sum is not zero`.
+///
+/// Without this test, a regression that broke the compress→output
+/// relation (e.g., the producer side firing on the wrong row, or
+/// the consumer side reading from `side_note.out_bytes` directly
+/// instead of via the relation) could leave the binding cosmetic.
+#[test]
+fn harness_ristretto_output_mismatch_rejected() {
+    use zkpvm::chips::{
+        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    let scalar_ptr: u32 = 0;
+    let point_ptr: u32 = 64;
+    let output_ptr: u32 = 128;
+    let ts: u64 = 1;
+
+    // Honest scalar.
+    let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_u64);
+    let scalar = scalar_value.to_bytes();
+    let basepoint =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    // B1 = honest compress output.
+    let _b1 = (scalar_value
+        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        .compress()
+        .to_bytes();
+    // B2 = the actor's CLAIMED bytes — pick something distinct (toggle
+    // every byte from B1 to make sure they differ).
+    let mut b2 = _b1;
+    for byte in b2.iter_mut() {
+        *byte = byte.wrapping_add(1);
+    }
+    assert_ne!(_b1, b2, "test setup: B1 and B2 must differ");
+
+    let mut initial_memory = vec![0u8; 256];
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
+        .copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32]
+        .copy_from_slice(&basepoint);
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note.initial_memory = initial_memory;
+    side_note.ristretto_mem_ops.push(RistrettoMemOp {
+        scalar_ptr,
+        point_ptr,
+        output_ptr,
+        ts,
+        scalar_bytes: scalar,
+        point_bytes: basepoint,
+        // The actor's claim — what gets written to PVM memory.
+        out_bytes: b2,
+        kind: ScalarMultKind::FixedBasepoint,
+    });
+    // RistrettoCombCall.out_bytes feeds the output chip's value column.
+    // Setting it to B2 makes the output chip emit memory producers at
+    // (output_ptr+i, B2[i], ts, write=1) — what the actor claims.
+    // The compress chip's row +43 will compute B1 (honest) — relation
+    // imbalance.
+    side_note
+        .ristretto_comb_calls
+        .push(RistrettoCombCall {
+            scalar,
+            out_bytes: b2,
+            output_ptr,
+            ts,
+        });
+    side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+        &RistrettoCombCompressChip,
+        &RistrettoCombCompressOutputChip,
+        &ByteToBitsChip,
+    ];
+
+    let proof_result = prove_with_explicit_components(&mut side_note, config, components);
+    let proof = match proof_result {
+        Ok(p) => p,
+        Err(e) => panic!(
+            "output-mismatch harness: prove unexpectedly failed (constraints \
+             should still satisfy individually; verify is the gate that \
+             catches the relation imbalance): {e:?}"
+        ),
+    };
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!(
+            "output-mismatch harness: verify rejected for the wrong reason: {e:?}"
+        ),
+        Ok(()) => panic!(
+            "output-mismatch harness: verify accepted unexpectedly — \
+             output binding is structural only (regression)"
+        ),
+    }
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`
