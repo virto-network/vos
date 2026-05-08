@@ -6,20 +6,31 @@ license.workspace = true
 description = "Guest-side shims for zkpvm precompile ECALLs.  Users (cipher-clerk, vos actors, etc.) link this to call into chip-accelerated host computations via the JAM ECALL ABI.  On host (non-riscv64) builds the shims fall through to native crypto so the same code path runs in tests."
 
 [features]
-# Default: dalek-backed types and operators.  On riscv64 targets the
-# `Mul<&RistrettoPoint>` impls dispatch via inline asm `ecalli 200`;
-# on other targets they fall through to dalek's native scalar mult.
-# In both modes the *types* are dalek's types (Scalar, RistrettoPoint),
-# so call sites read identically to plain dalek code.
-default = []
+# Default = both precompile families.  Backward-compat with the
+# pre-split single-module layout.  Guests that need only one can opt
+# out via `default-features = false, features = ["blake2b"]` (or
+# `["ristretto"]`).
+default = ["ristretto", "blake2b"]
+
+# Scalar / RistrettoPoint newtypes + their `Mul`/`Add` impls + the
+# low-level `ristretto_scalar_mult`, `ristretto_point_add`,
+# `scalar_mul_mod_l`, `scalar_add_mod_l`,
+# `scalar_from_bytes_mod_order_wide` ABI fns.  On riscv64 the
+# operators dispatch to `ecalli {200-204}`; on other targets they
+# fall through to dalek's native impls (the shim's *types* are
+# dalek's types, so call sites read identically in both modes).
+ristretto = ["dep:curve25519-dalek"]
+
+# `blake2b_compress` (one-block primitive) + the streaming
+# `blake2b_hash::<N>(domain, parts)` helper.  No extra runtime deps
+# — the off-target software reference lives inside this crate.
+blake2b = []
 
 [dependencies]
-# Always pulled in — the shim re-exports `Scalar`, `RistrettoPoint`
-# etc. as thin newtypes over dalek's, so call sites can stay
-# operator-shaped (`&v * G + b * H`).  The on-target path replaces
-# the multiplication with an ECALL but keeps the type signatures.
-curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
+# Optional under the `ristretto` feature.  Guests that only need
+# blake2b skip dalek entirely, dropping a substantial dep tree
+# (~30 transitive crates plus its precomputed-tables LUT).
+curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables"] }
 
 [dev-dependencies]
 blake2 = "0.10"
-
