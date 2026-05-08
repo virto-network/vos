@@ -10,6 +10,8 @@
 //! (or ACME) once we have an operator story.
 
 use std::error::Error;
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,12 +19,15 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
 use crate::HttpGateway;
 use crate::config;
-use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS};
+use crate::limits::{
+    MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS, MAX_STREAMS_PER_CONN,
+};
 use crate::routing::handle_admin;
 use crate::runtime::{self, serve_with};
 use crate::state::Inner;
@@ -55,33 +60,75 @@ fn spawn(
     })
 }
 
-/// Build a QUIC endpoint listening on `addr` with a freshly-minted
-/// self-signed cert for `localhost`. ALPN advertises `h3`.
+/// Build a QUIC endpoint listening on `addr`. Uses the operator-
+/// supplied cert/key when `HTTP_GATEWAY_TLS_CERT` and
+/// `HTTP_GATEWAY_TLS_KEY` are both set; otherwise falls back to a
+/// freshly-minted self-signed cert for `localhost` and logs a WARN
+/// (dev only). ALPN advertises `h3`.
 fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
     // rustls 0.23 with the ring provider needs the global crypto
     // provider installed before any cert work. Idempotent — safe to
     // call repeatedly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .map_err(|e| format!("rcgen self-signed cert: {e}"))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
-    );
+    let (cert_chain, key_der) = match config::tls_paths() {
+        Some((cert_path, key_path)) => load_pem(&cert_path, &key_path)?,
+        None => {
+            log::warn!(
+                "http-gateway: no HTTP_GATEWAY_TLS_CERT/KEY — using self-signed `localhost` cert (dev only)"
+            );
+            self_signed()?
+        }
+    };
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(cert_chain, key_der)
         .map_err(|e| format!("rustls config: {e}"))?;
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .map_err(|e| format!("quinn rustls config: {e}"))?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(MAX_STREAMS_PER_CONN.into());
+    server_config.transport_config(Arc::new(transport));
 
     quinn::Endpoint::server(server_config, addr)
         .map_err(|e| format!("quinn endpoint bind {addr}: {e}"))
+}
+
+fn self_signed() -> IoResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| format!("rcgen self-signed cert: {e}"))?;
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+    );
+    Ok((vec![cert_der], key_der))
+}
+
+fn load_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> IoResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_file =
+        File::open(cert_path).map_err(|e| format!("open cert {cert_path}: {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<core::result::Result<_, _>>()
+        .map_err(|e| format!("parse cert {cert_path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("no certs in {cert_path}"));
+    }
+
+    let key_file = File::open(key_path).map_err(|e| format!("open key {key_path}: {e}"))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| format!("parse key {key_path}: {e}"))?
+        .ok_or_else(|| format!("no private key in {key_path}"))?;
+
+    log::info!("http-gateway: loaded TLS cert chain ({} certs) from {cert_path}", certs.len());
+    Ok((certs, key))
 }
 
 async fn accept_loop(

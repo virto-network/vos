@@ -19,6 +19,10 @@ use std::net::{IpAddr, Ipv4Addr};
 pub(crate) const ENV_BIND_ADDR: &str = "HTTP_GATEWAY_BIND_ADDR";
 pub(crate) const ENV_ADMIN_TOKEN: &str = "HTTP_GATEWAY_ADMIN_TOKEN";
 pub(crate) const ENV_AUTH_TOKEN: &str = "HTTP_GATEWAY_AUTH_TOKEN";
+#[cfg(feature = "http3")]
+pub(crate) const ENV_TLS_CERT: &str = "HTTP_GATEWAY_TLS_CERT";
+#[cfg(feature = "http3")]
+pub(crate) const ENV_TLS_KEY: &str = "HTTP_GATEWAY_TLS_KEY";
 
 const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -37,6 +41,16 @@ pub(crate) fn admin_token() -> Option<String> {
 
 pub(crate) fn auth_token() -> Option<String> {
     env::var(ENV_AUTH_TOKEN).ok().filter(|s| !s.is_empty())
+}
+
+/// Both PEM paths for TLS — `(cert_chain_path, key_path)`. Returns
+/// `None` if either is unset/empty so callers fall back to a
+/// self-signed cert.
+#[cfg(feature = "http3")]
+pub(crate) fn tls_paths() -> Option<(String, String)> {
+    let cert = env::var(ENV_TLS_CERT).ok().filter(|s| !s.is_empty())?;
+    let key = env::var(ENV_TLS_KEY).ok().filter(|s| !s.is_empty())?;
+    Some((cert, key))
 }
 
 /// Constant-time equality check. Length differences leak (early

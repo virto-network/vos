@@ -22,3 +22,10 @@ pub(crate) const JOB_QUEUE_CAP: usize = 256;
 /// limits; this is a belt-and-suspenders guard against an attacker
 /// who somehow stuffs a many-header request through.
 pub(crate) const MAX_REQUEST_HEADERS: usize = 64;
+
+/// Maximum number of concurrent bidirectional streams a single QUIC
+/// connection can have open against the gateway. Caps stream-flood
+/// amplification within a single connection (per-connection limit
+/// `MAX_CONCURRENT_CONNS` × this is the total task ceiling).
+#[cfg(feature = "http3")]
+pub(crate) const MAX_STREAMS_PER_CONN: u32 = 64;

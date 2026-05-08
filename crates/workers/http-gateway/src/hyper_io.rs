@@ -160,11 +160,29 @@ async fn serve_request(
 }
 
 fn into_hyper(r: Response) -> HyperResponse {
-    // Builder errors are unreachable: status codes come from a fixed
-    // set and content-types are static.
-    hyper::Response::builder()
+    // Today all callers go through `Response::{text,json,empty}` with
+    // status codes from a small set, so the builder never errors —
+    // but if a future caller hands us a malformed status / header,
+    // fall through to a static 500 instead of panicking the worker.
+    match hyper::Response::builder()
         .status(r.status)
         .header("content-type", r.content_type)
         .body(Full::new(Bytes::from(r.body)))
-        .expect("hyper response builder")
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::error!("http-gateway: response build error: {e}");
+            fallback_500()
+        }
+    }
+}
+
+fn fallback_500() -> HyperResponse {
+    // Construction is purely literal — status 500, fixed content-type,
+    // empty body — so the inner builder genuinely cannot fail.
+    hyper::Response::builder()
+        .status(500)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from_static(b"internal error")))
+        .expect("static 500 response")
 }

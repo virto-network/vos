@@ -14,7 +14,7 @@ bin = []
 # Add HTTP/3 (QUIC) on top of the default h1+h2c TCP stack. Adds
 # `serve_h3(port)` as an actor message and pulls in h3 + quinn
 # + rustls + rcgen (for dev-mode self-signed cert auto-gen).
-http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:http"]
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:http"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
@@ -51,5 +51,6 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "log"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"], optional = true }
 http = { version = "1", optional = true }
