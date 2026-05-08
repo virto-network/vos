@@ -3938,7 +3938,6 @@ dependencies = [
  "libc",
  "libp2p",
  "redb",
- "registry",
  "serde",
  "serde_json",
  "space-registry",
