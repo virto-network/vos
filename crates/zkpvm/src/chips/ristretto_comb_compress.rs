@@ -103,7 +103,12 @@ const ROW_BD_INVSQRT_AMD: u16 = 1;
 ///  17..=20  — 4 algebra rows (sign-check prep): T·z_inv, iX, iY,
 ///             enchanted = i1·INVSQRT_A_MINUS_D
 ///      21   — IsSignWitness for `rotate` (sign of T·z_inv at +17)
-pub const ROWS_PER_CALL: usize = 22;
+///  22..=24  — Conditional select X' = if rotate then iY else X
+///             (out = X + rotate · (iY - X), 3 rows: sub/mul/add)
+///  25..=27  — Conditional select Y' = if rotate then iX else Y
+///  28..=30  — Conditional select den_inv =
+///             if rotate then enchanted else i2
+pub const ROWS_PER_CALL: usize = 31;
 
 // IsInput / algebra row offsets within a per-call block.
 // Some constants are unused in current batches but consumed by later
@@ -151,6 +156,27 @@ const ROW_IY: usize = 19;
 #[allow(dead_code)]
 const ROW_ENCHANTED: usize = 20;
 const ROW_SIGN_ROTATE: usize = 21;
+// Conditional select rows for X' / Y' / den_inv.  Each select uses
+// the `out = b + flag · (a - b)` decomposition (3 rows: IsSub diff,
+// IsMul scaled, IsAdd out).
+#[allow(dead_code)]
+const ROW_X_DIFF: usize = 22;
+#[allow(dead_code)]
+const ROW_X_SCALED: usize = 23;
+#[allow(dead_code)]
+const ROW_X_POST_ROTATE: usize = 24;
+#[allow(dead_code)]
+const ROW_Y_DIFF: usize = 25;
+#[allow(dead_code)]
+const ROW_Y_SCALED: usize = 26;
+#[allow(dead_code)]
+const ROW_Y_POST_ROTATE: usize = 27;
+#[allow(dead_code)]
+const ROW_DEN_INV_DIFF: usize = 28;
+#[allow(dead_code)]
+const ROW_DEN_INV_SCALED: usize = 29;
+#[allow(dead_code)]
+const ROW_DEN_INV: usize = 30;
 
 /// Per-row column layout.  Mirrors `RistrettoFixedBaseConsumerChip`'s
 /// FieldOp witness columns + source-row threading metadata.  No
@@ -557,6 +583,83 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             is_sign_witness: 1,
             sign_bits,
         });
+        let r_sign_rotate = base + ROW_SIGN_ROTATE as u16;
+        let r_ix = base + ROW_IX as u16;
+        let r_iy = base + ROW_IY as u16;
+        let r_enchanted = base + ROW_ENCHANTED as u16;
+        let r_i2 = base + ROW_I2 as u16;
+        // The rotate flag as a 32-byte field element: byte 0 = rotate,
+        // others = 0.  Lives in the sign-witness row's `out`.
+        let mut rotate_field = [0u8; 32];
+        rotate_field[0] = w.rotate;
+
+        // ── Conditional select X' = if rotate then iY else X ──
+        // out = X + rotate · (iY - X)
+        // row+22: IsSub diff_x = iY - X
+        let diff_x = w.i_y; // placeholder; filled by fill_sub below
+        let mut fr = fill_sub(w.i_y, acc.x);
+        fr.a_source_row = r_iy;
+        fr.b_source_row = r_x;
+        let diff_x = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_x_diff = base + ROW_X_DIFF as u16;
+        // row+23: IsMul scaled_x = rotate · diff_x
+        let mut fr = fill_mul(rotate_field, diff_x);
+        fr.a_source_row = r_sign_rotate;
+        fr.b_source_row = r_x_diff;
+        let scaled_x = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_x_scaled = base + ROW_X_SCALED as u16;
+        // row+24: IsAdd x_post_rotate = X + scaled_x
+        let mut fr = fill_add(acc.x, scaled_x);
+        fr.a_source_row = r_x;
+        fr.b_source_row = r_x_scaled;
+        debug_assert_eq!(fr.out, w.x_post_rotate);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+
+        // ── Conditional select Y' = if rotate then iX else Y ──
+        // row+25: IsSub diff_y = iX - Y
+        let mut fr = fill_sub(w.i_x, acc.y);
+        fr.a_source_row = r_ix;
+        fr.b_source_row = r_y;
+        let diff_y = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_y_diff = base + ROW_Y_DIFF as u16;
+        // row+26: IsMul scaled_y = rotate · diff_y
+        let mut fr = fill_mul(rotate_field, diff_y);
+        fr.a_source_row = r_sign_rotate;
+        fr.b_source_row = r_y_diff;
+        let scaled_y = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_y_scaled = base + ROW_Y_SCALED as u16;
+        // row+27: IsAdd y_post_rotate = Y + scaled_y
+        let mut fr = fill_add(acc.y, scaled_y);
+        fr.a_source_row = r_y;
+        fr.b_source_row = r_y_scaled;
+        debug_assert_eq!(fr.out, w.y_post_rotate);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+
+        // ── Conditional select den_inv = if rotate then enchanted else i2 ──
+        // row+28: IsSub diff_d = enchanted - i2
+        let mut fr = fill_sub(w.enchanted_denominator, w.i2);
+        fr.a_source_row = r_enchanted;
+        fr.b_source_row = r_i2;
+        let diff_d = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_d_diff = base + ROW_DEN_INV_DIFF as u16;
+        // row+29: IsMul scaled_d = rotate · diff_d
+        let mut fr = fill_mul(rotate_field, diff_d);
+        fr.a_source_row = r_sign_rotate;
+        fr.b_source_row = r_d_diff;
+        let scaled_d = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_d_scaled = base + ROW_DEN_INV_SCALED as u16;
+        // row+30: IsAdd den_inv = i2 + scaled_d
+        let mut fr = fill_add(w.i2, scaled_d);
+        fr.a_source_row = r_i2;
+        fr.b_source_row = r_d_scaled;
+        debug_assert_eq!(fr.out, w.den_inv);
+        rows.push(CompressRow { field: fr, ..Default::default() });
     }
 
     finalize_producer_multiplicities(&mut rows);
