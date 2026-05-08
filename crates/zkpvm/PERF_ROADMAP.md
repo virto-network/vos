@@ -444,22 +444,16 @@ natural batches:
      rows: Z - Y_neg (IsSub) + s = den_inv·(Z-Y_neg) (IsMul).
 4. Output-byte memory producer + RistrettoEcallChip skip + the
    inter-chip X/Y/Z/T boundary binding.  Two sub-batches:
-   - **4a (output memory producer)**: sibling
-     `RistrettoCombCompressOutputChip` with 32 rows per call
-     (mirroring `RistrettoCombScalarBoundaryChip`'s 32-row layout).
-     Per row: emit MemoryAccessLookupElements producer
-     `(addr, byte, ts, is_write=1)` where `addr = output_ptr + k`.
-     Source the per-byte values from the compress chip's row +43
-     via a new boundary relation
-     `RistrettoCombCompressOutputLookupElements` keyed on
-     `(call_idx, byte_idx, byte_value)`.  Compress chip's row +43
-     emits 32 producer tuples; output chip's 32 rows emit
-     consumer tuples.  Plus update
-     `RistrettoEcallChip::collect_accesses` to skip the 32-byte
-     output block when `op.kind == FixedBasepoint`.  Plus add
-     `output_ptr` + `ts` fields to `RistrettoCombCall` (or walk
-     the parallel `ristretto_mem_ops` like the scalar boundary
-     chip does).
+   - **4a — DONE (commit 7f44260)**: sibling
+     `RistrettoCombCompressOutputChip` with 32 rows per call.
+     New `RistrettoCombCompressOutputLookupElements` relation ties
+     compress chip's row +43 (32 producer tuples) to output chip's
+     32 consumer tuples.  Output chip emits MemoryAccess producers
+     at `(output_ptr + k, byte, ts, is_write=1)`.  EcallChip skips
+     the output block for FixedBasepoint records.  `RistrettoCombCall`
+     gained `output_ptr: u32` + `ts: u64` fields.  `chip_isolated`
+     12/12 GREEN with the e2e + 3-call harnesses now exercising the
+     full output-binding chain.
    - **4b (X/Y/Z/T cross-chip binding)**: tie compress chain's
      rows 0..3 (IsInput X, Y, Z, T) to consumer chip's window-63
      final-Acc rows — those are the LAST 4 mul rows of window
