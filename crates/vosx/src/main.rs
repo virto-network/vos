@@ -58,6 +58,12 @@ struct Cli {
     /// and LLM consumption. Inherited by all subcommands.
     #[arg(long, value_enum, default_value_t = Format::Text, global = true)]
     format: Format,
+
+    /// Enable progress / status chatter on stderr. Off by
+    /// default — only warnings and errors print. Inherited by
+    /// all subcommands.
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +112,7 @@ fn main() {
     init_tracing();
     let cli = Cli::parse();
     output::set(cli.format);
+    output::set_verbose(cli.verbose);
 
     match cli.command {
         Some(Command::Run { program, payload, hex, gas }) => {

@@ -82,7 +82,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             std::time::Duration::from_millis(0),
         )? {
             crate::commands::space::verify::VerifyOutcome::Verified { genesis_cid } => {
-                eprintln!(
+                crate::progress!(
                     "vosx: genesis verified (root={})",
                     hex::encode(genesis_cid),
                 );
@@ -127,7 +127,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     node.attach_network(network);
 
-    eprintln!(
+    crate::progress!(
         "vosx: space '{}' (id={}…) registry as {id}",
         entry.name,
         &entry.id[..12],
@@ -158,10 +158,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     publish_endpoint(&node, &data_dir, local_prefix)?;
 
     if args.once {
-        eprintln!("vosx: --once — exiting once registry goes idle");
+        crate::progress!("vosx: --once — exiting once registry goes idle");
         node.run();
     } else {
-        eprintln!("vosx: running until shutdown (Ctrl-C)");
+        crate::progress!("vosx: running until shutdown (Ctrl-C)");
         node.run_forever();
     }
 
@@ -240,7 +240,7 @@ fn build_network_for_daemon(
         .map_err(|e| anyhow::anyhow!("decode keypair: {e}"))?;
     let peer_id = libp2p::PeerId::from(keypair.public());
     let local_prefix = vos::network::derive_node_prefix(&peer_id);
-    eprintln!(
+    crate::progress!(
         "vosx: node identity {peer_id} (prefix {local_prefix:#06x})",
     );
 
@@ -284,9 +284,9 @@ fn publish_endpoint(
         pid: std::process::id(),
     };
     crate::commands::space::endpoint::write(data_dir, &ep)?;
-    eprintln!("vosx: endpoint published");
+    crate::progress!("vosx: endpoint published");
     for a in &multiaddrs {
-        eprintln!("  {a}");
+        crate::progress!("  {a}");
     }
     Ok(())
 }
@@ -307,7 +307,7 @@ fn spawn_installed_agents(
     let local_cfg = crate::commands::space::subscriptions::load(data_dir)
         .unwrap_or_default();
     if local_cfg.is_filtering() {
-        eprintln!(
+        crate::progress!(
             "vosx: subscriptions filter active — {} agent(s)",
             local_cfg.subscriptions.len(),
         );
@@ -319,7 +319,7 @@ fn spawn_installed_agents(
 
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
-            eprintln!(
+            crate::progress!(
                 "vosx:   skipping '{}' (not subscribed)",
                 a.instance_name,
             );
@@ -379,7 +379,7 @@ fn spawn_installed_agents(
 
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         let id = node.register_at_id(cfg, svc_id);
-        eprintln!(
+        crate::progress!(
             "vosx:   agent '{}' as {id} ({})",
             a.instance_name,
             space_registry::consistency_name(a.consistency),

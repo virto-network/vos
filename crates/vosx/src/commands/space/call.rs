@@ -33,9 +33,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     DaemonClient::with_connect(&args.space, |client| {
         let target_id = client.resolve_target(&args.target)?;
         let msg = build_msg(&args.method, &args.args)?;
-        if !output::is_json() {
-            eprintln!("vosx: invoking {} on {target_id}", args.method);
-        }
+        crate::progress!("vosx: invoking {} on {target_id}", args.method);
         let reply = client.invoke_dyn(target_id, &msg)?;
         if output::is_json() {
             output::print_json(&output::value_to_json(&reply));

@@ -18,7 +18,7 @@ pub fn run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
 
     let idx = rt.register_service_blob(blob);
     let id = rt.register_service(idx);
-    eprintln!("vosx: loaded '{}' as {id:?}", program.display());
+    crate::progress!("vosx: loaded '{}' as {id:?}", program.display());
 
     let mut items: Vec<Vec<u8>> = Vec::new();
     for p in payloads {
@@ -34,7 +34,7 @@ pub fn run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
         rt.send_to(id, item);
     }
 
-    eprintln!("vosx: running...\n");
+    crate::progress!("vosx: running...\n");
     rt.run_blocking();
     exit_with_status(rt.panics);
 }
