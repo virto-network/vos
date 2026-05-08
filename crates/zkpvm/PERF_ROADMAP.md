@@ -515,6 +515,23 @@ in-circuit chain.  Soundness chain in full:
     at a 9% prove-time cost.  Net win: a malicious prover can no
     longer fabricate output bytes.
 
+**Optimization attempt (rejected; informative)**: tried widening the
+chip-local register-file relation from 4-limb (byte-keyed:
+`(row_id_lo, row_id_hi, byte_idx, value)`) to 34-limb (row-wide:
+`(row_id_lo, row_id_hi, value[0..32])`), collapsing 32 byte-tuple
+emissions per row into 1 wide tuple.  Hypothesis: 32× fewer
+emissions ⇒ much less interaction work.  **Reality: prove time
+went 0.86 s → 1.13 s (+31%).**  Stwo's per-emission overhead is
+lower than I'd estimated, while wider tuples cost more per
+fraction evaluation (random linear combination over 34 limbs vs
+4).  Reverted.
+
+Practical conclusion: the new chips are well-tuned for Stwo's
+relation framework as-is.  Bigger perf wins lie elsewhere
+(B5/B6 chip-shrinks on RegisterMemoryChip / MemoryChip, both
+log_size 16 = 65k rows).  Those are Session 3 territory (2-4
+weeks per item per the roadmap, audit-sensitive).
+
 ### Step 5 design tree
 
 The consumer side has to (a) emit one `+1` contribution to
