@@ -468,14 +468,36 @@ natural batches:
      `(call_idx, coord_kind ∈ {0=X, 1=Y, 2=Z, 3=T}, byte_idx,
      byte_value)`.  Consumer side on the compress chip's rows
      0..3 emits 4 × 32 byte tuples per call.
-5. Activity gating (`ChipActivity.ristretto_comb` already covers
-   the new chip — just add idx 25 to the gate); BASE_COMPONENTS
-   wiring; chip-isolated end-to-end harness covering the full
-   chain (includes a soundness regression test mirroring
-   `harness_ristretto_scalar_memory_mismatch_rejected`: feed
-   `out_bytes ≠ compress(scalar · G)` and assert verify rejects
-   with `claimed logup sum is not zero`); bench validation
-   targeting MOBILE ≤ 0.85 s vs ~0.79 s baseline.
+5. **DONE (commit 2771fa5)** — BASE_COMPONENTS wiring + soundness
+   regression.  Both new chips added at prover indices 25/26 and
+   verifier-only mirror; `ChipActivity::is_active` extended to
+   gate 21..=26 by `ristretto_comb`.  New harness
+   `harness_ristretto_output_mismatch_rejected` confirms a
+   tampered `out_bytes` triggers `claimed logup sum is not zero`.
+   `profile_clerk_private_pay_bench_mobile` proves+verifies
+   cleanly with the full chain (25 active chips; 2 new chips at
+   log_sizes 6 and 8).  chip_isolated 13/13 GREEN.
+
+**R1e-bis OUTPUT BINDING COMPLETE — SOUNDNESS-COMPLETE END-TO-END**.
+The actor's PVM-memory output bytes for every FixedBasepoint scalar
+mult are mechanically forced to equal `compress(scalar · G)` via the
+in-circuit chain.  Soundness chain in full:
+
+  scalar bytes (PVM memory)
+    → RistrettoCombScalarBoundaryChip + RistrettoCombAnchorChip
+  per-window k_i nibbles
+    → RistrettoCombTableChip preprocessed table
+  T[i][k_i] table entries
+    → RistrettoFixedBaseConsumerChip's per-window add chain
+  window-63 final-Acc X3/Y3/T3/Z3
+    → RistrettoCombFinalAccLookupElements (Batch 4b)
+  compress chain's IsInput X/Y/Z/T
+    → 44-row compress chain (Batches 2 + 3a-3e)
+  canonical s_can on row +43
+    → RistrettoCombCompressOutputLookupElements (Batch 4a)
+  RistrettoCombCompressOutputChip
+    → MemoryAccessLookupElements
+  PVM-memory output bytes
 
 ### Step 5 design tree
 
