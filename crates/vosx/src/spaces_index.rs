@@ -27,10 +27,6 @@ pub struct SpaceEntry {
     pub name: String,
     /// ISO-8601 timestamp of when this entry was first added.
     pub created_at: String,
-    /// libp2p multiaddrs the local node listens on for this space.
-    /// Empty when the space is local-only.
-    #[serde(default)]
-    pub listen: Vec<String>,
     /// Where this entry's per-space data lives. Defaults to
     /// `data_root()/<id>` but may be overridden by `--data-dir`.
     #[serde(default)]
@@ -146,8 +142,10 @@ pub fn find<'a>(index: &'a SpacesIndex, query: &str) -> Result<&'a SpaceEntry, I
 }
 
 /// Construct a fresh entry with a default `data_dir` derived
-/// from the space_id.
-pub fn entry_for(id_bytes: &[u8; 32], name: &str, listen: Vec<String>) -> SpaceEntry {
+/// from the space_id. Persistent listen prefs aren't on the
+/// entry — they live in `<data_dir>/local.toml` (per-node
+/// override, see `subscriptions::LocalConfig`).
+pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
     let id = space_id_hex(id_bytes);
     let data_dir = crate::paths::space_dir(id_bytes)
         .to_string_lossy()
@@ -156,7 +154,6 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str, listen: Vec<String>) -> SpaceE
         id,
         name: name.to_string(),
         created_at: now_iso8601(),
-        listen,
         data_dir,
         registry_hash: String::new(),
         bootnodes: Vec::new(),
@@ -230,7 +227,6 @@ mod tests {
                 id: "ab".repeat(32),
                 name: "demo".into(),
                 created_at: "2026-05-07T00:00:00Z".into(),
-                listen: vec!["/ip4/127.0.0.1/tcp/4811".into()],
                 data_dir: "/tmp/data".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
@@ -253,7 +249,6 @@ mod tests {
                 id: id.clone(),
                 name: "v1".into(),
                 created_at: "x".into(),
-                listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
@@ -265,7 +260,6 @@ mod tests {
                 id: id.clone(),
                 name: "v2".into(),
                 created_at: "y".into(),
-                listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
@@ -285,7 +279,6 @@ mod tests {
                 id: id_a.clone(),
                 name: "alpha".into(),
                 created_at: "".into(),
-                listen: vec![],
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
@@ -308,8 +301,7 @@ mod tests {
     #[test]
     fn entry_for_uses_default_data_dir() {
         let id = [0xCDu8; 32];
-        let entry = entry_for(&id, "demo", vec![]);
+        let entry = entry_for(&id, "demo");
         assert!(entry.data_dir.contains(&space_id_hex(&id)));
     }
-
 }

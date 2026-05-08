@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use crate::commands::space::new::resolve_registry_source;
+use crate::commands::space::subscriptions::{self, LocalConfig};
 use crate::paths;
 use crate::spaces_index::{self, SpacesIndex};
 
@@ -20,6 +21,9 @@ pub struct Args {
     pub bootstrap: String,
     pub registry: Option<String>,
     pub name: Option<String>,
+    /// Persistent libp2p listen addrs. Written to
+    /// `<data_dir>/local.toml`; `space up --listen <addr>` can
+    /// still override per-run.
     pub listen: Vec<String>,
     pub data_dir: Option<PathBuf>,
 }
@@ -68,9 +72,23 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(space_dir.join("node.key"), key_bytes)?;
 
+    // If the user passed `--listen <addr>`, persist it into
+    // `local.toml` so subsequent `space up` runs pick it up
+    // without having to re-specify. The flag used to live on
+    // the spaces.toml entry; that field is gone now.
+    if !args.listen.is_empty() {
+        subscriptions::save(
+            &space_dir,
+            &LocalConfig {
+                subscriptions: Vec::new(),
+                listen: args.listen.clone(),
+            },
+        )?;
+    }
+
     // Index entry.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
-    let mut entry = spaces_index::entry_for(&space_id, &name, args.listen.clone());
+    let mut entry = spaces_index::entry_for(&space_id, &name);
     entry.data_dir = space_dir.to_string_lossy().to_string();
     entry.registry_hash = registry_hash.to_hex();
     entry.bootnodes = vec![bootnode.clone()];
