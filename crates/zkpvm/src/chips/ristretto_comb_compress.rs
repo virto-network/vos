@@ -91,9 +91,11 @@ pub struct RistrettoCombCompressChip;
 /// Chip-wide boundary input rows at the start of the trace.  Layout:
 ///   0 — SQRT_M1 (used by iX, iY)
 ///   1 — INVSQRT_A_MINUS_D (used by enchanted)
-pub const N_BOUNDARY_INPUTS: usize = 2;
+///   2 — ZERO (used by conditional-negate IsSub `0 - a` step)
+pub const N_BOUNDARY_INPUTS: usize = 3;
 const ROW_BD_SQRT_M1: u16 = 0;
 const ROW_BD_INVSQRT_AMD: u16 = 1;
+const ROW_BD_ZERO: u16 = 2;
 
 /// Number of rows the chip lays down per fixed-basepoint scalar-mult
 /// call.  Layout (offsets within the call):
@@ -104,11 +106,20 @@ const ROW_BD_INVSQRT_AMD: u16 = 1;
 ///             enchanted = i1·INVSQRT_A_MINUS_D
 ///      21   — IsSignWitness for `rotate` (sign of T·z_inv at +17)
 ///  22..=24  — Conditional select X' = if rotate then iY else X
-///             (out = X + rotate · (iY - X), 3 rows: sub/mul/add)
 ///  25..=27  — Conditional select Y' = if rotate then iX else Y
 ///  28..=30  — Conditional select den_inv =
 ///             if rotate then enchanted else i2
-pub const ROWS_PER_CALL: usize = 31;
+///      31   — IsMul X'·z_inv (sign source for y_negate)
+///      32   — IsSignWitness for `y_negate`
+///      33   — IsSub neg_y = 0 - Y'
+///  34..=36  — Conditional select Y_neg =
+///             if y_negate then neg_y else Y'
+///      37   — IsSub Z - Y_neg
+///      38   — IsMul s = den_inv · (Z - Y_neg)
+///      39   — IsSignWitness for `s_neg` (sign of s)
+///      40   — IsSub neg_s = 0 - s
+///  41..=43  — Conditional select s_can = if s_neg then neg_s else s
+pub const ROWS_PER_CALL: usize = 44;
 
 // IsInput / algebra row offsets within a per-call block.
 // Some constants are unused in current batches but consumed by later
@@ -177,6 +188,30 @@ const ROW_DEN_INV_DIFF: usize = 28;
 const ROW_DEN_INV_SCALED: usize = 29;
 #[allow(dead_code)]
 const ROW_DEN_INV: usize = 30;
+#[allow(dead_code)]
+const ROW_X_Z_INV: usize = 31;
+const ROW_SIGN_Y_NEGATE: usize = 32;
+#[allow(dead_code)]
+const ROW_NEG_Y: usize = 33;
+#[allow(dead_code)]
+const ROW_Y_NEG_DIFF: usize = 34;
+#[allow(dead_code)]
+const ROW_Y_NEG_SCALED: usize = 35;
+#[allow(dead_code)]
+const ROW_Y_NEG: usize = 36;
+#[allow(dead_code)]
+const ROW_Z_MINUS_Y_NEG: usize = 37;
+#[allow(dead_code)]
+const ROW_S: usize = 38;
+const ROW_SIGN_S_NEG: usize = 39;
+#[allow(dead_code)]
+const ROW_NEG_S: usize = 40;
+#[allow(dead_code)]
+const ROW_S_CAN_DIFF: usize = 41;
+#[allow(dead_code)]
+const ROW_S_CAN_SCALED: usize = 42;
+#[allow(dead_code)]
+const ROW_S_CAN: usize = 43;
 
 /// Per-row column layout.  Mirrors `RistrettoFixedBaseConsumerChip`'s
 /// FieldOp witness columns + source-row threading metadata.  No
@@ -388,10 +423,13 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
 
     // ── Chip-wide boundary inputs (rows 0..N_BOUNDARY_INPUTS) ──
     // SQRT_M1 and INVSQRT_A_MINUS_D are constants used by every
-    // call's iX/iY/enchanted rows.  Push them once at the trace's
-    // start; per-call rows reference them by absolute row id.
+    // call's iX/iY/enchanted rows.  ZERO drives every conditional
+    // negate's IsSub `0 - a` step (Batch 3e).  Push them once at
+    // the trace's start; per-call rows reference them by absolute
+    // row id.
     rows.push(CompressRow { field: fill_input(*sqrt_m1()), ..Default::default() });
     rows.push(CompressRow { field: fill_input(*invsqrt_a_minus_d()), ..Default::default() });
+    rows.push(CompressRow { field: fill_input([0u8; 32]), ..Default::default() });
     debug_assert_eq!(rows.len(), N_BOUNDARY_INPUTS);
 
     let table = CombTable::from_base(&ed25519_basepoint_extended());
@@ -659,6 +697,135 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_i2;
         fr.b_source_row = r_d_scaled;
         debug_assert_eq!(fr.out, w.den_inv);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_x_post_rotate = base + ROW_X_POST_ROTATE as u16;
+        let r_y_post_rotate = base + ROW_Y_POST_ROTATE as u16;
+        let r_z_inv = base + ROW_Z_INV as u16;
+        let r_den_inv = base + ROW_DEN_INV as u16;
+
+        // ── row+31: X' · z_inv (sign source for y_negate) ──
+        let mut fr = fill_mul(w.x_post_rotate, w.z_inv);
+        fr.a_source_row = r_x_post_rotate;
+        fr.b_source_row = r_z_inv;
+        debug_assert_eq!(fr.out, w.x_z_inv);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_x_z_inv = base + ROW_X_Z_INV as u16;
+
+        // ── row+32: y_negate sign witness ──
+        let mut sign_witness_bytes = [0u8; 32];
+        sign_witness_bytes[0] = w.y_negate_flag;
+        let mut fr = fill_input(sign_witness_bytes);
+        fr.a = w.x_z_inv;
+        fr.a_source_row = r_x_z_inv;
+        let mut sign_bits = [0u8; 7];
+        for k in 0..7 {
+            sign_bits[k] = (w.x_z_inv[0] >> (k + 1)) & 1;
+        }
+        rows.push(CompressRow {
+            field: fr,
+            is_sign_witness: 1,
+            sign_bits,
+        });
+        let r_sign_y_negate = base + ROW_SIGN_Y_NEGATE as u16;
+
+        // ── row+33: neg_y = 0 - Y' ──
+        let mut fr = fill_sub([0u8; 32], w.y_post_rotate);
+        fr.a_source_row = ROW_BD_ZERO;
+        fr.b_source_row = r_y_post_rotate;
+        let neg_y = fr.out;
+        // Cross-check: neg_y == p - Y' (or 0 if Y' == 0).
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_neg_y = base + ROW_NEG_Y as u16;
+
+        // ── Conditional negate Y_neg = if y_negate then neg_y else Y' ──
+        // out = Y' + y_negate · (neg_y - Y')
+        // row+34: IsSub diff = neg_y - Y'
+        let mut fr = fill_sub(neg_y, w.y_post_rotate);
+        fr.a_source_row = r_neg_y;
+        fr.b_source_row = r_y_post_rotate;
+        let diff_yneg = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_y_neg_diff = base + ROW_Y_NEG_DIFF as u16;
+        // row+35: IsMul scaled = y_negate · diff
+        let mut y_negate_field = [0u8; 32];
+        y_negate_field[0] = w.y_negate_flag;
+        let mut fr = fill_mul(y_negate_field, diff_yneg);
+        fr.a_source_row = r_sign_y_negate;
+        fr.b_source_row = r_y_neg_diff;
+        let scaled_yneg = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_y_neg_scaled = base + ROW_Y_NEG_SCALED as u16;
+        // row+36: IsAdd Y_neg = Y' + scaled
+        let mut fr = fill_add(w.y_post_rotate, scaled_yneg);
+        fr.a_source_row = r_y_post_rotate;
+        fr.b_source_row = r_y_neg_scaled;
+        debug_assert_eq!(fr.out, w.y_neg);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_y_neg = base + ROW_Y_NEG as u16;
+
+        // ── row+37: Z - Y_neg ──
+        let mut fr = fill_sub(acc.z, w.y_neg);
+        fr.a_source_row = r_z;
+        fr.b_source_row = r_y_neg;
+        debug_assert_eq!(fr.out, w.z_minus_y_neg);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_z_minus_y_neg = base + ROW_Z_MINUS_Y_NEG as u16;
+
+        // ── row+38: s = den_inv · (Z - Y_neg) ──
+        let mut fr = fill_mul(w.den_inv, w.z_minus_y_neg);
+        fr.a_source_row = r_den_inv;
+        fr.b_source_row = r_z_minus_y_neg;
+        debug_assert_eq!(fr.out, w.s);
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_s = base + ROW_S as u16;
+
+        // ── row+39: s_neg sign witness ──
+        let mut sign_witness_bytes = [0u8; 32];
+        sign_witness_bytes[0] = w.s_neg_flag;
+        let mut fr = fill_input(sign_witness_bytes);
+        fr.a = w.s;
+        fr.a_source_row = r_s;
+        let mut sign_bits = [0u8; 7];
+        for k in 0..7 {
+            sign_bits[k] = (w.s[0] >> (k + 1)) & 1;
+        }
+        rows.push(CompressRow {
+            field: fr,
+            is_sign_witness: 1,
+            sign_bits,
+        });
+        let r_sign_s_neg = base + ROW_SIGN_S_NEG as u16;
+
+        // ── row+40: neg_s = 0 - s ──
+        let mut fr = fill_sub([0u8; 32], w.s);
+        fr.a_source_row = ROW_BD_ZERO;
+        fr.b_source_row = r_s;
+        let neg_s = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_neg_s = base + ROW_NEG_S as u16;
+
+        // ── Conditional negate s_can = if s_neg then neg_s else s ──
+        // row+41: IsSub diff = neg_s - s
+        let mut fr = fill_sub(neg_s, w.s);
+        fr.a_source_row = r_neg_s;
+        fr.b_source_row = r_s;
+        let diff_scan = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_s_can_diff = base + ROW_S_CAN_DIFF as u16;
+        // row+42: IsMul scaled = s_neg · diff
+        let mut s_neg_field = [0u8; 32];
+        s_neg_field[0] = w.s_neg_flag;
+        let mut fr = fill_mul(s_neg_field, diff_scan);
+        fr.a_source_row = r_sign_s_neg;
+        fr.b_source_row = r_s_can_diff;
+        let scaled_scan = fr.out;
+        rows.push(CompressRow { field: fr, ..Default::default() });
+        let r_s_can_scaled = base + ROW_S_CAN_SCALED as u16;
+        // row+43: IsAdd s_can = s + scaled
+        let mut fr = fill_add(w.s, scaled_scan);
+        fr.a_source_row = r_s;
+        fr.b_source_row = r_s_can_scaled;
+        debug_assert_eq!(fr.out, w.s_can);
         rows.push(CompressRow { field: fr, ..Default::default() });
     }
 

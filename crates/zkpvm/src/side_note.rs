@@ -562,8 +562,10 @@ impl SideNote {
             let w = compute_compress_witness(&acc);
             // Rotate sign source: byte 0 of T·z_inv.
             self.byte_to_bits_counts[w.t_z_inv[0] as usize] += 1;
-            // y_negate / s_neg sign sources will be added once
-            // Batches 3d/3e land their respective rows.
+            // y_negate sign source: byte 0 of X'·z_inv.
+            self.byte_to_bits_counts[w.x_z_inv[0] as usize] += 1;
+            // s_neg sign source: byte 0 of s.
+            self.byte_to_bits_counts[w.s[0] as usize] += 1;
         }
     }
 
