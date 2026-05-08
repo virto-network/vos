@@ -176,6 +176,14 @@ pub struct RistrettoMemOp {
     pub point_bytes: [u8; 32],
     /// 32 output bytes written at (output_ptr + i, ts).
     pub out_bytes: [u8; 32],
+    /// Mirrors `RistrettoRecord.kind` so the
+    /// memory-producer chip can dispatch on basepoint vs variable-base
+    /// without rejoining records and memops.  `RistrettoEcallChip` uses
+    /// this to skip the scalar-byte producers for `FixedBasepoint`
+    /// records — those bytes are produced by
+    /// `RistrettoCombScalarBoundaryChip` instead so the ledger can bind
+    /// the scalar nibbles directly to PVM memory.
+    pub kind: ScalarMultKind,
 }
 
 pub struct TracingPvm {
@@ -495,16 +503,18 @@ impl TracingPvm {
         }
 
         let ts = self.timestamp - 1;
+        let kind = detect_scalar_mult_kind(&point_bytes);
 
         self.ristretto_records.push(RistrettoRecord {
             scalar: scalar_bytes,
             point: point_bytes,
             output: out_bytes,
-            kind: detect_scalar_mult_kind(&point_bytes),
+            kind,
         });
         self.ristretto_mem_ops.push(RistrettoMemOp {
             scalar_ptr, point_ptr, output_ptr, ts,
             scalar_bytes, point_bytes, out_bytes,
+            kind,
         });
     }
 
