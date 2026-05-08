@@ -609,13 +609,15 @@ impl TracingPvm {
     /// write 32 output bytes back, and capture the call.  Buffers
     /// out of bounds → canonical compressed identity sentinel.
     fn handle_ristretto_point_add_ecall(&mut self) {
-        // Same off-by-three bug as handle_blake2b_ecall.
-        let p_ptr_u = self.pvm.registers[10] as usize;
-        let q_ptr_u = self.pvm.registers[11] as usize;
-        let output_ptr_u = self.pvm.registers[12] as usize;
-        let p_ptr = self.pvm.registers[10] as u32;
-        let q_ptr = self.pvm.registers[11] as u32;
-        let output_ptr = self.pvm.registers[12] as u32;
+        // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  Same
+        // off-by-three pattern as the other ECALL handlers; no
+        // CpuChip-side binding tuple, so handler-only fix.
+        let p_ptr_u = self.pvm.registers[7] as usize;
+        let q_ptr_u = self.pvm.registers[8] as usize;
+        let output_ptr_u = self.pvm.registers[9] as usize;
+        let p_ptr = self.pvm.registers[7] as u32;
+        let q_ptr = self.pvm.registers[8] as u32;
+        let output_ptr = self.pvm.registers[9] as u32;
 
         let mut p_bytes = [0u8; 32];
         let mut q_bytes = [0u8; 32];
