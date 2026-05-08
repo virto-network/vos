@@ -8,14 +8,16 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         match client.uninstall(instance.to_string())? {
             STATUS_OK => {
+                // The redb file under `<data_dir>/agents/<svc_id>.redb`
+                // is held open by the running daemon and can't be
+                // moved here. The next `space up` sweeps orphan
+                // redbs into `<data_dir>/trash/` (see
+                // `up::sweep_orphan_redbs`).
                 println!("uninstalled {instance}");
                 Ok(())
             }
             STATUS_NOT_FOUND => anyhow::bail!("no agent named '{instance}' installed"),
             other => anyhow::bail!("uninstall returned status {other}"),
         }
-        // TODO: move per-agent redb to space_dir/trash/{instance}
-        // so an `--undo` can recover instead of leaving the file
-        // orphaned.
     })
 }

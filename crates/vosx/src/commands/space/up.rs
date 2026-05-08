@@ -298,6 +298,7 @@ fn spawn_installed_agents(
     local_prefix: u16,
 ) -> anyhow::Result<()> {
     use space_registry::SpaceRegistryRef;
+    use std::collections::HashSet;
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir)
         .unwrap_or_default();
@@ -311,6 +312,18 @@ fn spawn_installed_agents(
     let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
     let agents = vos::block_on(reg.agents(&mut &*node))
         .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+
+    // Set of svc_ids the catalog knows about — used at the
+    // end to sweep orphaned redbs into trash. We add to this
+    // even for skipped agents (subscriptions filter, missing
+    // blob, …) so we don't accidentally trash their state.
+    let mut live_svc_ids: HashSet<u32> = HashSet::new();
+    live_svc_ids.insert(ServiceId::REGISTRY.0);
+
+    for a in agents.iter() {
+        let svc_id = instance_service_id(&a.instance_name, local_prefix);
+        live_svc_ids.insert(svc_id.0);
+    }
 
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
@@ -378,6 +391,51 @@ fn spawn_installed_agents(
             crate::commands::space::common::consistency_name(a.consistency),
         );
     }
+
+    // Sweep `agents/` for redbs whose svc_id no longer maps to
+    // a catalog entry — the trace left by past `space uninstall`
+    // calls. Move them to `<data_dir>/trash/<svc_id>.redb` so
+    // a future `--undo` (or just an `ls`) can recover the bytes
+    // instead of finding orphans.
+    sweep_orphan_redbs(data_dir, &live_svc_ids);
+
     Ok(())
+}
+
+/// Walk `<data_dir>/agents/`, trash any `<svc_id>.redb` whose
+/// id isn't in `live`. Best-effort — failures log a warning
+/// but don't abort the daemon boot. The registry's own redb
+/// (svc_id 0) is always live, by virtue of being added to
+/// `live` before this runs.
+fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashSet<u32>) {
+    let agents_dir = data_dir.join("agents");
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    let trash = data_dir.join("trash");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let Some(stem) = name_str.strip_suffix(".redb") else { continue };
+        let Ok(svc_id) = u32::from_str_radix(stem, 16) else { continue };
+        if live.contains(&svc_id) {
+            continue;
+        }
+        if std::fs::create_dir_all(&trash).is_err() {
+            continue;
+        }
+        let dest = trash.join(name_str);
+        match std::fs::rename(entry.path(), &dest) {
+            Ok(()) => tracing::info!(
+                "moved orphan redb to trash: svc_id={svc_id:#010x}, path={}",
+                dest.display(),
+            ),
+            Err(e) => tracing::warn!(
+                "failed to trash orphan redb {}: {e}",
+                entry.path().display(),
+            ),
+        }
+    }
 }
 
