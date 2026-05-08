@@ -432,6 +432,183 @@ fn profile_clerk_private_pay_bench_mobile() {
     );
 }
 
+/// B5 feasibility check: build the side_note exactly as the prover would for
+/// `name`'s canonical workload, then run `register_memory::analyze_dedup` and
+/// print the report.  No prove step — fast.  See PERF_ROADMAP §3.1.
+fn analyze_register_dedup(name: &str, gas: u64) {
+    let blob = load_actor_blob(name);
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
+
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run_with_vos_stubs();
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
+    let ristretto_add_records = tracing.ristretto_add_records.clone();
+    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
+    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
+    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
+    let scalar_binop_records = tracing.scalar_binop_records.clone();
+    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
+    let steps = tracing.into_trace();
+
+    let mut side_note = zkpvm::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
+
+    for c in &blake2b_calls {
+        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
+            h: c.h, m: c.m, t: c.t, f: c.f
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+    side_note.ristretto_calls = ristretto_calls;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ristretto_add_calls = ristretto_add_records;
+    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
+    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
+    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
+    side_note.scalar_binop_calls = scalar_binop_records;
+    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
+    side_note.ingest_ristretto_boundary();
+
+    let report = zkpvm::chips::register_memory::analyze_dedup(&side_note);
+
+    eprintln!("=== {name} register-memory dedup feasibility ===");
+    eprintln!("PVM steps:           {}", side_note.steps.len());
+    eprintln!("Total ledger entries: {} ({} reads + {} writes)",
+        report.total_entries, report.total_reads, report.total_writes);
+    eprintln!("After dedup:         {} ({} merged rows)",
+        report.after_dedup, report.run_count);
+    eprintln!("Saved:               {} entries ({:.1}%)",
+        report.saved,
+        100.0 * report.saved as f64 / report.total_entries as f64);
+    eprintln!("Current log_size:    {}", report.current_log_size);
+    eprintln!("After-dedup log_size: {}", report.after_dedup_log_size);
+    eprintln!("Longest run:         {}", report.longest_run);
+    eprintln!("Run-length histogram (length: count):");
+    let total_runs = report.run_count.max(1) as f64;
+    let mut cumulative = 0usize;
+    for (len, cnt) in &report.run_length_histogram {
+        cumulative += cnt;
+        eprintln!("  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
+            len, cnt,
+            100.0 * (*cnt as f64) / total_runs,
+            cumulative,
+            100.0 * (cumulative as f64) / total_runs);
+    }
+    eprintln!("\nFixed-cap merge sweep (M = max-merge per row):");
+    eprintln!("  M  rows-after-dedup  log_size");
+    for (m, rows, log) in &report.cap_after_dedup {
+        let fits = if *log <= 15 { " (fits log=15)" } else { "" };
+        eprintln!("  {:>2}  {:>16}  {:>8}{}", m, rows, log, fits);
+    }
+}
+
+#[test]
+fn analyze_register_dedup_clerk_private_pay_bench() {
+    analyze_register_dedup("clerk-private-pay-bench", 100_000_000);
+}
+
+/// B6 feasibility check: build the side_note for `name` and run
+/// `memory::analyze_dedup`, which counts byte-flood groups (runs of
+/// consecutive same-(ts, is_write) entries with monotone-by-1 addresses).
+fn analyze_memory_dedup(name: &str, gas: u64) {
+    let blob = load_actor_blob(name);
+    let parsed = program::parse_blob(&blob).expect("parse blob");
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
+    let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
+
+    let mut tracing = TracingPvm::new(interp);
+    let _exit = tracing.run_with_vos_stubs();
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
+    let ristretto_add_records = tracing.ristretto_add_records.clone();
+    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
+    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
+    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
+    let scalar_binop_records = tracing.scalar_binop_records.clone();
+    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
+    let steps = tracing.into_trace();
+
+    let mut side_note = zkpvm::SideNote::new(
+        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
+
+    for c in &blake2b_calls {
+        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
+            h: c.h, m: c.m, t: c.t, f: c.f
+        });
+    }
+    side_note.blake2b_mem_ops = blake2b_mem_ops;
+    side_note.ristretto_calls = ristretto_calls;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ristretto_add_calls = ristretto_add_records;
+    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
+    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
+    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
+    side_note.scalar_binop_calls = scalar_binop_records;
+    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
+    side_note.ingest_ristretto_boundary();
+
+    let report = zkpvm::chips::memory::analyze_dedup(&side_note);
+
+    eprintln!("=== {name} memory dedup feasibility ===");
+    eprintln!("Total ledger entries:    {}", report.total_entries);
+    eprintln!("Bytes in flood groups:   {} ({:.1}%)",
+        report.bytes_in_flood_groups,
+        100.0 * report.bytes_in_flood_groups as f64 / report.total_entries as f64);
+    eprintln!("After unbounded dedup:   {}", report.after_dedup);
+    eprintln!("Current log_size:        {}", report.current_log_size);
+    eprintln!("After-dedup log_size:    {}", report.after_dedup_log_size);
+    eprintln!("Longest flood:           {}", report.longest_flood);
+    eprintln!("Flood-length histogram (length: count):");
+    let total_groups = report.after_dedup.max(1) as f64;
+    let mut cumulative = 0usize;
+    for (len, cnt) in &report.flood_length_histogram {
+        cumulative += cnt;
+        eprintln!("  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
+            len, cnt,
+            100.0 * (*cnt as f64) / total_groups,
+            cumulative,
+            100.0 * (cumulative as f64) / total_groups);
+    }
+    eprintln!("\nFixed-cap merge sweep (M = max bytes per row):");
+    eprintln!("  M  rows-after-dedup  log_size");
+    for (m, rows, log) in &report.cap_after_dedup {
+        let fits = if *log <= 15 { " (fits log=15)" } else { "" };
+        eprintln!("  {:>2}  {:>16}  {:>8}{}", m, rows, log, fits);
+    }
+}
+
+#[test]
+fn analyze_memory_dedup_clerk_private_pay_bench() {
+    analyze_memory_dedup("clerk-private-pay-bench", 100_000_000);
+}
+
 #[test]
 fn trace_clerk_private_pay_bench() {
     let blob = load_actor_blob("clerk-private-pay-bench");

@@ -663,7 +663,6 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         // ── Conditional select X' = if rotate then iY else X ──
         // out = X + rotate · (iY - X)
         // row+22: IsSub diff_x = iY - X
-        let diff_x = w.i_y; // placeholder; filled by fill_sub below
         let mut fr = fill_sub(w.i_y, acc.x);
         fr.a_source_row = r_iy;
         fr.b_source_row = r_x;
@@ -1385,10 +1384,10 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             component_trace,
             Column::ProducerEmissionMult
         );
-        let consumer_a_gate_h = crate::trace::original_base_column!(
-            component_trace,
-            Column::ConsumerAGateH
-        );
+        // ConsumerAGateH is read in `add_constraints` to derive
+        // `EffectiveConsumerAGateH = ConsumerAGateH + IsSignWitness`, but the
+        // interaction trace below only emits via `EffectiveConsumerAGateH`,
+        // not the raw column.
         let consumer_b_gate_h = crate::trace::original_base_column!(
             component_trace,
             Column::ConsumerBGateH

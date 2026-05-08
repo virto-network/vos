@@ -1,57 +1,42 @@
 # zkpvm — performance benchmarks
 
-## Latest — Session 2.1 step 8 (scalar memory binding closed)
+## Latest — Session 3 / B5 landed (2026-05-08)
 
 `profile_clerk_private_pay_bench_mobile`, on the reference Intel Core
-Ultra 7 155H, after step 8's scalar memory binding landed
-(`82f893d` + `0218a41` + `c60b447`):
+Ultra 7 155H, after the B5 RegisterMemoryChip log=16→15 fold
+(`7cc7c49` + `66f73e0`):
 
-| Build       | Trials | Median  | Min     | Max     |
-|---          |---     |---      |---      |---      |
-| no-PGO      | 4      | **0.76 s** | 737 ms  | 782 ms  |
+| Build       | Trials | Median   | Min     | Max     |
+|---          |---     |---       |---      |---      |
+| no-PGO      | 6      | **0.862 s** | 827 ms  | 877 ms  |
 
-(Trials 2–5 of a 5-trial run; trial 1 cold-start outlier discarded
-per the standard protocol.)
+(7-trial post-cooldown run; trial 1 cold-start outlier discarded.
+Trials 2–7 totals: 827, 833, 858, 867, 877, 877 ms.)
 
-Slightly improved vs the 0.79 s pre-step-8 baseline — the EcallChip
-96→64 byte shrink per fixed-base call (32 scalar bytes producer
-moves to the boundary chip) more than offsets the boundary chip's
-+320 cells/call growth.  Net: soundness tightens at near-zero perf
-cost.
+**Performance-neutral within ±2 ms of the pre-B5 baseline (0.861 s).**
+B5's row-count halving (`RegisterMemoryChip` 65k→32k) produces no
+prove-time win because:
 
-Architecture (post step 8):
+1. Max log_size still 16 (`MemoryChip` stuck at 16) — FRI's number of
+   folding rounds doesn't drop.  Only this chip's per-chip contribution
+   at log=16 vanishes.
+2. 4 emissions per row (vs 1 pre-B5) cancels the row-count savings in
+   interaction-gen.  Total tuple work is ~equal.
+3. Cell counts roughly flat: 28 × 65k ≈ 55 × 32k ≈ 1.8 M.
 
-- `RistrettoCombScalarBoundaryChip` rebuilt at 32 rows/call (was 64)
-  carrying `(IsReal, CallIdx, LowNibble, HighNibble, ScalarByte,
-  Addr[4], Ts[8])` plus two preprocessed window-index columns
-  `WindowEven=2k`, `WindowOdd=2k+1`.  Per-row constraint
-  `IsReal · (ScalarByte − LowNibble − 16·HighNibble) = 0` ties the
-  byte to its decomposition.  3 emissions per row: 2 −IsReal to the
-  scalar-boundary relation (low + high nibbles, drains anchor's 64
-  +IsReal) + 1 +IsReal `MemoryAccessLookupElements` producer pinning
-  the byte to `(scalar_ptr+i, ts)` in PVM memory.
-- `RistrettoEcallChip::collect_accesses` now skips the 32-byte
-  scalar block when `op.kind == FixedBasepoint`; the boundary chip
-  takes over that producer responsibility.
-- New `harness_ristretto_fixed_base_e2e_with_memory` exercises the
-  full chain (MemoryChip + MemoryBoundaryChip + RistrettoEcallChip
-  + comb chip pair); `harness_ristretto_scalar_memory_mismatch_rejected`
-  is the soundness regression net (verifies a K1≠K2 mismatch is
-  caught at verify with `claimed logup sum is not zero`).
+Trace shape: 25 active chips, `main_cols=6415`, `interaction_cols=4008`,
+log_sizes range 4..16.  Soundness chain end-to-end via R1e-bis output
+binding (compress chain) — see `PERF_ROADMAP.md` for the full chain.
 
-Soundness chain (now closed for the scalar):
-  PVM mem ledger → memory-access relation → scalar-boundary chip's
-  byte producer → nibble decomposition → scalar-boundary relation →
-  anchor's `ScalarWindow` → comb relation → consumer's IsInput coord
-  rows → FieldOp add chain.
+Architecture (post-B5):
 
-**Output binding still open** — the chip's final extended-Edwards
-Acc is not yet tied to the output's compressed Ristretto bytes.
-Compress chain (R1e-bis) is the next-larger deliverable.
-
-Still ~21% slower than the 0.63 s post-PGO boundary-only baseline
-below; the residual cost is the consumer chip's per-row FieldOp
-algebra which RistrettoChip wasn't running before.
+- `RegisterMemoryChip` ledger collapses runs of consecutive same-(reg,
+  value) reads into multi-slot rows.  Cap M=4 (even count fits
+  `finalize_logup_in_pairs`), 4 timestamp slots + 3 SlotReal flags
+  per row.  Mechanism + property tests in `chips/register_memory.rs`.
+- All B6-style byte-flood merging on `MemoryChip` is **infeasible**
+  (only 0.9% of byte entries form mergeable groups in the canonical
+  bench — see `PERF_ROADMAP.md` § "B6 dead as scoped").
 
 ## Earlier — Session 2.1 column-shrink + step 5(b) (comb chip pair active)
 
