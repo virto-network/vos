@@ -1,9 +1,9 @@
-//! Hasher actor — endless compute loop demonstrating yield_now().
-//!
-//! Each invocation: hash once, print progress, yield to let the agent
-//! re-invoke us. The loop body runs once per invocation — `try_poll`
-//! returns `Yielded` on the first `.await`, and the agent re-sends
-//! the same `Start` message to drive the next iteration.
+// Hasher actor — endless compute loop demonstrating yield_now().
+//
+// Each invocation: hash once, print progress, yield to let the agent
+// re-invoke us. The loop body runs once per invocation — `try_poll`
+// returns `Yielded` on the first `.await`, and the agent re-sends
+// the same `Start` message to drive the next iteration.
 
 use vos::prelude::*;
 /// Simple hash: XOR-fold with rotation.

@@ -1,12 +1,12 @@
-//! Scheduler agent — orchestrator that drives guest actors via invoke().
-//!
-//! Runs as a full JAM service (refine+accumulate). Discovers registered actors
-//! from init args (written to storage by the host), and accepts runtime
-//! `install` messages to register new actors dynamically.
-//!
-//! On start, sends a dynamic `start` message to each child. Actors without
-//! a `start` handler silently skip it. Actors that yield get re-invoked in
-//! subsequent tick rounds.
+// Scheduler agent — orchestrator that drives guest actors via invoke().
+//
+// Runs as a full JAM service (refine+accumulate). Discovers registered actors
+// from init args (written to storage by the host), and accepts runtime
+// `install` messages to register new actors dynamically.
+//
+// On start, sends a dynamic `start` message to each child. Actors without
+// a `start` handler silently skip it. Actors that yield get re-invoked in
+// subsequent tick rounds.
 
 use vos::lifecycle::InvokeResult;
 use vos::prelude::*;

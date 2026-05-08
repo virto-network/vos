@@ -1,10 +1,10 @@
-//! Display service — virtual screen with a queryable framebuffer.
-//!
-//! Receives pixel data from animation actors via `render`, stores it
-//! in a framebuffer, and returns the number of ticks elapsed since the
-//! last frame so callers can compute time-based animations.
-//!
-//! The `read` handler returns the current framebuffer contents.
+// Display service — virtual screen with a queryable framebuffer.
+//
+// Receives pixel data from animation actors via `render`, stores it
+// in a framebuffer, and returns the number of ticks elapsed since the
+// last frame so callers can compute time-based animations.
+//
+// The `read` handler returns the current framebuffer contents.
 
 use vos::prelude::*;
 const WIDTH: u32 = 16;

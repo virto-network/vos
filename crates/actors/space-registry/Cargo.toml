@@ -20,7 +20,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "space-registry-actor"
-path = "src/lib.rs"
+path = "src/main.rs"
 required-features = ["bin"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]

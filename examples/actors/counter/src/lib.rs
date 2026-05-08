@@ -1,8 +1,8 @@
-//! Counter actor — increments and prints a count each iteration.
-//!
-//! Demonstrates a stateful refine-only actor with a yield loop.
-//! Each invocation runs one iteration: increment, print, yield.
-//! The agent re-invokes to drive subsequent iterations.
+// Counter actor — increments and prints a count each iteration.
+//
+// Demonstrates a stateful refine-only actor with a yield loop.
+// Each invocation runs one iteration: increment, print, yield.
+// The agent re-invokes to drive subsequent iterations.
 
 use vos::prelude::*;
 

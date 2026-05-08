@@ -23,7 +23,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "pipeline"
-path = "src/lib.rs"
+path = "src/main.rs"
 required-features = ["bin"]
 
 # Target-conditional vos deps — pick the right feature set per build target.

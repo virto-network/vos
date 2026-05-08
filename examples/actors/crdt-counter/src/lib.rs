@@ -1,22 +1,21 @@
-//! CRDT counter — a minimal actor whose state replicates across
-//! nodes via the merkle-CRDT machinery.
-//!
-//! Two messages:
-//!   - `inc()` increments the count by one. Two replicas calling
-//!     this concurrently produce distinct DAG nodes (and so the
-//!     merge surfaces both events) because the runtime stamps
-//!     each event with `(origin, seq)` — see
-//!     [`vos::effect_log::CrdtEvent`]. Handlers don't see those
-//!     fields; they're metadata for CID stability.
-//!   - `get() -> u64` reports the current count (read-only →
-//!     no DAG node, see `crdt_commit_skips_unchanged_plain_commits`).
-//!
-//! Replication shape: each `inc()` is recorded as an EffectLog
-//! tagged with the producing replica's origin+seq. Replicas that
-//! see the same set of logs converge to the same count regardless
-//! of order, since the underlying op is commutative.
+// CRDT counter — a minimal actor whose state replicates across
+// nodes via the merkle-CRDT machinery.
+//
+// Two messages:
+//   - `inc()` increments the count by one. Two replicas calling
+//     this concurrently produce distinct DAG nodes (and so the
+//     merge surfaces both events) because the runtime stamps
+//     each event with `(origin, seq)` — see
+//     [`vos::effect_log::CrdtEvent`]. Handlers don't see those
+//     fields; they're metadata for CID stability.
+//   - `get() -> u64` reports the current count (read-only →
+//     no DAG node, see `crdt_commit_skips_unchanged_plain_commits`).
+//
+// Replication shape: each `inc()` is recorded as an EffectLog
+// tagged with the producing replica's origin+seq. Replicas that
+// see the same set of logs converge to the same count regardless
+// of order, since the underlying op is commutative.
 
-#![cfg_attr(any(target_arch = "riscv64", target_arch = "wasm32"), no_std)]
 use vos::prelude::*;
 #[actor]
 pub struct CrdtCounter {

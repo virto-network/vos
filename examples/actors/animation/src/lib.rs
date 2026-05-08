@@ -1,14 +1,14 @@
-//! Animation actor — drives a spinner on a virtual display.
-//!
-//! Each iteration:
-//! 1. Compute the current spinner frame from elapsed ticks
-//! 2. Render pixels into a 16x8 framebuffer
-//! 3. Ask the Display service to render, receiving delta ticks back
-//! 4. Accumulate elapsed time and advance the animation phase
-//! 5. Yield and loop
-//!
-//! Demonstrates cross-actor rendering: the animation logic lives here,
-//! the framebuffer/timing lives in the Display service.
+// Animation actor — drives a spinner on a virtual display.
+//
+// Each iteration:
+// 1. Compute the current spinner frame from elapsed ticks
+// 2. Render pixels into a 16x8 framebuffer
+// 3. Ask the Display service to render, receiving delta ticks back
+// 4. Accumulate elapsed time and advance the animation phase
+// 5. Yield and loop
+//
+// Demonstrates cross-actor rendering: the animation logic lives here,
+// the framebuffer/timing lives in the Display service.
 
 use vos::prelude::*;
 const DISPLAY_ID: u32 = 6;

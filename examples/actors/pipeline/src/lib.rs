@@ -1,16 +1,16 @@
-//! Pipeline actor — multi-step cross-actor computation loop.
-//!
-//! Each iteration:
-//! 1. Compute local values
-//! 2. Ask Math to add (suspends, resumes with Value)
-//! 3. Use the result, compute more
-//! 4. Ask Math to multiply (suspends again)
-//! 5. Accumulate the result
-//! 6. If threshold crossed → return the accumulated value
-//! 7. Otherwise → yield and loop
-//!
-//! Demonstrates `ctx.ask().await` returning `Value`, handler return
-//! types as replies, and a loop that terminates with a result.
+// Pipeline actor — multi-step cross-actor computation loop.
+//
+// Each iteration:
+// 1. Compute local values
+// 2. Ask Math to add (suspends, resumes with Value)
+// 3. Use the result, compute more
+// 4. Ask Math to multiply (suspends again)
+// 5. Accumulate the result
+// 6. If threshold crossed → return the accumulated value
+// 7. Otherwise → yield and loop
+//
+// Demonstrates `ctx.ask().await` returning `Value`, handler return
+// types as replies, and a loop that terminates with a result.
 
 use vos::prelude::*;
 const MATH_ID: u32 = 8;

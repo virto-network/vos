@@ -1,7 +1,7 @@
-//! FizzBuzz actor — prints the fizzbuzz sequence, one per iteration.
-//!
-//! Demonstrates a stateful refine-only actor with conditional logic
-//! and a yield loop. Each invocation prints the next fizzbuzz value.
+// FizzBuzz actor — prints the fizzbuzz sequence, one per iteration.
+//
+// Demonstrates a stateful refine-only actor with conditional logic
+// and a yield loop. Each invocation prints the next fizzbuzz value.
 
 use vos::prelude::*;
 #[actor]

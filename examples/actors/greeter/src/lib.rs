@@ -1,7 +1,7 @@
-//! Greeter actor — one-shot actor that prints a greeting and exits.
-//!
-//! Demonstrates the simplest refine-only actor: a single `start()` handler
-//! that executes once and completes.
+// Greeter actor — one-shot actor that prints a greeting and exits.
+//
+// Demonstrates the simplest refine-only actor: a single `start()` handler
+// that executes once and completes.
 
 use vos::prelude::*;
 #[actor]
