@@ -14,14 +14,15 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
+use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS};
 use crate::runtime;
 use crate::routing::handle_admin;
 use crate::state::Inner;
@@ -34,7 +35,7 @@ type HyperResponse = hyper::Response<Full<Bytes>>;
 /// Synchronously blocks until the listener is bound.
 pub(crate) fn spawn(
     port: u16,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> IoResult<()> {
     runtime::spawn_on_thread(format!("http-gateway-rt:{port}"), move |ready_tx| async move {
@@ -52,13 +53,17 @@ pub(crate) fn spawn(
 
 async fn accept_loop(
     listener: TcpListener,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) {
     // One builder shared across connections; sniffs the protocol
     // preface and dispatches to h1 or h2c.
     let conn_builder =
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    // Per-protocol connection cap. Connections beyond this are
+    // dropped; clients see an immediate close rather than queuing
+    // FDs in the kernel.
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
 
     while !inner.stop.load(Ordering::Relaxed) {
         let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
@@ -71,10 +76,19 @@ async fn accept_loop(
             }
             Err(_) => continue, // timeout — re-check stop
         };
+        let permit = match conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                log::warn!("http-gateway: conn limit ({MAX_CONCURRENT_CONNS}) hit; dropping {peer}");
+                drop(stream);
+                continue;
+            }
+        };
         let job_tx = job_tx.clone();
         let inner = inner.clone();
         let conn_builder = conn_builder.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this task ends
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: hyper::Request<Incoming>| {
                 let job_tx = job_tx.clone();
@@ -90,16 +104,23 @@ async fn accept_loop(
 
 async fn serve_request(
     req: hyper::Request<Incoming>,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> HyperResponse {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    let body = match req.into_body().collect().await {
+    // `Limited` aborts the body stream once `MAX_BODY_BYTES` is
+    // exceeded, so an attacker can't OOM us with a huge payload.
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
         Ok(c) => c.to_bytes().to_vec(),
-        Err(e) => return into_hyper(Response::text(400, format!("read body: {e}"))),
+        Err(_) => {
+            return into_hyper(Response::text(
+                413,
+                format!("body exceeds {MAX_BODY_BYTES} bytes"),
+            ));
+        }
     };
 
     let our_req = Request { method, path, query, body };
@@ -109,8 +130,14 @@ async fn serve_request(
     }
 
     let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-    if job_tx.send(Job { request: our_req, resp_tx }).is_err() {
-        return into_hyper(Response::text(503, "gateway stopped"));
+    match job_tx.try_send(Job { request: our_req, resp_tx }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            return into_hyper(Response::text(503, "gateway saturated; retry"));
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            return into_hyper(Response::text(503, "gateway stopped"));
+        }
     }
 
     let response = resp_rx

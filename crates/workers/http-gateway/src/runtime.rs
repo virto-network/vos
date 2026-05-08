@@ -18,6 +18,7 @@ use std::thread;
 use vos::log;
 
 use crate::HttpGateway;
+use crate::limits::JOB_QUEUE_CAP;
 use crate::routing::drain_jobs;
 use crate::state::{Inner, inner, now_unix};
 use crate::types::{IoResult, Job};
@@ -67,7 +68,7 @@ pub(crate) async fn serve_with<F>(
     ctx: &mut vos::Context<HttpGateway>,
 ) -> String
 where
-    F: FnOnce(u16, mpsc::Sender<Job>, Arc<Inner>) -> IoResult<()>,
+    F: FnOnce(u16, mpsc::SyncSender<Job>, Arc<Inner>) -> IoResult<()>,
 {
     let inner = inner().clone();
 
@@ -77,7 +78,7 @@ where
     }
     inner.stop.store(false, Ordering::Relaxed);
 
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(JOB_QUEUE_CAP);
     if let Err(e) = spawn_protocol(port, job_tx, inner.clone()) {
         log::error!("http-gateway: {e}");
         return e;

@@ -17,10 +17,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
 use crate::HttpGateway;
+use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS};
 use crate::routing::handle_admin;
 use crate::runtime::{self, serve_with};
 use crate::state::Inner;
@@ -34,7 +35,11 @@ pub(crate) async fn serve_h3_impl(
     serve_with(port, "udp/h3", spawn, ctx).await
 }
 
-fn spawn(port: u16, job_tx: mpsc::Sender<Job>, inner: Arc<Inner>) -> IoResult<()> {
+fn spawn(
+    port: u16,
+    job_tx: mpsc::SyncSender<Job>,
+    inner: Arc<Inner>,
+) -> IoResult<()> {
     runtime::spawn_on_thread(format!("http-gateway-h3:{port}"), move |ready_tx| async move {
         let addr: SocketAddr = match format!("0.0.0.0:{port}").parse() {
             Ok(a) => a,
@@ -86,9 +91,11 @@ fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
 
 async fn accept_loop(
     endpoint: quinn::Endpoint,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) {
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
+
     while !inner.stop.load(Ordering::Relaxed) {
         let accept = tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await;
         let incoming = match accept {
@@ -96,9 +103,18 @@ async fn accept_loop(
             Ok(None) => break, // endpoint closed
             Err(_) => continue, // timeout — re-check stop
         };
+        let permit = match conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                log::warn!("http-gateway: h3 conn limit ({MAX_CONCURRENT_CONNS}) hit; refusing");
+                incoming.refuse();
+                continue;
+            }
+        };
         let job_tx = job_tx.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match incoming.await {
                 Ok(conn) => handle_connection(conn, job_tx, inner).await,
                 Err(e) => log::debug!("http-gateway: h3 handshake: {e}"),
@@ -110,7 +126,7 @@ async fn accept_loop(
 
 async fn handle_connection(
     quinn_conn: quinn::Connection,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) {
     let mut h3_conn =
@@ -145,33 +161,53 @@ async fn handle_connection(
 
 async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (req, mut stream) = resolver.resolve_request().await?;
 
+    // Drain the body chunk-by-chunk, refusing once the running total
+    // crosses the cap. Mirrors the hyper-side `Limited` posture.
     let mut body = Vec::new();
+    let mut over_limit = false;
     while let Some(mut chunk) = stream.recv_data().await? {
+        if over_limit {
+            continue; // drain remaining chunks so the peer's flow-control unblocks
+        }
+        if body.len().saturating_add(chunk.remaining()) > MAX_BODY_BYTES {
+            over_limit = true;
+            continue;
+        }
         let mut buf = vec![0u8; chunk.remaining()];
         chunk.copy_to_slice(&mut buf);
         body.extend_from_slice(&buf);
     }
 
-    let our_req = Request {
-        method: req.method().as_str().to_string(),
-        path: req.uri().path().to_string(),
-        query: req.uri().query().unwrap_or("").to_string(),
-        body,
-    };
-
-    let response = if let Some(r) = handle_admin(&our_req, &inner) {
-        r
+    let response = if over_limit {
+        Response::text(413, format!("body exceeds {MAX_BODY_BYTES} bytes"))
     } else {
-        let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-        if job_tx.send(Job { request: our_req, resp_tx }).is_err() {
-            Response::text(503, "gateway stopped")
+        let our_req = Request {
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+            query: req.uri().query().unwrap_or("").to_string(),
+            body,
+        };
+
+        if let Some(r) = handle_admin(&our_req, &inner) {
+            r
         } else {
-            resp_rx.await.unwrap_or_else(|_| Response::text(500, "no response from actor"))
+            let (resp_tx, resp_rx) = oneshot::channel::<Response>();
+            match job_tx.try_send(Job { request: our_req, resp_tx }) {
+                Ok(()) => resp_rx
+                    .await
+                    .unwrap_or_else(|_| Response::text(500, "no response from actor")),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    Response::text(503, "gateway saturated; retry")
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    Response::text(503, "gateway stopped")
+                }
+            }
         }
     };
 
