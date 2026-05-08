@@ -20,8 +20,11 @@ use std::path::PathBuf;
 mod blob_store;
 mod bundled;
 mod commands;
+mod output;
 mod paths;
 mod spaces_index;
+
+use output::Format;
 
 #[derive(Parser)]
 #[command(name = "vosx", about = "JAM-aligned PVM executor + space orchestrator")]
@@ -33,6 +36,12 @@ struct Cli {
     /// `vosx run <file>`. Anything space-related needs an
     /// explicit `vosx space *` subcommand.
     file: Option<PathBuf>,
+
+    /// Output format. `text` (default) is human-readable;
+    /// `json` emits a single JSON value per command for scripts
+    /// and LLM consumption. Inherited by all subcommands.
+    #[arg(long, value_enum, default_value_t = Format::Text, global = true)]
+    format: Format,
 }
 
 #[derive(Subcommand)]
@@ -74,6 +83,7 @@ fn init_tracing() {
 fn main() {
     init_tracing();
     let cli = Cli::parse();
+    output::set(cli.format);
 
     match cli.command {
         Some(Command::Run { program, payload, hex, gas }) => {

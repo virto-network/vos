@@ -6,25 +6,93 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::endpoint;
-use crate::commands::space::subscriptions;
-use crate::spaces_index;
+use crate::commands::space::endpoint::{self, Endpoint};
+use crate::commands::space::subscriptions::{self, LocalConfig};
+use crate::output;
+use crate::spaces_index::{self, SpaceEntry};
+
+#[derive(Serialize)]
+struct InfoView<'a> {
+    name: &'a str,
+    space_id: &'a str,
+    created_at: &'a str,
+    data_dir: &'a str,
+    listen: &'a [String],
+    bootnodes: &'a [String],
+    subscriptions: &'a [String],
+    daemon: DaemonState,
+    agents_on_disk: usize,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+enum DaemonState {
+    Down,
+    Stale {
+        pid: u32,
+    },
+    Running {
+        pid: u32,
+        peer_id: String,
+        multiaddrs: Vec<String>,
+        rtt: Option<RttView>,
+        rtt_error: Option<String>,
+    },
+}
+
+#[derive(Serialize)]
+struct RttView {
+    connect_us: u128,
+    invoke_us: u128,
+}
 
 pub fn run(query: &str) -> anyhow::Result<()> {
     let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, query)?;
+    let data_dir = PathBuf::from(&entry.data_dir);
+    let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
 
+    if output::is_json() {
+        let agents_on_disk = std::fs::read_dir(data_dir.join("agents"))
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0);
+        let daemon = match endpoint::read(&data_dir)? {
+            Some(ep) if endpoint::is_alive(&ep) => running_state(query, ep),
+            Some(ep) => DaemonState::Stale { pid: ep.pid },
+            None => DaemonState::Down,
+        };
+        let view = InfoView {
+            name: &entry.name,
+            space_id: &entry.id,
+            created_at: &entry.created_at,
+            data_dir: &entry.data_dir,
+            listen: &local_cfg.listen,
+            bootnodes: &entry.bootnodes,
+            subscriptions: &local_cfg.subscriptions,
+            daemon,
+            agents_on_disk,
+        };
+        output::print_json(&view);
+        return Ok(());
+    }
+
+    print_text(entry, &data_dir, &local_cfg, query)
+}
+
+fn print_text(
+    entry: &SpaceEntry,
+    data_dir: &std::path::Path,
+    local_cfg: &LocalConfig,
+    query: &str,
+) -> anyhow::Result<()> {
     println!("name        {}", entry.name);
     println!("space_id    {}", entry.id);
     println!("created_at  {}", entry.created_at);
     println!("data_dir    {}", entry.data_dir);
 
-    let data_dir = PathBuf::from(&entry.data_dir);
-
-    // Persisted listen prefs from local.toml (per-space user
-    // setting; --listen on `space up` overrides per-run).
-    let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
     if local_cfg.listen.is_empty() {
         println!("listen      (none — `space up --listen <addr>` per run, or set");
         println!("            `listen = [...]` in local.toml for a persistent default)");
@@ -54,7 +122,7 @@ pub fn run(query: &str) -> anyhow::Result<()> {
     // Live endpoint info — only present while `space up` is
     // running, written to .endpoint on swarm bind, removed on
     // graceful shutdown.
-    match endpoint::read(&data_dir)? {
+    match endpoint::read(data_dir)? {
         Some(ep) if endpoint::is_alive(&ep) => {
             println!();
             println!("daemon      RUNNING (pid {})", ep.pid);
@@ -89,6 +157,35 @@ pub fn run(query: &str) -> anyhow::Result<()> {
     println!("agents      {count} on disk (in {})", agents_dir.display());
 
     Ok(())
+}
+
+/// Connect to the daemon, time a registry round-trip, and pack
+/// the outcome into the JSON `Running` variant. Errors are
+/// surfaced via `rtt_error` rather than failing the whole call,
+/// matching the text path's best-effort behavior.
+fn running_state(query: &str, ep: Endpoint) -> DaemonState {
+    let connect_started = Instant::now();
+    let (rtt, rtt_error) = match DaemonClient::connect(query) {
+        Ok(client) => {
+            let connect_us = connect_started.elapsed().as_micros();
+            let invoke_started = Instant::now();
+            let outcome = client.programs();
+            let invoke_us = invoke_started.elapsed().as_micros();
+            let _ = client.shutdown();
+            match outcome {
+                Ok(_) => (Some(RttView { connect_us, invoke_us }), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+        Err(e) => (None, Some(e.to_string())),
+    };
+    DaemonState::Running {
+        pid: ep.pid,
+        peer_id: ep.peer_id,
+        multiaddrs: ep.multiaddrs,
+        rtt,
+        rtt_error,
+    }
 }
 
 /// Connect to the daemon and time a single registry round-trip.

@@ -20,6 +20,7 @@
 use vos::value::{Msg, Value};
 
 use crate::commands::space::client::DaemonClient;
+use crate::output;
 
 pub struct Args {
     pub space: String,
@@ -32,10 +33,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     DaemonClient::with_connect(&args.space, |client| {
         let target_id = client.resolve_target(&args.target)?;
         let msg = build_msg(&args.method, &args.args)?;
-        eprintln!("vosx: invoking {} on {target_id}", args.method);
-        match client.invoke_dyn(target_id, &msg)? {
-            Value::Unit => println!("()"),
-            other => println!("{other:?}"),
+        if !output::is_json() {
+            eprintln!("vosx: invoking {} on {target_id}", args.method);
+        }
+        let reply = client.invoke_dyn(target_id, &msg)?;
+        if output::is_json() {
+            output::print_json(&output::value_to_json(&reply));
+        } else {
+            match reply {
+                Value::Unit => println!("()"),
+                other => println!("{other:?}"),
+            }
         }
         Ok(())
     })

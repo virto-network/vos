@@ -14,7 +14,29 @@ use space_registry::{
     STATUS_OK,
 };
 
+use serde::Serialize;
+
 use crate::commands::space::client::DaemonClient;
+use crate::output;
+
+#[derive(Serialize)]
+struct NodeView {
+    prefix: u16,
+    peer_id_hex: String,
+    role: &'static str,
+}
+
+#[derive(Serialize)]
+struct IdentityView {
+    public_key_hex: String,
+    proof_kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct MembersView {
+    nodes: Vec<NodeView>,
+    identities: Vec<IdentityView>,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum MembersCommand {
@@ -93,17 +115,34 @@ fn list(space: &str) -> anyhow::Result<()> {
             .filter(|m| m.kind == MEMBER_KIND_IDENTITY)
             .collect();
 
+        if output::is_json() {
+            let view = MembersView {
+                nodes: nodes
+                    .iter()
+                    .map(|n| NodeView {
+                        prefix: n.prefix,
+                        peer_id_hex: hex::encode(&n.key),
+                        role: role_name(n.role),
+                    })
+                    .collect(),
+                identities: identities
+                    .iter()
+                    .map(|i| IdentityView {
+                        public_key_hex: hex::encode(&i.key),
+                        proof_kind: proof_kind_name(i.proof_kind),
+                    })
+                    .collect(),
+            };
+            output::print_json(&view);
+            return Ok(());
+        }
+
         if !nodes.is_empty() {
             println!("# nodes");
             println!("{:<8}  {:<10}  PEER_ID", "PREFIX", "ROLE");
             for n in &nodes {
-                let role = match n.role {
-                    NODE_ROLE_VOTER => "voter",
-                    NODE_ROLE_OBSERVER => "observer",
-                    _ => "?",
-                };
                 let short_pid: String = hex::encode(&n.key).chars().take(20).collect();
-                println!("{:<8}  {:<10}  {short_pid}…", n.prefix, role);
+                println!("{:<8}  {:<10}  {short_pid}…", n.prefix, role_name(n.role));
             }
         }
         if !identities.is_empty() {
@@ -113,13 +152,8 @@ fn list(space: &str) -> anyhow::Result<()> {
             println!("# identities");
             println!("{:<10}  PUBLIC_KEY", "PROOF");
             for i in &identities {
-                let proof = match i.proof_kind {
-                    PROOF_KIND_MERKLE_INCLUSION => "merkle",
-                    PROOF_KIND_ZK => "zk",
-                    _ => "?",
-                };
                 let short_pk: String = hex::encode(&i.key).chars().take(20).collect();
-                println!("{:<10}  {short_pk}…", proof);
+                println!("{:<10}  {short_pk}…", proof_kind_name(i.proof_kind));
             }
         }
         if nodes.is_empty() && identities.is_empty() {
@@ -127,6 +161,22 @@ fn list(space: &str) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+fn role_name(r: u8) -> &'static str {
+    match r {
+        NODE_ROLE_VOTER => "voter",
+        NODE_ROLE_OBSERVER => "observer",
+        _ => "?",
+    }
+}
+
+fn proof_kind_name(k: u8) -> &'static str {
+    match k {
+        PROOF_KIND_MERKLE_INCLUSION => "merkle",
+        PROOF_KIND_ZK => "zk",
+        _ => "?",
+    }
 }
 
 fn add_node(
