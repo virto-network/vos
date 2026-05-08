@@ -241,6 +241,119 @@ integration remains.
   the next unlock).
 * **Activity gating — DONE (`daaff55`)**: `ChipActivity.ristretto_comb` (true iff `!ristretto_comb_calls.is_empty()`) gates `RistrettoCombTableChip` (idx 21) + `RistrettoFixedBaseConsumerChip` (idx 22) in `BASE_COMPONENTS`.
 
+### R1e-bis output binding (compress chain) — design sketch
+
+The remaining Step 8 piece.  The consumer chip's final extended-Edwards
+accumulator `Acc = (X, Y, Z, T)` (32 bytes per coord, sitting in the
+last 4 add rows of the chain for the 64th window) needs to be tied to
+the 32-byte compressed Ristretto encoding the actor stored at
+`output_ptr`.  Today that storage is a free witness on the prover —
+nothing forces it to equal `compress(Acc)`.
+
+**Compress per dalek's reference** (curve25519-dalek source,
+`ristretto.rs::compress`):
+
+```
+u1 = (Z + Y) · (Z - Y)               // mod p25519
+u2 = X · Y
+inv_sqrt = (u1 · u2²)^((p-3)/4)·...  // ±1/√(u1·u2²); witness + verify
+i1 = inv_sqrt · u1
+i2 = inv_sqrt · u2
+z_inv = i1 · (i2 · T)
+rotate = (T · z_inv).is_negative()
+  (X, Y, den_inv) := if rotate then (Y·SQRT_M1, X·SQRT_M1,
+                                     i1·INVSQRT_A_MINUS_D)
+                     else        (X, Y, i2)
+Y_neg = Y · sign((X · z_inv).is_negative())
+s = den_inv · (Z - Y_neg)
+s_can = s · sign(s.is_negative())
+output = s_can.as_bytes()
+```
+
+**Row budget** (~22-25 rows per call, all reusing the existing
+field_op_constraints helper):
+
+| # | Row class                | Source bytes                  | Out                    |
+|---|---                       |---                            |---                     |
+|  1 | `is_add`  (Z+Y)         | Z, Y from anchor consumer      | Z+Y mod p              |
+|  2 | `is_sub`  (Z-Y)         | Z, Y from anchor consumer      | Z-Y mod p              |
+|  3 | `is_mul`  u1            | rows 1, 2                      | u1                     |
+|  4 | `is_mul`  u2            | X, Y from anchor consumer      | u2                     |
+|  5 | `is_mul`  u2sq          | row 4, row 4                   | u2²                    |
+|  6 | `is_mul`  u1·u2sq       | rows 3, 5                      | tmp                    |
+|  7 | `is_mul`  inv_sqrt²     | inv_sqrt witness × itself      | should be ±tmp⁻¹       |
+|  8 | `is_mul`  inv_sqrt²·tmp | row 7, row 6                   | should be ±1           |
+|  9 | `is_mul`  i1            | inv_sqrt witness, row 3        | i1                     |
+| 10 | `is_mul`  i2            | inv_sqrt witness, row 4        | i2                     |
+| 11 | `is_mul`  i2·T          | row 10, T from anchor          | i2T                    |
+| 12 | `is_mul`  z_inv         | row 9, row 11                  | z_inv                  |
+| 13 | `is_mul`  T·z_inv       | T, row 12                      | for sign check         |
+| 14 | sign-check               | row 13's `out` low byte         | rotate flag (witness)  |
+| 15 | `is_mul`  iX            | X, SQRT_M1 const               | iX                     |
+| 16 | `is_mul`  iY            | Y, SQRT_M1 const               | iY                     |
+| 17 | `is_mul`  enchanted     | row 9, INVSQRT_A_MINUS_D const | enchanted_denom        |
+| 18 | conditional select       | rows 16/X, 15/Y, row 10/17     | 3 selects (witness)    |
+| 19 | `is_mul`  X·z_inv       | row 18 X, row 12               | for sign check         |
+| 20 | sign-check               | row 19                          | y_negate flag (witness)|
+| 21 | conditional negate Y     | row 18 Y                        | Y_neg (witness)        |
+| 22 | `is_sub`  Z - Y_neg     | Z, Y_neg                        | Z-Y_neg                |
+| 23 | `is_mul`  s             | row 18 den_inv, row 22         | s                      |
+| 24 | sign-check               | row 23 byte 0 LSB               | s_neg flag             |
+| 25 | conditional negate s     | row 23                          | output bytes (witness) |
+
+**Inter-chip bindings**:
+
+- **Consumer chip → compress chain (`X/Y/Z/T` of final Acc)**: the
+  consumer chip's last 4 IsInput coord rows (corresponding to window
+  63's anchor) hold X/Y/Z/T.  Compress chain rows 1-4 reference those
+  via the chip-local register-file relation
+  (`RistrettoCombConsumerRegisterFileLookupElements`) — same source-row
+  threading mechanism the existing add chain uses for `q.{x,y,z,t}`.
+  Add a sibling relation if it's cleaner to bound separately; reuse
+  the existing one if the chip-local row IDs don't collide.
+- **Compress chain → output bytes (PVM memory)**: row 25's `out` (32
+  bytes of canonical s) is emitted as +IsReal `MemoryAccessLookupElements`
+  producers at `(output_ptr+i, byte, ts, is_write=1)` for i=0..32.
+  Mirrors the scalar-byte producer pattern from
+  `RistrettoCombScalarBoundaryChip` (commit `82f893d`).
+  `RistrettoEcallChip::collect_accesses` skips the 32-byte output
+  block when `op.kind == FixedBasepoint` — same shape as the scalar
+  skip already in place.
+
+**inv_sqrt witness**: the prover provides `inv_sqrt` as a 32-byte
+witness column on row 7's `a` and `b` (squaring to row 7's `out`).
+Row 8 verifies `inv_sqrt² · (u1·u2²) = ±1`.  The ±1 ambiguity is
+resolved by another witness bit + per-byte canonical encoding check
+(every byte-0 bit-0 of result equals the sign witness; bytes 1..32
+all zero).  ~3 extra constraint rows.
+
+**Sign checks (rows 14, 20, 24)**: a Ristretto element `s` is
+canonical-positive iff `s.bytes[0] & 1 == 0` (after reducing mod p).
+The chip witnesses `s.bytes[0]`'s LSB via byte-to-bits decomposition
+(reuse `ByteToBitsLookupElements`).  ~1 extra emission per sign check.
+
+**Activity gating**: same `ChipActivity.ristretto_comb` flag that
+gates the existing comb chip pair; the compress rows live inside the
+existing `RistrettoFixedBaseConsumerChip` (extending its row layout
+from `~1411` to `~1436` per call) OR in a new sibling
+`RistrettoCombCompressChip` (cleaner but duplicates field-op
+infrastructure).  Path A (extend consumer chip) is the smaller diff;
+Path B (sibling chip) is the cleaner separation.
+
+**Bench projection**: ~25 extra FieldOp rows per call × 5 calls ×
+~50 cells/row ≈ 6 K extra cells.  Negligible (current consumer chip
+is ~7 M cells at log_size=13).  Bench should stay within noise of
+post-step-8 ~0.79 s MOBILE.
+
+**Effort estimate**: 3-5 days including audit + bench.  Multi-commit;
+natural batches:
+1. Add inv_sqrt + output_bytes witness columns to side_note +
+   consumer chip column layout.
+2. Implement compress chain rows 1-12 (the algebra prologue).
+3. Implement sign-checks + conditional rows.
+4. Wire up output-byte memory producer + RistrettoEcallChip skip.
+5. Add chip-isolated harness + bench validation.
+
 ### Step 5 design tree
 
 The consumer side has to (a) emit one `+1` contribution to
