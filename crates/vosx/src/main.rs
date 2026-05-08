@@ -26,6 +26,21 @@ mod paths;
 mod spaces_index;
 
 use output::Format;
+use spaces_index::IndexError;
+
+/// Exit codes. Anything not listed here is `0` (success).
+///
+/// - `1` — runtime error (I/O, network, daemon hung, registry
+///   returned an error status). The default; agents can retry.
+/// - `2` — usage error. Clap exits 2 on parse failures, and we
+///   reuse the same code when the binary is invoked with no
+///   command.
+/// - `3` — not found. The space, agent, or program named in
+///   the command doesn't exist locally / on the daemon. Agents
+///   can treat this as "fix your input" rather than "retry".
+const EXIT_RUNTIME_ERROR: i32 = 1;
+const EXIT_USAGE_ERROR: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 3;
 
 #[derive(Parser)]
 #[command(name = "vosx", about = "JAM-aligned PVM executor + space orchestrator")]
@@ -98,8 +113,7 @@ fn main() {
         }
         Some(Command::Space { command }) => {
             if let Err(e) = commands::space::run(command) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+                report_error(e);
             }
         }
         Some(Command::HelpSchema) => {
@@ -108,7 +122,7 @@ fn main() {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
                     eprintln!("error: {e}");
-                    std::process::exit(1);
+                    std::process::exit(EXIT_RUNTIME_ERROR);
                 }
             }
         }
@@ -119,8 +133,38 @@ fn main() {
                     "vosx: no command. Try `vosx space new --name foo`, \
                      `vosx run path/to.elf`, or `vosx --help`."
                 );
-                std::process::exit(2);
+                std::process::exit(EXIT_USAGE_ERROR);
             }
         },
     }
+}
+
+/// Print an error and exit with the appropriate code. In JSON
+/// mode the error envelope goes to stderr too — tools parsing
+/// stdout get nothing on the failure path, and structured
+/// failure detail is one line away on fd 2.
+fn report_error(e: anyhow::Error) -> ! {
+    let code = exit_code_for(&e);
+    if output::is_json() {
+        let envelope = serde_json::json!({
+            "error": e.to_string(),
+            "code": code,
+        });
+        eprintln!("{envelope}");
+    } else {
+        eprintln!("error: {e}");
+    }
+    std::process::exit(code)
+}
+
+/// Inspect the error chain to pick a code. `IndexError::NotFound`
+/// is the only "not found" we can detect typed today (returned
+/// by `spaces_index::find` when a space name/id doesn't match);
+/// registry-status not-founds still surface as plain anyhow
+/// strings and map to runtime-error.
+fn exit_code_for(e: &anyhow::Error) -> i32 {
+    if let Some(IndexError::NotFound(_)) = e.downcast_ref::<IndexError>() {
+        return EXIT_NOT_FOUND;
+    }
+    EXIT_RUNTIME_ERROR
 }
