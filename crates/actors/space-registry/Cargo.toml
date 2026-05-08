@@ -16,14 +16,6 @@ bin = []
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-[[bin]]
-name = "space-registry-actor"
-# Bin name differs from the package name, so cargo's default
-# `src/bin/space-registry-actor.rs` discovery doesn't apply —
-# point at our `src/main.rs` shim explicitly.
-path = "src/main.rs"
-required-features = ["bin"]
-
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
 

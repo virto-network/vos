@@ -25,7 +25,7 @@ fn main() {
         .join("target")
         .join("riscv64em-javm")
         .join("release")
-        .join("space-registry-actor.elf");
+        .join("space_registry.elf");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let dest = out_dir.join("bundled_registry.elf");

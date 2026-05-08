@@ -16,12 +16,6 @@ bin = []
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-[[bin]]
-name = "animation"
-required-features = ["bin"]
-
-# Target-conditional vos deps — pick the right feature set per build target.
-
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
 

@@ -22,7 +22,7 @@ version = "0.1.0"
 
 [[agent]]
 name = "counter"
-path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf"
 consistency = "crdt"
 on_start = [
   { msg = "inc" },
