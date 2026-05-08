@@ -364,25 +364,43 @@ natural batches:
    chip-local register-file relation
    `RistrettoCombCompressRegFileLookupElements` for source-row
    threading — distinct from the consumer chip's relation so
-   chip-local row IDs don't collide.  Two chip-isolated harnesses
-   GREEN (`harness_ristretto_compress_algebra_only` exercises a
-   real FixedBasepoint call; `harness_ristretto_compress_isolated_empty`
-   is the structural smoke test).  `chip_isolated` 13/13 +
-   `phase2_alu` 94/94 stay green.
-3. Sign-checks + conditional select/negate rows (rows 13/14, 18,
-   19/20, 21, 23/24, 25).  Each needs a new row class beyond the
-   FieldOp partition; lands as additional IsSignCheck / IsSelect /
-   IsNegate flag columns + extra constraints in
-   `RistrettoCombCompressChip::add_constraints`.  Sign-check
-   semantics: Ristretto element `s` is "negative" iff
-   `s.bytes[0] & 1 == 1`; emit a `ByteToBitsLookupElements`
-   consumer on byte 0 to bind the sign witness.  Conditional
-   select `out = flag·a + (1-flag)·b`: 3 mul/add subrows OR a
-   single new row class with a 32-byte equality constraint
-   `flag·(a - b) + b - out = 0` (degree-2 with helpers).
-   Conditional negate similarly.  Includes the
-   `inv_sqrt²·tmp = 1` unity check on row +12 (constrain
-   `out[0] = 1, out[1..32] = 0`).
+   chip-local row IDs don't collide.  Plus 3-call coverage harness
+   (commit e6e7c49).  `chip_isolated` 14/14 + `phase2_alu` 94/94
+   stay green.
+3. Sign-checks + conditional select/negate rows.  Sub-batches:
+   - **3a — DONE (commit ad23764)**: `inv_sqrt² · tmp = 1` unity
+     check on row +12.  New preprocessed `IsUnityCheck` column;
+     constraints `IsUnityCheck · (out[0] - 1) = 0` and
+     `IsUnityCheck · out[k] = 0` for k=1..31.  Padding rows have
+     IsUnityCheck = 0 so the constraint is trivially satisfied
+     there — no IsReal gating helper needed.
+   - **3b** (next): chip-wide boundary inputs for `SQRT_M1` and
+     `INVSQRT_A_MINUS_D` (currently held by `chips::ristretto::compress`
+     module via OnceLock); add 2 IsInput rows at the chip's start
+     (row 0 = SQRT_M1, row 1 = INVSQRT_A_MINUS_D), shift per-call
+     row offsets by N_BOUNDARY_INPUTS = 2.  Algebra rows: T·z_inv
+     (sign source #1), iX = X·SQRT_M1, iY = Y·SQRT_M1, enchanted =
+     i1·INVSQRT_A_MINUS_D — 4 mul rows.
+   - **3c**: sign-check infrastructure.  Each sign check is a row
+     with `IsSignCheck = 1` whose `out` carries the boolean
+     witness (out[0] ∈ {0, 1}, out[1..32] = 0).  Constraint:
+     `IsSignCheck · out[0] · (1 - out[0]) = 0` (boolean) AND
+     `IsSignCheck · out[k] = 0` (k=1..31).  Plus a
+     `ByteToBitsLookupElements` consumer on the source row's
+     `out[0]` binding the LSB to `out[0]` here.  Three sign
+     checks: rotate (T·z_inv), y_negate (X'·z_inv), s_neg (s).
+   - **3d**: conditional select rows (X', Y', den_inv) — 3 selects.
+     Each can decompose to 3 algebra rows (flag·a, (1-flag)·b,
+     sum) using existing IsMul + IsAdd, OR add a new IsSelect row
+     class with a single byte-wise equality `flag·(a-b) + b - out
+     = 0` (no carry chain needed since a, b < p, flag ∈ {0,1}).
+     Decomposed = 9 extra rows total; new row class = 3.  Pick
+     decomposed for now (smaller diff) unless the row count
+     becomes a perf concern.
+   - **3e**: conditional negate rows (Y_neg, s_can) — 2 negates.
+     Each: 1 IsSub `0 - a → neg_a` + 1 select `(a, neg_a, flag)`
+     using the decomposition from 3d.  Plus the final algebra
+     rows: Z - Y_neg (IsSub) + s = den_inv·(Z-Y_neg) (IsMul).
 4. Output-byte memory producer + RistrettoEcallChip skip + the
    inter-chip X/Y/Z/T boundary binding.  Compress chain's row +25
    `out` (32 bytes of canonical s) emits +IsReal
