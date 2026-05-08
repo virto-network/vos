@@ -431,25 +431,33 @@ fn harness_ristretto_comb_table_unbalanced_rejected() {
 
 /// Session 2.1 step 5 — comb-method lookup-balance harness.
 ///
-/// Proves `[&RistrettoCombTableChip, &RistrettoFixedBaseConsumerChip]`
+/// Proves `[&RistrettoCombTableChip, &RistrettoFixedBaseConsumerChip,
+/// &RistrettoCombAnchorChip, &RistrettoCombScalarBoundaryChip]`
 /// together with one synthetic scalar.  The consumer emits +1 per
 /// window (64 emissions); `populate_ristretto_comb_counts` matches
 /// each emission with a +1 in the table chip's Multiplicity column;
-/// the table chip's lookup contribution is −Multiplicity.  Sum is
-/// zero — relation balances cleanly and verify accepts.
+/// the table chip's lookup contribution is −Multiplicity.
+///
+/// As of Session 2.1 step 8 (memory-binding), `RistrettoCombScalarBoundaryChip`
+/// also emits a +IsReal `MemoryAccessLookupElements` producer per row to
+/// pin the scalar bytes to PVM memory.  Since this harness does not
+/// include `MemoryChip` / `MemoryBoundaryChip` in scope, that producer
+/// goes unbalanced and verify rejects open-chain.  The fully-closed
+/// chain is exercised in `harness_ristretto_fixed_base_e2e_with_memory`
+/// below; this harness now serves as a regression net for the
+/// comb→anchor→scalar-boundary→consumer chip algebra (PROVE must still
+/// succeed; an algebra regression would surface as `ConstraintsNotSatisfied`).
 ///
 /// What this validates:
-/// - The 130-limb `RistrettoCombLookupElements` relation closes
-///   end-to-end across producer + consumer.
+/// - The 130-limb `RistrettoCombLookupElements` relation has no
+///   constraint regressions on the producer + consumer sides.
 /// - `populate_ristretto_comb_counts` correctly walks each call's
 ///   64 windows and bumps the table-chip multiplicity.
 /// - The consumer chip's IsReal flag, padding behaviour, and column
 ///   layout coexist with the table chip's preprocessed table.
-///
-/// What this does NOT validate (deferred to step 8):
-/// - That the input scalar bytes match the ECALL boundary's scalar.
-/// - That the running sum (yet to land) hits the ECALL boundary's
-///   output point.
+/// - Anchor + scalar-boundary chips' AIR algebra is degree ≤ 2 and
+///   the per-row `ScalarByte = LowNibble + 16·HighNibble` constraint
+///   holds across the synthesized witness.
 #[test]
 fn harness_ristretto_comb_balance() {
     use zkpvm::chips::{
@@ -494,14 +502,26 @@ fn harness_ristretto_comb_balance() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    verify_with_explicit_components(
+    let verify_result = verify_with_explicit_components(
         proof,
         &side_note,
         &verifier_components,
         components,
         &policy,
-    )
-    .expect("comb-balance harness: verify failed — relation didn't close end-to-end");
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!(
+            "comb-balance harness: verify rejected for the wrong reason: {e:?}"
+        ),
+        Ok(()) => panic!(
+            "comb-balance harness: verify accepted unexpectedly — \
+             scalar-boundary chip's memory producer should be unbalanced \
+             without MemoryChip in scope"
+        ),
+    }
 }
 
 /// Debug: ConsumerChip-isolated with EMPTY side_note (no calls).

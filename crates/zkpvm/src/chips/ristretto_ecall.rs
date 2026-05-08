@@ -121,7 +121,18 @@ impl BuiltInComponent for RistrettoEcallChip {
 
 #[cfg(feature = "prover")]
 fn ristretto_ecall_log_size(side_note: &SideNote) -> u32 {
-    let n_scalar = side_note.ristretto_mem_ops.len() * 96;
+    use crate::core::tracing::ScalarMultKind;
+    // FixedBasepoint scalar mults skip the 32-byte scalar producer
+    // here — `RistrettoCombScalarBoundaryChip` emits those memory
+    // producers instead so the ledger pins the scalar to PVM memory.
+    let n_scalar: usize = side_note
+        .ristretto_mem_ops
+        .iter()
+        .map(|op| match op.kind {
+            ScalarMultKind::FixedBasepoint => 64, // point + output only
+            ScalarMultKind::Variable => 96,
+        })
+        .sum();
     let n_add = side_note.ristretto_add_mem_ops.len() * 96;
     let n_reduce = side_note.scalar_reduce_wide_mem_ops.len() * 96;
     let n_binop = side_note.scalar_binop_mem_ops.len() * 96;
@@ -140,14 +151,20 @@ struct ByteAccess {
 
 #[cfg(feature = "prover")]
 fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
+    use crate::core::tracing::ScalarMultKind;
     let mut out = Vec::new();
     for op in &side_note.ristretto_mem_ops {
-        for i in 0..32u32 {
-            out.push(ByteAccess {
-                addr: op.scalar_ptr + i,
-                value: op.scalar_bytes[i as usize],
-                ts: op.ts, is_write: false,
-            });
+        // Scalar-byte producers: skipped for FixedBasepoint records —
+        // `RistrettoCombScalarBoundaryChip` produces those tuples to
+        // bind the scalar nibbles directly to the PVM memory ledger.
+        if op.kind != ScalarMultKind::FixedBasepoint {
+            for i in 0..32u32 {
+                out.push(ByteAccess {
+                    addr: op.scalar_ptr + i,
+                    value: op.scalar_bytes[i as usize],
+                    ts: op.ts, is_write: false,
+                });
+            }
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
