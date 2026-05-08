@@ -1,5 +1,5 @@
-//! `space subscribe / unsubscribe / subscriptions` — per-node
-//! opt-in filter for which installed agents this node syncs.
+//! `space subs [add|rm|list]` — per-node opt-in filter for
+//! which installed agents this node syncs.
 //!
 //! By default (no `local.toml` or empty `subscriptions` list)
 //! `space up` spawns every agent in the registry's catalog —
@@ -14,9 +14,28 @@
 
 use std::path::Path;
 
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 use crate::spaces_index::{self, SpaceEntry};
+
+#[derive(Subcommand, Debug)]
+pub enum SubsCommand {
+    /// List the current filter (default if no subcommand given).
+    List,
+    /// Add an agent to the subscription filter.
+    Add { agent: String },
+    /// Remove an agent from the filter.
+    Rm { agent: String },
+}
+
+pub fn run(space: &str, command: Option<SubsCommand>) -> anyhow::Result<()> {
+    match command.unwrap_or(SubsCommand::List) {
+        SubsCommand::List => run_list(space),
+        SubsCommand::Add { agent } => run_subscribe(space, &agent),
+        SubsCommand::Rm { agent } => run_unsubscribe(space, &agent),
+    }
+}
 
 const LOCAL_FILE: &str = "local.toml";
 
@@ -85,7 +104,7 @@ fn data_dir_of(space: &str) -> anyhow::Result<(SpaceEntry, std::path::PathBuf)> 
     Ok((entry, dir))
 }
 
-pub fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
+fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
     let (entry, dir) = data_dir_of(space)?;
     let mut cfg = load(&dir)?;
     if cfg.subscriptions.iter().any(|s| s == agent) {
@@ -104,7 +123,7 @@ pub fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
+fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
     let (entry, dir) = data_dir_of(space)?;
     let mut cfg = load(&dir)?;
     let before = cfg.subscriptions.len();
@@ -126,7 +145,7 @@ pub fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_list(space: &str) -> anyhow::Result<()> {
+fn run_list(space: &str) -> anyhow::Result<()> {
     let (entry, dir) = data_dir_of(space)?;
     let cfg = load(&dir)?;
     if cfg.subscriptions.is_empty() {
@@ -134,7 +153,7 @@ pub fn run_list(space: &str) -> anyhow::Result<()> {
             "space '{}': no filter — syncing all installed agents.",
             entry.name,
         );
-        println!("subscribe to a subset with `vosx space subscribe {} <agent>`.", entry.name);
+        println!("subscribe to a subset with `vosx space subs {} add <agent>`.", entry.name);
     } else {
         println!("space '{}' subscriptions ({}):", entry.name, cfg.subscriptions.len());
         for s in &cfg.subscriptions {

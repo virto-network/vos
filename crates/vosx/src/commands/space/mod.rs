@@ -211,24 +211,14 @@ pub enum SpaceCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Subscribe this node to syncing a specific agent. Empty
-    /// subscriptions list (the default) = sync every installed
-    /// agent. Non-empty = sync only the listed instances.
-    /// Stored in `<data_dir>/local.toml`.
-    Subscribe {
+    /// Per-node subscription filter. Empty filter (the default)
+    /// = sync every installed agent; non-empty = sync only the
+    /// listed instances. Stored in `<data_dir>/local.toml`.
+    /// Bare `space subs <space>` lists.
+    Subs {
         space: String,
-        agent: String,
-    },
-    /// Drop a subscription. After this the node stops syncing
-    /// that agent on next `space up`.
-    Unsubscribe {
-        space: String,
-        agent: String,
-    },
-    /// Print the current subscription list (or "syncing all"
-    /// when no filter is set).
-    Subscriptions {
-        space: String,
+        #[command(subcommand)]
+        command: Option<subscriptions::SubsCommand>,
     },
     /// Round-trip the daemon to verify it's reachable. Times
     /// the libp2p connect + an empty registry query.
@@ -336,13 +326,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Call { space, target, method, args } => {
             call::run(call::Args { space, target, method, args })
         }
-        SpaceCommand::Subscribe { space, agent } => {
-            subscriptions::run_subscribe(&space, &agent)
-        }
-        SpaceCommand::Unsubscribe { space, agent } => {
-            subscriptions::run_unsubscribe(&space, &agent)
-        }
-        SpaceCommand::Subscriptions { space } => subscriptions::run_list(&space),
+        SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
         SpaceCommand::Ping { space } => ping::run(&space),
     }
 }
