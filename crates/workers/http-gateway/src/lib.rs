@@ -72,12 +72,15 @@ use vos::actors::context::ServiceId;
 use vos::actors::value::{Msg, Value};
 use vos::prelude::*;
 
+#[cfg(feature = "http3")]
+mod http3;
+
 type HyperResponse = hyper::Response<Full<Bytes>>;
 
 // `#[messages]` emits a `type Result<T> = core::result::Result<T, ActorErr>`
 // alias that shadows the std `Result`. Keep an unaliased one around for
 // the HTTP/JSON helpers below (which want their own error type).
-type IoResult<T> = core::result::Result<T, String>;
+pub(crate) type IoResult<T> = core::result::Result<T, String>;
 
 // ── Shared runtime state ───────────────────────────────────────────────
 //
@@ -86,16 +89,16 @@ type IoResult<T> = core::result::Result<T, String>;
 // endpoints + bumps the request counter). One per process — there's
 // only meant to be a single gateway instance per worker .so load.
 
-struct Inner {
+pub(crate) struct Inner {
     /// Set to true to ask the running `start` loop to exit.
-    stop: AtomicBool,
+    pub(crate) stop: AtomicBool,
     /// Bound port, 0 when the gateway isn't running.
-    bound_port: AtomicU16,
+    pub(crate) bound_port: AtomicU16,
     /// Total HTTP requests fully served since process boot.
-    requests: AtomicU64,
+    pub(crate) requests: AtomicU64,
     /// Unix epoch seconds when `start` last entered the serve loop;
     /// 0 when never started.
-    started_unix: AtomicU64,
+    pub(crate) started_unix: AtomicU64,
 }
 
 impl Inner {
@@ -159,26 +162,7 @@ impl HttpGateway {
         inner.started_unix.store(unix_now(), Ordering::Relaxed);
         log::info!("http-gateway: listening on 0.0.0.0:{port}");
 
-        // Drain loop. Polls the stop flag every recv-timeout tick so
-        // even a quiet gateway notices a shutdown request.
-        let stop_msg = loop {
-            if inner.stop.load(Ordering::Relaxed) {
-                break "stopped".to_string();
-            }
-            match job_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(job) => {
-                    let response = handle(&job.request, ctx).await;
-                    inner.requests.fetch_add(1, Ordering::Relaxed);
-                    // Connection task may have given up (client hangup);
-                    // drop the response silently rather than failing.
-                    let _ = job.resp_tx.send(response);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break "job channel closed".to_string();
-                }
-            }
-        };
+        let stop_msg = drain_jobs(&job_rx, &inner, ctx).await;
 
         inner.bound_port.store(0, Ordering::Relaxed);
         log::info!("http-gateway: {stop_msg}");
@@ -225,6 +209,53 @@ impl HttpGateway {
     async fn status(&self, _ctx: &mut Context<Self>) -> String {
         status_json(inner())
     }
+
+    /// Bind a QUIC + HTTP/3 listener on UDP `port`. Same Job → ctx.ask
+    /// → Response flow as `serve`, just QUIC on the wire. Auto-mints a
+    /// self-signed cert for `localhost` (dev only — operator cert
+    /// loading lands in a follow-up).
+    ///
+    /// Like `serve`, this blocks until the stop flag flips. Available
+    /// only when this crate is built with `--features http3`; without
+    /// the feature it returns a "not enabled" message so the message
+    /// surface is stable across feature combinations.
+    #[msg]
+    async fn serve_h3(&mut self, port: u32, ctx: &mut Context<Self>) -> String {
+        serve_h3_impl(port as u16, ctx).await
+    }
+}
+
+#[cfg(not(feature = "http3"))]
+async fn serve_h3_impl(_port: u16, _ctx: &mut vos::Context<HttpGateway>) -> String {
+    "http3 feature not enabled — rebuild with --features http3".into()
+}
+
+#[cfg(feature = "http3")]
+async fn serve_h3_impl(port: u16, ctx: &mut vos::Context<HttpGateway>) -> String {
+    let inner = inner().clone();
+
+    if inner.bound_port.load(Ordering::Relaxed) != 0 {
+        return format!(
+            "already listening on 0.0.0.0:{}",
+            inner.bound_port.load(Ordering::Relaxed),
+        );
+    }
+    inner.stop.store(false, Ordering::Relaxed);
+
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    if let Err(e) = spawn_h3_runtime(port, job_tx, inner.clone()) {
+        log::error!("http-gateway: {e}");
+        return e;
+    }
+    inner.bound_port.store(port, Ordering::Relaxed);
+    inner.started_unix.store(unix_now(), Ordering::Relaxed);
+    log::info!("http-gateway: listening on udp/0.0.0.0:{port} (h3)");
+
+    let stop_msg = drain_jobs(&job_rx, &inner, ctx).await;
+
+    inner.bound_port.store(0, Ordering::Relaxed);
+    log::info!("http-gateway: {stop_msg}");
+    stop_msg
 }
 
 fn unix_now() -> u64 {
@@ -246,38 +277,112 @@ fn status_json(inner: &Inner) -> String {
     )
 }
 
+/// Shared job-drain loop used by both `serve` and `serve_h3`. Polls
+/// the stop flag every 200 ms so even an idle gateway notices a
+/// shutdown request promptly. Returns a short status string when the
+/// loop exits.
+async fn drain_jobs(
+    job_rx: &mpsc::Receiver<Job>,
+    inner: &Inner,
+    ctx: &mut vos::Context<HttpGateway>,
+) -> String {
+    loop {
+        if inner.stop.load(Ordering::Relaxed) {
+            return "stopped".into();
+        }
+        match job_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(job) => {
+                let response = handle(&job.request, ctx).await;
+                inner.requests.fetch_add(1, Ordering::Relaxed);
+                let _ = job.resp_tx.send(response);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return "job channel closed".into();
+            }
+        }
+    }
+}
+
 // ── Job queue ───────────────────────────────────────────────────────
 
 /// One HTTP job in flight. The connection task pushes a `Job` onto
 /// the actor's mpsc; the actor handler fills `resp_tx` once `ctx.ask`
 /// completes; the task awaits the oneshot and writes the response.
-struct Job {
-    request: Request,
-    resp_tx: oneshot::Sender<Response>,
+pub(crate) struct Job {
+    pub(crate) request: Request,
+    pub(crate) resp_tx: oneshot::Sender<Response>,
 }
 
 // ── HTTP plumbing ───────────────────────────────────────────────────
 
-struct Request {
-    method: String,
-    path: String,
-    query: String,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: String,
+    pub(crate) body: Vec<u8>,
 }
 
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Response {
     fn json(status: u16, body: Vec<u8>) -> Self {
         Self { status, content_type: "application/json", body }
     }
-    fn text(status: u16, msg: impl Into<String>) -> Self {
+    pub(crate) fn text(status: u16, msg: impl Into<String>) -> Self {
         Self { status, content_type: "text/plain", body: msg.into().into_bytes() }
     }
+}
+
+/// Spawn a QUIC + h3 runtime in a dedicated OS thread. Same
+/// ready-signal handshake as `spawn_runtime`.
+#[cfg(feature = "http3")]
+fn spawn_h3_runtime(
+    port: u16,
+    job_tx: mpsc::Sender<Job>,
+    inner: Arc<Inner>,
+) -> IoResult<()> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<IoResult<()>>(1);
+    thread::Builder::new()
+        .name(format!("http-gateway-h3:{port}"))
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("runtime build: {e}")));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let addr = match format!("0.0.0.0:{port}").parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("addr parse: {e}")));
+                        return;
+                    }
+                };
+                let endpoint = match http3::build_endpoint(addr) {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                http3::accept_loop(endpoint, job_tx, inner).await;
+            });
+        })
+        .map_err(|e| format!("spawn h3 thread: {e}"))?;
+    ready_rx
+        .recv()
+        .map_err(|e| format!("ready signal: {e}"))?
 }
 
 /// Spawn the tokio runtime + accept loop in a dedicated OS thread.
@@ -427,7 +532,7 @@ fn into_hyper(r: Response) -> HyperResponse {
 ///
 /// - `GET  /__admin/status` — JSON snapshot
 /// - `POST /__admin/stop`   — set the stop flag, reply 204
-fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
+pub(crate) fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
     if !req.path.starts_with("/__admin/") {
         return None;
     }
