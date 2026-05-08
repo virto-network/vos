@@ -282,7 +282,11 @@ fn publish_endpoint(
 }
 
 /// Query the registry for installed agents and register each
-/// on the local node.
+/// on the local node. If `<data_dir>/local.toml` declares a
+/// `subscriptions` filter, only listed instances spawn — the
+/// rest are skipped (their state still arrives via gossipsub
+/// for full replicas, but isn't materialized into a running
+/// agent here).
 fn spawn_installed_agents(
     node: &mut VosNode,
     data_dir: &std::path::Path,
@@ -290,11 +294,27 @@ fn spawn_installed_agents(
 ) -> anyhow::Result<()> {
     use space_registry::SpaceRegistryRef;
 
+    let local_cfg = crate::commands::space::subscriptions::load(data_dir)
+        .unwrap_or_default();
+    if local_cfg.is_filtering() {
+        eprintln!(
+            "vosx: subscriptions filter active — {} agent(s)",
+            local_cfg.subscriptions.len(),
+        );
+    }
+
     let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
     let agents = vos::block_on(reg.agents(&mut &*node))
         .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
     for a in agents {
+        if !local_cfg.should_spawn(&a.instance_name) {
+            eprintln!(
+                "vosx:   skipping '{}' (not subscribed)",
+                a.instance_name,
+            );
+            continue;
+        }
         let program_hash = BlobHash(a.program_hash);
         let elf = match blob_store::cache_get(&program_hash)? {
             Some(b) => b,

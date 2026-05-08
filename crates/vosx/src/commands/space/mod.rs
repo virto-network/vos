@@ -34,6 +34,7 @@ pub mod new;
 pub mod programs;
 pub mod publish;
 pub mod reconcile;
+pub mod subscriptions;
 pub mod uninstall;
 pub mod unpublish;
 pub mod up;
@@ -208,6 +209,25 @@ pub enum SpaceCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Subscribe this node to syncing a specific agent. Empty
+    /// subscriptions list (the default) = sync every installed
+    /// agent. Non-empty = sync only the listed instances.
+    /// Stored in `<data_dir>/local.toml`.
+    Subscribe {
+        space: String,
+        agent: String,
+    },
+    /// Drop a subscription. After this the node stops syncing
+    /// that agent on next `space up`.
+    Unsubscribe {
+        space: String,
+        agent: String,
+    },
+    /// Print the current subscription list (or "syncing all"
+    /// when no filter is set).
+    Subscriptions {
+        space: String,
+    },
     /// Invoke any agent on the running daemon. Generic floor
     /// primitive; `publish` / `install` / etc. are typed sugar
     /// wrappers around the same plumbing.
@@ -311,5 +331,12 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Call { space, target, method, args } => {
             call::run(call::Args { space, target, method, args })
         }
+        SpaceCommand::Subscribe { space, agent } => {
+            subscriptions::run_subscribe(&space, &agent)
+        }
+        SpaceCommand::Unsubscribe { space, agent } => {
+            subscriptions::run_unsubscribe(&space, &agent)
+        }
+        SpaceCommand::Subscriptions { space } => subscriptions::run_list(&space),
     }
 }
