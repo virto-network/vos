@@ -453,7 +453,8 @@ fn harness_ristretto_comb_table_unbalanced_rejected() {
 #[test]
 fn harness_ristretto_comb_balance() {
     use zkpvm::chips::{
-        RistrettoCombAnchorChip, RistrettoCombTableChip, RistrettoFixedBaseConsumerChip,
+        RistrettoCombAnchorChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::side_note::RistrettoCombCall;
 
@@ -477,6 +478,7 @@ fn harness_ristretto_comb_balance() {
     let components: &[&'static dyn MachineProverComponent] = &[
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
         &RistrettoFixedBaseConsumerChip,
     ];
 

@@ -248,6 +248,37 @@ stwo_constraint_framework::relation!(
     REL_RISTRETTO_COMB_LOOKUP_SIZE
 );
 
+// Session 2.1 step 8 (partial): scalar nibble binding between
+// `RistrettoCombAnchorChip` and a new `RistrettoCombScalarBoundaryChip`.
+//
+// Tuple: (call_idx, window_idx, k_value).  3 limbs.
+//
+// Producer: `RistrettoCombAnchorChip` emits +IsReal per row at
+// (CallIdx, WindowIdx, ScalarWindow).
+// Consumer: `RistrettoCombScalarBoundaryChip` reads the scalar bytes
+// from `side_note.ristretto_comb_calls`, decomposes each byte into
+// two 4-bit nibbles, and emits −IsReal per row at (call_idx,
+// window_idx, expected_nibble).
+//
+// Balance forces the anchor chip's ScalarWindow per (call, window) to
+// equal the expected nibble from the actor's scalar.  Since the
+// anchor chip's row stream is a deterministic function of
+// `ristretto_comb_calls`, the scalar is consistent end-to-end through
+// the comb chip pair.
+//
+// SOUNDNESS LIMITATION: the boundary chip pulls from `side_note`,
+// not directly from PVM memory.  A separate (deferred) refactor is
+// needed to bind `side_note.ristretto_comb_calls.scalar` to
+// `MemoryAccessLookupElements` — i.e., have the boundary chip emit
+// memory producers for the scalar bytes (with `RistrettoEcallChip`
+// stopping its scalar-byte producers for FixedBasepoint records to
+// avoid double-emission).
+const REL_RISTRETTO_COMB_SCALAR_BOUNDARY_SIZE: usize = 3;
+stwo_constraint_framework::relation!(
+    RistrettoCombScalarBoundaryLookupElements,
+    REL_RISTRETTO_COMB_SCALAR_BOUNDARY_SIZE
+);
+
 // Session 2.1 column-shrink: anchor-chip↔consumer-chip coord binding.
 //
 // Tuple: (call_idx, window_idx, coord_kind ∈ {0=X,1=Y,2=Z,3=T},

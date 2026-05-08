@@ -146,6 +146,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RistrettoCombTableChip, // Session 2.1 step 4 — OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoFixedBaseConsumerChip, // Session 2.1 step 5(b) — OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoCombAnchorChip, // Session 2.1 column-shrink — OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoCombScalarBoundaryChip, // Session 2.1 step 8 partial — OPTIONAL, gated by activity.ristretto_comb
 ];
 
 #[cfg(not(feature = "prover"))]
@@ -172,6 +173,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RistrettoCombTableChip,
     &chips::RistrettoFixedBaseConsumerChip,
     &chips::RistrettoCombAnchorChip,
+    &chips::RistrettoCombScalarBoundaryChip,
 ];
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
@@ -309,7 +311,7 @@ impl ChipActivity {
             18 => self.divrem,
             19 => self.ristretto,
             20 => self.ristretto_ecall,
-            21 | 22 | 23 => self.ristretto_comb,
+            21 | 22 | 23 | 24 => self.ristretto_comb,
             _ => true,
         }
     }

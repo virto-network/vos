@@ -44,7 +44,10 @@ use crate::trace::{
 
 use crate::{
     framework::BuiltInComponent,
-    lookups::{RistrettoCombCoordBoundaryLookupElements, RistrettoCombLookupElements},
+    lookups::{
+        RistrettoCombCoordBoundaryLookupElements, RistrettoCombLookupElements,
+        RistrettoCombScalarBoundaryLookupElements,
+    },
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -98,6 +101,7 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
     type LookupElements = (
         RistrettoCombLookupElements,
         RistrettoCombCoordBoundaryLookupElements,
+        RistrettoCombScalarBoundaryLookupElements,
     );
 
     fn add_constraints<E: EvalAtRow>(
@@ -107,9 +111,10 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
         lookup_elements: &(
             RistrettoCombLookupElements,
             RistrettoCombCoordBoundaryLookupElements,
+            RistrettoCombScalarBoundaryLookupElements,
         ),
     ) {
-        let (comb_lookup, coord_lookup) = lookup_elements;
+        let (comb_lookup, coord_lookup, scalar_lookup) = lookup_elements;
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
         let call_idx = crate::trace::trace_eval!(trace_eval, Column::CallIdx);
         let window_idx = crate::trace::trace_eval!(trace_eval, Column::WindowIdx);
@@ -193,6 +198,19 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
                 ],
             ));
         }
+
+        // ── Scalar boundary relation (step 8): bind ScalarWindow per
+        // (call, window) to the actor's scalar's nibble.  Emits 1
+        // tuple per row.
+        eval.add_to_relation(RelationEntry::new(
+            scalar_lookup,
+            is_real[0].clone().into(),
+            &[
+                call_idx[0].clone(),
+                window_idx[0].clone(),
+                scalar_window[0].clone(),
+            ],
+        ));
 
         eval.finalize_logup_in_pairs();
     }
@@ -324,6 +342,20 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
                 );
             }
         }
+
+        // Scalar boundary emission.
+        let scalar: &RistrettoCombScalarBoundaryLookupElements =
+            lookup_elements.as_ref();
+        logup.add_to_relation_with(
+            scalar,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            &[
+                call_idx[0].clone(),
+                window_idx[0].clone(),
+                scalar_window[0].clone(),
+            ],
+        );
 
         logup.finalize()
     }

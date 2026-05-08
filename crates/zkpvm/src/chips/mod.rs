@@ -20,6 +20,7 @@ pub mod register_memory_boundary;
 pub mod ristretto;
 pub mod ristretto_comb;
 pub mod ristretto_comb_anchor;
+pub mod ristretto_comb_scalar_boundary;
 pub mod ristretto_ecall;
 pub mod ristretto_fixed_base_consumer;
 
@@ -45,5 +46,6 @@ pub use register_memory_boundary::RegisterMemoryBoundaryChip;
 pub use ristretto::RistrettoChip;
 pub use ristretto_comb::RistrettoCombTableChip;
 pub use ristretto_comb_anchor::RistrettoCombAnchorChip;
+pub use ristretto_comb_scalar_boundary::RistrettoCombScalarBoundaryChip;
 pub use ristretto_ecall::RistrettoEcallChip;
 pub use ristretto_fixed_base_consumer::RistrettoFixedBaseConsumerChip;
