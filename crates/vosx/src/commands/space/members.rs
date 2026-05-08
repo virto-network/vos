@@ -19,16 +19,22 @@ use serde::Serialize;
 use crate::commands::space::client::DaemonClient;
 use crate::output;
 
+// Hex-string fields drop the `_hex` suffix to match the
+// convention used by ProgramView / AgentView / InfoView (where
+// every byte field is just a bare hex string). `prefix` stays a
+// numeric u16 — JSON consumers can format it however they want
+// without paying a parse step.
+
 #[derive(Serialize)]
 struct NodeView {
     prefix: u16,
-    peer_id_hex: String,
+    peer_id: String,
     role: &'static str,
 }
 
 #[derive(Serialize)]
 struct IdentityView {
-    public_key_hex: String,
+    public_key: String,
     proof_kind: &'static str,
 }
 
@@ -121,14 +127,14 @@ fn list(space: &str) -> anyhow::Result<()> {
                     .iter()
                     .map(|n| NodeView {
                         prefix: n.prefix,
-                        peer_id_hex: hex::encode(&n.key),
+                        peer_id: hex::encode(&n.key),
                         role: role_name(n.role),
                     })
                     .collect(),
                 identities: identities
                     .iter()
                     .map(|i| IdentityView {
-                        public_key_hex: hex::encode(&i.key),
+                        public_key: hex::encode(&i.key),
                         proof_kind: proof_kind_name(i.proof_kind),
                     })
                     .collect(),
