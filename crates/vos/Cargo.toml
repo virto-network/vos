@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:blake2b_simd", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -19,7 +19,7 @@ wasm-bootstrap = ["wasm", "dep:dlmalloc"]
 # Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
 http = ["dep:ureq"]
 # Enables redb-backed worker state persistence in the worker host.
-storage = ["dep:redb", "dep:merkle-crdt"]
+storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-channel", "dep:vos-raft"]
 # Enables the libp2p-backed networking layer (peer transport, identity,
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
@@ -28,14 +28,19 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", optional = true }
-rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
+vos-raft = { path = "../vos-raft", default-features = false, features = ["std"], optional = true }
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+# Logging facade — re-exported as `vos::log` and pulled into
+# `vos::prelude::*`. `default-features = false` keeps it usable
+# in no_std actor / wasm guests; the std-side host code can use
+# the same facade and bridge to tracing if it wants.
+log = { version = "0.4", default-features = false }
 
 # std-only: PVM runtime and vosx binary dependencies
-javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168", optional = true }
-grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168", optional = true }
+javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-blake2b_simd = { version = "1", optional = true }
 pollster = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -48,11 +53,35 @@ merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
+# Drives vos-raft's async Storage / Transport futures from inside
+# the existing sync Network::set_raft_handler / RaftCommit code
+# paths. Std-only — gated behind the `storage` feature so no_std
+# actor builds (default-features = false) don't drag std into the
+# riscv guest.
+futures-executor = { version = "0.3", default-features = false, features = ["std"], optional = true }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
+
+# Backs `vos::crypto::blake2b` on every non-riscv64 target —
+# host code, workers, wasm guests. PVM (riscv64) actors hit
+# the host via ECALL_BLAKE2B_COMPRESS and never link this dep.
+# Target-conditional so the riscv64 actor build doesn't even
+# compile blake2b_simd. `default-features = false` keeps it
+# usable from no_std (worker / wasm).
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+blake2b_simd = { version = "1", default-features = false }
 
 [dev-dependencies]
-# Tests need typed access to the registry actor — `host` pulls
-# in `Client` and `replication_id`. Cargo allows this dev-dep
-# cycle (registry → vos) because dev-deps don't participate in
-# the regular dep graph; only test/example builds activate it.
-registry = { path = "../actors/registry", features = ["host"] }
-crdt-counter = { path = "../../examples/actors/crdt-counter", features = ["host"] }
+# `default-features = false` so the `bin` feature stays off — host
+# tests just need the `CrdtCounterRef` typed surface from the
+# rlib, not the cdylib glue. The vos build for these dev-deps
+# pulls vos's own default features (std + http + storage + network)
+# via the test crate's own resolution so the integration tests can
+# `use vos::runtime::*` etc.
+crdt-counter = { path = "../../examples/actors/crdt-counter", default-features = false }
+# Used by a single robustness test that hand-corrupts the
+# actor's persisted state to simulate schema drift.
+redb = "2"
+# Reference blake2b implementation for cross-checking the
+# vos::crypto software fallback. Dev-only; the in-tree fallback
+# is self-contained.
+blake2 = "0.10"

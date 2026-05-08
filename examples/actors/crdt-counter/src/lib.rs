@@ -1,29 +1,22 @@
 //! CRDT counter — a minimal actor whose state replicates across
-//! nodes via the cycle-3/4 merkle-CRDT machinery.
+//! nodes via the merkle-CRDT machinery.
 //!
 //! Two messages:
-//!   - `inc(tag: u32)` increments the count by one. The `tag`
-//!     parameter is part of the EffectLog payload, so callers
-//!     using different tags produce different DAG-node CIDs —
-//!     necessary because the merkle-DAG content-addresses
-//!     events and would otherwise dedup byte-identical incs
-//!     coming from concurrent replicas. Use a per-replica
-//!     unique tag (or a monotone source counter) when driving
-//!     it; for unit tests, simple integers suffice.
+//!   - `inc()` increments the count by one. Two replicas calling
+//!     this concurrently produce distinct DAG nodes (and so the
+//!     merge surfaces both events) because the runtime stamps
+//!     each event with `(origin, seq)` — see
+//!     [`vos::effect_log::CrdtEvent`]. Handlers don't see those
+//!     fields; they're metadata for CID stability.
 //!   - `get() -> u64` reports the current count (read-only →
 //!     no DAG node, see `crdt_commit_skips_unchanged_plain_commits`).
 //!
-//! Replication shape: each `inc(tag)` is recorded as an
-//! EffectLog. Replicas that see the same set of logs converge
-//! to the same count regardless of order, since the underlying
-//! op is commutative.
+//! Replication shape: each `inc()` is recorded as an EffectLog
+//! tagged with the producing replica's origin+seq. Replicas that
+//! see the same set of logs converge to the same count regardless
+//! of order, since the underlying op is commutative.
 
-#![no_std]
-
-use vos::{actor, messages};
-#[allow(unused_imports)]
-use vos::{print, println, eprint, eprintln};
-
+use vos::prelude::*;
 #[actor]
 pub struct CrdtCounter {
     count: u64,
@@ -36,43 +29,40 @@ impl CrdtCounter {
     }
 
     #[msg]
-    async fn inc(&mut self, tag: u32) {
-        // `tag` is in the EffectLog so concurrent incs from different
-        // replicas hash to different DAG-node CIDs. Not used in the
-        // state transition.
+    async fn inc(&mut self) {
         self.count += 1;
-        println!("crdt-counter: inc tag={tag} -> count={}", self.count);
+        log::info!("crdt-counter: inc -> count={}", self.count);
     }
 
     #[msg]
     async fn get(&self) -> u64 {
-        println!("crdt-counter: get -> {}", self.count);
+        log::info!("crdt-counter: get -> {}", self.count);
         self.count
     }
 
-    /// Resolve `name` against the hyperspace registry via the
-    /// macro-generated `RegistryActorClient`. The actor-side
-    /// client wraps `ctx.ask(REGISTRY, "resolve", ...).await`
-    /// in a typed method.
+    /// Deliberate panic for failure-mode tests. The runtime
+    /// should surface this to the caller as
+    /// `InvokeError::Panicked`, leave the actor's state
+    /// intact, and continue dispatching subsequent messages
+    /// — the next `inc()` after a `boom()` must work.
+    #[msg]
+    async fn boom(&self) {
+        panic!("crdt-counter: boom — deliberate panic for test");
+    }
+
+    /// Resolve `name` against the per-space registry via the
+    /// `Context::resolve` utility. No dep on space-registry's
+    /// typed Ref — `ctx.resolve` sends a dynamic message to
+    /// the well-known `ServiceId::REGISTRY` and returns the
+    /// asking node's local svc_id (or 0 if not installed).
     #[msg]
     async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
-        use vos::abi::service::ServiceId;
-        use registry::RegistryActorClient;
-        match RegistryActorClient::at(ctx, ServiceId::REGISTRY)
-            .resolve(name.clone()).await
-        {
-            Ok(id) => {
-                if id == 0 {
-                    println!("crdt-counter: whois({name}) -> not found");
-                } else {
-                    println!("crdt-counter: whois({name}) -> {id}");
-                }
-                id
-            }
-            Err(e) => {
-                println!("crdt-counter: whois({name}) -> error {e}");
-                0
-            }
+        let id = ctx.resolve(name.clone()).await;
+        if id == 0 {
+            log::info!("crdt-counter: whois({name}) -> not found");
+        } else {
+            log::info!("crdt-counter: whois({name}) -> {id}");
         }
+        id
     }
 }

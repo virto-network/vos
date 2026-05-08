@@ -6,27 +6,27 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# When set on a host consumer, `#[messages]` emits the typed
-# `CrdtCounterClient` (see registry/Cargo.toml for the same
-# convention). Off for the riscv64 actor build.
-default = []
-host = []
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+default = ["bin"]
+bin = []
 
 [lib]
-name = "crdt_counter"
-path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
-[[bin]]
-name = "crdt-counter"
-path = "src/main.rs"
-
-[dependencies]
+[target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
-# Registry actor's lib portion: types + the macro-generated
-# `RegistryActorClient` (used by `whois` below). No `host`
-# feature — that would pull `VosNode` and host-side blake2b
-# into a riscv64 build, which doesn't make sense.
-registry = { path = "../../../crates/actors/registry" }
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "worker"] }
+
 
 [profile.release]
 opt-level = "s"

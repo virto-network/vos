@@ -1,0 +1,37 @@
+//! A starter Raft-backed counter actor scaffolded by `vosx new`.
+//!
+//! State is replicated by Raft consensus: each `inc()` blocks
+//! the leader's reply until a majority of replicas have the
+//! entry. Tweak the message handlers, rebuild, and `vosx up`
+//! to see the cluster pick up the change.
+
+// `#![no_std]` only applies to non-host targets — riscv64 PVM
+// actors and wasm32 modules run without std. The host (worker)
+// build links against std for its native cdylib glue.
+#![cfg_attr(any(target_arch = "riscv64", target_arch = "wasm32"), no_std)]
+
+use vos::prelude::*;
+
+#[actor]
+pub struct Counter {
+    count: u64,
+}
+
+#[messages]
+impl Counter {
+    fn new() -> Self {
+        Counter { count: 0 }
+    }
+
+    #[msg]
+    async fn inc(&mut self) -> u64 {
+        self.count += 1;
+        log::info!("counter: inc -> {}", self.count);
+        self.count
+    }
+
+    #[msg]
+    async fn get(&self) -> u64 {
+        self.count
+    }
+}

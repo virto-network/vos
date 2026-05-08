@@ -7,7 +7,7 @@
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
-use vos::{actor, messages};
+use vos::prelude::*;
 
 #[actor]
 struct Fetcher;
@@ -47,7 +47,8 @@ impl Fetcher {
         body: String,
         ctx: &mut Context<Self>,
     ) -> String {
-        let resp = ctx.fetch(url)
+        let resp = ctx
+            .fetch(url)
             .post()
             .header("Authorization", format!("Bearer {token}"))
             .json(body)

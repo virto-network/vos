@@ -8,6 +8,7 @@ members = [
     "crates/zkpvm/precompiles",
     "crates/zkpvm/derive",
     "crates/zkpvm/verifier",
+    "crates/workers/http-gateway",
     "examples/workers/*",
 ]
 exclude = [
@@ -21,6 +22,7 @@ exclude = [
     # it up as a workspace member.
     "crates/actors",
     "crates/actors/registry",
+    "crates/actors/space-registry",
     # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.
@@ -29,6 +31,9 @@ exclude = [
     # that doesn't resolve in this worktree.  Excluded so zkpvm
     # builds.  DO NOT COMMIT.
     "crates/vosx",
+    # `crates/workers` is a parent directory holding worker
+    # plugins; each sub-crate is listed in `members` explicitly.
+    "crates/workers",
 ]
 
 [workspace.package]

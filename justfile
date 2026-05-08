@@ -52,7 +52,7 @@ test-one name: build-workers
 
 # Build just the crdt-counter actor (cycle-5 example)
 build-crdt-counter:
-    cd examples/actors/crdt-counter && cargo +nightly -Zjson-target-spec build --release
+    cd examples/actors/crdt-counter && cargo actor
 
 # Build the hyperspace registry actor — built-in PVM actor that
 # lives under crates/actors/ alongside the workspace crates.
@@ -68,37 +68,63 @@ demo-crdt-sync: build-crdt-counter
     cargo test -p vos --features network --test elf_integration \
         crdt_counter_converges_across_nodes_live -- --nocapture
 
-# Two-process CRDT demo using real `vosx start` instances. Each
-# process owns its own data dir + libp2p identity; both run the
-# crdt-counter actor under the same replication_id (auto-derived
-# from blob+name). On startup each side fires `inc(tag=N)` with
-# N differing per host so the two EffectLogs hash to distinct
-# DAG nodes. Cycle-3 sync pulls each replica's node into the
-# other's redb; cycle-4 soft restart replays both logs; the
-# println in the actor reports `count=2` on each side once
-# convergence completes.
+# Two-process CRDT demo using real `vosx space up` daemons.
+# Each process gets its own isolated XDG state tree (so
+# `~/.config/vosx/spaces.toml` doesn't collide between them)
+# and reconciles the same crdt-counter agent from
+# `examples/space-crdt-{a,b}.toml`. Both manifests' `on_start`
+# fires one inc per replica; the EffectLogs hash to distinct
+# DAG nodes (different `(origin, seq)` per replica), gossipsub
+# carries them to the other side, soft-restart replays both
+# logs, and `count=2` shows up on each side once convergence
+# completes (~6s end-to-end).
 demo-crdt-procs: build-crdt-counter build-crates
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf /tmp/vosx-a /tmp/vosx-b
-    mkdir -p /tmp/vosx-a /tmp/vosx-b
-    echo "→ starting host A (listens on :4811)..."
-    RUST_LOG=info ./target/debug/vosx start examples/space-crdt-a.toml \
-        --data-dir /tmp/vosx-a --listen /ip4/127.0.0.1/tcp/4811 \
+    A=/tmp/vosx-a; B=/tmp/vosx-b
+    rm -rf $A $B
+    mkdir -p $A/{data,config,cache} $B/{data,config,cache}
+
+    echo "→ host A: create space..."
+    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
+      ./target/debug/vosx space new --name demo > /dev/null
+    SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
+    echo "  space_id=$SPACE_ID"
+
+    echo "→ host A: starting daemon on :4811, reconciling space-crdt-a.toml..."
+    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
+    RUST_LOG=info ./target/debug/vosx space up demo \
+        --manifest examples/space-crdt-a.toml \
+        --listen /ip4/127.0.0.1/tcp/4811 \
         > /tmp/vosx-a.log 2>&1 &
     PID_A=$!
-    sleep 1
-    echo "→ starting host B (dials A)..."
-    RUST_LOG=info ./target/debug/vosx start examples/space-crdt-b.toml \
-        --data-dir /tmp/vosx-b --connect /ip4/127.0.0.1/tcp/4811 \
+
+    # Wait for A's swarm to bind and write its endpoint, then
+    # extract the peer-id so B can dial it.
+    for _ in $(seq 1 50); do
+        [ -f "$A/data/vosx/$SPACE_ID/.endpoint" ] && break
+        sleep 0.1
+    done
+    PEER_A=$(grep peer_id "$A/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
+    BOOTNODE="/ip4/127.0.0.1/tcp/4811/p2p/$PEER_A"
+    echo "  bootnode=$BOOTNODE"
+
+    echo "→ host B: join + start (dials A)..."
+    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
+      ./target/debug/vosx space join "$SPACE_ID@$BOOTNODE" --name demo > /dev/null
+    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
+    RUST_LOG=info ./target/debug/vosx space up demo \
+        --manifest examples/space-crdt-b.toml \
+        --connect "$BOOTNODE" \
         > /tmp/vosx-b.log 2>&1 &
     PID_B=$!
+
     sleep 6
     echo ""
-    echo "── host A inc log ─────────────────────────────────────────"
+    echo "── host A counter log ─────────────────────────────────────"
     grep "crdt-counter:" /tmp/vosx-a.log || echo "(no actor output)"
     echo ""
-    echo "── host B inc log ─────────────────────────────────────────"
+    echo "── host B counter log ─────────────────────────────────────"
     grep "crdt-counter:" /tmp/vosx-b.log || echo "(no actor output)"
     echo ""
     echo "→ shutting down..."
@@ -109,27 +135,9 @@ demo-crdt-procs: build-crdt-counter build-crates
 
 # ── Run ─────────────────────────────────────────────────────────────
 
-# Run vosx with the example space manifest
-run-manifest: build build-pvm
-    cargo run --bin vosx -- start examples/space.toml --no-persist
-
-# Run a single PVM actor
+# Run a single PVM actor as a one-shot, no space, no networking.
 run-actor name="greeter": build-pvm
     cargo run --bin vosx -- run examples/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
-
-# Run a worker standalone
-run-worker name="echo": build-workers
-    cargo run --bin vosx -- node --worker target/debug/lib{{name}}_worker.so
-
-# Run two workers together (proxy can ask echo)
-run-workers: build-workers
-    cargo run --bin vosx -- node \
-        --worker target/debug/libecho_worker.so \
-        --worker target/debug/libproxy_worker.so
-
-# List metadata of actors in a manifest
-list manifest="examples/space.toml": build-pvm
-    cargo run --bin vosx -- list {{manifest}}
 
 # ── zkpvm verifier ──────────────────────────────────────────────────
 
@@ -174,3 +182,33 @@ lint:
 # Check everything compiles without building artifacts
 check:
     cargo check --all-targets
+
+# Run all checks the pre-commit + pre-push hooks run, in one go
+verify:
+    cargo fmt --all -- --check
+    cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::result_unit_err -A clippy::manual_async_fn
+    cargo test --workspace --lib
+    just build-pvm
+
+# Point git at the in-repo hooks under .githooks/ (idempotent)
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "✓ git hooks installed (.githooks/pre-commit, .githooks/pre-push)"
+
+# Verify vos-raft builds on representative no_std + alloc embedded
+# targets. Catches regressions to the alloc-only code paths
+# (anything accidentally pulling in std::collections, std::time,
+# etc.) at CI time before a downstream Embassy / firmware user
+# breaks. Requires the riscv32imc-unknown-none-elf and
+# thumbv7em-none-eabihf rustup targets.
+check-no-std:
+    cargo build -p vos-raft --no-default-features --target thumbv7em-none-eabihf
+    cargo build -p vos-raft --no-default-features --target riscv32imc-unknown-none-elf
+
+# Run cargo-deny across the workspace (license / advisory / bans /
+# sources). Requires `cargo install cargo-deny` once. Wire this into
+# CI before any release that ships outside the trusted-internal
+# bucket — without it, RustSec advisories on hyper / quinn / rustls /
+# ring won't get caught.
+deny:
+    cargo deny --all-features check

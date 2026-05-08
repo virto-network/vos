@@ -1,0 +1,328 @@
+//! `vosx space *` — per-space lifecycle, daemon control,
+//! and registry-mediated agent management.
+//!
+//! Three groups of commands:
+//!
+//! - **Offline**: `new`, `list`, `info`, `join`, `delete`,
+//!   `export` (read-only). Operate on `~/.config/vosx/spaces.toml`
+//!   and per-space data dirs without contacting a daemon.
+//! - **Daemon**: `up` runs the libp2p server that owns the
+//!   redb. One daemon per space, identified by an
+//!   `<data_dir>/.endpoint` file.
+//! - **Client**: `publish`, `install`, `upgrade`, `uninstall`,
+//!   `unpublish`, `programs`, `agents`, `members`, `call`.
+//!   Each spawns a tiny libp2p peer, dials the daemon's
+//!   endpoint, sends one registry invoke, and exits. Same
+//!   plumbing under `DaemonClient` — `call` is the floor
+//!   primitive, the rest are typed sugar.
+
+use clap::Subcommand;
+use std::path::PathBuf;
+
+pub mod agents;
+pub mod call;
+pub mod client;
+pub mod common;
+pub mod endpoint;
+pub mod export;
+pub mod forget;
+pub mod info;
+pub mod install;
+pub mod join;
+pub mod list;
+pub mod members;
+pub mod new;
+pub mod payload_codec;
+pub mod programs;
+pub mod publish;
+pub mod reconcile;
+pub mod subscriptions;
+pub mod uninstall;
+pub mod unpublish;
+pub mod up;
+pub mod upgrade;
+pub mod verify;
+
+#[derive(Subcommand, Debug)]
+pub enum SpaceCommand {
+    /// Create a new space — scaffold identity, initial data
+    /// dir, and add to the local spaces index. Doesn't run
+    /// any daemon; `space up` is what binds a network. Set
+    /// the daemon's persistent listen addrs by editing the
+    /// per-space `local.toml`'s `listen = […]`, or pass
+    /// `--listen` to `space up` per-run.
+    New {
+        /// Short name for the space. Used in listings and as the
+        /// default lookup key.
+        #[arg(long)]
+        name: String,
+        /// Source for the space-registry actor blob: file path,
+        /// 64-hex content hash (cache lookup), `ipfs:<cid>`, or
+        /// `https://…`. Optional — falls back to the registry
+        /// blob bundled into the vosx binary at build time.
+        #[arg(long, value_name = "SOURCE")]
+        registry: Option<String>,
+        /// Override the per-space data directory (default:
+        /// `~/.local/share/vosx/<space_id>`).
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+    },
+    /// List spaces in the local index.
+    List,
+    /// Show details for a single space (by id-prefix or name).
+    Info {
+        /// Space id (full hex) or name.
+        space: String,
+    },
+    /// Join a remote space — register it locally so
+    /// `space up` can dial the bootnode and start syncing.
+    Join {
+        /// `<space-id>@<bootnode-multiaddr>`. The space-id half
+        /// is 64 hex chars; the bootnode half is whatever
+        /// follows the `@`.
+        bootstrap: String,
+        /// Source for the space-registry actor blob. Optional —
+        /// falls back to the bundled blob.
+        #[arg(long, value_name = "SOURCE")]
+        registry: Option<String>,
+        /// Local short-name for the space. Defaults to a short
+        /// hex prefix of the space_id.
+        #[arg(long)]
+        name: Option<String>,
+        /// libp2p multiaddr to listen on (optional). Repeatable.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// Override the per-space data directory.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<std::path::PathBuf>,
+    },
+    /// Boot a saved space — load the registry from cache,
+    /// register it as `ServiceId::REGISTRY`, run forever.
+    Up {
+        /// Space id (full hex) or name.
+        space: String,
+        /// Exit when the registry goes idle (smoke-test mode).
+        #[arg(long)]
+        once: bool,
+        /// Optional TOML manifest. The startup pass reconciles
+        /// it into the registry: any `[[agent]]` not yet
+        /// installed gets published+installed; existing entries
+        /// are left alone unless `--reconcile-upgrade` is set.
+        /// Manifests are devhelpers — the registry remains the
+        /// runtime source of truth.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<std::path::PathBuf>,
+        /// libp2p multiaddr to listen on. Repeatable. Overrides
+        /// the saved `listen` field on the spaces.toml entry
+        /// for this run.
+        #[arg(long, value_name = "MULTIADDR")]
+        listen: Vec<String>,
+        /// libp2p multiaddr to dial at startup. Repeatable.
+        /// Extends the saved `bootnodes` field on the
+        /// spaces.toml entry for this run.
+        #[arg(long, value_name = "MULTIADDR")]
+        connect: Vec<String>,
+    },
+    /// Query a space's registry and emit a round-trippable
+    /// TOML manifest to stdout.
+    Export {
+        /// Space id (full hex) or name.
+        space: String,
+    },
+    /// Add a program (PVM blob) to the catalog with an
+    /// immutable `(name, version)` tag.
+    Publish {
+        /// Space id or name.
+        space: String,
+        /// `name` or `name:version`. Bare `name` ⇒ `name:latest`.
+        program_ref: String,
+        /// Blob source: file path, hash, ipfs:<cid>, or URL.
+        source: String,
+    },
+    /// Remove a program from the catalog. Errors if any
+    /// installed agent still references the version.
+    Unpublish {
+        space: String,
+        /// `name:version` (both required).
+        program_ref: String,
+    },
+    /// List programs in the catalog.
+    Programs { space: String },
+    /// Instantiate a published program as an installed agent.
+    Install {
+        /// Space id or name.
+        space: String,
+        /// Program ref: `name`, `name:version`. Bare `name`
+        /// resolves to `name:latest`.
+        program_ref: String,
+        /// Override the install/instance name. Defaults to
+        /// the program's `name`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Init args as `key=value` pairs (repeatable). Values
+        /// are typed as u64 / bool / String in that order.
+        #[arg(long, value_name = "KEY=VALUE")]
+        init: Vec<String>,
+        /// Consistency mode: ephemeral, local, crdt, or raft.
+        #[arg(long, default_value = "crdt")]
+        consistency: String,
+        /// Optional explicit replication id (64 hex). Default:
+        /// blake2b("vos-replication-id/v1" || instance_name ||
+        /// 0 || program_hash).
+        #[arg(long, value_name = "HEX")]
+        replication_id: Option<String>,
+    },
+    /// Tombstone an installed agent.
+    Uninstall { space: String, instance: String },
+    /// Repoint an installed agent at a different program
+    /// version. State is preserved (same replication_id, same
+    /// redb); replicas restart on next sync.
+    Upgrade {
+        space: String,
+        instance: String,
+        /// New program ref: `name:version`.
+        program_ref: String,
+    },
+    /// List installed agents.
+    Agents { space: String },
+    /// Manage Node + Identity members. Subcommands: list,
+    /// add-node, remove-node, add-identity, remove-identity.
+    /// Bare `space members <space>` lists.
+    Members {
+        space: String,
+        #[command(subcommand)]
+        command: Option<members::MembersCommand>,
+    },
+    /// Drop the local copy of a space — wipes the per-space
+    /// data dir and the spaces.toml entry. The shared blob
+    /// cache is kept and the space stays alive on its peers;
+    /// this is purely a local operation.
+    Forget {
+        space: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Per-node subscription filter. Empty filter (the default)
+    /// = sync every installed agent; non-empty = sync only the
+    /// listed instances. Stored in `<data_dir>/local.toml`.
+    /// Bare `space subs <space>` lists.
+    Subs {
+        space: String,
+        #[command(subcommand)]
+        command: Option<subscriptions::SubsCommand>,
+    },
+    /// Invoke any agent on the running daemon. Generic floor
+    /// primitive; `publish` / `install` / etc. are typed sugar
+    /// wrappers around the same plumbing.
+    ///
+    /// `target` accepts:
+    /// - `registry` — the well-known per-space registry
+    /// - `<instance_name>` — an installed agent (resolved via
+    ///   the daemon's registry)
+    /// - `0xHEX` — bare 32-bit ServiceId
+    Call {
+        space: String,
+        target: String,
+        method: String,
+        /// Positional `key=value` args. Numbers and booleans
+        /// are auto-typed; everything else is a string.
+        args: Vec<String>,
+    },
+}
+
+pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
+    match cmd {
+        SpaceCommand::New {
+            name,
+            registry,
+            data_dir,
+        } => new::run(new::Args {
+            name,
+            registry,
+            data_dir,
+        }),
+        SpaceCommand::List => list::run(),
+        SpaceCommand::Info { space } => info::run(&space),
+        SpaceCommand::Join {
+            bootstrap,
+            registry,
+            name,
+            listen,
+            data_dir,
+        } => join::run(join::Args {
+            bootstrap,
+            registry,
+            name,
+            listen,
+            data_dir,
+        }),
+        SpaceCommand::Up {
+            space,
+            once,
+            manifest,
+            listen,
+            connect,
+        } => up::run(up::Args {
+            query: space,
+            once,
+            manifest,
+            listen,
+            connect,
+        }),
+        SpaceCommand::Export { space } => export::run(export::Args { query: space }),
+        SpaceCommand::Publish {
+            space,
+            program_ref,
+            source,
+        } => publish::run(publish::Args {
+            space,
+            program_ref,
+            source,
+        }),
+        SpaceCommand::Unpublish { space, program_ref } => {
+            unpublish::run(unpublish::Args { space, program_ref })
+        }
+        SpaceCommand::Programs { space } => programs::run(&space),
+        SpaceCommand::Install {
+            space,
+            program_ref,
+            name,
+            init,
+            consistency,
+            replication_id,
+        } => install::run(install::Args {
+            space,
+            program_ref,
+            name,
+            init,
+            consistency,
+            replication_id,
+        }),
+        SpaceCommand::Uninstall { space, instance } => uninstall::run(&space, &instance),
+        SpaceCommand::Upgrade {
+            space,
+            instance,
+            program_ref,
+        } => upgrade::run(upgrade::Args {
+            space,
+            instance,
+            program_ref,
+        }),
+        SpaceCommand::Agents { space } => agents::run(&space),
+        SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
+        SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),
+        SpaceCommand::Call {
+            space,
+            target,
+            method,
+            args,
+        } => call::run(call::Args {
+            space,
+            target,
+            method,
+            args,
+        }),
+        SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
+    }
+}

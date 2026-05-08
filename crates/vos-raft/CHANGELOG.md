@@ -1,0 +1,316 @@
+# Changelog
+
+All notable changes to `vos-raft`. The crate is pre-1.0; the API
+surface is intentionally small but reserves room to grow via
+`#[non_exhaustive]` on every public struct/enum.
+
+## [Unreleased]
+
+### Audit follow-ups (May 2026)
+
+Two further hardening changes from the audit's "remaining
+caveats" list:
+
+- **`InstallSnapshotReq` carries cluster membership**
+  (wire-breaking). New `members: Vec<N>` and
+  `joint_old: Option<Vec<N>>` fields populate from the leader's
+  `effective_cfg` on the final chunk (`done = true`); the
+  follower writes them via `WriteBatch::active_config` in the
+  same atomic install batch. Closes the long-standing gap
+  where a fresh follower whose first activity was an
+  `InstallSnapshot` at a high index had no way to learn the
+  cluster's current shape and would silently retain its static
+  `Config::members`. Empty `members` on the wire is
+  interpreted as "leader from an older crate version" and
+  preserves the prior behavior (keep current `effective_cfg`).
+  Pinned by
+  `install_snapshot_adopts_leader_supplied_membership_on_fresh_follower`.
+  Vos's libp2p frame layer doesn't yet ferry the new fields —
+  same caveat as the existing chunked-offset gap; vos workers
+  don't currently emit `change_membership` either, so the
+  divergence is benign in practice until membership changes
+  land in vos.
+- **`try_compact` runtime-caps floor at `commit_index`**
+  (defense-in-depth). The previous `debug_assert!` only fired
+  in debug builds; in release a future refactor that broke the
+  no-op invariant could silently compact past committed state.
+  The cap is one extra `min` per heartbeat tick.
+
+### Audit fixes (May 2026 protocol-correctness review)
+
+Four safety/liveness bugs surfaced during a protocol audit:
+
+- **Persisted active_config goes stale on truncate** (safety,
+  liveness). `recover_active_config` (boot path) returned the
+  persisted view BEFORE scanning the log, with
+  `active_config_index = None` for non-joint persisted views —
+  so a subsequent truncate that dropped the entry that produced
+  the persisted view did not trigger
+  `truncate_invalidated_cfg` and the persisted row was never
+  rewritten. On reboot the worker re-adopted a stale member set
+  that no longer existed in the log. Fixed by inverting the
+  recover precedence (live-log scan is authoritative; persisted
+  view is the fallback for compacted-past-CC) and by computing
+  the post-truncate active_config and rolling it into the same
+  atomic `WriteBatch` as the truncate. Pinned by
+  `truncate_dropping_originating_config_change_invalidates_persisted_view`.
+- **match_index can regress on out-of-order ack** (liveness).
+  `handle_append_response` did
+  `leader.match_index.insert(from, resp.match_index)`
+  unconditionally, so a stale ack from an earlier heartbeat
+  arriving after a fresh ack from a later one would overwrite
+  the higher value. Per Raft §5.3 `match_index` is monotonic.
+  Fixed by max-clamping against the previous tracked value.
+  Affects `commit_index` advancement cadence and `try_compact`
+  — does NOT roll committed state backwards (the commit
+  advance path itself max-clamps).
+- **No-op append failure during leader promotion** (safety).
+  `become_leader_no_heartbeat` set `role = Leader` and built
+  `LeaderState` BEFORE persisting the linearizability-gate no-op,
+  so a transient `commit_batch` Err left the worker in
+  `Role::Leader` without `current_term_first_index` set —
+  `read_index` would then resolve against a possibly prior-term
+  `commit_index`, breaking Ongaro §6.4. Fixed by persisting the
+  no-op first; a storage Err keeps the worker in Candidate and
+  the next election timer retries. Pinned by
+  `no_op_append_failure_keeps_us_out_of_leader_role`.
+- **Snapshot install loses persisted active_config** (liveness).
+  When `handle_install_snapshot` committed a snapshot whose
+  `last_included_index` crossed the entry that produced the
+  follower's `active_config_index`, the persisted `active_config`
+  row was not refreshed in the same WriteBatch. On the next
+  reboot, recovery would scan the post-install (now empty up
+  through the snap pointer) live log, find no `ConfigChange`,
+  and fall back to `cfg.members` — silently dropping the
+  membership view the worker had been operating with. Fixed by
+  writing `effective_cfg` alongside the snapshot commit and
+  invalidating any `active_config_index` / `pending_joint_entry`
+  that pointed at a now-compacted entry. Pinned by
+  `install_snapshot_persists_effective_cfg_after_compaction`.
+
+### Hardening (post-feature review)
+
+A self-review of the four landed features (pre-vote, read_index,
+chunked snapshots, joint consensus) surfaced a list of gaps;
+this section captures fixes that landed in response.
+
+- **Removed leader steps down**: `auto_finalize_joint_config`
+  now calls `step_down` after writing the final non-joint
+  ConfigChange when the local replica is no longer a voter.
+  Previously the removed leader kept serving indefinitely.
+- **Joint finalization is index-based**, not member-equality
+  based: `WorkerState::pending_joint_entry` tracks the actual
+  joint entry's index, so a stale historical joint entry that
+  happens to target the same member set can't trigger a
+  spurious finalization.
+- **Bounded queues / buffers**:
+  - `Config::max_pending_reads` (default 1024) caps the
+    in-flight `read_index` queue with a new
+    `ReadIndexError::Backpressure` outcome.
+  - `Config::max_snapshot_bytes` (default 512 MiB) caps the
+    follower's chunked-snapshot accumulator. A misbehaving
+    leader streaming chunks without `done = true` can no
+    longer OOM the follower.
+  - `Config::pre_candidate_misses_before_revert` (default 3)
+    flips a stuck PreCandidate back to Follower so external
+    observers see "no election in progress" rather than an
+    indefinite PreCandidate.
+- **Linearizability gate**: `become_leader_no_heartbeat`
+  appends a no-op `Data` entry at the current term (Ongaro
+  §6.4); `read_index` waits for `commit_index >=` that no-op's
+  index before resolving. Closes the "freshly-elected leader
+  serves prior-term state" gap.
+- **Defensive checks**:
+  - Vote / pre-vote responses from outside the active
+    configuration's union are ignored (no contamination of
+    `votes_received` from a recently-removed peer).
+  - Replicas that aren't in their own active configuration
+    don't start elections (avoids a removed-leader-with-orphan-
+    log re-electing itself).
+- **Performance**: `recover_active_config` no longer scans the
+  full live log on every append batch. `WorkerState::active_config_index`
+  caches the index of the entry that produced the active
+  view; only a truncate that drops below this index forces a
+  fresh scan, and a newly-appended ConfigChange is adopted
+  in-place from `req.entries`.
+- **API hygiene**:
+  - `ProposeError` is no longer parameterized over an unused
+    `E` (the worker erases storage errors to `()`).
+  - New `ChangeMembershipError::EmptyConfig` variant — distinct
+    from `InProgress`, returned when `new_members` is empty.
+  - New `LogEntry::config_change(idx, term, joint_old, members)`
+    constructor for symmetry with `LogEntry::data`.
+
+### Added
+- **Joint-consensus membership change** (Ongaro thesis §4.3) —
+  new `WorkerHandle::change_membership(new_members)` API moves
+  the cluster to a new voter set without downtime. The leader
+  appends a joint `EntryKind::ConfigChange { joint_old:
+  Some(old), members: new }` entry; the joint configuration
+  takes effect immediately for quorum decisions (heartbeat
+  targets, vote counting, commit-index advancement) and quorum
+  now requires majorities from BOTH the old AND new sets.
+  Once the joint entry commits the leader auto-appends the
+  final non-joint entry (`joint_old: None, members: new`);
+  once that commits the cluster is on the new membership.
+  New `ChangeMembershipError` enum (`NotLeader`, `InProgress`,
+  `Storage`). Concurrent change requests during a joint phase
+  return `InProgress` — Raft permits at most one membership
+  change in flight at a time. `LogEntry` is now parameterized
+  over `N: NodeId` so config-change entries can carry typed
+  `Vec<N>` member sets; pure-data callers use the new
+  `LogEntry::data(idx, term, payload)` constructor and
+  `entry.payload()` accessor.
+  **Wire compatibility**: vos's libp2p frame layer doesn't yet
+  ferry the `ConfigChange` variant — vos's transport adapters
+  panic with a clear message if a `ConfigChange` entry ever
+  reaches them. Vos workers don't emit them today.
+- **Chunked `InstallSnapshot`** — snapshots that exceed the
+  transport's frame budget are now streamed across multiple
+  RPCs. `InstallSnapshotReq` gained `offset: u64`, `done: bool`,
+  and renamed `snapshot: Vec<u8>` → `data: Vec<u8>` (the chunk
+  bytes for *this RPC only*). `InstallSnapshotResp` gained
+  `bytes_received: u64` so the leader can resume after a
+  dropped chunk. The follower assembles chunks under a
+  `(last_included_index, last_included_term)` identity and
+  commits the snapshot atomically when `done = true` lands;
+  duplicate chunks (same offset) and gap chunks
+  (offset > current length) are handled idempotently. New
+  `Config::install_snapshot_chunk_bytes` (default `32 * 1024`,
+  i.e. 32 KiB) caps each chunk; `usize::MAX` disables chunking.
+  **Breaking** schema change for transports — vos's adapter
+  pins the chunk size to `usize::MAX` until libp2p's frame
+  layer learns to ferry chunked offsets.
+- **Linearizable reads via `read_index`** (Ongaro thesis §6.4) —
+  new `WorkerHandle::read_index() -> Result<u64, ReadIndexError>`
+  returns the leader's `commit_index` only after a fresh
+  heartbeat round confirms quorum-leadership at the current
+  term. Callers wait for their apply progress to reach the
+  returned index, then read state-machine state without going
+  through the log. `ReadIndexError` distinguishes `NotLeader`
+  (address the leader instead) from `LeaderStepped` (we were
+  leader at request time but stepped down before a quorum could
+  confirm — retry against the new leader). Solo-cluster
+  shortcut resolves immediately. Linearizability is closed
+  by appending a no-op `Data` entry on leader promotion
+  (Ongaro §6.4) so `read_index` can't return a `commit_index`
+  that points only at prior-term state.
+- **Pre-vote** (Ongaro thesis §9.6) — prevents term inflation
+  from a flapping partition. New `Role::PreCandidate`, new
+  `PreVoteReq`/`PreVoteResp` RPC types, new
+  `Transport::send_prevote` method (with a default impl that
+  refuses, so existing transports degrade gracefully). New
+  `Config::pre_vote` flag (default `true`); set to `false`
+  if your transport doesn't yet route `PreVoteReq` over the
+  wire — the worker skips the pre-vote phase and falls back
+  to plain Raft. Vos's `RaftCommit` defaults to `false`
+  pending libp2p frame support.
+- **`TokioClock`** behind the new `tokio` feature — uses
+  `tokio::time::sleep_until` instead of `StdClock`'s thread-per-`Delay`
+  approach. Recommended for tokio-native hosts. Spawn via
+  [`Worker::spawn_with_tokio_runtime`] (which builds a tokio
+  current-thread runtime with `enable_time()` on the worker
+  thread); plain `spawn_with` panics on the first `TokioClock`
+  poll because `futures-executor` has no timer driver.
+- **Async-by-default `Storage<N>` and `Transport<N>` traits**.
+  Methods return `impl Future + Send`. Synchronous backends
+  (`MemStorage`, the redb adapter in `vos`) just return ready
+  futures; async backends (`embassy-storage`, an SPI flash
+  driver) `.await` natively.
+- **`Clock` and `Rng` traits**. Worker is runtime-agnostic — the
+  host plugs in `tokio::time` / `embassy_time::Timer` / a
+  deterministic simulator. Std-feature ships `StdClock`
+  (per-`Delay` thread-spawning timer) + `StdRng` (xorshift64*).
+- **`ApplySink` trait** with `()` and `std::sync::mpsc::Sender<u64>`
+  blanket impls. Replaces the earlier `Option<std::sync::mpsc::Sender<u64>>`
+  parameter so embedded hosts can plug their own commit-notification
+  channel.
+- **Single-future async worker** driven by `futures::select!` over
+  inbox + election timer + in-flight outbound RPCs
+  (`FuturesUnordered`). No threads spawned by the core. Std-feature
+  `Worker::spawn` is a thread-spawning convenience for hosts that
+  want one.
+- **`run_worker(...)` async function** for embedded hosts that
+  drive the future directly on their own executor.
+- **Atomic `WriteBatch<N>`** storage contract: `truncate_after`,
+  `compact_to`, `appends`, `state`, `meta` apply in one
+  implementation-defined unit (a redb txn, a flash erase-program
+  cycle, etc.). Crash-safe.
+- **`#[non_exhaustive]` on `Config`, `WorkerSnapshot`, `ProposeError`,
+  `RaftMsg`** so future field/variant additions don't break SemVer.
+- **`Config::compact_hysteresis`** field replaces the old
+  `pub const COMPACT_HYSTERESIS = 16` so each replica can tune it.
+- **`Config::new(me, members, replication_id)`** constructor with
+  sensible defaults (election 150–300ms, heartbeat 50ms,
+  compact_hysteresis 16).
+- **`Inbox<N>` opaque newtype** hides `futures-channel` from the
+  public API so a future channel-impl swap stays SemVer-safe.
+- **`WorkerSnapshot::snap_last_index`** — newly surfaced for
+  proptest-style invariant audits.
+
+### Verified
+- Builds cleanly on `thumbv7em-none-eabihf` (Cortex-M4F) and
+  `riscv32imc-unknown-none-elf` with `--no-default-features`.
+  Zero non-stdlib deps in that mode (the `std` feature pulls
+  in `futures-channel`, `futures-util`, `futures-executor`).
+- Test coverage:
+  - 18 worker unit tests (handler-level state transitions)
+  - 2 proptest properties × 256 cases each (term / commit /
+    snap-pointer monotonicity, log-matching, at-most-one-vote-per-term)
+  - 2 no_std build smoke tests (skip cleanly when targets aren't
+    installed)
+  - 22 integration tests against a `MockTransport` with per-edge
+    partition control (3-node election, replication, partition
+    quorum, one-way-partition, leader/candidate step-down on
+    higher-term replies, pre-vote term-stability,
+    `read_index` quorum confirmation, leader-stepped-on-partition,
+    `read_index` backpressure, chunked-`InstallSnapshot`
+    assembly + duplicate-idempotence + gap-rejection +
+    oversized-buffer-rejection, joint-consensus growth from 3
+    to 4 nodes with `InProgress` rejection, leader-removed
+    step-down, `change_membership` `NotLeader` and `EmptyConfig`,
+    PreCandidate fallback to Follower, cross-snapshot
+    membership recovery via persisted view)
+  - 5 fault-injection tests (storage `Err` paths)
+  - 1 runnable doctest
+
+### Known limitations (deferred for future commits)
+- **No learner role** — every `Config::members` entry is a full
+  voter.
+- **Cross-snapshot membership recovery** — `Storage` now has
+  an optional `active_config()` method (default returns
+  `None`) and `WriteBatch` has an `active_config` field. The
+  worker writes the active configuration in the same atomic
+  batch that emits a `ConfigChange` entry; on boot,
+  `recover_active_config` consults the persisted view first
+  and only falls back to the log-tail scan when the backend
+  doesn't support it. `MemStorage` implements both paths.
+  Vos's redb adapter currently uses the `None` default —
+  cross-snapshot recovery for vos is gated on a follow-up
+  redb schema bump.
+- **Storage error rolls back in-memory meta**: every handler
+  that mutates `state.meta` snapshots the pre-call value before
+  any mutation and restores it on `Storage::commit_batch` Err.
+  The worker stays consistent with disk: the in-memory and
+  on-disk views always agree after any handler returns.
+  Persistently-failing storage backends still wedge the worker
+  (each retry rolls back), but they no longer diverge.
+- *(removed)* `Meta::last_applied` is no longer part of the
+  worker's meta — the host tracks its own apply progress.
+  See `Meta`'s docs.
+- **`StdClock::sleep_until` spawns a thread per `Delay`** to avoid
+  `futures-timer`'s shared-timer contention under heavy
+  parallelism. Tokio-native hosts should enable the `tokio`
+  feature and use `TokioClock` (`tokio::time::sleep_until`,
+  no thread spawns).
+
+### Comparison vs `openraft`
+
+`openraft` is a mature, production-grade Raft library tied to
+`tokio` + `std`. `vos-raft` is positioned for hosts that need
+consensus on a non-tokio executor — Embassy on a microcontroller,
+async-std, smol, a deterministic simulator. It is **not**
+feature-equivalent: `openraft` has joint consensus, learners,
+chunked snapshot streaming, and years of production hardening.
+Pick `openraft` for tokio-native production; pick `vos-raft` for
+embedded / runtime-agnostic / vos-specific use cases.
