@@ -29,3 +29,21 @@ pub(crate) const MAX_REQUEST_HEADERS: usize = 64;
 /// `MAX_CONCURRENT_CONNS` × this is the total task ceiling).
 #[cfg(feature = "http3")]
 pub(crate) const MAX_STREAMS_PER_CONN: u32 = 64;
+
+/// Maximum time a hyper connection may take to send the request line
+/// + headers. Slow-loris mitigation. Hyper closes the connection
+/// when this elapses without progress.
+pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Maximum time the h3 path waits between body chunks before it
+/// abandons the request. Equivalent slow-loris guard for QUIC streams.
+#[cfg(feature = "http3")]
+pub(crate) const H3_BODY_CHUNK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Maximum time `accept_loop` waits for in-flight connection tasks
+/// to finish after the stop flag flips. Past this, the runtime drops
+/// regardless and remaining tasks are cancelled abruptly.
+pub(crate) const DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);

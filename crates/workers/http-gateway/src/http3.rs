@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -26,10 +27,11 @@ use vos::log;
 use crate::HttpGateway;
 use crate::config;
 use crate::limits::{
-    MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS, MAX_STREAMS_PER_CONN,
+    H3_BODY_CHUNK_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
+    MAX_STREAMS_PER_CONN,
 };
 use crate::routing::handle_admin;
-use crate::runtime::{self, serve_with};
+use crate::runtime::{self, InFlightGuard, drain_in_flight, serve_with};
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
 
@@ -45,7 +47,7 @@ fn spawn(
     port: u16,
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
-) -> IoResult<()> {
+) -> IoResult<thread::JoinHandle<()>> {
     let addr = SocketAddr::new(config::bind_ip(), port);
     runtime::spawn_on_thread(format!("http-gateway-h3:{port}"), move |ready_tx| async move {
         let endpoint = match build_endpoint(addr) {
@@ -153,16 +155,22 @@ async fn accept_loop(
                 continue;
             }
         };
+        inner.in_flight.fetch_add(1, Ordering::Relaxed);
         let job_tx = job_tx.clone();
-        let inner = inner.clone();
+        let inner_for_task = inner.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _guard = InFlightGuard::new(inner_for_task.clone());
             match incoming.await {
-                Ok(conn) => handle_connection(conn, job_tx, inner).await,
+                Ok(conn) => handle_connection(conn, job_tx, inner_for_task).await,
                 Err(e) => log::debug!("http-gateway: h3 handshake: {e}"),
             }
         });
     }
+
+    // Stop signaled — wait for live connections to drain before
+    // closing the endpoint, so in-flight requests get to finish.
+    drain_in_flight(&inner).await;
     endpoint.close(0u32.into(), b"gateway-stop");
 }
 
@@ -210,9 +218,23 @@ async fn handle_request(
 
     // Drain the body chunk-by-chunk, refusing once the running total
     // crosses the cap. Mirrors the hyper-side `Limited` posture.
+    // Each chunk read is bounded by `H3_BODY_CHUNK_TIMEOUT` so a
+    // peer that opens the stream and stalls can't hold a slot
+    // indefinitely.
     let mut body = Vec::new();
     let mut over_limit = false;
-    while let Some(mut chunk) = stream.recv_data().await? {
+    let mut timed_out = false;
+    loop {
+        let chunk = match tokio::time::timeout(H3_BODY_CHUNK_TIMEOUT, stream.recv_data()).await {
+            Ok(Ok(Some(c))) => c,
+            Ok(Ok(None)) => break, // end of body
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        };
+        let mut chunk = chunk;
         if over_limit {
             continue; // drain remaining chunks so the peer's flow-control unblocks
         }
@@ -225,7 +247,9 @@ async fn handle_request(
         body.extend_from_slice(&buf);
     }
 
-    let response = if over_limit {
+    let response = if timed_out {
+        Response::text(408, "body read timed out")
+    } else if over_limit {
         Response::text(413, format!("body exceeds {MAX_BODY_BYTES} bytes"))
     } else {
         let headers: Vec<(String, String)> = req

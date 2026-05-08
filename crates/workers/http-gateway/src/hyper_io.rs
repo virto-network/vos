@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,8 +24,10 @@ use tokio::sync::{Semaphore, oneshot};
 use vos::log;
 
 use crate::config;
-use crate::limits::{MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS};
-use crate::runtime;
+use crate::limits::{
+    HEADER_READ_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
+};
+use crate::runtime::{self, InFlightGuard, drain_in_flight};
 use crate::routing::handle_admin;
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
@@ -38,7 +41,7 @@ pub(crate) fn spawn(
     port: u16,
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
-) -> IoResult<()> {
+) -> IoResult<thread::JoinHandle<()>> {
     let bind = config::bind_ip();
     runtime::spawn_on_thread(format!("http-gateway-rt:{port}"), move |ready_tx| async move {
         let listener = match TcpListener::bind((bind, port)).await {
@@ -60,8 +63,12 @@ async fn accept_loop(
 ) {
     // One builder shared across connections; sniffs the protocol
     // preface and dispatches to h1 or h2c.
-    let conn_builder =
+    let mut conn_builder =
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    // Slow-loris mitigation: cap the time spent reading the request
+    // line + headers. Hyper closes the connection if this elapses
+    // without progress.
+    conn_builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
     // Per-protocol connection cap. Connections beyond this are
     // dropped; clients see an immediate close rather than queuing
     // FDs in the kernel.
@@ -86,15 +93,17 @@ async fn accept_loop(
                 continue;
             }
         };
+        inner.in_flight.fetch_add(1, Ordering::Relaxed);
         let job_tx = job_tx.clone();
-        let inner = inner.clone();
+        let inner_for_task = inner.clone();
         let conn_builder = conn_builder.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when this task ends
+            let _guard = InFlightGuard::new(inner_for_task.clone());
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: hyper::Request<Incoming>| {
                 let job_tx = job_tx.clone();
-                let inner = inner.clone();
+                let inner = inner_for_task.clone();
                 async move { Ok::<_, Infallible>(serve_request(req, job_tx, inner).await) }
             });
             if let Err(e) = conn_builder.serve_connection(io, svc).await {
@@ -102,6 +111,9 @@ async fn accept_loop(
             }
         });
     }
+
+    // Stop signaled — wait for live connections to drain.
+    drain_in_flight(&inner).await;
 }
 
 async fn serve_request(

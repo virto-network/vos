@@ -22,6 +22,11 @@ pub(crate) struct Inner {
     /// Unix epoch seconds when the gateway last entered the serve
     /// loop; 0 when never started.
     pub(crate) started_unix: AtomicU64,
+    /// Per-connection tasks currently running. Bumped in the accept
+    /// loop before spawn; an `InFlightGuard` decrements on task drop.
+    /// `accept_loop` polls this on shutdown so connections drain
+    /// before the runtime exits.
+    pub(crate) in_flight: AtomicU16,
 }
 
 impl Inner {
@@ -31,6 +36,7 @@ impl Inner {
             bound_port: AtomicU16::new(0),
             requests: AtomicU64::new(0),
             started_unix: AtomicU64::new(0),
+            in_flight: AtomicU16::new(0),
         })
     }
 
