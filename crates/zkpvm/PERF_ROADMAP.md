@@ -367,7 +367,12 @@ natural batches:
    chip-local row IDs don't collide.  Plus 3-call coverage harness
    (commit e6e7c49).  `chip_isolated` 14/14 + `phase2_alu` 94/94
    stay green.
-3. Sign-checks + conditional select/negate rows.  Sub-batches:
+3. **DONE (commits ad23764, 57c4e05, 851db48, 20317b9, 751acfb)** —
+   sign-checks + conditional select/negate rows.  Compress chain
+   in-circuit is now COMPLETE: row +43 of each per-call block holds
+   `s_can` = canonical compressed Ristretto bytes.  Per-call rows
+   grew 17 → 44.  N_BOUNDARY_INPUTS grew 2 → 3 (+ZERO row at
+   trace position 2).  Sub-batches:
    - **3a — DONE (commit ad23764)**: `inv_sqrt² · tmp = 1` unity
      check on row +12.  New preprocessed `IsUnityCheck` column;
      constraints `IsUnityCheck · (out[0] - 1) = 0` and
@@ -438,20 +443,37 @@ natural batches:
      using the decomposition from 3d.  Plus the final algebra
      rows: Z - Y_neg (IsSub) + s = den_inv·(Z-Y_neg) (IsMul).
 4. Output-byte memory producer + RistrettoEcallChip skip + the
-   inter-chip X/Y/Z/T boundary binding.  Compress chain's row +25
-   `out` (32 bytes of canonical s) emits +IsReal
-   `MemoryAccessLookupElements` producers at
-   `(output_ptr + i, byte, ts, is_write=1)` for i=0..32; mirror
-   `RistrettoCombScalarBoundaryChip`'s pattern (commit 82f893d).
-   Update `RistrettoEcallChip::collect_accesses` to skip the
-   32-byte output block when `op.kind == FixedBasepoint`.  New
-   relation tying compress chain's row 0-3 IsInput X/Y/Z/T to
-   consumer chip's window-63 last 4 mul rows — those produce the
-   final Acc bytes (NOT the IsInput coord rows of window 63,
-   which hold the looked-up table entry T[63][k_63] — see the
-   design-sketch correction above).  Producer side on the
-   consumer chip needs a new flag column "IsFinalAcc" gating the
-   emission.
+   inter-chip X/Y/Z/T boundary binding.  Two sub-batches:
+   - **4a (output memory producer)**: sibling
+     `RistrettoCombCompressOutputChip` with 32 rows per call
+     (mirroring `RistrettoCombScalarBoundaryChip`'s 32-row layout).
+     Per row: emit MemoryAccessLookupElements producer
+     `(addr, byte, ts, is_write=1)` where `addr = output_ptr + k`.
+     Source the per-byte values from the compress chip's row +43
+     via a new boundary relation
+     `RistrettoCombCompressOutputLookupElements` keyed on
+     `(call_idx, byte_idx, byte_value)`.  Compress chip's row +43
+     emits 32 producer tuples; output chip's 32 rows emit
+     consumer tuples.  Plus update
+     `RistrettoEcallChip::collect_accesses` to skip the 32-byte
+     output block when `op.kind == FixedBasepoint`.  Plus add
+     `output_ptr` + `ts` fields to `RistrettoCombCall` (or walk
+     the parallel `ristretto_mem_ops` like the scalar boundary
+     chip does).
+   - **4b (X/Y/Z/T cross-chip binding)**: tie compress chain's
+     rows 0..3 (IsInput X, Y, Z, T) to consumer chip's window-63
+     final-Acc rows — those are the LAST 4 mul rows of window
+     63's 18-row add chain (X3 = E·F at offset 18, Y3 = G·H at
+     19, T3 = E·H at 20, Z3 = F·G at 21 within the per-window
+     block — NOT the IsInput coord rows of window 63 which hold
+     the looked-up table entry T[63][k_63]).  Producer side on
+     the consumer chip needs a new flag column "IsFinalAcc"
+     gating the emission of 4 × 32 = 128 byte tuples per call to
+     the new boundary relation
+     `RistrettoCombFinalAccLookupElements` keyed on
+     `(call_idx, coord_kind ∈ {0=X, 1=Y, 2=Z, 3=T}, byte_idx,
+     byte_value)`.  Consumer side on the compress chip's rows
+     0..3 emits 4 × 32 byte tuples per call.
 5. Activity gating (`ChipActivity.ristretto_comb` already covers
    the new chip — just add idx 25 to the gate); BASE_COMPONENTS
    wiring; chip-isolated end-to-end harness covering the full
