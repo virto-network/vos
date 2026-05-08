@@ -207,7 +207,16 @@ fn add_node(
         if status != STATUS_OK {
             anyhow::bail!("add_node returned status {status}");
         }
-        println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
+        if output::is_json() {
+            #[derive(Serialize)]
+            struct V<'a> {
+                prefix: u16,
+                role: &'a str,
+            }
+            output::print_json(&V { prefix: prefix as u16, role: role_str });
+        } else {
+            println!("added node prefix=0x{:04x} role={role_str}", prefix as u16);
+        }
         Ok(())
     })
 }
@@ -216,7 +225,15 @@ fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         match client.remove_node(prefix)? {
             STATUS_OK => {
-                println!("removed node prefix=0x{:04x}", prefix as u16);
+                if output::is_json() {
+                    #[derive(Serialize)]
+                    struct V {
+                        prefix: u16,
+                    }
+                    output::print_json(&V { prefix: prefix as u16 });
+                } else {
+                    println!("removed node prefix=0x{:04x}", prefix as u16);
+                }
                 Ok(())
             }
             STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
@@ -249,10 +266,22 @@ fn add_identity(
         if status != STATUS_OK {
             anyhow::bail!("add_identity returned status {status}");
         }
-        println!(
-            "added identity {} (proof={proof_kind_str})",
-            &hex::encode(&pubkey)[..20.min(pubkey.len() * 2)],
-        );
+        if output::is_json() {
+            #[derive(Serialize)]
+            struct V<'a> {
+                public_key: String,
+                proof_kind: &'a str,
+            }
+            output::print_json(&V {
+                public_key: hex::encode(&pubkey),
+                proof_kind: proof_kind_str,
+            });
+        } else {
+            println!(
+                "added identity {} (proof={proof_kind_str})",
+                &hex::encode(&pubkey)[..20.min(pubkey.len() * 2)],
+            );
+        }
         Ok(())
     })
 }
@@ -261,9 +290,17 @@ fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
     let pubkey = hex::decode(pubkey_hex.trim_start_matches("0x"))
         .map_err(|_| anyhow::anyhow!("public_key must be hex"))?;
     DaemonClient::with_connect(space, |client| {
-        match client.remove_identity(pubkey)? {
+        match client.remove_identity(pubkey.clone())? {
             STATUS_OK => {
-                println!("removed identity");
+                if output::is_json() {
+                    #[derive(Serialize)]
+                    struct V {
+                        public_key: String,
+                    }
+                    output::print_json(&V { public_key: hex::encode(&pubkey) });
+                } else {
+                    println!("removed identity");
+                }
                 Ok(())
             }
             STATUS_NOT_FOUND => anyhow::bail!("no identity with that public key"),

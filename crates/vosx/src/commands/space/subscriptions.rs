@@ -17,7 +17,14 @@ use std::path::Path;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+use crate::output;
 use crate::spaces_index::{self, SpaceEntry};
+
+#[derive(Serialize)]
+struct SubsView<'a> {
+    space: &'a str,
+    subscriptions: &'a [String],
+}
 
 #[derive(Subcommand, Debug)]
 pub enum SubsCommand {
@@ -107,19 +114,24 @@ fn data_dir_of(space: &str) -> anyhow::Result<(SpaceEntry, std::path::PathBuf)> 
 fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
     let (entry, dir) = data_dir_of(space)?;
     let mut cfg = load(&dir)?;
-    if cfg.subscriptions.iter().any(|s| s == agent) {
-        println!("space '{}' already subscribed to '{agent}'", entry.name);
-        return Ok(());
+    if !cfg.subscriptions.iter().any(|s| s == agent) {
+        cfg.subscriptions.push(agent.to_string());
+        cfg.subscriptions.sort();
+        save(&dir, &cfg)?;
     }
-    cfg.subscriptions.push(agent.to_string());
-    cfg.subscriptions.sort();
-    save(&dir, &cfg)?;
-    println!(
-        "subscribed space '{}' to '{agent}' ({} total)",
-        entry.name,
-        cfg.subscriptions.len(),
-    );
-    println!("note: takes effect on next `vosx space up {}`.", entry.name);
+    if output::is_json() {
+        output::print_json(&SubsView {
+            space: &entry.name,
+            subscriptions: &cfg.subscriptions,
+        });
+    } else {
+        println!(
+            "subscribed space '{}' to '{agent}' ({} total)",
+            entry.name,
+            cfg.subscriptions.len(),
+        );
+        println!("note: takes effect on next `vosx space up {}`.", entry.name);
+    }
     Ok(())
 }
 
@@ -132,15 +144,22 @@ fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
         anyhow::bail!("space '{}' wasn't subscribed to '{agent}'", entry.name);
     }
     save(&dir, &cfg)?;
-    println!(
-        "unsubscribed space '{}' from '{agent}' ({} remaining)",
-        entry.name,
-        cfg.subscriptions.len(),
-    );
-    if cfg.subscriptions.is_empty() {
-        println!("note: subscription list is now empty — node will sync all agents again.");
+    if output::is_json() {
+        output::print_json(&SubsView {
+            space: &entry.name,
+            subscriptions: &cfg.subscriptions,
+        });
     } else {
-        println!("note: takes effect on next `vosx space up {}`.", entry.name);
+        println!(
+            "unsubscribed space '{}' from '{agent}' ({} remaining)",
+            entry.name,
+            cfg.subscriptions.len(),
+        );
+        if cfg.subscriptions.is_empty() {
+            println!("note: subscription list is now empty — node will sync all agents again.");
+        } else {
+            println!("note: takes effect on next `vosx space up {}`.", entry.name);
+        }
     }
     Ok(())
 }
@@ -148,6 +167,13 @@ fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
 fn run_list(space: &str) -> anyhow::Result<()> {
     let (entry, dir) = data_dir_of(space)?;
     let cfg = load(&dir)?;
+    if output::is_json() {
+        output::print_json(&SubsView {
+            space: &entry.name,
+            subscriptions: &cfg.subscriptions,
+        });
+        return Ok(());
+    }
     if cfg.subscriptions.is_empty() {
         println!(
             "space '{}': no filter — syncing all installed agents.",

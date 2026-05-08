@@ -8,6 +8,9 @@
 
 use std::io::{self, Write};
 
+use serde::Serialize;
+
+use crate::output;
 use crate::spaces_index;
 
 pub struct Args {
@@ -15,26 +18,45 @@ pub struct Args {
     pub yes: bool,
 }
 
+#[derive(Serialize)]
+struct ForgottenView<'a> {
+    name: &'a str,
+    space_id: &'a str,
+    data_dir: &'a str,
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     let mut index = spaces_index::load()?;
     let entry = spaces_index::find(&index, &args.space)?.clone();
 
     let data_dir = std::path::PathBuf::from(&entry.data_dir);
-    println!("about to remove space '{}':", entry.name);
-    println!("  space_id  = {}", entry.id);
-    println!("  data_dir  = {}", data_dir.display());
-    println!();
-    println!("the shared blob cache is preserved — other spaces");
-    println!("that reference the same blobs keep working.");
 
-    if !args.yes {
-        print!("\nproceed? [y/N] ");
-        io::stdout().flush().ok();
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
-        if !matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            println!("aborted.");
-            return Ok(());
+    if output::is_json() {
+        // JSON mode is non-interactive; require --yes so a
+        // misfire from a script can't drop user state. The
+        // prompt path is text-mode only.
+        if !args.yes {
+            anyhow::bail!(
+                "space forget in --format=json requires --yes (no interactive confirmation)",
+            );
+        }
+    } else {
+        println!("about to remove space '{}':", entry.name);
+        println!("  space_id  = {}", entry.id);
+        println!("  data_dir  = {}", data_dir.display());
+        println!();
+        println!("the shared blob cache is preserved — other spaces");
+        println!("that reference the same blobs keep working.");
+
+        if !args.yes {
+            print!("\nproceed? [y/N] ");
+            io::stdout().flush().ok();
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
+            if !matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("aborted.");
+                return Ok(());
+            }
         }
     }
 
@@ -45,6 +67,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     index.spaces.retain(|e| e.id != entry.id);
     spaces_index::save(&index)?;
 
-    println!("removed space '{}' from local store.", entry.name);
+    if output::is_json() {
+        output::print_json(&ForgottenView {
+            name: &entry.name,
+            space_id: &entry.id,
+            data_dir: &entry.data_dir,
+        });
+    } else {
+        println!("removed space '{}' from local store.", entry.name);
+    }
     Ok(())
 }

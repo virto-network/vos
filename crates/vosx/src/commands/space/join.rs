@@ -12,10 +12,23 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::commands::space::new::resolve_registry_source;
 use crate::commands::space::subscriptions::{self, LocalConfig};
+use crate::output;
 use crate::paths;
 use crate::spaces_index::{self, SpacesIndex};
+
+#[derive(Serialize)]
+struct JoinedView<'a> {
+    name: &'a str,
+    space_id: String,
+    data_dir: String,
+    bootnode: &'a str,
+    registry_hash: String,
+    registry_source: &'a str,
+}
 
 pub struct Args {
     pub bootstrap: String,
@@ -96,17 +109,28 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     spaces_index::save(&index)?;
 
     let space_id_hex = paths::space_id_hex(&space_id);
-    println!("joined space '{name}'");
-    println!("  space_id  = {space_id_hex}");
-    println!("  data_dir  = {}", space_dir.display());
-    println!("  bootnode  = {bootnode}");
-    println!("  registry  = {registry_label} ({registry_hash})");
-    println!();
-    println!("note: space_id is taken on trust from the bootstrap address. ");
-    println!("      verification against genesis DAG root lands when the");
-    println!("      placeholder space_id derivation is replaced.");
-    println!();
-    println!("run `vosx space up {name}` to dial the bootnode and start syncing.");
+    if output::is_json() {
+        output::print_json(&JoinedView {
+            name: &name,
+            space_id: space_id_hex,
+            data_dir: space_dir.to_string_lossy().to_string(),
+            bootnode: &bootnode,
+            registry_hash: registry_hash.to_hex(),
+            registry_source: &registry_label,
+        });
+    } else {
+        println!("joined space '{name}'");
+        println!("  space_id  = {space_id_hex}");
+        println!("  data_dir  = {}", space_dir.display());
+        println!("  bootnode  = {bootnode}");
+        println!("  registry  = {registry_label} ({registry_hash})");
+        println!();
+        println!("note: space_id is taken on trust from the bootstrap address. ");
+        println!("      verification against genesis DAG root lands when the");
+        println!("      placeholder space_id derivation is replaced.");
+        println!();
+        println!("run `vosx space up {name}` to dial the bootnode and start syncing.");
+    }
 
     Ok(())
 }

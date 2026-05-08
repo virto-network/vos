@@ -12,13 +12,27 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 use space_registry::{NODE_ROLE_VOTER, SpaceRegistryRef, STATUS_OK};
 
 use crate::blob_store::{self, BlobSource};
+use crate::output;
 use crate::paths;
 use crate::spaces_index::{self, SpacesIndex};
+
+#[derive(Serialize)]
+struct CreatedView<'a> {
+    name: &'a str,
+    space_id: String,
+    genesis_root: String,
+    data_dir: String,
+    node_key: String,
+    registry_hash: String,
+    registry_source: &'a str,
+    peer_id: String,
+}
 
 pub struct Args {
     pub name: String,
@@ -140,17 +154,30 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // 11. Print.
     let space_id_hex = paths::space_id_hex(&space_id);
-    println!("created space '{}'", args.name);
-    println!("  space_id     = {space_id_hex}");
-    println!("  genesis_root = {}", hex::encode(genesis_root));
-    println!("  data_dir     = {}", final_dir.display());
-    println!("  node.key     = {}", key_path.display());
-    println!("  registry     = {registry_label} ({registry_hash})");
-    println!("  peer_id      = {peer_id}");
-    println!();
-    println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
-    println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
-    println!("printed by `space info {}` once the daemon's running.", args.name);
+    if output::is_json() {
+        output::print_json(&CreatedView {
+            name: &args.name,
+            space_id: space_id_hex,
+            genesis_root: hex::encode(genesis_root),
+            data_dir: final_dir.to_string_lossy().to_string(),
+            node_key: key_path.to_string_lossy().to_string(),
+            registry_hash: registry_hash.to_hex(),
+            registry_source: &registry_label,
+            peer_id: peer_id.to_string(),
+        });
+    } else {
+        println!("created space '{}'", args.name);
+        println!("  space_id     = {space_id_hex}");
+        println!("  genesis_root = {}", hex::encode(genesis_root));
+        println!("  data_dir     = {}", final_dir.display());
+        println!("  node.key     = {}", key_path.display());
+        println!("  registry     = {registry_label} ({registry_hash})");
+        println!("  peer_id      = {peer_id}");
+        println!();
+        println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
+        println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
+        println!("printed by `space info {}` once the daemon's running.", args.name);
+    }
 
     Ok(())
 }

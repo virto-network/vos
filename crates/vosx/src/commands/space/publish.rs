@@ -1,10 +1,19 @@
 //! `space publish` — add a program to the catalog.
 
+use serde::Serialize;
 use space_registry::{STATUS_OK, STATUS_TAG_CONFLICT};
 
 use crate::blob_store::{self, BlobSource};
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::parse_program_ref;
+use crate::output;
+
+#[derive(Serialize)]
+struct PublishedView {
+    name: String,
+    version: String,
+    hash: String,
+}
 
 pub struct Args {
     pub space: String,
@@ -24,8 +33,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
         match status {
             STATUS_OK => {
-                println!("published {name}:{version}");
-                println!("  hash = {hash}");
+                if output::is_json() {
+                    output::print_json(&PublishedView {
+                        name: name.clone(),
+                        version: version.clone(),
+                        hash: hash.to_hex(),
+                    });
+                } else {
+                    println!("published {name}:{version}");
+                    println!("  hash = {hash}");
+                }
                 Ok(())
             }
             STATUS_TAG_CONFLICT => anyhow::bail!(
