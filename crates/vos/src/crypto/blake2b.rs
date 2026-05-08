@@ -13,6 +13,14 @@
 //! `φ[10]=h_ptr (64B)`, `φ[11]=m_ptr (128B)`, `φ[12]=t_low`,
 //! `φ[7]=f` flag. When the zkpvm chip lands on master, the same
 //! ECALL hits the accelerated chip path with no actor changes.
+//!
+//! **ABI limit**: only the low 64 bits of the blake2b byte
+//! counter are passed (`t_low`). Inputs larger than 2^64 bytes
+//! (~16 EB) per hash would lose the high half and produce a
+//! divergent digest. Not a practical concern for any realistic
+//! workload; matched by zkpvm-precompiles. If we ever need
+//! arbitrary-length hashes we'd extend the ABI to also pass
+//! `t_high` in `φ[13]`.
 
 #[cfg(target_arch = "riscv64")]
 use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
