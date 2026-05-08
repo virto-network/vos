@@ -63,6 +63,7 @@ use crate::{
     lookups::{
         RistrettoCombConsumerRegisterFileLookupElements,
         RistrettoCombCoordBoundaryLookupElements,
+        RistrettoCombFinalAccLookupElements,
     },
 };
 #[cfg(feature = "prover")]
@@ -213,6 +214,25 @@ pub enum PreprocessedColumn {
     /// `ByteIdx[k] = k` for k=0..32.
     #[size = 32]
     ByteIdx,
+    /// R1e-bis Batch 4b: 1 iff this row is one of the 4 final-Acc
+    /// mul rows of window 63 within a real per-call block — i.e.,
+    /// the rows producing X3 / Y3 / T3 / Z3 of the running
+    /// accumulator at the end of the comb chain.  Per-call block
+    /// offsets (0-indexed): 1404 (X3), 1405 (Y3), 1406 (T3),
+    /// 1407 (Z3).  Drives 32 producer emissions per row to
+    /// `RistrettoCombFinalAccLookupElements`.
+    #[size = 1]
+    IsFinalAccProducer,
+    /// On IsFinalAccProducer rows: the per-call call index
+    /// `(row - N_BOUNDARY_INPUTS) / 1408`.  Zero on other rows.
+    #[size = 1]
+    FinalAccCallIdx,
+    /// On IsFinalAccProducer rows: coord_kind ∈ {0=X, 1=Y, 2=Z,
+    /// 3=T}.  Mapping mirrors `point_add_rows_chained` emission
+    /// order: row offset 1404 → X (0), 1405 → Y (1), 1406 → T (3),
+    /// 1407 → Z (2).
+    #[size = 1]
+    FinalAccCoordKind,
 }
 
 /// Per-row witness for the consumer chip.
@@ -394,6 +414,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
     type LookupElements = (
         RistrettoCombCoordBoundaryLookupElements,
         RistrettoCombConsumerRegisterFileLookupElements,
+        RistrettoCombFinalAccLookupElements,
     );
 
     fn add_constraints<E: EvalAtRow>(
@@ -403,9 +424,10 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
         lookup_elements: &(
             RistrettoCombCoordBoundaryLookupElements,
             RistrettoCombConsumerRegisterFileLookupElements,
+            RistrettoCombFinalAccLookupElements,
         ),
     ) {
-        let (coord_lookup, regfile_lookup) = lookup_elements;
+        let (coord_lookup, regfile_lookup, final_acc_lookup) = lookup_elements;
 
         // Column reads.
         let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
@@ -466,6 +488,18 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
         let byte_idx_pp =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
+        let is_final_acc_producer = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::IsFinalAccProducer
+        );
+        let final_acc_call_idx = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::FinalAccCallIdx
+        );
+        let final_acc_coord_kind = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::FinalAccCoordKind
+        );
 
         // Shared FieldOp algebra.
         field_op_constraints::add_field_op_constraints(
@@ -583,6 +617,28 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
             ));
         }
 
+        // ── Final-Acc cross-chip producer (Batch 4b) ──
+        // On each of the 4 final-Acc rows of window 63 in real
+        // per-call blocks (gated by IsFinalAccProducer), emit 32
+        // producer tuples `(call_idx, coord_kind, byte_idx, out[k])`
+        // to the cross-chip relation.  The compress chip's IsInput
+        // rows for X/Y/Z/T (offsets +0..+3 of each per-call block
+        // in compress's row layout) consume these tuples — binding
+        // compress's X/Y/Z/T inputs to the comb chain's
+        // window-63 final accumulator coords.
+        for k in 0..32 {
+            eval.add_to_relation(RelationEntry::new(
+                final_acc_lookup,
+                is_final_acc_producer[0].clone().into(),
+                &[
+                    final_acc_call_idx[0].clone(),
+                    final_acc_coord_kind[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -599,6 +655,18 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
         let log_size = log_size_for(consumer_n_rows(side_note));
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
+        let real_n_rows = consumer_n_rows(side_note);
+        let n_calls = side_note.ristretto_comb_calls.len();
+        // Per-window block: 4 IsInput coord rows + 18 add rows = 22.
+        // Per-call block: 64 windows × 22 = 1408 rows.
+        // Window-63 final-Acc rows are the LAST 4 rows of window 63's
+        // 18-row add chain — at offsets 1404, 1405, 1406, 1407 within
+        // the per-call block.  Coord kind mapping mirrors
+        // `point_add_rows_chained` emission order: X3 (0), Y3 (1),
+        // T3 (3), Z3 (2).
+        const FINAL_ACC_OFFSETS: [usize; 4] = [1404, 1405, 1406, 1407];
+        const FINAL_ACC_COORD_KINDS: [u8; 4] = [0, 1, 3, 2];
+        const PER_CALL_ROWS: usize = 64 * ROWS_PER_WINDOW; // 1408
         for row in 0..num_rows {
             let row_lo = (row & 0xff) as u8;
             let row_hi = ((row >> 8) & 0xff) as u8;
@@ -606,6 +674,34 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
             trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
             let byte_idx_arr: [u8; 32] = core::array::from_fn(|k| k as u8);
             trace.fill_columns_bytes(row, &byte_idx_arr, PreprocessedColumn::ByteIdx);
+
+            // IsFinalAccProducer + FinalAccCallIdx + FinalAccCoordKind:
+            // 1 only on the 4 final-Acc rows of window 63 in real
+            // per-call blocks.
+            let mut is_final_acc = 0u8;
+            let mut call_idx = 0u8;
+            let mut coord_kind = 0u8;
+            if row >= N_BOUNDARY_INPUTS && row < real_n_rows && n_calls > 0 {
+                let within_call_section = row - N_BOUNDARY_INPUTS;
+                let c = within_call_section / PER_CALL_ROWS;
+                let off = within_call_section % PER_CALL_ROWS;
+                if let Some(slot) = FINAL_ACC_OFFSETS.iter().position(|&o| o == off) {
+                    is_final_acc = 1;
+                    call_idx = c as u8;
+                    coord_kind = FINAL_ACC_COORD_KINDS[slot];
+                }
+            }
+            trace.fill_columns(
+                row,
+                is_final_acc,
+                PreprocessedColumn::IsFinalAccProducer,
+            );
+            trace.fill_columns(row, call_idx, PreprocessedColumn::FinalAccCallIdx);
+            trace.fill_columns(
+                row,
+                coord_kind,
+                PreprocessedColumn::FinalAccCoordKind,
+            );
         }
         trace.finalize_bit_reversed()
     }
@@ -637,6 +733,7 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
         let coord: &RistrettoCombCoordBoundaryLookupElements = lookup_elements.as_ref();
         let regfile: &RistrettoCombConsumerRegisterFileLookupElements =
             lookup_elements.as_ref();
+        let final_acc: &RistrettoCombFinalAccLookupElements = lookup_elements.as_ref();
 
         let is_coord_input =
             crate::trace::original_base_column!(component_trace, Column::IsCoordInput);
@@ -646,6 +743,19 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
             crate::trace::original_base_column!(component_trace, Column::WindowIdx);
         let coord_kind =
             crate::trace::original_base_column!(component_trace, Column::CoordKind);
+
+        let is_final_acc_producer_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::IsFinalAccProducer
+        );
+        let final_acc_call_idx_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::FinalAccCallIdx
+        );
+        let final_acc_coord_kind_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::FinalAccCoordKind
+        );
 
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -732,6 +842,21 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
                     b_src_hi_col[0].clone(),
                     byte_idx_pp[k].clone(),
                     b_cols[k].clone(),
+                ],
+            );
+        }
+
+        // ── Final-Acc cross-chip producer emissions ──
+        for k in 0..32 {
+            logup.add_to_relation_with(
+                final_acc,
+                [is_final_acc_producer_pp[0].clone()],
+                |[g]| g.into(),
+                &[
+                    final_acc_call_idx_pp[0].clone(),
+                    final_acc_coord_kind_pp[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
                 ],
             );
         }

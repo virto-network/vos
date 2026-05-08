@@ -370,3 +370,31 @@ stwo_constraint_framework::relation!(
     RistrettoCombCompressOutputLookupElements,
     REL_RISTRETTO_COMB_COMPRESS_OUTPUT_SIZE
 );
+
+// R1e-bis Batch 4b: cross-chip relation binding the final-Acc
+// X/Y/Z/T from `RistrettoFixedBaseConsumerChip`'s window-63 last
+// 4 mul rows to `RistrettoCombCompressChip`'s 4 IsInput rows for
+// X/Y/Z/T (offsets +0..+3 within each per-call block).
+//
+// Tuple: (call_idx, coord_kind, byte_idx, value) — 4 limbs.
+// `coord_kind` ∈ {0=X, 1=Y, 2=Z, 3=T}.
+//
+// PRODUCER (`RistrettoFixedBaseConsumerChip`): per call, the last
+// 4 mul rows of window 63's 18-row add chain — at offsets
+// `N_BOUNDARY_INPUTS + call_idx × 1408 + 1404..=1407` in the chip's
+// row layout — emit 32 producer tuples each (one per byte).
+// 4 × 32 = 128 producer tuples per call.  Order within those 4
+// rows: X3 (coord_kind=0) at +1404, Y3 (=1) at +1405, T3 (=3)
+// at +1406, Z3 (=2) at +1407 — matches the
+// `point_add_rows_chained` emission order.
+//
+// CONSUMER (`RistrettoCombCompressChip`): per call, the 4 IsInput
+// rows for X/Y/Z/T (compress-chip offsets +0..+3) emit 32 consumer
+// tuples each.  Balance forces the compress chain's IsInput
+// `out` columns to equal the consumer chip's window-63 final-Acc
+// coords — closing the X/Y/Z/T cross-chip binding gap.
+const REL_RISTRETTO_COMB_FINAL_ACC_SIZE: usize = 4;
+stwo_constraint_framework::relation!(
+    RistrettoCombFinalAccLookupElements,
+    REL_RISTRETTO_COMB_FINAL_ACC_SIZE
+);

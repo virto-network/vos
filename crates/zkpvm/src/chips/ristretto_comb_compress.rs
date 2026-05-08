@@ -80,7 +80,7 @@ use crate::chips::ristretto::field_op_constraints;
 use crate::framework::BuiltInComponent;
 use crate::lookups::{
     ByteToBitsLookupElements, RistrettoCombCompressOutputLookupElements,
-    RistrettoCombCompressRegFileLookupElements,
+    RistrettoCombCompressRegFileLookupElements, RistrettoCombFinalAccLookupElements,
 };
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
@@ -391,6 +391,18 @@ pub enum PreprocessedColumn {
     /// of the output-binding relation tuple.
     #[size = 1]
     CallIdx,
+    /// R1e-bis Batch 4b: 1 iff this row is one of the 4 IsInput
+    /// X/Y/Z/T rows at the start of a real per-call block (offsets
+    /// +0..+3).  Drives 32 consumer emissions per row to
+    /// `RistrettoCombFinalAccLookupElements`, binding the
+    /// compress chain's X/Y/Z/T inputs to the consumer chip's
+    /// window-63 final-Acc producer.
+    #[size = 1]
+    IsCoordInputConsumer,
+    /// On IsCoordInputConsumer rows: coord_kind ∈ {0=X, 1=Y, 2=Z,
+    /// 3=T} matching the per-call offset (+0=X, +1=Y, +2=Z, +3=T).
+    #[size = 1]
+    CompressCoordKind,
 }
 
 #[cfg(feature = "prover")]
@@ -928,6 +940,7 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         RistrettoCombCompressRegFileLookupElements,
         ByteToBitsLookupElements,
         RistrettoCombCompressOutputLookupElements,
+        RistrettoCombFinalAccLookupElements,
     );
 
     fn add_constraints<E: EvalAtRow>(
@@ -938,9 +951,11 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             RistrettoCombCompressRegFileLookupElements,
             ByteToBitsLookupElements,
             RistrettoCombCompressOutputLookupElements,
+            RistrettoCombFinalAccLookupElements,
         ),
     ) {
-        let (regfile_lookup, byte_to_bits_lookup, output_lookup) = lookup_elements;
+        let (regfile_lookup, byte_to_bits_lookup, output_lookup, final_acc_lookup) =
+            lookup_elements;
         // Column reads.
         let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
         let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
@@ -1014,6 +1029,14 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         );
         let call_idx_pp =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::CallIdx);
+        let is_coord_input_consumer = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::IsCoordInputConsumer
+        );
+        let compress_coord_kind = crate::trace::preprocessed_trace_eval!(
+            trace_eval,
+            PreprocessedColumn::CompressCoordKind
+        );
 
         // Shared FieldOp algebra.
         field_op_constraints::add_field_op_constraints(
@@ -1204,6 +1227,30 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             ));
         }
 
+        // ── Final-Acc cross-chip consumer emissions (Batch 4b) ──
+        // On the 4 IsInput rows for X/Y/Z/T (offsets +0..+3 of
+        // each per-call block, gated by IsCoordInputConsumer), emit
+        // 32 consumer tuples `(call_idx, coord_kind, byte_idx,
+        // out[k])` to `RistrettoCombFinalAccLookupElements`.
+        // Producer side lives in `RistrettoFixedBaseConsumerChip`
+        // (Batch 4b) — its window-63 final-Acc rows emit the
+        // matching tuples.  Balance forces the compress chain's
+        // X/Y/Z/T inputs to equal the comb chain's window-63 final
+        // accumulator coords, closing the X/Y/Z/T cross-chip
+        // soundness gap.
+        for k in 0..32 {
+            eval.add_to_relation(RelationEntry::new(
+                final_acc_lookup,
+                (-is_coord_input_consumer[0].clone()).into(),
+                &[
+                    call_idx_pp[0].clone(),
+                    compress_coord_kind[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+        }
+
         eval.finalize_logup_in_pairs();
     }
 }
@@ -1253,6 +1300,23 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
                 0
             };
             trace.fill_columns(row, call_idx, PreprocessedColumn::CallIdx);
+            // IsCoordInputConsumer + CompressCoordKind: 1 on the 4
+            // IsInput X/Y/Z/T rows at offsets +0..+3 of real
+            // per-call blocks.
+            let (is_coord_input_consumer, coord_kind) = match per_call_offset {
+                Some(o) if o < 4 => (1u8, o as u8),
+                _ => (0u8, 0u8),
+            };
+            trace.fill_columns(
+                row,
+                is_coord_input_consumer,
+                PreprocessedColumn::IsCoordInputConsumer,
+            );
+            trace.fill_columns(
+                row,
+                coord_kind,
+                PreprocessedColumn::CompressCoordKind,
+            );
         }
         trace.finalize_bit_reversed()
     }
@@ -1286,6 +1350,8 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let byte_to_bits: &ByteToBitsLookupElements = lookup_elements.as_ref();
         let output_relation: &RistrettoCombCompressOutputLookupElements =
             lookup_elements.as_ref();
+        let final_acc_relation: &RistrettoCombFinalAccLookupElements =
+            lookup_elements.as_ref();
 
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -1298,6 +1364,14 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let call_idx_pp_col = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::CallIdx
+        );
+        let is_coord_input_consumer_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::IsCoordInputConsumer
+        );
+        let compress_coord_kind_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::CompressCoordKind
         );
         let row_idx_hi_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -1417,6 +1491,21 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
                 |[g]| g.into(),
                 &[
                     call_idx_pp_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
+                ],
+            );
+        }
+
+        // ── Final-Acc cross-chip consumer emissions ──
+        for k in 0..32 {
+            logup.add_to_relation_with(
+                final_acc_relation,
+                [is_coord_input_consumer_pp[0].clone()],
+                |[g]| (-g).into(),
+                &[
+                    call_idx_pp_col[0].clone(),
+                    compress_coord_kind_pp[0].clone(),
                     byte_idx_pp[k].clone(),
                     out_cols[k].clone(),
                 ],
