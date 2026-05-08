@@ -33,22 +33,12 @@ pub fn truncate(s: &str, max: usize) -> &str {
 }
 
 /// Deterministic per-node `ServiceId` for an installed agent.
-///
-/// `prefix` is the node's 16-bit identity prefix; the low 16
-/// bits are derived from `instance_name` and clamped to
-/// `[0x100, 0x7FFF]` so they can't collide with `ServiceId::REGISTRY`
-/// (= 0) or any reserved low system ids. Stable across restarts
-/// of the same node so each instance's redb path persists.
+/// Thin wrapper around `space_registry::instance_service_id`
+/// that returns the typed `ServiceId` host code prefers; the
+/// formula itself lives next to the registry actor's `resolve`
+/// handler so both sides agree by construction.
 pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
-    let mut h = blake2b_simd::Params::new().hash_length(2).to_state();
-    h.update(b"vos-instance-svc-id/v1");
-    h.update(&[0u8]);
-    h.update(instance_name.as_bytes());
-    let bytes = h.finalize();
-    let buf = bytes.as_bytes();
-    let raw = u16::from_le_bytes([buf[0], buf[1]]);
-    let local = (raw & 0x7FFF).max(0x100);
-    ServiceId(((prefix as u32) << 16) | (local as u32))
+    ServiceId(space_registry::instance_service_id(instance_name, prefix))
 }
 
 /// Map a registry-stored `consistency` u8 to the host enum.

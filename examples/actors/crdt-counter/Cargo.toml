@@ -30,17 +30,14 @@ required-features = ["bin"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
-registry = { path = "../../../crates/actors/registry", default-features = false }
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
-registry = { path = "../../../crates/actors/registry", default-features = false }
 
 
 [target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
 vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "worker"] }
-registry = { path = "../../../crates/actors/registry", default-features = false }
 
 
 [profile.release]

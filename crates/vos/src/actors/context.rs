@@ -162,12 +162,31 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    // Name resolution belongs to the registry actor, not vos. To
-    // resolve from a PVM actor handler, depend on the `registry`
-    // crate and call `ctx.ask(ServiceId::REGISTRY, ...)`
-    // directly. A future macro-generated `RegistryActorClient`
-    // will wrap this; for now it stays explicit so vos doesn't
-    // know about any specific service.
+    /// Resolve an installed agent's name to its node-local
+    /// `ServiceId` (packed as u32) by asking the well-known
+    /// `ServiceId::REGISTRY` service. Returns 0 when no agent
+    /// with that name is installed.
+    ///
+    /// Thin convenience over `ctx.ask(REGISTRY, Msg::new("resolve")…)`
+    /// so actor crates don't need to depend on the registry's
+    /// typed Ref to use it. The returned id is dispatchable via
+    /// `ctx.tell` / `ctx.send` — same formula `space up` uses
+    /// when registering installed agents on this node.
+    ///
+    /// ```ignore
+    /// let counter = ctx.resolve("counter").await;
+    /// if counter != 0 {
+    ///     ctx.tell(ServiceId(counter), &Msg::new("inc"));
+    /// }
+    /// ```
+    pub fn resolve(&mut self, name: impl Into<alloc::string::String>) -> super::run::Resolve {
+        let prefix = self.id.node_prefix();
+        let mut msg = super::value::Msg::new("resolve");
+        msg = msg.with("name", name.into());
+        msg = msg.with("caller_prefix", prefix as u64);
+        let ask = self.ask(ServiceId::REGISTRY, &msg);
+        super::run::Resolve::new(ask)
+    }
 
     // --- Host I/O (worker mode) ---
 

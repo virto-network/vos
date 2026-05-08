@@ -221,6 +221,36 @@ impl Future for HostIo {
     }
 }
 
+/// Future returned by [`super::context::Context::resolve`].
+///
+/// Wraps a registry `Ask`, decoding the reply into a u32. Any
+/// non-`Value::U32` reply (or invoke error) collapses to 0 —
+/// callers treat 0 as "not found", matching the registry's
+/// own protocol.
+pub struct Resolve {
+    ask: Ask,
+}
+
+impl Resolve {
+    pub(crate) fn new(ask: Ask) -> Self {
+        Self { ask }
+    }
+}
+
+impl Unpin for Resolve {}
+
+impl Future for Resolve {
+    type Output = u32;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        match Pin::new(&mut self.ask).poll(cx) {
+            Poll::Ready(Ok(super::value::Value::U32(n))) => Poll::Ready(n),
+            Poll::Ready(_) => Poll::Ready(0),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 // ── Refine-mode flag (service framework) ──────────────────────────────
 
 /// Global flag: are we currently inside `run_refine_service`?

@@ -63,15 +63,9 @@ futures-executor = { version = "0.3", default-features = false, features = ["std
 futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
 
 [dev-dependencies]
-# Tests use the typed `RegistryRef` (always emitted) and the
-# host-only `replication_id` helper (gated on registry's `host`
-# feature). Cargo allows this dev-dep cycle (registry → vos)
-# because dev-deps don't participate in the regular dep graph;
-# only test/example builds activate it.
-registry = { path = "../actors/registry", default-features = false, features = ["host"] }
 # `default-features = false` so the `bin` feature stays off — host
-# tests just need the `RegistryRef` / `CrdtCounterRef` typed surface
-# from the rlib, not the cdylib glue. The vos build for these dev-deps
+# tests just need the `CrdtCounterRef` typed surface from the
+# rlib, not the cdylib glue. The vos build for these dev-deps
 # pulls vos's own default features (std + http + storage + network)
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.

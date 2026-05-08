@@ -369,6 +369,26 @@ impl SpaceRegistry {
         self.agents.clone()
     }
 
+    /// Resolve an installed agent's name to the `ServiceId` it
+    /// occupies on the caller's node, packed as a u32.
+    /// `caller_prefix` is the asking node's 16-bit identity
+    /// prefix (passed by `Context::resolve` from the caller's
+    /// own `id().node_prefix()`); the registry derives the
+    /// local half via `instance_service_id`. Returns 0 when no
+    /// agent with that name is installed.
+    ///
+    /// This is the runtime name → ServiceId lookup actors reach
+    /// for via `ctx.resolve(name)`. Same formula `space up`
+    /// uses host-side, so the derived id matches the actual
+    /// per-node registration.
+    #[msg]
+    async fn resolve(&self, name: String, caller_prefix: u64) -> u32 {
+        if !self.agents.iter().any(|a| a.instance_name == name) {
+            return 0;
+        }
+        instance_service_id(&name, caller_prefix as u16)
+    }
+
     // ── Members ────────────────────────────────────────────────
 
     /// Add a Node member. Idempotent in `prefix` — re-adding
@@ -529,6 +549,31 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
     } else {
         0
     }
+}
+
+// ── Common helpers (host + actor) ────────────────────────────────
+
+/// Deterministic per-node `ServiceId` (packed as u32) for an
+/// installed agent named `instance_name` on a node with the
+/// given 16-bit `prefix`.
+///
+/// The low 16 bits are derived from `instance_name` via blake2b
+/// and clamped to `[0x100, 0x7FFF]` so they can't collide with
+/// `ServiceId::REGISTRY` (= 0) or any reserved low system ids.
+/// Stable across restarts of the same node so each instance's
+/// redb path persists.
+///
+/// On riscv64 (PVM actors) the blake2b dispatches to the host
+/// ECALL precompile; on host targets it runs the in-tree
+/// software fallback. Both paths produce the same bytes.
+pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
+    let raw_bytes: [u8; 2] = vos::crypto::blake2b_hash(
+        b"vos-instance-svc-id/v1",
+        &[&[0u8], instance_name.as_bytes()],
+    );
+    let raw = u16::from_le_bytes(raw_bytes);
+    let local = (raw & 0x7FFF).max(0x100);
+    ((prefix as u32) << 16) | (local as u32)
 }
 
 // ── Host helpers (`host` feature) ────────────────────────────────

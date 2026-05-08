@@ -51,28 +51,20 @@ impl CrdtCounter {
         panic!("crdt-counter: boom — deliberate panic for test");
     }
 
-    /// Resolve `name` against the hyperspace registry via the
-    /// macro-generated `RegistryRef`. The same Ref type works
-    /// here (with `ctx` as the invoker) and from host code (with
-    /// `&node` as the invoker).
+    /// Resolve `name` against the per-space registry via the
+    /// `Context::resolve` utility. No dep on space-registry's
+    /// typed Ref — `ctx.resolve` sends a dynamic message to
+    /// the well-known `ServiceId::REGISTRY` and returns the
+    /// asking node's local svc_id (or 0 if not installed).
     #[msg]
     async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
-        use vos::abi::service::ServiceId;
-        use registry::RegistryRef;
-        match RegistryRef::at(ServiceId::REGISTRY).resolve(ctx, name.clone()).await {
-            Ok(id) => {
-                if id == 0 {
-                    log::info!("crdt-counter: whois({name}) -> not found");
-                } else {
-                    log::info!("crdt-counter: whois({name}) -> {id}");
-                }
-                id
-            }
-            Err(e) => {
-                log::info!("crdt-counter: whois({name}) -> error {e}");
-                0
-            }
+        let id = ctx.resolve(name.clone()).await;
+        if id == 0 {
+            log::info!("crdt-counter: whois({name}) -> not found");
+        } else {
+            log::info!("crdt-counter: whois({name}) -> {id}");
         }
+        id
     }
 }
 
