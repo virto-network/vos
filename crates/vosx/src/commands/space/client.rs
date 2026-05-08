@@ -120,18 +120,15 @@ impl DaemonClient {
     }
 
     /// Macro-generated typed `Ref` pointed at the daemon's
-    /// registry. Use as `vos::block_on(client.registry().publish(&mut &*client.node(), ...))`.
-    pub fn registry(&self) -> SpaceRegistryRef {
+    /// registry. Internal — every typed wrapper goes through
+    /// here.
+    fn registry(&self) -> SpaceRegistryRef {
         SpaceRegistryRef::at(self.registry_id())
     }
 
     /// The daemon's registry `ServiceId` — `(daemon_prefix, 0)`.
-    pub fn registry_id(&self) -> ServiceId {
+    fn registry_id(&self) -> ServiceId {
         ServiceId::new(self.daemon_prefix, ServiceId::REGISTRY.local_id())
-    }
-
-    pub fn node(&self) -> &VosNode {
-        &self.node
     }
 
     /// Resolve a user-supplied target string to a daemon-side

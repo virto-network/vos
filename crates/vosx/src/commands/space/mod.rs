@@ -23,7 +23,6 @@ pub mod agents;
 pub mod call;
 pub mod client;
 pub mod common;
-pub mod dag;
 pub mod delete;
 pub mod endpoint;
 pub mod export;
@@ -238,14 +237,6 @@ pub enum SpaceCommand {
     Ping {
         space: String,
     },
-    /// Read-only DAG diagnostic for an installed agent's
-    /// CRDT redb. `<agent>` is `registry` or any installed
-    /// instance name. The daemon must NOT be running (redb
-    /// is exclusively locked while `space up` holds it).
-    Dag {
-        space: String,
-        agent: String,
-    },
     /// Invoke any agent on the running daemon. Generic floor
     /// primitive; `publish` / `install` / etc. are typed sugar
     /// wrappers around the same plumbing.
@@ -355,6 +346,5 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         }
         SpaceCommand::Subscriptions { space } => subscriptions::run_list(&space),
         SpaceCommand::Ping { space } => ping::run(&space),
-        SpaceCommand::Dag { space, agent } => dag::run(&space, &agent),
     }
 }

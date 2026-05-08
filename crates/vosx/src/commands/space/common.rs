@@ -6,7 +6,7 @@
 //!   tabular output.
 //! - `instance_service_id` / `registry_replication_id` — the two
 //!   deterministic id derivations that need to agree across
-//!   `up`, `dag`, `reconcile`, `client`.
+//!   `up`, `reconcile`, `client`.
 
 use vos::abi::service::ServiceId;
 use vos::node::Consistency;
