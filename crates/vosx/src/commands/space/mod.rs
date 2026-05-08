@@ -72,10 +72,8 @@ pub enum SpaceCommand {
     List,
     /// Show details for a single space (by id-prefix or name).
     Info {
-        /// Space id (full hex) or name. If omitted, shows the
-        /// space whose `data_dir` matches the current directory
-        /// when present, else errors.
-        space: Option<String>,
+        /// Space id (full hex) or name.
+        space: String,
     },
     /// Join a remote space — register it locally so
     /// `space up` can dial the bootnode and start syncing.
@@ -256,7 +254,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             data_dir,
         }),
         SpaceCommand::List => list::run(),
-        SpaceCommand::Info { space } => info::run(space.as_deref()),
+        SpaceCommand::Info { space } => info::run(&space),
         SpaceCommand::Join {
             bootstrap,
             registry,

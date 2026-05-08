@@ -6,22 +6,9 @@ use crate::commands::space::endpoint;
 use crate::commands::space::subscriptions;
 use crate::spaces_index;
 
-pub fn run(query: Option<&str>) -> anyhow::Result<()> {
+pub fn run(query: &str) -> anyhow::Result<()> {
     let index = spaces_index::load()?;
-    let entry = match query {
-        Some(q) => spaces_index::find(&index, q)?,
-        None => {
-            // No arg → look for a space whose data_dir is the
-            // current directory or one of its ancestors.
-            let cwd = std::env::current_dir()?;
-            match resolve_by_cwd(&index.spaces, &cwd) {
-                Some(e) => e,
-                None => anyhow::bail!(
-                    "no space matches the current dir; pass a space name or id"
-                ),
-            }
-        }
-    };
+    let entry = spaces_index::find(&index, query)?;
 
     println!("name        {}", entry.name);
     println!("space_id    {}", entry.id);
@@ -93,14 +80,4 @@ pub fn run(query: Option<&str>) -> anyhow::Result<()> {
     println!("agents      {count} on disk (in {})", agents_dir.display());
 
     Ok(())
-}
-
-fn resolve_by_cwd<'a>(
-    spaces: &'a [crate::spaces_index::SpaceEntry],
-    cwd: &std::path::Path,
-) -> Option<&'a crate::spaces_index::SpaceEntry> {
-    spaces.iter().find(|e| {
-        let p = PathBuf::from(&e.data_dir);
-        cwd.starts_with(&p) || p == *cwd
-    })
 }
