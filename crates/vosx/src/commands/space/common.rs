@@ -59,13 +59,7 @@ pub fn consistency_from_u8(c: u8) -> Option<Consistency> {
 /// || space_id). Deterministic from `space_id` so any two replicas
 /// of the same space subscribe to the same gossipsub topic.
 pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-space-registry/v1");
-    h.update(&[0u8]);
-    h.update(space_id);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+    vos::crypto::blake2b_hash(b"vos-space-registry/v1", &[&[0u8], space_id])
 }
 
 /// Compute a space's id from the registry's genesis DAG root.
@@ -73,13 +67,10 @@ pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
 /// joiner that fetches the genesis snapshot. Host-only
 /// (called before any daemon is up).
 pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(space_registry::SPACE_ID_DOMAIN_TAG);
-    h.update(&[0u8]);
-    h.update(genesis_dag_root);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+    vos::crypto::blake2b_hash(
+        space_registry::SPACE_ID_DOMAIN_TAG,
+        &[&[0u8], genesis_dag_root],
+    )
 }
 
 /// Auto-derive a `replication_id` for an installed agent.
@@ -89,15 +80,10 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 /// topic this id maps to. Host-only — set at install time
 /// from vosx and stored on the registry's `AgentRow`.
 pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-replication-id/v1");
-    h.update(&[0u8]);
-    h.update(instance_name.as_bytes());
-    h.update(&[0u8]);
-    h.update(program_hash);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
+    vos::crypto::blake2b_hash(
+        b"vos-replication-id/v1",
+        &[&[0u8], instance_name.as_bytes(), &[0u8], program_hash],
+    )
 }
 
 /// Render a registry-stored consistency u8 as the canonical

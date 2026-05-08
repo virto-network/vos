@@ -21,10 +21,11 @@ pub struct BlobHash(pub [u8; 32]);
 
 impl BlobHash {
     pub fn of(bytes: &[u8]) -> Self {
-        let h = blake2b_simd::Params::new().hash_length(32).hash(bytes);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(h.as_bytes());
-        BlobHash(out)
+        // Bare 32-byte blake2b digest — no domain tag, no
+        // separator. Routes through `vos::crypto` so the
+        // host's blake2b_simd backend is the one impl that
+        // sees actor blobs *and* anything else vosx hashes.
+        BlobHash(vos::crypto::blake2b_hash::<32>(&[], &[bytes]))
     }
 
     pub fn to_hex(&self) -> String {

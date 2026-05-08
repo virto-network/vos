@@ -41,11 +41,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Used only by the auto-derive replication-id helper for
-# CRDT actors that don't pin a group manually. The registry's
-# own group-id derivation lives behind `registry::replication_id`.
-blake2b_simd = "1"
-
 # libp2p multiaddr parsing for `--listen` / `--connect`. The
 # rest of the network plumbing is owned by `vos::network`.
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"] }
