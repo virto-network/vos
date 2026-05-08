@@ -160,39 +160,16 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
     }
 }
 
+/// `yyyy-mm-ddThh:mm:ssZ` UTC — bit-identical to the previous
+/// handrolled impl, just delegated to the `time` crate so the
+/// civil-date math doesn't live in vosx.
 fn now_iso8601() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Truly tiny formatter — yyyy-mm-ddThh:mm:ssZ in UTC.
-    // Avoids pulling chrono just for one field.
-    let secs = now;
-    let days = secs / 86_400;
-    let secs_of_day = secs % 86_400;
-    let h = secs_of_day / 3600;
-    let m = (secs_of_day % 3600) / 60;
-    let s = secs_of_day % 60;
-    let (y, mo, d) = days_to_ymd(days as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-/// Civil-date conversion (proleptic Gregorian) — same as the
-/// algorithm in `time` v0.3 minus the dependency. Days since
-/// 1970-01-01 → (y, mo, d).
-fn days_to_ymd(days_since_epoch: i64) -> (i64, u32, u32) {
-    // Convert epoch days to days-since-0000-03-01.
-    let days = days_since_epoch + 719_468;
-    let era = days.div_euclid(146_097);
-    let doe = days.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    const FORMAT: &[time::format_description::FormatItem<'_>] = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+    );
+    time::OffsetDateTime::now_utc()
+        .format(FORMAT)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 #[cfg(test)]

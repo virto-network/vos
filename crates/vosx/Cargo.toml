@@ -36,6 +36,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# UTC `created_at` formatting in spaces.toml. `formatting` for
+# the `format` API; `macros` so the format-description literal
+# is checked at compile time.
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 
 # Logging
 tracing = "0.1"
