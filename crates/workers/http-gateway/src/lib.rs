@@ -1,4 +1,4 @@
-//! HttpGateway worker — exposes other actors over a tiny HTTP/1.1 server.
+//! HttpGateway worker — exposes other actors over hyper-backed HTTP.
 //!
 //! ## URL convention
 //!
@@ -14,22 +14,22 @@
 //!
 //! The reply `Value` from `ctx.ask` is rendered as JSON in the body.
 //!
+//! ## HTTP stack
+//!
+//! Hyper handles HTTP/1.1 + HTTP/2 (cleartext, prior-knowledge): keep-alive,
+//! chunked transfer, h2 multiplexing all come for free. HTTP/3 will arrive
+//! as a `feature = "http3"` add-on (h3 + quinn + rustls); plain-TCP
+//! HTTP/2 remains here.
+//!
 //! ## Concurrency
 //!
-//! Connection-side I/O (accept, read, parse, write) runs on a tokio
-//! runtime owned by the worker — one OS thread, multiple async tasks.
-//! That part scales to many concurrent clients.
-//!
-//! Dispatch through `ctx.ask` is **serial**: the actor's `ctx` is
-//! single-threaded, so each parsed request waits its turn behind the
-//! one currently in flight. The bridge is an `mpsc` queue from the
-//! tokio side to the actor handler, plus a `tokio::sync::oneshot`
-//! per request that the handler fires to release the connection task.
-//!
-//! For dispatch-bound workloads (every request needs an upstream
-//! ask) this is still effectively serial; for connection-bound ones
-//! (slow clients, many idle keep-alives in the future) the async
-//! side keeps things flowing.
+//! Connection-side I/O runs on a tokio runtime owned by the worker.
+//! Each connection gets a hyper `service_fn` that bridges into a tokio
+//! `mpsc` of `Job`s; the actor handler drains that queue calling
+//! `ctx.ask` per request. h2 lets a single connection multiplex many
+//! requests, all of which funnel through the same mpsc — dispatch is
+//! still serial through the worker's single-threaded `ctx`, but the
+//! wire side scales.
 //!
 //! ## Lifecycle
 //!
@@ -51,13 +51,8 @@
 //! Once vos lets a worker post messages back to its own inbox, `serve`
 //! will become a non-blocking bootstrap and the actor messages will
 //! work mid-flight too.
-//!
-//! ## Status / scope
-//!
-//! Still intentionally minimal — args are string-typed only, no
-//! keep-alive, no streaming, plain-text error bodies. These are the
-//! obvious next places to iterate.
 
+use std::convert::Infallible;
 use std::sync::OnceLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -65,13 +60,19 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use vos::actors::context::ServiceId;
 use vos::actors::value::{Msg, Value};
 use vos::prelude::*;
+
+type HyperResponse = hyper::Response<Full<Bytes>>;
 
 // `#[messages]` emits a `type Result<T> = core::result::Result<T, ActorErr>`
 // alias that shadows the std `Result`. Keep an unaliased one around for
@@ -261,8 +262,6 @@ struct Request {
     method: String,
     path: String,
     query: String,
-    #[allow(dead_code)] // headers not used yet; kept for future routing/auth
-    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -326,6 +325,14 @@ async fn accept_loop(
     job_tx: mpsc::Sender<Job>,
     inner: Arc<Inner>,
 ) {
+    // Single connection builder for both h1 and h2c. `auto::Builder`
+    // sniffs the connection preface and dispatches to the right
+    // protocol — h2c gives a single TCP connection multiplexed over
+    // many requests, all of which funnel into our mpsc.
+    let conn_builder = hyper_util::server::conn::auto::Builder::new(
+        hyper_util::rt::TokioExecutor::new(),
+    );
+
     loop {
         // Stop flipping → finish in-flight tasks but stop accepting.
         if inner.stop.load(Ordering::Relaxed) {
@@ -343,44 +350,56 @@ async fn accept_loop(
         };
         let job_tx = job_tx.clone();
         let inner = inner.clone();
+        let conn_builder = conn_builder.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_one(stream, job_tx, inner).await {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req: hyper::Request<Incoming>| {
+                let job_tx = job_tx.clone();
+                let inner = inner.clone();
+                async move { Ok::<_, Infallible>(serve_request(req, job_tx, inner).await) }
+            });
+            if let Err(e) = conn_builder.serve_connection(io, svc).await {
                 log::debug!("http-gateway: conn {peer}: {e}");
             }
         });
     }
 }
 
-/// Per-connection task. Owns the stream end-to-end: parse → admin or
-/// enqueue job → await response → write. Errors here are logged at
-/// debug; they don't bubble up to the actor.
-async fn serve_one(
-    mut stream: TcpStream,
+/// Hyper service function. Translates hyper's `Request<Incoming>` into
+/// our internal `Request`, runs the admin shortcut or queues a `Job`
+/// for the actor handler, then turns the resulting `Response` back
+/// into a hyper response.
+async fn serve_request(
+    req: hyper::Request<Incoming>,
     job_tx: mpsc::Sender<Job>,
     inner: Arc<Inner>,
-) -> IoResult<()> {
-    let request = match read_request_async(&mut stream).await {
-        Ok(r) => r,
+) -> HyperResponse {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+
+    // Read the body. Bounded by hyper's default per-frame limits;
+    // a future iteration could enforce a hard cap here.
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes().to_vec(),
         Err(e) => {
-            let _ = write_response_async(&mut stream, 400, "text/plain", e.as_bytes()).await;
-            return Err(e);
+            return into_hyper(Response::text(400, format!("read body: {e}")));
         }
     };
 
+    let our_req = Request { method, path, query, body };
+
     // Admin endpoints don't need an actor round-trip — handle them in
-    // the tokio task so they work even while `start()` is the only
+    // the tokio task so they work even while `serve()` is the only
     // message the worker is currently processing.
-    if let Some(response) = handle_admin(&request, &inner) {
-        return write_response_async(&mut stream, response.status, response.content_type, &response.body)
-            .await
-            .map_err(|e| format!("write: {e}"));
+    if let Some(response) = handle_admin(&our_req, &inner) {
+        return into_hyper(response);
     }
 
     let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-    if job_tx.send(Job { request, resp_tx }).is_err() {
+    if job_tx.send(Job { request: our_req, resp_tx }).is_err() {
         // Actor handler dropped the receiver — gateway is shutting down.
-        let _ = write_response_async(&mut stream, 503, "text/plain", b"gateway stopped").await;
-        return Err("job channel closed".into());
+        return into_hyper(Response::text(503, "gateway stopped"));
     }
 
     let response = match resp_rx.await {
@@ -390,9 +409,17 @@ async fn serve_one(
             Response::text(500, "no response from actor")
         }
     };
-    write_response_async(&mut stream, response.status, response.content_type, &response.body)
-        .await
-        .map_err(|e| format!("write: {e}"))
+    into_hyper(response)
+}
+
+fn into_hyper(r: Response) -> HyperResponse {
+    // Builder errors are unreachable here: status codes are limited to
+    // the small set we hand-write, and content-type values are static.
+    hyper::Response::builder()
+        .status(r.status)
+        .header("content-type", r.content_type)
+        .body(Full::new(Bytes::from(r.body)))
+        .expect("hyper response builder")
 }
 
 /// Direct admin endpoints. Returns `Some(response)` to short-circuit
@@ -412,117 +439,6 @@ fn handle_admin(req: &Request, inner: &Inner) -> Option<Response> {
         }
         _ => Response::text(404, format!("unknown admin route {} {}", req.method, req.path)),
     })
-}
-
-/// Minimal HTTP/1.x request reader. Reads request line + headers, then
-/// `Content-Length` body bytes. Returns a human-readable error on
-/// malformed input — caller turns it into a 400.
-async fn read_request_async(stream: &mut TcpStream) -> IoResult<Request> {
-    // Read until we see CRLFCRLF, then read the rest of the body
-    // based on Content-Length. Buffered crudely with a fixed read
-    // size; fine for small request lines + headers.
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    let header_end = loop {
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed before headers".into());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(idx) = find_header_end(&buf) {
-            break idx;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err("request headers too large".into());
-        }
-    };
-
-    let header_bytes = &buf[..header_end];
-    let header_str = std::str::from_utf8(header_bytes)
-        .map_err(|_| "headers are not valid utf-8".to_string())?;
-
-    let mut lines = header_str.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| "missing request line".to_string())?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or_else(|| "missing method".to_string())?.to_string();
-    let target = parts.next().ok_or_else(|| "missing target".to_string())?;
-    // version is parts.next() — ignored
-
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.to_string(), String::new()),
-    };
-
-    let mut headers: Vec<(String, String)> = Vec::new();
-    let mut content_length: usize = 0;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else { continue };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_string();
-        if name == "content-length" {
-            content_length = value.parse().unwrap_or(0);
-        }
-        headers.push((name, value));
-    }
-
-    // Body = whatever followed the header terminator + any extra reads.
-    let body_start = header_end + 4; // skip CRLFCRLF
-    let mut body = buf[body_start..].to_vec();
-    while body.len() < content_length {
-        let need = content_length - body.len();
-        let take = need.min(chunk.len());
-        let n = stream
-            .read(&mut chunk[..take])
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
-        if n == 0 {
-            return Err("connection closed mid-body".into());
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-
-    Ok(Request { method, path, query, headers, body })
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-async fn write_response_async(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "OK",
-    };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 // ── Routing ─────────────────────────────────────────────────────────

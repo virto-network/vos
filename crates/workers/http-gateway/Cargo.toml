@@ -26,3 +26,12 @@ vos = { path = "../../vos", default-features = false, features = ["worker"] }
 # (the actor's `ctx` is single-threaded), but accept/parse/write
 # parallelizes across the runtime's worker tasks.
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+# HTTP layer. hyper handles parsing, serialization, keep-alive, h2c
+# multiplexing — none of which we want to maintain by hand. The h2
+# feature also enables h2c (cleartext) for non-TLS clients with
+# prior-knowledge negotiation. HTTP/3 will live behind a feature
+# gate (h3 + quinn + rustls) in a follow-up.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "server-auto", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
