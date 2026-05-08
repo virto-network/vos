@@ -78,7 +78,8 @@ fn read_stdin() -> Vec<u8> {
 /// if any character isn't a hex digit / the length is odd.
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim_start_matches("0x");
-    (hex.len() % 2 == 0)
+    hex.len()
+        .is_multiple_of(2)
         .then(|| {
             (0..hex.len())
                 .step_by(2)

@@ -112,7 +112,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
-    let network = build_network_for_daemon(&entry, &data_dir, &args.listen, &args.connect)?;
+    let network = build_network_for_daemon(entry, &data_dir, &args.listen, &args.connect)?;
     let local_prefix = network.local_prefix();
 
     let mut node = VosNode::with_prefix(local_prefix);

@@ -28,7 +28,7 @@ impl BlobHash {
         BlobHash(vos::crypto::blake2b_hash::<32>(&[], &[bytes]))
     }
 
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
 
@@ -89,10 +89,11 @@ impl BlobSource {
         if s.starts_with("http://") || s.starts_with("https://") {
             return BlobSource::Url(s.to_string());
         }
-        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            if let Ok(h) = BlobHash::from_hex(s) {
-                return BlobSource::Hash(h);
-            }
+        if s.len() == 64
+            && s.chars().all(|c| c.is_ascii_hexdigit())
+            && let Ok(h) = BlobHash::from_hex(s)
+        {
+            return BlobSource::Hash(h);
         }
         BlobSource::Path(PathBuf::from(s))
     }

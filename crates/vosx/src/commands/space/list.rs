@@ -15,7 +15,7 @@ pub fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16}  {:<24}  {}", "NAME", "CREATED", "ID");
+    println!("{:<16}  {:<24}  ID", "NAME", "CREATED");
     for entry in &index.spaces {
         // Print first 12 hex chars of the id for readability.
         let short_id: String = entry.id.chars().take(12).collect();
