@@ -14,7 +14,6 @@ exclude = [
     # Listing the directory itself keeps `crates/*` from picking
     # it up as a workspace member.
     "crates/actors",
-    "crates/actors/registry",
     "crates/actors/space-registry",
 ]
 

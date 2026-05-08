@@ -259,9 +259,12 @@ mod tests {
 
     #[test]
     fn matches_blake2b_simd_for_two_byte_output() {
-        // The pattern `instance_service_id` will use: 2-byte digest
-        // of `domain || 0u8 || name`. Cross-check against
-        // blake2b_simd, which vosx's host paths still use.
+        // The pattern `space_registry::instance_service_id` uses:
+        // 2-byte digest of `domain || 0u8 || name`. Cross-check
+        // against blake2b_simd — host helpers still call
+        // blake2b_simd directly, so we want our software fallback
+        // (which the host kernel runs through on PVM ecalls) to
+        // match byte-for-byte.
         let bytes = blake2b_simd::Params::new()
             .hash_length(2)
             .to_state()
