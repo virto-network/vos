@@ -45,7 +45,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // 3. Boot the registry in a temp dir under `data_root` so
     //    the eventual rename to the canonical space dir stays
-    //    within the same filesystem.
+    //    within the same filesystem. The guard wipes the dir
+    //    on any early-return / panic so genesis aborts don't
+    //    litter `data_root` with `.genesis-*` skeletons.
     let temp_dir = paths::data_root().join(format!(
         ".genesis-{}-{}",
         std::process::id(),
@@ -56,6 +58,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     ));
     std::fs::create_dir_all(&temp_dir)?;
     std::fs::create_dir_all(temp_dir.join("agents"))?;
+    let mut temp_guard = TempDirGuard(Some(temp_dir.clone()));
 
     // 4. Register the registry agent. The replication_id passed
     //    here doesn't affect the on-disk layout — it's a
@@ -80,12 +83,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         peer_id.to_bytes(),
         NODE_ROLE_VOTER,
     ))
-    .map_err(|e| {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        anyhow::anyhow!("genesis add_node failed: {e}")
-    })?;
+    .map_err(|e| anyhow::anyhow!("genesis add_node failed: {e}"))?;
     if status != STATUS_OK {
-        let _ = std::fs::remove_dir_all(&temp_dir);
         anyhow::bail!("genesis add_node returned status {status}");
     }
 
@@ -94,7 +93,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let results = node.collect();
     for r in &results {
         if let Some(err) = &r.error {
-            let _ = std::fs::remove_dir_all(&temp_dir);
             anyhow::bail!("genesis registry boot: {err}");
         }
     }
@@ -103,18 +101,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let registry_db = temp_dir
         .join("agents")
         .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
-    let genesis_root = read_genesis_root(&registry_db).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        e
-    })?;
+    let genesis_root = read_genesis_root(&registry_db)?;
     let space_id = crate::commands::space::common::derive_space_id(&genesis_root);
 
-    // 8. Move temp dir to the canonical location.
+    // 8. Move temp dir to the canonical location. Disarm the
+    //    guard once the rename succeeds — the destination dir
+    //    is now legitimate state, not a temp leftover.
     let final_dir = args
         .data_dir
         .unwrap_or_else(|| paths::space_dir(&space_id));
     if final_dir.exists() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
         anyhow::bail!(
             "space data dir already exists: {}",
             final_dir.display(),
@@ -125,6 +121,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     std::fs::rename(&temp_dir, &final_dir)
         .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", temp_dir.display(), final_dir.display()))?;
+    temp_guard.disarm();
 
     // 9. Persist the keypair under the final dir.
     let key_path = final_dir.join("node.key");
@@ -182,6 +179,28 @@ pub fn resolve_registry_source(
              `cd crates/actors/space-registry && cargo actor` and \
              rebuild vosx, or pass --registry <source>"
         ),
+    }
+}
+
+/// RAII cleanup for the genesis temp dir. Wipes the directory
+/// on Drop unless `disarm()` was called first — covers every
+/// `?` short-circuit, every `bail!`, and a panic from the
+/// runtime / blob resolution. After the rename to the
+/// canonical space dir succeeds, callers disarm so the now-
+/// legitimate state survives.
+struct TempDirGuard(Option<PathBuf>);
+
+impl TempDirGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
     }
 }
 
