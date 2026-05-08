@@ -1,0 +1,851 @@
+//! Session 2.1 step 8 R1e-bis Batch 2 — RistrettoCombCompressChip.
+//!
+//! Implements the Ristretto255 compress chain over our `field::Bytes`
+//! reference, pinning each step's algebra to the chip's per-row
+//! FieldOp constraints.  This batch lays out the **algebra prologue**
+//! (rows 1-12 of the design sketch in PERF_ROADMAP.md§"R1e-bis output
+//! binding"); the sign checks + conditional rows + memory output
+//! producer come in subsequent batches.
+//!
+//! Per scalar-mult call, the chip emits:
+//!   - 5 `IsInput` rows holding `X`, `Y`, `Z`, `T` of the running
+//!     extended-Edwards accumulator (the consumer chip's window-63
+//!     output) plus the prover's witnessed `inv_sqrt`.
+//!   - 12 algebra rows:
+//!       row +5: `IsAdd`  — `Z + Y`
+//!       row +6: `IsSub`  — `Z - Y`
+//!       row +7: `IsMul`  — `u1 = (Z+Y)·(Z-Y)`
+//!       row +8: `IsMul`  — `u2 = X·Y`
+//!       row +9: `IsMul`  — `u2² = u2·u2`
+//!       row+10: `IsMul`  — `tmp = u1·u2²`
+//!       row+11: `IsMul`  — `inv_sqrt²`
+//!       row+12: `IsMul`  — `inv_sqrt²·tmp` (the unity-check row)
+//!       row+13: `IsMul`  — `i1 = inv_sqrt·u1`
+//!       row+14: `IsMul`  — `i2 = inv_sqrt·u2`
+//!       row+15: `IsMul`  — `i2·T`
+//!       row+16: `IsMul`  — `z_inv = i1·(i2·T)`
+//!
+//! Total: 17 rows per call.  All algebra rows reuse the shared
+//! `field_op_constraints` helper for byte-wise mod-p25519 arithmetic.
+//!
+//! Source-row threading uses a chip-local register-file relation
+//! (`RistrettoCombCompressRegFileLookupElements`) — same shape as
+//! the consumer chip's, but a distinct relation type so chip-local
+//! row IDs don't collide.  Producer per real row: 32 (row_lo, row_hi,
+//! byte_idx, out[k]) tuples.  Consumer A/B per algebra row: 32 each
+//! for `a` / `b` keyed on the source row's ID.
+//!
+//! NOT YET IN THIS BATCH:
+//!   - The `inv_sqrt²·tmp = 1` unity check on row +12's `out`
+//!     (constrains `out[0]=1, out[1..32]=0`).  Lands with the rest of
+//!     the integrity checks once row+12 is wired against the rest of
+//!     the chain.
+//!   - Inter-chip binding: tying X/Y/Z/T to the consumer chip's
+//!     window-63 final mul rows via a new boundary relation.  Today
+//!     X/Y/Z/T are open IsInput witness — chip-isolated tests rely on
+//!     the host-side compress witness to fill them consistently with
+//!     the prover-claimed `out_bytes`.
+//!   - Sign checks (rows 13, 19, 23) and conditional select/negate
+//!     rows (rows 18, 21, 25) — Batch 3.
+//!   - Output-byte memory producer + RistrettoEcallChip skip — Batch 4.
+//!
+//! Validation in this batch: `harness_ristretto_compress_algebra_only`
+//! exercises the algebra closure for a synthetic FixedBasepoint call
+//! and proves the chip in isolation.  The chip-local register-file
+//! relation closes (every consumer balances against the matching
+//! producer), so `prove + verify` succeeds against the open chain.
+
+#[allow(unused_imports)]
+use alloc::{boxed::Box, vec, vec::Vec};
+use stwo::core::fields::m31::BaseField;
+#[cfg(feature = "prover")]
+use stwo::{
+    core::{fields::qm31::SecureField, ColumnVec},
+    prover::{
+        backend::simd::{m31::LOG_N_LANES, SimdBackend},
+        poly::{circle::CircleEvaluation, BitReversedOrder},
+    },
+};
+use stwo_constraint_framework::{EvalAtRow, RelationEntry};
+
+use crate::air_column::{AirColumn, PreprocessedAirColumn};
+use crate::trace::eval::TraceEval;
+#[cfg(feature = "prover")]
+use crate::trace::{
+    builder::{FinalizedTrace, TraceBuilder},
+    component::ComponentTrace,
+};
+
+use crate::chips::ristretto::field_op_constraints;
+use crate::framework::BuiltInComponent;
+use crate::lookups::RistrettoCombCompressRegFileLookupElements;
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
+
+pub struct RistrettoCombCompressChip;
+
+/// Number of rows the chip lays down per fixed-basepoint scalar-mult
+/// call.  Layout (offsets within the call):
+///   0..=3  — IsInput X, Y, Z, T (final Acc)
+///       4  — IsInput inv_sqrt witness
+///   5..=16 — 12 algebra rows (rows 1-12 of the design sketch)
+pub const ROWS_PER_CALL: usize = 17;
+
+// IsInput / algebra row offsets within a per-call block.
+// Some constants are unused in Batch 2 but consumed by later batches
+// (the unity check on row+12, the z_inv refs from rows 13+ that wire
+// against the sign-check chain in Batch 3).
+#[allow(dead_code)]
+const ROW_IN_X: usize = 0;
+#[allow(dead_code)]
+const ROW_IN_Y: usize = 1;
+#[allow(dead_code)]
+const ROW_IN_Z: usize = 2;
+#[allow(dead_code)]
+const ROW_IN_T: usize = 3;
+#[allow(dead_code)]
+const ROW_IN_INVSQRT: usize = 4;
+#[allow(dead_code)]
+const ROW_ZPY: usize = 5;
+#[allow(dead_code)]
+const ROW_ZMY: usize = 6;
+#[allow(dead_code)]
+const ROW_U1: usize = 7;
+#[allow(dead_code)]
+const ROW_U2: usize = 8;
+#[allow(dead_code)]
+const ROW_U2_SQ: usize = 9;
+#[allow(dead_code)]
+const ROW_TMP: usize = 10;
+#[allow(dead_code)]
+const ROW_INVSQRT_SQ: usize = 11;
+#[allow(dead_code)]
+const ROW_UNITY: usize = 12;
+#[allow(dead_code)]
+const ROW_I1: usize = 13;
+#[allow(dead_code)]
+const ROW_I2: usize = 14;
+#[allow(dead_code)]
+const ROW_I2_T: usize = 15;
+#[allow(dead_code)]
+const ROW_Z_INV: usize = 16;
+
+/// Per-row column layout.  Mirrors `RistrettoFixedBaseConsumerChip`'s
+/// FieldOp witness columns + source-row threading metadata.  No
+/// boundary-binding metadata yet — that lands with Batch 2's later
+/// sub-step (inter-chip binding to consumer chip's final Acc).
+#[derive(Debug, Copy, Clone, AirColumn)]
+pub enum Column {
+    // ── FieldOp witness columns (mirror RistrettoChip / consumer chip) ──
+    #[size = 32]
+    FieldA,
+    #[size = 32]
+    FieldB,
+    #[size = 32]
+    FieldOut,
+    #[size = 32]
+    AddIntermediate,
+    #[size = 32]
+    AddCarry,
+    #[size = 1]
+    IsOverflow,
+    #[size = 32]
+    SubBorrow,
+    #[size = 32]
+    FinalFormBorrow,
+    #[size = 32]
+    SubChainBorrow,
+    #[size = 32]
+    SubChainCarryAip,
+    #[size = 64]
+    MulProduct,
+    #[size = 64]
+    MulCarry,
+    #[size = 64]
+    MulCarryMid,
+    #[size = 64]
+    MulCarryHi,
+    #[size = 32]
+    Pass1Lo,
+    #[size = 2]
+    Pass1Hi,
+    #[size = 32]
+    Pass1Carry,
+    #[size = 32]
+    Pass1CarryMid,
+    #[size = 32]
+    Pass2Lo,
+    #[size = 1]
+    Pass2CarryOut,
+    #[size = 32]
+    Pass2Carry,
+    #[size = 1]
+    Pass2TopBit,
+    #[size = 32]
+    AfterTopBit,
+    #[size = 32]
+    AfterTopCarry,
+    #[size = 1]
+    IsAdd,
+    #[size = 1]
+    IsSub,
+    #[size = 1]
+    IsMul,
+    #[size = 1]
+    IsInput,
+    #[size = 1]
+    IsOutput,
+    #[size = 1]
+    IsReal,
+    // Phase I-ristretto deg-flatten helpers — defined by FieldOp helper.
+    #[size = 1]
+    RealAddH,
+    #[size = 1]
+    RealSubH,
+    #[size = 1]
+    RealMulH,
+    #[size = 1]
+    ProducerGateH,
+    #[size = 1]
+    ConsumerAGateH,
+    #[size = 1]
+    ConsumerBGateH,
+    #[size = 64]
+    MulPartialSum,
+
+    // ── Source-row threading for FieldOp consumer A/B ──
+    #[size = 1]
+    ASourceRowLo,
+    #[size = 1]
+    ASourceRowHi,
+    #[size = 1]
+    BSourceRowLo,
+    #[size = 1]
+    BSourceRowHi,
+
+    // ── Chip-local register-file producer multiplicity ──
+    /// How many downstream FieldOp consumers reference this row's
+    /// `out` (counts `a`/`b` refs across the trace).  Padding /
+    /// output rows have 0.
+    #[size = 1]
+    ProducerMultiplicity,
+    /// `producer_gate_h * producer_multiplicity` deg-flatten helper.
+    #[size = 1]
+    ProducerEmissionMult,
+}
+
+#[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
+#[preprocessed_prefix = "ristretto_comb_compress"]
+pub enum PreprocessedColumn {
+    /// Chip-local row index (low byte).
+    #[size = 1]
+    RowIndexLo,
+    /// Chip-local row index (high byte).
+    #[size = 1]
+    RowIndexHi,
+    /// `ByteIdx[k] = k` for k=0..32.
+    #[size = 32]
+    ByteIdx,
+}
+
+#[cfg(feature = "prover")]
+#[derive(Clone, Copy, Debug)]
+struct CompressRow {
+    field: crate::chips::ristretto::witness::FieldOpRow,
+}
+
+#[cfg(feature = "prover")]
+impl Default for CompressRow {
+    fn default() -> Self {
+        Self {
+            field: crate::chips::ristretto::witness::FieldOpRow::default(),
+        }
+    }
+}
+
+/// Build the per-row witness stream for the compress chain.  Walks
+/// `side_note.ristretto_comb_calls` and for each call:
+///   1. Computes the running accumulator `Acc = scalar · G` via the
+///      comb-table walk (mirroring the consumer chip's logic).
+///   2. Calls `compute_compress_witness(&Acc)` to derive every
+///      compress-chain intermediate.
+///   3. Lays down the 17 per-call rows, threading source-row IDs
+///      through the algebra chain.
+#[cfg(feature = "prover")]
+fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
+    use crate::chips::ristretto::comb_table::{
+        ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
+    };
+    use crate::chips::ristretto::compress::compute_compress_witness;
+    use crate::chips::ristretto::point::{point_add_rows, point_identity, ExtendedPoint};
+    use crate::chips::ristretto::witness::{fill_add, fill_input, fill_mul, fill_sub};
+
+    let mut rows: Vec<CompressRow> = Vec::new();
+
+    let table = CombTable::from_base(&ed25519_basepoint_extended());
+
+    for call in side_note.ristretto_comb_calls.iter() {
+        // Re-derive Acc = scalar · G via the comb-table walk.
+        let mut acc = point_identity();
+        for w in 0..NUM_WINDOWS {
+            let byte = call.scalar[w / 2];
+            let nibble_idx = w % 2;
+            let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
+            let entry: ExtendedPoint = table.rows[w][k_i];
+            let (_r, new_acc) = point_add_rows(&acc, &entry);
+            acc = new_acc;
+        }
+
+        let w = compute_compress_witness(&acc);
+
+        // Per-call base row id (in chip-local row numbering).
+        let base = rows.len() as u16;
+        let r_x = base + ROW_IN_X as u16;
+        let r_y = base + ROW_IN_Y as u16;
+        let r_z = base + ROW_IN_Z as u16;
+        let r_t = base + ROW_IN_T as u16;
+        let r_inv = base + ROW_IN_INVSQRT as u16;
+        let r_zpy = base + ROW_ZPY as u16;
+        let r_zmy = base + ROW_ZMY as u16;
+        let r_u1 = base + ROW_U1 as u16;
+        let r_u2 = base + ROW_U2 as u16;
+        let r_u2sq = base + ROW_U2_SQ as u16;
+        let r_tmp = base + ROW_TMP as u16;
+        let r_invsq = base + ROW_INVSQRT_SQ as u16;
+        let r_i1 = base + ROW_I1 as u16;
+        let r_i2 = base + ROW_I2 as u16;
+        let r_i2t = base + ROW_I2_T as u16;
+
+        // ── 5 IsInput rows ──
+        rows.push(CompressRow { field: fill_input(acc.x) });
+        rows.push(CompressRow { field: fill_input(acc.y) });
+        rows.push(CompressRow { field: fill_input(acc.z) });
+        rows.push(CompressRow { field: fill_input(acc.t) });
+        rows.push(CompressRow { field: fill_input(w.inv_sqrt) });
+
+        // ── Algebra rows 1-12 ──
+        // row +5: Z + Y
+        let mut fr = fill_add(acc.z, acc.y);
+        fr.a_source_row = r_z;
+        fr.b_source_row = r_y;
+        debug_assert_eq!(fr.out, w.z_plus_y);
+        rows.push(CompressRow { field: fr });
+
+        // row +6: Z - Y
+        let mut fr = fill_sub(acc.z, acc.y);
+        fr.a_source_row = r_z;
+        fr.b_source_row = r_y;
+        debug_assert_eq!(fr.out, w.z_minus_y);
+        rows.push(CompressRow { field: fr });
+
+        // row +7: u1 = (Z+Y)·(Z-Y)
+        let mut fr = fill_mul(w.z_plus_y, w.z_minus_y);
+        fr.a_source_row = r_zpy;
+        fr.b_source_row = r_zmy;
+        debug_assert_eq!(fr.out, w.u1);
+        rows.push(CompressRow { field: fr });
+
+        // row +8: u2 = X·Y
+        let mut fr = fill_mul(acc.x, acc.y);
+        fr.a_source_row = r_x;
+        fr.b_source_row = r_y;
+        debug_assert_eq!(fr.out, w.u2);
+        rows.push(CompressRow { field: fr });
+
+        // row +9: u2² = u2·u2
+        let mut fr = fill_mul(w.u2, w.u2);
+        fr.a_source_row = r_u2;
+        fr.b_source_row = r_u2;
+        debug_assert_eq!(fr.out, w.u2_sq);
+        rows.push(CompressRow { field: fr });
+
+        // row+10: tmp = u1·u2²
+        let mut fr = fill_mul(w.u1, w.u2_sq);
+        fr.a_source_row = r_u1;
+        fr.b_source_row = r_u2sq;
+        debug_assert_eq!(fr.out, w.u1_u2_sq);
+        rows.push(CompressRow { field: fr });
+
+        // row+11: inv_sqrt²
+        let mut fr = fill_mul(w.inv_sqrt, w.inv_sqrt);
+        fr.a_source_row = r_inv;
+        fr.b_source_row = r_inv;
+        debug_assert_eq!(fr.out, w.inv_sqrt_sq);
+        rows.push(CompressRow { field: fr });
+
+        // row+12: inv_sqrt²·tmp (must equal 1; the unity-check
+        // constraint on this row's `out` lands in a follow-up).
+        let mut fr = fill_mul(w.inv_sqrt_sq, w.u1_u2_sq);
+        fr.a_source_row = r_invsq;
+        fr.b_source_row = r_tmp;
+        // Sanity cross-check (assertion only — the constraint comes later).
+        let one_b = {
+            let mut o = [0u8; 32];
+            o[0] = 1;
+            o
+        };
+        debug_assert_eq!(fr.out, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
+        rows.push(CompressRow { field: fr });
+
+        // row+13: i1 = inv_sqrt·u1
+        let mut fr = fill_mul(w.inv_sqrt, w.u1);
+        fr.a_source_row = r_inv;
+        fr.b_source_row = r_u1;
+        debug_assert_eq!(fr.out, w.i1);
+        rows.push(CompressRow { field: fr });
+
+        // row+14: i2 = inv_sqrt·u2
+        let mut fr = fill_mul(w.inv_sqrt, w.u2);
+        fr.a_source_row = r_inv;
+        fr.b_source_row = r_u2;
+        debug_assert_eq!(fr.out, w.i2);
+        rows.push(CompressRow { field: fr });
+
+        // row+15: i2·T
+        let mut fr = fill_mul(w.i2, acc.t);
+        fr.a_source_row = r_i2;
+        fr.b_source_row = r_t;
+        debug_assert_eq!(fr.out, w.i2_t);
+        rows.push(CompressRow { field: fr });
+
+        // row+16: z_inv = i1·(i2·T)
+        let mut fr = fill_mul(w.i1, w.i2_t);
+        fr.a_source_row = r_i1;
+        fr.b_source_row = r_i2t;
+        debug_assert_eq!(fr.out, w.z_inv);
+        rows.push(CompressRow { field: fr });
+    }
+
+    finalize_producer_multiplicities(&mut rows);
+    rows
+}
+
+/// Walk the row stream and count downstream consumer references onto
+/// each producer row's `producer_multiplicity`.  Mirrors the consumer
+/// chip's algorithm.
+#[cfg(feature = "prover")]
+fn finalize_producer_multiplicities(rows: &mut [CompressRow]) {
+    let n = rows.len();
+    for cr in rows.iter_mut() {
+        cr.field.producer_multiplicity = 0;
+    }
+    for i in 0..n {
+        let row = rows[i];
+        if row.field.is_real == 0 {
+            continue;
+        }
+        // Op + output rows consume `a` from a_source_row.
+        if row.field.is_input == 0 {
+            let a_src = row.field.a_source_row as usize;
+            if a_src < n {
+                rows[a_src].field.producer_multiplicity = rows[a_src]
+                    .field
+                    .producer_multiplicity
+                    .checked_add(1)
+                    .expect("producer_multiplicity overflowed u16");
+            }
+        }
+        if row.field.is_input == 0 && row.field.is_output == 0 {
+            let b_src = row.field.b_source_row as usize;
+            if b_src < n {
+                rows[b_src].field.producer_multiplicity = rows[b_src]
+                    .field
+                    .producer_multiplicity
+                    .checked_add(1)
+                    .expect("producer_multiplicity overflowed u16");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "prover")]
+fn log_size_for(n_rows: usize) -> u32 {
+    if n_rows <= 1 {
+        return LOG_N_LANES;
+    }
+    let n = n_rows as u32;
+    let log = 32 - (n - 1).leading_zeros();
+    log.max(LOG_N_LANES)
+}
+
+#[cfg(feature = "prover")]
+fn compress_n_rows(side_note: &SideNote) -> usize {
+    side_note.ristretto_comb_calls.len() * ROWS_PER_CALL
+}
+
+impl BuiltInComponent for RistrettoCombCompressChip {
+    type PreprocessedColumn = PreprocessedColumn;
+    type MainColumn = Column;
+    type LookupElements = RistrettoCombCompressRegFileLookupElements;
+
+    fn add_constraints<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
+        regfile_lookup: &RistrettoCombCompressRegFileLookupElements,
+    ) {
+        // Column reads.
+        let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
+        let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
+        let out = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
+        let interm = crate::trace::trace_eval!(trace_eval, Column::AddIntermediate);
+        let carry = crate::trace::trace_eval!(trace_eval, Column::AddCarry);
+        let borrow = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
+        let ff_brw = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
+        let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
+        let sub_chain_aip = crate::trace::trace_eval!(trace_eval, Column::SubChainCarryAip);
+        let mul_product = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
+        let mul_carry = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
+        let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
+        let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
+        let pass1_lo = crate::trace::trace_eval!(trace_eval, Column::Pass1Lo);
+        let pass1_hi = crate::trace::trace_eval!(trace_eval, Column::Pass1Hi);
+        let pass1_carry = crate::trace::trace_eval!(trace_eval, Column::Pass1Carry);
+        let pass1_carry_mid = crate::trace::trace_eval!(trace_eval, Column::Pass1CarryMid);
+        let pass2_lo = crate::trace::trace_eval!(trace_eval, Column::Pass2Lo);
+        let pass2_carry_out = crate::trace::trace_eval!(trace_eval, Column::Pass2CarryOut);
+        let pass2_carry = crate::trace::trace_eval!(trace_eval, Column::Pass2Carry);
+        let pass2_top_bit = crate::trace::trace_eval!(trace_eval, Column::Pass2TopBit);
+        let after_top_bit = crate::trace::trace_eval!(trace_eval, Column::AfterTopBit);
+        let after_top_carry = crate::trace::trace_eval!(trace_eval, Column::AfterTopCarry);
+        let is_ovf = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
+        let is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
+        let is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
+        let is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
+        let is_input = crate::trace::trace_eval!(trace_eval, Column::IsInput);
+        let is_output = crate::trace::trace_eval!(trace_eval, Column::IsOutput);
+        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        let real_add_h = crate::trace::trace_eval!(trace_eval, Column::RealAddH);
+        let real_sub_h = crate::trace::trace_eval!(trace_eval, Column::RealSubH);
+        let real_mul_h = crate::trace::trace_eval!(trace_eval, Column::RealMulH);
+        let producer_gate_h = crate::trace::trace_eval!(trace_eval, Column::ProducerGateH);
+        let consumer_a_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerAGateH);
+        let consumer_b_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
+        let mul_partial_sum = crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
+
+        let a_src_lo = crate::trace::trace_eval!(trace_eval, Column::ASourceRowLo);
+        let a_src_hi = crate::trace::trace_eval!(trace_eval, Column::ASourceRowHi);
+        let b_src_lo = crate::trace::trace_eval!(trace_eval, Column::BSourceRowLo);
+        let b_src_hi = crate::trace::trace_eval!(trace_eval, Column::BSourceRowHi);
+
+        let producer_mult = crate::trace::trace_eval!(trace_eval, Column::ProducerMultiplicity);
+        let producer_emission_mult =
+            crate::trace::trace_eval!(trace_eval, Column::ProducerEmissionMult);
+
+        let row_idx_lo =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
+        let row_idx_hi =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
+        let byte_idx_pp =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
+
+        // Shared FieldOp algebra.
+        field_op_constraints::add_field_op_constraints(
+            eval,
+            &field_op_constraints::FieldOpRefs {
+                field_a: &a,
+                field_b: &b,
+                field_out: &out,
+                add_intermediate: &interm,
+                add_carry: &carry,
+                sub_borrow: &borrow,
+                final_form_borrow: &ff_brw,
+                sub_chain_borrow: &sub_chain_brw,
+                sub_chain_carry_aip: &sub_chain_aip,
+                mul_product: &mul_product,
+                mul_carry: &mul_carry,
+                mul_carry_mid: &mul_carry_mid,
+                mul_carry_hi: &mul_carry_hi,
+                pass1_lo: &pass1_lo,
+                pass1_hi: &pass1_hi,
+                pass1_carry: &pass1_carry,
+                pass1_carry_mid: &pass1_carry_mid,
+                pass2_lo: &pass2_lo,
+                pass2_carry_out: &pass2_carry_out,
+                pass2_carry: &pass2_carry,
+                pass2_top_bit: &pass2_top_bit,
+                after_top_bit: &after_top_bit,
+                after_top_carry: &after_top_carry,
+                is_overflow: &is_ovf,
+                is_add: &is_add,
+                is_sub: &is_sub,
+                is_mul: &is_mul,
+                is_input: &is_input,
+                is_output: &is_output,
+                is_real: &is_real,
+                real_add_h: &real_add_h,
+                real_sub_h: &real_sub_h,
+                real_mul_h: &real_mul_h,
+                producer_gate_h: &producer_gate_h,
+                consumer_a_gate_h: &consumer_a_gate_h,
+                consumer_b_gate_h: &consumer_b_gate_h,
+                mul_partial_sum: &mul_partial_sum,
+            },
+        );
+
+        // ProducerEmissionMult deg-flatten helper.
+        eval.add_constraint(
+            producer_emission_mult[0].clone()
+                - producer_gate_h[0].clone() * producer_mult[0].clone(),
+        );
+
+        // ── Chip-local register-file producer + consumer A/B ──
+        for k in 0..32 {
+            // Producer: emit `producer_emission_mult` × tuple per byte
+            // on every IsInput / IsAdd / IsSub / IsMul row.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                producer_emission_mult[0].clone().into(),
+                &[
+                    row_idx_lo[0].clone(),
+                    row_idx_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out[k].clone(),
+                ],
+            ));
+            // Consumer A: emit `-consumer_a_gate_h` per byte on
+            // IsAdd / IsSub / IsMul rows.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                (-consumer_a_gate_h[0].clone()).into(),
+                &[
+                    a_src_lo[0].clone(),
+                    a_src_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    a[k].clone(),
+                ],
+            ));
+            // Consumer B: emit `-consumer_b_gate_h` per byte on
+            // IsAdd / IsSub / IsMul rows.  IsInput / IsOutput rows
+            // have no `b` so the gate is 0 there.
+            eval.add_to_relation(RelationEntry::new(
+                regfile_lookup,
+                (-consumer_b_gate_h[0].clone()).into(),
+                &[
+                    b_src_lo[0].clone(),
+                    b_src_hi[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    b[k].clone(),
+                ],
+            ));
+        }
+
+        eval.finalize_logup_in_pairs();
+    }
+}
+
+#[cfg(feature = "prover")]
+impl BuiltInProverComponent for RistrettoCombCompressChip {
+    const IS_PRODUCER: bool = false;
+
+    fn generate_preprocessed_trace(
+        &self,
+        _log_size: u32,
+        side_note: &SideNote,
+    ) -> FinalizedTrace {
+        let log_size = log_size_for(compress_n_rows(side_note));
+        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
+        let num_rows = trace.num_rows();
+        for row in 0..num_rows {
+            let row_lo = (row & 0xff) as u8;
+            let row_hi = ((row >> 8) & 0xff) as u8;
+            trace.fill_columns(row, row_lo, PreprocessedColumn::RowIndexLo);
+            trace.fill_columns(row, row_hi, PreprocessedColumn::RowIndexHi);
+            let byte_idx_arr: [u8; 32] = core::array::from_fn(|k| k as u8);
+            trace.fill_columns_bytes(row, &byte_idx_arr, PreprocessedColumn::ByteIdx);
+        }
+        trace.finalize_bit_reversed()
+    }
+
+    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        let rows = build_compress_rows(side_note);
+        let log_size = log_size_for(rows.len());
+        let mut trace = TraceBuilder::<Column>::new(log_size);
+        let num_rows = trace.num_rows();
+        for row_i in 0..num_rows {
+            let cr = rows.get(row_i).copied().unwrap_or_default();
+            fill_compress_row(&mut trace, row_i, &cr);
+        }
+        trace.finalize_bit_reversed()
+    }
+
+    fn generate_interaction_trace(
+        &self,
+        component_trace: ComponentTrace,
+        _side_note: &SideNote,
+        lookup_elements: &AllLookupElements,
+    ) -> (
+        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+        SecureField,
+    ) {
+        let log_size = component_trace.log_size();
+        let mut logup = LogupTraceBuilder::new(log_size);
+
+        let regfile: &RistrettoCombCompressRegFileLookupElements =
+            lookup_elements.as_ref();
+
+        let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::RowIndexLo
+        );
+        let row_idx_hi_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::RowIndexHi
+        );
+        let byte_idx_pp = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::ByteIdx
+        );
+        let producer_emission_mult = crate::trace::original_base_column!(
+            component_trace,
+            Column::ProducerEmissionMult
+        );
+        let consumer_a_gate_h = crate::trace::original_base_column!(
+            component_trace,
+            Column::ConsumerAGateH
+        );
+        let consumer_b_gate_h = crate::trace::original_base_column!(
+            component_trace,
+            Column::ConsumerBGateH
+        );
+        let a_cols = crate::trace::original_base_column!(component_trace, Column::FieldA);
+        let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
+        let out_cols = crate::trace::original_base_column!(component_trace, Column::FieldOut);
+        let a_src_lo_col =
+            crate::trace::original_base_column!(component_trace, Column::ASourceRowLo);
+        let a_src_hi_col =
+            crate::trace::original_base_column!(component_trace, Column::ASourceRowHi);
+        let b_src_lo_col =
+            crate::trace::original_base_column!(component_trace, Column::BSourceRowLo);
+        let b_src_hi_col =
+            crate::trace::original_base_column!(component_trace, Column::BSourceRowHi);
+
+        for k in 0..32 {
+            logup.add_to_relation_with(
+                regfile,
+                [producer_emission_mult[0].clone()],
+                |[m]| m.into(),
+                &[
+                    row_idx_lo_pp[0].clone(),
+                    row_idx_hi_pp[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    out_cols[k].clone(),
+                ],
+            );
+            logup.add_to_relation_with(
+                regfile,
+                [consumer_a_gate_h[0].clone()],
+                |[g]| (-g).into(),
+                &[
+                    a_src_lo_col[0].clone(),
+                    a_src_hi_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    a_cols[k].clone(),
+                ],
+            );
+            logup.add_to_relation_with(
+                regfile,
+                [consumer_b_gate_h[0].clone()],
+                |[g]| (-g).into(),
+                &[
+                    b_src_lo_col[0].clone(),
+                    b_src_hi_col[0].clone(),
+                    byte_idx_pp[k].clone(),
+                    b_cols[k].clone(),
+                ],
+            );
+        }
+
+        logup.finalize()
+    }
+}
+
+#[cfg(feature = "prover")]
+fn fill_compress_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &CompressRow) {
+    use crate::chips::ristretto::witness::FieldOpRow;
+    let r: FieldOpRow = cr.field;
+
+    // FieldOp witness columns.
+    trace.fill_columns_bytes(row_i, &r.a, Column::FieldA);
+    trace.fill_columns_bytes(row_i, &r.b, Column::FieldB);
+    trace.fill_columns_bytes(row_i, &r.out, Column::FieldOut);
+    trace.fill_columns_bytes(row_i, &r.add_intermediate, Column::AddIntermediate);
+    trace.fill_columns_bytes(row_i, &r.add_carry, Column::AddCarry);
+    trace.fill_columns_bytes(row_i, &r.sub_borrow, Column::SubBorrow);
+    trace.fill_columns_bytes(row_i, &r.final_form_borrow, Column::FinalFormBorrow);
+    trace.fill_columns_bytes(row_i, &r.sub_chain_borrow, Column::SubChainBorrow);
+    trace.fill_columns_bytes(row_i, &r.sub_chain_carry_aip, Column::SubChainCarryAip);
+    trace.fill_columns_bytes(row_i, &r.mul_product, Column::MulProduct);
+    trace.fill_columns_bytes(row_i, &r.mul_carry, Column::MulCarry);
+    trace.fill_columns_bytes(row_i, &r.mul_carry_mid, Column::MulCarryMid);
+    trace.fill_columns_bytes(row_i, &r.mul_carry_hi, Column::MulCarryHi);
+    trace.fill_columns_bytes(row_i, &r.pass1_lo, Column::Pass1Lo);
+    trace.fill_columns_bytes(row_i, &r.pass1_hi, Column::Pass1Hi);
+    trace.fill_columns_bytes(row_i, &r.pass1_carry, Column::Pass1Carry);
+    trace.fill_columns_bytes(row_i, &r.pass1_carry_mid, Column::Pass1CarryMid);
+    trace.fill_columns_bytes(row_i, &r.pass2_lo, Column::Pass2Lo);
+    trace.fill_columns_bytes(row_i, &r.pass2_carry, Column::Pass2Carry);
+    trace.fill_columns_bytes(row_i, &r.after_top_bit, Column::AfterTopBit);
+    trace.fill_columns_bytes(row_i, &r.after_top_carry, Column::AfterTopCarry);
+    trace.fill_columns(row_i, r.is_overflow, Column::IsOverflow);
+    trace.fill_columns(row_i, r.pass2_carry_out, Column::Pass2CarryOut);
+    trace.fill_columns(row_i, r.pass2_top_bit, Column::Pass2TopBit);
+    trace.fill_columns(row_i, r.is_add, Column::IsAdd);
+    trace.fill_columns(row_i, r.is_sub, Column::IsSub);
+    trace.fill_columns(row_i, r.is_mul, Column::IsMul);
+    trace.fill_columns(row_i, r.is_input, Column::IsInput);
+    trace.fill_columns(row_i, r.is_output, Column::IsOutput);
+    trace.fill_columns(row_i, r.is_real, Column::IsReal);
+
+    // Source-row low/high bytes.
+    trace.fill_columns(row_i, (r.a_source_row & 0xff) as u8, Column::ASourceRowLo);
+    trace.fill_columns(
+        row_i,
+        ((r.a_source_row >> 8) & 0xff) as u8,
+        Column::ASourceRowHi,
+    );
+    trace.fill_columns(row_i, (r.b_source_row & 0xff) as u8, Column::BSourceRowLo);
+    trace.fill_columns(
+        row_i,
+        ((r.b_source_row >> 8) & 0xff) as u8,
+        Column::BSourceRowHi,
+    );
+
+    // Phase I-ristretto deg-flatten helpers.
+    let real_b = r.is_real != 0;
+    let add_b = r.is_add != 0;
+    let sub_b = r.is_sub != 0;
+    let mul_b = r.is_mul != 0;
+    let inp_b = r.is_input != 0;
+    let out_b = r.is_output != 0;
+    trace.fill_columns(row_i, real_b && add_b, Column::RealAddH);
+    trace.fill_columns(row_i, real_b && sub_b, Column::RealSubH);
+    trace.fill_columns(row_i, real_b && mul_b, Column::RealMulH);
+    trace.fill_columns(row_i, real_b && !out_b, Column::ProducerGateH);
+    trace.fill_columns(row_i, real_b && !inp_b, Column::ConsumerAGateH);
+    trace.fill_columns(row_i, real_b && !inp_b && !out_b, Column::ConsumerBGateH);
+
+    // MulPartialSum[k] = Σ a[i]·b[j] for i+j=k.
+    let mut psum = [BaseField::from(0u32); 64];
+    for k in 0..64usize {
+        let mut s: u32 = 0;
+        for i in 0..32usize {
+            let j = k.wrapping_sub(i);
+            if j < 32 {
+                s += r.a[i] as u32 * r.b[j] as u32;
+            }
+        }
+        psum[k] = BaseField::from(s);
+    }
+    trace.fill_columns_base_field(row_i, &psum, Column::MulPartialSum);
+
+    // Producer multiplicity + emission helper.
+    let pm: u32 = r.producer_multiplicity as u32;
+    trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
+    let emission = if real_b && !out_b { pm } else { 0 };
+    trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
+}

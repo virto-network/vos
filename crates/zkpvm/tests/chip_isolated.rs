@@ -919,6 +919,113 @@ fn harness_ristretto_consumer_isolated_empty() {
         .expect("consumer-empty harness: prove failed");
 }
 
+/// R1e-bis Batch 2 — `RistrettoCombCompressChip` in isolation,
+/// exercising the algebra prologue (rows 1-12 of the compress chain)
+/// for one synthetic FixedBasepoint scalar-mult call.
+///
+/// The chip lays down 17 rows per call: 4 IsInput rows holding the
+/// running accumulator's X/Y/Z/T (re-derived from the comb-table
+/// walk), 1 IsInput row for the host-witnessed `inv_sqrt`, and 12
+/// algebra rows (Z+Y, Z-Y, u1, u2, u2², tmp=u1·u2², inv_sqrt²,
+/// inv_sqrt²·tmp, i1, i2, i2·T, z_inv).
+///
+/// Validates:
+///   - The shared `field_op_constraints` algebra holds across every
+///     IsAdd / IsSub / IsMul row (byte-wise mod-p25519 carry chains
+///     close, final-form < p check passes, etc.).
+///   - The chip-local register-file relation balances internally —
+///     every consumer A/B emission finds the matching producer
+///     emission from a prior IsInput / algebra row.
+///   - `compute_compress_witness` provides intermediates that the
+///     chip's `fill_*` witness builders accept without
+///     debug-assertion panics.
+///
+/// A regression that breaks any of these (e.g., wrong source-row
+/// threading, off-by-one row IDs, FieldOp helper drift) surfaces as
+/// either a `prove` panic (constraint failure) or a `verify` reject
+/// (`claimed logup sum is not zero`).
+#[test]
+fn harness_ristretto_compress_algebra_only() {
+    use zkpvm::chips::RistrettoCombCompressChip;
+    use zkpvm::side_note::RistrettoCombCall;
+
+    // One synthetic call — pick a non-trivial scalar so X/Y/Z/T are
+    // a non-identity Edwards point, and the algebra rows hit the
+    // mul/add chains' generic paths (not zero-special-cases).
+    let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_9abc_def0_u64);
+    let scalar = scalar_value.to_bytes();
+    let out_bytes = (scalar_value
+        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        .compress()
+        .to_bytes();
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note
+        .ristretto_comb_calls
+        .push(RistrettoCombCall { scalar, out_bytes });
+    side_note.populate_ristretto_comb_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] =
+        &[&RistrettoCombCompressChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect(
+            "compress-algebra harness: prove failed — likely a FieldOp \
+             algebra regression, source-row threading bug, or \
+             compress-witness divergence vs dalek",
+        );
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect(
+        "compress-algebra harness: verify failed — chip-local \
+         register-file relation didn't close (consumer/producer \
+         imbalance somewhere in the algebra chain)",
+    );
+}
+
+/// `RistrettoCombCompressChip` with EMPTY side_note (no calls).
+/// All cells zero, no emissions.  Should prove + verify cleanly.
+/// Catches structural bugs separately from data-dependent ones.
+#[test]
+fn harness_ristretto_compress_isolated_empty() {
+    use zkpvm::chips::RistrettoCombCompressChip;
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] =
+        &[&RistrettoCombCompressChip];
+
+    let _proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("compress-empty harness: prove failed");
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`

@@ -324,3 +324,24 @@ stwo_constraint_framework::relation!(
     RistrettoCombConsumerRegisterFileLookupElements,
     REL_RISTRETTO_COMB_CONSUMER_REGFILE_SIZE
 );
+
+// R1e-bis Batch 2: chip-local register-file relation for
+// RistrettoCombCompressChip.  Same shape as the consumer chip's
+// (row_id_lo, row_id_hi, byte_idx, value) but a distinct type so the
+// compress chip's own row numbering doesn't collide with the
+// consumer chip's.  Drives source-row threading within the compress
+// chain (rows 1-12 of the algebra prologue plus the 4 IsInput rows
+// for X/Y/Z/T and the inv_sqrt witness row).
+//
+// PRODUCER per real row: 32 tuples (row_id_lo, row_id_hi, byte_idx[k],
+// out[k]) — emitted on IsInput + IsAdd/IsSub/IsMul rows.
+// CONSUMER A per real row: 32 tuples for `a` keyed on
+// (a_src_lo, a_src_hi, byte_idx[k], a[k]) — emitted on
+// IsAdd/IsSub/IsMul rows.
+// CONSUMER B per real row: 32 tuples for `b` — emitted only on
+// IsAdd/IsSub/IsMul rows.
+const REL_RISTRETTO_COMB_COMPRESS_REGFILE_SIZE: usize = 4;
+stwo_constraint_framework::relation!(
+    RistrettoCombCompressRegFileLookupElements,
+    REL_RISTRETTO_COMB_COMPRESS_REGFILE_SIZE
+);
