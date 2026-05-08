@@ -1,30 +1,30 @@
-// Space registry — the per-space source of truth.
-//
-// Holds three tables, all replicated via the registry actor's
-// own consistency strategy (Raft today, BFT-swappable later):
-//
-// 1. **Programs** — published PVM blobs identified by
-//    `(name, version)`. Tags are immutable: republishing a
-//    `(name, version)` pair with a different hash errors.
-// 2. **Agents** — installed *instances* of programs, each with
-//    its own `instance_name`, `replication_id`, consistency,
-//    and state. Multiple agents can share one program.
-// 3. **Members** — Nodes (libp2p peers, may vote in consensus)
-//    and Identities (people / bots, author signed messages
-//    with a Merkle-inclusion or ZK proof of set membership).
-//
-// Init args for an installed agent are NOT stored in the
-// Agents table; they live in the registry's own DAG as the
-// genesis effect of the `install` operation. Auditable via
-// the DAG; not part of the queryable schema.
-//
-// Hashes (`program_hash`, `replication_id`, `peer_id`) cross
-// message boundaries as `Vec<u8>` because the dynamic-`Msg`
-// arg system handles a small fixed set of primitive types.
-// The actor validates lengths internally and stores `[u8; 32]`
-// in the rkyv-archived rows.
+//! Space registry — the per-space source of truth.
+//!
+//! Holds three tables, all replicated via the registry actor's
+//! own consistency strategy (Raft today, BFT-swappable later):
+//!
+//! 1. **Programs** — published PVM blobs identified by
+//!    `(name, version)`. Tags are immutable: republishing a
+//!    `(name, version)` pair with a different hash errors.
+//! 2. **Agents** — installed *instances* of programs, each with
+//!    its own `instance_name`, `replication_id`, consistency,
+//!    and state. Multiple agents can share one program.
+//! 3. **Members** — Nodes (libp2p peers, may vote in consensus)
+//!    and Identities (people / bots, author signed messages
+//!    with a Merkle-inclusion or ZK proof of set membership).
+//!
+//! Init args for an installed agent are NOT stored in the
+//! Agents table; they live in the registry's own DAG as the
+//! genesis effect of the `install` operation. Auditable via
+//! the DAG; not part of the queryable schema.
+//!
+//! Hashes (`program_hash`, `replication_id`, `peer_id`) cross
+//! message boundaries as `Vec<u8>` because the dynamic-`Msg`
+//! arg system handles a small fixed set of primitive types.
+//! The actor validates lengths internally and stores `[u8; 32]`
+//! in the rkyv-archived rows.
 
-// ── Wire types ─────────────────────────────────────────────────────
+//! ── Wire types ─────────────────────────────────────────────────────
 
 /// Reserved ServiceId for the space registry. Mirrors
 /// `vos::abi::service::ServiceId::REGISTRY` so the host can route

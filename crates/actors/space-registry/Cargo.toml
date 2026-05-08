@@ -14,12 +14,13 @@ default = ["bin"]
 bin = []
 
 [lib]
-name = "space_registry"
 crate-type = ["rlib", "cdylib"]
-path = "src/lib.rs"
 
 [[bin]]
 name = "space-registry-actor"
+# Bin name differs from the package name, so cargo's default
+# `src/bin/space-registry-actor.rs` discovery doesn't apply —
+# point at our `src/main.rs` shim explicitly.
 path = "src/main.rs"
 required-features = ["bin"]
 

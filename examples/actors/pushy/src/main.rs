@@ -1,19 +1,12 @@
-// PVM entry-point for the actor. The build splits the same
-// source between two targets:
-//
-//   * `[lib]` (`src/lib.rs`) — rlib + cdylib, used by other
-//     crates as a Ref source and by workers as a `.so`. Built
-//     with `default-features = false` so the actor framework
-//     macro skips emitting `_start`.
-//   * `[[bin]]` (this file, gated on the `bin` feature) — the
-//     riscv64 / wasm32 entry-point ELF that `vosx run` consumes.
-//     Pulls in the same actor body via `include!` so we don't
-//     duplicate the source. The macro emits `_start` here
-//     because the `bin` feature is on.
-//
-// Splitting the bin path off lib.rs is what silences cargo's
-// `file ... found to be present in multiple build targets`
-// warning — same content reaches both targets, but Cargo sees
-// distinct paths.
+// PVM bin entry. The actor's `_start` and `#[panic_handler]`
+// lang items live in the lib's rlib (`src/lib.rs`); `extern
+// crate pushy;` is what forces the linker to pull them
+// into this executable. The riscv64 / wasm32 targets get
+// `-Zcrate-attr=no_main` from `.cargo/config.toml`, so no
+// `fn main()` is needed there — we add one only for host
+// builds, where it's a no-op.
 
-include!("lib.rs");
+extern crate pushy;
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))]
+fn main() {}

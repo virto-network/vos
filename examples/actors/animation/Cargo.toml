@@ -14,16 +14,10 @@ default = ["bin"]
 bin = []
 
 [lib]
-# rlib  : usable as Ref source by other actors / host crates.
-# cdylib: produces the worker `.so` on host targets and the wasm
-#         `.wasm` on wasm32 targets.
-name = "animation"
 crate-type = ["rlib", "cdylib"]
-path = "src/lib.rs"
 
 [[bin]]
 name = "animation"
-path = "src/main.rs"
 required-features = ["bin"]
 
 # Target-conditional vos deps — pick the right feature set per build target.

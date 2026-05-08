@@ -1,7 +1,7 @@
-// Math actor — stateless compute service for cross-actor queries.
-//
-// Handlers return typed values that are automatically converted to
-// `Value` and sent back as replies to `ask()` callers.
+//! Math actor — stateless compute service for cross-actor queries.
+//!
+//! Handlers return typed values that are automatically converted to
+//! `Value` and sent back as replies to `ask()` callers.
 
 use vos::prelude::*;
 #[actor]

@@ -1,10 +1,12 @@
-// PVM entry-point for the actor. The actor source lives in
-// `src/lib.rs`; this file just `include!`s it so the `[lib]`
-// and `[[bin]]` Cargo targets resolve to distinct paths,
-// silencing cargo's "found to be present in multiple build
-// targets" warning. The macro framework's `_start` emission is
-// gated on the `bin` feature (default-on), so the lib build
-// (default-features = false) skips it and the bin build
-// includes it.
+// PVM bin entry. The actor's `_start` and `#[panic_handler]`
+// lang items live in the lib's rlib (`src/lib.rs`); `extern
+// crate crdt_counter;` is what forces the linker to pull them
+// into this executable. The riscv64 / wasm32 targets get
+// `-Zcrate-attr=no_main` from `.cargo/config.toml`, so no
+// `fn main()` is needed there — we add one only for host
+// builds, where it's a no-op.
 
-include!("lib.rs");
+extern crate crdt_counter;
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))]
+fn main() {}

@@ -1,6 +1,6 @@
-// Nushell agent — stub for a nu script interpreter.
-//
-// Actors appear as pipeable commands in nu scripts. Not yet implemented.
+//! Nushell agent — stub for a nu script interpreter.
+//!
+//! Actors appear as pipeable commands in nu scripts. Not yet implemented.
 
 use vos::prelude::*;
 #[actor]

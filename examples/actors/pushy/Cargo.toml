@@ -10,13 +10,10 @@ default = ["bin"]
 bin = []
 
 [lib]
-name = "pushy"
 crate-type = ["rlib", "cdylib"]
-path = "src/lib.rs"
 
 [[bin]]
 name = "pushy"
-path = "src/main.rs"
 required-features = ["bin"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
