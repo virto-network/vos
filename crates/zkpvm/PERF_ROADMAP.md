@@ -499,6 +499,33 @@ in-circuit chain.  Soundness chain in full:
     → MemoryAccessLookupElements
   PVM-memory output bytes
 
+**Validation post-Batch-5**:
+  - `chip_isolated`: 13/13 GREEN (all 5 batches' tests + the new
+    soundness regression `harness_ristretto_output_mismatch_rejected`).
+  - `phase2_alu`: 94/94 GREEN (no FieldOp-helper / register-file
+    regressions from the 2 new chips' constraint additions).
+  - `profile_clerk_private_pay_bench_mobile` release-mode 1-trial
+    measurement: prove ~2.77 s, verify ~152 ms, 25 active chips,
+    main_cols 6388, interaction_cols 4004, log_sizes range 4..16.
+
+**Bench follow-up (deferred)**: the prove time is ~3.5× the
+post-step-8 baseline of ~0.79 s 5-trial median.  Likely
+contributors:
+  - Two new chips at log_size 8 add ~226K cells (~2-3% of total
+    trace cell count) — should be a small slowdown.
+  - Interaction-col growth from the 2 new relations
+    (`RistrettoCombCompressOutputLookupElements`,
+    `RistrettoCombFinalAccLookupElements`) plus the ByteToBits
+    consumer is heavier — visible in `interaction_cols 4004` and
+    the proportional `interaction_gen` time.
+  - 5-trial median has not been re-measured; the 0.79 s baseline
+    was 5-trial median, this is 1-trial.  Cold/warm cache effects
+    likely contribute some delta.
+Investigation worth: try collapsing the compress chip's
+FieldOp-witness-column footprint (most rows don't need all 850+
+cols), measure 5-trial median, profile interaction_gen.  Filed as
+follow-up; does NOT block the soundness deliverable.
+
 ### Step 5 design tree
 
 The consumer side has to (a) emit one `+1` contribution to
