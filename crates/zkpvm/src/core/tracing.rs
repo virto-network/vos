@@ -1,15 +1,14 @@
+use javm::ExitReason;
+use javm::PVM_REGISTER_COUNT;
 use javm::args;
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
-use javm::ExitReason;
-use javm::PVM_REGISTER_COUNT;
 
 use crate::core::step::{MemAccess, PvmStep};
 
 pub use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT, ECALL_RISTRETTO_POINT_ADD,
-    ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
-    ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L,
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
 };
 
 /// A recorded blake2b call for the precompile chip.
@@ -46,7 +45,7 @@ pub struct Blake2bMemOp {
 /// Both ECALL types share the same shape: 32B + 32B → 32B.
 #[derive(Clone, Debug)]
 pub struct ScalarBinopRecord {
-    pub op_id: u32,           // ECALL_SCALAR_MUL_MOD_L or _ADD_MOD_L
+    pub op_id: u32, // ECALL_SCALAR_MUL_MOD_L or _ADD_MOD_L
     pub a: [u8; 32],
     pub b: [u8; 32],
     pub output: [u8; 32],
@@ -237,7 +236,12 @@ impl TracingPvm {
         let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
         let skip_len = compute_skip(&self.pvm.bitmask, pc_before as usize);
         let category = opcode.category();
-        let decoded_args = args::decode_args(&self.pvm.code, pc_before as usize, skip_len as usize, category);
+        let decoded_args = args::decode_args(
+            &self.pvm.code,
+            pc_before as usize,
+            skip_len as usize,
+            category,
+        );
 
         // Decode register indices and immediate from args
         let (reg_a, reg_b, reg_d) = decode_reg_indices(opcode, &decoded_args);
@@ -254,8 +258,7 @@ impl TracingPvm {
         let gas_after = self.pvm.gas;
         let next_pc = self.pvm.pc;
 
-        let reg_write = (0..PVM_REGISTER_COUNT)
-            .find(|&i| regs_before[i] != regs_after[i]);
+        let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
 
         let gas_charged = if need_gas_charge {
             gas_before - gas_after
@@ -267,9 +270,8 @@ impl TracingPvm {
         let branch_taken = !exit && next_pc != sequential_next_pc;
 
         // Reconstruct memory accesses from opcode + args + register state
-        let (mem_read, mem_write) = decode_mem_access(
-            opcode, &decoded_args, &regs_before, &regs_after,
-        );
+        let (mem_read, mem_write) =
+            decode_mem_access(opcode, &decoded_args, &regs_before, &regs_after);
 
         self.steps.push(PvmStep {
             timestamp: self.timestamp,
@@ -421,15 +423,15 @@ impl TracingPvm {
         for i in 0..8 {
             let off = h_ptr_u + i * 8;
             if off + 8 <= self.pvm.flat_mem.len() {
-                h[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off+8].try_into().unwrap());
-                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off+8]);
+                h[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off + 8].try_into().unwrap());
+                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off + 8]);
             }
         }
         for i in 0..16 {
             let off = m_ptr_u + i * 8;
             if off + 8 <= self.pvm.flat_mem.len() {
-                m[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off+8].try_into().unwrap());
-                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off+8]);
+                m[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off + 8].try_into().unwrap());
+                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off + 8]);
             }
         }
 
@@ -445,7 +447,7 @@ impl TracingPvm {
             let bytes = result[i].to_le_bytes();
             out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
             if off + 8 <= self.pvm.flat_mem.len() {
-                self.pvm.flat_mem[off..off+8].copy_from_slice(&bytes);
+                self.pvm.flat_mem[off..off + 8].copy_from_slice(&bytes);
             }
         }
 
@@ -455,7 +457,12 @@ impl TracingPvm {
 
         self.blake2b_records.push(Blake2bRecord { h, m, t, f });
         self.blake2b_mem_ops.push(Blake2bMemOp {
-            h_ptr, m_ptr, ts, h_bytes, m_bytes, out_bytes,
+            h_ptr,
+            m_ptr,
+            ts,
+            h_bytes,
+            m_bytes,
+            out_bytes,
         });
     }
 
@@ -477,14 +484,14 @@ impl TracingPvm {
         // φ[10/11/12] and have the same bug; they're left as-is here to
         // keep this fix scoped to the comb path.
         let scalar_ptr_u = self.pvm.registers[7] as usize;
-        let point_ptr_u  = self.pvm.registers[8] as usize;
+        let point_ptr_u = self.pvm.registers[8] as usize;
         let output_ptr_u = self.pvm.registers[9] as usize;
         let scalar_ptr = self.pvm.registers[7] as u32;
-        let point_ptr  = self.pvm.registers[8] as u32;
+        let point_ptr = self.pvm.registers[8] as u32;
         let output_ptr = self.pvm.registers[9] as u32;
 
         let mut scalar_bytes = [0u8; 32];
-        let mut point_bytes  = [0u8; 32];
+        let mut point_bytes = [0u8; 32];
         let mem_len = self.pvm.flat_mem.len();
         let buffers_in_bounds = scalar_ptr_u.saturating_add(32) <= mem_len
             && point_ptr_u.saturating_add(32) <= mem_len
@@ -510,8 +517,13 @@ impl TracingPvm {
             kind,
         });
         self.ristretto_mem_ops.push(RistrettoMemOp {
-            scalar_ptr, point_ptr, output_ptr, ts,
-            scalar_bytes, point_bytes, out_bytes,
+            scalar_ptr,
+            point_ptr,
+            output_ptr,
+            ts,
+            scalar_bytes,
+            point_bytes,
+            out_bytes,
             kind,
         });
     }
@@ -551,11 +563,19 @@ impl TracingPvm {
 
         let ts = self.timestamp - 1;
         self.scalar_binop_records.push(ScalarBinopRecord {
-            op_id, a: a_bytes, b: b_bytes, output: out_bytes,
+            op_id,
+            a: a_bytes,
+            b: b_bytes,
+            output: out_bytes,
         });
         self.scalar_binop_mem_ops.push(ScalarBinopMemOp {
-            a_ptr, b_ptr, output_ptr, ts,
-            a_bytes, b_bytes, out_bytes,
+            a_ptr,
+            b_ptr,
+            output_ptr,
+            ts,
+            a_bytes,
+            b_bytes,
+            out_bytes,
         });
     }
 
@@ -581,8 +601,8 @@ impl TracingPvm {
 
         let mut wide_bytes = [0u8; 64];
         let mem_len = self.pvm.flat_mem.len();
-        let buffers_in_bounds = wide_ptr_u.saturating_add(64) <= mem_len
-            && output_ptr_u.saturating_add(32) <= mem_len;
+        let buffers_in_bounds =
+            wide_ptr_u.saturating_add(64) <= mem_len && output_ptr_u.saturating_add(32) <= mem_len;
         if buffers_in_bounds {
             wide_bytes.copy_from_slice(&self.pvm.flat_mem[wide_ptr_u..wide_ptr_u + 64]);
         }
@@ -594,11 +614,17 @@ impl TracingPvm {
         }
 
         let ts = self.timestamp - 1;
-        self.scalar_reduce_wide_records.push(ScalarReduceWideRecord {
-            wide: wide_bytes, output: out_bytes,
-        });
+        self.scalar_reduce_wide_records
+            .push(ScalarReduceWideRecord {
+                wide: wide_bytes,
+                output: out_bytes,
+            });
         self.scalar_reduce_wide_mem_ops.push(ScalarReduceWideMemOp {
-            wide_ptr, output_ptr, ts, wide_bytes, out_bytes,
+            wide_ptr,
+            output_ptr,
+            ts,
+            wide_bytes,
+            out_bytes,
         });
     }
 
@@ -636,11 +662,18 @@ impl TracingPvm {
 
         let ts = self.timestamp - 1;
         self.ristretto_add_records.push(RistrettoPointAddRecord {
-            p: p_bytes, q: q_bytes, output: out_bytes,
+            p: p_bytes,
+            q: q_bytes,
+            output: out_bytes,
         });
         self.ristretto_add_mem_ops.push(RistrettoPointAddMemOp {
-            p_ptr, q_ptr, output_ptr, ts,
-            p_bytes, q_bytes, out_bytes,
+            p_ptr,
+            q_ptr,
+            output_ptr,
+            ts,
+            p_bytes,
+            q_bytes,
+            out_bytes,
         });
     }
 
@@ -663,10 +696,14 @@ impl TracingPvm {
 // ── Software blake2b for the precompile ──────────────────────
 
 const BLAKE2B_IV: [u64; 8] = [
-    0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+    0x6A09E667F3BCC908,
+    0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B,
+    0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1,
+    0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B,
+    0x5BE0CD19137E2179,
 ];
 
 const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
@@ -690,7 +727,9 @@ fn blake2b_compress_sw(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8
     v[8..].copy_from_slice(&BLAKE2B_IV);
     v[12] ^= t as u64;
     v[13] ^= (t >> 64) as u64;
-    if f { v[14] = !v[14]; }
+    if f {
+        v[14] = !v[14];
+    }
 
     for round in 0..12 {
         let s = &BLAKE2B_SIGMA[round];
@@ -705,7 +744,9 @@ fn blake2b_compress_sw(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8
     }
 
     let mut result = [0u64; 8];
-    for i in 0..8 { result[i] = h[i] ^ v[i] ^ v[i + 8]; }
+    for i in 0..8 {
+        result[i] = h[i] ^ v[i] ^ v[i + 8];
+    }
     result
 }
 
@@ -851,28 +892,56 @@ fn decode_mem_access(
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 1 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadU16 | Opcode::LoadI16 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 2 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadU32 | Opcode::LoadI32 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 4 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadU64 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 8 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                    None,
+                );
             }
         }
         // Direct stores (A.5.6): addr = imm, value from ra
@@ -880,28 +949,56 @@ fn decode_mem_access(
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_before[*ra] & 0xFF;
-                return (None, Some(MemAccess { address: addr, value, size: 1 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                );
             }
         }
         Opcode::StoreU16 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_before[*ra] & 0xFFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 2 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                );
             }
         }
         Opcode::StoreU32 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_before[*ra] & 0xFFFF_FFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 4 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                );
             }
         }
         Opcode::StoreU64 => {
             if let args::Args::RegImm { ra, imm } = decoded_args {
                 let addr = *imm as u32;
                 let value = regs_before[*ra];
-                return (None, Some(MemAccess { address: addr, value, size: 8 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                );
             }
         }
         // Indirect loads (A.5.10): addr = φ[rb] + imm, result in ra
@@ -909,28 +1006,56 @@ fn decode_mem_access(
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 1 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadIndU16 | Opcode::LoadIndI16 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 2 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadIndU32 | Opcode::LoadIndI32 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 4 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                    None,
+                );
             }
         }
         Opcode::LoadIndU64 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_after[*ra];
-                return (Some(MemAccess { address: addr, value, size: 8 }), None);
+                return (
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                    None,
+                );
             }
         }
         // Indirect stores (A.5.10): addr = φ[rb] + imm, value from ra
@@ -938,28 +1063,56 @@ fn decode_mem_access(
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_before[*ra] & 0xFF;
-                return (None, Some(MemAccess { address: addr, value, size: 1 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                );
             }
         }
         Opcode::StoreIndU16 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_before[*ra] & 0xFFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 2 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                );
             }
         }
         Opcode::StoreIndU32 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_before[*ra] & 0xFFFF_FFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 4 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                );
             }
         }
         Opcode::StoreIndU64 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
                 let addr = regs_before[*rb].wrapping_add(*imm) as u32;
                 let value = regs_before[*ra];
-                return (None, Some(MemAccess { address: addr, value, size: 8 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                );
             }
         }
         // Store immediate (A.5.4): addr = imm_x, value = imm_y
@@ -967,28 +1120,56 @@ fn decode_mem_access(
             if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
                 let addr = *imm_x as u32;
                 let value = *imm_y & 0xFF;
-                return (None, Some(MemAccess { address: addr, value, size: 1 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                );
             }
         }
         Opcode::StoreImmU16 => {
             if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
                 let addr = *imm_x as u32;
                 let value = *imm_y & 0xFFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 2 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                );
             }
         }
         Opcode::StoreImmU32 => {
             if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
                 let addr = *imm_x as u32;
                 let value = *imm_y & 0xFFFF_FFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 4 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                );
             }
         }
         Opcode::StoreImmU64 => {
             if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
                 let addr = *imm_x as u32;
                 let value = *imm_y;
-                return (None, Some(MemAccess { address: addr, value, size: 8 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                );
             }
         }
         // Store immediate indirect (A.5.7): addr = φ[ra] + imm_x, value = imm_y
@@ -996,28 +1177,56 @@ fn decode_mem_access(
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
                 let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
                 let value = *imm_y & 0xFF;
-                return (None, Some(MemAccess { address: addr, value, size: 1 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 1,
+                    }),
+                );
             }
         }
         Opcode::StoreImmIndU16 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
                 let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
                 let value = *imm_y & 0xFFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 2 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 2,
+                    }),
+                );
             }
         }
         Opcode::StoreImmIndU32 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
                 let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
                 let value = *imm_y & 0xFFFF_FFFF;
-                return (None, Some(MemAccess { address: addr, value, size: 4 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 4,
+                    }),
+                );
             }
         }
         Opcode::StoreImmIndU64 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
                 let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
                 let value = *imm_y;
-                return (None, Some(MemAccess { address: addr, value, size: 8 }));
+                return (
+                    None,
+                    Some(MemAccess {
+                        address: addr,
+                        value,
+                        size: 8,
+                    }),
+                );
             }
         }
         _ => {}
@@ -1044,12 +1253,18 @@ mod tests {
 
     #[test]
     fn rejects_zero() {
-        assert_eq!(detect_scalar_mult_kind(&[0u8; 32]), ScalarMultKind::Variable);
+        assert_eq!(
+            detect_scalar_mult_kind(&[0u8; 32]),
+            ScalarMultKind::Variable
+        );
     }
 }
 
 /// Decode register indices from decoded instruction arguments.
-pub(crate) fn decode_reg_indices(_opcode: Opcode, decoded_args: &args::Args) -> (usize, usize, usize) {
+pub(crate) fn decode_reg_indices(
+    _opcode: Opcode,
+    decoded_args: &args::Args,
+) -> (usize, usize, usize) {
     match decoded_args {
         args::Args::ThreeReg { ra, rb, rd } => (*ra, *rb, *rd),
         args::Args::TwoReg { rd, ra } => (*rd, *ra, 0),

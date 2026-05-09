@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::core::step::{PvmStep, NUM_REGS};
+use crate::core::step::{NUM_REGS, PvmStep};
 
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
@@ -351,10 +351,7 @@ impl SideNote {
     /// multiplicity consumer side balances against the chip's
     /// positive emissions.
     #[cfg(feature = "prover")]
-    pub fn add_ristretto_field_row(
-        &mut self,
-        row: crate::chips::ristretto::witness::FieldOpRow,
-    ) {
+    pub fn add_ristretto_field_row(&mut self, row: crate::chips::ristretto::witness::FieldOpRow) {
         if row.is_real != 0 {
             for k in 0..32 {
                 self.add_range256(row.a[k]);
@@ -406,14 +403,17 @@ impl SideNote {
                 // for them.  Padding (is_real=0) likewise.
                 if row.is_input != 0 { /* still real, but no consumer fields */ }
             }
-            if row.is_real == 0 { continue; }
+            if row.is_real == 0 {
+                continue;
+            }
             // OUTPUT and op rows consume `a`.
             if row.is_input == 0 {
                 let a_src = row.a_source_row as usize;
                 if a_src < n {
                     let cur = self.ristretto_field_rows[a_src].producer_multiplicity;
-                    self.ristretto_field_rows[a_src].producer_multiplicity =
-                        cur.checked_add(1).expect("producer_multiplicity overflowed u16");
+                    self.ristretto_field_rows[a_src].producer_multiplicity = cur
+                        .checked_add(1)
+                        .expect("producer_multiplicity overflowed u16");
                 }
             }
             // Op rows additionally consume `b` (NOT input nor output).
@@ -421,8 +421,9 @@ impl SideNote {
                 let b_src = row.b_source_row as usize;
                 if b_src < n {
                     let cur = self.ristretto_field_rows[b_src].producer_multiplicity;
-                    self.ristretto_field_rows[b_src].producer_multiplicity =
-                        cur.checked_add(1).expect("producer_multiplicity overflowed u16");
+                    self.ristretto_field_rows[b_src].producer_multiplicity = cur
+                        .checked_add(1)
+                        .expect("producer_multiplicity overflowed u16");
                 }
             }
         }
@@ -504,16 +505,14 @@ impl SideNote {
             let mem_op = mem_iter.next().copied();
             match rec.kind {
                 ScalarMultKind::FixedBasepoint => {
-                    let (output_ptr, ts) = mem_op.expect(
-                        "ristretto_mem_ops length must match ristretto_calls",
-                    );
-                    self.ristretto_comb_calls
-                        .push(RistrettoCombCall {
-                            scalar: rec.scalar,
-                            out_bytes: rec.output,
-                            output_ptr,
-                            ts,
-                        });
+                    let (output_ptr, ts) =
+                        mem_op.expect("ristretto_mem_ops length must match ristretto_calls");
+                    self.ristretto_comb_calls.push(RistrettoCombCall {
+                        scalar: rec.scalar,
+                        out_bytes: rec.output,
+                        output_ptr,
+                        ts,
+                    });
                 }
                 ScalarMultKind::Variable => {
                     let scalar_row = self.ristretto_field_rows.len() as u16;
@@ -570,11 +569,11 @@ impl SideNote {
     /// from `ingest_ristretto_boundary` for production traces.
     #[cfg(feature = "prover")]
     pub fn populate_ristretto_compress_counts(&mut self) {
-        use crate::chips::ristretto::compress::compute_compress_witness;
         use crate::chips::ristretto::comb_table::{
-            ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
+            CombTable, NUM_WINDOWS, ed25519_basepoint_extended,
         };
-        use crate::chips::ristretto::point::{point_add_rows, point_identity, ExtendedPoint};
+        use crate::chips::ristretto::compress::compute_compress_witness;
+        use crate::chips::ristretto::point::{ExtendedPoint, point_add_rows, point_identity};
 
         let table = CombTable::from_base(&ed25519_basepoint_extended());
         for call in &self.ristretto_comb_calls {

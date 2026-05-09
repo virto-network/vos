@@ -22,7 +22,11 @@ pub fn run(manifest: &Manifest, dir: &Path) {
         let role = format!(
             "agent {:?}{}",
             a.consistency,
-            if a.provides.is_empty() { String::new() } else { format!(" provides={:?}", a.provides) },
+            if a.provides.is_empty() {
+                String::new()
+            } else {
+                format!(" provides={:?}", a.provides)
+            },
         );
         let path = display_path(&a.name, &a.path, &a.service, dir);
         print_actor_meta(&a.name, &path, &role);
@@ -31,7 +35,11 @@ pub fn run(manifest: &Manifest, dir: &Path) {
             let role = format!(
                 "actor (child of {}){}",
                 a.name,
-                if child.provides.is_empty() { String::new() } else { format!(" provides={:?}", child.provides) },
+                if child.provides.is_empty() {
+                    String::new()
+                } else {
+                    format!(" provides={:?}", child.provides)
+                },
             );
             let path = display_path(&child.name, &child.path, &child.service, dir);
             print_actor_meta(&child.name, &path, &role);
@@ -48,7 +56,11 @@ pub fn run(manifest: &Manifest, dir: &Path) {
         if path.exists() {
             println!("  {} (worker{role_tag}) — {}", w.name, path.display());
         } else {
-            println!("  {} (worker{role_tag}) — not built ({})", w.name, path.display());
+            println!(
+                "  {} (worker{role_tag}) — not built ({})",
+                w.name,
+                path.display()
+            );
         }
     }
 }

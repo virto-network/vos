@@ -16,10 +16,7 @@ use zkpvm::core::tracing::TracingPvm;
 
 /// Build a BranchEq program: BranchEq φ[0], φ[1] → +5; then Trap at pc=5.
 fn branch_eq_program() -> (Vec<u8>, Vec<u8>) {
-    let code = vec![
-        Opcode::BranchEq as u8, 0x10, 5, 0, 0,
-        Opcode::Trap as u8,
-    ];
+    let code = vec![Opcode::BranchEq as u8, 0x10, 5, 0, 0, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     (code, bitmask)
 }
@@ -30,8 +27,13 @@ fn trace_branch_eq(rv0: u64, rv1: u64) -> (Vec<u8>, Vec<u8>, Vec<zkpvm::core::st
     regs[1] = rv1;
     let (code, bitmask) = branch_eq_program();
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tr = TracingPvm::new(pvm);
     let _ = tr.run();
@@ -46,7 +48,11 @@ fn trace_branch_eq(rv0: u64, rv1: u64) -> (Vec<u8>, Vec<u8>, Vec<zkpvm::core::st
 ///   pc=6:    Trap (target basic-block start)
 fn branch_program(op: Opcode) -> (Vec<u8>, Vec<u8>) {
     let code = vec![
-        op as u8, 0x10, 6, 0, 0,
+        op as u8,
+        0x10,
+        6,
+        0,
+        0,
         Opcode::Trap as u8,
         Opcode::Trap as u8,
     ];
@@ -55,15 +61,22 @@ fn branch_program(op: Opcode) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn trace_branch(
-    op: Opcode, rv0: u64, rv1: u64,
+    op: Opcode,
+    rv0: u64,
+    rv1: u64,
 ) -> (Vec<u8>, Vec<u8>, Vec<zkpvm::core::step::PvmStep>) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = rv0;
     regs[1] = rv1;
     let (code, bitmask) = branch_program(op);
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tr = TracingPvm::new(pvm);
     let _ = tr.run();
@@ -241,18 +254,14 @@ fn branch_ge_u_forged_taken_when_lt_rejected() {
 
 #[test]
 fn branch_lt_s_negative_lt_zero_smoke() {
-    let (code, bitmask, steps) = trace_branch(
-        Opcode::BranchLtS, 0xFFFF_FFFF_FFFF_FFFF, 0,
-    );
+    let (code, bitmask, steps) = trace_branch(Opcode::BranchLtS, 0xFFFF_FFFF_FFFF_FFFF, 0);
     assert!(steps[0].branch_taken);
     prove_and_verify(steps, &code, &bitmask);
 }
 
 #[test]
 fn branch_lt_s_zero_ge_negative_smoke() {
-    let (code, bitmask, steps) = trace_branch(
-        Opcode::BranchLtS, 0, 0xFFFF_FFFF_FFFF_FFFF,
-    );
+    let (code, bitmask, steps) = trace_branch(Opcode::BranchLtS, 0, 0xFFFF_FFFF_FFFF_FFFF);
     assert!(!steps[0].branch_taken);
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -260,9 +269,7 @@ fn branch_lt_s_zero_ge_negative_smoke() {
 #[test]
 #[should_panic(expected = "failed")]
 fn branch_lt_s_forged_not_taken_when_lt_rejected() {
-    let (code, bitmask, mut steps) = trace_branch(
-        Opcode::BranchLtS, 0xFFFF_FFFF_FFFF_FFFF, 0,
-    );
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchLtS, 0xFFFF_FFFF_FFFF_FFFF, 0);
     steps[0].branch_taken = false;
     steps[0].next_pc = 5;
     prove_and_verify(steps, &code, &bitmask);
@@ -271,9 +278,7 @@ fn branch_lt_s_forged_not_taken_when_lt_rejected() {
 #[test]
 #[should_panic(expected = "failed")]
 fn branch_lt_s_forged_taken_when_ge_rejected() {
-    let (code, bitmask, mut steps) = trace_branch(
-        Opcode::BranchLtS, 0, 0xFFFF_FFFF_FFFF_FFFF,
-    );
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchLtS, 0, 0xFFFF_FFFF_FFFF_FFFF);
     steps[0].branch_taken = true;
     steps[0].next_pc = 6;
     prove_and_verify(steps, &code, &bitmask);
@@ -285,18 +290,14 @@ fn branch_lt_s_forged_taken_when_ge_rejected() {
 
 #[test]
 fn branch_ge_s_zero_ge_negative_smoke() {
-    let (code, bitmask, steps) = trace_branch(
-        Opcode::BranchGeS, 0, 0xFFFF_FFFF_FFFF_FFFF,
-    );
+    let (code, bitmask, steps) = trace_branch(Opcode::BranchGeS, 0, 0xFFFF_FFFF_FFFF_FFFF);
     assert!(steps[0].branch_taken);
     prove_and_verify(steps, &code, &bitmask);
 }
 
 #[test]
 fn branch_ge_s_negative_lt_zero_smoke() {
-    let (code, bitmask, steps) = trace_branch(
-        Opcode::BranchGeS, 0xFFFF_FFFF_FFFF_FFFF, 0,
-    );
+    let (code, bitmask, steps) = trace_branch(Opcode::BranchGeS, 0xFFFF_FFFF_FFFF_FFFF, 0);
     assert!(!steps[0].branch_taken);
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -304,9 +305,7 @@ fn branch_ge_s_negative_lt_zero_smoke() {
 #[test]
 #[should_panic(expected = "failed")]
 fn branch_ge_s_forged_not_taken_when_ge_rejected() {
-    let (code, bitmask, mut steps) = trace_branch(
-        Opcode::BranchGeS, 0, 0xFFFF_FFFF_FFFF_FFFF,
-    );
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchGeS, 0, 0xFFFF_FFFF_FFFF_FFFF);
     steps[0].branch_taken = false;
     steps[0].next_pc = 5;
     prove_and_verify(steps, &code, &bitmask);
@@ -315,9 +314,7 @@ fn branch_ge_s_forged_not_taken_when_ge_rejected() {
 #[test]
 #[should_panic(expected = "failed")]
 fn branch_ge_s_forged_taken_when_lt_rejected() {
-    let (code, bitmask, mut steps) = trace_branch(
-        Opcode::BranchGeS, 0xFFFF_FFFF_FFFF_FFFF, 0,
-    );
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchGeS, 0xFFFF_FFFF_FFFF_FFFF, 0);
     steps[0].branch_taken = true;
     steps[0].next_pc = 6;
     prove_and_verify(steps, &code, &bitmask);

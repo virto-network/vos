@@ -12,7 +12,8 @@ use javm::instruction::Opcode;
 fn prove_reverse_bytes() {
     prove_two_reg(
         Opcode::ReverseBytes,
-        2, 3,
+        2,
+        3,
         0x0123_4567_89AB_CDEF,
         0xEFCD_AB89_6745_2301,
     );
@@ -22,7 +23,9 @@ fn prove_reverse_bytes() {
 #[should_panic(expected = "failed")]
 fn reverse_bytes_forged_result_rejected() {
     forge_two_reg_result(
-        Opcode::ReverseBytes, 2, 3,
+        Opcode::ReverseBytes,
+        2,
+        3,
         0x0123_4567_89AB_CDEF,
         0xDEAD_BEEF_DEAD_BEEF,
     );
@@ -32,18 +35,16 @@ fn reverse_bytes_forged_result_rejected() {
 
 #[test]
 fn prove_zero_extend_16() {
-    prove_two_reg(
-        Opcode::ZeroExtend16, 2, 3,
-        0xFFFF_FFFF_FFFF_BEEF,
-        0xBEEF,
-    );
+    prove_two_reg(Opcode::ZeroExtend16, 2, 3, 0xFFFF_FFFF_FFFF_BEEF, 0xBEEF);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn zero_extend_16_forged_upper_byte_rejected() {
     forge_two_reg_result(
-        Opcode::ZeroExtend16, 2, 3,
+        Opcode::ZeroExtend16,
+        2,
+        3,
         0xFFFF_FFFF_FFFF_BEEF,
         0x0000_0000_0001_BEEF, // byte 2 = 0x01 must be 0
     );
@@ -53,7 +54,9 @@ fn zero_extend_16_forged_upper_byte_rejected() {
 #[should_panic(expected = "failed")]
 fn zero_extend_16_forged_low_byte_rejected() {
     forge_two_reg_result(
-        Opcode::ZeroExtend16, 2, 3,
+        Opcode::ZeroExtend16,
+        2,
+        3,
         0xFFFF_FFFF_FFFF_BEEF,
         0xCAFE, // low 16 must equal val_d low 16 (0xBEEF)
     );
@@ -65,7 +68,9 @@ fn zero_extend_16_forged_low_byte_rejected() {
 fn prove_sign_extend_8_negative() {
     // val_d byte 0 = 0x80 (sign bit set) → result = 0xFFFF_FFFF_FFFF_FF80.
     prove_two_reg(
-        Opcode::SignExtend8, 2, 3,
+        Opcode::SignExtend8,
+        2,
+        3,
         0xCAFE_BABE_DEAD_BE80,
         0xFFFF_FFFF_FFFF_FF80,
     );
@@ -74,18 +79,16 @@ fn prove_sign_extend_8_negative() {
 #[test]
 fn prove_sign_extend_8_positive() {
     // val_d byte 0 = 0x7F (sign bit clear) → result = 0x7F.
-    prove_two_reg(
-        Opcode::SignExtend8, 2, 3,
-        0xFFFF_FFFF_FFFF_FF7F,
-        0x7F,
-    );
+    prove_two_reg(Opcode::SignExtend8, 2, 3, 0xFFFF_FFFF_FFFF_FF7F, 0x7F);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn sign_extend_8_forged_upper_byte_rejected() {
     forge_two_reg_result(
-        Opcode::SignExtend8, 2, 3,
+        Opcode::SignExtend8,
+        2,
+        3,
         0xCAFE_BABE_DEAD_BE80,
         0x0000_0000_0000_FF80, // bytes 2..7 forged to 0
     );
@@ -98,9 +101,11 @@ fn sign_extend_8_forged_sign_bit_rejected() {
     // look like zero-extension when the source's sign bit is set should be
     // rejected by the nibble-AND lookup (8 in (hi_nib, 8, 8·SignExtBit)).
     forge_two_reg_result(
-        Opcode::SignExtend8, 2, 3,
-        0x80,                  // sign bit set
-        0x80,                  // honest = 0xFFFF_FFFF_FFFF_FF80
+        Opcode::SignExtend8,
+        2,
+        3,
+        0x80, // sign bit set
+        0x80, // honest = 0xFFFF_FFFF_FFFF_FF80
     );
 }
 
@@ -109,7 +114,9 @@ fn sign_extend_8_forged_sign_bit_rejected() {
 #[test]
 fn prove_sign_extend_16_negative() {
     prove_two_reg(
-        Opcode::SignExtend16, 2, 3,
+        Opcode::SignExtend16,
+        2,
+        3,
         0xCAFE_BABE_DEAD_8000,
         0xFFFF_FFFF_FFFF_8000,
     );
@@ -117,18 +124,16 @@ fn prove_sign_extend_16_negative() {
 
 #[test]
 fn prove_sign_extend_16_positive() {
-    prove_two_reg(
-        Opcode::SignExtend16, 2, 3,
-        0xFFFF_FFFF_FFFF_7FFF,
-        0x7FFF,
-    );
+    prove_two_reg(Opcode::SignExtend16, 2, 3, 0xFFFF_FFFF_FFFF_7FFF, 0x7FFF);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn sign_extend_16_forged_upper_byte_rejected() {
     forge_two_reg_result(
-        Opcode::SignExtend16, 2, 3,
+        Opcode::SignExtend16,
+        2,
+        3,
         0x8000,
         0x0000_0000_FFFF_8000, // bytes 4..7 forged to 0
     );
@@ -138,7 +143,9 @@ fn sign_extend_16_forged_upper_byte_rejected() {
 #[should_panic(expected = "failed")]
 fn sign_extend_16_forged_byte_1_rejected() {
     forge_two_reg_result(
-        Opcode::SignExtend16, 2, 3,
+        Opcode::SignExtend16,
+        2,
+        3,
         0x12_34,
         0x9934, // byte 1 = 0x99 ≠ val_d[1] = 0x12 (positive case, no sign)
     );
@@ -219,7 +226,9 @@ fn forged_opcode_to_different_category_rejected() {
 #[test]
 fn prove_count_set_bits_64() {
     prove_two_reg(
-        Opcode::CountSetBits64, 2, 3,
+        Opcode::CountSetBits64,
+        2,
+        3,
         0x0F0F_0F0F_0F0F_0F0F, // 32 ones
         32,
     );
@@ -229,7 +238,9 @@ fn prove_count_set_bits_64() {
 #[should_panic(expected = "failed")]
 fn count_set_bits_64_forged_count_rejected() {
     forge_two_reg_result(
-        Opcode::CountSetBits64, 2, 3,
+        Opcode::CountSetBits64,
+        2,
+        3,
         0x0F0F_0F0F_0F0F_0F0F,
         31, // honest count is 32; forge to 31
     );
@@ -240,7 +251,9 @@ fn count_set_bits_64_forged_count_rejected() {
 fn count_set_bits_64_forged_high_byte_rejected() {
     // Result high bytes must be 0; forge byte 1 to 1 → rejected.
     forge_two_reg_result(
-        Opcode::CountSetBits64, 2, 3,
+        Opcode::CountSetBits64,
+        2,
+        3,
         0x0F0F_0F0F_0F0F_0F0F,
         32 | (1u64 << 8), // result[1] = 1
     );
@@ -249,18 +262,16 @@ fn count_set_bits_64_forged_high_byte_rejected() {
 #[test]
 fn prove_count_set_bits_32() {
     // High 32 bits ignored; low 32 = 0xFF → 8 ones.
-    prove_two_reg(
-        Opcode::CountSetBits32, 2, 3,
-        0xFFFF_FFFF_0000_00FF,
-        8,
-    );
+    prove_two_reg(Opcode::CountSetBits32, 2, 3, 0xFFFF_FFFF_0000_00FF, 8);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn count_set_bits_32_forged_count_rejected() {
     forge_two_reg_result(
-        Opcode::CountSetBits32, 2, 3,
+        Opcode::CountSetBits32,
+        2,
+        3,
         0xFFFF_FFFF_0000_00FF,
         9, // honest count is 8
     );
@@ -271,7 +282,9 @@ fn count_set_bits_32_forged_count_rejected() {
 #[test]
 fn prove_leading_zero_bits_64() {
     prove_two_reg(
-        Opcode::LeadingZeroBits64, 2, 3,
+        Opcode::LeadingZeroBits64,
+        2,
+        3,
         0x0000_0000_0001_0000, // bit 16 set → 47 leading zeros
         47,
     );
@@ -280,28 +293,22 @@ fn prove_leading_zero_bits_64() {
 #[test]
 #[should_panic(expected = "failed")]
 fn leading_zero_bits_64_forged_count_rejected() {
-    forge_two_reg_result(
-        Opcode::LeadingZeroBits64, 2, 3,
-        0x0000_0000_0001_0000,
-        48,
-    );
+    forge_two_reg_result(Opcode::LeadingZeroBits64, 2, 3, 0x0000_0000_0001_0000, 48);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn leading_zero_bits_64_forged_zero_input_rejected() {
     // val_d = 0 → result must be 64; forge to 0.
-    forge_two_reg_result(
-        Opcode::LeadingZeroBits64, 2, 3,
-        0,
-        0,
-    );
+    forge_two_reg_result(Opcode::LeadingZeroBits64, 2, 3, 0, 0);
 }
 
 #[test]
 fn prove_trailing_zero_bits_64() {
     prove_two_reg(
-        Opcode::TrailingZeroBits64, 2, 3,
+        Opcode::TrailingZeroBits64,
+        2,
+        3,
         0x0000_0000_0010_0000, // bit 20 set → 20 trailing zeros
         20,
     );
@@ -310,17 +317,15 @@ fn prove_trailing_zero_bits_64() {
 #[test]
 #[should_panic(expected = "failed")]
 fn trailing_zero_bits_64_forged_count_rejected() {
-    forge_two_reg_result(
-        Opcode::TrailingZeroBits64, 2, 3,
-        0x0000_0000_0010_0000,
-        21,
-    );
+    forge_two_reg_result(Opcode::TrailingZeroBits64, 2, 3, 0x0000_0000_0010_0000, 21);
 }
 
 #[test]
 fn prove_leading_zero_bits_32_zero_low() {
     prove_two_reg(
-        Opcode::LeadingZeroBits32, 2, 3,
+        Opcode::LeadingZeroBits32,
+        2,
+        3,
         0xFFFF_FFFF_0000_0000, // low 32 = 0 → result 32
         32,
     );
@@ -330,7 +335,9 @@ fn prove_leading_zero_bits_32_zero_low() {
 #[should_panic(expected = "failed")]
 fn leading_zero_bits_32_forged_count_rejected() {
     forge_two_reg_result(
-        Opcode::LeadingZeroBits32, 2, 3,
+        Opcode::LeadingZeroBits32,
+        2,
+        3,
         0xFFFF_FFFF_0000_0000,
         16, // honest count is 32 (low 32 are zero)
     );

@@ -3,10 +3,14 @@
 //! in-circuit state-chain schedule.
 
 pub(super) const IV: [u64; 8] = [
-    0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+    0x6A09E667F3BCC908,
+    0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B,
+    0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1,
+    0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B,
+    0x5BE0CD19137E2179,
 ];
 
 pub(super) const SIGMA: [[usize; 16]; 12] = [
@@ -26,6 +30,12 @@ pub(super) const SIGMA: [[usize; 16]; 12] = [
 
 /// G-function mixing indices per round: (a, b, c, d) indices into v[16]
 pub(super) const G_INDICES: [[usize; 4]; 8] = [
-    [0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15], // columns
-    [0, 5, 10, 15], [1, 6, 11, 12], [2, 7, 8, 13], [3, 4, 9, 14],  // diagonals
+    [0, 4, 8, 12],
+    [1, 5, 9, 13],
+    [2, 6, 10, 14],
+    [3, 7, 11, 15], // columns
+    [0, 5, 10, 15],
+    [1, 6, 11, 12],
+    [2, 7, 8, 13],
+    [3, 4, 9, 14], // diagonals
 ];

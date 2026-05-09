@@ -29,7 +29,7 @@ pub type Bytes = [u8; 32];
 /// Modulus p = 2²⁵⁵ - 19 in little-endian bytes.
 pub const P_BYTES: Bytes = {
     let mut p = [0xffu8; 32];
-    p[0] = 0xed;       // 0xff..ed = 2^255 - 19
+    p[0] = 0xed; // 0xff..ed = 2^255 - 19
     p[31] = 0x7f;
     p
 };
@@ -114,7 +114,9 @@ pub fn mul(a: &Bytes, b: &Bytes) -> Bytes {
         let (sum, overflow_bytes) = mul_small_then_add(&hi, 38, &lo);
         lo = sum;
         hi = overflow_bytes; // most rounds will produce hi = [0u8; 32]
-        if hi == [0u8; 32] { break; }
+        if hi == [0u8; 32] {
+            break;
+        }
     }
 
     // Now lo is in [0, 2 * p) — final conditional subtraction.
@@ -149,7 +151,9 @@ pub fn inv(a: &Bytes) -> Bytes {
             exp[i] = v as u8;
             borrow = 0;
         }
-        if borrow == 0 { break; }
+        if borrow == 0 {
+            break;
+        }
     }
     pow(a, &exp)
 }
@@ -265,8 +269,12 @@ mod tests {
     /// mult end-to-end against dalek, which is the real ground truth.
     #[test]
     fn add_sub_round_trip() {
-        let mut a = [0u8; 32]; a[0] = 5; a[1] = 3;
-        let mut b = [0u8; 32]; b[0] = 7; b[5] = 11;
+        let mut a = [0u8; 32];
+        a[0] = 5;
+        a[1] = 3;
+        let mut b = [0u8; 32];
+        b[0] = 7;
+        b[5] = 11;
         let s = add(&a, &b);
         let back = sub(&s, &b);
         assert_eq!(back, a, "(a + b) - b = a");
@@ -282,14 +290,18 @@ mod tests {
 
     #[test]
     fn mul_by_zero_is_zero() {
-        let mut a = [0u8; 32]; a[0] = 0xab; a[15] = 0xcd;
+        let mut a = [0u8; 32];
+        a[0] = 0xab;
+        a[15] = 0xcd;
         assert_eq!(mul(&a, &[0u8; 32]), [0u8; 32]);
     }
 
     #[test]
     fn mul_by_one_is_identity() {
         let mut a = [0u8; 32];
-        for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
+        for i in 0..32 {
+            a[i] = (0xa3u8).wrapping_mul((i + 1) as u8);
+        }
         a[31] &= 0x7f; // canonical
         let prod = mul(&a, &one());
         assert_eq!(prod, reduce(a));
@@ -338,16 +350,22 @@ mod tests {
     }
 
     fn one() -> Bytes {
-        let mut o = [0u8; 32]; o[0] = 1; o
+        let mut o = [0u8; 32];
+        o[0] = 1;
+        o
     }
 
     fn small(v: u8) -> Bytes {
-        let mut o = [0u8; 32]; o[0] = v; o
+        let mut o = [0u8; 32];
+        o[0] = v;
+        o
     }
 
     fn bytes_filled(seed: u8) -> Bytes {
         let mut o = [0u8; 32];
-        for i in 0..32 { o[i] = seed.wrapping_add(i as u8); }
+        for i in 0..32 {
+            o[i] = seed.wrapping_add(i as u8);
+        }
         o[31] &= 0x7f; // canonical: clear top bit
         o
     }

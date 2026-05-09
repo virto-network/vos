@@ -52,8 +52,12 @@ fn add32_negative_result_smoke() {
     // to u64 = 0xFFFFFFFF80000000.  Pre-Phase-19 AIR rejected this
     // (result[4..8] forced to 0).
     prove_three_reg(
-        Opcode::Add32, 2, 0, 1,
-        0x7FFF_FFFF, 1,
+        Opcode::Add32,
+        2,
+        0,
+        1,
+        0x7FFF_FFFF,
+        1,
         0xFFFF_FFFF_8000_0000,
     );
 }
@@ -61,18 +65,17 @@ fn add32_negative_result_smoke() {
 #[test]
 fn sub32_negative_result_smoke() {
     // 5 - 10 = -5 in i32 → 0xFFFFFFFB sign-extended = 0xFFFFFFFFFFFFFFFB.
-    prove_three_reg(
-        Opcode::Sub32, 2, 0, 1,
-        5, 10,
-        (-5i64) as u64,
-    );
+    prove_three_reg(Opcode::Sub32, 2, 0, 1, 5, 10, (-5i64) as u64);
 }
 
 #[test]
 fn mul32_negative_result_smoke() {
     // (-2) * 3 = -6 in i32 → 0xFFFFFFFA sign-extended.
     prove_three_reg(
-        Opcode::Mul32, 2, 0, 1,
+        Opcode::Mul32,
+        2,
+        0,
+        1,
         (-2i32) as u32 as u64,
         3,
         (-6i64) as u64,
@@ -85,7 +88,10 @@ fn div_s32_negative_dividend_smoke() {
     // Phase 18 added the 32-bit DivS chain; Phase 19 fixed the result
     // sign-extension so this now proves end-to-end.
     prove_three_reg(
-        Opcode::DivS32, 2, 0, 1,
+        Opcode::DivS32,
+        2,
+        0,
+        1,
         (-100i32) as u32 as u64,
         7,
         (-14i64) as u64,
@@ -96,7 +102,10 @@ fn div_s32_negative_dividend_smoke() {
 fn rem_s32_negative_dividend_smoke() {
     // -100 % 7 = -2 in i32 → sign-extended 0xFFFFFFFFFFFFFFFE.
     prove_three_reg(
-        Opcode::RemS32, 2, 0, 1,
+        Opcode::RemS32,
+        2,
+        0,
+        1,
         (-100i32) as u32 as u64,
         7,
         (-2i64) as u64,
@@ -110,8 +119,12 @@ fn add32_negative_result_forged_high_byte_rejected() {
     // Forge to drop one of the high 0xFF bytes (mask off bit 56) — should
     // be caught by the new sign-extension constraint at result[7].
     forge_three_reg_result(
-        Opcode::Add32, 2, 0, 1,
-        0x7FFF_FFFF, 1,
+        Opcode::Add32,
+        2,
+        0,
+        1,
+        0x7FFF_FFFF,
+        1,
         /*forged*/ 0x00FF_FFFF_8000_0000,
     );
 }
@@ -153,8 +166,12 @@ fn and_positive_smoke() {
 #[should_panic(expected = "failed")]
 fn and_forged_result_rejected() {
     forge_three_reg_result(
-        Opcode::And, 2, 0, 1,
-        0xFF00_FF00, 0x0FF0_0FF0,
+        Opcode::And,
+        2,
+        0,
+        1,
+        0xFF00_FF00,
+        0x0FF0_0FF0,
         /*forged*/ 0xFFFF_FFFF, // honest = 0x0F00_0F00
     );
 }
@@ -167,7 +184,15 @@ fn or_positive_smoke() {
 #[test]
 #[should_panic(expected = "failed")]
 fn or_forged_result_rejected() {
-    forge_three_reg_result(Opcode::Or, 2, 0, 1, 0xFF00_0000, 0x0000_FF00, /*forged*/ 0);
+    forge_three_reg_result(
+        Opcode::Or,
+        2,
+        0,
+        1,
+        0xFF00_0000,
+        0x0000_FF00,
+        /*forged*/ 0,
+    );
 }
 
 #[test]
@@ -179,8 +204,12 @@ fn xor_positive_smoke() {
 #[should_panic(expected = "failed")]
 fn xor_forged_result_rejected() {
     forge_three_reg_result(
-        Opcode::Xor, 2, 0, 1,
-        0xFF00_FF00, 0x0FF0_0FF0,
+        Opcode::Xor,
+        2,
+        0,
+        1,
+        0xFF00_FF00,
+        0x0FF0_0FF0,
         /*forged*/ 0,
     );
 }
@@ -217,8 +246,12 @@ fn set_lt_s_positive_negative_lt() {
 fn set_lt_s_forged_result_rejected() {
     // Honest: -1 <_s 0 = 1.  Forge: claim -1 ≥_s 0.
     forge_three_reg_result(
-        Opcode::SetLtS, 2, 0, 1,
-        0xFFFF_FFFF_FFFF_FFFF, 0,
+        Opcode::SetLtS,
+        2,
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0,
         /*forged*/ 0,
     );
 }
@@ -309,8 +342,12 @@ fn div_s64_negative_dividend_smoke() {
     // -100 / 7 = -14.  In u64: dividend = 2^64−100 = 0xFFFFFFFFFFFFFF9C,
     // expected quotient = 2^64−14 = 0xFFFFFFFFFFFFFFF2.
     prove_three_reg(
-        Opcode::DivS64, 2, 0, 1,
-        (-100i64) as u64, 7,
+        Opcode::DivS64,
+        2,
+        0,
+        1,
+        (-100i64) as u64,
+        7,
         (-14i64) as u64,
     );
 }
@@ -319,8 +356,12 @@ fn div_s64_negative_dividend_smoke() {
 fn div_s64_negative_divisor_smoke() {
     // 100 / -7 = -14.
     prove_three_reg(
-        Opcode::DivS64, 2, 0, 1,
-        100, (-7i64) as u64,
+        Opcode::DivS64,
+        2,
+        0,
+        1,
+        100,
+        (-7i64) as u64,
         (-14i64) as u64,
     );
 }
@@ -329,8 +370,12 @@ fn div_s64_negative_divisor_smoke() {
 fn div_s64_both_negative_smoke() {
     // -100 / -7 = 14 (positive quotient with negative operands).
     prove_three_reg(
-        Opcode::DivS64, 2, 0, 1,
-        (-100i64) as u64, (-7i64) as u64,
+        Opcode::DivS64,
+        2,
+        0,
+        1,
+        (-100i64) as u64,
+        (-7i64) as u64,
         14,
     );
 }
@@ -338,11 +383,7 @@ fn div_s64_both_negative_smoke() {
 #[test]
 fn rem_s64_negative_dividend_smoke() {
     // -100 % 7 = -2 (round-toward-zero remainder takes dividend's sign).
-    prove_three_reg(
-        Opcode::RemS64, 2, 0, 1,
-        (-100i64) as u64, 7,
-        (-2i64) as u64,
-    );
+    prove_three_reg(Opcode::RemS64, 2, 0, 1, (-100i64) as u64, 7, (-2i64) as u64);
 }
 
 #[test]
@@ -358,8 +399,12 @@ fn div_s64_negative_forged_off_by_one_rejected() {
     // -100 / 7 = -14, forge to -13 to confirm the new sign-correction
     // chain still detects forgery on the negative path.
     forge_three_reg_result(
-        Opcode::DivS64, 2, 0, 1,
-        (-100i64) as u64, 7,
+        Opcode::DivS64,
+        2,
+        0,
+        1,
+        (-100i64) as u64,
+        7,
         /*forged*/ (-13i64) as u64,
     );
 }
@@ -389,7 +434,10 @@ fn div_s32_both_negative_smoke() {
     // to 0).  Result column has high bytes = 0 (positive 14), so
     // dodges the result-truncation gap.
     prove_three_reg(
-        Opcode::DivS32, 2, 0, 1,
+        Opcode::DivS32,
+        2,
+        0,
+        1,
         (-100i32) as u32 as u64,
         (-7i32) as u32 as u64,
         14,
@@ -402,12 +450,7 @@ fn rem_s32_positive_with_negative_divisor_smoke() {
     // Quotient is -14 (sq = 1, sd = 1) so the schoolbook chain still
     // exercises the 32-bit correction; *result* (= remainder = 2) has
     // high bytes = 0, so the truncation gap is dodged.
-    prove_three_reg(
-        Opcode::RemS32, 2, 0, 1,
-        100,
-        (-7i32) as u32 as u64,
-        2,
-    );
+    prove_three_reg(Opcode::RemS32, 2, 0, 1, 100, (-7i32) as u32 as u64, 2);
 }
 
 #[test]
@@ -417,7 +460,10 @@ fn div_s32_both_negative_forged_off_by_one_rejected() {
     // rejects a bad quotient on a row whose negative-operand path
     // goes through the new sign-correction.
     forge_three_reg_result(
-        Opcode::DivS32, 2, 0, 1,
+        Opcode::DivS32,
+        2,
+        0,
+        1,
         (-100i32) as u32 as u64,
         (-7i32) as u32 as u64,
         /*forged*/ 13,
@@ -432,7 +478,10 @@ fn div_s32_negative_result_smoke() {
     // Pre-Phase-19-on-divrem the AIR rejected this because it
     // required result[4..8] = 0.
     prove_three_reg(
-        Opcode::DivS32, 2, 0, 1,
+        Opcode::DivS32,
+        2,
+        0,
+        1,
         100,
         (-7i32) as u32 as u64,
         (-14i32) as i64 as u64, // sign-extended to 64-bit
@@ -444,7 +493,10 @@ fn rem_s32_negative_result_smoke() {
     // -100 % 7 = -2 (negative 32-bit remainder, sign-of-dividend
     // rule).  Result column has sign-extension on high bytes.
     prove_three_reg(
-        Opcode::RemS32, 2, 0, 1,
+        Opcode::RemS32,
+        2,
+        0,
+        1,
         (-100i32) as u32 as u64,
         7,
         (-2i32) as i64 as u64,
@@ -460,7 +512,10 @@ fn div_s32_negative_result_forged_high_bytes_rejected() {
     // and SignBitResult = bit 7 of result[3] = 1, so high bytes
     // must all be 0xFF.  Forging to 0 should be rejected.
     forge_three_reg_result(
-        Opcode::DivS32, 2, 0, 1,
+        Opcode::DivS32,
+        2,
+        0,
+        1,
         100,
         (-7i32) as u32 as u64,
         /*forged*/ 0xFFFFFFF2u64, // honest = sign-ext, this truncates
@@ -479,7 +534,10 @@ fn div_s32_negative_result_forged_high_bytes_rejected() {
 fn div_s64_negative_dividend_positive_divisor_smoke() {
     // -100 / 7 = -14 r -2.  sign(r) = sign(b) = 1 ✓.  Honest path.
     prove_three_reg(
-        Opcode::DivS64, 2, 0, 1,
+        Opcode::DivS64,
+        2,
+        0,
+        1,
         (-100i64) as u64,
         7,
         (-14i64) as u64,
@@ -497,7 +555,10 @@ fn rem_s64_forged_sign_flip_rejected() {
     // rejects it: r' = +5 has sign 0 ≠ sign(b) = 1.  Forge the
     // result to +5 (the bad remainder) and confirm rejection.
     forge_three_reg_result(
-        Opcode::RemS64, 2, 0, 1,
+        Opcode::RemS64,
+        2,
+        0,
+        1,
         (-100i64) as u64,
         7,
         /*forged*/ 5,
@@ -509,19 +570,19 @@ fn rem_s64_forged_sign_flip_rejected() {
 #[test]
 fn mul_upper_uu_top_bits_smoke() {
     // 2^63 * 2 = 2^64; top 64 bits = 1, low 64 bits = 0.
-    prove_three_reg(
-        Opcode::MulUpperUU, 2, 0, 1,
-        1u64 << 63, 2,
-        1,
-    );
+    prove_three_reg(Opcode::MulUpperUU, 2, 0, 1, 1u64 << 63, 2, 1);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn mul_upper_uu_forged_result_rejected() {
     forge_three_reg_result(
-        Opcode::MulUpperUU, 2, 0, 1,
-        1u64 << 63, 2,
+        Opcode::MulUpperUU,
+        2,
+        0,
+        1,
+        1u64 << 63,
+        2,
         /*forged*/ 0, // honest = 1
     );
 }
@@ -535,19 +596,19 @@ fn mul_upper_uu_forged_result_rejected() {
 fn mul_upper_uu_low32_squared() {
     // 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFF_FFFE_0000_0001 (low 64).
     // Top 64 bits = 0.
-    prove_three_reg(
-        Opcode::MulUpperUU, 2, 0, 1,
-        0xFFFF_FFFF, 0xFFFF_FFFF,
-        0,
-    );
+    prove_three_reg(Opcode::MulUpperUU, 2, 0, 1, 0xFFFF_FFFF, 0xFFFF_FFFF, 0);
 }
 
 #[test]
 fn mul64_low32_squared() {
     // Same operands, plain Mul64: result = low 64 bits.
     prove_three_reg(
-        Opcode::Mul64, 2, 0, 1,
-        0xFFFF_FFFF, 0xFFFF_FFFF,
+        Opcode::Mul64,
+        2,
+        0,
+        1,
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
         0xFFFF_FFFE_0000_0001,
     );
 }
@@ -557,8 +618,12 @@ fn mul_upper_uu_full_64bit_squared() {
     // 0xFFFFFFFFFFFFFFFF² = 0xFFFFFFFFFFFFFFFE_0000000000000001 (128-bit).
     // Top 64 bits = 0xFFFFFFFFFFFFFFFE.
     prove_three_reg(
-        Opcode::MulUpperUU, 2, 0, 1,
-        0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
+        Opcode::MulUpperUU,
+        2,
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_FFFF_FFFF,
         0xFFFF_FFFF_FFFF_FFFE,
     );
 }
@@ -574,8 +639,12 @@ fn mul_upper_ss_negative_squared_smoke() {
     // (-1) × (-1) signed = 1.  As u64: 0xFFFF...FFFF² = 0xFFFF...FFFE_…1.
     // High 64 of SIGNED product = 0.
     prove_three_reg(
-        Opcode::MulUpperSS, 2, 0, 1,
-        0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
+        Opcode::MulUpperSS,
+        2,
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_FFFF_FFFF,
         0,
     );
 }
@@ -585,8 +654,12 @@ fn mul_upper_su_negative_unsigned_smoke() {
     // (-2) signed × 3 unsigned = -6 (signed 128-bit).
     // High 64 of SIGNED = 0xFFFFFFFFFFFFFFFF (sign-ext from -1).
     prove_three_reg(
-        Opcode::MulUpperSU, 2, 0, 1,
-        0xFFFF_FFFF_FFFF_FFFE, 3,
+        Opcode::MulUpperSU,
+        2,
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFE,
+        3,
         0xFFFF_FFFF_FFFF_FFFF,
     );
 }
@@ -607,8 +680,11 @@ fn move_reg_positive_smoke() {
 #[should_panic(expected = "failed")]
 fn move_reg_forged_result_rejected() {
     forge_two_reg_result(
-        Opcode::MoveReg, 2, 0,
-        0xDEAD_BEEF, /*forged*/ 0xCAFE_BABE,
+        Opcode::MoveReg,
+        2,
+        0,
+        0xDEAD_BEEF,
+        /*forged*/ 0xCAFE_BABE,
     );
 }
 
@@ -632,8 +708,13 @@ fn load_imm_forged_result_rejected() {
     bitmask.push(1);
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tr = TracingPvm::new(pvm);
     let _ = tr.run();
@@ -674,19 +755,19 @@ fn rotate_r64_forged_result_rejected() {
 #[test]
 fn rotate_r64_wraparound_positive() {
     // 0x1 rotate-right 1 → 0x8000_0000_0000_0000 (LSB wraps to MSB).
-    prove_three_reg(
-        Opcode::RotR64, 2, 0, 1,
-        0x1, 1,
-        0x8000_0000_0000_0000,
-    );
+    prove_three_reg(Opcode::RotR64, 2, 0, 1, 0x1, 1, 0x8000_0000_0000_0000);
 }
 
 #[test]
 #[should_panic(expected = "failed")]
 fn rotate_r64_wraparound_forged_result_rejected() {
     forge_three_reg_result(
-        Opcode::RotR64, 2, 0, 1,
-        0x1, 1,
+        Opcode::RotR64,
+        2,
+        0,
+        1,
+        0x1,
+        1,
         /*forged*/ 0x8000_0000_0000_0001,
     );
 }

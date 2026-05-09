@@ -30,9 +30,10 @@ pub fn with_query_node(
     sync_timeout_secs: u64,
     f: impl FnOnce(&VosNode),
 ) {
-    let hyperspace = manifest.hyperspace.as_deref().unwrap_or_else(|| {
-        die("manifest does not declare a `hyperspace`; nothing to query")
-    });
+    let hyperspace = manifest
+        .hyperspace
+        .as_deref()
+        .unwrap_or_else(|| die("manifest does not declare a `hyperspace`; nothing to query"));
     let blob_path = manifest
         .registry_blob
         .as_ref()

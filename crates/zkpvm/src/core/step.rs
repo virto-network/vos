@@ -1,5 +1,5 @@
-use javm::instruction::Opcode;
 use javm::PVM_REGISTER_COUNT;
+use javm::instruction::Opcode;
 
 /// Number of PVM registers.
 pub const NUM_REGS: usize = PVM_REGISTER_COUNT;

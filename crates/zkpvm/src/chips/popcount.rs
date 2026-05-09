@@ -14,13 +14,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -33,16 +30,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::PopcountLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::PopcountLookupElements};
 
 pub struct PopcountChip;
 
@@ -78,7 +72,8 @@ impl BuiltInComponent for PopcountChip {
         lookup_elements: &PopcountLookupElements,
     ) {
         let byte = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Byte);
-        let popcount = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Popcount);
+        let popcount =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Popcount);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
         // Tuple shape: (byte, popcount).
@@ -103,7 +98,11 @@ impl BuiltInProverComponent for PopcountChip {
 
         for row in 0..256usize {
             trace.fill_columns(row, row as u8, PreprocessedColumn::Byte);
-            trace.fill_columns(row, (row as u8).count_ones() as u8, PreprocessedColumn::Popcount);
+            trace.fill_columns(
+                row,
+                (row as u8).count_ones() as u8,
+                PreprocessedColumn::Popcount,
+            );
         }
 
         trace.finalize_bit_reversed()
@@ -134,17 +133,14 @@ impl BuiltInProverComponent for PopcountChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let popcount: &PopcountLookupElements = lookup_elements.as_ref();
-        let byte = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
-        let popc = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Popcount);
+        let byte =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
+        let popc =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Popcount);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         let tuple = vec![byte[0].clone(), popc[0].clone()];
-        logup.add_to_relation_with(
-            popcount,
-            [mult[0].clone()],
-            |[m]| (-m).into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(popcount, [mult[0].clone()], |[m]| (-m).into(), &tuple);
 
         logup.finalize()
     }

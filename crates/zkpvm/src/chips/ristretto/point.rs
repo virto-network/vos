@@ -21,7 +21,7 @@
 #[cfg(test)]
 use super::field;
 use super::field::Bytes;
-use super::witness::{fill_add, fill_mul, fill_sub, FieldOpRow};
+use super::witness::{FieldOpRow, fill_add, fill_mul, fill_sub};
 use alloc::vec::Vec;
 
 /// Extended Edwards coordinates.  Each coordinate is a canonical
@@ -56,15 +56,15 @@ pub struct ExtendedPointSources {
 /// The chip scheduler (R1e) embeds this as a boundary-injected
 /// constant or a preprocessed column.
 pub const ED25519_TWO_D: Bytes = [
-    0x59, 0xf1, 0xb2, 0x26, 0x94, 0x9b, 0xd6, 0xeb,
-    0x56, 0xb1, 0x83, 0x82, 0x9a, 0x14, 0xe0, 0x00,
-    0x30, 0xd1, 0xf3, 0xee, 0xf2, 0x80, 0x8e, 0x19,
-    0xe7, 0xfc, 0xdf, 0x56, 0xdc, 0xd9, 0x06, 0x24,
+    0x59, 0xf1, 0xb2, 0x26, 0x94, 0x9b, 0xd6, 0xeb, 0x56, 0xb1, 0x83, 0x82, 0x9a, 0x14, 0xe0, 0x00,
+    0x30, 0xd1, 0xf3, 0xee, 0xf2, 0x80, 0x8e, 0x19, 0xe7, 0xfc, 0xdf, 0x56, 0xdc, 0xd9, 0x06, 0x24,
 ];
 
 // Field-element constants used in the formulas.
 fn one_field() -> Bytes {
-    let mut o = [0u8; 32]; o[0] = 1; o
+    let mut o = [0u8; 32];
+    o[0] = 1;
+    o
 }
 
 fn zero_field() -> Bytes {
@@ -91,38 +91,78 @@ pub fn point_double_rows(p: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) 
     let mut rows = Vec::new();
 
     // A = X1²
-    let r = fill_mul(p.x, p.x); let aa = r.out; rows.push(r);
+    let r = fill_mul(p.x, p.x);
+    let aa = r.out;
+    rows.push(r);
     // B = Y1²
-    let r = fill_mul(p.y, p.y); let bb = r.out; rows.push(r);
+    let r = fill_mul(p.y, p.y);
+    let bb = r.out;
+    rows.push(r);
     // ZZ = Z1²
-    let r = fill_mul(p.z, p.z); let zz = r.out; rows.push(r);
+    let r = fill_mul(p.z, p.z);
+    let zz = r.out;
+    rows.push(r);
     // C = 2·Z1²
-    let r = fill_add(zz, zz);   let cc = r.out; rows.push(r);
+    let r = fill_add(zz, zz);
+    let cc = r.out;
+    rows.push(r);
     // D = -A   (i.e. p − A)
-    let r = fill_sub(zero_field(), aa); let dd = r.out; rows.push(r);
+    let r = fill_sub(zero_field(), aa);
+    let dd = r.out;
+    rows.push(r);
     // X1+Y1
-    let r = fill_add(p.x, p.y); let xpy = r.out; rows.push(r);
+    let r = fill_add(p.x, p.y);
+    let xpy = r.out;
+    rows.push(r);
     // (X1+Y1)²
-    let r = fill_mul(xpy, xpy); let xpy2 = r.out; rows.push(r);
+    let r = fill_mul(xpy, xpy);
+    let xpy2 = r.out;
+    rows.push(r);
     // E = (X1+Y1)² − A − B  (two sub steps)
-    let r = fill_sub(xpy2, aa); let tmp = r.out; rows.push(r);
-    let r = fill_sub(tmp, bb);  let e_coord = r.out; rows.push(r);
+    let r = fill_sub(xpy2, aa);
+    let tmp = r.out;
+    rows.push(r);
+    let r = fill_sub(tmp, bb);
+    let e_coord = r.out;
+    rows.push(r);
     // G = D + B
-    let r = fill_add(dd, bb);   let g_coord = r.out; rows.push(r);
+    let r = fill_add(dd, bb);
+    let g_coord = r.out;
+    rows.push(r);
     // F = G − C
-    let r = fill_sub(g_coord, cc); let f_coord = r.out; rows.push(r);
+    let r = fill_sub(g_coord, cc);
+    let f_coord = r.out;
+    rows.push(r);
     // H = D − B
-    let r = fill_sub(dd, bb);   let h_coord = r.out; rows.push(r);
+    let r = fill_sub(dd, bb);
+    let h_coord = r.out;
+    rows.push(r);
     // X3 = E·F
-    let r = fill_mul(e_coord, f_coord); let x3 = r.out; rows.push(r);
+    let r = fill_mul(e_coord, f_coord);
+    let x3 = r.out;
+    rows.push(r);
     // Y3 = G·H
-    let r = fill_mul(g_coord, h_coord); let y3 = r.out; rows.push(r);
+    let r = fill_mul(g_coord, h_coord);
+    let y3 = r.out;
+    rows.push(r);
     // T3 = E·H
-    let r = fill_mul(e_coord, h_coord); let t3 = r.out; rows.push(r);
+    let r = fill_mul(e_coord, h_coord);
+    let t3 = r.out;
+    rows.push(r);
     // Z3 = F·G
-    let r = fill_mul(f_coord, g_coord); let z3 = r.out; rows.push(r);
+    let r = fill_mul(f_coord, g_coord);
+    let z3 = r.out;
+    rows.push(r);
 
-    (rows, ExtendedPoint { x: x3, y: y3, z: z3, t: t3 })
+    (
+        rows,
+        ExtendedPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+            t: t3,
+        },
+    )
 }
 
 /// R1d: emit field-op rows for `P + Q` on extended Edwards
@@ -136,51 +176,93 @@ pub fn point_double_rows(p: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) 
 ///   D = Z1·Z2·2
 ///   E = B − A;  F = D − C;  G = D + C;  H = B + A
 ///   X3 = E·F;  Y3 = G·H;  T3 = E·H;  Z3 = F·G
-pub fn point_add_rows(p: &ExtendedPoint, q: &ExtendedPoint)
-    -> (Vec<FieldOpRow>, ExtendedPoint)
-{
+pub fn point_add_rows(p: &ExtendedPoint, q: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) {
     let mut rows = Vec::new();
 
     // ymx_p = Y1−X1
-    let r = fill_sub(p.y, p.x); let ymx_p = r.out; rows.push(r);
+    let r = fill_sub(p.y, p.x);
+    let ymx_p = r.out;
+    rows.push(r);
     // ymx_q = Y2−X2
-    let r = fill_sub(q.y, q.x); let ymx_q = r.out; rows.push(r);
+    let r = fill_sub(q.y, q.x);
+    let ymx_q = r.out;
+    rows.push(r);
     // A = ymx_p · ymx_q
-    let r = fill_mul(ymx_p, ymx_q); let aa = r.out; rows.push(r);
+    let r = fill_mul(ymx_p, ymx_q);
+    let aa = r.out;
+    rows.push(r);
 
     // ypx_p = Y1+X1
-    let r = fill_add(p.y, p.x); let ypx_p = r.out; rows.push(r);
+    let r = fill_add(p.y, p.x);
+    let ypx_p = r.out;
+    rows.push(r);
     // ypx_q = Y2+X2
-    let r = fill_add(q.y, q.x); let ypx_q = r.out; rows.push(r);
+    let r = fill_add(q.y, q.x);
+    let ypx_q = r.out;
+    rows.push(r);
     // B = ypx_p · ypx_q
-    let r = fill_mul(ypx_p, ypx_q); let bb = r.out; rows.push(r);
+    let r = fill_mul(ypx_p, ypx_q);
+    let bb = r.out;
+    rows.push(r);
 
     // T1·T2
-    let r = fill_mul(p.t, q.t); let t1t2 = r.out; rows.push(r);
+    let r = fill_mul(p.t, q.t);
+    let t1t2 = r.out;
+    rows.push(r);
     // C = T1·T2·(2d)
-    let r = fill_mul(t1t2, ED25519_TWO_D); let cc = r.out; rows.push(r);
+    let r = fill_mul(t1t2, ED25519_TWO_D);
+    let cc = r.out;
+    rows.push(r);
 
     // Z1·Z2
-    let r = fill_mul(p.z, q.z); let z1z2 = r.out; rows.push(r);
+    let r = fill_mul(p.z, q.z);
+    let z1z2 = r.out;
+    rows.push(r);
     // D = Z1·Z2·2
-    let r = fill_add(z1z2, z1z2); let dd = r.out; rows.push(r);
+    let r = fill_add(z1z2, z1z2);
+    let dd = r.out;
+    rows.push(r);
 
     // E = B − A
-    let r = fill_sub(bb, aa); let e_coord = r.out; rows.push(r);
+    let r = fill_sub(bb, aa);
+    let e_coord = r.out;
+    rows.push(r);
     // F = D − C
-    let r = fill_sub(dd, cc); let f_coord = r.out; rows.push(r);
+    let r = fill_sub(dd, cc);
+    let f_coord = r.out;
+    rows.push(r);
     // G = D + C
-    let r = fill_add(dd, cc); let g_coord = r.out; rows.push(r);
+    let r = fill_add(dd, cc);
+    let g_coord = r.out;
+    rows.push(r);
     // H = B + A
-    let r = fill_add(bb, aa); let h_coord = r.out; rows.push(r);
+    let r = fill_add(bb, aa);
+    let h_coord = r.out;
+    rows.push(r);
 
     // X3 = E·F;  Y3 = G·H;  T3 = E·H;  Z3 = F·G
-    let r = fill_mul(e_coord, f_coord); let x3 = r.out; rows.push(r);
-    let r = fill_mul(g_coord, h_coord); let y3 = r.out; rows.push(r);
-    let r = fill_mul(e_coord, h_coord); let t3 = r.out; rows.push(r);
-    let r = fill_mul(f_coord, g_coord); let z3 = r.out; rows.push(r);
+    let r = fill_mul(e_coord, f_coord);
+    let x3 = r.out;
+    rows.push(r);
+    let r = fill_mul(g_coord, h_coord);
+    let y3 = r.out;
+    rows.push(r);
+    let r = fill_mul(e_coord, h_coord);
+    let t3 = r.out;
+    rows.push(r);
+    let r = fill_mul(f_coord, g_coord);
+    let z3 = r.out;
+    rows.push(r);
 
-    (rows, ExtendedPoint { x: x3, y: y3, z: z3, t: t3 })
+    (
+        rows,
+        ExtendedPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+            t: t3,
+        },
+    )
 }
 
 /// R1e (Step 4): source-threaded `2·P` doubling.  Same formula as
@@ -201,8 +283,7 @@ pub fn point_double_rows_chained(
     start_row: u16,
 ) -> (Vec<FieldOpRow>, ExtendedPoint, ExtendedPointSources) {
     let mut rows: Vec<FieldOpRow> = Vec::new();
-    let tag = |rows: &mut Vec<FieldOpRow>, mut r: FieldOpRow,
-                   a_src: u16, b_src: u16| -> u16 {
+    let tag = |rows: &mut Vec<FieldOpRow>, mut r: FieldOpRow, a_src: u16, b_src: u16| -> u16 {
         r.a_source_row = a_src;
         r.b_source_row = b_src;
         let idx = start_row + rows.len() as u16;
@@ -211,59 +292,86 @@ pub fn point_double_rows_chained(
     };
 
     // A = X1·X1
-    let r = fill_mul(p.x, p.x); let aa = r.out;
+    let r = fill_mul(p.x, p.x);
+    let aa = r.out;
     let a_row = tag(&mut rows, r, sources.x_source, sources.x_source);
     // B = Y1·Y1
-    let r = fill_mul(p.y, p.y); let bb = r.out;
+    let r = fill_mul(p.y, p.y);
+    let bb = r.out;
     let b_row = tag(&mut rows, r, sources.y_source, sources.y_source);
     // ZZ = Z1·Z1
-    let r = fill_mul(p.z, p.z); let zz = r.out;
+    let r = fill_mul(p.z, p.z);
+    let zz = r.out;
     let zz_row = tag(&mut rows, r, sources.z_source, sources.z_source);
     // C = ZZ + ZZ
-    let r = fill_add(zz, zz); let cc = r.out;
+    let r = fill_add(zz, zz);
+    let cc = r.out;
     let c_row = tag(&mut rows, r, zz_row, zz_row);
     // D = 0 − A
-    let r = fill_sub(zero_field(), aa); let dd = r.out;
+    let r = fill_sub(zero_field(), aa);
+    let dd = r.out;
     let d_row = tag(&mut rows, r, zero_source, a_row);
     // X1 + Y1
-    let r = fill_add(p.x, p.y); let xpy = r.out;
+    let r = fill_add(p.x, p.y);
+    let xpy = r.out;
     let xpy_row = tag(&mut rows, r, sources.x_source, sources.y_source);
     // (X1+Y1)²
-    let r = fill_mul(xpy, xpy); let xpy2 = r.out;
+    let r = fill_mul(xpy, xpy);
+    let xpy2 = r.out;
     let xpy2_row = tag(&mut rows, r, xpy_row, xpy_row);
     // tmp = (X1+Y1)² − A
-    let r = fill_sub(xpy2, aa); let tmp = r.out;
+    let r = fill_sub(xpy2, aa);
+    let tmp = r.out;
     let tmp_row = tag(&mut rows, r, xpy2_row, a_row);
     // E = tmp − B
-    let r = fill_sub(tmp, bb); let e_coord = r.out;
+    let r = fill_sub(tmp, bb);
+    let e_coord = r.out;
     let e_row = tag(&mut rows, r, tmp_row, b_row);
     // G = D + B
-    let r = fill_add(dd, bb); let g_coord = r.out;
+    let r = fill_add(dd, bb);
+    let g_coord = r.out;
     let g_row = tag(&mut rows, r, d_row, b_row);
     // F = G − C
-    let r = fill_sub(g_coord, cc); let f_coord = r.out;
+    let r = fill_sub(g_coord, cc);
+    let f_coord = r.out;
     let f_row = tag(&mut rows, r, g_row, c_row);
     // H = D − B
-    let r = fill_sub(dd, bb); let h_coord = r.out;
+    let r = fill_sub(dd, bb);
+    let h_coord = r.out;
     let h_row = tag(&mut rows, r, d_row, b_row);
     // X3 = E·F
-    let r = fill_mul(e_coord, f_coord); let x3 = r.out;
+    let r = fill_mul(e_coord, f_coord);
+    let x3 = r.out;
     let x3_row = tag(&mut rows, r, e_row, f_row);
     // Y3 = G·H
-    let r = fill_mul(g_coord, h_coord); let y3 = r.out;
+    let r = fill_mul(g_coord, h_coord);
+    let y3 = r.out;
     let y3_row = tag(&mut rows, r, g_row, h_row);
     // T3 = E·H
-    let r = fill_mul(e_coord, h_coord); let t3 = r.out;
+    let r = fill_mul(e_coord, h_coord);
+    let t3 = r.out;
     let t3_row = tag(&mut rows, r, e_row, h_row);
     // Z3 = F·G
-    let r = fill_mul(f_coord, g_coord); let z3 = r.out;
+    let r = fill_mul(f_coord, g_coord);
+    let z3 = r.out;
     let z3_row = tag(&mut rows, r, f_row, g_row);
 
     let out_sources = ExtendedPointSources {
-        x_source: x3_row, y_source: y3_row,
-        z_source: z3_row, t_source: t3_row,
+        x_source: x3_row,
+        y_source: y3_row,
+        z_source: z3_row,
+        t_source: t3_row,
     };
-    (rows, ExtendedPoint { x: x3, y: y3, z: z3, t: t3 }, out_sources)
+    (
+        rows,
+        ExtendedPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+            t: t3,
+        },
+        out_sources,
+    )
 }
 
 /// R1e (Step 4): source-threaded `P + Q` addition.  `p_sources` /
@@ -283,8 +391,7 @@ pub fn point_add_rows_chained(
     start_row: u16,
 ) -> (Vec<FieldOpRow>, ExtendedPoint, ExtendedPointSources) {
     let mut rows: Vec<FieldOpRow> = Vec::new();
-    let tag = |rows: &mut Vec<FieldOpRow>, mut r: FieldOpRow,
-                   a_src: u16, b_src: u16| -> u16 {
+    let tag = |rows: &mut Vec<FieldOpRow>, mut r: FieldOpRow, a_src: u16, b_src: u16| -> u16 {
         r.a_source_row = a_src;
         r.b_source_row = b_src;
         let idx = start_row + rows.len() as u16;
@@ -293,70 +400,99 @@ pub fn point_add_rows_chained(
     };
 
     // ymx_p = Y1 − X1
-    let r = fill_sub(p.y, p.x); let ymx_p = r.out;
+    let r = fill_sub(p.y, p.x);
+    let ymx_p = r.out;
     let ymx_p_row = tag(&mut rows, r, p_sources.y_source, p_sources.x_source);
     // ymx_q = Y2 − X2
-    let r = fill_sub(q.y, q.x); let ymx_q = r.out;
+    let r = fill_sub(q.y, q.x);
+    let ymx_q = r.out;
     let ymx_q_row = tag(&mut rows, r, q_sources.y_source, q_sources.x_source);
     // A = ymx_p · ymx_q
-    let r = fill_mul(ymx_p, ymx_q); let aa = r.out;
+    let r = fill_mul(ymx_p, ymx_q);
+    let aa = r.out;
     let a_row = tag(&mut rows, r, ymx_p_row, ymx_q_row);
 
     // ypx_p = Y1 + X1
-    let r = fill_add(p.y, p.x); let ypx_p = r.out;
+    let r = fill_add(p.y, p.x);
+    let ypx_p = r.out;
     let ypx_p_row = tag(&mut rows, r, p_sources.y_source, p_sources.x_source);
     // ypx_q = Y2 + X2
-    let r = fill_add(q.y, q.x); let ypx_q = r.out;
+    let r = fill_add(q.y, q.x);
+    let ypx_q = r.out;
     let ypx_q_row = tag(&mut rows, r, q_sources.y_source, q_sources.x_source);
     // B = ypx_p · ypx_q
-    let r = fill_mul(ypx_p, ypx_q); let bb = r.out;
+    let r = fill_mul(ypx_p, ypx_q);
+    let bb = r.out;
     let b_row = tag(&mut rows, r, ypx_p_row, ypx_q_row);
 
     // T1·T2
-    let r = fill_mul(p.t, q.t); let t1t2 = r.out;
+    let r = fill_mul(p.t, q.t);
+    let t1t2 = r.out;
     let t1t2_row = tag(&mut rows, r, p_sources.t_source, q_sources.t_source);
     // C = T1·T2·(2d)
-    let r = fill_mul(t1t2, ED25519_TWO_D); let cc = r.out;
+    let r = fill_mul(t1t2, ED25519_TWO_D);
+    let cc = r.out;
     let c_row = tag(&mut rows, r, t1t2_row, two_d_source);
 
     // Z1·Z2
-    let r = fill_mul(p.z, q.z); let z1z2 = r.out;
+    let r = fill_mul(p.z, q.z);
+    let z1z2 = r.out;
     let z1z2_row = tag(&mut rows, r, p_sources.z_source, q_sources.z_source);
     // D = Z1·Z2 + Z1·Z2
-    let r = fill_add(z1z2, z1z2); let dd = r.out;
+    let r = fill_add(z1z2, z1z2);
+    let dd = r.out;
     let d_row = tag(&mut rows, r, z1z2_row, z1z2_row);
 
     // E = B − A
-    let r = fill_sub(bb, aa); let e_coord = r.out;
+    let r = fill_sub(bb, aa);
+    let e_coord = r.out;
     let e_row = tag(&mut rows, r, b_row, a_row);
     // F = D − C
-    let r = fill_sub(dd, cc); let f_coord = r.out;
+    let r = fill_sub(dd, cc);
+    let f_coord = r.out;
     let f_row = tag(&mut rows, r, d_row, c_row);
     // G = D + C
-    let r = fill_add(dd, cc); let g_coord = r.out;
+    let r = fill_add(dd, cc);
+    let g_coord = r.out;
     let g_row = tag(&mut rows, r, d_row, c_row);
     // H = B + A
-    let r = fill_add(bb, aa); let h_coord = r.out;
+    let r = fill_add(bb, aa);
+    let h_coord = r.out;
     let h_row = tag(&mut rows, r, b_row, a_row);
 
     // X3 = E·F
-    let r = fill_mul(e_coord, f_coord); let x3 = r.out;
+    let r = fill_mul(e_coord, f_coord);
+    let x3 = r.out;
     let x3_row = tag(&mut rows, r, e_row, f_row);
     // Y3 = G·H
-    let r = fill_mul(g_coord, h_coord); let y3 = r.out;
+    let r = fill_mul(g_coord, h_coord);
+    let y3 = r.out;
     let y3_row = tag(&mut rows, r, g_row, h_row);
     // T3 = E·H
-    let r = fill_mul(e_coord, h_coord); let t3 = r.out;
+    let r = fill_mul(e_coord, h_coord);
+    let t3 = r.out;
     let t3_row = tag(&mut rows, r, e_row, h_row);
     // Z3 = F·G
-    let r = fill_mul(f_coord, g_coord); let z3 = r.out;
+    let r = fill_mul(f_coord, g_coord);
+    let z3 = r.out;
     let z3_row = tag(&mut rows, r, f_row, g_row);
 
     let out_sources = ExtendedPointSources {
-        x_source: x3_row, y_source: y3_row,
-        z_source: z3_row, t_source: t3_row,
+        x_source: x3_row,
+        y_source: y3_row,
+        z_source: z3_row,
+        t_source: t3_row,
     };
-    (rows, ExtendedPoint { x: x3, y: y3, z: z3, t: t3 }, out_sources)
+    (
+        rows,
+        ExtendedPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+            t: t3,
+        },
+        out_sources,
+    )
 }
 
 /// Step 5: source-threaded scalar-mult `k · P` via the double-and-add
@@ -412,9 +548,8 @@ pub fn scalar_mult_rows_chained(
 
         // 1. Double.
         let cur_start = start_row + rows.len() as u16;
-        let (mut dr, doubled, dr_sources) = point_double_rows_chained(
-            &acc, &acc_sources, zero_source, cur_start,
-        );
+        let (mut dr, doubled, dr_sources) =
+            point_double_rows_chained(&acc, &acc_sources, zero_source, cur_start);
         rows.append(&mut dr);
         acc = doubled;
         acc_sources = dr_sources;
@@ -422,9 +557,8 @@ pub fn scalar_mult_rows_chained(
         // 2. Conditional add of P.
         if bit == 1 {
             let cur_start = start_row + rows.len() as u16;
-            let (mut ar, added, ar_sources) = point_add_rows_chained(
-                &acc, &acc_sources, p, p_sources, two_d_source, cur_start,
-            );
+            let (mut ar, added, ar_sources) =
+                point_add_rows_chained(&acc, &acc_sources, p, p_sources, two_d_source, cur_start);
             rows.append(&mut ar);
             acc = added;
             acc_sources = ar_sources;
@@ -512,9 +646,7 @@ pub fn point_identity() -> ExtendedPoint {
 /// ExtendedPoint requires decompression / compression — a separate
 /// piece (R1e-bis) that adds ~50 field-op rows of curve-equation
 /// witness at the boundary.
-pub fn scalar_mult_rows(scalar: &Bytes, p: &ExtendedPoint)
-    -> (Vec<FieldOpRow>, ExtendedPoint)
-{
+pub fn scalar_mult_rows(scalar: &Bytes, p: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) {
     let mut rows = Vec::new();
     let mut acc = point_identity();
 
@@ -557,8 +689,7 @@ mod tests {
     fn dalek_basepoint_extended() -> ExtendedPoint {
         // Affine basepoint (x, y) hard-coded from RFC 7748.  Lifting
         // to extended: (x, y, 1, xy).
-        let bx_dalek = curve25519_dalek::constants::ED25519_BASEPOINT_POINT
-            .compress();
+        let bx_dalek = curve25519_dalek::constants::ED25519_BASEPOINT_POINT.compress();
         let _ = bx_dalek;
 
         // Pull the Edwards basepoint affine coordinates from dalek.
@@ -598,7 +729,8 @@ mod tests {
         let x_affine = field::mul(&doubled.x, &z_inv);
         let y_affine = field::mul(&doubled.y, &z_inv);
         assert_eq!(x_affine, [0u8; 32], "2·O affine x must be 0");
-        let mut one_b = [0u8; 32]; one_b[0] = 1;
+        let mut one_b = [0u8; 32];
+        one_b[0] = 1;
         assert_eq!(y_affine, one_b, "2·O affine y must be 1");
     }
 
@@ -618,7 +750,8 @@ mod tests {
         let x_aff = field::mul(&sum.x, &z_inv);
         let y_aff = field::mul(&sum.y, &z_inv);
         assert_eq!(x_aff, [0u8; 32]);
-        let mut one_b = [0u8; 32]; one_b[0] = 1;
+        let mut one_b = [0u8; 32];
+        one_b[0] = 1;
         assert_eq!(y_aff, one_b);
     }
 
@@ -669,7 +802,8 @@ mod tests {
     fn scalar_mult_of_identity_is_identity() {
         // For any k, k · O = O.  Use k = 1.
         let id = point_identity();
-        let mut k = [0u8; 32]; k[0] = 1;
+        let mut k = [0u8; 32];
+        k[0] = 1;
         let (_rows, result) = scalar_mult_rows(&k, &id);
         assert!(projective_eq(&result, &point_identity()));
     }
@@ -684,7 +818,8 @@ mod tests {
         // confirms only that 1·O = O.  Real basepoint coverage
         // lands in R1f via the ECALL path against dalek directly.
         let id = point_identity();
-        let mut k = [0u8; 32]; k[0] = 1;
+        let mut k = [0u8; 32];
+        k[0] = 1;
         let (_, result) = scalar_mult_rows(&k, &id);
         assert!(projective_eq(&result, &id));
     }

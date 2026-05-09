@@ -1,5 +1,5 @@
 use super::Context;
-use super::codec::{Encode, Decode};
+use super::codec::{Decode, Encode};
 use super::run::RunResult;
 
 /// The core actor trait. Defines the full lifecycle of a VOS actor:
@@ -62,7 +62,10 @@ pub trait Actor: Sized + Encode + Decode {
     ///
     /// The `#[actor]` macro auto-generates this to forward to the `start`
     /// message handler if one is defined via `#[messages]`.
-    async fn on_start(&mut self, _ctx: &mut Context<Self>) -> core::result::Result<(), Self::Error> {
+    async fn on_start(
+        &mut self,
+        _ctx: &mut Context<Self>,
+    ) -> core::result::Result<(), Self::Error> {
         Ok(())
     }
 
@@ -98,7 +101,7 @@ pub trait Actor: Sized + Encode + Decode {
                     Ok(())
                 }
             }
-            let _ = core::fmt::write(&mut ErrorWriter, format_args!("error: {:?}\n", error));
+            let _ = core::fmt::write(&mut ErrorWriter, format_args!("error: {error:?}\n"));
         }
         true
     }
@@ -115,9 +118,5 @@ pub trait Message<M>: Actor {
     type Output;
 
     /// Process the message with exclusive mutable access to actor state.
-    async fn handle(
-        &mut self,
-        msg: M,
-        ctx: &mut Context<Self>,
-    ) -> Self::Output;
+    async fn handle(&mut self, msg: M, ctx: &mut Context<Self>) -> Self::Output;
 }

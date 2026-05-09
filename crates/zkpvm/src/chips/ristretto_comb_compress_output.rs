@@ -22,16 +22,16 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
-use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -43,13 +43,11 @@ use crate::trace::{
 };
 
 use crate::framework::BuiltInComponent;
-use crate::lookups::{
-    MemoryAccessLookupElements, RistrettoCombCompressOutputLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+use crate::lookups::{MemoryAccessLookupElements, RistrettoCombCompressOutputLookupElements};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
@@ -173,11 +171,7 @@ fn log_size_for(n_rows: usize) -> u32 {
 impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = output_log_size(side_note);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -223,22 +217,16 @@ impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let memory: &MemoryAccessLookupElements = lookup_elements.as_ref();
-        let output_relation: &RistrettoCombCompressOutputLookupElements =
-            lookup_elements.as_ref();
+        let output_relation: &RistrettoCombCompressOutputLookupElements = lookup_elements.as_ref();
 
-        let is_real =
-            crate::trace::original_base_column!(component_trace, Column::IsReal);
+        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
         let addr = crate::trace::original_base_column!(component_trace, Column::Addr);
         let value = crate::trace::original_base_column!(component_trace, Column::Value);
         let ts = crate::trace::original_base_column!(component_trace, Column::Ts);
-        let call_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::CallIdx
-        );
-        let byte_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::ByteIdx
-        );
+        let call_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::CallIdx);
+        let byte_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ByteIdx);
 
         use crate::trace::component::FinalizedColumn;
         use stwo::core::fields::m31::BaseField as BF;
@@ -262,12 +250,7 @@ impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
         tuple.push(value[0].clone());
         tuple.extend(ts.iter().cloned());
         tuple.push(one_col);
-        logup.add_to_relation_with(
-            memory,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(memory, [is_real[0].clone()], |[r]| r.into(), &tuple);
 
         logup.finalize()
     }

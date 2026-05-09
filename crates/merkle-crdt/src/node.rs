@@ -1,6 +1,6 @@
+use crate::{Cid, Decode, Encode, Hasher};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use crate::{Cid, Encode, Decode, Hasher};
 
 /// A node in the Merkle-DAG.
 ///
@@ -83,11 +83,15 @@ impl<H: Hasher, P: Decode> DagNode<H, P> {
             pos += 8;
             u64::from_le_bytes(b.try_into().ok()?) as usize
         };
-        if pos + payload_len > bytes.len() { return None; }
+        if pos + payload_len > bytes.len() {
+            return None;
+        }
         let payload = P::decode_from(&bytes[pos..pos + payload_len], &mut 0)?;
         pos += payload_len;
         let count = {
-            if pos + 8 > bytes.len() { return None; }
+            if pos + 8 > bytes.len() {
+                return None;
+            }
             let b = &bytes[pos..pos + 8];
             pos += 8;
             u64::from_le_bytes(b.try_into().ok()?) as usize
@@ -95,7 +99,9 @@ impl<H: Hasher, P: Decode> DagNode<H, P> {
         let hash_len = core::mem::size_of::<H::Output>();
         let mut children = BTreeSet::new();
         for _ in 0..count {
-            if pos + hash_len > bytes.len() { return None; }
+            if pos + hash_len > bytes.len() {
+                return None;
+            }
             let h = H::Output::decode_from(bytes, &mut pos)?;
             children.insert(Cid(h));
         }

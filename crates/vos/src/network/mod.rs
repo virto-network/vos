@@ -27,8 +27,6 @@
 //! - CRDT gossip / sync via libp2p pubsub.
 //! - Hyperspace-driven peer discovery.
 
-#![cfg(feature = "network")]
-
 mod codec;
 mod wire;
 
@@ -36,7 +34,7 @@ pub use wire::{Frame, FrameError, MAX_FRAME_BYTES};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -44,11 +42,11 @@ use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, identity, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, identity, mdns, noise, ping, tcp, yamux};
 use tokio::sync::mpsc as async_mpsc;
 use tracing::{debug, error, info, warn};
 
-use codec::{VosCodec, PROTOCOL};
+use codec::{PROTOCOL, VosCodec};
 
 /// Combined libp2p behaviour.
 #[derive(NetworkBehaviour)]
@@ -182,7 +180,9 @@ enum NetworkCmd {
     },
     /// Subscribe the local node to the gossipsub topic for a
     /// replication group. Idempotent — re-subscribing is a no-op.
-    SubscribeRep { replication_id: [u8; 32] },
+    SubscribeRep {
+        replication_id: [u8; 32],
+    },
     /// Publish a head announcement for a replication group on
     /// its gossipsub topic. Subscribers schedule an immediate
     /// fetch from the publisher rather than waiting for the
@@ -218,8 +218,7 @@ impl Network {
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>> =
             Arc::new(Mutex::new(None));
-        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> =
-            Arc::new(Mutex::new(None));
+        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
@@ -322,7 +321,9 @@ impl Network {
     /// gossipsub topic. Idempotent — call once per local
     /// replica when registered.
     pub fn subscribe_rep(&self, replication_id: [u8; 32]) {
-        let _ = self.cmd_tx.send(NetworkCmd::SubscribeRep { replication_id });
+        let _ = self
+            .cmd_tx
+            .send(NetworkCmd::SubscribeRep { replication_id });
     }
 
     /// Publish a head announcement for a replication group.
@@ -330,7 +331,10 @@ impl Network {
     /// can pull the new state without waiting for the next 250ms
     /// sync tick.
     pub fn publish_heads(&self, replication_id: [u8; 32], roots: Vec<[u8; 32]>) {
-        let _ = self.cmd_tx.send(NetworkCmd::PublishHeads { replication_id, roots });
+        let _ = self.cmd_tx.send(NetworkCmd::PublishHeads {
+            replication_id,
+            roots,
+        });
     }
 
     /// Register a sender that receives hint `(peer)` whenever a
@@ -339,11 +343,7 @@ impl Network {
     /// triggers an immediate fetch — that's how cycle 8 turns
     /// the previously-poll-only sync into a near-zero-latency
     /// push.
-    pub fn register_hint_sender(
-        &self,
-        replication_id: [u8; 32],
-        sender: std_mpsc::Sender<PeerId>,
-    ) {
+    pub fn register_hint_sender(&self, replication_id: [u8; 32], sender: std_mpsc::Sender<PeerId>) {
         let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
             replication_id,
             sender,
@@ -518,10 +518,8 @@ async fn network_main(
     // to the caller. One map for invoke + sync because each
     // RequestId is unique across all outbound traffic on the
     // behaviour.
-    let mut outbound_replies: HashMap<
-        request_response::OutboundRequestId,
-        OutboundReply,
-    > = HashMap::new();
+    let mut outbound_replies: HashMap<request_response::OutboundRequestId, OutboundReply> =
+        HashMap::new();
 
     // Inbound dispatch path: blocking tasks complete asynchronously
     // and need to push (response_channel, frame) back to the swarm
@@ -668,13 +666,14 @@ fn build_swarm(
         )?
         .with_behaviour(|key| {
             let mdns_cfg = mdns::Config::default();
-            let mdns = mdns::tokio::Behaviour::new(mdns_cfg, local_peer_id)
-                .map_err::<Box<dyn std::error::Error + Send + Sync>, _>(|e| Box::new(e))?;
+            let mdns = mdns::tokio::Behaviour::new(mdns_cfg, local_peer_id).map_err::<Box<
+                dyn std::error::Error + Send + Sync,
+            >, _>(
+                |e| Box::new(e)
+            )?;
             let ping = ping::Behaviour::default();
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/vos/0.1.0".into(),
-                key.public(),
-            ));
+            let identify =
+                identify::Behaviour::new(identify::Config::new("/vos/0.1.0".into(), key.public()));
             let req_resp = request_response::Behaviour::with_codec(
                 VosCodec,
                 std::iter::once((PROTOCOL, ProtocolSupport::Full)),
@@ -734,7 +733,9 @@ fn handle_swarm_event(
                 }
             }
         }
-        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
             info!(%peer_id, ?endpoint, "network: peer connected");
             // Initiate the Hello handshake from the dialer side.
             // The listener's reply rides back as the response, so
@@ -744,7 +745,9 @@ fn handle_swarm_event(
             if endpoint.is_dialer() {
                 let _ = swarm.behaviour_mut().req_resp.send_request(
                     &peer_id,
-                    Frame::Hello { node_prefix: local_prefix },
+                    Frame::Hello {
+                        node_prefix: local_prefix,
+                    },
                 );
             }
         }
@@ -765,13 +768,24 @@ fn handle_swarm_event(
                 debug!(%peer_id, "network: mDNS peer expired");
             }
         }
-        SwarmEvent::Behaviour(VosBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+        SwarmEvent::Behaviour(VosBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
             debug!(%peer_id, agent = %info.agent_version, "network: identify received");
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::ReqResp(rr_event)) => {
             handle_req_resp(
-                swarm, rr_event, local_prefix, prefix_map, inbox,
-                outbound_replies, invoke_dispatcher, sync_provider, response_tx,
+                swarm,
+                rr_event,
+                local_prefix,
+                prefix_map,
+                inbox,
+                outbound_replies,
+                invoke_dispatcher,
+                sync_provider,
+                response_tx,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {
@@ -796,13 +810,17 @@ fn handle_req_resp(
 
     match event {
         Event::Message { peer, message, .. } => match message {
-            Message::Request { request, channel, .. } => {
+            Message::Request {
+                request, channel, ..
+            } => {
                 match request {
                     Frame::Hello { node_prefix } => {
                         record_prefix(prefix_map, node_prefix, peer);
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
-                            Frame::Hello { node_prefix: local_prefix },
+                            Frame::Hello {
+                                node_prefix: local_prefix,
+                            },
                         );
                     }
                     Frame::Tell { from, to, payload } => {
@@ -814,7 +832,12 @@ fn handle_req_resp(
                             .req_resp
                             .send_response(channel, Frame::Ack);
                     }
-                    Frame::InvokeRequest { from, to, chain, msg } => {
+                    Frame::InvokeRequest {
+                        from,
+                        to,
+                        chain,
+                        msg,
+                    } => {
                         // Hand off to a blocking task: the dispatcher's
                         // reply channel uses std::sync::mpsc, which would
                         // park the runtime if awaited inline. The task
@@ -827,15 +850,15 @@ fn handle_req_resp(
                                 Some(d) => d.dispatch(from, to, chain, msg),
                                 None => {
                                     warn!(
-                                        from, to,
+                                        from,
+                                        to,
                                         "network: inbound InvokeRequest with no \
                                          dispatcher installed; replying empty",
                                     );
                                     Vec::new()
                                 }
                             };
-                            let _ = response_tx
-                                .send((channel, Frame::InvokeReply { payload }));
+                            let _ = response_tx.send((channel, Frame::InvokeReply { payload }));
                         });
                     }
                     Frame::FetchHeads { replication_id } => {
@@ -848,10 +871,16 @@ fn handle_req_resp(
                             .unwrap_or_default();
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
-                            Frame::Heads { replication_id, roots },
+                            Frame::Heads {
+                                replication_id,
+                                roots,
+                            },
                         );
                     }
-                    Frame::FetchNode { replication_id, cid } => {
+                    Frame::FetchNode {
+                        replication_id,
+                        cid,
+                    } => {
                         let provider = sync_provider.lock().ok().and_then(|g| g.clone());
                         let node = provider
                             .as_ref()
@@ -870,7 +899,11 @@ fn handle_req_resp(
                     }
                 }
             }
-            Message::Response { response, request_id, .. } => {
+            Message::Response {
+                response,
+                request_id,
+                ..
+            } => {
                 let pending = outbound_replies.remove(&request_id);
                 match (response, pending) {
                     (Frame::Hello { node_prefix }, _) => {
@@ -894,7 +927,12 @@ fn handle_req_resp(
                 }
             }
         },
-        Event::OutboundFailure { peer, request_id, error, .. } => {
+        Event::OutboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        } => {
             warn!(%peer, error = %error, "network: outbound request failed");
             // Drop the reply Sender so the caller's recv yields
             // Disconnected — surfaces as None / NotFound.
@@ -912,7 +950,7 @@ fn gossip_topic(rep_id: &[u8; 32]) -> gossipsub::IdentTopic {
     let mut hex = String::with_capacity(64);
     for b in rep_id {
         use core::fmt::Write;
-        let _ = write!(&mut hex, "{:02x}", b);
+        let _ = write!(&mut hex, "{b:02x}");
     }
     gossipsub::IdentTopic::new(format!("vos/sync/{hex}"))
 }
@@ -921,29 +959,31 @@ fn handle_gossipsub_event(
     event: gossipsub::Event,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
-    match event {
-        gossipsub::Event::Message { propagation_source, message, .. } => {
-            // Decode the published frame; expect Heads with a
-            // replication_id matching the topic. We use rep_id
-            // from the frame as the routing key (the topic's hex
-            // is derivable but the frame's bytes are
-            // authoritative).
-            let frame = match Frame::decode(&message.data) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(error = %e, "gossipsub: bad frame, dropping");
-                    return;
-                }
-            };
-            if let Frame::Heads { replication_id, .. } = frame {
-                if let Some(sender) = hint_senders.get(&replication_id) {
-                    let _ = sender.send(propagation_source);
-                }
-            } else {
-                warn!(?frame, "gossipsub: unexpected frame on sync topic");
+    if let gossipsub::Event::Message {
+        propagation_source,
+        message,
+        ..
+    } = event
+    {
+        // Decode the published frame; expect Heads with a
+        // replication_id matching the topic. We use rep_id
+        // from the frame as the routing key (the topic's hex
+        // is derivable but the frame's bytes are
+        // authoritative).
+        let frame = match Frame::decode(&message.data) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "gossipsub: bad frame, dropping");
+                return;
             }
+        };
+        if let Frame::Heads { replication_id, .. } = frame {
+            if let Some(sender) = hint_senders.get(&replication_id) {
+                let _ = sender.send(propagation_source);
+            }
+        } else {
+            warn!(?frame, "gossipsub: unexpected frame on sync topic");
         }
-        _ => {}
     }
 }
 
@@ -1058,7 +1098,11 @@ mod tests {
             seen.insert(derive_node_prefix(&pid));
         }
         // 16 random u16s collide vanishingly rarely.
-        assert!(seen.len() >= 15, "got {} unique prefixes from 16 keys", seen.len());
+        assert!(
+            seen.len() >= 15,
+            "got {} unique prefixes from 16 keys",
+            seen.len()
+        );
     }
 
     #[test]
@@ -1092,8 +1136,11 @@ mod tests {
 
         // Wait until A reports a bound address — without this, B
         // has nothing to dial.
-        let a_addr = wait_for(|| net_a.listen_addrs().into_iter().next(), Duration::from_secs(5))
-            .expect("net_a should have bound a listen address");
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a should have bound a listen address");
         let a_peer_id = net_a.peer_id();
         let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(a_peer_id));
 
@@ -1221,10 +1268,8 @@ mod tests {
         let log1 = EffectLog::for_msg(b"first".to_vec());
         let log2 = EffectLog::for_msg(b"second".to_vec());
         {
-            let mut cc_a = CrdtCommit::from_db_arc_locked(
-                slot_a.db.clone(),
-                slot_a.commit_lock.clone(),
-            );
+            let mut cc_a =
+                CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone());
             cc_a.commit_with_log(b"v1", &log1).unwrap();
             cc_a.commit_with_log(b"v2", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
@@ -1245,10 +1290,8 @@ mod tests {
                 // roots. The sync ticker writes through the same
                 // redb file, so a fresh CrdtCommit picks up the
                 // merged state.
-                let cc = CrdtCommit::from_db_arc_locked(
-                    slot_b.db.clone(),
-                    slot_b.commit_lock.clone(),
-                );
+                let cc =
+                    CrdtCommit::from_db_arc_locked(slot_b.db.clone(), slot_b.commit_lock.clone());
                 if cc.root_bytes().is_empty() {
                     None
                 } else {
@@ -1266,10 +1309,7 @@ mod tests {
         assert_eq!(logs[1], log2);
 
         // Roots match too.
-        let cc_a = CrdtCommit::from_db_arc_locked(
-            slot_a.db.clone(),
-            slot_a.commit_lock.clone(),
-        );
+        let cc_a = CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone());
         assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
 
         let _ = node_a.collect();
@@ -1337,12 +1377,12 @@ mod tests {
             .get(&rep_id)
             .cloned()
             .unwrap();
-        let mut cc = CrdtCommit::from_db_arc_locked(
-            slot_for_writes.db,
-            slot_for_writes.commit_lock,
-        );
-        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec())).unwrap();
-        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec())).unwrap();
+        let mut cc =
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock);
+        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
+            .unwrap();
+        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec()))
+            .unwrap();
         let expected_root = cc.root_bytes()[0];
         let expected_node_bytes = cc.get_node_bytes(&expected_root).unwrap().unwrap();
         drop(cc);
@@ -1566,8 +1606,7 @@ mod tests {
 
         impl InvokeDispatcher for RecordingDispatcher {
             fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
-                *self.seen.lock().unwrap() =
-                    Some((from, to, chain.clone(), msg));
+                *self.seen.lock().unwrap() = Some((from, to, chain.clone(), msg));
                 self.reply.clone()
             }
         }
@@ -1606,17 +1645,14 @@ mod tests {
             reply: b"the answer".to_vec(),
         }));
 
-        wait_for(
-            || net_a.peer_for_prefix(prefix_b),
-            Duration::from_secs(10),
-        )
-        .expect("Hello completes");
+        wait_for(|| net_a.peer_for_prefix(prefix_b), Duration::from_secs(10))
+            .expect("Hello completes");
 
         let target_peer = net_a.peer_for_prefix(prefix_b).unwrap();
         let reply_rx = net_a.send_invoke(
             target_peer,
-            0x00010002, // from
-            0xBBBB0007, // to (B's local id 7)
+            0x00010002,       // from
+            0xBBBB0007,       // to (B's local id 7)
             vec![0x00010002], // chain
             b"please reply".to_vec(),
         );
@@ -1626,7 +1662,11 @@ mod tests {
             .expect("invoke reply");
         assert_eq!(payload, b"the answer");
 
-        let seen = seen.lock().unwrap().clone().expect("dispatcher saw the call");
+        let seen = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("dispatcher saw the call");
         assert_eq!(seen.0, 0x00010002);
         assert_eq!(seen.1, 0xBBBB0007);
         assert_eq!(seen.2, vec![0x00010002]);

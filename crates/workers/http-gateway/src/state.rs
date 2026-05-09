@@ -44,8 +44,7 @@ impl Inner {
     /// stop. Used both by the `running()` actor message and to gate
     /// the "already running" early-return on a second `serve` call.
     pub(crate) fn running(&self) -> bool {
-        self.bound_port.load(Ordering::Relaxed) != 0
-            && !self.stop.load(Ordering::Relaxed)
+        self.bound_port.load(Ordering::Relaxed) != 0 && !self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -64,7 +63,11 @@ pub(crate) fn now_unix() -> u64 {
 /// and the `status()` actor message.
 pub(crate) fn status_json(inner: &Inner) -> String {
     let started = inner.started_unix.load(Ordering::Relaxed);
-    let uptime = if started == 0 { 0 } else { now_unix().saturating_sub(started) };
+    let uptime = if started == 0 {
+        0
+    } else {
+        now_unix().saturating_sub(started)
+    };
     serde_json::json!({
         "port": inner.bound_port.load(Ordering::Relaxed),
         "running": inner.running(),

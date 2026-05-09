@@ -60,10 +60,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -78,14 +78,14 @@ use crate::trace::{
 
 use crate::chips::ristretto::field_op_constraints;
 use crate::framework::BuiltInComponent;
-use crate::lookups::{
-    ByteToBitsLookupElements, RistrettoCombCompressOutputLookupElements,
-    RistrettoCombCompressRegFileLookupElements, RistrettoCombFinalAccLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+use crate::lookups::{
+    ByteToBitsLookupElements, RistrettoCombCompressOutputLookupElements,
+    RistrettoCombCompressRegFileLookupElements, RistrettoCombFinalAccLookupElements,
+};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
@@ -439,13 +439,9 @@ impl Default for CompressRow {
 ///      through the algebra chain.
 #[cfg(feature = "prover")]
 fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
-    use crate::chips::ristretto::comb_table::{
-        ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
-    };
-    use crate::chips::ristretto::compress::{
-        compute_compress_witness, invsqrt_a_minus_d, sqrt_m1,
-    };
-    use crate::chips::ristretto::point::{point_add_rows, point_identity, ExtendedPoint};
+    use crate::chips::ristretto::comb_table::{CombTable, NUM_WINDOWS, ed25519_basepoint_extended};
+    use crate::chips::ristretto::compress::{compute_compress_witness, invsqrt_a_minus_d, sqrt_m1};
+    use crate::chips::ristretto::point::{ExtendedPoint, point_add_rows, point_identity};
     use crate::chips::ristretto::witness::{fill_add, fill_input, fill_mul, fill_sub};
 
     let mut rows: Vec<CompressRow> = Vec::new();
@@ -456,9 +452,18 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
     // negate's IsSub `0 - a` step (Batch 3e).  Push them once at
     // the trace's start; per-call rows reference them by absolute
     // row id.
-    rows.push(CompressRow { field: fill_input(*sqrt_m1()), ..Default::default() });
-    rows.push(CompressRow { field: fill_input(*invsqrt_a_minus_d()), ..Default::default() });
-    rows.push(CompressRow { field: fill_input([0u8; 32]), ..Default::default() });
+    rows.push(CompressRow {
+        field: fill_input(*sqrt_m1()),
+        ..Default::default()
+    });
+    rows.push(CompressRow {
+        field: fill_input(*invsqrt_a_minus_d()),
+        ..Default::default()
+    });
+    rows.push(CompressRow {
+        field: fill_input([0u8; 32]),
+        ..Default::default()
+    });
     debug_assert_eq!(rows.len(), N_BOUNDARY_INPUTS);
 
     let table = CombTable::from_base(&ed25519_basepoint_extended());
@@ -496,11 +501,26 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         let r_i2t = base + ROW_I2_T as u16;
 
         // ── 5 IsInput rows ──
-        rows.push(CompressRow { field: fill_input(acc.x), ..Default::default() });
-        rows.push(CompressRow { field: fill_input(acc.y), ..Default::default() });
-        rows.push(CompressRow { field: fill_input(acc.z), ..Default::default() });
-        rows.push(CompressRow { field: fill_input(acc.t), ..Default::default() });
-        rows.push(CompressRow { field: fill_input(w.inv_sqrt), ..Default::default() });
+        rows.push(CompressRow {
+            field: fill_input(acc.x),
+            ..Default::default()
+        });
+        rows.push(CompressRow {
+            field: fill_input(acc.y),
+            ..Default::default()
+        });
+        rows.push(CompressRow {
+            field: fill_input(acc.z),
+            ..Default::default()
+        });
+        rows.push(CompressRow {
+            field: fill_input(acc.t),
+            ..Default::default()
+        });
+        rows.push(CompressRow {
+            field: fill_input(w.inv_sqrt),
+            ..Default::default()
+        });
 
         // ── Algebra rows 1-12 ──
         // row +5: Z + Y
@@ -508,49 +528,70 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_z;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.z_plus_y);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row +6: Z - Y
         let mut fr = fill_sub(acc.z, acc.y);
         fr.a_source_row = r_z;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.z_minus_y);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row +7: u1 = (Z+Y)·(Z-Y)
         let mut fr = fill_mul(w.z_plus_y, w.z_minus_y);
         fr.a_source_row = r_zpy;
         fr.b_source_row = r_zmy;
         debug_assert_eq!(fr.out, w.u1);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row +8: u2 = X·Y
         let mut fr = fill_mul(acc.x, acc.y);
         fr.a_source_row = r_x;
         fr.b_source_row = r_y;
         debug_assert_eq!(fr.out, w.u2);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row +9: u2² = u2·u2
         let mut fr = fill_mul(w.u2, w.u2);
         fr.a_source_row = r_u2;
         fr.b_source_row = r_u2;
         debug_assert_eq!(fr.out, w.u2_sq);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+10: tmp = u1·u2²
         let mut fr = fill_mul(w.u1, w.u2_sq);
         fr.a_source_row = r_u1;
         fr.b_source_row = r_u2sq;
         debug_assert_eq!(fr.out, w.u1_u2_sq);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+11: inv_sqrt²
         let mut fr = fill_mul(w.inv_sqrt, w.inv_sqrt);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_inv;
         debug_assert_eq!(fr.out, w.inv_sqrt_sq);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+12: inv_sqrt²·tmp (must equal 1; the unity-check
         // constraint on this row's `out` lands in a follow-up).
@@ -564,35 +605,50 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             o
         };
         debug_assert_eq!(fr.out, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+13: i1 = inv_sqrt·u1
         let mut fr = fill_mul(w.inv_sqrt, w.u1);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_u1;
         debug_assert_eq!(fr.out, w.i1);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+14: i2 = inv_sqrt·u2
         let mut fr = fill_mul(w.inv_sqrt, w.u2);
         fr.a_source_row = r_inv;
         fr.b_source_row = r_u2;
         debug_assert_eq!(fr.out, w.i2);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+15: i2·T
         let mut fr = fill_mul(w.i2, acc.t);
         fr.a_source_row = r_i2;
         fr.b_source_row = r_t;
         debug_assert_eq!(fr.out, w.i2_t);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+16: z_inv = i1·(i2·T)
         let mut fr = fill_mul(w.i1, w.i2_t);
         fr.a_source_row = r_i1;
         fr.b_source_row = r_i2t;
         debug_assert_eq!(fr.out, w.z_inv);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_z_inv = base + ROW_Z_INV as u16;
 
         // row+17: T · z_inv (sign source — its byte 0 LSB feeds the
@@ -601,28 +657,40 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_t;
         fr.b_source_row = r_z_inv;
         debug_assert_eq!(fr.out, w.t_z_inv);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+18: iX = X · SQRT_M1
         let mut fr = fill_mul(acc.x, *sqrt_m1());
         fr.a_source_row = r_x;
         fr.b_source_row = ROW_BD_SQRT_M1;
         debug_assert_eq!(fr.out, w.i_x);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+19: iY = Y · SQRT_M1
         let mut fr = fill_mul(acc.y, *sqrt_m1());
         fr.a_source_row = r_y;
         fr.b_source_row = ROW_BD_SQRT_M1;
         debug_assert_eq!(fr.out, w.i_y);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+20: enchanted = i1 · INVSQRT_A_MINUS_D
         let mut fr = fill_mul(w.i1, *invsqrt_a_minus_d());
         fr.a_source_row = r_i1;
         fr.b_source_row = ROW_BD_INVSQRT_AMD;
         debug_assert_eq!(fr.out, w.enchanted_denominator);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // row+21: rotate sign witness — IsInput row carrying
         // `out[0] = T·z_inv.bytes[0] & 1` with `out[1..32] = 0`.
@@ -667,21 +735,30 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_iy;
         fr.b_source_row = r_x;
         let diff_x = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_x_diff = base + ROW_X_DIFF as u16;
         // row+23: IsMul scaled_x = rotate · diff_x
         let mut fr = fill_mul(rotate_field, diff_x);
         fr.a_source_row = r_sign_rotate;
         fr.b_source_row = r_x_diff;
         let scaled_x = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_x_scaled = base + ROW_X_SCALED as u16;
         // row+24: IsAdd x_post_rotate = X + scaled_x
         let mut fr = fill_add(acc.x, scaled_x);
         fr.a_source_row = r_x;
         fr.b_source_row = r_x_scaled;
         debug_assert_eq!(fr.out, w.x_post_rotate);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // ── Conditional select Y' = if rotate then iX else Y ──
         // row+25: IsSub diff_y = iX - Y
@@ -689,21 +766,30 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_ix;
         fr.b_source_row = r_y;
         let diff_y = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_y_diff = base + ROW_Y_DIFF as u16;
         // row+26: IsMul scaled_y = rotate · diff_y
         let mut fr = fill_mul(rotate_field, diff_y);
         fr.a_source_row = r_sign_rotate;
         fr.b_source_row = r_y_diff;
         let scaled_y = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_y_scaled = base + ROW_Y_SCALED as u16;
         // row+27: IsAdd y_post_rotate = Y + scaled_y
         let mut fr = fill_add(acc.y, scaled_y);
         fr.a_source_row = r_y;
         fr.b_source_row = r_y_scaled;
         debug_assert_eq!(fr.out, w.y_post_rotate);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
 
         // ── Conditional select den_inv = if rotate then enchanted else i2 ──
         // row+28: IsSub diff_d = enchanted - i2
@@ -711,21 +797,30 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_enchanted;
         fr.b_source_row = r_i2;
         let diff_d = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_d_diff = base + ROW_DEN_INV_DIFF as u16;
         // row+29: IsMul scaled_d = rotate · diff_d
         let mut fr = fill_mul(rotate_field, diff_d);
         fr.a_source_row = r_sign_rotate;
         fr.b_source_row = r_d_diff;
         let scaled_d = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_d_scaled = base + ROW_DEN_INV_SCALED as u16;
         // row+30: IsAdd den_inv = i2 + scaled_d
         let mut fr = fill_add(w.i2, scaled_d);
         fr.a_source_row = r_i2;
         fr.b_source_row = r_d_scaled;
         debug_assert_eq!(fr.out, w.den_inv);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_x_post_rotate = base + ROW_X_POST_ROTATE as u16;
         let r_y_post_rotate = base + ROW_Y_POST_ROTATE as u16;
         let r_z_inv = base + ROW_Z_INV as u16;
@@ -736,7 +831,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_x_post_rotate;
         fr.b_source_row = r_z_inv;
         debug_assert_eq!(fr.out, w.x_z_inv);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_x_z_inv = base + ROW_X_Z_INV as u16;
 
         // ── row+32: y_negate sign witness ──
@@ -762,7 +860,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.b_source_row = r_y_post_rotate;
         let neg_y = fr.out;
         // Cross-check: neg_y == p - Y' (or 0 if Y' == 0).
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_neg_y = base + ROW_NEG_Y as u16;
 
         // ── Conditional negate Y_neg = if y_negate then neg_y else Y' ──
@@ -772,7 +873,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_neg_y;
         fr.b_source_row = r_y_post_rotate;
         let diff_yneg = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_y_neg_diff = base + ROW_Y_NEG_DIFF as u16;
         // row+35: IsMul scaled = y_negate · diff
         let mut y_negate_field = [0u8; 32];
@@ -781,14 +885,20 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_sign_y_negate;
         fr.b_source_row = r_y_neg_diff;
         let scaled_yneg = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_y_neg_scaled = base + ROW_Y_NEG_SCALED as u16;
         // row+36: IsAdd Y_neg = Y' + scaled
         let mut fr = fill_add(w.y_post_rotate, scaled_yneg);
         fr.a_source_row = r_y_post_rotate;
         fr.b_source_row = r_y_neg_scaled;
         debug_assert_eq!(fr.out, w.y_neg);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_y_neg = base + ROW_Y_NEG as u16;
 
         // ── row+37: Z - Y_neg ──
@@ -796,7 +906,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_z;
         fr.b_source_row = r_y_neg;
         debug_assert_eq!(fr.out, w.z_minus_y_neg);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_z_minus_y_neg = base + ROW_Z_MINUS_Y_NEG as u16;
 
         // ── row+38: s = den_inv · (Z - Y_neg) ──
@@ -804,7 +917,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_den_inv;
         fr.b_source_row = r_z_minus_y_neg;
         debug_assert_eq!(fr.out, w.s);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_s = base + ROW_S as u16;
 
         // ── row+39: s_neg sign witness ──
@@ -829,7 +945,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = ROW_BD_ZERO;
         fr.b_source_row = r_s;
         let neg_s = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_neg_s = base + ROW_NEG_S as u16;
 
         // ── Conditional negate s_can = if s_neg then neg_s else s ──
@@ -838,7 +957,10 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_neg_s;
         fr.b_source_row = r_s;
         let diff_scan = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_s_can_diff = base + ROW_S_CAN_DIFF as u16;
         // row+42: IsMul scaled = s_neg · diff
         let mut s_neg_field = [0u8; 32];
@@ -847,14 +969,20 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
         fr.a_source_row = r_sign_s_neg;
         fr.b_source_row = r_s_can_diff;
         let scaled_scan = fr.out;
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
         let r_s_can_scaled = base + ROW_S_CAN_SCALED as u16;
         // row+43: IsAdd s_can = s + scaled
         let mut fr = fill_add(w.s, scaled_scan);
         fr.a_source_row = r_s;
         fr.b_source_row = r_s_can_scaled;
         debug_assert_eq!(fr.out, w.s_can);
-        rows.push(CompressRow { field: fr, ..Default::default() });
+        rows.push(CompressRow {
+            field: fr,
+            ..Default::default()
+        });
     }
 
     finalize_producer_multiplicities(&mut rows);
@@ -1113,8 +1241,7 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         // partition's `is_real · (is_input - 1) = 0` clause is
         // satisfied without any helper changes).
         eval.add_constraint(
-            is_sign_witness[0].clone()
-                * (E::F::from(BaseField::from(1u32)) - is_input[0].clone()),
+            is_sign_witness[0].clone() * (E::F::from(BaseField::from(1u32)) - is_input[0].clone()),
         );
         // Higher bytes of `out` zero on sign-witness rows.  Together
         // with `out[0] ∈ {0, 1}` (from the ByteToBits consumer), this
@@ -1258,11 +1385,7 @@ impl BuiltInComponent for RistrettoCombCompressChip {
 impl BuiltInProverComponent for RistrettoCombCompressChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = log_size_for(compress_n_rows(side_note));
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -1311,11 +1434,7 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
                 is_coord_input_consumer,
                 PreprocessedColumn::IsCoordInputConsumer,
             );
-            trace.fill_columns(
-                row,
-                coord_kind,
-                PreprocessedColumn::CompressCoordKind,
-            );
+            trace.fill_columns(row, coord_kind, PreprocessedColumn::CompressCoordKind);
         }
         trace.finalize_bit_reversed()
     }
@@ -1344,13 +1463,10 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
         let log_size = component_trace.log_size();
         let mut logup = LogupTraceBuilder::new(log_size);
 
-        let regfile: &RistrettoCombCompressRegFileLookupElements =
-            lookup_elements.as_ref();
+        let regfile: &RistrettoCombCompressRegFileLookupElements = lookup_elements.as_ref();
         let byte_to_bits: &ByteToBitsLookupElements = lookup_elements.as_ref();
-        let output_relation: &RistrettoCombCompressOutputLookupElements =
-            lookup_elements.as_ref();
-        let final_acc_relation: &RistrettoCombFinalAccLookupElements =
-            lookup_elements.as_ref();
+        let output_relation: &RistrettoCombCompressOutputLookupElements = lookup_elements.as_ref();
+        let final_acc_relation: &RistrettoCombFinalAccLookupElements = lookup_elements.as_ref();
 
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -1360,10 +1476,8 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             component_trace,
             PreprocessedColumn::IsOutputProducer
         );
-        let call_idx_pp_col = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::CallIdx
-        );
+        let call_idx_pp_col =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::CallIdx);
         let is_coord_input_consumer_pp = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::IsCoordInputConsumer
@@ -1376,22 +1490,16 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
             component_trace,
             PreprocessedColumn::RowIndexHi
         );
-        let byte_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::ByteIdx
-        );
-        let producer_emission_mult = crate::trace::original_base_column!(
-            component_trace,
-            Column::ProducerEmissionMult
-        );
+        let byte_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ByteIdx);
+        let producer_emission_mult =
+            crate::trace::original_base_column!(component_trace, Column::ProducerEmissionMult);
         // ConsumerAGateH is read in `add_constraints` to derive
         // `EffectiveConsumerAGateH = ConsumerAGateH + IsSignWitness`, but the
         // interaction trace below only emits via `EffectiveConsumerAGateH`,
         // not the raw column.
-        let consumer_b_gate_h = crate::trace::original_base_column!(
-            component_trace,
-            Column::ConsumerBGateH
-        );
+        let consumer_b_gate_h =
+            crate::trace::original_base_column!(component_trace, Column::ConsumerBGateH);
         let a_cols = crate::trace::original_base_column!(component_trace, Column::FieldA);
         let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let out_cols = crate::trace::original_base_column!(component_trace, Column::FieldOut);
@@ -1406,24 +1514,15 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
 
         let is_sign_witness_col =
             crate::trace::original_base_column!(component_trace, Column::IsSignWitness);
-        let effective_consumer_a_gate_h_col = crate::trace::original_base_column!(
-            component_trace,
-            Column::EffectiveConsumerAGateH
-        );
-        let sign_bit1_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit1);
-        let sign_bit2_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit2);
-        let sign_bit3_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit3);
-        let sign_bit4_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit4);
-        let sign_bit5_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit5);
-        let sign_bit6_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit6);
-        let sign_bit7_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBit7);
+        let effective_consumer_a_gate_h_col =
+            crate::trace::original_base_column!(component_trace, Column::EffectiveConsumerAGateH);
+        let sign_bit1_col = crate::trace::original_base_column!(component_trace, Column::SignBit1);
+        let sign_bit2_col = crate::trace::original_base_column!(component_trace, Column::SignBit2);
+        let sign_bit3_col = crate::trace::original_base_column!(component_trace, Column::SignBit3);
+        let sign_bit4_col = crate::trace::original_base_column!(component_trace, Column::SignBit4);
+        let sign_bit5_col = crate::trace::original_base_column!(component_trace, Column::SignBit5);
+        let sign_bit6_col = crate::trace::original_base_column!(component_trace, Column::SignBit6);
+        let sign_bit7_col = crate::trace::original_base_column!(component_trace, Column::SignBit7);
 
         for k in 0..32 {
             logup.add_to_relation_with(
@@ -1598,7 +1697,11 @@ fn fill_compress_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Compre
     let pm: u32 = r.producer_multiplicity as u32;
     trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
     let emission = if real_b && !out_b { pm } else { 0 };
-    trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
+    trace.fill_columns(
+        row_i,
+        BaseField::from(emission),
+        Column::ProducerEmissionMult,
+    );
 
     // Sign-witness columns (Path γ).
     trace.fill_columns(row_i, cr.is_sign_witness, Column::IsSignWitness);

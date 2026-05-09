@@ -6,10 +6,10 @@
 //! they emit, otherwise the logup balance breaks.  Centralising the
 //! derivation here keeps them in sync.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
 use super::classify::{classify_opcode, uses_immediate};
 use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+#[allow(unused_imports)]
+use alloc::{boxed::Box, vec, vec::Vec};
 
 /// Phase 9d: register-access descriptor for a single PVM step.  Used by both
 /// CpuChip (to fill the ValB/ValD/Result register-source flags + indices) and
@@ -69,7 +69,9 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     let val_d_read = match step.opcode.category() {
         ThreeReg | TwoReg => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
         // Phase 40 swap: val_d is regs[rb] (the shift) for RotR*ImmAlt.
-        TwoRegOneImm if is_rotate_r_imm_alt => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
+        TwoRegOneImm if is_rotate_r_imm_alt => {
+            Some((step.reg_b as u8, step.regs_before[step.reg_b]))
+        }
         TwoRegOneImm | OneRegImmOffset => None,
         _ if uses_immediate(step.opcode) => None,
         _ => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
@@ -89,9 +91,10 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in `mod.rs` and
     // `interaction.rs`) emits register-file producers at [10, 7, 8, 9]
     // — matching this ledger consumer per blake2b ECALL step.
-    let is_blake_ecall = matches!(step.opcode,
-            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall)
-        && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+    let is_blake_ecall = matches!(
+        step.opcode,
+        crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+    ) && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
     let ecall_reads = if is_blake_ecall {
         vec![
             (7u8, step.regs_before[7]),
@@ -102,5 +105,11 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     } else {
         Vec::new()
     };
-    StepRegAccesses { val_b_read, val_d_read, val_a_read, result_write, ecall_reads }
+    StepRegAccesses {
+        val_b_read,
+        val_d_read,
+        val_a_read,
+        result_write,
+        ecall_reads,
+    }
 }

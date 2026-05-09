@@ -16,15 +16,13 @@ extern crate alloc;
 
 use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use num_traits::Zero;
-use stwo::{
-    core::{
-        air::Component,
-        channel::{Blake2sChannel, Channel},
-        fields::qm31::SecureField,
-        pcs::{CommitmentSchemeVerifier, TreeVec},
-        vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
-        verifier::VerificationError,
-    },
+use stwo::core::{
+    air::Component,
+    channel::{Blake2sChannel, Channel},
+    fields::qm31::SecureField,
+    pcs::{CommitmentSchemeVerifier, TreeVec},
+    vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
+    verifier::VerificationError,
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -32,15 +30,15 @@ use stwo_constraint_framework::TraceLocationAllocator;
 // was compiled against.  Callers can compare against
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
-pub use zkpvm::{Proof, PROOF_FORMAT_VERSION};
+pub use zkpvm::{PROOF_FORMAT_VERSION, Proof};
 // Phase 49: PcsPolicy floor — see SECURITY.md "Proof shape".
 pub use zkpvm::proof::{
-    check_pcs_policy, PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES,
-    STANDARD_MIN_POW_BITS,
+    PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
+    check_pcs_policy,
 };
 
 use zkpvm::framework_access::{
-    create_verifier_components, draw_all_lookup_elements, AllLookupElements,
+    AllLookupElements, create_verifier_components, draw_all_lookup_elements,
 };
 
 /// Verification hash type (Blake2s Merkle root)
@@ -113,12 +111,7 @@ pub fn verify_standalone_with_pcs_policy(
     preprocessed_commitment: CommitmentHash,
     policy: &PcsPolicy,
 ) -> Result<(), VerificationError> {
-    verify_standalone_with_options(
-        proof,
-        preprocessed_commitment,
-        DEFAULT_MAX_LOG_SIZE,
-        policy,
-    )
+    verify_standalone_with_options(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE, policy)
 }
 
 /// Both knobs at once.
@@ -201,7 +194,10 @@ pub fn verify_standalone_with_options(
 
     // Commit preprocessed and original traces
     let (trace_sizes, preprocessed_sizes) =
-        create_verifier_components::trace_and_preprocessed_sizes(&claimed_log_sizes, component_mask);
+        create_verifier_components::trace_and_preprocessed_sizes(
+            &claimed_log_sizes,
+            component_mask,
+        );
     let mut log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
     log_sizes[0] = preprocessed_sizes; // PREPROCESSED_TRACE_IDX
 
@@ -225,14 +221,13 @@ pub fn verify_standalone_with_options(
     }
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
-    let verifier_components: Vec<Box<dyn Component>> =
-        create_verifier_components::components(
-            tree_span_provider,
-            &lookup_elements,
-            &claimed_log_sizes,
-            &claimed_sums,
-            component_mask,
-        );
+    let verifier_components: Vec<Box<dyn Component>> = create_verifier_components::components(
+        tree_span_provider,
+        &lookup_elements,
+        &claimed_log_sizes,
+        &claimed_sums,
+        component_mask,
+    );
     let components_ref: Vec<&dyn Component> = verifier_components.iter().map(|c| &**c).collect();
 
     verifier_channel.mix_felts(&claimed_sums);
@@ -249,4 +244,3 @@ pub fn verify_standalone_with_options(
         stark_proof,
     )
 }
-

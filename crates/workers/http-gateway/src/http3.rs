@@ -36,10 +36,7 @@ use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
 
 /// Actor-side entry for `serve_h3` when the feature is on.
-pub(crate) async fn serve_h3_impl(
-    port: u16,
-    ctx: &mut vos::Context<HttpGateway>,
-) -> String {
+pub(crate) async fn serve_h3_impl(port: u16, ctx: &mut vos::Context<HttpGateway>) -> String {
     serve_with(port, "udp/h3", spawn, ctx).await
 }
 
@@ -49,17 +46,20 @@ fn spawn(
     inner: Arc<Inner>,
 ) -> IoResult<thread::JoinHandle<()>> {
     let addr = SocketAddr::new(config::bind_ip(), port);
-    runtime::spawn_on_thread(format!("http-gateway-h3:{port}"), move |ready_tx| async move {
-        let endpoint = match build_endpoint(addr) {
-            Ok(ep) => ep,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-        let _ = ready_tx.send(Ok(()));
-        accept_loop(endpoint, job_tx, inner).await;
-    })
+    runtime::spawn_on_thread(
+        format!("http-gateway-h3:{port}"),
+        move |ready_tx| async move {
+            let endpoint = match build_endpoint(addr) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+            accept_loop(endpoint, job_tx, inner).await;
+        },
+    )
 }
 
 /// Build a QUIC endpoint listening on `addr`. Uses the operator-
@@ -105,9 +105,9 @@ fn self_signed() -> IoResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| format!("rcgen self-signed cert: {e}"))?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
-    );
+    let key_der = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        cert.key_pair.serialize_der(),
+    ));
     Ok((vec![cert_der], key_der))
 }
 
@@ -115,8 +115,7 @@ fn load_pem(
     cert_path: &str,
     key_path: &str,
 ) -> IoResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_file =
-        File::open(cert_path).map_err(|e| format!("open cert {cert_path}: {e}"))?;
+    let cert_file = File::open(cert_path).map_err(|e| format!("open cert {cert_path}: {e}"))?;
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<core::result::Result<_, _>>()
         .map_err(|e| format!("parse cert {cert_path}: {e}"))?;
@@ -129,22 +128,21 @@ fn load_pem(
         .map_err(|e| format!("parse key {key_path}: {e}"))?
         .ok_or_else(|| format!("no private key in {key_path}"))?;
 
-    log::info!("http-gateway: loaded TLS cert chain ({} certs) from {cert_path}", certs.len());
+    log::info!(
+        "http-gateway: loaded TLS cert chain ({} certs) from {cert_path}",
+        certs.len()
+    );
     Ok((certs, key))
 }
 
-async fn accept_loop(
-    endpoint: quinn::Endpoint,
-    job_tx: mpsc::SyncSender<Job>,
-    inner: Arc<Inner>,
-) {
+async fn accept_loop(endpoint: quinn::Endpoint, job_tx: mpsc::SyncSender<Job>, inner: Arc<Inner>) {
     let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
 
     while !inner.stop.load(Ordering::Relaxed) {
         let accept = tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await;
         let incoming = match accept {
             Ok(Some(i)) => i,
-            Ok(None) => break, // endpoint closed
+            Ok(None) => break,  // endpoint closed
             Err(_) => continue, // timeout — re-check stop
         };
         let permit = match conn_sem.clone().try_acquire_owned() {
@@ -179,14 +177,14 @@ async fn handle_connection(
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) {
-    let mut h3_conn =
-        match h3::server::Connection::new(h3_quinn::Connection::new(quinn_conn)).await {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!("http-gateway: h3 init: {e}");
-                return;
-            }
-        };
+    let mut h3_conn = match h3::server::Connection::new(h3_quinn::Connection::new(quinn_conn)).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::debug!("http-gateway: h3 init: {e}");
+            return;
+        }
+    };
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {

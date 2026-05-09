@@ -218,34 +218,117 @@ pub(crate) struct OpcodeFlags {
 pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
     let mut f = OpcodeFlags::default();
     match op {
-        Opcode::Add64 | Opcode::AddImm64 => { f.is_add = true; }
-        Opcode::Add32 | Opcode::AddImm32 => { f.is_add = true; f.is_32bit = true; }
-        Opcode::Sub64 => { f.is_sub = true; }
-        Opcode::Sub32 => { f.is_sub = true; f.is_32bit = true; }
-        Opcode::NegAddImm64 => { f.is_sub = true; f.is_neg_add = true; }
-        Opcode::NegAddImm32 => { f.is_sub = true; f.is_neg_add = true; f.is_32bit = true; }
-        Opcode::Mul64 | Opcode::MulImm64 => { f.is_mul = true; }
-        Opcode::Mul32 | Opcode::MulImm32 => { f.is_mul = true; f.is_32bit = true; }
+        Opcode::Add64 | Opcode::AddImm64 => {
+            f.is_add = true;
+        }
+        Opcode::Add32 | Opcode::AddImm32 => {
+            f.is_add = true;
+            f.is_32bit = true;
+        }
+        Opcode::Sub64 => {
+            f.is_sub = true;
+        }
+        Opcode::Sub32 => {
+            f.is_sub = true;
+            f.is_32bit = true;
+        }
+        Opcode::NegAddImm64 => {
+            f.is_sub = true;
+            f.is_neg_add = true;
+        }
+        Opcode::NegAddImm32 => {
+            f.is_sub = true;
+            f.is_neg_add = true;
+            f.is_32bit = true;
+        }
+        Opcode::Mul64 | Opcode::MulImm64 => {
+            f.is_mul = true;
+        }
+        Opcode::Mul32 | Opcode::MulImm32 => {
+            f.is_mul = true;
+            f.is_32bit = true;
+        }
         // MulUpper: result = high 64 bits of 128-bit product
-        Opcode::MulUpperUU => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_uu = true; }
-        Opcode::MulUpperSS => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_ss = true; }
-        Opcode::MulUpperSU => { f.is_mul = true; f.is_mul_upper = true; f.is_mul_upper_su = true; }
-        Opcode::And | Opcode::AndImm => { f.is_bitwise = true; f.is_and = true; }
-        Opcode::Or  | Opcode::OrImm  => { f.is_bitwise = true; f.is_or = true; }
-        Opcode::Xor | Opcode::XorImm => { f.is_bitwise = true; f.is_xor = true; }
-        Opcode::AndInv => { f.is_bitwise = true; f.is_and_inv = true; }
-        Opcode::OrInv  => { f.is_bitwise = true; f.is_or_inv = true; }
-        Opcode::Xnor   => { f.is_bitwise = true; f.is_xnor = true; }
+        Opcode::MulUpperUU => {
+            f.is_mul = true;
+            f.is_mul_upper = true;
+            f.is_mul_upper_uu = true;
+        }
+        Opcode::MulUpperSS => {
+            f.is_mul = true;
+            f.is_mul_upper = true;
+            f.is_mul_upper_ss = true;
+        }
+        Opcode::MulUpperSU => {
+            f.is_mul = true;
+            f.is_mul_upper = true;
+            f.is_mul_upper_su = true;
+        }
+        Opcode::And | Opcode::AndImm => {
+            f.is_bitwise = true;
+            f.is_and = true;
+        }
+        Opcode::Or | Opcode::OrImm => {
+            f.is_bitwise = true;
+            f.is_or = true;
+        }
+        Opcode::Xor | Opcode::XorImm => {
+            f.is_bitwise = true;
+            f.is_xor = true;
+        }
+        Opcode::AndInv => {
+            f.is_bitwise = true;
+            f.is_and_inv = true;
+        }
+        Opcode::OrInv => {
+            f.is_bitwise = true;
+            f.is_or_inv = true;
+        }
+        Opcode::Xnor => {
+            f.is_bitwise = true;
+            f.is_xnor = true;
+        }
         // Left shifts: constrained via mul (val_d = 2^shift_amount)
-        Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; }
-        Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => { f.is_shift = true; f.shift_op = 0; f.is_mul = true; f.is_32bit = true; }
+        Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => {
+            f.is_shift = true;
+            f.shift_op = 0;
+            f.is_mul = true;
+        }
+        Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => {
+            f.is_shift = true;
+            f.shift_op = 0;
+            f.is_mul = true;
+            f.is_32bit = true;
+        }
         // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
-        Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; }
-        Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => { f.is_shift = true; f.shift_op = 1; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
+        Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => {
+            f.is_shift = true;
+            f.shift_op = 1;
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+        }
+        Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => {
+            f.is_shift = true;
+            f.shift_op = 1;
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+            f.is_32bit = true;
+        }
         // Arithmetic right shifts: same as logical right but with sign extension
         // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
-        Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; }
-        Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => { f.is_shift = true; f.shift_op = 2; f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
+        Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => {
+            f.is_shift = true;
+            f.shift_op = 2;
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+        }
+        Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => {
+            f.is_shift = true;
+            f.shift_op = 2;
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+            f.is_32bit = true;
+        }
         // Phase 32: RotL64 reuses the mul-schoolbook (val_d = 2^n)
         // to compute both halves of `a · 2^n`; result = low + high.
         Opcode::RotL64 => {
@@ -306,157 +389,364 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_rotate_r_imm_alt = true;
         }
         // Compare
-        Opcode::SetLtU | Opcode::SetLtUImm => { f.is_compare = true; f.is_set_lt_u = true; }
-        Opcode::SetLtS | Opcode::SetLtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
-        Opcode::SetGtUImm => { f.is_compare = true; f.is_set_lt_u = true; } // SetGt = swap + SetLt
-        Opcode::SetGtSImm => { f.is_compare = true; f.is_set_lt_s = true; }
-        Opcode::CmovIz | Opcode::CmovIzImm => { f.is_compare = true; f.is_cmov_iz = true; }
-        Opcode::CmovNz | Opcode::CmovNzImm => { f.is_compare = true; f.is_cmov_nz = true; }
-        Opcode::Min  => { f.is_compare = true; f.is_min_s = true; }
-        Opcode::MinU => { f.is_compare = true; f.is_min_u = true; }
-        Opcode::Max  => { f.is_compare = true; f.is_max_s = true; }
-        Opcode::MaxU => { f.is_compare = true; f.is_max_u = true; }
+        Opcode::SetLtU | Opcode::SetLtUImm => {
+            f.is_compare = true;
+            f.is_set_lt_u = true;
+        }
+        Opcode::SetLtS | Opcode::SetLtSImm => {
+            f.is_compare = true;
+            f.is_set_lt_s = true;
+        }
+        Opcode::SetGtUImm => {
+            f.is_compare = true;
+            f.is_set_lt_u = true;
+        } // SetGt = swap + SetLt
+        Opcode::SetGtSImm => {
+            f.is_compare = true;
+            f.is_set_lt_s = true;
+        }
+        Opcode::CmovIz | Opcode::CmovIzImm => {
+            f.is_compare = true;
+            f.is_cmov_iz = true;
+        }
+        Opcode::CmovNz | Opcode::CmovNzImm => {
+            f.is_compare = true;
+            f.is_cmov_nz = true;
+        }
+        Opcode::Min => {
+            f.is_compare = true;
+            f.is_min_s = true;
+        }
+        Opcode::MinU => {
+            f.is_compare = true;
+            f.is_min_u = true;
+        }
+        Opcode::Max => {
+            f.is_compare = true;
+            f.is_max_s = true;
+        }
+        Opcode::MaxU => {
+            f.is_compare = true;
+            f.is_max_u = true;
+        }
         // Move
-        Opcode::MoveReg | Opcode::LoadImm | Opcode::LoadImm64 => { f.is_move = true; }
+        Opcode::MoveReg | Opcode::LoadImm | Opcode::LoadImm64 => {
+            f.is_move = true;
+        }
         // BitManip (TwoReg unary ops).
         // Constrained (Phase 12b): ZeroExtend16, ReverseBytes (this commit).
         // Still prover-trusted: CountSetBits, LeadingZeroBits, TrailingZeroBits,
         // SignExtend8/16, Sbrk — see Phase 12a/12b-2/12f.
-        Opcode::ZeroExtend16 => { f.is_zero_ext_16 = true; }
-        Opcode::ReverseBytes => { f.is_reverse_bytes = true; }
-        Opcode::SignExtend8 => { f.is_sign_ext_8 = true; }
-        Opcode::SignExtend16 => { f.is_sign_ext_16 = true; }
-        Opcode::CountSetBits64 => { f.is_count_set_bits = true; }
-        Opcode::CountSetBits32 => { f.is_count_set_bits = true; f.is_32bit = true; }
-        Opcode::LeadingZeroBits64 => { f.is_lzb = true; }
-        Opcode::LeadingZeroBits32 => { f.is_lzb = true; f.is_32bit = true; }
-        Opcode::TrailingZeroBits64 => { f.is_tzb = true; }
-        Opcode::TrailingZeroBits32 => { f.is_tzb = true; f.is_32bit = true; }
+        Opcode::ZeroExtend16 => {
+            f.is_zero_ext_16 = true;
+        }
+        Opcode::ReverseBytes => {
+            f.is_reverse_bytes = true;
+        }
+        Opcode::SignExtend8 => {
+            f.is_sign_ext_8 = true;
+        }
+        Opcode::SignExtend16 => {
+            f.is_sign_ext_16 = true;
+        }
+        Opcode::CountSetBits64 => {
+            f.is_count_set_bits = true;
+        }
+        Opcode::CountSetBits32 => {
+            f.is_count_set_bits = true;
+            f.is_32bit = true;
+        }
+        Opcode::LeadingZeroBits64 => {
+            f.is_lzb = true;
+        }
+        Opcode::LeadingZeroBits32 => {
+            f.is_lzb = true;
+            f.is_32bit = true;
+        }
+        Opcode::TrailingZeroBits64 => {
+            f.is_tzb = true;
+        }
+        Opcode::TrailingZeroBits32 => {
+            f.is_tzb = true;
+            f.is_32bit = true;
+        }
         // Phase 41: Sbrk panics on execution (JAR v0.8.0 removed it
         // from the ISA — replaced by the grow_heap hostcall).  Mark
         // it terminal in the same way as Trap so the Phase 13e-redux
         // no-successor-row constraint fires.  is_exit covers the
         // execution-stops semantics; is_trap forbids any subsequent
         // real row.
-        Opcode::Sbrk => { f.is_exit = true; f.is_trap = true; }
+        Opcode::Sbrk => {
+            f.is_exit = true;
+            f.is_trap = true;
+        }
         // Branches (conditional) — classify by comparison type
         // For Le/Gt variants we'll flip the operand order / invert
-        Opcode::BranchEq | Opcode::BranchEqImm
-            => { f.is_branch = true; f.is_br_eq = true; }
-        Opcode::BranchNe | Opcode::BranchNeImm
-            => { f.is_branch = true; f.is_br_ne = true; }
+        Opcode::BranchEq | Opcode::BranchEqImm => {
+            f.is_branch = true;
+            f.is_br_eq = true;
+        }
+        Opcode::BranchNe | Opcode::BranchNeImm => {
+            f.is_branch = true;
+            f.is_br_ne = true;
+        }
         // Unsigned: branch_taken = val_b < val_d
-        Opcode::BranchLtU | Opcode::BranchLtUImm
-            => { f.is_branch = true; f.is_br_lt_u = true; }
+        Opcode::BranchLtU | Opcode::BranchLtUImm => {
+            f.is_branch = true;
+            f.is_br_lt_u = true;
+        }
         // Unsigned: branch_taken = val_b >= val_d (= !lt)
-        Opcode::BranchGeU | Opcode::BranchGeUImm
-            => { f.is_branch = true; f.is_br_ge_u = true; }
+        Opcode::BranchGeU | Opcode::BranchGeUImm => {
+            f.is_branch = true;
+            f.is_br_ge_u = true;
+        }
         // Unsigned: branch_taken = val_b <= val_d (imm only; swap operands vs ge)
-        Opcode::BranchLeUImm
-            => { f.is_branch = true; f.is_br_le_u = true; }
+        Opcode::BranchLeUImm => {
+            f.is_branch = true;
+            f.is_br_le_u = true;
+        }
         // Unsigned: branch_taken = val_b > val_d (imm only)
-        Opcode::BranchGtUImm
-            => { f.is_branch = true; f.is_br_gt_u = true; }
+        Opcode::BranchGtUImm => {
+            f.is_branch = true;
+            f.is_br_gt_u = true;
+        }
         // Signed: branch_taken = val_b < val_d (signed)
-        Opcode::BranchLtS | Opcode::BranchLtSImm
-            => { f.is_branch = true; f.is_br_lt_s = true; }
-        Opcode::BranchGeS | Opcode::BranchGeSImm
-            => { f.is_branch = true; f.is_br_ge_s = true; }
-        Opcode::BranchLeSImm
-            => { f.is_branch = true; f.is_br_le_s = true; }
-        Opcode::BranchGtSImm
-            => { f.is_branch = true; f.is_br_gt_s = true; }
+        Opcode::BranchLtS | Opcode::BranchLtSImm => {
+            f.is_branch = true;
+            f.is_br_lt_s = true;
+        }
+        Opcode::BranchGeS | Opcode::BranchGeSImm => {
+            f.is_branch = true;
+            f.is_br_ge_s = true;
+        }
+        Opcode::BranchLeSImm => {
+            f.is_branch = true;
+            f.is_br_le_s = true;
+        }
+        Opcode::BranchGtSImm => {
+            f.is_branch = true;
+            f.is_br_gt_s = true;
+        }
         // DivRem
-        Opcode::DivU64 => { f.is_div_rem = true; f.div_rem_op = 0; }
-        Opcode::DivU32 => { f.is_div_rem = true; f.div_rem_op = 0; f.is_32bit = true; }
-        Opcode::DivS64 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_div_s = true; }
-        Opcode::DivS32 => { f.is_div_rem = true; f.div_rem_op = 1; f.is_32bit = true; f.is_div_s = true; }
-        Opcode::RemU64 => { f.is_div_rem = true; f.div_rem_op = 2; }
-        Opcode::RemU32 => { f.is_div_rem = true; f.div_rem_op = 2; f.is_32bit = true; }
-        Opcode::RemS64 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_div_s = true; }
-        Opcode::RemS32 => { f.is_div_rem = true; f.div_rem_op = 3; f.is_32bit = true; f.is_div_s = true; }
+        Opcode::DivU64 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+        }
+        Opcode::DivU32 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 0;
+            f.is_32bit = true;
+        }
+        Opcode::DivS64 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 1;
+            f.is_div_s = true;
+        }
+        Opcode::DivS32 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 1;
+            f.is_32bit = true;
+            f.is_div_s = true;
+        }
+        Opcode::RemU64 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 2;
+        }
+        Opcode::RemU32 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 2;
+            f.is_32bit = true;
+        }
+        Opcode::RemS64 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 3;
+            f.is_div_s = true;
+        }
+        Opcode::RemS32 => {
+            f.is_div_rem = true;
+            f.div_rem_op = 3;
+            f.is_32bit = true;
+            f.is_div_s = true;
+        }
         // Loads — `is_mem_size_*` covers both load and store; set per
         // width.  `is_load_direct` set on the OneRegOneImm-category
         // direct loads (no Ind variant), driving the MemAddr ↔ ImmBytes
         // binding (Phase 25).
-        Opcode::LoadU8
-            => { f.is_load = true; f.is_mem_size_1 = true; f.is_load_direct = true; }
-        Opcode::LoadIndU8
-            => { f.is_load = true; f.is_mem_size_1 = true; f.is_mem_indirect = true; }
-        Opcode::LoadU16
-            => { f.is_load = true; f.is_mem_size_2 = true; f.is_load_direct = true; }
-        Opcode::LoadIndU16
-            => { f.is_load = true; f.is_mem_size_2 = true; f.is_mem_indirect = true; }
-        Opcode::LoadU32
-            => { f.is_load = true; f.is_mem_size_4 = true; f.is_load_direct = true; }
-        Opcode::LoadIndU32
-            => { f.is_load = true; f.is_mem_size_4 = true; f.is_mem_indirect = true; }
-        Opcode::LoadU64
-            => { f.is_load = true; f.is_mem_size_8 = true; f.is_load_direct = true; }
-        Opcode::LoadIndU64
-            => { f.is_load = true; f.is_mem_size_8 = true; f.is_mem_indirect = true; }
-        Opcode::LoadI8
-            => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; f.is_load_direct = true; }
-        Opcode::LoadIndI8
-            => { f.is_load = true; f.is_load_i8 = true; f.is_mem_size_1 = true; f.is_mem_indirect = true; }
-        Opcode::LoadI16
-            => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; f.is_load_direct = true; }
-        Opcode::LoadIndI16
-            => { f.is_load = true; f.is_load_i16 = true; f.is_mem_size_2 = true; f.is_mem_indirect = true; }
-        Opcode::LoadI32
-            => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; f.is_load_direct = true; }
-        Opcode::LoadIndI32
-            => { f.is_load = true; f.is_load_i32 = true; f.is_mem_size_4 = true; f.is_mem_indirect = true; }
+        Opcode::LoadU8 => {
+            f.is_load = true;
+            f.is_mem_size_1 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndU8 => {
+            f.is_load = true;
+            f.is_mem_size_1 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadU16 => {
+            f.is_load = true;
+            f.is_mem_size_2 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndU16 => {
+            f.is_load = true;
+            f.is_mem_size_2 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadU32 => {
+            f.is_load = true;
+            f.is_mem_size_4 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndU32 => {
+            f.is_load = true;
+            f.is_mem_size_4 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadU64 => {
+            f.is_load = true;
+            f.is_mem_size_8 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndU64 => {
+            f.is_load = true;
+            f.is_mem_size_8 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadI8 => {
+            f.is_load = true;
+            f.is_load_i8 = true;
+            f.is_mem_size_1 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndI8 => {
+            f.is_load = true;
+            f.is_load_i8 = true;
+            f.is_mem_size_1 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadI16 => {
+            f.is_load = true;
+            f.is_load_i16 = true;
+            f.is_mem_size_2 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndI16 => {
+            f.is_load = true;
+            f.is_load_i16 = true;
+            f.is_mem_size_2 = true;
+            f.is_mem_indirect = true;
+        }
+        Opcode::LoadI32 => {
+            f.is_load = true;
+            f.is_load_i32 = true;
+            f.is_mem_size_4 = true;
+            f.is_load_direct = true;
+        }
+        Opcode::LoadIndI32 => {
+            f.is_load = true;
+            f.is_load_i32 = true;
+            f.is_mem_size_4 = true;
+            f.is_mem_indirect = true;
+        }
         // Stores — split by addressing mode (Phase 24 needs is_store_direct
         // set only on the OneRegOneImm-category direct stores; Ind / Imm
         // / ImmInd handle their source values differently).
-        Opcode::StoreU8
-            => { f.is_store = true; f.is_mem_size_1 = true; f.is_store_direct = true; }
-        Opcode::StoreU16
-            => { f.is_store = true; f.is_mem_size_2 = true; f.is_store_direct = true; }
-        Opcode::StoreU32
-            => { f.is_store = true; f.is_mem_size_4 = true; f.is_store_direct = true; }
-        Opcode::StoreU64
-            => { f.is_store = true; f.is_mem_size_8 = true; f.is_store_direct = true; }
-        Opcode::StoreIndU8
-            => { f.is_store = true; f.is_mem_size_1 = true; f.is_mem_indirect = true;
-                 f.is_store_ind = true; }
-        Opcode::StoreImmIndU8
-            => { f.is_store = true; f.is_mem_size_1 = true; f.is_mem_indirect = true;
-                 f.is_store_imm_any = true; }
-        Opcode::StoreImmU8
-            => { f.is_store = true; f.is_mem_size_1 = true;
-                 f.is_store_imm_any = true; f.is_store_imm_direct = true; }
-        Opcode::StoreIndU16
-            => { f.is_store = true; f.is_mem_size_2 = true; f.is_mem_indirect = true;
-                 f.is_store_ind = true; }
-        Opcode::StoreImmIndU16
-            => { f.is_store = true; f.is_mem_size_2 = true; f.is_mem_indirect = true;
-                 f.is_store_imm_any = true; }
-        Opcode::StoreImmU16
-            => { f.is_store = true; f.is_mem_size_2 = true;
-                 f.is_store_imm_any = true; f.is_store_imm_direct = true; }
-        Opcode::StoreIndU32
-            => { f.is_store = true; f.is_mem_size_4 = true; f.is_mem_indirect = true;
-                 f.is_store_ind = true; }
-        Opcode::StoreImmIndU32
-            => { f.is_store = true; f.is_mem_size_4 = true; f.is_mem_indirect = true;
-                 f.is_store_imm_any = true; }
-        Opcode::StoreImmU32
-            => { f.is_store = true; f.is_mem_size_4 = true;
-                 f.is_store_imm_any = true; f.is_store_imm_direct = true; }
-        Opcode::StoreIndU64
-            => { f.is_store = true; f.is_mem_size_8 = true; f.is_mem_indirect = true;
-                 f.is_store_ind = true; }
-        Opcode::StoreImmIndU64
-            => { f.is_store = true; f.is_mem_size_8 = true; f.is_mem_indirect = true;
-                 f.is_store_imm_any = true; }
-        Opcode::StoreImmU64
-            => { f.is_store = true; f.is_mem_size_8 = true;
-                 f.is_store_imm_any = true; f.is_store_imm_direct = true; }
+        Opcode::StoreU8 => {
+            f.is_store = true;
+            f.is_mem_size_1 = true;
+            f.is_store_direct = true;
+        }
+        Opcode::StoreU16 => {
+            f.is_store = true;
+            f.is_mem_size_2 = true;
+            f.is_store_direct = true;
+        }
+        Opcode::StoreU32 => {
+            f.is_store = true;
+            f.is_mem_size_4 = true;
+            f.is_store_direct = true;
+        }
+        Opcode::StoreU64 => {
+            f.is_store = true;
+            f.is_mem_size_8 = true;
+            f.is_store_direct = true;
+        }
+        Opcode::StoreIndU8 => {
+            f.is_store = true;
+            f.is_mem_size_1 = true;
+            f.is_mem_indirect = true;
+            f.is_store_ind = true;
+        }
+        Opcode::StoreImmIndU8 => {
+            f.is_store = true;
+            f.is_mem_size_1 = true;
+            f.is_mem_indirect = true;
+            f.is_store_imm_any = true;
+        }
+        Opcode::StoreImmU8 => {
+            f.is_store = true;
+            f.is_mem_size_1 = true;
+            f.is_store_imm_any = true;
+            f.is_store_imm_direct = true;
+        }
+        Opcode::StoreIndU16 => {
+            f.is_store = true;
+            f.is_mem_size_2 = true;
+            f.is_mem_indirect = true;
+            f.is_store_ind = true;
+        }
+        Opcode::StoreImmIndU16 => {
+            f.is_store = true;
+            f.is_mem_size_2 = true;
+            f.is_mem_indirect = true;
+            f.is_store_imm_any = true;
+        }
+        Opcode::StoreImmU16 => {
+            f.is_store = true;
+            f.is_mem_size_2 = true;
+            f.is_store_imm_any = true;
+            f.is_store_imm_direct = true;
+        }
+        Opcode::StoreIndU32 => {
+            f.is_store = true;
+            f.is_mem_size_4 = true;
+            f.is_mem_indirect = true;
+            f.is_store_ind = true;
+        }
+        Opcode::StoreImmIndU32 => {
+            f.is_store = true;
+            f.is_mem_size_4 = true;
+            f.is_mem_indirect = true;
+            f.is_store_imm_any = true;
+        }
+        Opcode::StoreImmU32 => {
+            f.is_store = true;
+            f.is_mem_size_4 = true;
+            f.is_store_imm_any = true;
+            f.is_store_imm_direct = true;
+        }
+        Opcode::StoreIndU64 => {
+            f.is_store = true;
+            f.is_mem_size_8 = true;
+            f.is_mem_indirect = true;
+            f.is_store_ind = true;
+        }
+        Opcode::StoreImmIndU64 => {
+            f.is_store = true;
+            f.is_mem_size_8 = true;
+            f.is_mem_indirect = true;
+            f.is_store_imm_any = true;
+        }
+        Opcode::StoreImmU64 => {
+            f.is_store = true;
+            f.is_mem_size_8 = true;
+            f.is_store_imm_any = true;
+            f.is_store_imm_direct = true;
+        }
         // Jumps (unconditional, non-sequential target)
-        Opcode::Jump | Opcode::LoadImmJump
-            => { f.is_jump = true; }
+        Opcode::Jump | Opcode::LoadImmJump => {
+            f.is_jump = true;
+        }
         // Fallthrough/Unlikely: pure sequential terminators (basic-block hints
         // with no semantic effect).  All flags stay 0 so the default
         // sequential-PC identity (next_pc = pc + 1 + skip_len) constrains them
@@ -466,30 +756,63 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // JumpInd / LoadImmJumpInd: dynamic dispatch.  Both pinned via
         // JumpTableChip lookups; JumpInd uses (val_b+imm), LoadImmJumpInd
         // uses (val_d+imm_y) for the addr computation.
-        Opcode::JumpInd => { f.is_exit = true; f.is_jump_ind = true; }
-        Opcode::LoadImmJumpInd => { f.is_exit = true; f.is_load_imm_jump_ind = true; }
+        Opcode::JumpInd => {
+            f.is_exit = true;
+            f.is_jump_ind = true;
+        }
+        Opcode::LoadImmJumpInd => {
+            f.is_exit = true;
+            f.is_load_imm_jump_ind = true;
+        }
         // Ecalli: host call (execution exits, no ALU constraint)
-        Opcode::Ecalli | Opcode::Ecall => { f.is_exit = true; }
+        Opcode::Ecalli | Opcode::Ecall => {
+            f.is_exit = true;
+        }
         // Trap: causes panic exit
-        Opcode::Trap => { f.is_exit = true; f.is_trap = true; }
+        Opcode::Trap => {
+            f.is_exit = true;
+            f.is_trap = true;
+        }
     }
     f
 }
 
 pub(super) fn uses_immediate(op: Opcode) -> bool {
-    matches!(op,
-        Opcode::AddImm32 | Opcode::AddImm64
-        | Opcode::NegAddImm32 | Opcode::NegAddImm64
-        | Opcode::MulImm32 | Opcode::MulImm64
-        | Opcode::AndImm | Opcode::OrImm | Opcode::XorImm
-        | Opcode::ShloLImm32 | Opcode::ShloRImm32 | Opcode::SharRImm32
-        | Opcode::ShloLImmAlt32 | Opcode::ShloRImmAlt32 | Opcode::SharRImmAlt32
-        | Opcode::ShloLImm64 | Opcode::ShloRImm64 | Opcode::SharRImm64
-        | Opcode::ShloLImmAlt64 | Opcode::ShloRImmAlt64 | Opcode::SharRImmAlt64
-        | Opcode::RotR64Imm | Opcode::RotR64ImmAlt | Opcode::RotR32Imm | Opcode::RotR32ImmAlt
-        | Opcode::SetLtUImm | Opcode::SetLtSImm | Opcode::SetGtUImm | Opcode::SetGtSImm
-        | Opcode::CmovIzImm | Opcode::CmovNzImm
-        | Opcode::LoadImm | Opcode::LoadImm64
+    matches!(
+        op,
+        Opcode::AddImm32
+            | Opcode::AddImm64
+            | Opcode::NegAddImm32
+            | Opcode::NegAddImm64
+            | Opcode::MulImm32
+            | Opcode::MulImm64
+            | Opcode::AndImm
+            | Opcode::OrImm
+            | Opcode::XorImm
+            | Opcode::ShloLImm32
+            | Opcode::ShloRImm32
+            | Opcode::SharRImm32
+            | Opcode::ShloLImmAlt32
+            | Opcode::ShloRImmAlt32
+            | Opcode::SharRImmAlt32
+            | Opcode::ShloLImm64
+            | Opcode::ShloRImm64
+            | Opcode::SharRImm64
+            | Opcode::ShloLImmAlt64
+            | Opcode::ShloRImmAlt64
+            | Opcode::SharRImmAlt64
+            | Opcode::RotR64Imm
+            | Opcode::RotR64ImmAlt
+            | Opcode::RotR32Imm
+            | Opcode::RotR32ImmAlt
+            | Opcode::SetLtUImm
+            | Opcode::SetLtSImm
+            | Opcode::SetGtUImm
+            | Opcode::SetGtSImm
+            | Opcode::CmovIzImm
+            | Opcode::CmovNzImm
+            | Opcode::LoadImm
+            | Opcode::LoadImm64
     )
 }
 
@@ -509,23 +832,45 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
 pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
     let f = classify_opcode(op);
     [
-        f.is_add as u8, f.is_sub as u8, f.is_mul as u8, f.is_mul_upper as u8,
-        f.is_bitwise as u8, f.is_shift as u8, f.is_compare as u8, f.is_move as u8,
-        f.is_32bit as u8, f.is_branch as u8, f.is_jump as u8, f.is_div_rem as u8,
-        f.is_load as u8, f.is_store as u8, f.is_exit as u8, f.is_neg_add as u8,
-        f.is_reverse_bytes as u8, f.is_zero_ext_16 as u8,
-        f.is_sign_ext_8 as u8, f.is_sign_ext_16 as u8,
-        f.is_trap as u8, f.is_jump_ind as u8,
+        f.is_add as u8,
+        f.is_sub as u8,
+        f.is_mul as u8,
+        f.is_mul_upper as u8,
+        f.is_bitwise as u8,
+        f.is_shift as u8,
+        f.is_compare as u8,
+        f.is_move as u8,
+        f.is_32bit as u8,
+        f.is_branch as u8,
+        f.is_jump as u8,
+        f.is_div_rem as u8,
+        f.is_load as u8,
+        f.is_store as u8,
+        f.is_exit as u8,
+        f.is_neg_add as u8,
+        f.is_reverse_bytes as u8,
+        f.is_zero_ext_16 as u8,
+        f.is_sign_ext_8 as u8,
+        f.is_sign_ext_16 as u8,
+        f.is_trap as u8,
+        f.is_jump_ind as u8,
         f.is_load_imm_jump_ind as u8,
-        f.is_mul_upper_uu as u8, f.is_mul_upper_su as u8, f.is_mul_upper_ss as u8,
+        f.is_mul_upper_uu as u8,
+        f.is_mul_upper_su as u8,
+        f.is_mul_upper_ss as u8,
         f.is_div_s as u8,
-        f.is_load_i8 as u8, f.is_load_i16 as u8, f.is_load_i32 as u8,
-        f.is_mem_size_1 as u8, f.is_mem_size_2 as u8,
-        f.is_mem_size_4 as u8, f.is_mem_size_8 as u8,
+        f.is_load_i8 as u8,
+        f.is_load_i16 as u8,
+        f.is_load_i32 as u8,
+        f.is_mem_size_1 as u8,
+        f.is_mem_size_2 as u8,
+        f.is_mem_size_4 as u8,
+        f.is_mem_size_8 as u8,
         f.is_store_direct as u8,
         f.is_load_direct as u8,
         f.is_mem_indirect as u8,
-        f.is_store_imm_any as u8, f.is_store_imm_direct as u8,
+        f.is_store_imm_any as u8,
+        f.is_store_imm_direct as u8,
         f.is_store_ind as u8,
         f.is_rotate_l64 as u8,
         f.is_count_set_bits as u8,

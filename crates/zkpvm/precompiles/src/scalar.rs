@@ -68,13 +68,19 @@ impl Scalar {
 }
 
 impl From<u64> for Scalar {
-    fn from(v: u64) -> Self { Self(DalekScalar::from(v)) }
+    fn from(v: u64) -> Self {
+        Self(DalekScalar::from(v))
+    }
 }
 impl From<u32> for Scalar {
-    fn from(v: u32) -> Self { Self(DalekScalar::from(v)) }
+    fn from(v: u32) -> Self {
+        Self(DalekScalar::from(v))
+    }
 }
 impl From<DalekScalar> for Scalar {
-    fn from(s: DalekScalar) -> Self { Self(s) }
+    fn from(s: DalekScalar) -> Self {
+        Self(s)
+    }
 }
 
 // On PVM, dispatches to ECALL_SCALAR_MUL_MOD_L / _ADD_MOD_L so the
@@ -90,7 +96,9 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a Scalar {
 }
 impl Mul<Scalar> for Scalar {
     type Output = Scalar;
-    fn mul(self, rhs: Scalar) -> Scalar { (&self).mul(&rhs) }
+    fn mul(self, rhs: Scalar) -> Scalar {
+        (&self).mul(&rhs)
+    }
 }
 
 impl<'a, 'b> core::ops::Add<&'b Scalar> for &'a Scalar {
@@ -102,7 +110,9 @@ impl<'a, 'b> core::ops::Add<&'b Scalar> for &'a Scalar {
 }
 impl core::ops::Add<Scalar> for Scalar {
     type Output = Scalar;
-    fn add(self, rhs: Scalar) -> Scalar { (&self).add(&rhs) }
+    fn add(self, rhs: Scalar) -> Scalar {
+        (&self).add(&rhs)
+    }
 }
 
 // ── Low-level ABI fns (kept public for prover-side trace integration) ──

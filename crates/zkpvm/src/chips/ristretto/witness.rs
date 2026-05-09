@@ -192,7 +192,11 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
     // is_overflow ⇔ the unreduced sum ≥ p.  When carry_out = 1 the
     // sum is ≥ 2²⁵⁶ > p; when carry_out = 0 we still need a final
     // < p comparison on intermediate.
-    let is_overflow = if carry_out != 0 || !less_than_p(&intermediate) { 1 } else { 0 };
+    let is_overflow = if carry_out != 0 || !less_than_p(&intermediate) {
+        1
+    } else {
+        0
+    };
 
     // Subtract p when overflow, else copy.
     let mut out = [0u8; 32];
@@ -213,8 +217,11 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
 
     // Cross-check against the standalone host reference.  If they
     // diverge here, the witness layout is the bug, not the chip.
-    debug_assert_eq!(out, field::add(&a, &b),
-        "witness fill diverged from field::add reference");
+    debug_assert_eq!(
+        out,
+        field::add(&a, &b),
+        "witness fill diverged from field::add reference"
+    );
 
     // Final-form check witness: byte-wise compute `p − out − 1` with a
     // borrow chain.  If `out < p` the result is non-negative and the
@@ -231,19 +238,23 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         }
         final_form_borrow[i] = bw as u8;
     }
-    debug_assert_eq!(final_form_borrow[31], 0,
-        "final-form borrow chain ends with borrow=1, witness output ≥ p");
+    debug_assert_eq!(
+        final_form_borrow[31], 0,
+        "final-form borrow chain ends with borrow=1, witness output ≥ p"
+    );
 
     FieldOpRow {
-        a, b, out,
+        a,
+        b,
+        out,
         add_intermediate: intermediate,
         add_carry: carry,
         is_overflow,
         sub_borrow,
         final_form_borrow,
-        sub_chain_borrow: [0u8; 32], // unused on is_add rows
+        sub_chain_borrow: [0u8; 32],    // unused on is_add rows
         sub_chain_carry_aip: [0u8; 32], // unused
-        mul_product: [0u8; 64],      // unused on is_add rows
+        mul_product: [0u8; 64],         // unused on is_add rows
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
         mul_carry_hi: [0u8; 64],
@@ -290,7 +301,7 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
     //
     // Out-side: out[i] + b[i] + cy_obb[i-1] = byte[i] + 256·cy_obb[i].
     // Aip-side: a[i] + is_uf·p[i] + cy_aip[i-1] = byte[i] + 256·cy_aip[i].
-    let mut sub_chain_borrow = [0u8; 32];   // cy_obb (out + b carry)
+    let mut sub_chain_borrow = [0u8; 32]; // cy_obb (out + b carry)
     let mut sub_chain_carry_aip = [0u8; 32]; // cy_aip (a + is_uf·p carry)
     let mut cy_obb: u32 = 0;
     let mut cy_aip: u32 = 0;
@@ -304,13 +315,19 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         sub_chain_carry_aip[i] = cy_aip as u8;
 
         // Per-position byte equality (the implicit `byte[i]`):
-        debug_assert_eq!(v_obb & 0xff, v_aip & 0xff,
+        debug_assert_eq!(
+            v_obb & 0xff,
+            v_aip & 0xff,
             "sub byte mismatch at position {i}: obb={} aip={}",
-            v_obb & 0xff, v_aip & 0xff);
+            v_obb & 0xff,
+            v_aip & 0xff
+        );
     }
-    debug_assert_eq!(sub_chain_borrow[31], sub_chain_carry_aip[31],
+    debug_assert_eq!(
+        sub_chain_borrow[31], sub_chain_carry_aip[31],
         "sub-chain carries didn't agree at position 31: obb={} aip={}",
-        sub_chain_borrow[31], sub_chain_carry_aip[31]);
+        sub_chain_borrow[31], sub_chain_carry_aip[31]
+    );
 
     // Final-form chain (out < p) — same as fill_add, since out is
     // shared.
@@ -326,7 +343,9 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert_eq!(out, field::sub(&a, &b));
 
     FieldOpRow {
-        a, b, out,
+        a,
+        b,
+        out,
         // is_add columns left zero on is_sub rows.
         add_intermediate: [0u8; 32],
         add_carry: [0u8; 32],
@@ -335,7 +354,7 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
         final_form_borrow,
         sub_chain_borrow,
         sub_chain_carry_aip,
-        mul_product: [0u8; 64],      // unused on is_sub rows
+        mul_product: [0u8; 64], // unused on is_sub rows
         mul_carry: [0u8; 64],
         mul_carry_mid: [0u8; 64],
         mul_carry_hi: [0u8; 64],
@@ -405,9 +424,9 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         let v = prod[k] + full_carry;
         mul_product[k] = (v & 0xff) as u8;
         let new_carry = v >> 8;
-        mul_carry[k]     = (new_carry & 0xff) as u8;
+        mul_carry[k] = (new_carry & 0xff) as u8;
         mul_carry_mid[k] = ((new_carry >> 8) & 0xff) as u8;
-        mul_carry_hi[k]  = ((new_carry >> 16) & 0xff) as u8;
+        mul_carry_hi[k] = ((new_carry >> 16) & 0xff) as u8;
         full_carry = new_carry;
     }
     debug_assert_eq!(full_carry, 0);
@@ -425,20 +444,17 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         // 38·byte[k+32] up to 38·255 = 9690 ≈ 14 bits.  Plus byte[k]
         // (≤ 255) and incoming carry (≤ 38·255 ≈ 14 bits).  Worst
         // case fits in u32 with room.
-        let v = (mul_product[k] as u32)
-            + 38 * (mul_product[k + 32] as u32)
-            + full_carry;
+        let v = (mul_product[k] as u32) + 38 * (mul_product[k + 32] as u32) + full_carry;
         pass1_lo[k] = (v & 0xff) as u8;
         let nc = v >> 8;
-        pass1_carry[k]     = (nc & 0xff) as u8;
+        pass1_carry[k] = (nc & 0xff) as u8;
         pass1_carry_mid[k] = ((nc >> 8) & 0xff) as u8;
         full_carry = nc;
     }
     let mut pass1_hi = [0u8; 2];
     pass1_hi[0] = (full_carry & 0xff) as u8;
     pass1_hi[1] = ((full_carry >> 8) & 0xff) as u8;
-    debug_assert!(full_carry < (1u32 << 16),
-        "pass1_hi overflowed 16 bits");
+    debug_assert!(full_carry < (1u32 << 16), "pass1_hi overflowed 16 bits");
 
     // ── Pass 2: pass1_lo + 38·pass1_hi ──
     //
@@ -466,8 +482,10 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         // is ≤ 1.  This is a constraint-soundness issue we'll
         // revisit in R1e-pent — for now we widen pass2_carry to a
         // byte and assert it fits.
-        debug_assert!(nc < 256,
-            "pass2_carry overflowed 1 byte at position {k} (= {nc})");
+        debug_assert!(
+            nc < 256,
+            "pass2_carry overflowed 1 byte at position {k} (= {nc})"
+        );
         full_carry = nc;
     }
     debug_assert!(full_carry <= 1, "pass2 final residual > 1");
@@ -492,8 +510,11 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         full_carry = nc;
         to_add >>= 8;
     }
-    debug_assert_eq!(full_carry + to_add, 0,
-        "after_top chain didn't close (residual carry {full_carry}, to_add {to_add})");
+    debug_assert_eq!(
+        full_carry + to_add,
+        0,
+        "after_top chain didn't close (residual carry {full_carry}, to_add {to_add})"
+    );
 
     // ── Final < p reduction (reuses is_overflow + sub_borrow) ──
     let needs_p_sub = !less_than_p(&after_top_bit);
@@ -514,8 +535,11 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         sub_borrow[i] = bw as u8;
     }
 
-    debug_assert_eq!(out, field::mul(&a, &b),
-        "is_mul witness fill diverged from field::mul reference");
+    debug_assert_eq!(
+        out,
+        field::mul(&a, &b),
+        "is_mul witness fill diverged from field::mul reference"
+    );
 
     // Final-form chain (out < p) — same as fill_add.
     let mut final_form_borrow = [0u8; 32];
@@ -528,7 +552,9 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert_eq!(final_form_borrow[31], 0);
 
     FieldOpRow {
-        a, b, out,
+        a,
+        b,
+        out,
         // is_add chain unused on is_mul rows.
         add_intermediate: [0u8; 32],
         add_carry: [0u8; 32],
@@ -536,7 +562,7 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         is_overflow,
         sub_borrow,
         final_form_borrow,
-        sub_chain_borrow: [0u8; 32], // unused on is_mul rows
+        sub_chain_borrow: [0u8; 32],    // unused on is_mul rows
         sub_chain_carry_aip: [0u8; 32], // unused on is_mul rows
         // Schoolbook witnesses (R1c-4).
         mul_product,
@@ -573,8 +599,7 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
 /// emissions.  Caller pushes these rows FIRST so they get the
 /// low row_ids that subsequent op rows reference.
 pub fn fill_input(value: Bytes) -> FieldOpRow {
-    debug_assert!(less_than_p(&value),
-        "input value must be canonical (< p)");
+    debug_assert!(less_than_p(&value), "input value must be canonical (< p)");
     // Final-form chain on `out`: required for the FinalFormBorrow
     // closure which is gated by is_real (fires on input rows too).
     let mut final_form_borrow = [0u8; 32];
@@ -632,12 +657,18 @@ pub fn validate_row_sequence_composes(
     use alloc::format;
     let mut seen_outs: alloc::vec::Vec<Bytes> = boundary_inputs.to_vec();
     for (i, row) in rows.iter().enumerate() {
-        if row.is_real == 0 { continue; }
+        if row.is_real == 0 {
+            continue;
+        }
         if !seen_outs.contains(&row.a) {
-            return Err(format!("row {i}: a not produced by any prior row or boundary"));
+            return Err(format!(
+                "row {i}: a not produced by any prior row or boundary"
+            ));
         }
         if !seen_outs.contains(&row.b) {
-            return Err(format!("row {i}: b not produced by any prior row or boundary"));
+            return Err(format!(
+                "row {i}: b not produced by any prior row or boundary"
+            ));
         }
         seen_outs.push(row.out);
     }
@@ -669,7 +700,9 @@ pub fn validate_row_sequence_composes(
 pub fn pow_rows(base: Bytes, exp: Bytes) -> alloc::vec::Vec<FieldOpRow> {
     let mut rows = alloc::vec::Vec::new();
     let one = {
-        let mut o = [0u8; 32]; o[0] = 1; o
+        let mut o = [0u8; 32];
+        o[0] = 1;
+        o
     };
     let mut result = one;
     let mut base_pow = base;
@@ -704,9 +737,16 @@ pub fn inv_rows(a: Bytes) -> alloc::vec::Vec<FieldOpRow> {
     let mut borrow = 2u16;
     for i in 0..32 {
         let v = exp[i] as i32 - borrow as i32;
-        if v < 0 { exp[i] = (v + 256) as u8; borrow = 1; }
-        else     { exp[i] = v as u8; borrow = 0; }
-        if borrow == 0 { break; }
+        if v < 0 {
+            exp[i] = (v + 256) as u8;
+            borrow = 1;
+        } else {
+            exp[i] = v as u8;
+            borrow = 0;
+        }
+        if borrow == 0 {
+            break;
+        }
     }
     pow_rows(a, exp)
 }
@@ -730,13 +770,18 @@ mod tests {
     use super::*;
 
     fn small(v: u8) -> Bytes {
-        let mut b = [0u8; 32]; b[0] = v; b
+        let mut b = [0u8; 32];
+        b[0] = v;
+        b
     }
 
     fn bytes_filled(seed: u8) -> Bytes {
         let mut o = [0u8; 32];
-        for i in 0..32 { o[i] = seed.wrapping_add(i as u8); }
-        o[31] &= 0x7f; o
+        for i in 0..32 {
+            o[i] = seed.wrapping_add(i as u8);
+        }
+        o[31] &= 0x7f;
+        o
     }
 
     #[test]
@@ -767,7 +812,9 @@ mod tests {
         // Pick operands that produce a multi-position carry to sanity-
         // check the chain matches the constraint we'll write later.
         let mut a = [0u8; 32];
-        for i in 0..16 { a[i] = 0xff; }
+        for i in 0..16 {
+            a[i] = 0xff;
+        }
         let mut b = [0u8; 32];
         b[0] = 1;
         // a is < p (high bytes are 0); b is < p.  a + b carries
@@ -809,7 +856,9 @@ mod tests {
         let row = fill_mul(small(7), small(13));
         assert_eq!(row.is_mul, 1);
         assert_eq!(row.mul_product[0], 91);
-        for i in 1..64 { assert_eq!(row.mul_product[i], 0); }
+        for i in 1..64 {
+            assert_eq!(row.mul_product[i], 0);
+        }
         assert_eq!(row.out, field::mul(&small(7), &small(13)));
         assert_eq!(row.out[0], 91);
     }
@@ -856,9 +905,16 @@ mod tests {
         let mut borrow = 2u16;
         for i in 0..32 {
             let v = exp_bytes[i] as i32 - borrow as i32;
-            if v < 0 { exp_bytes[i] = (v + 256) as u8; borrow = 1; }
-            else     { exp_bytes[i] = v as u8; borrow = 0; }
-            if borrow == 0 { break; }
+            if v < 0 {
+                exp_bytes[i] = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                exp_bytes[i] = v as u8;
+                borrow = 0;
+            }
+            if borrow == 0 {
+                break;
+            }
         }
         let computed = field::pow(&a, &exp_bytes);
         assert_eq!(computed, expected, "field::pow ↔ field::inv sanity check");
@@ -875,7 +931,10 @@ mod tests {
         // Cleaner: just check that `expected` appears as some row's
         // `out`.
         let any_match = rows.iter().any(|r| r.out == expected);
-        assert!(any_match, "inv_rows did not produce expected a^(p−2) anywhere");
+        assert!(
+            any_match,
+            "inv_rows did not produce expected a^(p−2) anywhere"
+        );
     }
 
     #[test]
@@ -885,12 +944,20 @@ mod tests {
         // required to bring it back below p.
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
-        for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
-        for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
-        a[31] &= 0x7f; b[31] &= 0x7f;
+        for i in 0..32 {
+            a[i] = (0xa3u8).wrapping_mul((i + 1) as u8);
+        }
+        for i in 0..32 {
+            b[i] = (0x71u8).wrapping_mul((i + 1) as u8);
+        }
+        a[31] &= 0x7f;
+        b[31] &= 0x7f;
         let row = fill_mul(a, b);
-        assert_eq!(row.out, field::mul(&a, &b),
-            "is_mul row's canonical out must match field::mul reference");
+        assert_eq!(
+            row.out,
+            field::mul(&a, &b),
+            "is_mul row's canonical out must match field::mul reference"
+        );
         // Confirm out < p.
         assert!(less_than_p(&row.out), "fill_mul produced non-canonical out");
     }
@@ -901,8 +968,12 @@ mod tests {
         // their max density and the carry chain exercises hi byte.
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
-        for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
-        for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
+        for i in 0..32 {
+            a[i] = (0xa3u8).wrapping_mul((i + 1) as u8);
+        }
+        for i in 0..32 {
+            b[i] = (0x71u8).wrapping_mul((i + 1) as u8);
+        }
         a[31] &= 0x7f; // canonical
         b[31] &= 0x7f;
         let row = fill_mul(a, b);
@@ -919,14 +990,19 @@ mod tests {
         let mut full_carry: u64 = 0;
         for k in 0..64 {
             let v = prod[k] + full_carry;
-            assert_eq!(row.mul_product[k] as u64, v & 0xff,
-                "mul_product diverges at position {k}");
+            assert_eq!(
+                row.mul_product[k] as u64,
+                v & 0xff,
+                "mul_product diverges at position {k}"
+            );
             let new_carry = v >> 8;
             let reconstructed = row.mul_carry[k] as u32
                 + 256 * row.mul_carry_mid[k] as u32
                 + 65536 * row.mul_carry_hi[k] as u32;
-            assert_eq!(reconstructed as u64, new_carry,
-                "carry split mismatched at position {k}");
+            assert_eq!(
+                reconstructed as u64, new_carry,
+                "carry split mismatched at position {k}"
+            );
             full_carry = new_carry;
         }
         assert_eq!(full_carry, 0, "chain must close at position 63");

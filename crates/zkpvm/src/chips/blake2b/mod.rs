@@ -15,13 +15,13 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::{LOG_N_LANES, PackedBaseField}, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{
+            SimdBackend,
+            m31::{LOG_N_LANES, PackedBaseField},
+        },
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -33,16 +33,19 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements, Range256LookupElements, },
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{
+        BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements,
+        Range256LookupElements,
+    },
+};
 
 mod call;
 mod columns;
@@ -55,7 +58,7 @@ pub use sw::blake2b_compress;
 
 use columns::{Column, PreprocessedColumn};
 use consts::{G_INDICES, IV, SIGMA};
-use trace::{fill_output_witnesses, g_traced, row_v_after, GRow};
+use trace::{GRow, fill_output_witnesses, g_traced, row_v_after};
 
 pub struct Blake2bChip;
 
@@ -94,25 +97,22 @@ impl BuiltInComponent for Blake2bChip {
         // contribution to algebraic degree drops from 2 to 1.  Subphases
         // 2-7 finish flattening the rest of the chip.
         let is_first = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::IsFirstOfCompression
+            trace_eval,
+            PreprocessedColumn::IsFirstOfCompression
         );
         let is_last = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::IsLastOfCompression
+            trace_eval,
+            PreprocessedColumn::IsLastOfCompression
         );
         let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
         let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
         let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
         let f1_top = E::F::one();
         eval.add_constraint(
-            gate_h[0].clone()
-                - is_real[0].clone() * (f1_top.clone() - is_last[0].clone())
+            gate_h[0].clone() - is_real[0].clone() * (f1_top.clone() - is_last[0].clone()),
         );
-        eval.add_constraint(
-            init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone()
-        );
-        eval.add_constraint(
-            output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone()
-        );
+        eval.add_constraint(init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone());
+        eval.add_constraint(output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone());
         let a_in = crate::trace::trace_eval!(trace_eval, Column::AIn);
         let b_in = crate::trace::trace_eval!(trace_eval, Column::BIn);
         let c_in = crate::trace::trace_eval!(trace_eval, Column::CIn);
@@ -139,12 +139,18 @@ impl BuiltInComponent for Blake2bChip {
 
         // ── Step 1: a1 = a_in + b_in + mx (3-input addition) ──
         for i in 0..8 {
-            let carry_in = if i == 0 { E::F::zero() } else { carry1[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                carry1[i - 1].clone()
+            };
             eval.add_constraint(
-                is_real[0].clone() * (
-                    a1[i].clone() + carry1[i].clone() * f256.clone()
-                    - a_in[i].clone() - b_in[i].clone() - mx[i].clone() - carry_in
-                )
+                is_real[0].clone()
+                    * (a1[i].clone() + carry1[i].clone() * f256.clone()
+                        - a_in[i].clone()
+                        - b_in[i].clone()
+                        - mx[i].clone()
+                        - carry_in),
             );
         }
 
@@ -155,14 +161,19 @@ impl BuiltInComponent for Blake2bChip {
         // ── Step 3: c1 = c_in + d1 ──
         // d1[i] = xor1[(i+4)%8] = d_in[(i+4)%8] + a1[(i+4)%8] - 2*and1[(i+4)%8]
         for i in 0..8 {
-            let carry_in = if i == 0 { E::F::zero() } else { carry2[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                carry2[i - 1].clone()
+            };
             let j = (i + 4) % 8; // byte permutation for >>>32
             let d1_i = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
             eval.add_constraint(
-                is_real[0].clone() * (
-                    c1[i].clone() + carry2[i].clone() * f256.clone()
-                    - c_in[i].clone() - d1_i - carry_in
-                )
+                is_real[0].clone()
+                    * (c1[i].clone() + carry2[i].clone() * f256.clone()
+                        - c_in[i].clone()
+                        - d1_i
+                        - carry_in),
             );
         }
 
@@ -171,14 +182,20 @@ impl BuiltInComponent for Blake2bChip {
 
         // ── Step 5: a_out = a1 + b1 + my ──
         for i in 0..8 {
-            let carry_in = if i == 0 { E::F::zero() } else { carry3[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                carry3[i - 1].clone()
+            };
             let j = (i + 3) % 8; // byte permutation for >>>24
             let b1_i = b_in[j].clone() + c1[j].clone() - f2.clone() * and2[j].clone();
             eval.add_constraint(
-                is_real[0].clone() * (
-                    a_out[i].clone() + carry3[i].clone() * f256.clone()
-                    - a1[i].clone() - b1_i - my[i].clone() - carry_in
-                )
+                is_real[0].clone()
+                    * (a_out[i].clone() + carry3[i].clone() * f256.clone()
+                        - a1[i].clone()
+                        - b1_i
+                        - my[i].clone()
+                        - carry_in),
             );
         }
 
@@ -188,7 +205,11 @@ impl BuiltInComponent for Blake2bChip {
 
         // ── Step 7: c_out = c1 + d_out ──
         for i in 0..8 {
-            let carry_in = if i == 0 { E::F::zero() } else { carry4[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                carry4[i - 1].clone()
+            };
             // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2*and3[k]
             // d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2*and1[(k+4)%8]
             let k = (i + 2) % 8; // byte perm for >>>16
@@ -196,10 +217,11 @@ impl BuiltInComponent for Blake2bChip {
             let d1_k = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
             let d_out_i = d1_k + a_out[k].clone() - f2.clone() * and3[k].clone();
             eval.add_constraint(
-                is_real[0].clone() * (
-                    c_out[i].clone() + carry4[i].clone() * f256.clone()
-                    - c1[i].clone() - d_out_i - carry_in
-                )
+                is_real[0].clone()
+                    * (c_out[i].clone() + carry4[i].clone() * f256.clone()
+                        - c1[i].clone()
+                        - d_out_i
+                        - carry_in),
             );
         }
 
@@ -219,10 +241,10 @@ impl BuiltInComponent for Blake2bChip {
             // If xor4[i] >= 128: result = xor4[i]*2 + prev_carry - 256, carry_out = 1
             // Constraint: b_out[i] + rot63_carry[i] * 256 = xor4[i] * 2 + prev_carry
             eval.add_constraint(
-                is_real[0].clone() * (
-                    b_out[i].clone() + rot63_carry[i].clone() * f256.clone()
-                    - f2.clone() * xor4_i - prev_carry
-                )
+                is_real[0].clone()
+                    * (b_out[i].clone() + rot63_carry[i].clone() * f256.clone()
+                        - f2.clone() * xor4_i
+                        - prev_carry),
             );
         }
 
@@ -250,7 +272,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone()],
+                &[
+                    and1_a_hi[i].clone(),
+                    and1_b_hi[i].clone(),
+                    and1_res_hi[i].clone(),
+                ],
             ));
             // And1 lo — (d_in - hi·16, a1 - hi·16, and1 - hi·16)
             eval.add_to_relation(RelationEntry::new(
@@ -267,7 +293,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone()],
+                &[
+                    and2_a_hi[i].clone(),
+                    and2_b_hi[i].clone(),
+                    and2_res_hi[i].clone(),
+                ],
             ));
             // And2 lo — (b_in - hi·16, c1 - hi·16, and2 - hi·16)
             eval.add_to_relation(RelationEntry::new(
@@ -284,7 +314,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone()],
+                &[
+                    and3_a_hi[i].clone(),
+                    and3_b_hi[i].clone(),
+                    and3_res_hi[i].clone(),
+                ],
             ));
             // And3 lo — A-side is derived D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8
             let j3 = (i + 4) % 8;
@@ -303,7 +337,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone()],
+                &[
+                    and4_a_hi[i].clone(),
+                    and4_b_hi[i].clone(),
+                    and4_res_hi[i].clone(),
+                ],
             ));
             // And4 lo — A-side is derived B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8
             let j4 = (i + 3) % 8;
@@ -331,7 +369,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[iv4_hi_f.clone(), t_hi_e[i].clone(), and_t_lo_hi_e[i].clone()],
+                &[
+                    iv4_hi_f.clone(),
+                    t_hi_e[i].clone(),
+                    and_t_lo_hi_e[i].clone(),
+                ],
             ));
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
@@ -350,7 +392,11 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 is_real[0].clone().into(),
-                &[iv5_hi_f.clone(), t_hi_e[8 + i].clone(), and_t_hi_hi_e[i].clone()],
+                &[
+                    iv5_hi_f.clone(),
+                    t_hi_e[8 + i].clone(),
+                    and_t_hi_hi_e[i].clone(),
+                ],
             ));
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
@@ -403,42 +449,36 @@ impl BuiltInComponent for Blake2bChip {
             // Carry1: degree-4 → degree-2 via 2 helpers.
             let c1_v = carry1[i].clone();
             eval.add_constraint(
-                carry1_xcm1[i].clone() - c1_v.clone() * (c1_v.clone() - f1.clone())
+                carry1_xcm1[i].clone() - c1_v.clone() * (c1_v.clone() - f1.clone()),
             );
             eval.add_constraint(
-                carry1_full[i].clone() - carry1_xcm1[i].clone() * (c1_v - f2.clone())
+                carry1_full[i].clone() - carry1_xcm1[i].clone() * (c1_v - f2.clone()),
             );
             eval.add_constraint(is_real[0].clone() * carry1_full[i].clone());
 
             // Carry3: same.
             let c3_v = carry3[i].clone();
             eval.add_constraint(
-                carry3_xcm1[i].clone() - c3_v.clone() * (c3_v.clone() - f1.clone())
+                carry3_xcm1[i].clone() - c3_v.clone() * (c3_v.clone() - f1.clone()),
             );
             eval.add_constraint(
-                carry3_full[i].clone() - carry3_xcm1[i].clone() * (c3_v - f2.clone())
+                carry3_full[i].clone() - carry3_xcm1[i].clone() * (c3_v - f2.clone()),
             );
             eval.add_constraint(is_real[0].clone() * carry3_full[i].clone());
 
             // Carry2: degree-3 → degree-2 via 1 helper.
             let c2_v = carry2[i].clone();
-            eval.add_constraint(
-                carry2_xcm1[i].clone() - c2_v.clone() * (c2_v - f1.clone())
-            );
+            eval.add_constraint(carry2_xcm1[i].clone() - c2_v.clone() * (c2_v - f1.clone()));
             eval.add_constraint(is_real[0].clone() * carry2_xcm1[i].clone());
 
             // Carry4: same.
             let c4_v = carry4[i].clone();
-            eval.add_constraint(
-                carry4_xcm1[i].clone() - c4_v.clone() * (c4_v - f1.clone())
-            );
+            eval.add_constraint(carry4_xcm1[i].clone() - c4_v.clone() * (c4_v - f1.clone()));
             eval.add_constraint(is_real[0].clone() * carry4_xcm1[i].clone());
 
             // Rot63Carry: same.
             let r_v = rot63_carry[i].clone();
-            eval.add_constraint(
-                rot63_xcm1[i].clone() - r_v.clone() * (r_v - f1.clone())
-            );
+            eval.add_constraint(rot63_xcm1[i].clone() - r_v.clone() * (r_v - f1.clone()));
             eval.add_constraint(is_real[0].clone() * rot63_xcm1[i].clone());
         }
 
@@ -568,18 +608,24 @@ impl BuiltInComponent for Blake2bChip {
             for i in 0..8 {
                 let mut update = E::F::zero();
                 for (j, &[aj, bj, cj, dj]) in G_INDICES.iter().enumerate() {
-                    let contribution = if k == aj { a_out[i].clone() }
-                        else if k == bj { b_out[i].clone() }
-                        else if k == cj { c_out[i].clone() }
-                        else if k == dj { d_out[i].clone() }
-                        else { v_cols[k][i].clone() };
+                    let contribution = if k == aj {
+                        a_out[i].clone()
+                    } else if k == bj {
+                        b_out[i].clone()
+                    } else if k == cj {
+                        c_out[i].clone()
+                    } else if k == dj {
+                        d_out[i].clone()
+                    } else {
+                        v_cols[k][i].clone()
+                    };
                     update += is_gidx[j][0].clone() * contribution;
                 }
                 // Helper-defining (deg 2): VNextSumK[i] = Σ_j IsGIdx[j] · contribution_j(k, i).
                 eval.add_constraint(v_next_sum[k][i].clone() - update);
                 // Main (deg 2): GateH · (V_next[k][i] - VNextSumK[i]) = 0.
                 eval.add_constraint(
-                    gate.clone() * (v_cols_next[k][i].clone() - v_next_sum[k][i].clone())
+                    gate.clone() * (v_cols_next[k][i].clone() - v_next_sum[k][i].clone()),
                 );
             }
         }
@@ -690,7 +736,7 @@ impl BuiltInComponent for Blake2bChip {
         for k in 0..16 {
             for i in 0..8 {
                 eval.add_constraint(
-                    gate.clone() * (m_cols_next[k][i].clone() - m_cols[k][i].clone())
+                    gate.clone() * (m_cols_next[k][i].clone() - m_cols[k][i].clone()),
                 );
             }
         }
@@ -725,9 +771,7 @@ impl BuiltInComponent for Blake2bChip {
 
         // F ∈ {0,1} (Phase I-blake2b-3 helper-flattened).
         let f_bound_h = crate::trace::trace_eval!(trace_eval, Column::FBoundH);
-        eval.add_constraint(
-            f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone())
-        );
+        eval.add_constraint(f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone()));
         eval.add_constraint(is_real[0].clone() * f_bound_h[0].clone());
 
         // Gate substitution (Phase I-blake2b-1): init_gate ← InitGateH.
@@ -745,7 +789,7 @@ impl BuiltInComponent for Blake2bChip {
             // V[0..8] = H_k
             for k in 0..8 {
                 eval.add_constraint(
-                    init_gate.clone() * (v_cols[k][i].clone() - h_cols[k][i].clone())
+                    init_gate.clone() * (v_cols[k][i].clone() - h_cols[k][i].clone()),
                 );
             }
             // V[8..12] = IV[0..4]
@@ -757,12 +801,14 @@ impl BuiltInComponent for Blake2bChip {
             let v12_expected = iv4_i.clone() + t_e[i].clone() - f2.clone() * and_t_lo_e[i].clone();
             eval.add_constraint(init_gate.clone() * (v_cols[12][i].clone() - v12_expected));
             // V[13] = IV[5] XOR T[8+i] via XOR identity using AndTHi.
-            let v13_expected = iv5_i.clone() + t_e[8 + i].clone() - f2.clone() * and_t_hi_e[i].clone();
+            let v13_expected =
+                iv5_i.clone() + t_e[8 + i].clone() - f2.clone() * and_t_hi_e[i].clone();
             eval.add_constraint(init_gate.clone() * (v_cols[13][i].clone() - v13_expected));
             // V[14] = IV[6] XOR (F·0xFF).
             // = IV[6] + F·0xFF - 2·F·IV[6]  (since F∈{0,1}, F·IV[6] = AND(IV[6], F·0xFF))
             // = IV[6]·(1 - 2F) + 255F
-            let v14_expected = iv6_i.clone() + f_e[0].clone() * (f255.clone() - f2.clone() * iv6_i.clone());
+            let v14_expected =
+                iv6_i.clone() + f_e[0].clone() * (f255.clone() - f2.clone() * iv6_i.clone());
             eval.add_constraint(init_gate.clone() * (v_cols[14][i].clone() - v14_expected));
             // V[15] = IV[7]
             eval.add_constraint(init_gate.clone() * (v_cols[15][i].clone() - iv7_i.clone()));
@@ -784,7 +830,7 @@ impl BuiltInComponent for Blake2bChip {
         for k in 0..8 {
             for i in 0..8 {
                 eval.add_constraint(
-                    gate.clone() * (h_cols_next[k][i].clone() - h_cols[k][i].clone())
+                    gate.clone() * (h_cols_next[k][i].clone() - h_cols[k][i].clone()),
                 );
             }
         }
@@ -831,13 +877,10 @@ impl BuiltInComponent for Blake2bChip {
                 let h_b = h_cols[word][byte].clone();
 
                 // Output derivation (gated at row 95).
-                let expected_out = h_b.clone() + v1.clone()
-                    - f2.clone() * out_and1_e[slot].clone()
+                let expected_out = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone()
                     + v2.clone()
                     - f2.clone() * out_and2_e[slot].clone();
-                eval.add_constraint(
-                    output_gate.clone() * (output_e[slot].clone() - expected_out)
-                );
+                eval.add_constraint(output_gate.clone() * (output_e[slot].clone() - expected_out));
 
                 // OutAnd1 hi
                 eval.add_to_relation(RelationEntry::new(
@@ -921,33 +964,43 @@ impl BuiltInComponent for Blake2bChip {
         let init_gate_8b = init_gate_h[0].clone();
         let combine = crate::framework::eval::combine_le_u64::<E>;
         let h_ptr_u32 = combine(&[
-            h_ptr_e[0].clone(), h_ptr_e[1].clone(),
-            h_ptr_e[2].clone(), h_ptr_e[3].clone(),
+            h_ptr_e[0].clone(),
+            h_ptr_e[1].clone(),
+            h_ptr_e[2].clone(),
+            h_ptr_e[3].clone(),
         ]);
         let m_ptr_u32 = combine(&[
-            m_ptr_e[0].clone(), m_ptr_e[1].clone(),
-            m_ptr_e[2].clone(), m_ptr_e[3].clone(),
+            m_ptr_e[0].clone(),
+            m_ptr_e[1].clone(),
+            m_ptr_e[2].clone(),
+            m_ptr_e[3].clone(),
         ]);
         for i in 0..64usize {
             let addr_u32 = combine(&[
-                h_rd_b0[i].clone(), h_rd_b1[i].clone(),
-                h_rd_b2[i].clone(), h_rd_b3[i].clone(),
+                h_rd_b0[i].clone(),
+                h_rd_b1[i].clone(),
+                h_rd_b2[i].clone(),
+                h_rd_b3[i].clone(),
             ]);
             let offset = E::F::from(BaseField::from(i as u32));
             eval.add_constraint(init_gate_8b.clone() * (addr_u32 - h_ptr_u32.clone() - offset));
         }
         for k in 0..128usize {
             let addr_u32 = combine(&[
-                m_rd_b0[k].clone(), m_rd_b1[k].clone(),
-                m_rd_b2[k].clone(), m_rd_b3[k].clone(),
+                m_rd_b0[k].clone(),
+                m_rd_b1[k].clone(),
+                m_rd_b2[k].clone(),
+                m_rd_b3[k].clone(),
             ]);
             let offset = E::F::from(BaseField::from(k as u32));
             eval.add_constraint(init_gate_8b.clone() * (addr_u32 - m_ptr_u32.clone() - offset));
         }
         for i in 0..64usize {
             let addr_u32 = combine(&[
-                h_wr_b0[i].clone(), h_wr_b1[i].clone(),
-                h_wr_b2[i].clone(), h_wr_b3[i].clone(),
+                h_wr_b0[i].clone(),
+                h_wr_b1[i].clone(),
+                h_wr_b2[i].clone(),
+                h_wr_b3[i].clone(),
             ]);
             let offset = E::F::from(BaseField::from(i as u32));
             eval.add_constraint(init_gate_8b.clone() * (addr_u32 - h_ptr_u32.clone() - offset));
@@ -978,7 +1031,9 @@ impl BuiltInComponent for Blake2bChip {
             tuple.push(h_rd_b2[i].clone());
             tuple.push(h_rd_b3[i].clone());
             tuple.push(h_cols[word][byte].clone());
-            for tb in 0..8 { tuple.push(call_ts_e[tb].clone()); }
+            for tb in 0..8 {
+                tuple.push(call_ts_e[tb].clone());
+            }
             tuple.push(f_zero.clone());
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
@@ -996,7 +1051,9 @@ impl BuiltInComponent for Blake2bChip {
             tuple.push(m_rd_b2[k].clone());
             tuple.push(m_rd_b3[k].clone());
             tuple.push(m_cols[word][byte].clone());
-            for tb in 0..8 { tuple.push(call_ts_e[tb].clone()); }
+            for tb in 0..8 {
+                tuple.push(call_ts_e[tb].clone());
+            }
             tuple.push(f_zero.clone());
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
@@ -1016,7 +1073,9 @@ impl BuiltInComponent for Blake2bChip {
             tuple.push(h_wr_b2[i].clone());
             tuple.push(h_wr_b3[i].clone());
             tuple.push(output_e[i].clone());
-            for tb in 0..8 { tuple.push(call_ts_e[tb].clone()); }
+            for tb in 0..8 {
+                tuple.push(call_ts_e[tb].clone());
+            }
             tuple.push(f_one.clone());
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
@@ -1032,11 +1091,19 @@ impl BuiltInComponent for Blake2bChip {
         let f_col_e = crate::trace::trace_eval!(trace_eval, Column::F);
         {
             let mut tuple: Vec<E::F> = Vec::with_capacity(25);
-            for i in 0..4 { tuple.push(h_ptr_e[i].clone()); }
-            for i in 0..4 { tuple.push(m_ptr_e[i].clone()); }
-            for i in 0..8 { tuple.push(t_e[i].clone()); }
+            for i in 0..4 {
+                tuple.push(h_ptr_e[i].clone());
+            }
+            for i in 0..4 {
+                tuple.push(m_ptr_e[i].clone());
+            }
+            for i in 0..8 {
+                tuple.push(t_e[i].clone());
+            }
             tuple.push(f_col_e[0].clone());
-            for i in 0..8 { tuple.push(call_ts_e[i].clone()); }
+            for i in 0..8 {
+                tuple.push(call_ts_e[i].clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 blake2b_call_lookup,
                 (-init_gate_8b.clone()).into(),
@@ -1065,30 +1132,50 @@ impl BuiltInProverComponent for Blake2bChip {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         const GIDX_COLS: [PreprocessedColumn; 8] = [
-            PreprocessedColumn::IsGIdx0, PreprocessedColumn::IsGIdx1,
-            PreprocessedColumn::IsGIdx2, PreprocessedColumn::IsGIdx3,
-            PreprocessedColumn::IsGIdx4, PreprocessedColumn::IsGIdx5,
-            PreprocessedColumn::IsGIdx6, PreprocessedColumn::IsGIdx7,
+            PreprocessedColumn::IsGIdx0,
+            PreprocessedColumn::IsGIdx1,
+            PreprocessedColumn::IsGIdx2,
+            PreprocessedColumn::IsGIdx3,
+            PreprocessedColumn::IsGIdx4,
+            PreprocessedColumn::IsGIdx5,
+            PreprocessedColumn::IsGIdx6,
+            PreprocessedColumn::IsGIdx7,
         ];
         const MX_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMxSlot0, PreprocessedColumn::IsMxSlot1,
-            PreprocessedColumn::IsMxSlot2, PreprocessedColumn::IsMxSlot3,
-            PreprocessedColumn::IsMxSlot4, PreprocessedColumn::IsMxSlot5,
-            PreprocessedColumn::IsMxSlot6, PreprocessedColumn::IsMxSlot7,
-            PreprocessedColumn::IsMxSlot8, PreprocessedColumn::IsMxSlot9,
-            PreprocessedColumn::IsMxSlot10, PreprocessedColumn::IsMxSlot11,
-            PreprocessedColumn::IsMxSlot12, PreprocessedColumn::IsMxSlot13,
-            PreprocessedColumn::IsMxSlot14, PreprocessedColumn::IsMxSlot15,
+            PreprocessedColumn::IsMxSlot0,
+            PreprocessedColumn::IsMxSlot1,
+            PreprocessedColumn::IsMxSlot2,
+            PreprocessedColumn::IsMxSlot3,
+            PreprocessedColumn::IsMxSlot4,
+            PreprocessedColumn::IsMxSlot5,
+            PreprocessedColumn::IsMxSlot6,
+            PreprocessedColumn::IsMxSlot7,
+            PreprocessedColumn::IsMxSlot8,
+            PreprocessedColumn::IsMxSlot9,
+            PreprocessedColumn::IsMxSlot10,
+            PreprocessedColumn::IsMxSlot11,
+            PreprocessedColumn::IsMxSlot12,
+            PreprocessedColumn::IsMxSlot13,
+            PreprocessedColumn::IsMxSlot14,
+            PreprocessedColumn::IsMxSlot15,
         ];
         const MY_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMySlot0, PreprocessedColumn::IsMySlot1,
-            PreprocessedColumn::IsMySlot2, PreprocessedColumn::IsMySlot3,
-            PreprocessedColumn::IsMySlot4, PreprocessedColumn::IsMySlot5,
-            PreprocessedColumn::IsMySlot6, PreprocessedColumn::IsMySlot7,
-            PreprocessedColumn::IsMySlot8, PreprocessedColumn::IsMySlot9,
-            PreprocessedColumn::IsMySlot10, PreprocessedColumn::IsMySlot11,
-            PreprocessedColumn::IsMySlot12, PreprocessedColumn::IsMySlot13,
-            PreprocessedColumn::IsMySlot14, PreprocessedColumn::IsMySlot15,
+            PreprocessedColumn::IsMySlot0,
+            PreprocessedColumn::IsMySlot1,
+            PreprocessedColumn::IsMySlot2,
+            PreprocessedColumn::IsMySlot3,
+            PreprocessedColumn::IsMySlot4,
+            PreprocessedColumn::IsMySlot5,
+            PreprocessedColumn::IsMySlot6,
+            PreprocessedColumn::IsMySlot7,
+            PreprocessedColumn::IsMySlot8,
+            PreprocessedColumn::IsMySlot9,
+            PreprocessedColumn::IsMySlot10,
+            PreprocessedColumn::IsMySlot11,
+            PreprocessedColumn::IsMySlot12,
+            PreprocessedColumn::IsMySlot13,
+            PreprocessedColumn::IsMySlot14,
+            PreprocessedColumn::IsMySlot15,
         ];
         for row in 0..num_rows {
             let g_idx = row % 8;
@@ -1124,7 +1211,9 @@ impl BuiltInProverComponent for Blake2bChip {
             v[8..].copy_from_slice(&IV);
             v[12] ^= call.t as u64;
             v[13] ^= (call.t >> 64) as u64;
-            if call.f { v[14] = !v[14]; }
+            if call.f {
+                v[14] = !v[14];
+            }
 
             // Phase 8b ECALL-binding data for this compression, if a matching
             // blake2b_mem_op was recorded by the tracer.
@@ -1159,8 +1248,7 @@ impl BuiltInProverComponent for Blake2bChip {
                     let my = call.m[s[2 * g_idx + 1]];
 
                     let mut row = g_traced(
-                        &v, &call.m, &call.h, call.t, call.f,
-                        v[ai], v[bi], v[ci], v[di], mx, my,
+                        &v, &call.m, &call.h, call.t, call.f, v[ai], v[bi], v[ci], v[di], mx, my,
                     );
 
                     v[ai] = u64::from_le_bytes(row.a_out);
@@ -1226,27 +1314,57 @@ impl BuiltInProverComponent for Blake2bChip {
             trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
             trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
             const V_COLS: [Column; 16] = [
-                Column::V0, Column::V1, Column::V2, Column::V3,
-                Column::V4, Column::V5, Column::V6, Column::V7,
-                Column::V8, Column::V9, Column::V10, Column::V11,
-                Column::V12, Column::V13, Column::V14, Column::V15,
+                Column::V0,
+                Column::V1,
+                Column::V2,
+                Column::V3,
+                Column::V4,
+                Column::V5,
+                Column::V6,
+                Column::V7,
+                Column::V8,
+                Column::V9,
+                Column::V10,
+                Column::V11,
+                Column::V12,
+                Column::V13,
+                Column::V14,
+                Column::V15,
             ];
             for k in 0..16 {
                 trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
             }
             const M_COLS: [Column; 16] = [
-                Column::M0, Column::M1, Column::M2, Column::M3,
-                Column::M4, Column::M5, Column::M6, Column::M7,
-                Column::M8, Column::M9, Column::M10, Column::M11,
-                Column::M12, Column::M13, Column::M14, Column::M15,
+                Column::M0,
+                Column::M1,
+                Column::M2,
+                Column::M3,
+                Column::M4,
+                Column::M5,
+                Column::M6,
+                Column::M7,
+                Column::M8,
+                Column::M9,
+                Column::M10,
+                Column::M11,
+                Column::M12,
+                Column::M13,
+                Column::M14,
+                Column::M15,
             ];
             for k in 0..16 {
                 trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
             }
             // Compression-level inputs.
             const H_COLS: [Column; 8] = [
-                Column::H0, Column::H1, Column::H2, Column::H3,
-                Column::H4, Column::H5, Column::H6, Column::H7,
+                Column::H0,
+                Column::H1,
+                Column::H2,
+                Column::H3,
+                Column::H4,
+                Column::H5,
+                Column::H6,
+                Column::H7,
             ];
             for k in 0..8 {
                 trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
@@ -1273,8 +1391,10 @@ impl BuiltInProverComponent for Blake2bChip {
             trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
             // Split 4-byte-wide address arrays into per-byte slices.
             {
-                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
+                let mut b0 = [0u8; 64];
+                let mut b1 = [0u8; 64];
+                let mut b2 = [0u8; 64];
+                let mut b3 = [0u8; 64];
                 for i in 0..64 {
                     b0[i] = r.h_rd_addr[i * 4];
                     b1[i] = r.h_rd_addr[i * 4 + 1];
@@ -1287,8 +1407,10 @@ impl BuiltInProverComponent for Blake2bChip {
                 trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
             }
             {
-                let mut b0 = [0u8; 128]; let mut b1 = [0u8; 128];
-                let mut b2 = [0u8; 128]; let mut b3 = [0u8; 128];
+                let mut b0 = [0u8; 128];
+                let mut b1 = [0u8; 128];
+                let mut b2 = [0u8; 128];
+                let mut b3 = [0u8; 128];
                 for k in 0..128 {
                     b0[k] = r.m_rd_addr[k * 4];
                     b1[k] = r.m_rd_addr[k * 4 + 1];
@@ -1301,8 +1423,10 @@ impl BuiltInProverComponent for Blake2bChip {
                 trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
             }
             {
-                let mut b0 = [0u8; 64]; let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64]; let mut b3 = [0u8; 64];
+                let mut b0 = [0u8; 64];
+                let mut b1 = [0u8; 64];
+                let mut b2 = [0u8; 64];
+                let mut b3 = [0u8; 64];
                 for i in 0..64 {
                     b0[i] = r.h_wr_addr[i * 4];
                     b1[i] = r.h_wr_addr[i * 4 + 1];
@@ -1384,10 +1508,22 @@ impl BuiltInProverComponent for Blake2bChip {
             v_after_bytes[ci_v] = r.c_out;
             v_after_bytes[di_v] = r.d_out;
             const V_NEXT_SUM_COLS: [Column; 16] = [
-                Column::VNextSum0, Column::VNextSum1, Column::VNextSum2, Column::VNextSum3,
-                Column::VNextSum4, Column::VNextSum5, Column::VNextSum6, Column::VNextSum7,
-                Column::VNextSum8, Column::VNextSum9, Column::VNextSum10, Column::VNextSum11,
-                Column::VNextSum12, Column::VNextSum13, Column::VNextSum14, Column::VNextSum15,
+                Column::VNextSum0,
+                Column::VNextSum1,
+                Column::VNextSum2,
+                Column::VNextSum3,
+                Column::VNextSum4,
+                Column::VNextSum5,
+                Column::VNextSum6,
+                Column::VNextSum7,
+                Column::VNextSum8,
+                Column::VNextSum9,
+                Column::VNextSum10,
+                Column::VNextSum11,
+                Column::VNextSum12,
+                Column::VNextSum13,
+                Column::VNextSum14,
+                Column::VNextSum15,
             ];
             for k in 0..16 {
                 trace.fill_columns_bytes(row_idx, &v_after_bytes[k], V_NEXT_SUM_COLS[k]);
@@ -1474,7 +1610,10 @@ impl BuiltInProverComponent for Blake2bChip {
         component_trace: ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
-    ) -> (ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
+    ) -> (
+        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+        SecureField,
+    ) {
         let log_size = component_trace.log_size();
         let mut logup = LogupTraceBuilder::new(log_size);
 
@@ -1523,11 +1662,18 @@ impl BuiltInProverComponent for Blake2bChip {
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
-                &[and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone()],
+                &[
+                    and1_a_hi[i].clone(),
+                    and1_b_hi[i].clone(),
+                    and1_res_hi[i].clone(),
+                ],
             );
             let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
-            let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) =
-                (and1_a_hi[i].clone(), and1_b_hi[i].clone(), and1_res_hi[i].clone());
+            let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) = (
+                and1_a_hi[i].clone(),
+                and1_b_hi[i].clone(),
+                and1_res_hi[i].clone(),
+            );
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
@@ -1546,11 +1692,18 @@ impl BuiltInProverComponent for Blake2bChip {
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
-                &[and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone()],
+                &[
+                    and2_a_hi[i].clone(),
+                    and2_b_hi[i].clone(),
+                    and2_res_hi[i].clone(),
+                ],
             );
             let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
-            let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) =
-                (and2_a_hi[i].clone(), and2_b_hi[i].clone(), and2_res_hi[i].clone());
+            let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) = (
+                and2_a_hi[i].clone(),
+                and2_b_hi[i].clone(),
+                and2_res_hi[i].clone(),
+            );
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
@@ -1570,13 +1723,20 @@ impl BuiltInProverComponent for Blake2bChip {
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
-                &[and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone()],
+                &[
+                    and3_a_hi[i].clone(),
+                    and3_b_hi[i].clone(),
+                    and3_res_hi[i].clone(),
+                ],
             );
             let j3 = (i + 4) % 8;
             let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
             let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
-            let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) =
-                (and3_a_hi[i].clone(), and3_b_hi[i].clone(), and3_res_hi[i].clone());
+            let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) = (
+                and3_a_hi[i].clone(),
+                and3_b_hi[i].clone(),
+                and3_res_hi[i].clone(),
+            );
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
@@ -1597,13 +1757,20 @@ impl BuiltInProverComponent for Blake2bChip {
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
-                &[and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone()],
+                &[
+                    and4_a_hi[i].clone(),
+                    and4_b_hi[i].clone(),
+                    and4_res_hi[i].clone(),
+                ],
             );
             let j4 = (i + 3) % 8;
             let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
             let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
-            let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) =
-                (and4_a_hi[i].clone(), and4_b_hi[i].clone(), and4_res_hi[i].clone());
+            let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) = (
+                and4_a_hi[i].clone(),
+                and4_b_hi[i].clone(),
+                and4_res_hi[i].clone(),
+            );
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
@@ -1625,22 +1792,20 @@ impl BuiltInProverComponent for Blake2bChip {
             let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
             let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
             let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
-            let and_t_lo_cols = crate::trace::original_base_column!(component_trace, Column::AndTLo);
-            let and_t_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHi);
-            let and_t_lo_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
-            let and_t_hi_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
+            let and_t_lo_cols =
+                crate::trace::original_base_column!(component_trace, Column::AndTLo);
+            let and_t_hi_cols =
+                crate::trace::original_base_column!(component_trace, Column::AndTHi);
+            let and_t_lo_hi_cols =
+                crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
+            let and_t_hi_hi_cols =
+                crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
             let iv4_hi_bcast_tuple = iv4_hi;
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                {
-                    let t_hi_i = t_hi_cols[i].clone();
-                    let and_hi_i = and_t_lo_hi_cols[i].clone();
-                    move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
-                },
-            );
+            logup.add_to_relation_computed(bitwise, [is_real[0].clone()], |[r]| r.into(), 3, {
+                let t_hi_i = t_hi_cols[i].clone();
+                let and_hi_i = and_t_lo_hi_cols[i].clone();
+                move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
+            });
             {
                 let iv4_lo_const = iv4_lo;
                 let t_i = t_cols[i].clone();
@@ -1719,15 +1884,20 @@ impl BuiltInProverComponent for Blake2bChip {
         // numeric index below because the column-fetch macro requires a
         // literal path.
         let is_last_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::IsLastOfCompression
+            component_trace,
+            PreprocessedColumn::IsLastOfCompression
         );
         let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
-        let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
+        let v_after_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::VAfterHi);
         let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
-        let out_and1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
-        let out_xor1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
+        let out_and1_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
+        let out_xor1_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
         let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
-        let out_and2_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
+        let out_and2_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
         let h_by_word: [_; 8] = [
             crate::trace::original_base_column!(component_trace, Column::H0),
             crate::trace::original_base_column!(component_trace, Column::H1),
@@ -1859,7 +2029,8 @@ impl BuiltInProverComponent for Blake2bChip {
         // Fire only at IsFirstOfCompression · IsReal (once per compression).
         let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
         let is_first_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::IsFirstOfCompression
+            component_trace,
+            PreprocessedColumn::IsFirstOfCompression
         );
         let h_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB0);
         let h_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB1);
@@ -1927,7 +2098,9 @@ impl BuiltInProverComponent for Blake2bChip {
                     t.push(addr2.at(v));
                     t.push(addr3.at(v));
                     t.push(h_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    for ts_col in &ts_c {
+                        t.push(ts_col.at(v));
+                    }
                     t.push(zero_val);
                     t
                 },
@@ -1956,7 +2129,9 @@ impl BuiltInProverComponent for Blake2bChip {
                     t.push(addr2.at(v));
                     t.push(addr3.at(v));
                     t.push(m_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    for ts_col in &ts_c {
+                        t.push(ts_col.at(v));
+                    }
                     t.push(zero_val);
                     t
                 },
@@ -1986,7 +2161,9 @@ impl BuiltInProverComponent for Blake2bChip {
                     t.push(addr2.at(v));
                     t.push(addr3.at(v));
                     t.push(out_b.at(v));
-                    for ts_col in &ts_c { t.push(ts_col.at(v)); }
+                    for ts_col in &ts_c {
+                        t.push(ts_col.at(v));
+                    }
                     t.push(one_val);
                     t
                 },
@@ -2015,11 +2192,19 @@ impl BuiltInProverComponent for Blake2bChip {
                 let ts_c = call_ts_cols.clone();
                 move |v| {
                     let mut t = Vec::with_capacity(25);
-                    for i in 0..4 { t.push(h_ptr_c[i].at(v)); }
-                    for i in 0..4 { t.push(m_ptr_c[i].at(v)); }
-                    for i in 0..8 { t.push(t_c[i].at(v)); }
+                    for i in 0..4 {
+                        t.push(h_ptr_c[i].at(v));
+                    }
+                    for i in 0..4 {
+                        t.push(m_ptr_c[i].at(v));
+                    }
+                    for i in 0..8 {
+                        t.push(t_c[i].at(v));
+                    }
                     t.push(f_c.at(v));
-                    for i in 0..8 { t.push(ts_c[i].at(v)); }
+                    for i in 0..8 {
+                        t.push(ts_c[i].at(v));
+                    }
                     t
                 }
             },
@@ -2031,8 +2216,8 @@ impl BuiltInProverComponent for Blake2bChip {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::sw::g_func;
+    use super::*;
 
     #[test]
     fn test_blake2b_compress() {
@@ -2061,8 +2246,7 @@ mod tests {
         let m_full = [0u64; 16];
         let h_full = [0u64; 8];
         let row = g_traced(
-            &v1, &m_full, &h_full, 0u128, false,
-            v1[0], v1[4], v1[8], v1[12], mx, my,
+            &v1, &m_full, &h_full, 0u128, false, v1[0], v1[4], v1[8], v1[12], mx, my,
         );
         assert_eq!(u64::from_le_bytes(row.a_out), v2[0]);
         assert_eq!(u64::from_le_bytes(row.b_out), v2[4]);

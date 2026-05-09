@@ -4,13 +4,10 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
         backend::simd::SimdBackend,
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -18,21 +15,25 @@ use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 use crate::core::step::WORD_SIZE;
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
-use crate::trace::{
-    builder::FinalizedTrace,
-    component::ComponentTrace,
-};
+use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements, Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements, },
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::AllLookupElements;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{
+        BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
+        Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
+        DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
+        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
+        RegisterMemoryLookupElements,
+    },
+};
 
 pub(crate) mod classify;
 mod columns;
@@ -40,13 +41,13 @@ mod reg_access;
 // Phase 47 split: trace fill + interaction-trace generation moved into
 // their own files.  add_constraints (the AIR) stays in mod.rs.
 #[cfg(feature = "prover")]
-mod trace_fill;
-#[cfg(feature = "prover")]
 mod interaction;
+#[cfg(feature = "prover")]
+mod trace_fill;
 
+pub(crate) use classify::classify_opcode_for_program_memory;
 use columns::{Column, PreprocessedColumn};
 pub(crate) use reg_access::step_reg_accesses;
-pub(crate) use classify::classify_opcode_for_program_memory;
 
 pub struct CpuChip;
 
@@ -75,9 +76,17 @@ impl BuiltInComponent for CpuChip {
         Blake2bCallLookupElements,
         RegisterMemoryLookupElements,
         ProgramMemoryLookupElements,
-        (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements, ByteToBitsLookupElements),
+        (
+            JumpTableLookupElements,
+            PopcountLookupElements,
+            BitcountLookupElements,
+            MultiplicationLookupElements,
+            BitwiseLookupElements,
+            CompareLookupElements,
+            DivRemLookupElements,
+            ByteToBitsLookupElements,
+        ),
     );
-
 
     fn add_constraints<E: EvalAtRow>(
         &self,
@@ -92,10 +101,38 @@ impl BuiltInComponent for CpuChip {
             Blake2bCallLookupElements,
             RegisterMemoryLookupElements,
             ProgramMemoryLookupElements,
-            (JumpTableLookupElements, PopcountLookupElements, BitcountLookupElements, MultiplicationLookupElements, BitwiseLookupElements, CompareLookupElements, DivRemLookupElements, ByteToBitsLookupElements),
+            (
+                JumpTableLookupElements,
+                PopcountLookupElements,
+                BitcountLookupElements,
+                MultiplicationLookupElements,
+                BitwiseLookupElements,
+                CompareLookupElements,
+                DivRemLookupElements,
+                ByteToBitsLookupElements,
+            ),
         ),
     ) {
-        let (range256_lookup, mem_lookup, prog_exec_lookup, bitwise_and_lookup, pow2_lookup, blake2b_call_lookup, reg_lookup, prog_mem_lookup, (jump_table_lookup, popcount_lookup, bitcount_lookup, mul_lookup, bitwise_lookup, compare_lookup, divrem_lookup, byte_to_bits_lookup)) = lookup_elements;
+        let (
+            range256_lookup,
+            mem_lookup,
+            prog_exec_lookup,
+            bitwise_and_lookup,
+            pow2_lookup,
+            blake2b_call_lookup,
+            reg_lookup,
+            prog_mem_lookup,
+            (
+                jump_table_lookup,
+                popcount_lookup,
+                bitcount_lookup,
+                mul_lookup,
+                bitwise_lookup,
+                compare_lookup,
+                divrem_lookup,
+                byte_to_bits_lookup,
+            ),
+        ) = lookup_elements;
         // bitwise_and_lookup is no longer emitted by CpuChip (Phase 54e
         // moved nibble emissions to BitwiseChip).
         let _ = bitwise_and_lookup;
@@ -119,8 +156,7 @@ impl BuiltInComponent for CpuChip {
             crate::trace::trace_eval!(trace_eval, Column::ValRPartNZTimesIndH);
         let div_s_active_partial_h =
             crate::trace::trace_eval!(trace_eval, Column::DivSActivePartialH);
-        let is_shift_c_not_rotr_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsShiftCNotRotrH);
+        let is_shift_c_not_rotr_h = crate::trace::trace_eval!(trace_eval, Column::IsShiftCNotRotrH);
 
         let is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
         let is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
@@ -174,20 +210,23 @@ impl BuiltInComponent for CpuChip {
         let is_br_le_s = crate::trace::trace_eval!(trace_eval, Column::IsBrLeS);
         let is_br_gt_s = crate::trace::trace_eval!(trace_eval, Column::IsBrGtS);
         let is_branch_e = || -> E::F {
-            is_br_eq[0].clone() + is_br_ne[0].clone()
-                + is_br_lt_u[0].clone() + is_br_ge_u[0].clone()
-                + is_br_le_u[0].clone() + is_br_gt_u[0].clone()
-                + is_br_lt_s[0].clone() + is_br_ge_s[0].clone()
-                + is_br_le_s[0].clone() + is_br_gt_s[0].clone()
+            is_br_eq[0].clone()
+                + is_br_ne[0].clone()
+                + is_br_lt_u[0].clone()
+                + is_br_ge_u[0].clone()
+                + is_br_le_u[0].clone()
+                + is_br_gt_u[0].clone()
+                + is_br_lt_s[0].clone()
+                + is_br_ge_s[0].clone()
+                + is_br_le_s[0].clone()
+                + is_br_gt_s[0].clone()
         };
         // Phase 53f: IsStore folded — sum of the 3 store-class sub-flags.
         let is_store_direct_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
         let is_store_imm_any_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
         let is_store_ind_e = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
         let is_store_e = || -> E::F {
-            is_store_direct_e[0].clone()
-                + is_store_imm_any_e[0].clone()
-                + is_store_ind_e[0].clone()
+            is_store_direct_e[0].clone() + is_store_imm_any_e[0].clone() + is_store_ind_e[0].clone()
         };
         let is_set_lt_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtU);
         let is_set_lt_s_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetLtS);
@@ -201,10 +240,14 @@ impl BuiltInComponent for CpuChip {
         let is_max_u_flag = crate::trace::trace_eval!(trace_eval, Column::IsMaxU);
         // Phase 53d: IsCompare = sum of the 8 compare sub-flags above.
         let is_compare_e = || -> E::F {
-            is_set_lt_u_flag[0].clone() + is_set_lt_s_flag[0].clone()
-                + is_cmov_iz_flag[0].clone() + is_cmov_nz_flag[0].clone()
-                + is_min_s_flag[0].clone() + is_min_u_flag[0].clone()
-                + is_max_s_flag[0].clone() + is_max_u_flag[0].clone()
+            is_set_lt_u_flag[0].clone()
+                + is_set_lt_s_flag[0].clone()
+                + is_cmov_iz_flag[0].clone()
+                + is_cmov_nz_flag[0].clone()
+                + is_min_s_flag[0].clone()
+                + is_min_u_flag[0].clone()
+                + is_max_s_flag[0].clone()
+                + is_max_u_flag[0].clone()
         };
 
         let f256 = E::F::from(BaseField::from(256u32));
@@ -225,30 +268,23 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(is_add_32_h[0].clone() - is_add[0].clone() * is_32bit[0].clone());
         eval.add_constraint(
             is_sub_not_negadd_h[0].clone()
-                - is_sub[0].clone() * (E::F::one() - is_neg_add[0].clone())
+                - is_sub[0].clone() * (E::F::one() - is_neg_add[0].clone()),
+        );
+        eval.add_constraint(is_sub_negadd_h[0].clone() - is_sub[0].clone() * is_neg_add[0].clone());
+        eval.add_constraint(
+            is_sub_64_not_negadd_h[0].clone() - is_sub_not_negadd_h[0].clone() * is_64bit.clone(),
         );
         eval.add_constraint(
-            is_sub_negadd_h[0].clone() - is_sub[0].clone() * is_neg_add[0].clone()
+            is_sub_64_negadd_h[0].clone() - is_sub_negadd_h[0].clone() * is_64bit.clone(),
         );
-        eval.add_constraint(
-            is_sub_64_not_negadd_h[0].clone() - is_sub_not_negadd_h[0].clone() * is_64bit.clone()
-        );
-        eval.add_constraint(
-            is_sub_64_negadd_h[0].clone() - is_sub_negadd_h[0].clone() * is_64bit.clone()
-        );
-        eval.add_constraint(
-            is_sub_32_h[0].clone() - is_sub[0].clone() * is_32bit[0].clone()
-        );
-        eval.add_constraint(
-            is_mul_32_h[0].clone() - is_mul[0].clone() * is_32bit[0].clone()
-        );
+        eval.add_constraint(is_sub_32_h[0].clone() - is_sub[0].clone() * is_32bit[0].clone());
+        eval.add_constraint(is_mul_32_h[0].clone() - is_mul[0].clone() * is_32bit[0].clone());
 
         // ── Phase I-cpu Wave-2 helpers (Compare / DivRem-binding) ──
         let signs_diff_h = crate::trace::trace_eval!(trace_eval, Column::SignsDiffH);
         let is_cmp_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsCmpVdzH);
         let is_cmov_iz_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsCmovIzVdzH);
-        let is_cmov_nz_not_vdz_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsCmovNzNotVdzH);
+        let is_cmov_nz_not_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsCmovNzNotVdzH);
         let cmp_lt_val_b_h = crate::trace::trace_eval!(trace_eval, Column::CmpLtValBH);
         let cmp_lt_val_d_h = crate::trace::trace_eval!(trace_eval, Column::CmpLtValDH);
         let cpu_div_active_h = crate::trace::trace_eval!(trace_eval, Column::CpuDivActiveH);
@@ -267,23 +303,29 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 signs_diff_h[0].clone()
                     - (sb[0].clone() + sd[0].clone()
-                        - E::F::from(BaseField::from(2u32))
-                            * sb[0].clone() * sd[0].clone())
+                        - E::F::from(BaseField::from(2u32)) * sb[0].clone() * sd[0].clone()),
             );
         }
         // ValDIsZero is a column; IsCompare/IsCmovIz/IsCmovNz selectors
         // are sums of column refs (deg 1).  Helpers below all deg 2 def.
-        eval.add_constraint(is_cmp_vdz_h[0].clone() - is_compare_e() * val_d_is_zero_for_h[0].clone());
         eval.add_constraint(
-            is_cmov_iz_vdz_h[0].clone() - is_cmov_iz_flag[0].clone() * val_d_is_zero_for_h[0].clone()
+            is_cmp_vdz_h[0].clone() - is_compare_e() * val_d_is_zero_for_h[0].clone(),
+        );
+        eval.add_constraint(
+            is_cmov_iz_vdz_h[0].clone()
+                - is_cmov_iz_flag[0].clone() * val_d_is_zero_for_h[0].clone(),
         );
         eval.add_constraint(
             is_cmov_nz_not_vdz_h[0].clone()
-                - is_cmov_nz_flag[0].clone() * (E::F::one() - val_d_is_zero_for_h[0].clone())
+                - is_cmov_nz_flag[0].clone() * (E::F::one() - val_d_is_zero_for_h[0].clone()),
         );
         for i in 0..WORD_SIZE {
-            eval.add_constraint(cmp_lt_val_b_h[i].clone() - cmp_lt_flag[0].clone() * val_b[i].clone());
-            eval.add_constraint(cmp_lt_val_d_h[i].clone() - cmp_lt_flag[0].clone() * val_d[i].clone());
+            eval.add_constraint(
+                cmp_lt_val_b_h[i].clone() - cmp_lt_flag[0].clone() * val_b[i].clone(),
+            );
+            eval.add_constraint(
+                cmp_lt_val_d_h[i].clone() - cmp_lt_flag[0].clone() * val_d[i].clone(),
+            );
         }
         // DivRem helpers.
         let div_by_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
@@ -291,23 +333,23 @@ impl BuiltInComponent for CpuChip {
         let div_rem_op_for_h = crate::trace::trace_eval!(trace_eval, Column::DivRemOp);
         eval.add_constraint(
             cpu_div_active_h[0].clone()
-                - is_div_rem_for_h[0].clone() * (E::F::one() - div_by_zero_for_h[0].clone())
+                - is_div_rem_for_h[0].clone() * (E::F::one() - div_by_zero_for_h[0].clone()),
         );
         let drop2_for_h = div_rem_op_for_h[0].clone() - E::F::from(BaseField::from(2u32));
         let drop3_for_h = div_rem_op_for_h[0].clone() - E::F::from(BaseField::from(3u32));
         eval.add_constraint(gate_div_h[0].clone() - drop2_for_h.clone() * drop3_for_h.clone());
         eval.add_constraint(
             gate_rem_h[0].clone()
-                - div_rem_op_for_h[0].clone() * (div_rem_op_for_h[0].clone() - E::F::one())
+                - div_rem_op_for_h[0].clone() * (div_rem_op_for_h[0].clone() - E::F::one()),
         );
         eval.add_constraint(
-            div_active_quot_h[0].clone() - cpu_div_active_h[0].clone() * gate_div_h[0].clone()
+            div_active_quot_h[0].clone() - cpu_div_active_h[0].clone() * gate_div_h[0].clone(),
         );
         eval.add_constraint(
-            div_active_rem_h[0].clone() - cpu_div_active_h[0].clone() * gate_rem_h[0].clone()
+            div_active_rem_h[0].clone() - cpu_div_active_h[0].clone() * gate_rem_h[0].clone(),
         );
         eval.add_constraint(
-            is_div_rem_32_h[0].clone() - is_div_rem_for_h[0].clone() * is_32bit[0].clone()
+            is_div_rem_32_h[0].clone() - is_div_rem_for_h[0].clone() * is_32bit[0].clone(),
         );
 
         // ── Phase I-cpu Wave-3 helpers (ValDIsZero / DBZ binding) ──
@@ -315,34 +357,29 @@ impl BuiltInComponent for CpuChip {
             crate::trace::trace_eval!(trace_eval, Column::ValDByteIndicatorH);
         let val_d_byte_ind_minus_1_h =
             crate::trace::trace_eval!(trace_eval, Column::ValDByteIndMinus1H);
-        let part_nz_times_ind_h =
-            crate::trace::trace_eval!(trace_eval, Column::PartNZTimesIndH);
+        let part_nz_times_ind_h = crate::trace::trace_eval!(trace_eval, Column::PartNZTimesIndH);
         let is_div_rem_times_vdz_h =
             crate::trace::trace_eval!(trace_eval, Column::IsDivRemTimesVdzH);
         let dbz_active_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveH);
-        let dbz_active_quot_h =
-            crate::trace::trace_eval!(trace_eval, Column::DbzActiveQuotH);
-        let dbz_active_rem_h =
-            crate::trace::trace_eval!(trace_eval, Column::DbzActiveRemH);
+        let dbz_active_quot_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveQuotH);
+        let dbz_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRemH);
         // ValDByteInv columns aren't read here directly — they're pulled
         // in within the inverse-pinning block below.  But we do define
         // helpers in terms of them at this top region for visibility:
         {
-            let val_d_byte_inv_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
-            let val_d_partial_nz_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
+            let val_d_byte_inv_top = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
+            let val_d_partial_nz_top = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
                     val_d_byte_indicator_h[i].clone()
-                        - val_d[i].clone() * val_d_byte_inv_top[i].clone()
+                        - val_d[i].clone() * val_d_byte_inv_top[i].clone(),
                 );
                 // ValDByteIndMinus1H[i] = ValD[i] · (ByteIndicator - 1)
                 //                       = ValD · ByteIndicator − ValD
                 eval.add_constraint(
                     val_d_byte_ind_minus_1_h[i].clone()
                         - val_d[i].clone() * val_d_byte_indicator_h[i].clone()
-                        + val_d[i].clone()
+                        + val_d[i].clone(),
                 );
             }
             // PartNZTimesIndH[i] = PartialNZ[i-1] · ByteIndicator[i] for i ≥ 1.
@@ -350,23 +387,22 @@ impl BuiltInComponent for CpuChip {
             for i in 1..WORD_SIZE {
                 eval.add_constraint(
                     part_nz_times_ind_h[i].clone()
-                        - val_d_partial_nz_top[i - 1].clone()
-                            * val_d_byte_indicator_h[i].clone()
+                        - val_d_partial_nz_top[i - 1].clone() * val_d_byte_indicator_h[i].clone(),
                 );
             }
         }
         eval.add_constraint(
             is_div_rem_times_vdz_h[0].clone()
-                - is_div_rem_for_h[0].clone() * val_d_is_zero_for_h[0].clone()
+                - is_div_rem_for_h[0].clone() * val_d_is_zero_for_h[0].clone(),
         );
         eval.add_constraint(
-            dbz_active_h[0].clone() - is_div_rem_for_h[0].clone() * div_by_zero_for_h[0].clone()
+            dbz_active_h[0].clone() - is_div_rem_for_h[0].clone() * div_by_zero_for_h[0].clone(),
         );
         eval.add_constraint(
-            dbz_active_quot_h[0].clone() - dbz_active_h[0].clone() * gate_div_h[0].clone()
+            dbz_active_quot_h[0].clone() - dbz_active_h[0].clone() * gate_div_h[0].clone(),
         );
         eval.add_constraint(
-            dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone()
+            dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone(),
         );
 
         // ── Phase I-cpu Wave-4a helpers (BitManip MSB + SignExtBit) ──
@@ -384,15 +420,14 @@ impl BuiltInComponent for CpuChip {
             // Trace fills 0 on non-sign-ext rows so 0·(1-0)=0 holds; gated form
             // `is_sign_ext · bool_h = 0` is now redundant and removed below.
             eval.add_constraint(
-                sign_ext_bit_top[0].clone()
-                    * (E::F::one() - sign_ext_bit_top[0].clone())
+                sign_ext_bit_top[0].clone() * (E::F::one() - sign_ext_bit_top[0].clone()),
             );
             // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
             for i in 0..7 {
                 eval.add_constraint(
                     part_nz_msb_times_ind_h[i].clone()
                         - val_d_partial_nz_msb_top[i + 1].clone()
-                            * val_d_byte_indicator_h[i].clone()
+                            * val_d_byte_indicator_h[i].clone(),
                 );
             }
             // PartNZMsbLoTimesIndH[i] = PartialNZMsbLo[i+1] · ByteIndicator[i] for i ∈ 0..3.
@@ -400,7 +435,7 @@ impl BuiltInComponent for CpuChip {
                 eval.add_constraint(
                     part_nz_msb_lo_times_ind_h[i].clone()
                         - val_d_partial_nz_msb_lo_top[i + 1].clone()
-                            * val_d_byte_indicator_h[i].clone()
+                            * val_d_byte_indicator_h[i].clone(),
                 );
             }
         }
@@ -410,9 +445,15 @@ impl BuiltInComponent for CpuChip {
         // (Phase I-cpu Wave-1 flattened)
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
-            let carry_in = if i == 0 { E::F::zero() } else { carry[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::zero()
+            } else {
+                carry[i - 1].clone()
+            };
             let c = result[i].clone() + carry[i].clone() * f256.clone()
-                - val_b[i].clone() - val_d[i].clone() - carry_in;
+                - val_b[i].clone()
+                - val_d[i].clone()
+                - carry_in;
             if i < 4 {
                 eval.add_constraint(is_add[0].clone() * c);
             } else {
@@ -423,7 +464,7 @@ impl BuiltInComponent for CpuChip {
         for i in 4..WORD_SIZE {
             eval.add_constraint(
                 is_add_32_h[0].clone()
-                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone()),
             );
         }
 
@@ -432,11 +473,21 @@ impl BuiltInComponent for CpuChip {
         // (Phase I-cpu Wave-1 flattened)
         // ════════════════════════════════════════════════════════════════════
         for i in 0..WORD_SIZE {
-            let carry_in = if i == 0 { E::F::one() } else { carry[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::one()
+            } else {
+                carry[i - 1].clone()
+            };
             let c_normal = result[i].clone() + carry[i].clone() * f256.clone()
-                - val_b[i].clone() - f255.clone() + val_d[i].clone() - carry_in.clone();
+                - val_b[i].clone()
+                - f255.clone()
+                + val_d[i].clone()
+                - carry_in.clone();
             let c_neg = result[i].clone() + carry[i].clone() * f256.clone()
-                - val_d[i].clone() - f255.clone() + val_b[i].clone() - carry_in;
+                - val_d[i].clone()
+                - f255.clone()
+                + val_b[i].clone()
+                - carry_in;
             if i < 4 {
                 eval.add_constraint(is_sub_not_negadd_h[0].clone() * c_normal);
                 eval.add_constraint(is_sub_negadd_h[0].clone() * c_neg);
@@ -448,7 +499,7 @@ impl BuiltInComponent for CpuChip {
         for i in 4..WORD_SIZE {
             eval.add_constraint(
                 is_sub_32_h[0].clone()
-                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone()),
             );
         }
 
@@ -461,9 +512,8 @@ impl BuiltInComponent for CpuChip {
         let mu_uu_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let mu_su_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
         let mu_ss_p53 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
-        let is_mul_upper_e = || -> E::F {
-            mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone()
-        };
+        let is_mul_upper_e =
+            || -> E::F { mu_uu_p53[0].clone() + mu_su_p53[0].clone() + mu_ss_p53[0].clone() };
         let is_mul_low = E::F::one() - is_mul_upper_e();
         // Phase 54c/d: UnsignedProductLow + UnsignedProductHi + MulHigh
         // moved to MulChip; result-variant binding (Phase 32/36) now
@@ -475,7 +525,7 @@ impl BuiltInComponent for CpuChip {
         for i in 4..WORD_SIZE {
             eval.add_constraint(
                 is_mul_32_h[0].clone()
-                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone()),
             );
         }
         // Suppress unused-warning for is_mul_low / is_64bit until later
@@ -498,7 +548,8 @@ impl BuiltInComponent for CpuChip {
             //     = is_32bit · is_mul = 1, which masks val_b high
             //     bytes to 0 in trace fill, while ImmBytes carries
             //     the sign-extended bytes from step.imm.to_le_bytes()).
-            let f_is_rotate_r_imm_alt_p40 = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let f_is_rotate_r_imm_alt_p40 =
+                crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
             let imm_bytes_p40 = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             let is_truncated_p40 = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
             // Wave 7-fix: helpers for the 3-factor selectors below.
@@ -509,26 +560,24 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_rot_r_imm_alt_not_trunc_h[0].clone()
                     - f_is_rotate_r_imm_alt_p40[0].clone()
-                        * (E::F::one() - is_truncated_p40[0].clone())
+                        * (E::F::one() - is_truncated_p40[0].clone()),
             );
             eval.add_constraint(
                 is_rot_r_imm_alt_trunc_h[0].clone()
-                    - f_is_rotate_r_imm_alt_p40[0].clone() * is_truncated_p40[0].clone()
+                    - f_is_rotate_r_imm_alt_p40[0].clone() * is_truncated_p40[0].clone(),
             );
             for i in 0..4 {
                 eval.add_constraint(
                     f_is_rotate_r_imm_alt_p40[0].clone()
-                        * (val_b[i].clone() - imm_bytes_p40[i].clone())
+                        * (val_b[i].clone() - imm_bytes_p40[i].clone()),
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
                     is_rot_r_imm_alt_not_trunc_h[0].clone()
-                        * (val_b[i].clone() - imm_bytes_p40[i].clone())
+                        * (val_b[i].clone() - imm_bytes_p40[i].clone()),
                 );
-                eval.add_constraint(
-                    is_rot_r_imm_alt_trunc_h[0].clone() * val_b[i].clone()
-                );
+                eval.add_constraint(is_rot_r_imm_alt_trunc_h[0].clone() * val_b[i].clone());
             }
 
             // Phase 36 / 37: pin val_d high 4 bytes = 0 on ALL 32-bit
@@ -552,12 +601,10 @@ impl BuiltInComponent for CpuChip {
             // Wave 7-fix: lift `is_32bit · is_shift_c` to a deg-1 helper.
             let is_32_shift_c_h = crate::trace::trace_eval!(trace_eval, Column::Is32ShiftCH);
             eval.add_constraint(
-                is_32_shift_c_h[0].clone() - is_32bit[0].clone() * is_shift_c_p37[0].clone()
+                is_32_shift_c_h[0].clone() - is_32bit[0].clone() * is_shift_c_p37[0].clone(),
             );
             for i in 4..WORD_SIZE {
-                eval.add_constraint(
-                    is_32_shift_c_h[0].clone() * val_d[i].clone()
-                );
+                eval.add_constraint(is_32_shift_c_h[0].clone() * val_d[i].clone());
             }
         }
 
@@ -598,9 +645,7 @@ impl BuiltInComponent for CpuChip {
             let sign_b_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
             let expected_s = signs_diff_h[0].clone() * sign_b_b[0].clone()
                 + (E::F::one() - signs_diff_h[0].clone()) * cmp_lt_flag[0].clone();
-            eval.add_constraint(
-                is_cmp_or_branch.clone() * (cmp_lt_s_flag[0].clone() - expected_s)
-            );
+            eval.add_constraint(is_cmp_or_branch.clone() * (cmp_lt_s_flag[0].clone() - expected_s));
         }
         // Compare sub-ops use per-op flag columns
         // (Phase I-cpu Wave-2 flattened to deg 2).
@@ -614,7 +659,7 @@ impl BuiltInComponent for CpuChip {
 
             // SetLtU: result = cmp_lt_flag (zero-extended)
             eval.add_constraint(
-                is_set_lt_u_flag[0].clone() * (result[0].clone() - cmp_lt_flag[0].clone())
+                is_set_lt_u_flag[0].clone() * (result[0].clone() - cmp_lt_flag[0].clone()),
             );
             for i in 1..WORD_SIZE {
                 eval.add_constraint(is_set_lt_u_flag[0].clone() * result[i].clone());
@@ -628,11 +673,11 @@ impl BuiltInComponent for CpuChip {
                 let expected_s = signs_diff_h[0].clone() * sign_b[0].clone()
                     + (E::F::one() - signs_diff_h[0].clone()) * cmp_lt_flag[0].clone();
                 eval.add_constraint(
-                    is_set_lt_s_flag[0].clone() * (cmp_lt_s_flag[0].clone() - expected_s)
+                    is_set_lt_s_flag[0].clone() * (cmp_lt_s_flag[0].clone() - expected_s),
                 );
 
                 eval.add_constraint(
-                    is_set_lt_s_flag[0].clone() * (result[0].clone() - cmp_lt_s_flag[0].clone())
+                    is_set_lt_s_flag[0].clone() * (result[0].clone() - cmp_lt_s_flag[0].clone()),
                 );
                 for i in 1..WORD_SIZE {
                     eval.add_constraint(is_set_lt_s_flag[0].clone() * result[i].clone());
@@ -643,21 +688,21 @@ impl BuiltInComponent for CpuChip {
             let _ = val_d_is_zero;
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    is_cmov_iz_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone())
+                    is_cmov_iz_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone()),
                 );
                 eval.add_constraint(
-                    is_cmov_nz_not_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone())
+                    is_cmov_nz_not_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone()),
                 );
             }
 
             // MinU/MaxU — body lifted into CmpLtValBH / CmpLtValDH so
             // the result-binding constraint becomes deg 2 (selector × linear).
             for i in 0..WORD_SIZE {
-                let expected_min = cmp_lt_val_b_h[i].clone()
-                    + val_d[i].clone() - cmp_lt_val_d_h[i].clone();
+                let expected_min =
+                    cmp_lt_val_b_h[i].clone() + val_d[i].clone() - cmp_lt_val_d_h[i].clone();
                 eval.add_constraint(is_min_u_flag[0].clone() * (result[i].clone() - expected_min));
-                let expected_max = cmp_lt_val_d_h[i].clone()
-                    + val_b[i].clone() - cmp_lt_val_b_h[i].clone();
+                let expected_max =
+                    cmp_lt_val_d_h[i].clone() + val_b[i].clone() - cmp_lt_val_b_h[i].clone();
                 eval.add_constraint(is_max_u_flag[0].clone() * (result[i].clone() - expected_max));
             }
         }
@@ -699,16 +744,14 @@ impl BuiltInComponent for CpuChip {
         // For div ops (op ∈ {0, 1}): result = quotient.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                div_active_quot_h[0].clone()
-                    * (result[i].clone() - div_quotient[i].clone())
+                div_active_quot_h[0].clone() * (result[i].clone() - div_quotient[i].clone()),
             );
         }
 
         // For rem ops (op ∈ {2, 3}): result = remainder.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                div_active_rem_h[0].clone()
-                    * (result[i].clone() - div_remainder[i].clone())
+                div_active_rem_h[0].clone() * (result[i].clone() - div_remainder[i].clone()),
             );
         }
 
@@ -716,7 +759,7 @@ impl BuiltInComponent for CpuChip {
         for i in 4..WORD_SIZE {
             eval.add_constraint(
                 is_div_rem_32_h[0].clone()
-                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone())
+                    * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone()),
             );
         }
 
@@ -762,52 +805,48 @@ impl BuiltInComponent for CpuChip {
             // via `ValDByteIndMinus1H[i] = val_d[i] · (ByteIndicator − 1)`
             // (helper-defined above); main constraint is is_real · helper = deg 2.
             for i in 0..WORD_SIZE {
-                eval.add_constraint(
-                    is_real.clone() * val_d_byte_ind_minus_1_h[i].clone()
-                );
+                eval.add_constraint(is_real.clone() * val_d_byte_ind_minus_1_h[i].clone());
             }
 
             // PartialNZ recurrence — flattened via PartNZTimesIndH.
             // PartialNZ[0] = ByteIndicator[0].
             eval.add_constraint(
-                is_real.clone()
-                    * (val_d_partial_nz[0].clone() - val_d_byte_indicator_h[0].clone())
+                is_real.clone() * (val_d_partial_nz[0].clone() - val_d_byte_indicator_h[0].clone()),
             );
             for i in 1..WORD_SIZE {
                 // OR(PartialNZ[i-1], Ind[i]) = PartialNZ[i-1] + Ind[i] -
                 //                              PartialNZ[i-1]·Ind[i]
                 // The product term is now PartNZTimesIndH[i] (deg 1 helper).
                 eval.add_constraint(
-                    is_real.clone() * (
-                        val_d_partial_nz[i].clone()
+                    is_real.clone()
+                        * (val_d_partial_nz[i].clone()
                             - val_d_partial_nz[i - 1].clone()
                             - val_d_byte_indicator_h[i].clone()
-                            + part_nz_times_ind_h[i].clone()
-                    )
+                            + part_nz_times_ind_h[i].clone()),
                 );
             }
 
             // ValDIsZero = 1 − PartialNZ[7].  (deg 2, unchanged)
             eval.add_constraint(
                 is_real.clone()
-                    * (val_d_is_zero_p29[0].clone()
-                        + val_d_partial_nz[WORD_SIZE - 1].clone()
-                        - E::F::one())
+                    * (val_d_is_zero_p29[0].clone() + val_d_partial_nz[WORD_SIZE - 1].clone()
+                        - E::F::one()),
             );
 
             // DivByZero = is_div_rem · ValDIsZero — flattened via IsDivRemTimesVdzH.
             eval.add_constraint(
-                is_real.clone() * (div_by_zero_for_h[0].clone() - is_div_rem_times_vdz_h[0].clone())
+                is_real.clone()
+                    * (div_by_zero_for_h[0].clone() - is_div_rem_times_vdz_h[0].clone()),
             );
 
             // DivByZero result binding — flattened via DbzActiveQuotH/RemH.
             let f_ff_p29: E::F = E::F::from(BaseField::from(255));
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    dbz_active_quot_h[0].clone() * (result[i].clone() - f_ff_p29.clone())
+                    dbz_active_quot_h[0].clone() * (result[i].clone() - f_ff_p29.clone()),
                 );
                 eval.add_constraint(
-                    dbz_active_rem_h[0].clone() * (result[i].clone() - val_b[i].clone())
+                    dbz_active_rem_h[0].clone() * (result[i].clone() - val_b[i].clone()),
                 );
             }
         }
@@ -846,23 +885,21 @@ impl BuiltInComponent for CpuChip {
             }
             // PartialNZ recurrence (Wave 8 flatten).
             eval.add_constraint(
-                is_real.clone()
-                    * (val_r_partial_nz[0].clone() - val_r_byte_indicator_h[0].clone())
+                is_real.clone() * (val_r_partial_nz[0].clone() - val_r_byte_indicator_h[0].clone()),
             );
             for i in 1..WORD_SIZE {
                 eval.add_constraint(
-                    is_real.clone() * (
-                        val_r_partial_nz[i].clone()
+                    is_real.clone()
+                        * (val_r_partial_nz[i].clone()
                             - val_r_partial_nz[i - 1].clone()
                             - val_r_byte_indicator_h[i].clone()
-                            + val_r_part_nz_times_ind_h[i].clone()
-                    )
+                            + val_r_part_nz_times_ind_h[i].clone()),
                 );
             }
             // Sign-of-r constraint (Wave 8 flatten).
             eval.add_constraint(
                 div_s_active_partial_h[0].clone()
-                    * (sign_bit_r_p31[0].clone() - sign_bit_b_p31[0].clone())
+                    * (sign_bit_r_p31[0].clone() - sign_bit_b_p31[0].clone()),
             );
             let _ = (val_r_byte_inv, div_remainder); // routed via helpers
         }
@@ -881,7 +918,7 @@ impl BuiltInComponent for CpuChip {
         for i in 0..WORD_SIZE {
             eval.add_constraint(
                 is_reverse_bytes[0].clone()
-                    * (result[i].clone() - val_d[WORD_SIZE - 1 - i].clone())
+                    * (result[i].clone() - val_d[WORD_SIZE - 1 - i].clone()),
             );
         }
 
@@ -889,12 +926,8 @@ impl BuiltInComponent for CpuChip {
         // BITMANIP — ZERO_EXTEND_16: result[0..2] = val_d[0..2]; result[2..8] = 0
         // ════════════════════════════════════════════════════════════════════
         let is_zero_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
-        eval.add_constraint(
-            is_zero_ext_16[0].clone() * (result[0].clone() - val_d[0].clone())
-        );
-        eval.add_constraint(
-            is_zero_ext_16[0].clone() * (result[1].clone() - val_d[1].clone())
-        );
+        eval.add_constraint(is_zero_ext_16[0].clone() * (result[0].clone() - val_d[0].clone()));
+        eval.add_constraint(is_zero_ext_16[0].clone() * (result[1].clone() - val_d[1].clone()));
         for i in 2..WORD_SIZE {
             eval.add_constraint(is_zero_ext_16[0].clone() * result[i].clone());
         }
@@ -907,7 +940,8 @@ impl BuiltInComponent for CpuChip {
         let is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
         let is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
         let sign_ext_bit = crate::trace::trace_eval!(trace_eval, Column::SignExtBit);
-        let _sign_ext_hi_nib_unused = crate::trace::trace_eval!(trace_eval, Column::SignExtSrcHiNib);
+        let _sign_ext_hi_nib_unused =
+            crate::trace::trace_eval!(trace_eval, Column::SignExtSrcHiNib);
         let is_sign_ext = is_sign_ext_8[0].clone() + is_sign_ext_16[0].clone();
         let ff_se: E::F = E::F::from(BaseField::from(255));
 
@@ -916,13 +950,9 @@ impl BuiltInComponent for CpuChip {
         // redundant once sign_ext_bit is boolean on every row, since
         // bool_h = 0 makes the product trivially zero.
         // SE8 + SE16 both copy byte 0.
-        eval.add_constraint(
-            is_sign_ext.clone() * (result[0].clone() - val_d[0].clone()),
-        );
+        eval.add_constraint(is_sign_ext.clone() * (result[0].clone() - val_d[0].clone()));
         // SE16 also copies byte 1.
-        eval.add_constraint(
-            is_sign_ext_16[0].clone() * (result[1].clone() - val_d[1].clone()),
-        );
+        eval.add_constraint(is_sign_ext_16[0].clone() * (result[1].clone() - val_d[1].clone()));
         // SE8: bytes 1..8 = 0xFF · sign_bit.
         for i in 1..WORD_SIZE {
             eval.add_constraint(
@@ -964,13 +994,11 @@ impl BuiltInComponent for CpuChip {
         let _ = sum_hi4;
         eval.add_constraint(
             is_count_set_bits[0].clone()
-                * (result[0].clone() - sum_lo4 - is_64bit_popcount_hi_h[0].clone())
+                * (result[0].clone() - sum_lo4 - is_64bit_popcount_hi_h[0].clone()),
         );
         // High bytes of result are zero on CSB rows (popcount ≤ 64 fits in result[0]).
         for i in 1..WORD_SIZE {
-            eval.add_constraint(
-                is_count_set_bits[0].clone() * result[i].clone()
-            );
+            eval.add_constraint(is_count_set_bits[0].clone() * result[i].clone());
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1010,7 +1038,8 @@ impl BuiltInComponent for CpuChip {
         let bit_op_tz_byte = crate::trace::trace_eval!(trace_eval, Column::BitOpTzByte);
         let val_d_partial_nz_p34 = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
         let val_d_partial_nz_msb = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsb);
-        let val_d_partial_nz_msb_lo = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
+        let val_d_partial_nz_msb_lo =
+            crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZMsbLo);
         let val_d_byte_inv_p34 = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
 
         // ── ValDPartialNZMsb[8] recurrence (Phase I-cpu Wave-4a flattened) ──
@@ -1018,35 +1047,32 @@ impl BuiltInComponent for CpuChip {
         // routed through PartNZMsbTimesIndH[i] body helper.
         let _ = val_d_byte_inv_p34; // ByteIndicator now sourced from ValDByteIndicatorH
         eval.add_constraint(
-            is_real.clone()
-                * (val_d_partial_nz_msb[7].clone() - val_d_byte_indicator_h[7].clone())
+            is_real.clone() * (val_d_partial_nz_msb[7].clone() - val_d_byte_indicator_h[7].clone()),
         );
         for i in (0..7).rev() {
             // OR(prev, ind) = prev + ind - prev·ind, with prev =
             // PartialNZMsb[i+1] and ind = ByteIndicator[i].
             eval.add_constraint(
-                is_real.clone() * (
-                    val_d_partial_nz_msb[i].clone()
+                is_real.clone()
+                    * (val_d_partial_nz_msb[i].clone()
                         - val_d_partial_nz_msb[i + 1].clone()
                         - val_d_byte_indicator_h[i].clone()
-                        + part_nz_msb_times_ind_h[i].clone()
-                )
+                        + part_nz_msb_times_ind_h[i].clone()),
             );
         }
 
         // ── ValDPartialNZMsbLo[4] recurrence (Phase I-cpu Wave-4a flattened) ──
         eval.add_constraint(
             is_real.clone()
-                * (val_d_partial_nz_msb_lo[3].clone() - val_d_byte_indicator_h[3].clone())
+                * (val_d_partial_nz_msb_lo[3].clone() - val_d_byte_indicator_h[3].clone()),
         );
         for i in (0..3).rev() {
             eval.add_constraint(
-                is_real.clone() * (
-                    val_d_partial_nz_msb_lo[i].clone()
+                is_real.clone()
+                    * (val_d_partial_nz_msb_lo[i].clone()
                         - val_d_partial_nz_msb_lo[i + 1].clone()
                         - val_d_byte_indicator_h[i].clone()
-                        + part_nz_msb_lo_times_ind_h[i].clone()
-                )
+                        + part_nz_msb_lo_times_ind_h[i].clone()),
             );
         }
 
@@ -1072,8 +1098,7 @@ impl BuiltInComponent for CpuChip {
                 };
                 let is_first_nz = val_d_partial_nz_p34[i].clone() - prev;
                 let term = is_first_nz
-                    * (E::F::from(BaseField::from(8u32 * i as u32))
-                        + bit_op_tz_byte[i].clone());
+                    * (E::F::from(BaseField::from(8u32 * i as u32)) + bit_op_tz_byte[i].clone());
                 if i < 4 {
                     tz_lo4_expr += term;
                 } else {
@@ -1093,8 +1118,7 @@ impl BuiltInComponent for CpuChip {
                 let is_first_nz_msb = val_d_partial_nz_msb[i].clone() - next;
                 let pos_weight = 8u32 * (7 - i as u32);
                 lz64_expr += is_first_nz_msb
-                    * (E::F::from(BaseField::from(pos_weight))
-                        + bit_op_lz_byte[i].clone());
+                    * (E::F::from(BaseField::from(pos_weight)) + bit_op_lz_byte[i].clone());
             }
             eval.add_constraint(lz64_h[0].clone() - lz64_expr);
             // Lz32H = sum_{i<4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
@@ -1108,8 +1132,7 @@ impl BuiltInComponent for CpuChip {
                 let is_first_nz_msb_lo = val_d_partial_nz_msb_lo[i].clone() - next;
                 let pos_weight = 8u32 * (3 - i as u32);
                 lz32_expr += is_first_nz_msb_lo
-                    * (E::F::from(BaseField::from(pos_weight))
-                        + bit_op_lz_byte[i].clone());
+                    * (E::F::from(BaseField::from(pos_weight)) + bit_op_lz_byte[i].clone());
             }
             eval.add_constraint(lz32_h[0].clone() - lz32_expr);
             // Is{Tzb,Lzb}{64,32}H selectors.
@@ -1120,34 +1143,28 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ── Phase I-cpu Wave-5 helpers (Branch conditions + sequential PC) ──
-        let is_br_eq_taken_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsBrEqTakenH);
-        let is_br_ne_not_taken_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsBrNeNotTakenH);
-        let is_cmp_or_branch_eq_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsCmpOrBranchEqH);
-        let is_branch_taken_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsBranchTakenH);
+        let is_br_eq_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBrEqTakenH);
+        let is_br_ne_not_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBrNeNotTakenH);
+        let is_cmp_or_branch_eq_h = crate::trace::trace_eval!(trace_eval, Column::IsCmpOrBranchEqH);
+        let is_branch_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBranchTakenH);
         {
-            let branch_taken_top =
-                crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
+            let branch_taken_top = crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
             let eq_flag_top = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
             eval.add_constraint(
-                is_br_eq_taken_h[0].clone() - is_br_eq[0].clone() * branch_taken_top[0].clone()
+                is_br_eq_taken_h[0].clone() - is_br_eq[0].clone() * branch_taken_top[0].clone(),
             );
             eval.add_constraint(
                 is_br_ne_not_taken_h[0].clone()
-                    - is_br_ne[0].clone() * (E::F::one() - branch_taken_top[0].clone())
+                    - is_br_ne[0].clone() * (E::F::one() - branch_taken_top[0].clone()),
             );
             // B3 audit: EqFlag boolean unconditional (was via EqFlagBoolH).
+            eval.add_constraint(eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone()));
             eval.add_constraint(
-                eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone())
+                is_cmp_or_branch_eq_h[0].clone()
+                    - is_cmp_or_branch.clone() * eq_flag_top[0].clone(),
             );
             eval.add_constraint(
-                is_cmp_or_branch_eq_h[0].clone() - is_cmp_or_branch.clone() * eq_flag_top[0].clone()
-            );
-            eval.add_constraint(
-                is_branch_taken_h[0].clone() - is_branch_e() * branch_taken_top[0].clone()
+                is_branch_taken_h[0].clone() - is_branch_e() * branch_taken_top[0].clone(),
             );
         }
 
@@ -1155,28 +1172,24 @@ impl BuiltInComponent for CpuChip {
         let mem_byte_active_mono_h =
             crate::trace::trace_eval!(trace_eval, Column::MemByteActiveMonoH);
         {
-            let branch_taken_w6 =
-                crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
-            let mem_byte_active_w6 =
-                crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+            let branch_taken_w6 = crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
+            let mem_byte_active_w6 = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
             // B3 audit: branch_taken/mem_byte_active boolean unconditional
             // (was via BranchTakenBoolH / MemByteActiveBoolH).  Trace fills
             // both as 0 on padding/non-mem rows.
             eval.add_constraint(
-                branch_taken_w6[0].clone()
-                    * (E::F::one() - branch_taken_w6[0].clone())
+                branch_taken_w6[0].clone() * (E::F::one() - branch_taken_w6[0].clone()),
             );
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
-                    mem_byte_active_w6[i].clone()
-                        * (E::F::one() - mem_byte_active_w6[i].clone())
+                    mem_byte_active_w6[i].clone() * (E::F::one() - mem_byte_active_w6[i].clone()),
                 );
             }
             for i in 0..WORD_SIZE - 1 {
                 eval.add_constraint(
                     mem_byte_active_mono_h[i].clone()
                         - mem_byte_active_w6[i + 1].clone()
-                            * (E::F::one() - mem_byte_active_w6[i].clone())
+                            * (E::F::one() - mem_byte_active_w6[i].clone()),
                 );
             }
         }
@@ -1189,8 +1202,7 @@ impl BuiltInComponent for CpuChip {
         let val_b_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValBIsRegH);
         let val_b_is_reg_not_trunc_h =
             crate::trace::trace_eval!(trace_eval, Column::ValBIsRegNotTruncH);
-        let val_b_is_reg_trunc_h =
-            crate::trace::trace_eval!(trace_eval, Column::ValBIsRegTruncH);
+        let val_b_is_reg_trunc_h = crate::trace::trace_eval!(trace_eval, Column::ValBIsRegTruncH);
         let val_d_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsRegH);
         let non_shift_gate_h = crate::trace::trace_eval!(trace_eval, Column::NonShiftGateH);
         let non_shift_gate_not_trunc_h =
@@ -1199,99 +1211,85 @@ impl BuiltInComponent for CpuChip {
             crate::trace::trace_eval!(trace_eval, Column::NonShiftGateTruncH);
         let val_d_is_reg_shift_c_h =
             crate::trace::trace_eval!(trace_eval, Column::ValDIsRegShiftCH);
-        let is_rotate_r_gate_h =
-            crate::trace::trace_eval!(trace_eval, Column::IsRotateRGateH);
+        let is_rotate_r_gate_h = crate::trace::trace_eval!(trace_eval, Column::IsRotateRGateH);
         {
-            let is_truncated_top =
-                crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
-            let val_b_is_reg_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValBIsReg);
-            let val_d_is_reg_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValDIsReg);
-            let result_is_reg_top =
-                crate::trace::trace_eval!(trace_eval, Column::ResultIsReg);
-            let phi7_bool_top =
-                crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
-            let is_blake_ecall_top =
-                crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
-            let is_shift_c_top =
-                crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
-            let is_rot_r64_top =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
-            let is_rot_r32_top =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+            let is_truncated_top = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
+            let val_b_is_reg_top = crate::trace::trace_eval!(trace_eval, Column::ValBIsReg);
+            let val_d_is_reg_top = crate::trace::trace_eval!(trace_eval, Column::ValDIsReg);
+            let result_is_reg_top = crate::trace::trace_eval!(trace_eval, Column::ResultIsReg);
+            let phi7_bool_top = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
+            let is_blake_ecall_top = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
+            let is_shift_c_top = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
+            let is_rot_r64_top = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
+            let is_rot_r32_top = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
             // B3 audit: 6 boolean flags enforced unconditionally — the
             // gated `is_real · bool_h = 0` pattern below is now redundant.
             for flag in [
-                &is_truncated_top, &val_b_is_reg_top, &val_d_is_reg_top,
-                &result_is_reg_top, &phi7_bool_top, &is_blake_ecall_top,
+                &is_truncated_top,
+                &val_b_is_reg_top,
+                &val_d_is_reg_top,
+                &result_is_reg_top,
+                &phi7_bool_top,
+                &is_blake_ecall_top,
             ] {
-                eval.add_constraint(
-                    flag[0].clone() * (E::F::one() - flag[0].clone())
-                );
+                eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
             }
             // Selector helpers (deg 2 def each).
+            eval.add_constraint(real_32bit_h[0].clone() - is_real.clone() * is_32bit[0].clone());
             eval.add_constraint(
-                real_32bit_h[0].clone() - is_real.clone() * is_32bit[0].clone()
-            );
-            eval.add_constraint(
-                val_b_is_reg_h[0].clone() - is_real.clone() * val_b_is_reg_top[0].clone()
+                val_b_is_reg_h[0].clone() - is_real.clone() * val_b_is_reg_top[0].clone(),
             );
             eval.add_constraint(
                 val_b_is_reg_not_trunc_h[0].clone()
-                    - val_b_is_reg_h[0].clone() * (E::F::one() - is_truncated_top[0].clone())
+                    - val_b_is_reg_h[0].clone() * (E::F::one() - is_truncated_top[0].clone()),
             );
             eval.add_constraint(
                 val_b_is_reg_trunc_h[0].clone()
-                    - val_b_is_reg_h[0].clone() * is_truncated_top[0].clone()
+                    - val_b_is_reg_h[0].clone() * is_truncated_top[0].clone(),
             );
             eval.add_constraint(
-                val_d_is_reg_h[0].clone() - is_real.clone() * val_d_is_reg_top[0].clone()
+                val_d_is_reg_h[0].clone() - is_real.clone() * val_d_is_reg_top[0].clone(),
             );
             eval.add_constraint(
                 non_shift_gate_h[0].clone()
-                    - val_d_is_reg_h[0].clone() * (E::F::one() - is_shift_c_top[0].clone())
+                    - val_d_is_reg_h[0].clone() * (E::F::one() - is_shift_c_top[0].clone()),
             );
             eval.add_constraint(
                 non_shift_gate_not_trunc_h[0].clone()
-                    - non_shift_gate_h[0].clone() * (E::F::one() - is_truncated_top[0].clone())
+                    - non_shift_gate_h[0].clone() * (E::F::one() - is_truncated_top[0].clone()),
             );
             eval.add_constraint(
                 non_shift_gate_trunc_h[0].clone()
-                    - non_shift_gate_h[0].clone() * is_truncated_top[0].clone()
+                    - non_shift_gate_h[0].clone() * is_truncated_top[0].clone(),
             );
             eval.add_constraint(
                 val_d_is_reg_shift_c_h[0].clone()
-                    - val_d_is_reg_h[0].clone() * is_shift_c_top[0].clone()
+                    - val_d_is_reg_h[0].clone() * is_shift_c_top[0].clone(),
             );
             eval.add_constraint(
                 is_rotate_r_gate_h[0].clone()
-                    - is_real.clone()
-                        * (is_rot_r64_top[0].clone() + is_rot_r32_top[0].clone())
+                    - is_real.clone() * (is_rot_r64_top[0].clone() + is_rot_r32_top[0].clone()),
             );
         }
         // Phi7-related helpers (Wave 7 continued).
-        let real_not_phi7_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::RealNotPhi7BoolH);
-        let real_phi7_bool_h =
-            crate::trace::trace_eval!(trace_eval, Column::RealPhi7BoolH);
-        let phi7_times_inv_h =
-            crate::trace::trace_eval!(trace_eval, Column::Phi7TimesInvH);
+        let real_not_phi7_bool_h = crate::trace::trace_eval!(trace_eval, Column::RealNotPhi7BoolH);
+        let real_phi7_bool_h = crate::trace::trace_eval!(trace_eval, Column::RealPhi7BoolH);
+        let phi7_times_inv_h = crate::trace::trace_eval!(trace_eval, Column::Phi7TimesInvH);
         {
             let phi7_top = crate::trace::trace_eval!(trace_eval, Column::Phi7);
             let phi7_inv_top = crate::trace::trace_eval!(trace_eval, Column::Phi7Inv);
             let phi7_bool_top = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
             eval.add_constraint(
                 real_not_phi7_bool_h[0].clone()
-                    - is_real.clone() * (E::F::one() - phi7_bool_top[0].clone())
+                    - is_real.clone() * (E::F::one() - phi7_bool_top[0].clone()),
             );
             eval.add_constraint(
-                real_phi7_bool_h[0].clone() - is_real.clone() * phi7_bool_top[0].clone()
+                real_phi7_bool_h[0].clone() - is_real.clone() * phi7_bool_top[0].clone(),
             );
             let phi7_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_top);
             let phi7_inv_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_inv_top);
             eval.add_constraint(
-                phi7_times_inv_h[0].clone() - phi7_field_local * phi7_inv_field_local
+                phi7_times_inv_h[0].clone() - phi7_field_local * phi7_inv_field_local,
             );
         }
 
@@ -1300,29 +1298,22 @@ impl BuiltInComponent for CpuChip {
         // (line ~825) and Phase 13e Trap (line ~2244).
         {
             let is_trap_col_top = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
-            let mem_addr_carry_top =
-                crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
+            let mem_addr_carry_top = crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
             let is_load_local_top = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
-            let mem_byte_active_top =
-                crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
-            let div_remainder_top =
-                crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
-            let val_r_byte_inv_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValRByteInv);
-            let val_r_partial_nz_top =
-                crate::trace::trace_eval!(trace_eval, Column::ValRPartialNZ);
-            let byte_popcount_top =
-                crate::trace::trace_eval!(trace_eval, Column::BytePopcount);
+            let mem_byte_active_top = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+            let div_remainder_top = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
+            let val_r_byte_inv_top = crate::trace::trace_eval!(trace_eval, Column::ValRByteInv);
+            let val_r_partial_nz_top = crate::trace::trace_eval!(trace_eval, Column::ValRPartialNZ);
+            let byte_popcount_top = crate::trace::trace_eval!(trace_eval, Column::BytePopcount);
             // Trap helper.
             eval.add_constraint(
-                is_real_trap_h[0].clone() - is_real.clone() * is_trap_col_top[0].clone()
+                is_real_trap_h[0].clone() - is_real.clone() * is_trap_col_top[0].clone(),
             );
             // B3 audit: MemAddrCarry boolean per byte (unconditional).
             // Was via MemAddrCarryBoolH helper + `is_real · helper = 0`.
             for i in 0..4 {
                 eval.add_constraint(
-                    mem_addr_carry_top[i].clone()
-                        * (E::F::one() - mem_addr_carry_top[i].clone())
+                    mem_addr_carry_top[i].clone() * (E::F::one() - mem_addr_carry_top[i].clone()),
                 );
             }
             // Popcount-hi helper.
@@ -1330,49 +1321,44 @@ impl BuiltInComponent for CpuChip {
             for i in 5..WORD_SIZE {
                 pop_hi_sum += byte_popcount_top[i].clone();
             }
-            eval.add_constraint(
-                is_64bit_popcount_hi_h[0].clone() - is_64bit.clone() * pop_hi_sum
-            );
+            eval.add_constraint(is_64bit_popcount_hi_h[0].clone() - is_64bit.clone() * pop_hi_sum);
             // IsLoadLocal × (1 - MemByteActive[i]) per byte.
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
                     is_load_local_not_active_h[i].clone()
                         - is_load_local_top[0].clone()
-                            * (E::F::one() - mem_byte_active_top[i].clone())
+                            * (E::F::one() - mem_byte_active_top[i].clone()),
                 );
             }
             // Phase 31: ValRByteIndicator + ByteIndMinus1 + PartNZTimesInd.
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
                     val_r_byte_indicator_h[i].clone()
-                        - div_remainder_top[i].clone() * val_r_byte_inv_top[i].clone()
+                        - div_remainder_top[i].clone() * val_r_byte_inv_top[i].clone(),
                 );
                 eval.add_constraint(
                     val_r_byte_ind_minus_1_h[i].clone()
                         - div_remainder_top[i].clone() * val_r_byte_indicator_h[i].clone()
-                        + div_remainder_top[i].clone()
+                        + div_remainder_top[i].clone(),
                 );
             }
             for i in 1..WORD_SIZE {
                 eval.add_constraint(
                     val_r_part_nz_times_ind_h[i].clone()
-                        - val_r_partial_nz_top[i - 1].clone()
-                            * val_r_byte_indicator_h[i].clone()
+                        - val_r_partial_nz_top[i - 1].clone() * val_r_byte_indicator_h[i].clone(),
                 );
             }
             // Phase 31 DivS sign-of-r gate via 2-step helper chain:
             // IsDivSNotDbzH = is_div_s · (1 - div_by_zero)         (deg 2 def)
             // DivSActivePartialH = IsDivSNotDbzH · val_r_partial_nz[7]  (deg 2 def)
-            let is_div_s_not_dbz_h =
-                crate::trace::trace_eval!(trace_eval, Column::IsDivSNotDbzH);
+            let is_div_s_not_dbz_h = crate::trace::trace_eval!(trace_eval, Column::IsDivSNotDbzH);
             eval.add_constraint(
                 is_div_s_not_dbz_h[0].clone()
-                    - is_div_s[0].clone() * (E::F::one() - div_by_zero_for_h[0].clone())
+                    - is_div_s[0].clone() * (E::F::one() - div_by_zero_for_h[0].clone()),
             );
             eval.add_constraint(
                 div_s_active_partial_h[0].clone()
-                    - is_div_s_not_dbz_h[0].clone()
-                        * val_r_partial_nz_top[WORD_SIZE - 1].clone()
+                    - is_div_s_not_dbz_h[0].clone() * val_r_partial_nz_top[WORD_SIZE - 1].clone(),
             );
         }
         // Main TZ constraint flattened to a sum of deg-2 terms.
@@ -1380,31 +1366,29 @@ impl BuiltInComponent for CpuChip {
         // Flatten: is_tzb·result - is_tzb·TzLo4H
         //          - IsTzb64H·(TzHi4H + 64·(1 - PartialNZ[7]))
         //          - IsTzb32H · 32·(1 - PartialNZ[3])  = 0
-        let tz_default_64_lin = E::F::from(BaseField::from(64u32))
-            * (E::F::one() - val_d_partial_nz_p34[7].clone());
-        let tz_default_32_lin = E::F::from(BaseField::from(32u32))
-            * (E::F::one() - val_d_partial_nz_p34[3].clone());
+        let tz_default_64_lin =
+            E::F::from(BaseField::from(64u32)) * (E::F::one() - val_d_partial_nz_p34[7].clone());
+        let tz_default_32_lin =
+            E::F::from(BaseField::from(32u32)) * (E::F::one() - val_d_partial_nz_p34[3].clone());
         eval.add_constraint(
             is_tzb[0].clone() * (result[0].clone() - tz_lo4_h[0].clone())
                 - is_tzb_64_h[0].clone() * (tz_hi4_h[0].clone() + tz_default_64_lin)
-                - is_tzb_32_h[0].clone() * tz_default_32_lin
+                - is_tzb_32_h[0].clone() * tz_default_32_lin,
         );
         // Main LZ constraint flattened similarly.
-        let lz_default_64_lin = E::F::from(BaseField::from(64u32))
-            * (E::F::one() - val_d_partial_nz_msb[0].clone());
-        let lz_default_32_lin = E::F::from(BaseField::from(32u32))
-            * (E::F::one() - val_d_partial_nz_msb_lo[0].clone());
+        let lz_default_64_lin =
+            E::F::from(BaseField::from(64u32)) * (E::F::one() - val_d_partial_nz_msb[0].clone());
+        let lz_default_32_lin =
+            E::F::from(BaseField::from(32u32)) * (E::F::one() - val_d_partial_nz_msb_lo[0].clone());
         eval.add_constraint(
             is_lzb[0].clone() * result[0].clone()
                 - is_lzb_64_h[0].clone() * (lz64_h[0].clone() + lz_default_64_lin)
-                - is_lzb_32_h[0].clone() * (lz32_h[0].clone() + lz_default_32_lin)
+                - is_lzb_32_h[0].clone() * (lz32_h[0].clone() + lz_default_32_lin),
         );
 
         // High bytes of result are zero on LZ/TZ rows.
         for i in 1..WORD_SIZE {
-            eval.add_constraint(
-                (is_lzb[0].clone() + is_tzb[0].clone()) * result[i].clone()
-            );
+            eval.add_constraint((is_lzb[0].clone() + is_tzb[0].clone()) * result[i].clone());
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1425,7 +1409,7 @@ impl BuiltInComponent for CpuChip {
         // For unconditional jumps: next_pc = branch_target
         for i in 0..4 {
             eval.add_constraint(
-                is_jump[0].clone() * (next_pc[i].clone() - branch_target[i].clone())
+                is_jump[0].clone() * (next_pc[i].clone() - branch_target[i].clone()),
             );
         }
 
@@ -1434,8 +1418,7 @@ impl BuiltInComponent for CpuChip {
         // Gate via IsBranchTakenH (already defined Wave 5).
         for i in 0..4 {
             eval.add_constraint(
-                is_branch_taken_h[0].clone()
-                    * (next_pc[i].clone() - branch_target[i].clone())
+                is_branch_taken_h[0].clone() * (next_pc[i].clone() - branch_target[i].clone()),
             );
         }
 
@@ -1467,19 +1450,21 @@ impl BuiltInComponent for CpuChip {
 
         // Unsigned Lt: branch_taken = cmp_lt_flag
         eval.add_constraint(
-            is_br_lt_u[0].clone() * (branch_taken[0].clone() - cmp_lt_flag[0].clone())
+            is_br_lt_u[0].clone() * (branch_taken[0].clone() - cmp_lt_flag[0].clone()),
         );
         // Unsigned Ge: branch_taken = 1 - cmp_lt_flag
         eval.add_constraint(
-            is_br_ge_u[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_flag[0].clone()))
+            is_br_ge_u[0].clone()
+                * (branch_taken[0].clone() - (E::F::one() - cmp_lt_flag[0].clone())),
         );
         // Signed Lt: branch_taken = cmp_lt_s_flag
         eval.add_constraint(
-            is_br_lt_s[0].clone() * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone())
+            is_br_lt_s[0].clone() * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone()),
         );
         // Signed Ge: branch_taken = 1 - cmp_lt_s_flag
         eval.add_constraint(
-            is_br_ge_s[0].clone() * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone()))
+            is_br_ge_s[0].clone()
+                * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone())),
         );
         // EqFlag: constrain val_b == val_d flag (Phase I-cpu Wave-5 flattened)
         let eq_flag = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
@@ -1490,7 +1475,7 @@ impl BuiltInComponent for CpuChip {
         let _ = eq_flag; // routed through helpers above
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_cmp_or_branch_eq_h[0].clone() * (val_b[i].clone() - val_d[i].clone())
+                is_cmp_or_branch_eq_h[0].clone() * (val_b[i].clone() - val_d[i].clone()),
             );
         }
         // eq_flag=0 ⇒ cmp_lt_flag or NOT equal. Constrain: eq_flag + cmp_lt_flag <= 1 wouldn't work.
@@ -1502,19 +1487,27 @@ impl BuiltInComponent for CpuChip {
         // Simpler since cmp_lt_flag and eq_flag can't both be 1 (if lt, not equal):
         // branch_taken = cmp_lt_flag + eq_flag
         eval.add_constraint(
-            is_br_le_u[0].clone() * (branch_taken[0].clone() - cmp_lt_flag[0].clone() - eq_flag[0].clone())
+            is_br_le_u[0].clone()
+                * (branch_taken[0].clone() - cmp_lt_flag[0].clone() - eq_flag[0].clone()),
         );
         // Unsigned Gt: branch_taken = 1 - (cmp_lt_flag + eq_flag)
         eval.add_constraint(
-            is_br_gt_u[0].clone() * (branch_taken[0].clone() - E::F::one() + cmp_lt_flag[0].clone() + eq_flag[0].clone())
+            is_br_gt_u[0].clone()
+                * (branch_taken[0].clone() - E::F::one()
+                    + cmp_lt_flag[0].clone()
+                    + eq_flag[0].clone()),
         );
         // Signed Le: branch_taken = cmp_lt_s_flag + eq_flag
         eval.add_constraint(
-            is_br_le_s[0].clone() * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone() - eq_flag[0].clone())
+            is_br_le_s[0].clone()
+                * (branch_taken[0].clone() - cmp_lt_s_flag[0].clone() - eq_flag[0].clone()),
         );
         // Signed Gt: branch_taken = 1 - (cmp_lt_s_flag + eq_flag)
         eval.add_constraint(
-            is_br_gt_s[0].clone() * (branch_taken[0].clone() - E::F::one() + cmp_lt_s_flag[0].clone() + eq_flag[0].clone())
+            is_br_gt_s[0].clone()
+                * (branch_taken[0].clone() - E::F::one()
+                    + cmp_lt_s_flag[0].clone()
+                    + eq_flag[0].clone()),
         );
 
         // Sequential PC: next_pc = pc + 1 + skip_len (4-byte addition with carry)
@@ -1535,32 +1528,32 @@ impl BuiltInComponent for CpuChip {
             let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
             // Phase I-cpu Wave-5 flatten: route is_branch · branch_taken
             // through IsBranchTakenH so is_sequential stays at deg 1.
-            let is_sequential = E::F::one() - is_pad[0].clone()
+            let is_sequential = E::F::one()
+                - is_pad[0].clone()
                 - is_jump[0].clone()
                 - is_branch_taken_h[0].clone()
                 - is_exit[0].clone();
 
             // Byte 0: next_pc[0] + carry[0]*256 = pc[0] + 1 + skip_len
             eval.add_constraint(
-                is_sequential.clone() * (
-                    next_pc[0].clone() + pc_carry[0].clone() * f256.clone()
-                    - pc[0].clone() - E::F::one() - skip_len[0].clone()
-                )
+                is_sequential.clone()
+                    * (next_pc[0].clone() + pc_carry[0].clone() * f256.clone()
+                        - pc[0].clone()
+                        - E::F::one()
+                        - skip_len[0].clone()),
             );
             // Bytes 1,2: next_pc[i] + carry[i]*256 = pc[i] + carry[i-1]
             for i in 1..3 {
                 eval.add_constraint(
-                    is_sequential.clone() * (
-                        next_pc[i].clone() + pc_carry[i].clone() * f256.clone()
-                        - pc[i].clone() - pc_carry[i - 1].clone()
-                    )
+                    is_sequential.clone()
+                        * (next_pc[i].clone() + pc_carry[i].clone() * f256.clone()
+                            - pc[i].clone()
+                            - pc_carry[i - 1].clone()),
                 );
             }
             // Byte 3: next_pc[3] = pc[3] + carry[2]
             eval.add_constraint(
-                is_sequential.clone() * (
-                    next_pc[3].clone() - pc[3].clone() - pc_carry[2].clone()
-                )
+                is_sequential.clone() * (next_pc[3].clone() - pc[3].clone() - pc_carry[2].clone()),
             );
         }
 
@@ -1592,7 +1585,9 @@ impl BuiltInComponent for CpuChip {
             let mut tuple: Vec<E::F> = Vec::with_capacity(14);
             // addr + byte_idx
             tuple.push(mem_addr[0].clone() + byte_offset);
-            for j in 1..4 { tuple.push(mem_addr[j].clone()); }
+            for j in 1..4 {
+                tuple.push(mem_addr[j].clone());
+            }
             // value byte
             tuple.push(mem_value[byte_idx].clone());
             // timestamp
@@ -1631,18 +1626,14 @@ impl BuiltInComponent for CpuChip {
             // is redundant once each byte is boolean on every row.
             // Monotonicity (Phase I-cpu Wave-6 flattened).
             for i in 0..WORD_SIZE - 1 {
-                eval.add_constraint(
-                    is_real.clone() * mem_byte_active_mono_h[i].clone()
-                );
+                eval.add_constraint(is_real.clone() * mem_byte_active_mono_h[i].clone());
             }
             // MemSize equals the count of active bytes.
             let mut active_sum = E::F::zero();
             for i in 0..WORD_SIZE {
                 active_sum += mem_byte_active[i].clone();
             }
-            eval.add_constraint(
-                is_real.clone() * (mem_size[0].clone() - active_sum)
-            );
+            eval.add_constraint(is_real.clone() * (mem_size[0].clone() - active_sum));
             // Phase 23: pin MemSize to opcode-canonical width via
             // per-size flags pinned by ProgramMemoryChip.  Closes the
             // gap deferred at the end of Phase 22 (the degree-6 valid-
@@ -1659,9 +1650,7 @@ impl BuiltInComponent for CpuChip {
                 + f_is_mem_size_2_l[0].clone() * E::F::from(BaseField::from(2u32))
                 + f_is_mem_size_4_l[0].clone() * E::F::from(BaseField::from(4u32))
                 + f_is_mem_size_8_l[0].clone() * E::F::from(BaseField::from(8u32));
-            eval.add_constraint(
-                is_real.clone() * (mem_size[0].clone() - canonical_size)
-            );
+            eval.add_constraint(is_real.clone() * (mem_size[0].clone() - canonical_size));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1707,7 +1696,8 @@ impl BuiltInComponent for CpuChip {
         // RotL32 rows use the first emission with ShiftAmount = n_real.
         let is_rotate_r64_pow2 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
         let is_rotate_r32_pow2 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-        let shift_amount_compl_pow2 = crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
+        let shift_amount_compl_pow2 =
+            crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
         {
             let shift_amount = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
             let is_shift_c = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
@@ -1721,7 +1711,7 @@ impl BuiltInComponent for CpuChip {
                     - is_shift_c[0].clone()
                         * (E::F::one()
                             - is_rotate_r64_pow2[0].clone()
-                            - is_rotate_r32_pow2[0].clone())
+                            - is_rotate_r32_pow2[0].clone()),
             );
             eval.add_to_relation(RelationEntry::new(
                 pow2_lookup,
@@ -1735,11 +1725,7 @@ impl BuiltInComponent for CpuChip {
             let mut tuple: Vec<E::F> = vec![shift_amount_compl_pow2[0].clone()];
             tuple.extend_from_slice(&val_d);
             let mult = is_rotate_r64_pow2[0].clone() + is_rotate_r32_pow2[0].clone();
-            eval.add_to_relation(RelationEntry::new(
-                pow2_lookup,
-                mult.into(),
-                &tuple,
-            ));
+            eval.add_to_relation(RelationEntry::new(pow2_lookup, mult.into(), &tuple));
         }
 
         // Phase 33: Popcount lookup — per-byte (val_d[i], BytePopcount[i]) on
@@ -1793,8 +1779,12 @@ impl BuiltInComponent for CpuChip {
             // may be truncated (for 32-bit ALU ops).  Producer uses RegValB.
             let reg_val_b = crate::trace::trace_eval!(trace_eval, Column::RegValB);
             let mut tuple: Vec<E::F> = vec![val_b_reg_idx[0].clone()];
-            for b in &reg_val_b { tuple.push(b.clone()); }
-            for ts in &timestamp { tuple.push(ts.clone()); }
+            for b in &reg_val_b {
+                tuple.push(b.clone());
+            }
+            for ts in &timestamp {
+                tuple.push(ts.clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 val_b_is_reg[0].clone().into(),
@@ -1805,8 +1795,12 @@ impl BuiltInComponent for CpuChip {
             // (which gets rewritten to 2^shift_amount for shift ops).
             let reg_val_d = crate::trace::trace_eval!(trace_eval, Column::RegValD);
             let mut tuple: Vec<E::F> = vec![val_d_reg_idx[0].clone()];
-            for b in &reg_val_d { tuple.push(b.clone()); }
-            for ts in &timestamp { tuple.push(ts.clone()); }
+            for b in &reg_val_d {
+                tuple.push(b.clone());
+            }
+            for ts in &timestamp {
+                tuple.push(ts.clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 val_d_is_reg[0].clone().into(),
@@ -1824,8 +1818,12 @@ impl BuiltInComponent for CpuChip {
             let reg_a_col = crate::trace::trace_eval!(trace_eval, Column::RegA);
             let is_store_ind_col = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
             let mut tuple_a: Vec<E::F> = vec![reg_a_col[0].clone()];
-            for b in &reg_val_a { tuple_a.push(b.clone()); }
-            for ts in &timestamp { tuple_a.push(ts.clone()); }
+            for b in &reg_val_a {
+                tuple_a.push(b.clone());
+            }
+            for ts in &timestamp {
+                tuple_a.push(ts.clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 is_store_ind_col[0].clone().into(),
@@ -1843,28 +1841,23 @@ impl BuiltInComponent for CpuChip {
             // is_truncated = is_32bit · (is_add+is_sub+is_mul+is_div_rem).
             // is_real · is_32bit lifted into Real32bitH so the constraint
             // factors as is_real·is_truncated - Real32bitH·trunc_sum.
-            let trunc_sum = is_add[0].clone() + is_sub[0].clone()
-                + is_mul[0].clone() + is_div_rem[0].clone();
+            let trunc_sum =
+                is_add[0].clone() + is_sub[0].clone() + is_mul[0].clone() + is_div_rem[0].clone();
             eval.add_constraint(
-                is_real.clone() * is_truncated[0].clone()
-                    - real_32bit_h[0].clone() * trunc_sum
+                is_real.clone() * is_truncated[0].clone() - real_32bit_h[0].clone() * trunc_sum,
             );
 
             // ValB byte-wise cross-constraint (Phase I-cpu Wave-7 flattened).
             for i in 0..4 {
                 eval.add_constraint(
-                    val_b_is_reg_h[0].clone()
-                        * (val_b[i].clone() - reg_val_b[i].clone())
+                    val_b_is_reg_h[0].clone() * (val_b[i].clone() - reg_val_b[i].clone()),
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
-                    val_b_is_reg_not_trunc_h[0].clone()
-                        * (val_b[i].clone() - reg_val_b[i].clone())
+                    val_b_is_reg_not_trunc_h[0].clone() * (val_b[i].clone() - reg_val_b[i].clone()),
                 );
-                eval.add_constraint(
-                    val_b_is_reg_trunc_h[0].clone() * val_b[i].clone()
-                );
+                eval.add_constraint(val_b_is_reg_trunc_h[0].clone() * val_b[i].clone());
             }
 
             // ValD byte-wise cross-constraint (Phase I-cpu Wave-7 flattened).
@@ -1873,17 +1866,15 @@ impl BuiltInComponent for CpuChip {
             let _ = is_shift_c; // routed through helpers above
             for i in 0..4 {
                 eval.add_constraint(
-                    non_shift_gate_h[0].clone() * (val_d[i].clone() - reg_val_d[i].clone())
+                    non_shift_gate_h[0].clone() * (val_d[i].clone() - reg_val_d[i].clone()),
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
                     non_shift_gate_not_trunc_h[0].clone()
-                        * (val_d[i].clone() - reg_val_d[i].clone())
+                        * (val_d[i].clone() - reg_val_d[i].clone()),
                 );
-                eval.add_constraint(
-                    non_shift_gate_trunc_h[0].clone() * val_d[i].clone()
-                );
+                eval.add_constraint(non_shift_gate_trunc_h[0].clone() * val_d[i].clone());
             }
 
             // Shift-amount identity: RegValD = ShiftAmount + modulus · ShiftQuotient.
@@ -1900,7 +1891,9 @@ impl BuiltInComponent for CpuChip {
             // Gated on ValDIsReg too (Phase I-cpu Wave-7 flattened via ValDIsRegShiftCH).
             eval.add_constraint(
                 val_d_is_reg_shift_c_h[0].clone()
-                    * (reg_val_d_field.clone() - shift_amount_e[0].clone() - modulus * shift_q_field)
+                    * (reg_val_d_field.clone()
+                        - shift_amount_e[0].clone()
+                        - modulus * shift_q_field),
             );
 
             // Phase 35 / 36: complementary shift-amount identity for
@@ -1912,7 +1905,8 @@ impl BuiltInComponent for CpuChip {
             // this uniquely determines ShiftAmountCompl = (modulus −
             // n_real) mod modulus.
             let shift_q_compl = crate::trace::trace_eval!(trace_eval, Column::ShiftQuotientCompl);
-            let shift_amount_compl = crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
+            let shift_amount_compl =
+                crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
             let is_rotate_r64_p35_id = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let is_rotate_r32_p36_id = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
             let shift_q_compl_field = crate::framework::eval::combine_le_u64::<E>(&shift_q_compl);
@@ -1924,12 +1918,16 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_rotate_r_gate_h[0].clone()
                     * (reg_val_d_field + shift_amount_compl[0].clone()
-                        - modulus_compl * shift_q_compl_field)
+                        - modulus_compl * shift_q_compl_field),
             );
 
             let mut tuple: Vec<E::F> = vec![result_reg_idx[0].clone()];
-            for b in &result_c { tuple.push(b.clone()); }
-            for ts in &timestamp { tuple.push(ts.clone()); }
+            for b in &result_c {
+                tuple.push(b.clone());
+            }
+            for ts in &timestamp {
+                tuple.push(ts.clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 result_is_reg[0].clone().into(),
@@ -1963,8 +1961,12 @@ impl BuiltInComponent for CpuChip {
             for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
                 let mut tuple: Vec<E::F> = Vec::with_capacity(17);
                 tuple.push(E::F::from(BaseField::from(reg_idx)));
-                for c in phi_cols[slot] { tuple.push(c.clone()); }
-                for c in &timestamp { tuple.push(c.clone()); }
+                for c in phi_cols[slot] {
+                    tuple.push(c.clone());
+                }
+                for c in &timestamp {
+                    tuple.push(c.clone());
+                }
                 eval.add_to_relation(RelationEntry::new(
                     reg_lookup,
                     is_blake_ecall[0].clone().into(),
@@ -1984,12 +1986,12 @@ impl BuiltInComponent for CpuChip {
             let _ = phi7_inv_field;
             eval.add_constraint(
                 real_not_phi7_bool_h[0].clone()
-                    * crate::framework::eval::combine_le_u64::<E>(&phi7)
+                    * crate::framework::eval::combine_le_u64::<E>(&phi7),
             );
             // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 — body lifted into
             // Phi7TimesInvH so the gate × body is deg 2.
             eval.add_constraint(
-                real_phi7_bool_h[0].clone() * (phi7_times_inv_h[0].clone() - E::F::one())
+                real_phi7_bool_h[0].clone() * (phi7_times_inv_h[0].clone() - E::F::one()),
             );
         }
 
@@ -2001,11 +2003,19 @@ impl BuiltInComponent for CpuChip {
             let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
             let phi7_bool = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
             let mut tuple: Vec<E::F> = Vec::with_capacity(25);
-            for i in 0..4 { tuple.push(phi10[i].clone()); }
-            for i in 0..4 { tuple.push(phi11[i].clone()); }
-            for i in 0..WORD_SIZE { tuple.push(phi12[i].clone()); }
+            for i in 0..4 {
+                tuple.push(phi10[i].clone());
+            }
+            for i in 0..4 {
+                tuple.push(phi11[i].clone());
+            }
+            for i in 0..WORD_SIZE {
+                tuple.push(phi12[i].clone());
+            }
             tuple.push(phi7_bool[0].clone());
-            for i in 0..WORD_SIZE { tuple.push(timestamp[i].clone()); }
+            for i in 0..WORD_SIZE {
+                tuple.push(timestamp[i].clone());
+            }
             eval.add_to_relation(RelationEntry::new(
                 blake2b_call_lookup,
                 is_blake_ecall[0].clone().into(),
@@ -2105,9 +2115,8 @@ impl BuiltInComponent for CpuChip {
             let fb4 = crate::trace::trace_eval!(trace_eval, Column::FlagByte4);
             let fb5 = crate::trace::trace_eval!(trace_eval, Column::FlagByte5);
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
-            let branch_target_for_lookup = crate::trace::trace_eval!(
-                trace_eval, Column::BranchTarget
-            );
+            let branch_target_for_lookup =
+                crate::trace::trace_eval!(trace_eval, Column::BranchTarget);
 
             let mut tuple: Vec<E::F> = pc.to_vec();
             tuple.push(opcode[0].clone());
@@ -2179,13 +2188,15 @@ impl BuiltInComponent for CpuChip {
             let f_is_div_rem_p55 = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let f_is_load_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
             let f_is_exit_p55 = crate::trace::trace_eval!(trace_eval, Column::IsExit);
-            let f_is_reverse_bytes_p55 = crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
+            let f_is_reverse_bytes_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsReverseBytes);
             let f_is_zero_ext_16_p55 = crate::trace::trace_eval!(trace_eval, Column::IsZeroExt16);
             let f_is_sign_ext_8_p55 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
             let f_is_sign_ext_16_p55 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
             let f_is_trap_p55 = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
             let f_is_jump_ind_p55 = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
-            let f_is_load_imm_jump_ind_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let f_is_load_imm_jump_ind_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
             let f_is_mul_upper_uu_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
             let f_is_mul_upper_su_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
             let f_is_mul_upper_ss_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSS);
@@ -2198,24 +2209,31 @@ impl BuiltInComponent for CpuChip {
             let f_is_mem_size_4_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
             let f_is_mem_size_8_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
             let f_is_load_direct_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
-            let f_is_mem_indirect_p55 = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
-            let f_is_store_imm_direct_p55 = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
+            let f_is_mem_indirect_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
+            let f_is_store_imm_direct_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let f_is_rotate_l64_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL64);
-            let f_is_count_set_bits_p55 = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
+            let f_is_count_set_bits_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
             let f_is_lzb_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLzb);
             let f_is_tzb_p55 = crate::trace::trace_eval!(trace_eval, Column::IsTzb);
             let f_is_rotate_r64_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let f_is_rotate_l32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
             let f_is_rotate_r32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            let f_is_rotate_r_imm_alt_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let f_is_rotate_r_imm_alt_p55 =
+                crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
 
             // Sum expressions for the 5 folded category slots.
             let mu_sum_e = f_is_mul_upper_uu_p55[0].clone()
                 + f_is_mul_upper_su_p55[0].clone()
                 + f_is_mul_upper_ss_p55[0].clone();
-            let bw_sum_e = is_and_flag[0].clone() + is_or_flag[0].clone()
-                + is_xor_flag[0].clone() + is_and_inv_flag[0].clone()
-                + is_or_inv_flag[0].clone() + is_xnor_flag[0].clone();
+            let bw_sum_e = is_and_flag[0].clone()
+                + is_or_flag[0].clone()
+                + is_xor_flag[0].clone()
+                + is_and_inv_flag[0].clone()
+                + is_or_inv_flag[0].clone()
+                + is_xnor_flag[0].clone();
             let cmp_sum_e = is_compare_e();
             let br_sum_e = is_branch_e();
             let st_sum_e = is_store_e();
@@ -2224,48 +2242,68 @@ impl BuiltInComponent for CpuChip {
             //          is_shift, CMP_SUM, is_move)
             let tuple0: Vec<E::F> = vec![
                 fb0[0].clone(),
-                is_add[0].clone(), is_sub[0].clone(), is_mul[0].clone(),
-                mu_sum_e.clone(), bw_sum_e.clone(),
-                is_shift[0].clone(), cmp_sum_e.clone(), is_move[0].clone(),
+                is_add[0].clone(),
+                is_sub[0].clone(),
+                is_mul[0].clone(),
+                mu_sum_e.clone(),
+                bw_sum_e.clone(),
+                is_shift[0].clone(),
+                cmp_sum_e.clone(),
+                is_move[0].clone(),
             ];
             // byte 1: (FlagByte1, is_32bit, BR_SUM, is_jump, is_div_rem,
             //          is_load, ST_SUM, is_exit, is_neg_add)
             let tuple1: Vec<E::F> = vec![
                 fb1[0].clone(),
-                is_32bit[0].clone(), br_sum_e.clone(), f_is_jump_p55[0].clone(),
-                f_is_div_rem_p55[0].clone(), f_is_load_p55[0].clone(),
-                st_sum_e.clone(), f_is_exit_p55[0].clone(), is_neg_add[0].clone(),
+                is_32bit[0].clone(),
+                br_sum_e.clone(),
+                f_is_jump_p55[0].clone(),
+                f_is_div_rem_p55[0].clone(),
+                f_is_load_p55[0].clone(),
+                st_sum_e.clone(),
+                f_is_exit_p55[0].clone(),
+                is_neg_add[0].clone(),
             ];
             // byte 2: (FlagByte2, is_reverse_bytes, is_zero_ext_16,
             //          is_sign_ext_8, is_sign_ext_16, is_trap, is_jump_ind,
             //          is_load_imm_jump_ind, is_mul_upper_uu)
             let tuple2: Vec<E::F> = vec![
                 fb2[0].clone(),
-                f_is_reverse_bytes_p55[0].clone(), f_is_zero_ext_16_p55[0].clone(),
-                f_is_sign_ext_8_p55[0].clone(), f_is_sign_ext_16_p55[0].clone(),
-                f_is_trap_p55[0].clone(), f_is_jump_ind_p55[0].clone(),
-                f_is_load_imm_jump_ind_p55[0].clone(), f_is_mul_upper_uu_p55[0].clone(),
+                f_is_reverse_bytes_p55[0].clone(),
+                f_is_zero_ext_16_p55[0].clone(),
+                f_is_sign_ext_8_p55[0].clone(),
+                f_is_sign_ext_16_p55[0].clone(),
+                f_is_trap_p55[0].clone(),
+                f_is_jump_ind_p55[0].clone(),
+                f_is_load_imm_jump_ind_p55[0].clone(),
+                f_is_mul_upper_uu_p55[0].clone(),
             ];
             // byte 3: (FlagByte3, is_mul_upper_su, is_mul_upper_ss, is_div_s,
             //          is_load_i8, is_load_i16, is_load_i32,
             //          is_mem_size_1, is_mem_size_2)
             let tuple3: Vec<E::F> = vec![
                 fb3[0].clone(),
-                f_is_mul_upper_su_p55[0].clone(), f_is_mul_upper_ss_p55[0].clone(),
+                f_is_mul_upper_su_p55[0].clone(),
+                f_is_mul_upper_ss_p55[0].clone(),
                 f_is_div_s_p55[0].clone(),
-                f_is_load_i8_p55[0].clone(), f_is_load_i16_p55[0].clone(),
+                f_is_load_i8_p55[0].clone(),
+                f_is_load_i16_p55[0].clone(),
                 f_is_load_i32_p55[0].clone(),
-                f_is_mem_size_1_p55[0].clone(), f_is_mem_size_2_p55[0].clone(),
+                f_is_mem_size_1_p55[0].clone(),
+                f_is_mem_size_2_p55[0].clone(),
             ];
             // byte 4: (FlagByte4, is_mem_size_4, is_mem_size_8,
             //          is_store_direct, is_load_direct, is_mem_indirect,
             //          is_store_imm_any, is_store_imm_direct, is_store_ind)
             let tuple4: Vec<E::F> = vec![
                 fb4[0].clone(),
-                f_is_mem_size_4_p55[0].clone(), f_is_mem_size_8_p55[0].clone(),
-                is_store_direct_e[0].clone(), f_is_load_direct_p55[0].clone(),
+                f_is_mem_size_4_p55[0].clone(),
+                f_is_mem_size_8_p55[0].clone(),
+                is_store_direct_e[0].clone(),
+                f_is_load_direct_p55[0].clone(),
                 f_is_mem_indirect_p55[0].clone(),
-                is_store_imm_any_e[0].clone(), f_is_store_imm_direct_p55[0].clone(),
+                is_store_imm_any_e[0].clone(),
+                f_is_store_imm_direct_p55[0].clone(),
                 is_store_ind_e[0].clone(),
             ];
             // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
@@ -2273,10 +2311,14 @@ impl BuiltInComponent for CpuChip {
             //          is_rotate_r32, is_rotate_r_imm_alt)
             let tuple5: Vec<E::F> = vec![
                 fb5[0].clone(),
-                f_is_rotate_l64_p55[0].clone(), f_is_count_set_bits_p55[0].clone(),
-                f_is_lzb_p55[0].clone(), f_is_tzb_p55[0].clone(),
-                f_is_rotate_r64_p55[0].clone(), f_is_rotate_l32_p55[0].clone(),
-                f_is_rotate_r32_p55[0].clone(), f_is_rotate_r_imm_alt_p55[0].clone(),
+                f_is_rotate_l64_p55[0].clone(),
+                f_is_count_set_bits_p55[0].clone(),
+                f_is_lzb_p55[0].clone(),
+                f_is_tzb_p55[0].clone(),
+                f_is_rotate_r64_p55[0].clone(),
+                f_is_rotate_l32_p55[0].clone(),
+                f_is_rotate_r32_p55[0].clone(),
+                f_is_rotate_r_imm_alt_p55[0].clone(),
             ];
 
             for t in [&tuple0, &tuple1, &tuple2, &tuple3, &tuple4, &tuple5] {
@@ -2301,18 +2343,13 @@ impl BuiltInComponent for CpuChip {
         // IsPadding column is `#[mask_next_row]`).  When the current row is
         // a real Trap, the next row's IsPadding must be 1.
         {
-            let is_padding_next = crate::trace::trace_eval_next_row!(
-                trace_eval, Column::IsPadding
-            );
+            let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
             let is_trap_col = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
             // Boolean witness.
-            eval.add_constraint(
-                is_trap_col[0].clone() * (E::F::one() - is_trap_col[0].clone())
-            );
+            eval.add_constraint(is_trap_col[0].clone() * (E::F::one() - is_trap_col[0].clone()));
             // Terminal: real Trap forbids successor real row (Wave 8 flatten).
             eval.add_constraint(
-                is_real_trap_h[0].clone()
-                    * (E::F::one() - is_padding_next[0].clone())
+                is_real_trap_h[0].clone() * (E::F::one() - is_padding_next[0].clone()),
             );
         }
 
@@ -2342,8 +2379,7 @@ impl BuiltInComponent for CpuChip {
             let next_pc_col = crate::trace::trace_eval!(trace_eval, Column::NextPc);
             // Boolean witness.
             eval.add_constraint(
-                is_jump_ind_col[0].clone()
-                    * (E::F::one() - is_jump_ind_col[0].clone())
+                is_jump_ind_col[0].clone() * (E::F::one() - is_jump_ind_col[0].clone()),
             );
             for i in 0..4 {
                 let carry_in: E::F = if i == 0 {
@@ -2352,13 +2388,11 @@ impl BuiltInComponent for CpuChip {
                     jump_ind_carry[i - 1].clone()
                 };
                 eval.add_constraint(
-                    is_jump_ind_col[0].clone() * (
-                        jump_ind_addr[i].clone()
-                            + jump_ind_carry[i].clone() * f256.clone()
+                    is_jump_ind_col[0].clone()
+                        * (jump_ind_addr[i].clone() + jump_ind_carry[i].clone() * f256.clone()
                             - val_b[i].clone()
                             - imm_bytes_col[i].clone()
-                            - carry_in
-                    )
+                            - carry_in),
                 );
             }
             // Paired JumpTable consumer (mult = is_jump_ind on each emission;
@@ -2401,9 +2435,7 @@ impl BuiltInComponent for CpuChip {
             let lij_carry = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndCarry);
             let imm_y_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             // Boolean witness.
-            eval.add_constraint(
-                is_lij_col[0].clone() * (E::F::one() - is_lij_col[0].clone())
-            );
+            eval.add_constraint(is_lij_col[0].clone() * (E::F::one() - is_lij_col[0].clone()));
             // Carry chain: lij_addr = val_d + imm_y_bytes (low 32 bits).
             for i in 0..4 {
                 let carry_in: E::F = if i == 0 {
@@ -2412,13 +2444,11 @@ impl BuiltInComponent for CpuChip {
                     lij_carry[i - 1].clone()
                 };
                 eval.add_constraint(
-                    is_lij_col[0].clone() * (
-                        lij_addr[i].clone()
-                            + lij_carry[i].clone() * f256.clone()
+                    is_lij_col[0].clone()
+                        * (lij_addr[i].clone() + lij_carry[i].clone() * f256.clone()
                             - val_d[i].clone()
                             - imm_y_bytes[i].clone()
-                            - carry_in
-                    )
+                            - carry_in),
                 );
             }
             // Paired JumpTable consumer.
@@ -2479,7 +2509,8 @@ impl BuiltInComponent for CpuChip {
         // StoreInd, imm_y for StoreImm/StoreImmInd) that aren't in
         // val_b — those bindings need their own follow-ups.
         {
-            let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+            let is_store_direct_local =
+                crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
             for i in 0..WORD_SIZE {
                 eval.add_constraint(
                     is_store_direct_local[0].clone()
@@ -2536,19 +2567,20 @@ impl BuiltInComponent for CpuChip {
         // separate carry-chain binding (deferred).
         {
             let is_load_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
-            let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
+            let is_store_direct_local =
+                crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
             // Phase 27 widens this to also cover StoreImm direct
             // (TwoImm with `addr = imm_x`).  step.imm = imm_x for
             // TwoImm, so ImmBytes already pins the address bytes.
-            let is_store_imm_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
+            let is_store_imm_direct_local =
+                crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
             let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             let direct_mem_active = is_load_direct_local[0].clone()
                 + is_store_direct_local[0].clone()
                 + is_store_imm_direct_local[0].clone();
             for i in 0..4 {
                 eval.add_constraint(
-                    direct_mem_active.clone()
-                        * (mem_addr[i].clone() - imm_bytes_local[i].clone())
+                    direct_mem_active.clone() * (mem_addr[i].clone() - imm_bytes_local[i].clone()),
                 );
             }
         }
@@ -2574,13 +2606,14 @@ impl BuiltInComponent for CpuChip {
         // partially prover-trusted (high 4 bytes of value
         // unbound).  The low 4 bytes of MemValue ARE bound.
         {
-            let is_store_imm_any_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
+            let is_store_imm_any_local =
+                crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
             let imm_y_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             for i in 0..4 {
                 eval.add_constraint(
                     is_store_imm_any_local[0].clone()
                         * mem_byte_active[i].clone()
-                        * (mem_value[i].clone() - imm_y_bytes_local[i].clone())
+                        * (mem_value[i].clone() - imm_y_bytes_local[i].clone()),
                 );
             }
         }
@@ -2606,7 +2639,8 @@ impl BuiltInComponent for CpuChip {
         // Per-byte carry boolean (val_b[i] + ImmBytes[i] + carry_in
         // ≤ 511 with carry_in ≤ 1, so carry_out ≤ 1).
         {
-            let is_mem_indirect_local = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
+            let is_mem_indirect_local =
+                crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
             let mem_addr_carry = crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
             let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             // Boolean carry per byte (gated by is_real so range is
@@ -2622,13 +2656,11 @@ impl BuiltInComponent for CpuChip {
                     mem_addr_carry[i - 1].clone()
                 };
                 eval.add_constraint(
-                    is_mem_indirect_local[0].clone() * (
-                        mem_addr[i].clone()
-                            + mem_addr_carry[i].clone() * f256.clone()
+                    is_mem_indirect_local[0].clone()
+                        * (mem_addr[i].clone() + mem_addr_carry[i].clone() * f256.clone()
                             - val_b[i].clone()
                             - imm_bytes_local[i].clone()
-                            - carry_in
-                    )
+                            - carry_in),
                 );
             }
         }
@@ -2670,7 +2702,7 @@ impl BuiltInComponent for CpuChip {
                 load_sign_src[0].clone()
                     - f_is_load_i8[0].clone() * result[0].clone()
                     - f_is_load_i16[0].clone() * result[1].clone()
-                    - f_is_load_i32[0].clone() * result[3].clone()
+                    - f_is_load_i32[0].clone() * result[3].clone(),
             );
 
             // Inactive-byte binding for all loads: result[i] = 0xFF · LoadSignBit
@@ -2681,7 +2713,7 @@ impl BuiltInComponent for CpuChip {
             for i in 1..WORD_SIZE {
                 eval.add_constraint(
                     is_load_local_not_active_h[i].clone()
-                        * (result[i].clone() - f_ff_p20.clone() * load_sign_bit[0].clone())
+                        * (result[i].clone() - f_ff_p20.clone() * load_sign_bit[0].clone()),
                 );
             }
         }
@@ -2732,22 +2764,22 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_real.clone() * sign_src_b[0].clone()
                     - real_minus_32.clone() * val_b[7].clone()
-                    - real_32bit_h[0].clone() * val_b[3].clone()
+                    - real_32bit_h[0].clone() * val_b[3].clone(),
             );
             eval.add_constraint(
                 is_real.clone() * sign_src_d[0].clone()
                     - real_minus_32.clone() * val_d[7].clone()
-                    - real_32bit_h[0].clone() * val_d[3].clone()
+                    - real_32bit_h[0].clone() * val_d[3].clone(),
             );
             eval.add_constraint(
                 is_real.clone() * sign_src_q[0].clone()
                     - real_minus_32.clone() * div_quotient_local[7].clone()
-                    - real_32bit_h[0].clone() * div_quotient_local[3].clone()
+                    - real_32bit_h[0].clone() * div_quotient_local[3].clone(),
             );
             eval.add_constraint(
                 is_real.clone() * sign_src_r[0].clone()
                     - real_minus_32 * div_remainder_local[7].clone()
-                    - real_32bit_h[0].clone() * div_remainder_local[3].clone()
+                    - real_32bit_h[0].clone() * div_remainder_local[3].clone(),
             );
         }
 
@@ -2875,7 +2907,8 @@ impl BuiltInComponent for CpuChip {
                     load_sign_bit_pin[0].clone() * eight_p17.clone(),
                 ],
             ));
-            let lo_load = load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17.clone();
+            let lo_load =
+                load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17.clone();
             eval.add_to_relation(RelationEntry::new(
                 bitwise_and_lookup,
                 is_real.clone().into(),
@@ -3018,8 +3051,12 @@ impl BuiltInComponent for CpuChip {
             let f_andinv = crate::trace::trace_eval!(trace_eval, Column::IsAndInv);
             let f_orinv = crate::trace::trace_eval!(trace_eval, Column::IsOrInv);
             let f_xnor = crate::trace::trace_eval!(trace_eval, Column::IsXnor);
-            let is_bitwise_p54e = f_and[0].clone() + f_or[0].clone() + f_xor[0].clone()
-                + f_andinv[0].clone() + f_orinv[0].clone() + f_xnor[0].clone();
+            let is_bitwise_p54e = f_and[0].clone()
+                + f_or[0].clone()
+                + f_xor[0].clone()
+                + f_andinv[0].clone()
+                + f_orinv[0].clone()
+                + f_xnor[0].clone();
             let mut tuple_p54e: Vec<E::F> = Vec::with_capacity(30);
             tuple_p54e.extend_from_slice(&val_b_p54e);
             tuple_p54e.extend_from_slice(&val_d_p54e);

@@ -41,7 +41,7 @@ impl<H: Hasher> hash::Hash for Cid<H> {
 
 impl<H: Hasher> fmt::Debug for Cid<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Cid({})", self)
+        write!(f, "Cid({self})")
     }
 }
 

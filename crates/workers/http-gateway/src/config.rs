@@ -45,12 +45,7 @@ use vos::log;
 /// Init-args carried into [`HttpGateway`](crate::HttpGateway). Auto-
 /// derives rkyv via the actor macro, so a warm restart restores the
 /// same config without re-reading the manifest.
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone, Default,
-)]
+#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Default)]
 #[rkyv(crate = vos::rkyv)]
 pub(crate) struct GatewayConfig {
     pub(crate) bind_addr: String,
@@ -121,10 +116,7 @@ pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 /// Find a header value (case-insensitive on name).
-pub(crate) fn header_value<'a>(
-    headers: &'a [(String, String)],
-    name: &str,
-) -> Option<&'a str> {
+pub(crate) fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -171,10 +163,7 @@ mod tests {
 
     #[test]
     fn header_value_returns_first_match() {
-        let headers = vec![
-            ("x".into(), "first".into()),
-            ("x".into(), "second".into()),
-        ];
+        let headers = vec![("x".into(), "first".into()), ("x".into(), "second".into())];
         assert_eq!(header_value(&headers, "x"), Some("first"));
     }
 }

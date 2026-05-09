@@ -4,13 +4,10 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -23,16 +20,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{MemoryAccessLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 
 /// MemoryBoundaryChip: produces logup entries for initial memory state.
 ///
@@ -63,7 +57,6 @@ impl BuiltInComponent for MemoryBoundaryChip {
     type MainColumn = Column;
     type LookupElements = MemoryAccessLookupElements;
 
-
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
@@ -77,7 +70,9 @@ impl BuiltInComponent for MemoryBoundaryChip {
         // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1)
         let mut tuple: Vec<E::F> = addr.to_vec();
         tuple.push(value[0].clone());
-        for _ in 0..8 { tuple.push(E::F::zero()); }
+        for _ in 0..8 {
+            tuple.push(E::F::zero());
+        }
         tuple.push(E::F::one());
 
         eval.add_to_relation(RelationEntry::new(
@@ -143,9 +138,13 @@ impl BuiltInProverComponent for MemoryBoundaryChip {
             14,
             |vec_idx| {
                 let mut tuple = Vec::with_capacity(14);
-                for col in &addr { tuple.push(col.at(vec_idx)); }
+                for col in &addr {
+                    tuple.push(col.at(vec_idx));
+                }
                 tuple.push(value[0].at(vec_idx));
-                for _ in 0..8 { tuple.push(PackedBaseField::zero()); } // timestamp = 0
+                for _ in 0..8 {
+                    tuple.push(PackedBaseField::zero());
+                } // timestamp = 0
                 tuple.push(PackedBaseField::one()); // is_write = 1
                 tuple
             },
@@ -178,7 +177,11 @@ fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
     let mut note = |addr: u32, ts: u64, is_write: bool| {
         first_ts_is_write
             .entry(addr)
-            .and_modify(|cur| if ts < cur.0 { *cur = (ts, is_write); })
+            .and_modify(|cur| {
+                if ts < cur.0 {
+                    *cur = (ts, is_write);
+                }
+            })
             .or_insert((ts, is_write));
     };
     for step in &side_note.steps {
@@ -196,28 +199,56 @@ fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
     for op in &side_note.blake2b_mem_ops {
         // Reads logged before writes at the same ts; note reads first so the
         // "is_write at earliest ts" resolves to false on ties.
-        for i in 0..64u32 { note(op.h_ptr + i, op.ts, false); }
-        for k in 0..128u32 { note(op.m_ptr + k, op.ts, false); }
-        for i in 0..64u32 { note(op.h_ptr + i, op.ts, true); }
+        for i in 0..64u32 {
+            note(op.h_ptr + i, op.ts, false);
+        }
+        for k in 0..128u32 {
+            note(op.m_ptr + k, op.ts, false);
+        }
+        for i in 0..64u32 {
+            note(op.h_ptr + i, op.ts, true);
+        }
     }
     for op in &side_note.ristretto_mem_ops {
-        for i in 0..32u32 { note(op.scalar_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.point_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+        for i in 0..32u32 {
+            note(op.scalar_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.point_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.output_ptr + i, op.ts, true);
+        }
     }
     for op in &side_note.ristretto_add_mem_ops {
-        for i in 0..32u32 { note(op.p_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.q_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+        for i in 0..32u32 {
+            note(op.p_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.q_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.output_ptr + i, op.ts, true);
+        }
     }
     for op in &side_note.scalar_reduce_wide_mem_ops {
-        for i in 0..64u32 { note(op.wide_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+        for i in 0..64u32 {
+            note(op.wide_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.output_ptr + i, op.ts, true);
+        }
     }
     for op in &side_note.scalar_binop_mem_ops {
-        for i in 0..32u32 { note(op.a_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.b_ptr + i, op.ts, false); }
-        for i in 0..32u32 { note(op.output_ptr + i, op.ts, true); }
+        for i in 0..32u32 {
+            note(op.a_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.b_ptr + i, op.ts, false);
+        }
+        for i in 0..32u32 {
+            note(op.output_ptr + i, op.ts, true);
+        }
     }
     // Convert to (addr, is_write) of the first event.
     let first_is_write: HashMap<u32, bool> = first_ts_is_write
@@ -228,7 +259,9 @@ fn collect_initial_bytes(side_note: &SideNote) -> Vec<(u32, u8)> {
     let flat_mem = &side_note.initial_memory;
     let mut result: Vec<(u32, u8)> = Vec::new();
     for (&addr, &is_write) in &first_is_write {
-        if is_write { continue; }
+        if is_write {
+            continue;
+        }
         let a = addr as usize;
         let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
         result.push((addr, value));

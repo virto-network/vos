@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 use vos::actors::context::ServiceId;
-use vos::actors::value::{Msg, Value};
+use vos::actors::value::Msg;
 use vos::log;
 
 use crate::HttpGateway;
@@ -57,7 +57,10 @@ pub(crate) async fn dispatch_request(
         return response;
     }
     let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-    match job_tx.try_send(Job { request: req, resp_tx }) {
+    match job_tx.try_send(Job {
+        request: req,
+        resp_tx,
+    }) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
             return Response::text(503, "gateway saturated; retry");
@@ -76,8 +79,10 @@ pub(crate) async fn dispatch_request(
 /// rejected.
 fn check_auth(req: &Request, expected: Option<&str>) -> Option<Response> {
     let expected = expected?;
-    let provided = header_value(&req.headers, "authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+    let provided = header_value(&req.headers, "authorization").and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+    });
     if provided.is_some_and(|t| ct_eq(t.trim(), expected)) {
         None
     } else {
@@ -159,7 +164,10 @@ pub(crate) fn handle_admin(
             inner.stop.store(true, Ordering::Relaxed);
             Response::empty(204)
         }
-        _ => Response::text(404, format!("unknown admin route {} {}", req.method, req.path)),
+        _ => Response::text(
+            404,
+            format!("unknown admin route {} {}", req.method, req.path),
+        ),
     })
 }
 
@@ -174,8 +182,12 @@ async fn resolve(
     name: &str,
 ) -> core::result::Result<Option<ServiceId>, vos::actors::value::InvokeError> {
     let msg = Msg::new("resolve").with("name", name.to_string());
-    let id = ctx.ask(ServiceId::REGISTRY, &msg).await?.as_u32().unwrap_or(0);
-    Ok((id != 0).then(|| ServiceId(id)))
+    let id = ctx
+        .ask(ServiceId::REGISTRY, &msg)
+        .await?
+        .as_u32()
+        .unwrap_or(0);
+    Ok((id != 0).then_some(ServiceId(id)))
 }
 
 fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Response> {
@@ -196,7 +208,7 @@ fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Respons
                     Response::text(400, "invalid JSON body")
                 })?;
                 for (k, v) in pairs {
-                    msg = msg.with(k, Value::from(v));
+                    msg = msg.with(k, v);
                 }
             }
         }
@@ -299,7 +311,10 @@ mod tests {
             method: method.into(),
             path: path.into(),
             query: String::new(),
-            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             body: body.to_vec(),
         }
     }
@@ -317,7 +332,8 @@ mod tests {
             &tx,
             &inner,
             Policy::default(),
-        ).await;
+        )
+        .await;
         assert_eq!(resp.status, 404);
     }
 
@@ -329,8 +345,12 @@ mod tests {
             req("GET", "/__admin/status", &[], &[]),
             &tx,
             &inner,
-            Policy { admin_token: Some("expected"), auth_token: None },
-        ).await;
+            Policy {
+                admin_token: Some("expected"),
+                auth_token: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status, 401);
     }
 
@@ -342,8 +362,12 @@ mod tests {
             req("GET", "/__admin/status", &[("x-admin-token", "wrong")], &[]),
             &tx,
             &inner,
-            Policy { admin_token: Some("expected"), auth_token: None },
-        ).await;
+            Policy {
+                admin_token: Some("expected"),
+                auth_token: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status, 401);
     }
 
@@ -352,11 +376,20 @@ mod tests {
         let inner = fresh_inner();
         let (tx, _rx) = channel();
         let resp = dispatch_request(
-            req("GET", "/__admin/status", &[("x-admin-token", "secret")], &[]),
+            req(
+                "GET",
+                "/__admin/status",
+                &[("x-admin-token", "secret")],
+                &[],
+            ),
             &tx,
             &inner,
-            Policy { admin_token: Some("secret"), auth_token: None },
-        ).await;
+            Policy {
+                admin_token: Some("secret"),
+                auth_token: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "application/json");
         // Status JSON should contain the bound port we set in `fresh_inner`.
@@ -372,8 +405,12 @@ mod tests {
             req("POST", "/__admin/stop", &[("x-admin-token", "secret")], &[]),
             &tx,
             &inner,
-            Policy { admin_token: Some("secret"), auth_token: None },
-        ).await;
+            Policy {
+                admin_token: Some("secret"),
+                auth_token: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status, 204);
         assert!(resp.body.is_empty());
         assert!(inner.stop.load(Ordering::Relaxed));
@@ -387,8 +424,12 @@ mod tests {
             req("GET", "/agent/method", &[], &[]),
             &tx,
             &inner,
-            Policy { admin_token: None, auth_token: Some("secret") },
-        ).await;
+            Policy {
+                admin_token: None,
+                auth_token: Some("secret"),
+            },
+        )
+        .await;
         assert_eq!(resp.status, 401);
     }
 
@@ -397,11 +438,20 @@ mod tests {
         let inner = fresh_inner();
         let (tx, _rx) = channel();
         let resp = dispatch_request(
-            req("GET", "/agent/method", &[("authorization", "Bearer wrong")], &[]),
+            req(
+                "GET",
+                "/agent/method",
+                &[("authorization", "Bearer wrong")],
+                &[],
+            ),
             &tx,
             &inner,
-            Policy { admin_token: None, auth_token: Some("secret") },
-        ).await;
+            Policy {
+                admin_token: None,
+                auth_token: Some("secret"),
+            },
+        )
+        .await;
         assert_eq!(resp.status, 401);
     }
 
@@ -423,8 +473,12 @@ mod tests {
             ),
             &tx,
             &inner,
-            Policy { admin_token: None, auth_token: Some("secret") },
-        ).await;
+            Policy {
+                admin_token: None,
+                auth_token: Some("secret"),
+            },
+        )
+        .await;
         actor.await.expect("actor task");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"from actor");
@@ -447,8 +501,12 @@ mod tests {
             ),
             &tx,
             &inner,
-            Policy { admin_token: None, auth_token: Some("secret") },
-        ).await;
+            Policy {
+                admin_token: None,
+                auth_token: Some("secret"),
+            },
+        )
+        .await;
         actor.await.expect("actor task");
         assert_eq!(resp.status, 200);
     }
@@ -463,7 +521,8 @@ mod tests {
             &tx,
             &inner,
             Policy::default(),
-        ).await;
+        )
+        .await;
         assert_eq!(resp.status, 503);
         // Body distinguishes Full vs Disconnected so operators can
         // tell saturation from shutdown apart in logs.
@@ -480,13 +539,15 @@ mod tests {
         tx.try_send(Job {
             request: req("GET", "/x/y", &[], &[]),
             resp_tx,
-        }).expect("first send fits");
+        })
+        .expect("first send fits");
         let resp = dispatch_request(
             req("GET", "/agent/method", &[], &[]),
             &tx,
             &inner,
             Policy::default(),
-        ).await;
+        )
+        .await;
         assert_eq!(resp.status, 503);
         assert!(resp.body.starts_with(b"gateway saturated"));
     }
@@ -496,11 +557,20 @@ mod tests {
         let inner = fresh_inner();
         let (tx, _rx) = channel();
         let resp = dispatch_request(
-            req("DELETE", "/__admin/whatever", &[("x-admin-token", "secret")], &[]),
+            req(
+                "DELETE",
+                "/__admin/whatever",
+                &[("x-admin-token", "secret")],
+                &[],
+            ),
             &tx,
             &inner,
-            Policy { admin_token: Some("secret"), auth_token: None },
-        ).await;
+            Policy {
+                admin_token: Some("secret"),
+                auth_token: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status, 404);
     }
 }

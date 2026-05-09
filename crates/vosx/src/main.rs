@@ -113,9 +113,7 @@ enum Command {
         connect: Vec<String>,
     },
     /// List actors in a manifest.
-    List {
-        manifest: Option<PathBuf>,
-    },
+    List { manifest: Option<PathBuf> },
     /// Snapshot of a hyperspace: local identity, connected
     /// peers, and the registry's contents. Joins the manifest's
     /// hyperspace as a transient peer (same model as `invoke`).
@@ -159,14 +157,42 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Run { program, payload, hex, gas }) => {
+        Some(Command::Run {
+            program,
+            payload,
+            hex,
+            gas,
+        }) => {
             commands::run::run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node { programs, registry, worker, data_dir, no_persist, consistency }) => {
-            let dir = if no_persist { None } else { data_dir.as_deref() };
-            commands::node::run(&programs, registry.as_deref(), &worker, dir, consistency.into());
+        Some(Command::Node {
+            programs,
+            registry,
+            worker,
+            data_dir,
+            no_persist,
+            consistency,
+        }) => {
+            let dir = if no_persist {
+                None
+            } else {
+                data_dir.as_deref()
+            };
+            commands::node::run(
+                &programs,
+                registry.as_deref(),
+                &worker,
+                dir,
+                consistency.into(),
+            );
         }
-        Some(Command::Start { manifest, data_dir, no_persist, listen, connect }) => {
+        Some(Command::Start {
+            manifest,
+            data_dir,
+            no_persist,
+            listen,
+            connect,
+        }) => {
             let (m, dir) = manifest_from(manifest);
             commands::start::run(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect);
         }
@@ -174,11 +200,22 @@ fn main() {
             let (m, dir) = manifest_from(manifest);
             commands::list::run(&m, &dir);
         }
-        Some(Command::Status { manifest, connect, sync_timeout }) => {
+        Some(Command::Status {
+            manifest,
+            connect,
+            sync_timeout,
+        }) => {
             let (m, dir) = manifest_from(manifest);
             commands::status::run(&m, &dir, &connect, sync_timeout);
         }
-        Some(Command::Invoke { target, msg, arg, manifest, connect, sync_timeout }) => {
+        Some(Command::Invoke {
+            target,
+            msg,
+            arg,
+            manifest,
+            connect,
+            sync_timeout,
+        }) => {
             let (m, dir) = manifest_from(manifest);
             commands::invoke::run(&m, &dir, &target, &msg, &arg, &connect, sync_timeout);
         }

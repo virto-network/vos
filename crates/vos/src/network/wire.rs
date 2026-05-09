@@ -74,7 +74,9 @@ const MAX_CHAIN_LEN: usize = 32;
 /// One frame on the wire. See module docs for tag layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    Hello { node_prefix: u16 },
+    Hello {
+        node_prefix: u16,
+    },
     Tell {
         from: u32,
         to: u32,
@@ -86,11 +88,15 @@ pub enum Frame {
         chain: Vec<u32>,
         msg: Vec<u8>,
     },
-    InvokeReply { payload: Vec<u8> },
+    InvokeReply {
+        payload: Vec<u8>,
+    },
     /// "What are your merkle-clock roots for this replication
     /// group?" Sent as a request; reply rides back as
     /// [`Frame::Heads`].
-    FetchHeads { replication_id: [u8; REPLICATION_ID_BYTES] },
+    FetchHeads {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+    },
     /// Reply to [`Frame::FetchHeads`].
     Heads {
         replication_id: [u8; REPLICATION_ID_BYTES],
@@ -105,7 +111,9 @@ pub enum Frame {
     /// Reply to [`Frame::FetchNode`]. `None` means the peer
     /// doesn't have the node — typically a transient state
     /// during sync, not an error.
-    NodeReply { node: Option<Vec<u8>> },
+    NodeReply {
+        node: Option<Vec<u8>>,
+    },
     /// Empty acknowledgement — used as the response slot for
     /// fire-and-forget `Tell` so the request_response behaviour
     /// has something to deliver.
@@ -127,7 +135,12 @@ impl Frame {
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
             }
-            Frame::InvokeRequest { from, to, chain, msg } => {
+            Frame::InvokeRequest {
+                from,
+                to,
+                chain,
+                msg,
+            } => {
                 out.push(TAG_INVOKE_REQ);
                 out.extend_from_slice(&from.to_le_bytes());
                 out.extend_from_slice(&to.to_le_bytes());
@@ -147,7 +160,10 @@ impl Frame {
                 out.push(TAG_FETCH_HEADS);
                 out.extend_from_slice(replication_id);
             }
-            Frame::Heads { replication_id, roots } => {
+            Frame::Heads {
+                replication_id,
+                roots,
+            } => {
                 out.push(TAG_HEADS);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(&(roots.len() as u32).to_le_bytes());
@@ -155,7 +171,10 @@ impl Frame {
                     out.extend_from_slice(cid);
                 }
             }
-            Frame::FetchNode { replication_id, cid } => {
+            Frame::FetchNode {
+                replication_id,
+                cid,
+            } => {
                 out.push(TAG_FETCH_NODE);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(cid);
@@ -204,7 +223,12 @@ impl Frame {
                     chain.push(r.u32()?);
                 }
                 let msg = r.bytes_with_len_prefix()?;
-                Frame::InvokeRequest { from, to, chain, msg }
+                Frame::InvokeRequest {
+                    from,
+                    to,
+                    chain,
+                    msg,
+                }
             }
             TAG_INVOKE_REPLY => Frame::InvokeReply {
                 payload: r.bytes_with_len_prefix()?,
@@ -222,7 +246,10 @@ impl Frame {
                 for _ in 0..count {
                     roots.push(r.fixed::<CID_BYTES>()?);
                 }
-                Frame::Heads { replication_id, roots }
+                Frame::Heads {
+                    replication_id,
+                    roots,
+                }
             }
             TAG_FETCH_NODE => Frame::FetchNode {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
@@ -341,9 +368,13 @@ mod tests {
 
     #[test]
     fn hello_roundtrip() {
-        roundtrip(Frame::Hello { node_prefix: 0x42AB });
+        roundtrip(Frame::Hello {
+            node_prefix: 0x42AB,
+        });
         roundtrip(Frame::Hello { node_prefix: 0 });
-        roundtrip(Frame::Hello { node_prefix: u16::MAX });
+        roundtrip(Frame::Hello {
+            node_prefix: u16::MAX,
+        });
     }
 
     #[test]
@@ -395,7 +426,9 @@ mod tests {
             replication_id: [0u8; REPLICATION_ID_BYTES],
         });
         let mut id = [0u8; REPLICATION_ID_BYTES];
-        for (i, b) in id.iter_mut().enumerate() { *b = i as u8; }
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         roundtrip(Frame::FetchHeads { replication_id: id });
     }
 
@@ -445,10 +478,7 @@ mod tests {
         let mut bad = Vec::new();
         bad.push(TAG_NODE_REPLY);
         bad.push(2); // not 0 or 1
-        assert!(matches!(
-            Frame::decode(&bad),
-            Err(FrameError::BadOption(2))
-        ));
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
     }
 
     #[test]

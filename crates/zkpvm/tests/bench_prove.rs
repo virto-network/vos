@@ -2,12 +2,15 @@
 //!
 //! Run with: cargo test -p zkpvm-machine --release bench_prove_ -- --nocapture
 
+use javm::PVM_REGISTER_COUNT;
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
-use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, prove_profiled, prove_with_config, verify, verify_with_pcs_policy, PcsConfig, FriConfig, PcsPolicy};
+use zkpvm::{
+    FriConfig, PcsConfig, PcsPolicy, prove, prove_profiled, prove_with_config, verify,
+    verify_with_pcs_policy,
+};
 
 /// Generate a program with `n` sequential ADD64 instructions followed by Trap.
 /// Each ADD cycles through registers to avoid data hazards.
@@ -100,12 +103,19 @@ fn profile_at_log_size(log_size: u32) {
     let (code, bitmask) = generate_add_program(n_steps);
 
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    for i in 0..13 {
+        regs[i] = (i as u64) + 1;
+    }
 
     let gas = (n_steps as u64 + 100) * 100;
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 64 * 1024], gas, 16,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 64 * 1024],
+        gas,
+        16,
     );
 
     let mut tracing = TracingPvm::new(pvm);
@@ -118,21 +128,32 @@ fn profile_at_log_size(log_size: u32) {
     let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
 
     let proof_bytes = bincode::serialize(&proof).unwrap();
-    eprintln!("Proof size: {} bytes ({:.1} KB)", proof_bytes.len(), proof_bytes.len() as f64 / 1024.0);
+    eprintln!(
+        "Proof size: {} bytes ({:.1} KB)",
+        proof_bytes.len(),
+        proof_bytes.len() as f64 / 1024.0
+    );
 
     verify(proof, &side_note).expect("verification failed");
 }
 
 #[test]
-fn profile_log10() { profile_at_log_size(10); }
+fn profile_log10() {
+    profile_at_log_size(10);
+}
 
 #[test]
-fn profile_log14() { profile_at_log_size(14); }
+fn profile_log14() {
+    profile_at_log_size(14);
+}
 
 #[test]
 fn debug_thread_pool() {
     let n = zkpvm::install_thread_pool();
-    eprintln!("install_thread_pool() returned {n} (rayon::current_num_threads = {})", rayon::current_num_threads());
+    eprintln!(
+        "install_thread_pool() returned {n} (rayon::current_num_threads = {})",
+        rayon::current_num_threads()
+    );
 }
 
 #[test]
@@ -141,11 +162,18 @@ fn profile_log15_mobile() {
     let n_steps = 1usize << 15;
     let (code, bitmask) = generate_add_program(n_steps);
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    for i in 0..13 {
+        regs[i] = (i as u64) + 1;
+    }
     let gas = (n_steps as u64 + 100) * 100;
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 64 * 1024], gas, 16,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 64 * 1024],
+        gas,
+        16,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
@@ -153,8 +181,8 @@ fn profile_log15_mobile() {
     let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
     let mobile = zkpvm::production_pcs_config_mobile();
     eprintln!("=== LogSize=15 MOBILE config ===");
-    let (proof, _) = zkpvm::prove_profiled_with_config(&mut side_note, mobile)
-        .expect("proving failed");
+    let (proof, _) =
+        zkpvm::prove_profiled_with_config(&mut side_note, mobile).expect("proving failed");
     let proof_bytes = bincode::serialize(&proof).unwrap();
     eprintln!("Proof size: {} KB", proof_bytes.len() / 1024);
     zkpvm::verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
@@ -166,11 +194,18 @@ fn profile_log14_mobile() {
     let n_steps = 1usize << 14;
     let (code, bitmask) = generate_add_program(n_steps);
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    for i in 0..13 {
+        regs[i] = (i as u64) + 1;
+    }
     let gas = (n_steps as u64 + 100) * 100;
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 64 * 1024], gas, 16,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 64 * 1024],
+        gas,
+        16,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
@@ -178,8 +213,8 @@ fn profile_log14_mobile() {
     let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
     let mobile = zkpvm::production_pcs_config_mobile();
     eprintln!("=== LogSize=14 MOBILE config (blowup=4, q=38, pow=20) ===");
-    let (proof, _) = zkpvm::prove_profiled_with_config(&mut side_note, mobile)
-        .expect("proving failed");
+    let (proof, _) =
+        zkpvm::prove_profiled_with_config(&mut side_note, mobile).expect("proving failed");
     let proof_bytes = bincode::serialize(&proof).unwrap();
     eprintln!("Proof size: {} KB", proof_bytes.len() / 1024);
     zkpvm::verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
@@ -189,7 +224,11 @@ fn profile_log14_mobile() {
 /// Sweep log_sizes with test-config (8-bit security) to find the scale breaking point.
 #[test]
 fn scale_sweep() {
-    let test_config = PcsConfig { pow_bits: 5, fri_config: FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let test_config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     eprintln!("=== Scale sweep (test security, rough memory estimate) ===");
     eprintln!("  main_cols=286, interaction_cols=~90, constraint_blowup=4");
     eprintln!();
@@ -197,9 +236,19 @@ fn scale_sweep() {
         let n_steps = 1usize << log_size;
         let (code, bitmask) = generate_add_program(n_steps);
         let mut regs = [0u64; PVM_REGISTER_COUNT];
-        for i in 0..13 { regs[i] = (i as u64) + 1; }
+        for i in 0..13 {
+            regs[i] = (i as u64) + 1;
+        }
         let gas = (n_steps as u64 + 100) * 100;
-        let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 64 * 1024], gas, 16);
+        let pvm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            regs,
+            vec![0u8; 64 * 1024],
+            gas,
+            16,
+        );
         let mut tracing = TracingPvm::new(pvm);
         let _exit = tracing.run();
         let steps = tracing.into_trace();
@@ -216,9 +265,14 @@ fn scale_sweep() {
                 let field_bytes = 4u64;
                 let main_mb = rows * 286 * field_bytes / (1024 * 1024);
                 let fft_mb = fft_rows * 286 * field_bytes / (1024 * 1024);
-                eprintln!("  log_size={log_size:>2} ({n_steps:>7} steps): prove={elapsed:>8.2?}, proof={kb:>5.1} KB, main_trace≈{main_mb}MB, fft_domain≈{fft_mb}MB");
+                eprintln!(
+                    "  log_size={log_size:>2} ({n_steps:>7} steps): prove={elapsed:>8.2?}, proof={kb:>5.1} KB, main_trace≈{main_mb}MB, fft_domain≈{fft_mb}MB"
+                );
             }
-            Err(e) => { eprintln!("  log_size={log_size:>2} ({n_steps:>7} steps): FAIL {e}"); break; }
+            Err(e) => {
+                eprintln!("  log_size={log_size:>2} ({n_steps:>7} steps): FAIL {e}");
+                break;
+            }
         }
     }
 }
@@ -229,18 +283,29 @@ fn bench_security(log_size: u32, pow_bits: u32, log_blowup: u32, n_queries: usiz
     let n_steps = 1usize << log_size;
     let (code, bitmask) = generate_add_program(n_steps);
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    for i in 0..13 {
+        regs[i] = (i as u64) + 1;
+    }
     let gas = (n_steps as u64 + 100) * 100;
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 64 * 1024], gas, 16,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 64 * 1024],
+        gas,
+        16,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     let mut side_note = zkpvm::SideNote::new(steps, code, bitmask);
 
-    let config = PcsConfig { pow_bits, fri_config: FriConfig::new(0, log_blowup, n_queries, 1), lifting_log_size: None };
+    let config = PcsConfig {
+        pow_bits,
+        fri_config: FriConfig::new(0, log_blowup, n_queries, 1),
+        lifting_log_size: None,
+    };
     let sec_bits = config.security_bits();
     // Policy mirrors the under-test config so we exercise the algebraic
     // verify path even on the dev-only / test-only sweeps (e.g.,
@@ -323,11 +388,18 @@ fn bench_pcs_config(log_size: u32, label: &str, config: PcsConfig) {
     let n_steps = 1usize << log_size;
     let (code, bitmask) = generate_add_program(n_steps);
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for i in 0..13 { regs[i] = (i as u64) + 1; }
+    for i in 0..13 {
+        regs[i] = (i as u64) + 1;
+    }
     let gas = (n_steps as u64 + 100) * 100;
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 64 * 1024], gas, 16,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 64 * 1024],
+        gas,
+        16,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
@@ -364,15 +436,43 @@ fn pcs_config_sweep_log14() {
     eprintln!("  Format: pow_bits, log_blowup, n_queries");
     eprintln!();
     // Baseline: production STANDARD (96 bits, blowup=16)
-    bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19, 1), lifting_log_size: None });
+    bench_pcs_config(
+        log,
+        "STANDARD: pow=20, blowup=2^4, q=19",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 4, 19, 1),
+            lifting_log_size: None,
+        },
+    );
     // Same blowup, fewer queries (under-secure if pow_bits don't compensate)
-    bench_pcs_config(log, "blowup=2^3, q=20, pow=16 (96 bits)",
-        PcsConfig { pow_bits: 16, fri_config: FriConfig::new(0, 3, 20, 1), lifting_log_size: None });
-    bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
-    bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76, 1), lifting_log_size: None });
+    bench_pcs_config(
+        log,
+        "blowup=2^3, q=20, pow=16 (96 bits)",
+        PcsConfig {
+            pow_bits: 16,
+            fri_config: FriConfig::new(0, 3, 20, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "blowup=2^2, q=38, pow=20 (96 bits)",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 2, 38, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "blowup=2^1, q=76, pow=20 (96 bits)",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 1, 76, 1),
+            lifting_log_size: None,
+        },
+    );
     // Same blowup=2, more pow trade.  pow=32 makes prove ~10x slower
     // (PoW-grind dominates at high pow_bits).  Documented for the
     // record; not a useful config.
@@ -383,30 +483,81 @@ fn pcs_config_sweep_log14() {
 fn pcs_config_sweep_log14_security_levels() {
     let log = 14;
     eprintln!("=== Security level sweep at LogSize={log} (blowup=4) ===");
-    eprintln!("(blowup=4 is the MOBILE-class shape; varying queries × pow trades security for prove time)");
+    eprintln!(
+        "(blowup=4 is the MOBILE-class shape; varying queries × pow trades security for prove time)"
+    );
     eprintln!();
-    bench_pcs_config(log, "MOBILE-96bit:  pow=20, q=38",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
-    bench_pcs_config(log, "MOBILE-80bit:  pow=20, q=30",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 30, 1), lifting_log_size: None });
-    bench_pcs_config(log, "MOBILE-64bit:  pow=20, q=22",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 22, 1), lifting_log_size: None });
+    bench_pcs_config(
+        log,
+        "MOBILE-96bit:  pow=20, q=38",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 2, 38, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "MOBILE-80bit:  pow=20, q=30",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 2, 30, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "MOBILE-64bit:  pow=20, q=22",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 2, 22, 1),
+            lifting_log_size: None,
+        },
+    );
     eprintln!();
     eprintln!("(blowup=4 with raised pow_bits — cheaper FRI but PoW grind cost)");
-    bench_pcs_config(log, "pow=24, q=36 (96 bits)",
-        PcsConfig { pow_bits: 24, fri_config: FriConfig::new(0, 2, 36, 1), lifting_log_size: None });
+    bench_pcs_config(
+        log,
+        "pow=24, q=36 (96 bits)",
+        PcsConfig {
+            pow_bits: 24,
+            fri_config: FriConfig::new(0, 2, 36, 1),
+            lifting_log_size: None,
+        },
+    );
 }
 
 #[test]
 fn pcs_config_sweep_log10() {
     let log = 10;
     eprintln!("=== PCS config sweep at LogSize={log} (1024 steps) ===");
-    bench_pcs_config(log, "STANDARD: pow=20, blowup=2^4, q=19",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 4, 19, 1), lifting_log_size: None });
-    bench_pcs_config(log, "blowup=2^2, q=38, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 2, 38, 1), lifting_log_size: None });
-    bench_pcs_config(log, "blowup=2^1, q=76, pow=20 (96 bits)",
-        PcsConfig { pow_bits: 20, fri_config: FriConfig::new(0, 1, 76, 1), lifting_log_size: None });
+    bench_pcs_config(
+        log,
+        "STANDARD: pow=20, blowup=2^4, q=19",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 4, 19, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "blowup=2^2, q=38, pow=20 (96 bits)",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 2, 38, 1),
+            lifting_log_size: None,
+        },
+    );
+    bench_pcs_config(
+        log,
+        "blowup=2^1, q=76, pow=20 (96 bits)",
+        PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 1, 76, 1),
+            lifting_log_size: None,
+        },
+    );
 }
 
 // `cargo test --workspace` runs every `#[test]` by default; log16 needs

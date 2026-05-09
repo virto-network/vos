@@ -26,13 +26,13 @@
 //! Run from the workspace root:
 //!     cargo run -p zkpvm --example multi_segment --release
 
-use javm::instruction::Opcode;
-use javm::interpreter::Interpreter;
 use javm::ExitReason;
 use javm::PVM_REGISTER_COUNT;
+use javm::instruction::Opcode;
+use javm::interpreter::Interpreter;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, verify_chain, SideNote};
+use zkpvm::{SideNote, prove, verify_chain};
 
 fn main() {
     println!("zkpvm multi_segment example");
@@ -51,12 +51,24 @@ fn main() {
     // regs[6] = regs[5] + regs[1]
     // regs[7] = regs[6] + regs[1]
     let code = vec![
-        Opcode::Add64 as u8, 0x10, 2,
-        Opcode::Add64 as u8, 0x12, 3,
-        Opcode::Add64 as u8, 0x13, 4,
-        Opcode::Add64 as u8, 0x14, 5,
-        Opcode::Add64 as u8, 0x15, 6,
-        Opcode::Add64 as u8, 0x16, 7,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Add64 as u8,
+        0x12,
+        3,
+        Opcode::Add64 as u8,
+        0x13,
+        4,
+        Opcode::Add64 as u8,
+        0x14,
+        5,
+        Opcode::Add64 as u8,
+        0x15,
+        6,
+        Opcode::Add64 as u8,
+        0x16,
+        7,
         Opcode::Trap as u8,
     ];
     let bitmask: Vec<u8> = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
@@ -64,7 +76,7 @@ fn main() {
     // ── Step 2: trace the full execution ───────────────────────────
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 100; // initial accumulator value
-    regs[1] = 1;   // increment
+    regs[1] = 1; // increment
     let initial_memory = vec![0u8; 4 * 1024 * 1024];
     let pvm = Interpreter::new(
         code.clone(),
@@ -128,31 +140,36 @@ fn main() {
     // ── Step 5: inspect boundary states ────────────────────────────
     println!();
     println!("Boundary states:");
-    println!("  seg1.initial_state: pc={}, ts={}, regs[7]={}",
-        proof1.initial_state.pc, proof1.initial_state.timestamp,
-        proof1.initial_state.registers[7]);
-    println!("  seg1.final_state:   pc={}, ts={}, regs[7]={}",
-        proof1.final_state.pc, proof1.final_state.timestamp,
-        proof1.final_state.registers[7]);
-    println!("  seg2.initial_state: pc={}, ts={}, regs[7]={}",
-        proof2.initial_state.pc, proof2.initial_state.timestamp,
-        proof2.initial_state.registers[7]);
-    println!("  seg2.final_state:   pc={}, ts={}, regs[7]={}",
-        proof2.final_state.pc, proof2.final_state.timestamp,
-        proof2.final_state.registers[7]);
+    println!(
+        "  seg1.initial_state: pc={}, ts={}, regs[7]={}",
+        proof1.initial_state.pc, proof1.initial_state.timestamp, proof1.initial_state.registers[7]
+    );
+    println!(
+        "  seg1.final_state:   pc={}, ts={}, regs[7]={}",
+        proof1.final_state.pc, proof1.final_state.timestamp, proof1.final_state.registers[7]
+    );
+    println!(
+        "  seg2.initial_state: pc={}, ts={}, regs[7]={}",
+        proof2.initial_state.pc, proof2.initial_state.timestamp, proof2.initial_state.registers[7]
+    );
+    println!(
+        "  seg2.final_state:   pc={}, ts={}, regs[7]={}",
+        proof2.final_state.pc, proof2.final_state.timestamp, proof2.final_state.registers[7]
+    );
 
     // Assert the chain links up at the prover side (verify_chain
     // will check this independently below; the assertion here is
     // just to make the example's intent obvious).
-    assert_eq!(proof1.final_state, proof2.initial_state,
-        "segment boundary mismatch — prove() should not have returned proofs that don't chain");
+    assert_eq!(
+        proof1.final_state, proof2.initial_state,
+        "segment boundary mismatch — prove() should not have returned proofs that don't chain"
+    );
 
     // ── Step 6: verify_chain ───────────────────────────────────────
     // Pass [proof1, proof2] + [&sn1, &sn2].  verify_chain runs
     // verify per segment AND checks final_state == next initial_state.
     let t = std::time::Instant::now();
-    verify_chain(&[proof1.clone(), proof2.clone()], &[&sn1, &sn2])
-        .expect("verify_chain failed");
+    verify_chain(&[proof1.clone(), proof2.clone()], &[&sn1, &sn2]).expect("verify_chain failed");
     println!("verify_chain ([2 segments]): ok ({:.2?})", t.elapsed());
 
     // ── Step 7: demonstrate a broken chain is rejected ─────────────

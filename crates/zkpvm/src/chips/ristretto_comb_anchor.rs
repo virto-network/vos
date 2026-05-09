@@ -22,16 +22,16 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
-use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -42,6 +42,12 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
+#[cfg(feature = "prover")]
+use crate::framework::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::lookups::{AllLookupElements, LogupTraceBuilder};
+#[cfg(feature = "prover")]
+use crate::side_note::SideNote;
 use crate::{
     framework::BuiltInComponent,
     lookups::{
@@ -49,12 +55,6 @@ use crate::{
         RistrettoCombScalarBoundaryLookupElements,
     },
 };
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::{AllLookupElements, LogupTraceBuilder};
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
 
 pub struct RistrettoCombAnchorChip;
 
@@ -220,11 +220,7 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
 impl BuiltInProverComponent for RistrettoCombAnchorChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = anchor_log_size(side_note);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -237,7 +233,7 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
         use crate::chips::ristretto::comb_table::{
-            ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
+            CombTable, NUM_WINDOWS, ed25519_basepoint_extended,
         };
         let log_size = anchor_log_size(side_note);
         let mut trace = TraceBuilder::<Column>::new(log_size);
@@ -282,20 +278,16 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
         let coord: &RistrettoCombCoordBoundaryLookupElements = lookup_elements.as_ref();
 
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let call_idx =
-            crate::trace::original_base_column!(component_trace, Column::CallIdx);
-        let window_idx =
-            crate::trace::original_base_column!(component_trace, Column::WindowIdx);
+        let call_idx = crate::trace::original_base_column!(component_trace, Column::CallIdx);
+        let window_idx = crate::trace::original_base_column!(component_trace, Column::WindowIdx);
         let scalar_window =
             crate::trace::original_base_column!(component_trace, Column::ScalarWindow);
         let x = crate::trace::original_base_column!(component_trace, Column::X);
         let y = crate::trace::original_base_column!(component_trace, Column::Y);
         let z = crate::trace::original_base_column!(component_trace, Column::Z);
         let t = crate::trace::original_base_column!(component_trace, Column::T);
-        let byte_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::ByteIdx
-        );
+        let byte_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ByteIdx);
 
         // Comb relation emission.
         let mut tuple: Vec<_> = Vec::with_capacity(1 + 1 + 32 * 4);
@@ -305,29 +297,19 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
         tuple.extend(y.iter().cloned());
         tuple.extend(z.iter().cloned());
         tuple.extend(t.iter().cloned());
-        logup.add_to_relation_with(
-            comb,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(comb, [is_real[0].clone()], |[r]| r.into(), &tuple);
 
         // Coord-boundary emissions.  Constants for coord_kind: use
         // FinalizedColumn::Constant via the From<BaseField> impl.
-        use stwo::core::fields::m31::BaseField as BF;
         use crate::trace::component::FinalizedColumn;
+        use stwo::core::fields::m31::BaseField as BF;
         let kind_0: FinalizedColumn<'_> = BF::from(0u32).into();
         let kind_1: FinalizedColumn<'_> = BF::from(1u32).into();
         let kind_2: FinalizedColumn<'_> = BF::from(2u32).into();
         let kind_3: FinalizedColumn<'_> = BF::from(3u32).into();
 
         for k in 0..32 {
-            for (kind, col) in [
-                (&kind_0, &x),
-                (&kind_1, &y),
-                (&kind_2, &z),
-                (&kind_3, &t),
-            ] {
+            for (kind, col) in [(&kind_0, &x), (&kind_1, &y), (&kind_2, &z), (&kind_3, &t)] {
                 logup.add_to_relation_with(
                     coord,
                     [is_real[0].clone()],
@@ -344,8 +326,7 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
         }
 
         // Scalar boundary emission.
-        let scalar: &RistrettoCombScalarBoundaryLookupElements =
-            lookup_elements.as_ref();
+        let scalar: &RistrettoCombScalarBoundaryLookupElements = lookup_elements.as_ref();
         logup.add_to_relation_with(
             scalar,
             [is_real[0].clone()],

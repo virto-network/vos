@@ -7,18 +7,12 @@ const TS_SIZE: usize = WORD_SIZE; // 8
 // (clk, pc)
 // clk is 8 bytes, PC is 4 bytes.
 const REL_PROG_EXEC_LOOKUP_SIZE: usize = TS_SIZE + PC_SIZE;
-stwo_constraint_framework::relation!(
-    ProgramExecutionLookupElements,
-    REL_PROG_EXEC_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(ProgramExecutionLookupElements, REL_PROG_EXEC_LOOKUP_SIZE);
 
 // (reg-addr, reg-val, reg-ts)
 // Address is 1 column, value is 8 bytes, timestamp is 8 bytes.
 const REL_REG_MEMORY_LOOKUP_SIZE: usize = 1 + WORD_SIZE + TS_SIZE;
-stwo_constraint_framework::relation!(
-    RegisterMemoryLookupElements,
-    REL_REG_MEMORY_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMORY_LOOKUP_SIZE);
 
 // (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],
 //  flag_bytes[N_FLAG_BYTES], imm_y_canon[4], branch_target_canon[4])
@@ -63,63 +57,39 @@ pub const PROG_MEMORY_N_FLAG_BYTES: usize = PROG_MEMORY_N_FLAGS / 8;
 //   + 6 packed flag bytes + imm_y_canon[4] + branch_target_canon[4] = 31 limbs.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
     PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAG_BYTES + PC_SIZE + PC_SIZE;
-stwo_constraint_framework::relation!(
-    ProgramMemoryLookupElements,
-    REL_PROG_MEMORY_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(ProgramMemoryLookupElements, REL_PROG_MEMORY_LOOKUP_SIZE);
 
 // Phase 13d: JumpTableChip lookup. Tuple: (addr[4], target[4]) — 8 limbs.
 // Pins runtime indirect jump targets: CpuChip emits (val_b+imm, next_pc) per
 // JumpInd row; JumpTableChip's preprocessed table holds the canonical
 // (addr=2*(idx+1), target=jump_table[idx]) for each entry.
 const REL_JUMP_TABLE_LOOKUP_SIZE: usize = PC_SIZE + PC_SIZE;
-stwo_constraint_framework::relation!(
-    JumpTableLookupElements,
-    REL_JUMP_TABLE_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(JumpTableLookupElements, REL_JUMP_TABLE_LOOKUP_SIZE);
 
 // Byte-level: (addr[4], value[1], timestamp[8], is_write[1])
 const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + 1 + TS_SIZE + 1;
-stwo_constraint_framework::relation!(
-    MemoryAccessLookupElements,
-    REL_MEMORY_ACCESS_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(MemoryAccessLookupElements, REL_MEMORY_ACCESS_LOOKUP_SIZE);
 
 // (shift_amount[1], power_val[8]) — proves val_d = 2^shift_amount
 const REL_POWER_OF_TWO_LOOKUP_SIZE: usize = 1 + WORD_SIZE;
-stwo_constraint_framework::relation!(
-    PowerOfTwoLookupElements,
-    REL_POWER_OF_TWO_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(PowerOfTwoLookupElements, REL_POWER_OF_TWO_LOOKUP_SIZE);
 
 // (a, b, a_and_b) — per-byte bitwise AND lookup
 const REL_BITWISE_AND_LOOKUP_SIZE: usize = 3;
-stwo_constraint_framework::relation!(
-    BitwiseAndLookupElements,
-    REL_BITWISE_AND_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(BitwiseAndLookupElements, REL_BITWISE_AND_LOOKUP_SIZE);
 
 // (byte, popcount) — per-byte popcount lookup (Phase 33)
 const REL_POPCOUNT_LOOKUP_SIZE: usize = 2;
-stwo_constraint_framework::relation!(
-    PopcountLookupElements,
-    REL_POPCOUNT_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(PopcountLookupElements, REL_POPCOUNT_LOOKUP_SIZE);
 
 // (byte, lz_byte, tz_byte) — per-byte leading/trailing-zeros lookup (Phase 34)
 const REL_BITCOUNT_LOOKUP_SIZE: usize = 3;
-stwo_constraint_framework::relation!(
-    BitcountLookupElements,
-    REL_BITCOUNT_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(BitcountLookupElements, REL_BITCOUNT_LOOKUP_SIZE);
 
 // (cid[4], slot[1], value[8]) — Blake2b state lookup between boundary chip
 // and main Blake2b chip for initial-state + final-state authentication.
 const REL_BLAKE2B_STATE_LOOKUP_SIZE: usize = 4 + 1 + WORD_SIZE;
-stwo_constraint_framework::relation!(
-    Blake2bStateLookupElements,
-    REL_BLAKE2B_STATE_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(Blake2bStateLookupElements, REL_BLAKE2B_STATE_LOOKUP_SIZE);
 
 // Phase 54g/54i/54k — DivRem lookup.  CpuChip emits one producer
 // per `is_div_rem` row; DivRemChip consumes once per real (non-
@@ -138,10 +108,7 @@ stwo_constraint_framework::relation!(
 //   correction; added SignBitB/D/Q/R so DivRemChip can run the
 //   Phase 16/18 sign-correction chains internally).
 const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 4 + 8;
-stwo_constraint_framework::relation!(
-    DivRemLookupElements,
-    REL_DIVREM_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(DivRemLookupElements, REL_DIVREM_LOOKUP_SIZE);
 
 // Phase 54f — Compare lookup.  CpuChip emits one producer per
 // `is_compare + is_branch` row; CompareChip consumes once per real
@@ -151,10 +118,7 @@ stwo_constraint_framework::relation!(
 //
 // Tuple: (val_b[8], val_d[8], cmp_lt_flag) — 17 limbs.
 const REL_COMPARE_LOOKUP_SIZE: usize = WORD_SIZE * 2 + 1;
-stwo_constraint_framework::relation!(
-    CompareLookupElements,
-    REL_COMPARE_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(CompareLookupElements, REL_COMPARE_LOOKUP_SIZE);
 
 // Phase 54e — Bitwise lookup.  CpuChip emits one producer per
 // `is_bitwise` row (sum of 6 sub-flags); BitwiseChip consumes once
@@ -165,10 +129,7 @@ stwo_constraint_framework::relation!(
 // Tuple: (val_b[8], val_d[8], result[8], is_and, is_or, is_xor,
 //   is_and_inv, is_or_inv, is_xnor) — 30 limbs.
 const REL_BITWISE_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 6;
-stwo_constraint_framework::relation!(
-    BitwiseLookupElements,
-    REL_BITWISE_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(BitwiseLookupElements, REL_BITWISE_LOOKUP_SIZE);
 
 // Phase 54a/b/c/d — Multiplication lookup.  CpuChip emits one producer
 // per `is_mul + is_mul_upper_uu + is_mul_upper_su + is_mul_upper_ss`
@@ -185,12 +146,8 @@ stwo_constraint_framework::relation!(
 // (MulChip witnesses both internally; result variant binding moved
 // to MulChip).  Added 4 rotate flags so MulChip's variant-dispatch
 // constraint can fire correctly per row.
-const REL_MULTIPLICATION_LOOKUP_SIZE: usize =
-    WORD_SIZE * 3 + 11;
-stwo_constraint_framework::relation!(
-    MultiplicationLookupElements,
-    REL_MULTIPLICATION_LOOKUP_SIZE
-);
+const REL_MULTIPLICATION_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 11;
+stwo_constraint_framework::relation!(MultiplicationLookupElements, REL_MULTIPLICATION_LOOKUP_SIZE);
 
 // Phase 55a — ByteToBits lookup.  256-row preprocessed table proving
 // `(byte, bit0, bit1, bit2, bit3, bit4, bit5, bit6, bit7)` where
@@ -200,10 +157,7 @@ stwo_constraint_framework::relation!(
 //
 // Tuple: (byte, bit0..bit7) — 9 limbs.
 const REL_BYTE_TO_BITS_LOOKUP_SIZE: usize = 1 + 8;
-stwo_constraint_framework::relation!(
-    ByteToBitsLookupElements,
-    REL_BYTE_TO_BITS_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(ByteToBitsLookupElements, REL_BYTE_TO_BITS_LOOKUP_SIZE);
 
 // (h_ptr[4], m_ptr[4], t_low[8], f[1], ts[8]) — binds Blake2bChip's HPtr,
 // MPtr, T[0..8], F and CallTs to CpuChip's ECALL-step register snapshot +
@@ -211,10 +165,7 @@ stwo_constraint_framework::relation!(
 // finalise-flag triple.  CpuChip emits 1 producer per blake2b ECALL step,
 // Blake2bChip emits 1 consumer per compression.
 const REL_BLAKE2B_CALL_LOOKUP_SIZE: usize = 4 + 4 + WORD_SIZE + 1 + TS_SIZE;
-stwo_constraint_framework::relation!(
-    Blake2bCallLookupElements,
-    REL_BLAKE2B_CALL_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(Blake2bCallLookupElements, REL_BLAKE2B_CALL_LOOKUP_SIZE);
 
 // R1e-pent: RistrettoChip register-file lookup.  Each row's `out`
 // bytes are PRODUCERS keyed by (row_index, byte_index, byte_value);
@@ -243,10 +194,7 @@ stwo_constraint_framework::relation!(
 //
 // Tuple: (window_idx, scalar_window, x[32], y[32], z[32], t[32]) — 130 limbs.
 const REL_RISTRETTO_COMB_LOOKUP_SIZE: usize = 1 + 1 + 32 * 4;
-stwo_constraint_framework::relation!(
-    RistrettoCombLookupElements,
-    REL_RISTRETTO_COMB_LOOKUP_SIZE
-);
+stwo_constraint_framework::relation!(RistrettoCombLookupElements, REL_RISTRETTO_COMB_LOOKUP_SIZE);
 
 // Session 2.1 step 8 (partial): scalar nibble binding between
 // `RistrettoCombAnchorChip` and a new `RistrettoCombScalarBoundaryChip`.

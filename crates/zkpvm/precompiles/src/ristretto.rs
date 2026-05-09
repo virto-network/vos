@@ -24,16 +24,25 @@ pub struct RistrettoPoint(pub [u8; 32]);
 impl RistrettoPoint {
     /// The 32-byte compressed encoding (this is the wire form).
     pub fn compress(&self) -> CompressedRistretto {
-        CompressedRistretto::from_slice(&self.0)
-            .expect("RistrettoPoint always holds 32 bytes")
+        CompressedRistretto::from_slice(&self.0).expect("RistrettoPoint always holds 32 bytes")
     }
-    pub fn to_bytes(&self) -> [u8; 32] { self.0 }
-    pub fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
     pub fn from_uniform_bytes(b: &[u8; 64]) -> Self {
-        Self(DalekRistrettoPoint::from_uniform_bytes(b).compress().to_bytes())
+        Self(
+            DalekRistrettoPoint::from_uniform_bytes(b)
+                .compress()
+                .to_bytes(),
+        )
     }
     /// Canonical compressed identity.
-    pub fn identity() -> Self { Self([0u8; 32]) }
+    pub fn identity() -> Self {
+        Self([0u8; 32])
+    }
     /// Wrap a dalek decompressed point — runs `compress()` host-side.
     /// Heavy: prefer to keep operands in compressed form throughout
     /// any chain of operations; only convert at the boundary.
@@ -50,12 +59,16 @@ impl RistrettoPoint {
 }
 
 impl From<DalekRistrettoPoint> for RistrettoPoint {
-    fn from(p: DalekRistrettoPoint) -> Self { Self::from_dalek(p) }
+    fn from(p: DalekRistrettoPoint) -> Self {
+        Self::from_dalek(p)
+    }
 }
 
 impl core::ops::Add for RistrettoPoint {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self { (&self).add(&rhs) }
+    fn add(self, rhs: Self) -> Self {
+        (&self).add(&rhs)
+    }
 }
 impl<'a, 'b> core::ops::Add<&'b RistrettoPoint> for &'a RistrettoPoint {
     type Output = RistrettoPoint;
@@ -236,7 +249,8 @@ mod tests {
         let g = &RISTRETTO_BASEPOINT_TABLE;
         let ours = &v * g;
         let theirs = (DalekScalar::from(50u64) * RISTRETTO_BASEPOINT_POINT)
-            .compress().to_bytes();
+            .compress()
+            .to_bytes();
         assert_eq!(ours.0, theirs);
     }
 
@@ -259,8 +273,9 @@ mod tests {
         let h = RistrettoPoint::from_dalek(h_dalek);
         let g = &RISTRETTO_BASEPOINT_TABLE;
         let p = &v * g + &b * &h;
-        let theirs = (DalekScalar::from(100u64) * RISTRETTO_BASEPOINT_POINT
-            + b.0 * h_dalek).compress().to_bytes();
+        let theirs = (DalekScalar::from(100u64) * RISTRETTO_BASEPOINT_POINT + b.0 * h_dalek)
+            .compress()
+            .to_bytes();
         assert_eq!(p.0, theirs);
     }
 
@@ -282,7 +297,8 @@ mod tests {
         let point = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
         let ours = ristretto_scalar_mult(&scalar, &point);
         let theirs = (DalekScalar::from(2u64) * RISTRETTO_BASEPOINT_POINT)
-            .compress().to_bytes();
+            .compress()
+            .to_bytes();
         assert_eq!(ours, theirs);
     }
 }

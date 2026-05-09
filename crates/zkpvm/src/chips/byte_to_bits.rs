@@ -26,13 +26,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -45,16 +42,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::ByteToBitsLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::ByteToBitsLookupElements};
 
 pub struct ByteToBitsChip;
 
@@ -75,14 +69,22 @@ pub enum PreprocessedColumn {
     /// Byte value (0..255).
     #[size = 1]
     Byte,
-    #[size = 1] Bit0,
-    #[size = 1] Bit1,
-    #[size = 1] Bit2,
-    #[size = 1] Bit3,
-    #[size = 1] Bit4,
-    #[size = 1] Bit5,
-    #[size = 1] Bit6,
-    #[size = 1] Bit7,
+    #[size = 1]
+    Bit0,
+    #[size = 1]
+    Bit1,
+    #[size = 1]
+    Bit2,
+    #[size = 1]
+    Bit3,
+    #[size = 1]
+    Bit4,
+    #[size = 1]
+    Bit5,
+    #[size = 1]
+    Bit6,
+    #[size = 1]
+    Bit7,
 }
 
 impl BuiltInComponent for ByteToBitsChip {
@@ -109,8 +111,14 @@ impl BuiltInComponent for ByteToBitsChip {
 
         let tuple = vec![
             byte[0].clone(),
-            b0[0].clone(), b1[0].clone(), b2[0].clone(), b3[0].clone(),
-            b4[0].clone(), b5[0].clone(), b6[0].clone(), b7[0].clone(),
+            b0[0].clone(),
+            b1[0].clone(),
+            b2[0].clone(),
+            b3[0].clone(),
+            b4[0].clone(),
+            b5[0].clone(),
+            b6[0].clone(),
+            b7[0].clone(),
         ];
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -171,7 +179,8 @@ impl BuiltInProverComponent for ByteToBitsChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let elems: &ByteToBitsLookupElements = lookup_elements.as_ref();
-        let byte = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
+        let byte =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
         let b0 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Bit0);
         let b1 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Bit1);
         let b2 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Bit2);
@@ -184,15 +193,16 @@ impl BuiltInProverComponent for ByteToBitsChip {
 
         let tuple = vec![
             byte[0].clone(),
-            b0[0].clone(), b1[0].clone(), b2[0].clone(), b3[0].clone(),
-            b4[0].clone(), b5[0].clone(), b6[0].clone(), b7[0].clone(),
+            b0[0].clone(),
+            b1[0].clone(),
+            b2[0].clone(),
+            b3[0].clone(),
+            b4[0].clone(),
+            b5[0].clone(),
+            b6[0].clone(),
+            b7[0].clone(),
         ];
-        logup.add_to_relation_with(
-            elems,
-            [mult[0].clone()],
-            |[m]| (-m).into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(elems, [mult[0].clone()], |[m]| (-m).into(), &tuple);
 
         logup.finalize()
     }

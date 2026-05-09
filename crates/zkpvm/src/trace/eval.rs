@@ -1,8 +1,8 @@
-use core::{array, marker::PhantomData};
 use alloc::{borrow::ToOwned, vec::Vec};
+use core::{array, marker::PhantomData};
 
 use num_traits::Zero;
-use stwo_constraint_framework::{preprocessed_columns::PreProcessedColumnId, EvalAtRow};
+use stwo_constraint_framework::{EvalAtRow, preprocessed_columns::PreProcessedColumnId};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 
@@ -82,23 +82,17 @@ pub fn shared_preprocessed_column<const N: usize, E: EvalAtRow, P: PreprocessedA
 /// Returns evaluations for a given column.
 #[macro_export]
 macro_rules! trace_eval {
-    ($traces:expr, $col:expr) => {{
-        $traces.column_eval::<{ $col.const_size() }>($col)
-    }};
+    ($traces:expr, $col:expr) => {{ $traces.column_eval::<{ $col.const_size() }>($col) }};
 }
 
 /// Returns evaluations for a given column on the next row.
 #[macro_export]
 macro_rules! trace_eval_next_row {
-    ($traces:expr, $col:expr) => {{
-        $traces.column_eval_next_row::<{ $col.const_size() }>($col)
-    }};
+    ($traces:expr, $col:expr) => {{ $traces.column_eval_next_row::<{ $col.const_size() }>($col) }};
 }
 
 /// Returns evaluations for a given column in preprocessed trace.
 #[macro_export]
 macro_rules! preprocessed_trace_eval {
-    ($traces:expr, $col:expr) => {{
-        $traces.preprocessed_column_eval::<{ $col.const_size() }>($col)
-    }};
+    ($traces:expr, $col:expr) => {{ $traces.preprocessed_column_eval::<{ $col.const_size() }>($col) }};
 }

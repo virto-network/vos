@@ -11,9 +11,8 @@
 //! proceed.
 
 use zkpvm::{
-    chips, harness::MachineProverComponent,
+    FriConfig, PcsConfig, PcsPolicy, SideNote, chips, harness::MachineProverComponent,
     prove_with_explicit_components, verify_with_explicit_components,
-    FriConfig, PcsConfig, PcsPolicy, SideNote,
 };
 
 /// Minimal bound-1-only configuration.  These chips all declare
@@ -22,9 +21,8 @@ use zkpvm::{
 ///
 /// Picked for: simple boundary semantics, no cross-chip lookup
 /// dependencies that need closure with an empty side_note.
-const BOUND1_HARNESS_COMPONENTS: &[&'static dyn MachineProverComponent] = &[
-    &chips::RangeMultiplicity256,
-];
+const BOUND1_HARNESS_COMPONENTS: &[&'static dyn MachineProverComponent] =
+    &[&chips::RangeMultiplicity256];
 
 /// Smoke test: prove + verify a no-op trace through the harness API.
 ///
@@ -56,25 +54,32 @@ fn harness_smoke_bound1_only() {
         lifting_log_size: None,
     };
 
-    let proof = prove_with_explicit_components(
-        &mut side_note, config, BOUND1_HARNESS_COMPONENTS,
-    ).expect("harness smoke: prove failed on bound-1 AIR — wiring bug");
+    let proof = prove_with_explicit_components(&mut side_note, config, BOUND1_HARNESS_COMPONENTS)
+        .expect("harness smoke: prove failed on bound-1 AIR — wiring bug");
 
     // Build the verifier-trait slice via upcast.
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> =
-        BOUND1_HARNESS_COMPONENTS.iter()
-            .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
-            .collect();
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = BOUND1_HARNESS_COMPONENTS
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
 
     // Cheap policy matching the cheap PcsConfig — production verify
     // would use PcsPolicy::STANDARD; the harness needs to accept its
     // own cheap config to keep chip-rewrite validation cycles fast.
-    let policy = PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
 
     verify_with_explicit_components(
-        proof, &side_note, &verifier_components, BOUND1_HARNESS_COMPONENTS,
+        proof,
+        &side_note,
+        &verifier_components,
+        BOUND1_HARNESS_COMPONENTS,
         &policy,
-    ).expect("harness smoke: verify failed on bound-1 AIR — wiring bug");
+    )
+    .expect("harness smoke: verify failed on bound-1 AIR — wiring bug");
 }
 
 /// Phase I.0 — Blake2bChip-isolated harness for the I-blake2b-N chip
@@ -132,27 +137,43 @@ fn harness_blake2b_isolated() {
 
     let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bChip];
 
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect("Blake2bChip harness: prove failed — chip-flatten regression \
-                 (the OODS sanity check fired; degree ≥ 3 constraint slipped in)");
+    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+        "Blake2bChip harness: prove failed — chip-flatten regression \
+                 (the OODS sanity check fired; degree ≥ 3 constraint slipped in)",
+    );
 
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> =
-        components.iter().map(|c| *c as &dyn zkpvm::harness::MachineComponent).collect();
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
 
-    let policy = PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
 
     let verify_result = verify_with_explicit_components(
-        proof, &side_note, &verifier_components, components, &policy,
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
     );
 
     // Expect open-chain rejection (lookups don't close without producer chips).
     use stwo::core::verifier::VerificationError;
     match verify_result {
         Err(VerificationError::InvalidStructure(msg))
-            if msg.contains("claimed logup sum is not zero") => (),
+            if msg.contains("claimed logup sum is not zero") =>
+        {
+            ()
+        }
         Err(e) => panic!("Blake2bChip harness: verify rejected for the wrong reason: {e:?}"),
-        Ok(()) => panic!("Blake2bChip harness: verify accepted unexpectedly — \
-                          something is balancing the lookups that shouldn't be"),
+        Ok(()) => panic!(
+            "Blake2bChip harness: verify accepted unexpectedly — \
+                          something is balancing the lookups that shouldn't be"
+        ),
     }
 }
 
@@ -167,9 +188,9 @@ fn harness_blake2b_isolated() {
 /// padding rows where DivRemOp=0 needed GateDivH = 6, not 0.
 #[test]
 fn harness_cpuchip_isolated_add64() {
-    use javm::interpreter::Interpreter;
-    use javm::instruction::Opcode;
     use javm::PVM_REGISTER_COUNT;
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
     use zkpvm::core::tracing::TracingPvm;
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 100;
@@ -177,8 +198,13 @@ fn harness_cpuchip_isolated_add64() {
     let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
@@ -224,10 +250,10 @@ fn harness_cpuchip_isolated_add64() {
 ///   row class.
 #[test]
 fn harness_ristretto_isolated() {
-    use javm::interpreter::Interpreter;
-    use javm::instruction::Opcode;
     use javm::PVM_REGISTER_COUNT;
-    use zkpvm::core::tracing::{TracingPvm, ECALL_RISTRETTO_SCALAR_MULT};
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
+    use zkpvm::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, TracingPvm};
 
     // Lay out 32-byte buffers in flat_mem at known addresses.
     let scalar_addr: u64 = 0x1000;
@@ -270,7 +296,15 @@ fn harness_ristretto_isolated() {
     regs[8] = point_addr;
     regs[9] = output_addr;
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, flat_mem, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
@@ -369,14 +403,8 @@ fn harness_ristretto_comb_table_isolated() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    )
-    .expect("RistrettoCombTableChip-only verify failed — table closure regression");
+    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
+        .expect("RistrettoCombTableChip-only verify failed — table closure regression");
 }
 
 /// Same chip but with a non-zero multiplicity injected on one row.
@@ -518,9 +546,7 @@ fn harness_ristretto_comb_balance() {
     match verify_result {
         Err(VerificationError::InvalidStructure(msg))
             if msg.contains("claimed logup sum is not zero") => {}
-        Err(e) => panic!(
-            "comb-balance harness: verify rejected for the wrong reason: {e:?}"
-        ),
+        Err(e) => panic!("comb-balance harness: verify rejected for the wrong reason: {e:?}"),
         Ok(()) => panic!(
             "comb-balance harness: verify accepted unexpectedly — \
              scalar-boundary chip's memory producer should be unbalanced \
@@ -566,14 +592,10 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     // comb chain hits non-identity table rows on the first ~16 windows
     // (rest stay at T[i][0] = identity).  Higher-order bytes stay zero
     // to keep the scalar within the curve25519 group order.
-    let scalar_value = curve25519_dalek::scalar::Scalar::from(
-        0x1234_5678_9abc_def0_u64,
-    );
+    let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_9abc_def0_u64);
     let scalar = scalar_value.to_bytes();
-    let basepoint =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-    let out_bytes = (scalar_value
-        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let out_bytes = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
         .compress()
         .to_bytes();
 
@@ -583,10 +605,8 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     // initial-memory byte).  Output region needs no initial value
     // since its first access is a write.
     let mut initial_memory = vec![0u8; 256];
-    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
-        .copy_from_slice(&scalar);
-    initial_memory[point_ptr as usize..point_ptr as usize + 32]
-        .copy_from_slice(&basepoint);
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
 
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
     side_note.initial_memory = initial_memory;
@@ -600,14 +620,12 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
         out_bytes,
         kind: ScalarMultKind::FixedBasepoint,
     });
-    side_note
-        .ristretto_comb_calls
-        .push(RistrettoCombCall {
-            scalar,
-            out_bytes,
-            output_ptr,
-            ts,
-        });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar,
+        out_bytes,
+        output_ptr,
+        ts,
+    });
     side_note.populate_ristretto_comb_counts();
     side_note.populate_ristretto_compress_counts();
 
@@ -631,9 +649,7 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
     ];
 
     let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect(
-            "fixed-base e2e harness: prove failed — chip algebra or witness regression",
-        );
+        .expect("fixed-base e2e harness: prove failed — chip algebra or witness regression");
 
     let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
         .iter()
@@ -644,17 +660,11 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    )
-    .expect(
-        "fixed-base e2e harness: verify failed — memory ledger or comb-chain \
+    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
+        .expect(
+            "fixed-base e2e harness: verify failed — memory ledger or comb-chain \
          lookup balance regression",
-    );
+        );
 }
 
 /// Session 2.1 step 8 — multi-call coverage for the comb chip pair.
@@ -690,32 +700,40 @@ fn harness_ristretto_fixed_base_three_calls() {
 
     // Three calls with distinct scalars + non-overlapping memory regions.
     let calls: [(curve25519_dalek::scalar::Scalar, u32, u32, u32, u64); 3] = [
-        (curve25519_dalek::scalar::Scalar::from(7u64), 0x000, 0x040, 0x080, 1),
+        (
+            curve25519_dalek::scalar::Scalar::from(7u64),
+            0x000,
+            0x040,
+            0x080,
+            1,
+        ),
         (
             curve25519_dalek::scalar::Scalar::from(0x1234_5678u64),
-            0x100, 0x140, 0x180, 5,
+            0x100,
+            0x140,
+            0x180,
+            5,
         ),
         (
             curve25519_dalek::scalar::Scalar::from(0xdead_beef_cafe_babe_u64),
-            0x200, 0x240, 0x280, 11,
+            0x200,
+            0x240,
+            0x280,
+            11,
         ),
     ];
 
-    let basepoint =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
     let mut initial_memory = vec![0u8; 1024];
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     for &(scalar_value, scalar_ptr, point_ptr, output_ptr, ts) in &calls {
         let scalar = scalar_value.to_bytes();
-        let out_bytes = (scalar_value
-            * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        let out_bytes = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
             .compress()
             .to_bytes();
-        initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
-            .copy_from_slice(&scalar);
-        initial_memory[point_ptr as usize..point_ptr as usize + 32]
-            .copy_from_slice(&basepoint);
+        initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
+        initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
         side_note.ristretto_mem_ops.push(RistrettoMemOp {
             scalar_ptr,
             point_ptr,
@@ -726,14 +744,12 @@ fn harness_ristretto_fixed_base_three_calls() {
             out_bytes,
             kind: ScalarMultKind::FixedBasepoint,
         });
-        side_note
-            .ristretto_comb_calls
-            .push(RistrettoCombCall {
-                scalar,
-                out_bytes,
-                output_ptr,
-                ts,
-            });
+        side_note.ristretto_comb_calls.push(RistrettoCombCall {
+            scalar,
+            out_bytes,
+            output_ptr,
+            ts,
+        });
     }
     side_note.initial_memory = initial_memory;
     side_note.populate_ristretto_comb_counts();
@@ -758,11 +774,10 @@ fn harness_ristretto_fixed_base_three_calls() {
         &ByteToBitsChip,
     ];
 
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect(
-            "3-call harness: prove failed — likely a per-call indexing or \
+    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+        "3-call harness: prove failed — likely a per-call indexing or \
              trace-fill misalignment regression",
-        );
+    );
 
     let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
         .iter()
@@ -773,17 +788,11 @@ fn harness_ristretto_fixed_base_three_calls() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    )
-    .expect(
-        "3-call harness: verify failed — comb-chain or memory ledger \
+    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
+        .expect(
+            "3-call harness: verify failed — comb-chain or memory ledger \
          imbalance under multi-call",
-    );
+        );
 }
 
 /// Session 2.1 step 8 — soundness regression net for the scalar /
@@ -808,9 +817,8 @@ fn harness_ristretto_fixed_base_three_calls() {
 #[test]
 fn harness_ristretto_scalar_memory_mismatch_rejected() {
     use zkpvm::chips::{
-        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip, RistrettoCombScalarBoundaryChip,
+        RistrettoCombTableChip, RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -828,20 +836,16 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
     let k2 = k2_value.to_bytes();
     assert_ne!(k1, k2, "test setup: K1 must differ from K2 byte-wise");
 
-    let basepoint =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
     // out_bytes ties to K2 (actor's memory) for the EcallChip producer
     // side of the output write.
-    let out_bytes = (k2_value
-        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+    let out_bytes = (k2_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
         .compress()
         .to_bytes();
 
     let mut initial_memory = vec![0u8; 256];
-    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
-        .copy_from_slice(&k2);
-    initial_memory[point_ptr as usize..point_ptr as usize + 32]
-        .copy_from_slice(&basepoint);
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&k2);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
 
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
     side_note.initial_memory = initial_memory;
@@ -856,14 +860,12 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
         kind: ScalarMultKind::FixedBasepoint,
     });
     // Mismatch: comb_calls says K1, mem_ops says K2.
-    side_note
-        .ristretto_comb_calls
-        .push(RistrettoCombCall {
-            scalar: k1,
-            out_bytes,
-            output_ptr,
-            ts,
-        });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar: k1,
+        out_bytes,
+        output_ptr,
+        ts,
+    });
     side_note.populate_ristretto_comb_counts();
 
     let config = PcsConfig {
@@ -882,12 +884,11 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
         &RistrettoFixedBaseConsumerChip,
     ];
 
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect(
-            "scalar/memory mismatch harness: prove unexpectedly failed — \
+    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+        "scalar/memory mismatch harness: prove unexpectedly failed — \
              constraints should still satisfy individually; verify is the \
              gate that catches the lookup imbalance",
-        );
+    );
 
     let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
         .iter()
@@ -936,8 +937,7 @@ fn harness_ristretto_consumer_isolated_empty() {
         lifting_log_size: None,
     };
 
-    let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoFixedBaseConsumerChip];
+    let components: &[&'static dyn MachineProverComponent] = &[&RistrettoFixedBaseConsumerChip];
 
     let _proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect("consumer-empty harness: prove failed");
@@ -958,8 +958,7 @@ fn harness_ristretto_compress_isolated_empty() {
         lifting_log_size: None,
     };
 
-    let components: &[&'static dyn MachineProverComponent] =
-        &[&RistrettoCombCompressChip];
+    let components: &[&'static dyn MachineProverComponent] = &[&RistrettoCombCompressChip];
 
     let _proof = prove_with_explicit_components(&mut side_note, config, components)
         .expect("compress-empty harness: prove failed");
@@ -1008,11 +1007,9 @@ fn harness_ristretto_output_mismatch_rejected() {
     // Honest scalar.
     let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_u64);
     let scalar = scalar_value.to_bytes();
-    let basepoint =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
     // B1 = honest compress output.
-    let _b1 = (scalar_value
-        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+    let _b1 = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
         .compress()
         .to_bytes();
     // B2 = the actor's CLAIMED bytes — pick something distinct (toggle
@@ -1024,10 +1021,8 @@ fn harness_ristretto_output_mismatch_rejected() {
     assert_ne!(_b1, b2, "test setup: B1 and B2 must differ");
 
     let mut initial_memory = vec![0u8; 256];
-    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32]
-        .copy_from_slice(&scalar);
-    initial_memory[point_ptr as usize..point_ptr as usize + 32]
-        .copy_from_slice(&basepoint);
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
 
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
     side_note.initial_memory = initial_memory;
@@ -1047,14 +1042,12 @@ fn harness_ristretto_output_mismatch_rejected() {
     // (output_ptr+i, B2[i], ts, write=1) — what the actor claims.
     // The compress chip's row +43 will compute B1 (honest) — relation
     // imbalance.
-    side_note
-        .ristretto_comb_calls
-        .push(RistrettoCombCall {
-            scalar,
-            out_bytes: b2,
-            output_ptr,
-            ts,
-        });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar,
+        out_bytes: b2,
+        output_ptr,
+        ts,
+    });
     side_note.populate_ristretto_comb_counts();
     side_note.populate_ristretto_compress_counts();
 
@@ -1107,9 +1100,7 @@ fn harness_ristretto_output_mismatch_rejected() {
     match verify_result {
         Err(VerificationError::InvalidStructure(msg))
             if msg.contains("claimed logup sum is not zero") => {}
-        Err(e) => panic!(
-            "output-mismatch harness: verify rejected for the wrong reason: {e:?}"
-        ),
+        Err(e) => panic!("output-mismatch harness: verify rejected for the wrong reason: {e:?}"),
         Ok(()) => panic!(
             "output-mismatch harness: verify accepted unexpectedly — \
              output binding is structural only (regression)"
@@ -1128,9 +1119,9 @@ fn harness_ristretto_output_mismatch_rejected() {
 #[test]
 #[ignore = "debug-only — pinpoints failing constraint when prove fails"]
 fn harness_cpuchip_debug_add64() {
-    use javm::interpreter::Interpreter;
-    use javm::instruction::Opcode;
     use javm::PVM_REGISTER_COUNT;
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
     use zkpvm::core::tracing::TracingPvm;
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 100;
@@ -1138,8 +1129,13 @@ fn harness_cpuchip_debug_add64() {
     let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();

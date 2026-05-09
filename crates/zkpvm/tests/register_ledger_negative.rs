@@ -35,8 +35,12 @@ use zkpvm::core::tracing::TracingPvm;
 ///   pc=6: Trap
 fn two_step_add_program() -> (Vec<u8>, Vec<u8>) {
     let code = vec![
-        Opcode::Add64 as u8, 0x10, 2,   // ra=0, rb=1, rd=2
-        Opcode::Add64 as u8, 0x22, 3,   // ra=2, rb=2, rd=3
+        Opcode::Add64 as u8,
+        0x10,
+        2, // ra=0, rb=1, rd=2
+        Opcode::Add64 as u8,
+        0x22,
+        3, // ra=2, rb=2, rd=3
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 1];
@@ -49,8 +53,13 @@ fn trace_two_step(rv0: u64, rv1: u64) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     regs[1] = rv1;
     let (code, bitmask) = two_step_add_program();
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
     );
     let mut tr = TracingPvm::new(pvm);
     let exit = tr.run();

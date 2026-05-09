@@ -247,7 +247,9 @@ pub fn manifest_from(path: Option<PathBuf>) -> (Manifest, PathBuf) {
                         break;
                     }
                 }
-                if applied { break; }
+                if applied {
+                    break;
+                }
             }
             if !applied {
                 eprintln!(
@@ -287,9 +289,7 @@ pub fn resolve_entry_path(
         (Some(_), Some(_)) => die(&format!(
             "'{name}': 'service' and 'path' are mutually exclusive — pick one",
         )),
-        (None, None) => die(&format!(
-            "'{name}': either 'service' or 'path' is required",
-        )),
+        (None, None) => die(&format!("'{name}': either 'service' or 'path' is required",)),
         (None, Some(s)) => die(&format!(
             "'{name}': 'service = {s:?}' requires registry resolution which lands \
              with the networking layer; use 'path' for now",
@@ -356,15 +356,17 @@ pub fn encode_on_start(
     name_ids: &BTreeMap<String, u32>,
     provides_map: &BTreeMap<String, Vec<u32>>,
 ) -> Vec<Vec<u8>> {
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let meta = vos::metadata::from_elf(elf_data);
     let mut out = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         let mut m = Msg::new(entry.msg.clone());
-        let handler_meta = meta
-            .as_ref()
-            .and_then(|am| am.messages.iter().find(|h| h.name.as_str() == entry.msg.as_str()));
+        let handler_meta = meta.as_ref().and_then(|am| {
+            am.messages
+                .iter()
+                .find(|h| h.name.as_str() == entry.msg.as_str())
+        });
         for (k, v) in &entry.args {
             let typed = handler_meta
                 .and_then(|h| h.fields.iter().find(|f| f.name.as_str() == k.as_str()))
@@ -380,8 +382,12 @@ pub fn encode_on_start(
             "vosx: on_start[{idx}] '{}' -> {}({})",
             agent_name,
             entry.msg,
-            entry.args.iter().map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>().join(", "),
+            entry
+                .args
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         out.push(payload);
         let _ = (name_ids, provides_map);
@@ -445,9 +451,9 @@ fn resolve_string_to_id(
             None => die(&format!(
                 "no actor or worker provides role '{role}' (referenced by '@{role}')",
             )),
-            Some(ids) if ids.is_empty() => die(&format!(
-                "no actor or worker provides role '{role}'",
-            )),
+            Some(ids) if ids.is_empty() => {
+                die(&format!("no actor or worker provides role '{role}'",))
+            }
             Some(ids) if ids.len() > 1 => die(&format!(
                 "role '{role}' is provided by {} entries; cannot resolve '@{role}' unambiguously",
                 ids.len(),
@@ -517,14 +523,20 @@ pub fn toml_to_value(
         toml::Value::Boolean(b) => Value::Bool(*b),
         toml::Value::String(s) => {
             if let Some(role) = s.strip_prefix('@') {
-                Value::U32(resolve_string_to_id(&format!("@{role}"), name_ids, provides_map))
+                Value::U32(resolve_string_to_id(
+                    &format!("@{role}"),
+                    name_ids,
+                    provides_map,
+                ))
             } else if let Some(&id) = name_ids.get(s) {
                 Value::U32(id)
             } else {
                 Value::Str(s.clone())
             }
         }
-        other => die(&format!("worker init value of unsupported TOML kind: {other:?}")),
+        other => die(&format!(
+            "worker init value of unsupported TOML kind: {other:?}"
+        )),
     }
 }
 

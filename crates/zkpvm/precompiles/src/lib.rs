@@ -36,6 +36,11 @@
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
+// Cryptographic code paths use index-based loops to mirror reference
+// implementations (RFC 7693 round constants, dalek's named lifetimes
+// across multiple impls). Allowed crate-wide so the workspace's
+// `-D warnings` gate doesn't reject this verbatim port.
+#![allow(clippy::needless_range_loop, clippy::needless_lifetimes)]
 
 extern crate alloc;
 
@@ -53,14 +58,12 @@ pub use blake2b::{blake2b_compress, blake2b_hash};
 #[cfg(feature = "ristretto")]
 pub mod scalar;
 #[cfg(feature = "ristretto")]
-pub use scalar::{
-    scalar_add_mod_l, scalar_from_bytes_mod_order_wide, scalar_mul_mod_l, Scalar,
-};
+pub use scalar::{Scalar, scalar_add_mod_l, scalar_from_bytes_mod_order_wide, scalar_mul_mod_l};
 
 #[cfg(feature = "ristretto")]
 pub mod ristretto;
 #[cfg(feature = "ristretto")]
 pub use ristretto::{
-    ristretto_point_add, ristretto_scalar_mult, RistrettoBasepointTable, RistrettoPoint,
-    RISTRETTO_BASEPOINT_TABLE,
+    RISTRETTO_BASEPOINT_TABLE, RistrettoBasepointTable, RistrettoPoint, ristretto_point_add,
+    ristretto_scalar_mult,
 };

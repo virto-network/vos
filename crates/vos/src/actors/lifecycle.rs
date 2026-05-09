@@ -10,7 +10,12 @@
 //! regardless.
 
 #[cfg(feature = "pvm")]
-use super::{Actor, Context, run::RunResult, codec::Decode, value::{TAG_DYNAMIC, FromDynamic}};
+use super::{
+    Actor, Context,
+    codec::Decode,
+    run::RunResult,
+    value::{FromDynamic, TAG_DYNAMIC},
+};
 #[cfg(feature = "pvm")]
 use alloc::vec::Vec;
 
@@ -75,10 +80,7 @@ pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
 /// Serializes the current (mutated) actor state. On service builds,
 /// also writes it to storage via hostcall. Returns the serialized bytes.
 #[cfg(feature = "pvm")]
-pub fn save_state<A: Actor>(
-    actor: &A,
-    _ctx: &Context<A>,
-) -> Vec<u8> {
+pub fn save_state<A: Actor>(actor: &A, _ctx: &Context<A>) -> Vec<u8> {
     let state = actor.encode();
 
     #[cfg(feature = "service")]
@@ -117,8 +119,16 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
 #[cfg(feature = "pvm")]
 pub fn fetch_raw(buf: &mut [u8]) -> usize {
     use crate::abi::pvm::ecall;
-    let n = ecall::ecall2(crate::abi::hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64);
-    if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
+    let n = ecall::ecall2(
+        crate::abi::hostcall::FETCH,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if n > 0 && n < buf.len() as u64 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 /// Build exit status bytes from context state.
@@ -152,7 +162,11 @@ pub fn emit_status<A: Actor>(ctx: &Context<A>) {
 #[cfg(feature = "service")]
 pub fn read_storage(key: &[u8], buf: &mut [u8]) -> usize {
     let n = crate::abi::pvm::hostcalls::read(key, buf);
-    if n > 0 && n < buf.len() as u64 { n as usize } else { 0 }
+    if n > 0 && n < buf.len() as u64 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 /// Read and decode a typed value from per-service storage.
@@ -160,7 +174,11 @@ pub fn read_storage(key: &[u8], buf: &mut [u8]) -> usize {
 pub fn load<T: super::codec::Decode>(key: &[u8]) -> Option<T> {
     let mut buf = [0u8; BUF_SIZE];
     let n = read_storage(key, &mut buf);
-    if n > 0 { Some(T::decode(&buf[..n])) } else { None }
+    if n > 0 {
+        Some(T::decode(&buf[..n]))
+    } else {
+        None
+    }
 }
 
 // ── Invoke ────────────────────────────────────────────────────────
@@ -187,11 +205,7 @@ pub enum InvokeResult {
 /// Encodes the `Msg` with the wire tag and delegates to `invoke_raw`.
 /// This is the preferred API for agents — no need to handle TAG_DYNAMIC manually.
 #[cfg(feature = "pvm")]
-pub fn invoke(
-    service_id: u32,
-    message: &super::value::Msg,
-    state: &[u8],
-) -> InvokeResult {
+pub fn invoke(service_id: u32, message: &super::value::Msg, state: &[u8]) -> InvokeResult {
     let encoded = super::codec::Encode::encode(message);
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(super::value::TAG_DYNAMIC);
@@ -204,11 +218,7 @@ pub fn invoke(
 /// Packs the invoke input `[state_len:4][state][message]`,
 /// calls the invoke hostcall, and unpacks the output.
 #[cfg(feature = "pvm")]
-pub fn invoke_raw(
-    service_id: u32,
-    message: &[u8],
-    state: &[u8],
-) -> InvokeResult {
+pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult {
     let total = 4 + state.len() + message.len();
     let mut input = alloc::vec![0u8; total];
     input[0..4].copy_from_slice(&(state.len() as u32).to_le_bytes());
@@ -219,7 +229,7 @@ pub fn invoke_raw(
     let mut output = [0u8; BUF_SIZE];
     let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
-    use super::run::{STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
+    use super::run::{STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
 
     // Short output = error status byte only (no state/reply envelope)
     if n < 5 {
@@ -228,12 +238,21 @@ pub fn invoke_raw(
                 STATUS_PANICKED => InvokeResult::Panicked,
                 STATUS_NOT_FOUND => InvokeResult::NotFound,
                 STATUS_OOG => InvokeResult::OutOfGas,
-                STATUS_DONE => InvokeResult::Done { state: Vec::new(), reply: Vec::new() },
-                STATUS_YIELDED => InvokeResult::Yielded { state: Vec::new(), reply: Vec::new() },
+                STATUS_DONE => InvokeResult::Done {
+                    state: Vec::new(),
+                    reply: Vec::new(),
+                },
+                STATUS_YIELDED => InvokeResult::Yielded {
+                    state: Vec::new(),
+                    reply: Vec::new(),
+                },
                 other => InvokeResult::Error(other),
             };
         }
-        return InvokeResult::Done { state: Vec::new(), reply: Vec::new() };
+        return InvokeResult::Done {
+            state: Vec::new(),
+            reply: Vec::new(),
+        };
     }
 
     let state_len = u32::from_le_bytes([output[1], output[2], output[3], output[4]]) as usize;
@@ -268,11 +287,7 @@ pub fn invoke_raw(
 /// snapshot — a `Yielded` result here always means a real
 /// `yield_now` / `sleep` commit, not an in-flight query.
 #[cfg(feature = "pvm")]
-pub fn dispatch_one<A: Actor>(
-    raw: &[u8],
-    actor: &mut A,
-    ctx: &mut Context<A>,
-) -> DispatchResult {
+pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -> DispatchResult {
     // Decode message: if first byte is TAG_DYNAMIC, decode as dynamic Msg → FromDynamic;
     // otherwise decode as typed A::Message directly.
     let msg = if !raw.is_empty() && raw[0] == TAG_DYNAMIC {
@@ -292,7 +307,11 @@ pub fn dispatch_one<A: Actor>(
         }
         RunResult::Complete(stop) => {
             ctx.flush_effects();
-            if stop { DispatchResult::Stopped } else { DispatchResult::Continue }
+            if stop {
+                DispatchResult::Stopped
+            } else {
+                DispatchResult::Continue
+            }
         }
     }
 }

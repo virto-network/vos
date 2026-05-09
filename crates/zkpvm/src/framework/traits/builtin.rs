@@ -6,20 +6,20 @@ use crate::trace::eval::TraceEval;
 use crate::lookups::ComponentLookupElements;
 
 #[cfg(feature = "prover")]
-use stwo::{
-    core::{
-        fields::{m31::BaseField, qm31::SecureField},
-        ColumnVec,
-    },
-    prover::{
-        backend::simd::SimdBackend,
-        poly::{circle::CircleEvaluation, BitReversedOrder},
-    },
-};
-#[cfg(feature = "prover")]
 use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
 #[cfg(feature = "prover")]
 use crate::{lookups::AllLookupElements, side_note::SideNote};
+#[cfg(feature = "prover")]
+use stwo::{
+    core::{
+        ColumnVec,
+        fields::{m31::BaseField, qm31::SecureField},
+    },
+    prover::{
+        backend::simd::SimdBackend,
+        poly::{BitReversedOrder, circle::CircleEvaluation},
+    },
+};
 
 /// Verifier-side surface of a chip: column types, constraint-degree bound,
 /// lookup-element bag, and the constraint emitter.  Compiled both prover-
@@ -54,11 +54,7 @@ pub trait BuiltInProverComponent: BuiltInComponent {
     /// Default: emits no preprocessed columns.  Chips that need a
     /// non-empty preprocessed trace (Blake2bChip, BitwiseLookupChip,
     /// PowerOfTwoChip, RangeMultiplicity256) override this.
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        _side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         FinalizedTrace::empty()
     }
 

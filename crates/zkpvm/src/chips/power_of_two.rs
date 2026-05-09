@@ -3,13 +3,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -22,16 +19,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{PowerOfTwoLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::PowerOfTwoLookupElements};
 
 /// PowerOfTwoChip: 64-row lookup table proving val_d = 2^shift_amount.
 ///
@@ -124,7 +118,9 @@ impl BuiltInProverComponent for PowerOfTwoChip {
         }
         // Use pre-accumulated counts from SideNote
         for (i, &c) in side_note.power_of_two_counts.iter().enumerate() {
-            if i < 64 { counts[i] = c; }
+            if i < 64 {
+                counts[i] = c;
+            }
         }
 
         for row in 0..64usize {
@@ -150,7 +146,8 @@ impl BuiltInProverComponent for PowerOfTwoChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
-        let shift_amount = crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
+        let shift_amount =
+            crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
         let power_val = crate::trace::original_base_column!(component_trace, Column::PowerVal);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
@@ -158,12 +155,7 @@ impl BuiltInProverComponent for PowerOfTwoChip {
         let mut tuple: Vec<_> = vec![shift_amount[0].clone()];
         tuple.extend_from_slice(&power_val);
 
-        logup.add_to_relation_with(
-            pow2_lookup,
-            [mult[0].clone()],
-            |[m]| (-m).into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(pow2_lookup, [mult[0].clone()], |[m]| (-m).into(), &tuple);
 
         logup.finalize()
     }

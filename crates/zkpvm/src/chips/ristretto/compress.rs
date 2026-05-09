@@ -152,11 +152,7 @@ pub fn conditional_negate(a: &Bytes, flag: u8) -> Bytes {
 
 /// Conditional select: returns `b` if `flag == 0`, else `a`.
 pub fn conditional_select(a: &Bytes, b: &Bytes, flag: u8) -> Bytes {
-    if flag == 0 {
-        *b
-    } else {
-        *a
-    }
+    if flag == 0 { *b } else { *a }
 }
 
 /// Per-call witness output of the host-side compress chain.  Every
@@ -278,13 +274,33 @@ pub fn compute_compress_witness(p: &ExtendedPoint) -> CompressWitness {
     let s_can = conditional_negate(&s, s_neg_flag);
 
     CompressWitness {
-        z_plus_y, z_minus_y, u1, u2, u2_sq, u1_u2_sq,
-        inv_sqrt, inv_sqrt_sq,
-        i1, i2, i2_t, z_inv, t_z_inv, rotate,
-        i_x, i_y, enchanted_denominator: enchanted,
-        x_post_rotate, y_post_rotate, den_inv,
-        x_z_inv, y_negate_flag, y_neg,
-        z_minus_y_neg, s, s_neg_flag, s_can,
+        z_plus_y,
+        z_minus_y,
+        u1,
+        u2,
+        u2_sq,
+        u1_u2_sq,
+        inv_sqrt,
+        inv_sqrt_sq,
+        i1,
+        i2,
+        i2_t,
+        z_inv,
+        t_z_inv,
+        rotate,
+        i_x,
+        i_y,
+        enchanted_denominator: enchanted,
+        x_post_rotate,
+        y_post_rotate,
+        den_inv,
+        x_z_inv,
+        y_negate_flag,
+        y_neg,
+        z_minus_y_neg,
+        s,
+        s_neg_flag,
+        s_can,
         out_bytes: s_can,
     }
 }
@@ -402,11 +418,9 @@ mod tests {
         // representative.  Simpler: trust the comb_table module's
         // `ed25519_basepoint_extended()` factory.
         use crate::chips::ristretto::comb_table::{
-            ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
+            CombTable, NUM_WINDOWS, ed25519_basepoint_extended,
         };
-        use crate::chips::ristretto::point::{
-            point_add_rows, point_identity, ExtendedPoint,
-        };
+        use crate::chips::ristretto::point::{ExtendedPoint, point_add_rows, point_identity};
 
         for k in &[1u64, 7, 0x1234_5678, 0xdead_beef_cafe_babe] {
             let scalar = Scalar::from(*k);
@@ -443,11 +457,7 @@ mod tests {
             };
             let check = field::mul(&witness.inv_sqrt_sq, &witness.u1_u2_sq);
             assert_eq!(check, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
-            assert_eq!(
-                witness.s_can[0] & 1,
-                0,
-                "canonical s must have low bit = 0"
-            );
+            assert_eq!(witness.s_can[0] & 1, 0, "canonical s must have low bit = 0");
         }
     }
 

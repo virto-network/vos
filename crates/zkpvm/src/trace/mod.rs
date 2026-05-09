@@ -16,6 +16,6 @@ mod utils_external;
 // path #[macro_export] puts them at).  Verifier-facing macros stay always-
 // compiled; the prover-only ones (defined alongside ComponentTrace) follow
 // the gate.
-pub use crate::{preprocessed_trace_eval, trace_eval, trace_eval_next_row};
 #[cfg(feature = "prover")]
 pub use crate::{original_base_column, preprocessed_base_column};
+pub use crate::{preprocessed_trace_eval, trace_eval, trace_eval_next_row};

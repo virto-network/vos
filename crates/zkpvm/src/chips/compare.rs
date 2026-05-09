@@ -14,13 +14,10 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -34,16 +31,16 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{CompareLookupElements, Range256LookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{CompareLookupElements, Range256LookupElements},
+};
 
 pub struct CompareChip;
 
@@ -97,13 +94,9 @@ impl BuiltInComponent for CompareChip {
         // B3 audit: cmp_lt_flag + cmp_carry[i] booleans enforced
         // unconditionally — trace fill defaults both to 0 on padding.
         let is_real = E::F::one() - is_padding[0].clone();
-        eval.add_constraint(
-            cmp_lt_flag[0].clone() * (E::F::one() - cmp_lt_flag[0].clone())
-        );
+        eval.add_constraint(cmp_lt_flag[0].clone() * (E::F::one() - cmp_lt_flag[0].clone()));
         for i in 0..WORD_SIZE {
-            eval.add_constraint(
-                cmp_carry[i].clone() * (E::F::one() - cmp_carry[i].clone())
-            );
+            eval.add_constraint(cmp_carry[i].clone() * (E::F::one() - cmp_carry[i].clone()));
         }
 
         // ── Subtraction carry chain ──
@@ -112,18 +105,24 @@ impl BuiltInComponent for CompareChip {
         let f256: E::F = E::F::from(BaseField::from(256));
         let f255: E::F = E::F::from(BaseField::from(255));
         for i in 0..WORD_SIZE {
-            let carry_in = if i == 0 { E::F::one() } else { cmp_carry[i - 1].clone() };
+            let carry_in = if i == 0 {
+                E::F::one()
+            } else {
+                cmp_carry[i - 1].clone()
+            };
             eval.add_constraint(
-                is_real.clone() * (
-                    cmp_sub_result[i].clone() + cmp_carry[i].clone() * f256.clone()
-                    - val_b[i].clone() - f255.clone() + val_d[i].clone() - carry_in
-                )
+                is_real.clone()
+                    * (cmp_sub_result[i].clone() + cmp_carry[i].clone() * f256.clone()
+                        - val_b[i].clone()
+                        - f255.clone()
+                        + val_d[i].clone()
+                        - carry_in),
             );
         }
         // cmp_lt_flag = 1 - cmp_carry[7]
         eval.add_constraint(
             is_real.clone()
-                * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one())
+                * (cmp_lt_flag[0].clone() + cmp_carry[WORD_SIZE - 1].clone() - E::F::one()),
         );
 
         // ── Range256 emissions on cmp_sub_result bytes ──
@@ -172,7 +171,8 @@ impl BuiltInProverComponent for CompareChip {
             return trace.finalize_bit_reversed();
         }
 
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
+        let log_size =
+            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -214,7 +214,8 @@ impl BuiltInProverComponent for CompareChip {
         let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let cmp_lt_flag = crate::trace::original_base_column!(component_trace, Column::CmpLtFlag);
-        let cmp_sub_result = crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
+        let cmp_sub_result =
+            crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
         let _ = side_note;

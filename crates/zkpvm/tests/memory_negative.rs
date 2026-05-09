@@ -21,8 +21,18 @@ use zkpvm::core::tracing::TracingPvm;
 /// then load that byte into regs[2].  Trap follows.
 fn store_load_program() -> (Vec<u8>, Vec<u8>) {
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,  // ra=0 src, rb=1 base, imm=0
-        Opcode::LoadIndU8  as u8, 0x12, 0, 0, 0, 0,  // ra=2 dst, rb=1 base, imm=0
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0, // ra=0 src, rb=1 base, imm=0
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0, // ra=2 dst, rb=1 base, imm=0
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
@@ -35,7 +45,15 @@ fn trace_store_load(value: u8, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     regs[1] = addr as u64;
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_program();
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tr = TracingPvm::new(pvm);
     let exit = tr.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -134,8 +152,18 @@ fn store_forged_address_rejected() {
 
 fn store_load_u64_program() -> (Vec<u8>, Vec<u8>) {
     let code = vec![
-        Opcode::StoreIndU64 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndU64 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU64 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndU64 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
@@ -148,7 +176,15 @@ fn trace_store_load_u64(value: u64, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep
     regs[1] = addr as u64;
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_u64_program();
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tr = TracingPvm::new(pvm);
     let exit = tr.run();
     assert_eq!(exit, javm::ExitReason::Trap);

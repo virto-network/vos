@@ -53,8 +53,9 @@ fn prove_unconditional_jump() {
     // signed_offset = target - pc = 3 - 0 = 3.
     // Encode 3 as 2-byte LE: [3, 0]
     let code = vec![
-        Opcode::Jump as u8,  // offset 0
-        3, 0,                // offset 1-2: signed_offset = 3 (2 bytes LE)
+        Opcode::Jump as u8, // offset 0
+        3,
+        0,                   // offset 1-2: signed_offset = 3 (2 bytes LE)
         Opcode::Add64 as u8, // offset 3: Add64
         0x10,                // ra=0, rb=1
         2,                   // rd=2
@@ -62,7 +63,15 @@ fn prove_unconditional_jump() {
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap); // Trap
@@ -91,13 +100,21 @@ fn prove_fallthrough() {
     let code = vec![
         Opcode::Fallthrough as u8, // offset 0
         Opcode::Add64 as u8,       // offset 1
-        0x10,                       // ra=0, rb=1
-        2,                          // rd=2
+        0x10,                      // ra=0, rb=1
+        2,                         // rd=2
         Opcode::Trap as u8,        // offset 4
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -131,7 +148,15 @@ fn fallthrough_forged_next_pc_rejected() {
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
@@ -162,7 +187,15 @@ fn prove_unlikely() {
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -200,14 +233,23 @@ fn load_imm_jump_ind_positive_smoke() {
     regs[0] = 2; // honest target = jump_table[(2+0)/2 - 1] = jump_table[0] = 3
 
     let code = vec![
-        Opcode::LoadImmJumpInd as u8, 0x01, 0,
-        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+        Opcode::LoadImmJumpInd as u8,
+        0x01,
+        0,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 1, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![3u32, 5u32],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -215,8 +257,8 @@ fn load_imm_jump_ind_positive_smoke() {
     assert_eq!(steps[0].opcode, Opcode::LoadImmJumpInd);
     assert_eq!(steps[0].next_pc, 3);
 
-    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
-        .with_jump_table(vec![3u32, 5u32]);
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code, bitmask).with_jump_table(vec![3u32, 5u32]);
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
@@ -228,14 +270,23 @@ fn load_imm_jump_ind_forged_target_rejected() {
     regs[0] = 2; // honest target pc=3
 
     let code = vec![
-        Opcode::LoadImmJumpInd as u8, 0x01, 0,
-        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+        Opcode::LoadImmJumpInd as u8,
+        0x01,
+        0,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 1, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![3u32, 5u32],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -246,8 +297,8 @@ fn load_imm_jump_ind_forged_target_rejected() {
     steps[0].next_pc = 5;
     steps[1].pc = 5;
 
-    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
-        .with_jump_table(vec![3u32, 5u32]);
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code, bitmask).with_jump_table(vec![3u32, 5u32]);
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
@@ -258,14 +309,23 @@ fn jump_ind_positive_smoke() {
     regs[0] = 2; // jump_table[0] index → target pc=3.
 
     let code = vec![
-        Opcode::JumpInd as u8, 0, 0,
-        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+        Opcode::JumpInd as u8,
+        0,
+        0,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 1, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![3u32, 5u32],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -273,8 +333,8 @@ fn jump_ind_positive_smoke() {
     assert_eq!(steps[0].opcode, Opcode::JumpInd);
     assert_eq!(steps[0].next_pc, 3);
 
-    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
-        .with_jump_table(vec![3u32, 5u32]);
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code, bitmask).with_jump_table(vec![3u32, 5u32]);
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
@@ -286,14 +346,23 @@ fn jump_ind_forged_target_rejected() {
     regs[0] = 2; // honest target pc=3.
 
     let code = vec![
-        Opcode::JumpInd as u8, 0, 0,
-        Opcode::Trap as u8, Opcode::Trap as u8, Opcode::Trap as u8,
+        Opcode::JumpInd as u8,
+        0,
+        0,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 1, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![3u32, 5u32], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![3u32, 5u32],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -307,8 +376,8 @@ fn jump_ind_forged_target_rejected() {
     steps[0].next_pc = 5;
     steps[1].pc = 5;
 
-    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask)
-        .with_jump_table(vec![3u32, 5u32]);
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code, bitmask).with_jump_table(vec![3u32, 5u32]);
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
@@ -338,15 +407,21 @@ fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
     // Both are valid BB starts; both decode to opcode=Trap.
     let code = vec![
         Opcode::Jump as u8, // pc=0
-        4, 0,                // pc=1-2: signed_offset = 4 (2 bytes LE)
+        4,
+        0,                  // pc=1-2: signed_offset = 4 (2 bytes LE)
         Opcode::Trap as u8, // pc=3: would-be-fallthrough Trap (BB start)
         Opcode::Trap as u8, // pc=4: honest jump target (BB start)
     ];
     let bitmask = vec![1, 0, 0, 1, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -385,14 +460,21 @@ fn trap_followed_by_trap_clone_rejected_by_terminal_constraint() {
 
     let code = vec![
         Opcode::Fallthrough as u8,
-        Opcode::Add64 as u8, 0x10, 2,
+        Opcode::Add64 as u8,
+        0x10,
+        2,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
@@ -432,7 +514,15 @@ fn trap_mid_trace_rejected() {
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
@@ -467,7 +557,15 @@ fn unlikely_forged_next_pc_rejected() {
     ];
     let bitmask = vec![1, 1, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
@@ -491,13 +589,23 @@ fn prove_branch_eq_taken() {
     // This tests that the branch mechanism works even when target == fallthrough.
     let code = vec![
         Opcode::BranchEq as u8, // offset 0
-        0x10,                    // ra=0, rb=1
-        5, 0, 0,                 // signed_offset = 5 (target = offset 5)
-        Opcode::Trap as u8,     // offset 5
+        0x10,                   // ra=0, rb=1
+        5,
+        0,
+        0,                  // signed_offset = 5 (target = offset 5)
+        Opcode::Trap as u8, // offset 5
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -520,13 +628,23 @@ fn prove_branch_eq_not_taken() {
     // Sequential next_pc = pc + 1 + skip = 0 + 1 + 4 = 5
     let code = vec![
         Opcode::BranchEq as u8, // offset 0
-        0x10,                    // ra=0, rb=1
-        10, 0, 0,                // offset (irrelevant since not taken)
-        Opcode::Trap as u8,     // offset 5
+        0x10,                   // ra=0, rb=1
+        10,
+        0,
+        0,                  // offset (irrelevant since not taken)
+        Opcode::Trap as u8, // offset 5
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -558,9 +676,9 @@ fn prove_loop_add() {
     // φ[3] = 0 (zero register for comparison)
 
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[0] = 0;  // accumulator
-    regs[1] = 3;  // counter
-    regs[2] = 1;  // constant 1
+    regs[0] = 0; // accumulator
+    regs[1] = 3; // counter
+    regs[2] = 1; // constant 1
 
     // Add64(ra=0,rb=2,rd=0): φ[0] = φ[0] + φ[2]
     // reg_byte = 0 | (2<<4) = 0x20, rd = 0
@@ -572,15 +690,30 @@ fn prove_loop_add() {
     // -6 as signed 3-byte LE: 0xFA, 0xFF, 0xFF
 
     let code = vec![
-        Opcode::Add64 as u8, 0x20, 0,       // offset 0: Add64 φ[0]=φ[0]+φ[2]
-        Opcode::Sub64 as u8, 0x21, 1,       // offset 3: Sub64 φ[1]=φ[1]-φ[2]
-        Opcode::BranchNe as u8, 0x31,       // offset 6: BranchNe φ[1] != φ[3]
-        0xFA_u8, 0xFF, 0xFF,                 // offset = -6 (signed, 3 bytes LE)
-        Opcode::Trap as u8,                  // offset 11
+        Opcode::Add64 as u8,
+        0x20,
+        0, // offset 0: Add64 φ[0]=φ[0]+φ[2]
+        Opcode::Sub64 as u8,
+        0x21,
+        1, // offset 3: Sub64 φ[1]=φ[1]-φ[2]
+        Opcode::BranchNe as u8,
+        0x31, // offset 6: BranchNe φ[1] != φ[3]
+        0xFA_u8,
+        0xFF,
+        0xFF,               // offset = -6 (signed, 3 bytes LE)
+        Opcode::Trap as u8, // offset 11
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -619,8 +752,13 @@ fn prove_sbrk_terminal() {
     let code = vec![Opcode::Sbrk as u8];
     let bitmask = vec![1];
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
@@ -643,8 +781,13 @@ fn sbrk_followed_by_clone_rejected_by_terminal_constraint() {
     let code = vec![Opcode::Sbrk as u8];
     let bitmask = vec![1];
     let pvm = Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs,
-        vec![0u8; 4 * 1024 * 1024], 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();

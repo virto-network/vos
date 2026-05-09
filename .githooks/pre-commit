@@ -5,7 +5,9 @@
 set -e
 
 echo "→ pre-commit: fmt"
-cargo fmt --all -- --check
+# `--all` follows path-deps into the sibling jar/grey tree and the
+# excluded actor crates, so we stick with the workspace-only run.
+cargo fmt -- --check
 
 echo "→ pre-commit: clippy"
 # Deferred architectural warnings — silenced so unrelated commits aren't

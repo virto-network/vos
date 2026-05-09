@@ -41,10 +41,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -58,20 +58,19 @@ use crate::trace::{
 };
 
 use crate::chips::ristretto::field_op_constraints;
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{
-        RistrettoCombConsumerRegisterFileLookupElements,
-        RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombFinalAccLookupElements,
-    },
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{
+        RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
+        RistrettoCombFinalAccLookupElements,
+    },
+};
 
 pub struct RistrettoFixedBaseConsumerChip;
 
@@ -262,12 +261,9 @@ impl Default for ConsumerRow {
 /// Build the per-row witness stream from the side_note.
 #[cfg(feature = "prover")]
 fn build_consumer_rows(side_note: &SideNote) -> Vec<ConsumerRow> {
-    use crate::chips::ristretto::comb_table::{
-        ed25519_basepoint_extended, CombTable, NUM_WINDOWS,
-    };
+    use crate::chips::ristretto::comb_table::{CombTable, NUM_WINDOWS, ed25519_basepoint_extended};
     use crate::chips::ristretto::point::{
-        point_add_rows_chained, point_identity, ExtendedPoint, ExtendedPointSources,
-        ED25519_TWO_D,
+        ED25519_TWO_D, ExtendedPoint, ExtendedPointSources, point_add_rows_chained, point_identity,
     };
     use crate::chips::ristretto::witness::fill_input;
 
@@ -492,10 +488,8 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
             trace_eval,
             PreprocessedColumn::IsFinalAccProducer
         );
-        let final_acc_call_idx = crate::trace::preprocessed_trace_eval!(
-            trace_eval,
-            PreprocessedColumn::FinalAccCallIdx
-        );
+        let final_acc_call_idx =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FinalAccCallIdx);
         let final_acc_coord_kind = crate::trace::preprocessed_trace_eval!(
             trace_eval,
             PreprocessedColumn::FinalAccCoordKind
@@ -548,7 +542,8 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
         // ── IsCoordInput flag rules ──
         // Boolean.
         eval.add_constraint(
-            is_coord_input[0].clone() * (E::F::from(BaseField::from(1u32)) - is_coord_input[0].clone()),
+            is_coord_input[0].clone()
+                * (E::F::from(BaseField::from(1u32)) - is_coord_input[0].clone()),
         );
         // IsCoordInput rows must be IsReal + IsInput.
         eval.add_constraint(
@@ -647,11 +642,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
 impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = log_size_for(consumer_n_rows(side_note));
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -691,17 +682,9 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
                     coord_kind = FINAL_ACC_COORD_KINDS[slot];
                 }
             }
-            trace.fill_columns(
-                row,
-                is_final_acc,
-                PreprocessedColumn::IsFinalAccProducer,
-            );
+            trace.fill_columns(row, is_final_acc, PreprocessedColumn::IsFinalAccProducer);
             trace.fill_columns(row, call_idx, PreprocessedColumn::FinalAccCallIdx);
-            trace.fill_columns(
-                row,
-                coord_kind,
-                PreprocessedColumn::FinalAccCoordKind,
-            );
+            trace.fill_columns(row, coord_kind, PreprocessedColumn::FinalAccCoordKind);
         }
         trace.finalize_bit_reversed()
     }
@@ -731,18 +714,14 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let coord: &RistrettoCombCoordBoundaryLookupElements = lookup_elements.as_ref();
-        let regfile: &RistrettoCombConsumerRegisterFileLookupElements =
-            lookup_elements.as_ref();
+        let regfile: &RistrettoCombConsumerRegisterFileLookupElements = lookup_elements.as_ref();
         let final_acc: &RistrettoCombFinalAccLookupElements = lookup_elements.as_ref();
 
         let is_coord_input =
             crate::trace::original_base_column!(component_trace, Column::IsCoordInput);
-        let call_idx =
-            crate::trace::original_base_column!(component_trace, Column::CallIdx);
-        let window_idx =
-            crate::trace::original_base_column!(component_trace, Column::WindowIdx);
-        let coord_kind =
-            crate::trace::original_base_column!(component_trace, Column::CoordKind);
+        let call_idx = crate::trace::original_base_column!(component_trace, Column::CallIdx);
+        let window_idx = crate::trace::original_base_column!(component_trace, Column::WindowIdx);
+        let coord_kind = crate::trace::original_base_column!(component_trace, Column::CoordKind);
 
         let is_final_acc_producer_pp = crate::trace::preprocessed_base_column!(
             component_trace,
@@ -765,22 +744,14 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
             component_trace,
             PreprocessedColumn::RowIndexHi
         );
-        let byte_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::ByteIdx
-        );
-        let producer_emission_mult = crate::trace::original_base_column!(
-            component_trace,
-            Column::ProducerEmissionMult
-        );
-        let consumer_a_gate_h = crate::trace::original_base_column!(
-            component_trace,
-            Column::ConsumerAGateH
-        );
-        let consumer_b_gate_h = crate::trace::original_base_column!(
-            component_trace,
-            Column::ConsumerBGateH
-        );
+        let byte_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ByteIdx);
+        let producer_emission_mult =
+            crate::trace::original_base_column!(component_trace, Column::ProducerEmissionMult);
+        let consumer_a_gate_h =
+            crate::trace::original_base_column!(component_trace, Column::ConsumerAGateH);
+        let consumer_b_gate_h =
+            crate::trace::original_base_column!(component_trace, Column::ConsumerBGateH);
         let a_cols = crate::trace::original_base_column!(component_trace, Column::FieldA);
         let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let out_cols = crate::trace::original_base_column!(component_trace, Column::FieldOut);
@@ -962,5 +933,9 @@ fn fill_consumer_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Consum
     let pm: u32 = r.producer_multiplicity as u32;
     trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
     let emission = if real_b && !out_b { pm } else { 0 };
-    trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
+    trace.fill_columns(
+        row_i,
+        BaseField::from(emission),
+        Column::ProducerEmissionMult,
+    );
 }

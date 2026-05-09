@@ -1,9 +1,6 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::{
-    air::Component,
-    channel::Blake2sChannel,
-    fields::qm31::SecureField,
-    pcs::TreeVec,
+    air::Component, channel::Blake2sChannel, fields::qm31::SecureField, pcs::TreeVec,
 };
 use stwo_constraint_framework::{FrameworkEval, InfoEvaluator, TraceLocationAllocator};
 
@@ -16,24 +13,20 @@ use crate::{
 };
 
 #[cfg(feature = "prover")]
-use stwo::{
-    core::{
-        fields::m31::BaseField,
-        poly::circle::CanonicCoset,
-        ColumnVec,
-    },
-    prover::{
-        backend::simd::SimdBackend,
-        poly::{circle::CircleEvaluation, BitReversedOrder},
-        ComponentProver,
-    },
-};
-#[cfg(feature = "prover")]
-use crate::trace::component::ComponentTrace;
-#[cfg(feature = "prover")]
 use super::builtin::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+#[cfg(feature = "prover")]
+use crate::trace::component::ComponentTrace;
+#[cfg(feature = "prover")]
+use stwo::{
+    core::{ColumnVec, fields::m31::BaseField, poly::circle::CanonicCoset},
+    prover::{
+        ComponentProver,
+        backend::simd::SimdBackend,
+        poly::{BitReversedOrder, circle::CircleEvaluation},
+    },
+};
 
 /// Verifier-side dyn-safe wrapper around `BuiltInComponent`.  All methods
 /// here are verifier-side: column-size queries, lookup drawing, and the
@@ -206,11 +199,8 @@ where
         let original_trace = <C as BuiltInProverComponent>::generate_main_trace(self, side_note);
 
         let log_size = original_trace.log_size;
-        let preprocessed_trace = <C as BuiltInProverComponent>::generate_preprocessed_trace(
-            self,
-            log_size,
-            side_note,
-        );
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
 
         ComponentTrace {
             log_size,
@@ -223,11 +213,8 @@ where
         let original_trace =
             <C as BuiltInProverComponent>::generate_main_trace_immut(self, side_note);
         let log_size = original_trace.log_size;
-        let preprocessed_trace = <C as BuiltInProverComponent>::generate_preprocessed_trace(
-            self,
-            log_size,
-            side_note,
-        );
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
         ComponentTrace {
             log_size,
             preprocessed_trace: preprocessed_trace.cols,
@@ -286,8 +273,11 @@ where
             .iter()
             .map(|col| {
                 let domain = CanonicCoset::new(log_size).circle_domain();
-                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, col.clone())
-                    .interpolate()
+                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    col.clone(),
+                )
+                .interpolate()
             })
             .collect();
         let original_polys: Vec<_> = component_trace
@@ -295,8 +285,11 @@ where
             .iter()
             .map(|col| {
                 let domain = CanonicCoset::new(log_size).circle_domain();
-                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, col.clone())
-                    .interpolate()
+                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    col.clone(),
+                )
+                .interpolate()
             })
             .collect();
         let interaction_polys: Vec<_> = interaction_trace

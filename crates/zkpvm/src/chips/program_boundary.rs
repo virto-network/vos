@@ -3,13 +3,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -22,16 +19,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{ProgramExecutionLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::ProgramExecutionLookupElements};
 
 /// ProgramBoundaryChip: closes the program execution lookup loop.
 ///
@@ -142,33 +136,26 @@ impl BuiltInProverComponent for ProgramBoundaryChip {
 
         let prog_exec: &ProgramExecutionLookupElements = lookup_elements.as_ref();
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let init_ts = crate::trace::original_base_column!(component_trace, Column::InitialTimestamp);
+        let init_ts =
+            crate::trace::original_base_column!(component_trace, Column::InitialTimestamp);
         let init_pc = crate::trace::original_base_column!(component_trace, Column::InitialPc);
-        let final_next_ts = crate::trace::original_base_column!(component_trace, Column::FinalNextTimestamp);
-        let final_next_pc = crate::trace::original_base_column!(component_trace, Column::FinalNextPc);
+        let final_next_ts =
+            crate::trace::original_base_column!(component_trace, Column::FinalNextTimestamp);
+        let final_next_pc =
+            crate::trace::original_base_column!(component_trace, Column::FinalNextPc);
 
         // Produce (initial_timestamp, initial_pc) — seeds step 0
         {
             let mut tuple: Vec<_> = init_ts.to_vec();
             tuple.extend_from_slice(&init_pc);
-            logup.add_to_relation_with(
-                prog_exec,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &tuple,
-            );
+            logup.add_to_relation_with(prog_exec, [is_real[0].clone()], |[r]| r.into(), &tuple);
         }
 
         // Consume (final_next_timestamp, final_next_pc) — absorbs last step's output
         {
             let mut tuple: Vec<_> = final_next_ts.to_vec();
             tuple.extend_from_slice(&final_next_pc);
-            logup.add_to_relation_with(
-                prog_exec,
-                [is_real[0].clone()],
-                |[r]| (-r).into(),
-                &tuple,
-            );
+            logup.add_to_relation_with(prog_exec, [is_real[0].clone()], |[r]| (-r).into(), &tuple);
         }
 
         logup.finalize()

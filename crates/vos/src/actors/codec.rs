@@ -19,11 +19,17 @@ pub trait Decode: Sized {
 impl<T> Encode for T
 where
     T: for<'a> rkyv::Serialize<
-        rkyv::api::high::HighSerializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'a>, rkyv::rancor::Error>,
-    >,
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        >,
 {
     fn encode(&self) -> Vec<u8> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self).unwrap().to_vec()
+        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .unwrap()
+            .to_vec()
     }
 }
 

@@ -24,10 +24,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -40,13 +40,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{framework::BuiltInComponent, lookups::RistrettoCombLookupElements};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::RistrettoCombLookupElements};
 
 pub struct RistrettoCombTableChip;
 
@@ -128,13 +128,9 @@ impl BuiltInComponent for RistrettoCombTableChip {
 impl BuiltInProverComponent for RistrettoCombTableChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        _side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         use crate::chips::ristretto::comb_table::{
-            ed25519_basepoint_extended, CombTable, NUM_WINDOWS, WINDOW_SIZE,
+            CombTable, NUM_WINDOWS, WINDOW_SIZE, ed25519_basepoint_extended,
         };
         let log_size = COMB_LOG_SIZE.max(LOG_N_LANES);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
@@ -183,10 +179,8 @@ impl BuiltInProverComponent for RistrettoCombTableChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let comb: &RistrettoCombLookupElements = lookup_elements.as_ref();
-        let window_idx = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::WindowIdx
-        );
+        let window_idx =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::WindowIdx);
         let scalar_window = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::ScalarWindow
@@ -195,8 +189,7 @@ impl BuiltInProverComponent for RistrettoCombTableChip {
         let y = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Y);
         let z = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Z);
         let t = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::T);
-        let mult =
-            crate::trace::original_base_column!(component_trace, Column::Multiplicity);
+        let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         let mut tuple: Vec<_> = Vec::with_capacity(1 + 1 + 32 * 4);
         tuple.push(window_idx[0].clone());

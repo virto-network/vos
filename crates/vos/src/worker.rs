@@ -103,7 +103,8 @@ mod host {
     type CreateFn = unsafe extern "C" fn(args_ptr: *const u8, args_len: usize) -> *mut ();
     type DispatchFn = unsafe extern "C" fn(state: *mut (), msg: *const u8, msg_len: usize);
     type PollFn = unsafe extern "C" fn(state: *mut ()) -> WorkerPollResult;
-    type PendingEffectFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *const u8, out_len: *mut usize);
+    type PendingEffectFn =
+        unsafe extern "C" fn(state: *mut (), out_ptr: *mut *const u8, out_len: *mut usize);
     type ProvideResultFn = unsafe extern "C" fn(state: *mut (), ptr: *const u8, len: usize);
     type DropFn = unsafe extern "C" fn(state: *mut ());
     type FreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize);
@@ -137,25 +138,35 @@ mod host {
             };
 
             unsafe {
-                let meta_fn = *lib.get::<MetaFn>(b"vos_worker_meta")
+                let meta_fn = *lib
+                    .get::<MetaFn>(b"vos_worker_meta")
                     .map_err(|e| format!("missing vos_worker_meta: {e}"))?;
-                let create_fn = *lib.get::<CreateFn>(b"vos_worker_create")
+                let create_fn = *lib
+                    .get::<CreateFn>(b"vos_worker_create")
                     .map_err(|e| format!("missing vos_worker_create: {e}"))?;
-                let dispatch_fn = *lib.get::<DispatchFn>(b"vos_worker_dispatch")
+                let dispatch_fn = *lib
+                    .get::<DispatchFn>(b"vos_worker_dispatch")
                     .map_err(|e| format!("missing vos_worker_dispatch: {e}"))?;
-                let poll_fn = *lib.get::<PollFn>(b"vos_worker_poll")
+                let poll_fn = *lib
+                    .get::<PollFn>(b"vos_worker_poll")
                     .map_err(|e| format!("missing vos_worker_poll: {e}"))?;
-                let pending_effect_fn = *lib.get::<PendingEffectFn>(b"vos_worker_pending_effect")
-                    .map_err(|e| format!("missing vos_worker_pending_effect: {e}"))?;
-                let provide_result_fn = *lib.get::<ProvideResultFn>(b"vos_worker_provide_result")
-                    .map_err(|e| format!("missing vos_worker_provide_result: {e}"))?;
-                let drop_fn = *lib.get::<DropFn>(b"vos_worker_drop")
+                let pending_effect_fn =
+                    *lib.get::<PendingEffectFn>(b"vos_worker_pending_effect")
+                        .map_err(|e| format!("missing vos_worker_pending_effect: {e}"))?;
+                let provide_result_fn =
+                    *lib.get::<ProvideResultFn>(b"vos_worker_provide_result")
+                        .map_err(|e| format!("missing vos_worker_provide_result: {e}"))?;
+                let drop_fn = *lib
+                    .get::<DropFn>(b"vos_worker_drop")
                     .map_err(|e| format!("missing vos_worker_drop: {e}"))?;
-                let free_fn = *lib.get::<FreeFn>(b"vos_worker_free")
+                let free_fn = *lib
+                    .get::<FreeFn>(b"vos_worker_free")
                     .map_err(|e| format!("missing vos_worker_free: {e}"))?;
-                let load_fn = *lib.get::<LoadFn>(b"vos_worker_load")
+                let load_fn = *lib
+                    .get::<LoadFn>(b"vos_worker_load")
                     .map_err(|e| format!("missing vos_worker_load: {e}"))?;
-                let state_fn = *lib.get::<StateFn>(b"vos_worker_state")
+                let state_fn = *lib
+                    .get::<StateFn>(b"vos_worker_state")
                     .map_err(|e| format!("missing vos_worker_state: {e}"))?;
 
                 // Read metadata
@@ -192,19 +203,28 @@ mod host {
         /// Create a new worker instance with no init args.
         pub fn create(&self) -> WorkerInstance<'_> {
             let state = unsafe { (self.create_fn)(std::ptr::null(), 0) };
-            WorkerInstance { plugin: self, state }
+            WorkerInstance {
+                plugin: self,
+                state,
+            }
         }
 
         /// Create a new worker instance with rkyv-encoded init args.
         pub fn create_with_args(&self, args: &[u8]) -> WorkerInstance<'_> {
             let state = unsafe { (self.create_fn)(args.as_ptr(), args.len()) };
-            WorkerInstance { plugin: self, state }
+            WorkerInstance {
+                plugin: self,
+                state,
+            }
         }
 
         /// Restore a worker instance from previously serialized state.
         pub fn load_state(&self, state: &[u8]) -> WorkerInstance<'_> {
             let s = unsafe { (self.load_fn)(state.as_ptr(), state.len()) };
-            WorkerInstance { plugin: self, state: s }
+            WorkerInstance {
+                plugin: self,
+                state: s,
+            }
         }
     }
 
@@ -233,9 +253,7 @@ mod host {
                         let bytes = if result.ptr.is_null() || result.len == 0 {
                             Vec::new()
                         } else {
-                            unsafe {
-                                std::slice::from_raw_parts(result.ptr, result.len)
-                            }.to_vec()
+                            unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec()
                         };
                         unsafe {
                             (self.plugin.free_fn)(result.ptr, result.len, result.cap);
@@ -249,15 +267,11 @@ mod host {
                         let mut eff_ptr: *const u8 = std::ptr::null();
                         let mut eff_len: usize = 0;
                         unsafe {
-                            (self.plugin.pending_effect_fn)(
-                                self.state, &mut eff_ptr, &mut eff_len,
-                            );
+                            (self.plugin.pending_effect_fn)(self.state, &mut eff_ptr, &mut eff_len);
                         }
                         // For now, provide empty result to unblock
                         unsafe {
-                            (self.plugin.provide_result_fn)(
-                                self.state, std::ptr::null(), 0,
-                            );
+                            (self.plugin.provide_result_fn)(self.state, std::ptr::null(), 0);
                         }
                     }
                     err => return Err(err),
@@ -305,9 +319,7 @@ mod host {
         /// Provide the result for the pending host I/O request.
         pub fn provide_result(&mut self, result: &[u8]) {
             unsafe {
-                (self.plugin.provide_result_fn)(
-                    self.state, result.as_ptr(), result.len(),
-                );
+                (self.plugin.provide_result_fn)(self.state, result.as_ptr(), result.len());
             }
         }
 
@@ -351,7 +363,7 @@ mod host {
 }
 
 #[cfg(feature = "std")]
-pub use host::{WorkerPlugin, WorkerInstance};
+pub use host::{WorkerInstance, WorkerPlugin};
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
@@ -360,9 +372,21 @@ mod tests {
 
     fn echo_worker_path() -> PathBuf {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root = PathBuf::from(manifest_dir).parent().unwrap().parent().unwrap().to_path_buf();
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        workspace_root.join("target").join(profile).join("libecho_worker.so")
+        let workspace_root = PathBuf::from(manifest_dir)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        workspace_root
+            .join("target")
+            .join(profile)
+            .join("libecho_worker.so")
     }
 
     #[test]
@@ -385,8 +409,7 @@ mod tests {
         let mut instance = plugin.create();
 
         // Send echo message
-        let msg = crate::actors::value::Msg::new("echo")
-            .with("text", "hello");
+        let msg = crate::actors::value::Msg::new("echo").with("text", "hello");
         let reply_bytes = instance.dispatch(&msg).expect("dispatch echo");
         assert!(!reply_bytes.is_empty(), "echo should return a reply");
 
@@ -396,16 +419,17 @@ mod tests {
         assert_eq!(reply_str, "echo #1: hello");
 
         // Send another and check count increments
-        let msg2 = crate::actors::value::Msg::new("echo")
-            .with("text", "world");
+        let msg2 = crate::actors::value::Msg::new("echo").with("text", "world");
         let reply_bytes2 = instance.dispatch(&msg2).expect("dispatch echo 2");
-        let value2: crate::actors::value::Value = crate::actors::codec::Decode::decode(&reply_bytes2);
+        let value2: crate::actors::value::Value =
+            crate::actors::codec::Decode::decode(&reply_bytes2);
         assert_eq!(value2.as_str().unwrap(), "echo #2: world");
 
         // Query count
         let count_msg = crate::actors::value::Msg::new("count");
         let count_bytes = instance.dispatch(&count_msg).expect("dispatch count");
-        let count_val: crate::actors::value::Value = crate::actors::codec::Decode::decode(&count_bytes);
+        let count_val: crate::actors::value::Value =
+            crate::actors::codec::Decode::decode(&count_bytes);
         assert_eq!(count_val.as_u32().unwrap(), 2);
     }
 }

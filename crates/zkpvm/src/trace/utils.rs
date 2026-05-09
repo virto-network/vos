@@ -2,7 +2,7 @@ use num_traits::Zero;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::{
     core::fields::m31::BaseField,
-    prover::backend::simd::{column::BaseColumn, m31::LOG_N_LANES, SimdBackend},
+    prover::backend::simd::{SimdBackend, column::BaseColumn, m31::LOG_N_LANES},
 };
 
 pub use stwo::prover::backend::ColumnOps;

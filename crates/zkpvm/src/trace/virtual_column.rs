@@ -1,10 +1,10 @@
 use num_traits::Zero;
 use stwo::prover::backend::{
+    Column,
     simd::{
         column::BaseColumn,
-        m31::{PackedBaseField, LOG_N_LANES},
+        m31::{LOG_N_LANES, PackedBaseField},
     },
-    Column,
 };
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};

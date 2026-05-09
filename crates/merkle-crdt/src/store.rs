@@ -1,6 +1,6 @@
+use crate::{Cid, DagNode, Hasher};
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
-use crate::{Cid, DagNode, Hasher};
 
 /// Abstract storage backend for DAG nodes.
 ///

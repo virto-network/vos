@@ -45,8 +45,10 @@ mod tests {
             C,
         }
 
-        assert!(Test::PREPROCESSED_IDS
-            .iter()
-            .all(|id| id.starts_with("abc")));
+        assert!(
+            Test::PREPROCESSED_IDS
+                .iter()
+                .all(|id| id.starts_with("abc"))
+        );
     }
 }

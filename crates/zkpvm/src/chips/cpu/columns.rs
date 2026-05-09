@@ -551,10 +551,14 @@ pub enum Column {
     // the opcode (Phase 22's prefix-1 + sum bound MemByteActive's shape
     // to MemSize, but left MemSize itself prover-witnessed).  Flags are
     // pinned to the canonical opcode decoding by ProgramMemoryChip.
-    #[size = 1] IsMemSize1,
-    #[size = 1] IsMemSize2,
-    #[size = 1] IsMemSize4,
-    #[size = 1] IsMemSize8,
+    #[size = 1]
+    IsMemSize1,
+    #[size = 1]
+    IsMemSize2,
+    #[size = 1]
+    IsMemSize4,
+    #[size = 1]
+    IsMemSize8,
     /// Phase 24: 1 iff this opcode is `StoreU8 / StoreU16 / StoreU32 /
     /// StoreU64` (the OneRegOneImm-category direct stores).  For these
     /// the trace fill puts `regs[ra]` into `val_b` (default arm in the
@@ -791,12 +795,18 @@ pub enum Column {
     /// Together these collapse the 48-flag prog_mem region to 6 bytes.
     /// Layout per byte is documented in `lookups/relations.rs` next
     /// to `PROG_MEMORY_N_FLAG_BYTES`.
-    #[size = 1] FlagByte0,
-    #[size = 1] FlagByte1,
-    #[size = 1] FlagByte2,
-    #[size = 1] FlagByte3,
-    #[size = 1] FlagByte4,
-    #[size = 1] FlagByte5,
+    #[size = 1]
+    FlagByte0,
+    #[size = 1]
+    FlagByte1,
+    #[size = 1]
+    FlagByte2,
+    #[size = 1]
+    FlagByte3,
+    #[size = 1]
+    FlagByte4,
+    #[size = 1]
+    FlagByte5,
 
     // ── Phase I-cpu Stwo-v2.x degree-flatten helpers ──
     //
@@ -811,21 +821,29 @@ pub enum Column {
 
     // Wave 1: ADD / SUB / MUL sign-extension blocks.
     /// `IsAdd · Is64Bit` (Is64Bit = 1 - Is32Bit).
-    #[size = 1] IsAdd64bitH,
+    #[size = 1]
+    IsAdd64bitH,
     /// `IsAdd · Is32Bit`.
-    #[size = 1] IsAdd32bitH,
+    #[size = 1]
+    IsAdd32bitH,
     /// `IsSub · (1 - IsNegAdd)` — non-negate path.
-    #[size = 1] IsSubNotNegaddH,
+    #[size = 1]
+    IsSubNotNegaddH,
     /// `IsSub · IsNegAdd` — negate path.
-    #[size = 1] IsSubNegaddH,
+    #[size = 1]
+    IsSubNegaddH,
     /// `IsSubNotNegaddH · Is64Bit`.
-    #[size = 1] IsSub64NotNegaddH,
+    #[size = 1]
+    IsSub64NotNegaddH,
     /// `IsSubNegaddH · Is64Bit`.
-    #[size = 1] IsSub64NegaddH,
+    #[size = 1]
+    IsSub64NegaddH,
     /// `IsSub · Is32Bit` — sign-extension on 32-bit Sub rows.
-    #[size = 1] IsSub32bitH,
+    #[size = 1]
+    IsSub32bitH,
     /// `IsMul · Is32Bit` — sign-extension on 32-bit Mul rows.
-    #[size = 1] IsMul32bitH,
+    #[size = 1]
+    IsMul32bitH,
 
     // Wave 2: Compare / DivRem-binding blocks.
     /// `IsCmpOrBranch · SignsDiff` body helper for cmp_lt_s expected-sign
@@ -833,94 +851,128 @@ pub enum Column {
     /// is degree 2; this materialises the per-row value so the
     /// `is_cmp_or_branch · (cmp_lt_s - expected_s)` constraint becomes
     /// degree 2 instead of 3.
-    #[size = 1] SignsDiffH,
+    #[size = 1]
+    SignsDiffH,
     /// `IsCompare · ValDIsZero` — gates the val_d-is-zero pinning.
-    #[size = 1] IsCmpVdzH,
+    #[size = 1]
+    IsCmpVdzH,
     /// `IsCmovIz · ValDIsZero` — the if-zero CMOV path.
-    #[size = 1] IsCmovIzVdzH,
+    #[size = 1]
+    IsCmovIzVdzH,
     /// `IsCmovNz · (1 - ValDIsZero)` — the if-not-zero CMOV path.
-    #[size = 1] IsCmovNzNotVdzH,
+    #[size = 1]
+    IsCmovNzNotVdzH,
     /// MinU/MaxU result-binding body helpers: `CmpLtFlag · ValB[i]` and
     /// `CmpLtFlag · ValD[i]`.  Per-byte (size 8 each).
-    #[size = 8] CmpLtValBH,
-    #[size = 8] CmpLtValDH,
+    #[size = 8]
+    CmpLtValBH,
+    #[size = 8]
+    CmpLtValDH,
 
     /// `IsDivRem · (1 - DivByZero)` — div is active.
-    #[size = 1] CpuDivActiveH,
+    #[size = 1]
+    CpuDivActiveH,
     /// `(op-2)·(op-3)` — nonzero when op ∈ {0, 1} (div ops).
-    #[size = 1] GateDivH,
+    #[size = 1]
+    GateDivH,
     /// `op·(op-1)` — nonzero when op ∈ {2, 3} (rem ops).
-    #[size = 1] GateRemH,
+    #[size = 1]
+    GateRemH,
     /// `CpuDivActiveH · GateDivH` — full quotient-binding selector.
-    #[size = 1] DivActiveQuotH,
+    #[size = 1]
+    DivActiveQuotH,
     /// `CpuDivActiveH · GateRemH` — full remainder-binding selector.
-    #[size = 1] DivActiveRemH,
+    #[size = 1]
+    DivActiveRemH,
     /// `IsDivRem · Is32Bit` — sign-extension on 32-bit DivRem rows.
-    #[size = 1] IsDivRem32bitH,
+    #[size = 1]
+    IsDivRem32bitH,
 
     // Wave 3: ValDIsZero / PartialNZ recurrence + DivByZero result binding.
     /// `ValD[i] · ValDByteInv[i]` — per-byte ValD nonzero indicator
     /// (1 when ValD[i] != 0, else 0).  Lifts the deg-2 product into a
     /// deg-1 column for the recurrence.
-    #[size = 8] ValDByteIndicatorH,
+    #[size = 8]
+    ValDByteIndicatorH,
     /// `ValD[i] · (ValDByteIndicatorH[i] - 1)` per byte.  Lifts the
     /// deg-2 ValDByteInv pinning constraint to deg 2 when wrapped in
     /// `is_real`.
-    #[size = 8] ValDByteIndMinus1H,
+    #[size = 8]
+    ValDByteIndMinus1H,
     /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` for i = 1..8 — used
     /// in the OR-recurrence `PartialNZ[i] = PartialNZ[i-1] + Ind[i] -
     /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ[0] is set
     /// directly to ValDByteIndicatorH[0]).
-    #[size = 8] PartNZTimesIndH,
+    #[size = 8]
+    PartNZTimesIndH,
     /// `IsDivRem · ValDIsZero` — pins DivByZero on divrem rows.
-    #[size = 1] IsDivRemTimesVdzH,
+    #[size = 1]
+    IsDivRemTimesVdzH,
     /// `IsDivRem · DivByZero` — DivByZero-active selector.
-    #[size = 1] DbzActiveH,
+    #[size = 1]
+    DbzActiveH,
     /// `DbzActiveH · GateDivH` and `DbzActiveH · GateRemH` —
     /// DivByZero quotient/remainder result-binding selectors.
-    #[size = 1] DbzActiveQuotH,
-    #[size = 1] DbzActiveRemH,
+    #[size = 1]
+    DbzActiveQuotH,
+    #[size = 1]
+    DbzActiveRemH,
 
     // Wave 4a: BitManip MSB recurrences.  (B3 audit dropped
     // SignExtBitBoolH — sign_ext_bit is now boolean unconditionally.)
     /// `ValDPartialNZMsb[i+1] · ValDByteIndicatorH[i]` for the MSB-direction
     /// recurrence — i ∈ 0..7 (index 7 unused; default fill = 0).
-    #[size = 8] PartNZMsbTimesIndH,
+    #[size = 8]
+    PartNZMsbTimesIndH,
     /// Same for the low-4-byte MSB recurrence — i ∈ 0..3 (index 3 unused).
-    #[size = 4] PartNZMsbLoTimesIndH,
+    #[size = 4]
+    PartNZMsbLoTimesIndH,
 
     // Wave 4b: TZ / LZ result binding.
     /// Sum_{i=0..4} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
-    #[size = 1] TzLo4H,
+    #[size = 1]
+    TzLo4H,
     /// Sum_{i=4..8} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
-    #[size = 1] TzHi4H,
+    #[size = 1]
+    TzHi4H,
     /// Sum_{i=0..8} (PartialNZMsb[i] - PartialNZMsb[i+1]) · (8(7-i) + LzByte[i]).
-    #[size = 1] Lz64H,
+    #[size = 1]
+    Lz64H,
     /// Sum_{i=0..4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
-    #[size = 1] Lz32H,
+    #[size = 1]
+    Lz32H,
     /// `IsTzb · Is64Bit`, `IsTzb · Is32Bit`, mirror for IsLzb.
-    #[size = 1] IsTzb64H,
-    #[size = 1] IsTzb32H,
-    #[size = 1] IsLzb64H,
-    #[size = 1] IsLzb32H,
+    #[size = 1]
+    IsTzb64H,
+    #[size = 1]
+    IsTzb32H,
+    #[size = 1]
+    IsLzb64H,
+    #[size = 1]
+    IsLzb32H,
 
     // Wave 5: Branch conditions + sequential PC.
     /// `IsBrEq · BranchTaken` — `val_b == val_d` constraint gate.
-    #[size = 1] IsBrEqTakenH,
+    #[size = 1]
+    IsBrEqTakenH,
     /// `IsBrNe · (1 - BranchTaken)` — `val_b == val_d` (when not taken) gate.
-    #[size = 1] IsBrNeNotTakenH,
+    #[size = 1]
+    IsBrNeNotTakenH,
     /// `IsCmpOrBranch · EqFlag` — gate for the val_b/val_d byte-equal pinning.
-    #[size = 1] IsCmpOrBranchEqH,
+    #[size = 1]
+    IsCmpOrBranchEqH,
     /// `IsBranch · BranchTaken` — feeds the is_sequential expression and
     /// keeps it deg 1.  IsBranch = sum of 10 br_* sub-flag column refs (deg 1).
-    #[size = 1] IsBranchTakenH,
+    #[size = 1]
+    IsBranchTakenH,
 
     // Wave 6: Control flow next_pc + memory monotonicity.
     // (B3 audit dropped BranchTakenBoolH / MemByteActiveBoolH —
     // booleans are now enforced unconditionally as `X·(1-X)=0`.)
     /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
     /// (index 7 unused, default fill = 0).
-    #[size = 8] MemByteActiveMonoH,
+    #[size = 8]
+    MemByteActiveMonoH,
 
     // Wave 7: Phase 9 register-memory binding.  Many cross-constraints
     // chain 3-4 selector flags before a linear body.  (B3 audit
@@ -928,65 +980,90 @@ pub enum Column {
     // ResultIsReg/Phi7Bool/IsBlakeEcall — all now enforced as
     // unconditional `X·(1-X)=0` constraints.)
     /// `(1 - IsPadding) · Is32Bit` — used in the IsTruncated identity binding.
-    #[size = 1] Real32bitH,
+    #[size = 1]
+    Real32bitH,
     /// `(1 - IsPadding) · ValBIsReg` — gate root for ValB cross-constraints.
-    #[size = 1] ValBIsRegH,
+    #[size = 1]
+    ValBIsRegH,
     /// `ValBIsRegH · (1 - IsTruncated)` — non-truncated ValB upper-byte gate.
-    #[size = 1] ValBIsRegNotTruncH,
+    #[size = 1]
+    ValBIsRegNotTruncH,
     /// `ValBIsRegH · IsTruncated` — truncated ValB upper-byte gate.
-    #[size = 1] ValBIsRegTruncH,
+    #[size = 1]
+    ValBIsRegTruncH,
     /// `(1 - IsPadding) · ValDIsReg` — gate root for ValD cross-constraints.
-    #[size = 1] ValDIsRegH,
+    #[size = 1]
+    ValDIsRegH,
     /// `ValDIsRegH · (1 - IsShiftConstrained)` — non-shift ValD gate
     /// (matches the original `non_shift_gate`).
-    #[size = 1] NonShiftGateH,
+    #[size = 1]
+    NonShiftGateH,
     /// `NonShiftGateH · (1 - IsTruncated)` — non-shift, non-truncated.
-    #[size = 1] NonShiftGateNotTruncH,
+    #[size = 1]
+    NonShiftGateNotTruncH,
     /// `NonShiftGateH · IsTruncated` — non-shift, truncated.
-    #[size = 1] NonShiftGateTruncH,
+    #[size = 1]
+    NonShiftGateTruncH,
     /// `ValDIsRegH · IsShiftConstrained` — shift-amount identity gate.
-    #[size = 1] ValDIsRegShiftCH,
+    #[size = 1]
+    ValDIsRegShiftCH,
     /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
-    #[size = 1] IsRotateRGateH,
+    #[size = 1]
+    IsRotateRGateH,
     /// `(1 - IsPadding) · (1 - Phi7Bool)` — gate for `Phi7=0` constraint.
-    #[size = 1] RealNotPhi7BoolH,
+    #[size = 1]
+    RealNotPhi7BoolH,
     /// `(1 - IsPadding) · Phi7Bool` — gate for `Phi7·Phi7Inv=1` constraint.
-    #[size = 1] RealPhi7BoolH,
+    #[size = 1]
+    RealPhi7BoolH,
     /// `Phi7Field · Phi7InvField` — body helper for the Phi7-nonzero proof.
-    #[size = 1] Phi7TimesInvH,
+    #[size = 1]
+    Phi7TimesInvH,
 
     // Wave 7-fix: missed deg-3 patterns from Phase 40 (RotR ImmAlt val_b
     // pinning) and Phase 36/37 (32-bit shift val_d-high-bytes-zero).
     /// `IsRotateRImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
-    #[size = 1] IsRotRImmAltNotTruncH,
+    #[size = 1]
+    IsRotRImmAltNotTruncH,
     /// `IsRotateRImmAlt · IsTruncated` — truncated ImmAlt gate.
-    #[size = 1] IsRotRImmAltTruncH,
+    #[size = 1]
+    IsRotRImmAltTruncH,
     /// `Is32Bit · IsShiftConstrained` — 32-bit shift gate.
-    #[size = 1] Is32ShiftCH,
+    #[size = 1]
+    Is32ShiftCH,
 
     // Wave 8: residual deg-3+ patterns missed by the earlier wave grep.
     /// `IsReal · IsTrap` — Phase 13e terminal-row gate.
-    #[size = 1] IsRealTrapH,
+    #[size = 1]
+    IsRealTrapH,
     // (B3 audit dropped MemAddrCarryBoolH — mem_addr_carry per-byte boolean
     // is now enforced unconditionally as `X·(1-X)=0`.)
     /// `Is64Bit · (BytePopcount[4] + ... + BytePopcount[7])` — used in
     /// CountSetBits result-binding to keep the gated body at deg 1.
-    #[size = 1] Is64bitPopcountHiH,
+    #[size = 1]
+    Is64bitPopcountHiH,
     /// `IsLoadLocal · (1 - MemByteActive[i])` — Phase 20 inactive-byte gate.
-    #[size = 8] IsLoadLocalNotActiveH,
+    #[size = 8]
+    IsLoadLocalNotActiveH,
     /// `DivRemainder[i] · ValRByteInv[i]` — Phase 31 nonzero indicator.
-    #[size = 8] ValRByteIndicatorH,
+    #[size = 8]
+    ValRByteIndicatorH,
     /// `DivRemainder[i] · (ValRByteIndicatorH - 1)` — Phase 31 inv pinning.
-    #[size = 8] ValRByteIndMinus1H,
+    #[size = 8]
+    ValRByteIndMinus1H,
     /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` — Phase 31 OR-recurrence.
-    #[size = 8] ValRPartNZTimesIndH,
+    #[size = 8]
+    ValRPartNZTimesIndH,
     /// `IsDivS · (1 - DivByZero) · ValRPartialNZ[7]` — Phase 31 sign-of-r gate.
-    #[size = 1] DivSActivePartialH,
+    #[size = 1]
+    DivSActivePartialH,
     /// `IsDivS · (1 - DivByZero)` — root helper for DivSActivePartialH.
-    #[size = 1] IsDivSNotDbzH,
+    #[size = 1]
+    IsDivSNotDbzH,
     /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32)` — Phase 36
     /// PowerOfTwo lookup multiplicity for the classic shift case.
-    #[size = 1] IsShiftCNotRotrH,
+    #[size = 1]
+    IsShiftCNotRotrH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

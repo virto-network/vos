@@ -35,16 +35,16 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{fields::qm31::SecureField, ColumnVec},
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
-use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -55,16 +55,16 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{MemoryAccessLookupElements, RistrettoCombScalarBoundaryLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{MemoryAccessLookupElements, RistrettoCombScalarBoundaryLookupElements},
+};
 
 pub struct RistrettoCombScalarBoundaryChip;
 
@@ -155,9 +155,7 @@ impl BuiltInComponent for RistrettoCombScalarBoundaryChip {
         let f16 = E::F::from(BaseField::from(16u32));
         eval.add_constraint(
             is_real[0].clone()
-                * (scalar_byte[0].clone()
-                    - low_nibble[0].clone()
-                    - f16 * high_nibble[0].clone()),
+                * (scalar_byte[0].clone() - low_nibble[0].clone() - f16 * high_nibble[0].clone()),
         );
 
         // ── Scalar-boundary emissions ──
@@ -204,11 +202,7 @@ impl BuiltInComponent for RistrettoCombScalarBoundaryChip {
 impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = boundary_log_size(side_note);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -290,30 +284,22 @@ impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
         let log_size = component_trace.log_size();
         let mut logup = LogupTraceBuilder::new(log_size);
 
-        let scalar: &RistrettoCombScalarBoundaryLookupElements =
-            lookup_elements.as_ref();
+        let scalar: &RistrettoCombScalarBoundaryLookupElements = lookup_elements.as_ref();
         let memory: &MemoryAccessLookupElements = lookup_elements.as_ref();
 
-        let is_real =
-            crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let call_idx =
-            crate::trace::original_base_column!(component_trace, Column::CallIdx);
-        let low_nibble =
-            crate::trace::original_base_column!(component_trace, Column::LowNibble);
-        let high_nibble =
-            crate::trace::original_base_column!(component_trace, Column::HighNibble);
-        let scalar_byte =
-            crate::trace::original_base_column!(component_trace, Column::ScalarByte);
+        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
+        let call_idx = crate::trace::original_base_column!(component_trace, Column::CallIdx);
+        let low_nibble = crate::trace::original_base_column!(component_trace, Column::LowNibble);
+        let high_nibble = crate::trace::original_base_column!(component_trace, Column::HighNibble);
+        let scalar_byte = crate::trace::original_base_column!(component_trace, Column::ScalarByte);
         let addr = crate::trace::original_base_column!(component_trace, Column::Addr);
         let ts = crate::trace::original_base_column!(component_trace, Column::Ts);
         let win_even = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::WindowEven
         );
-        let win_odd = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::WindowOdd
-        );
+        let win_odd =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::WindowOdd);
 
         use crate::trace::component::FinalizedColumn;
         use stwo::core::fields::m31::BaseField as BF;
@@ -348,12 +334,7 @@ impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
         tuple.push(scalar_byte[0].clone());
         tuple.extend(ts.iter().cloned());
         tuple.push(zero);
-        logup.add_to_relation_with(
-            memory,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(memory, [is_real[0].clone()], |[r]| r.into(), &tuple);
 
         logup.finalize()
     }

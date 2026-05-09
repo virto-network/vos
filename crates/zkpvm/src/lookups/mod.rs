@@ -1,5 +1,5 @@
-use core::any::TypeId;
 use alloc::collections::BTreeMap;
+use core::any::TypeId;
 
 use impl_trait_for_tuples::impl_for_tuples;
 
@@ -14,28 +14,16 @@ pub use self::logup_trace_builder::LogupTraceBuilder;
 pub use self::{
     range_check::Range256LookupElements,
     relations::{
-        BitcountLookupElements,
-        BitwiseAndLookupElements, BitwiseLookupElements,
-        Blake2bCallLookupElements,
-        Blake2bStateLookupElements,
-        ByteToBitsLookupElements,
-        CompareLookupElements,
-        DivRemLookupElements,
-        JumpTableLookupElements,
-        MemoryAccessLookupElements,
-        MultiplicationLookupElements,
-        PopcountLookupElements,
-        PowerOfTwoLookupElements,
-        ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements,
-        RistrettoCombCompressOutputLookupElements,
+        BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
+        Blake2bCallLookupElements, Blake2bStateLookupElements, ByteToBitsLookupElements,
+        CompareLookupElements, DivRemLookupElements, JumpTableLookupElements,
+        MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements,
+        PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
+        RegisterMemoryLookupElements, RistrettoCombCompressOutputLookupElements,
         RistrettoCombCompressRegFileLookupElements,
-        RistrettoCombFinalAccLookupElements,
-        RistrettoCombConsumerRegisterFileLookupElements,
-        RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombLookupElements,
-        RistrettoCombScalarBoundaryLookupElements,
-        RistrettoRegisterFileLookupElements,
+        RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
+        RistrettoCombFinalAccLookupElements, RistrettoCombLookupElements,
+        RistrettoCombScalarBoundaryLookupElements, RistrettoRegisterFileLookupElements,
     },
 };
 

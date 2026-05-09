@@ -2,11 +2,11 @@ use stwo::{
     core::fields::{m31::BaseField, qm31::SecureField},
     prover::{
         backend::simd::{
-            m31::{PackedBaseField, LOG_N_LANES},
-            qm31::PackedSecureField,
             SimdBackend,
+            m31::{LOG_N_LANES, PackedBaseField},
+            qm31::PackedSecureField,
         },
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{LogupTraceGenerator, Relation};

@@ -10,9 +10,9 @@
 //! - **Self-verification**: fetched nodes are verified by recomputing their CID.
 //! - **Causal ordering**: post-order traversal gives events in happened-before order.
 
+use crate::{Cid, DagNode, Encode, Hasher, Store};
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
-use crate::{Cid, DagNode, Encode, Hasher, Store};
 
 /// Error type for sync operations involving two stores.
 #[derive(Debug)]
@@ -126,11 +126,7 @@ pub(crate) fn topological_sort<H: Hasher, P>(
     let mut parents_of: BTreeMap<Cid<H>, Vec<Cid<H>>> = BTreeMap::new();
 
     for (cid, node) in &nodes {
-        let out = node
-            .children
-            .iter()
-            .filter(|c| cid_set.contains(c))
-            .count();
+        let out = node.children.iter().filter(|c| cid_set.contains(c)).count();
         out_degree.insert(cid.clone(), out);
         for child in &node.children {
             if cid_set.contains(child) {
@@ -173,7 +169,7 @@ pub(crate) fn topological_sort<H: Hasher, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MerkleClock, MemStore};
+    use crate::{MemStore, MerkleClock};
 
     struct TestHasher;
     impl crate::Hasher for TestHasher {

@@ -20,13 +20,10 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -40,16 +37,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::MultiplicationLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::MultiplicationLookupElements};
 
 pub struct MulChip;
 
@@ -134,40 +128,49 @@ pub enum Column {
     // multi-flag selectors `is_real · is_64bit · is_mul_lo · …`.
     // These helpers materialise the high-degree intermediates so every
     // gated constraint factors into (deg 1 column ref) × (deg 1 body).
-
     /// `(1 - IsPadding) · (1 - Is32Bit)` — deg-1 helper standing in for
     /// the "real 64-bit row" gate; defined via deg-2 helper-defining
     /// constraint `NotPadding64bit - (1 - IsPadding)(1 - Is32Bit) = 0`.
     /// Reused by the schoolbook 64-bit mul_lo and mul_upper chains.
-    #[size = 1] NotPadding64bit,
+    #[size = 1]
+    NotPadding64bit,
     /// `NotPadding64bit · IsMulLo` — full mul_lo 64-bit selector.
-    #[size = 1] MulLoActive,
+    #[size = 1]
+    MulLoActive,
     /// `NotPadding64bit · (IsMulUpperUU + IsMulUpperSU + IsMulUpperSS)`
     /// — full mul_upper 64-bit selector.
-    #[size = 1] MulUpperActive,
+    #[size = 1]
+    MulUpperActive,
     /// `(1 - IsPadding) · Is32Bit` — full 32-bit row selector.
-    #[size = 1] Is32BitActive,
+    #[size = 1]
+    Is32BitActive,
     /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64)` —
     /// full mul_lo 64-bit non-rotate selector for `result = upl` binding.
-    #[size = 1] MulLoNoRotate64,
+    #[size = 1]
+    MulLoNoRotate64,
     /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32)` —
     /// full 32-bit non-rotate selector for `result = upl` binding.
-    #[size = 1] Is32BitNoRotate32,
+    #[size = 1]
+    Is32BitNoRotate32,
 
     /// 64-bit schoolbook partial-sum helper at position k:
     /// `PartialSum64[k] := Σ_{i+j=k, i,j<8} ValB[i]·ValD[j]` (deg 2 def).
     /// Used by both mul_lo and mul_upper 64-bit chains (k=0..16).
-    #[size = 16] PartialSum64,
+    #[size = 16]
+    PartialSum64,
     /// 32-bit schoolbook partial-sum helper at position k:
     /// `PartialSum32[k] := Σ_{i+j=k, i,j<4} ValB[i]·ValD[j]` (deg 2 def).
     /// k=0..8.
-    #[size = 8] PartialSum32,
+    #[size = 8]
+    PartialSum32,
 
     /// Sign-correction body helpers (Phase 54c flatten).
     /// `SignDA[i] := SignBitB · ValD[i]` for i=0..8 (deg 2 def).
-    #[size = 8] SignDA,
+    #[size = 8]
+    SignDA,
     /// `SignDB[i] := SignBitD · ValB[i]` for i=0..8 (deg 2 def).
-    #[size = 8] SignDB,
+    #[size = 8]
+    SignDB,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -228,7 +231,14 @@ impl BuiltInComponent for MulChip {
         let sign_d_b = crate::trace::trace_eval!(trace_eval, Column::SignDB);
 
         // Boolean constraints on flag columns.
-        for flag in [&is_mul_lo, &is_mu_uu, &is_mu_su, &is_mu_ss, &is_32bit, &is_padding] {
+        for flag in [
+            &is_mul_lo,
+            &is_mu_uu,
+            &is_mu_su,
+            &is_mu_ss,
+            &is_32bit,
+            &is_padding,
+        ] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         // sign_bit_b/d are pinned to bit 7 of val_b/val_d's MSB by
@@ -243,26 +253,22 @@ impl BuiltInComponent for MulChip {
         // Each helper is one main-trace column; the constraint here pins
         // it to the algebraic expression so a malicious prover can't
         // diverge from the gates the original chip used.  All deg 2.
+        eval.add_constraint(not_padding_64bit[0].clone() - is_real.clone() * is_64bit.clone());
         eval.add_constraint(
-            not_padding_64bit[0].clone() - is_real.clone() * is_64bit.clone()
+            mul_lo_active[0].clone() - not_padding_64bit[0].clone() * is_mul_lo[0].clone(),
         );
         eval.add_constraint(
-            mul_lo_active[0].clone() - not_padding_64bit[0].clone() * is_mul_lo[0].clone()
+            mul_upper_active[0].clone() - not_padding_64bit[0].clone() * is_mul_upper_e.clone(),
         );
-        eval.add_constraint(
-            mul_upper_active[0].clone() - not_padding_64bit[0].clone() * is_mul_upper_e.clone()
-        );
-        eval.add_constraint(
-            is_32bit_active[0].clone() - is_real.clone() * is_32bit[0].clone()
-        );
+        eval.add_constraint(is_32bit_active[0].clone() - is_real.clone() * is_32bit[0].clone());
         let one_minus_rotate_64 = E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone();
         let one_minus_rotate_32 = E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone();
         eval.add_constraint(
-            mul_lo_no_rotate64[0].clone() - mul_lo_active[0].clone() * one_minus_rotate_64.clone()
+            mul_lo_no_rotate64[0].clone() - mul_lo_active[0].clone() * one_minus_rotate_64.clone(),
         );
         eval.add_constraint(
             is_32bit_no_rotate32[0].clone()
-                - is_32bit_active[0].clone() * one_minus_rotate_32.clone()
+                - is_32bit_active[0].clone() * one_minus_rotate_32.clone(),
         );
 
         // PartialSum64[k] = Σ_{i+j=k, i,j<8} ValB[i]·ValD[j] for k=0..16.
@@ -290,19 +296,13 @@ impl BuiltInComponent for MulChip {
 
         // Sign-correction body helpers.
         for i in 0..WORD_SIZE {
-            eval.add_constraint(
-                sign_d_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone()
-            );
-            eval.add_constraint(
-                sign_d_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone()
-            );
+            eval.add_constraint(sign_d_a[i].clone() - sign_bit_b[0].clone() * val_d[i].clone());
+            eval.add_constraint(sign_d_b[i].clone() - sign_bit_d[0].clone() * val_b[i].clone());
         }
 
         // Partition: on a real row, exactly one variant flag is 1.
-        let variant_sum = is_mul_lo[0].clone()
-            + is_mu_uu[0].clone()
-            + is_mu_su[0].clone()
-            + is_mu_ss[0].clone();
+        let variant_sum =
+            is_mul_lo[0].clone() + is_mu_uu[0].clone() + is_mu_su[0].clone() + is_mu_ss[0].clone();
         eval.add_constraint(is_real.clone() * (variant_sum.clone() - E::F::one()));
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
@@ -311,26 +311,45 @@ impl BuiltInComponent for MulChip {
         // helpers compress the original deg-4/5 selector × quadratic-body
         // expressions to deg-2 (selector_h × linear_body).
         let f256: E::F = E::F::from(BaseField::from(256));
-        let full_carry = |k: usize| -> E::F {
-            mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone()
-        };
+        let full_carry =
+            |k: usize| -> E::F { mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone() };
         for k in 0..16usize {
-            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let out_normal = if k < 8 { upl[k].clone() } else { mul_high[k - 8].clone() };
-            let out_upper = if k < 8 { mul_high[k].clone() } else { uph[k - 8].clone() };
+            let carry_in = if k == 0 {
+                E::F::zero()
+            } else {
+                full_carry(k - 1)
+            };
+            let out_normal = if k < 8 {
+                upl[k].clone()
+            } else {
+                mul_high[k - 8].clone()
+            };
+            let out_upper = if k < 8 {
+                mul_high[k].clone()
+            } else {
+                uph[k - 8].clone()
+            };
             // Body now linear in column refs (PartialSum64[k] is one helper col).
             let c_normal = out_normal + full_carry(k) * f256.clone()
-                - partial_sum_64[k].clone() - carry_in.clone();
-            let c_upper = out_upper + full_carry(k) * f256.clone()
-                - partial_sum_64[k].clone() - carry_in;
+                - partial_sum_64[k].clone()
+                - carry_in.clone();
+            let c_upper =
+                out_upper + full_carry(k) * f256.clone() - partial_sum_64[k].clone() - carry_in;
             eval.add_constraint(mul_lo_active[0].clone() * c_normal);
             eval.add_constraint(mul_upper_active[0].clone() * c_upper);
         }
         for k in 0..8usize {
-            let carry_in = if k == 0 { E::F::zero() } else { full_carry(k - 1) };
-            let out_byte = if k < 4 { upl[k].clone() } else { mul_high[k - 4].clone() };
-            let c = out_byte + full_carry(k) * f256.clone()
-                - partial_sum_32[k].clone() - carry_in;
+            let carry_in = if k == 0 {
+                E::F::zero()
+            } else {
+                full_carry(k - 1)
+            };
+            let out_byte = if k < 4 {
+                upl[k].clone()
+            } else {
+                mul_high[k - 4].clone()
+            };
+            let c = out_byte + full_carry(k) * f256.clone() - partial_sum_32[k].clone() - carry_in;
             eval.add_constraint(is_32bit_active[0].clone() * c);
         }
 
@@ -344,14 +363,11 @@ impl BuiltInComponent for MulChip {
             // TermA (Phase I-mul flattened): SignDA[i] = SignBitB · ValD[i].
             eval.add_constraint(
                 (is_mu_su[0].clone() + is_mu_ss[0].clone())
-                    * (term_a[i].clone() - sign_d_a[i].clone())
+                    * (term_a[i].clone() - sign_d_a[i].clone()),
             );
             eval.add_constraint(is_mu_uu[0].clone() * term_a[i].clone());
             // TermB (Phase I-mul flattened): SignDB[i] = SignBitD · ValB[i].
-            eval.add_constraint(
-                is_mu_ss[0].clone()
-                    * (term_b[i].clone() - sign_d_b[i].clone())
-            );
+            eval.add_constraint(is_mu_ss[0].clone() * (term_b[i].clone() - sign_d_b[i].clone()));
             eval.add_constraint((is_mu_uu[0].clone() + is_mu_su[0].clone()) * term_b[i].clone());
         }
         // Result-binding sum with byte-level carry chain.
@@ -364,14 +380,12 @@ impl BuiltInComponent for MulChip {
                 corr_carry[i - 1].clone()
             };
             eval.add_constraint(
-                is_mul_upper_e.clone() * (
-                    uph[i].clone()
-                        + corr_carry[i].clone() * f256.clone()
+                is_mul_upper_e.clone()
+                    * (uph[i].clone() + corr_carry[i].clone() * f256.clone()
                         - result[i].clone()
                         - term_a[i].clone()
                         - term_b[i].clone()
-                        - carry_in
-                )
+                        - carry_in),
             );
         }
 
@@ -390,23 +404,21 @@ impl BuiltInComponent for MulChip {
                 // is the deg-1 helper standing in for the original 4-factor
                 // gate `is_real · is_64bit · is_mul_lo · (1 - rot_l - rot_r)`.
                 eval.add_constraint(
-                    mul_lo_no_rotate64[0].clone()
-                        * (result[i].clone() - upl[i].clone())
+                    mul_lo_no_rotate64[0].clone() * (result[i].clone() - upl[i].clone()),
                 );
                 eval.add_constraint(
                     is_rotate_64_either.clone()
-                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone())
+                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone()),
                 );
             }
             let is_rotate_32_either = is_rot_l32[0].clone() + is_rot_r32[0].clone();
             for i in 0..4 {
                 eval.add_constraint(
-                    is_32bit_no_rotate32[0].clone()
-                        * (result[i].clone() - upl[i].clone())
+                    is_32bit_no_rotate32[0].clone() * (result[i].clone() - upl[i].clone()),
                 );
                 eval.add_constraint(
                     is_rotate_32_either.clone()
-                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone())
+                        * (result[i].clone() - upl[i].clone() - mul_high[i].clone()),
                 );
             }
         }
@@ -459,7 +471,8 @@ impl BuiltInProverComponent for MulChip {
             return trace.finalize_bit_reversed();
         }
 
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
+        let log_size =
+            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -468,8 +481,16 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns_bytes(row, &e.val_d.to_le_bytes(), Column::ValD);
             trace.fill_columns_bytes(row, &e.result.to_le_bytes(), Column::Result);
             trace.fill_columns_bytes(row, &e.mul_high.to_le_bytes(), Column::MulHigh);
-            trace.fill_columns_bytes(row, &e.unsigned_product_low.to_le_bytes(), Column::UnsignedProductLow);
-            trace.fill_columns_bytes(row, &e.unsigned_product_hi.to_le_bytes(), Column::UnsignedProductHi);
+            trace.fill_columns_bytes(
+                row,
+                &e.unsigned_product_low.to_le_bytes(),
+                Column::UnsignedProductLow,
+            );
+            trace.fill_columns_bytes(
+                row,
+                &e.unsigned_product_hi.to_le_bytes(),
+                Column::UnsignedProductHi,
+            );
             trace.fill_columns_bytes(row, &e.mul_carry, Column::MulCarry);
             trace.fill_columns_bytes(row, &e.mul_carry_hi, Column::MulCarryHi);
             trace.fill_columns_bytes(row, &e.mul_corr_term_a, Column::MulCorrTermA);
@@ -490,7 +511,7 @@ impl BuiltInProverComponent for MulChip {
 
             // ── Phase I-mul helper fills ──
             // Selector helpers — in valid traces, evaluated bool products.
-            let real = true;  // not padding
+            let real = true; // not padding
             let np_64 = real && !e.is_32bit;
             let mu_e = e.is_mul_upper_uu || e.is_mul_upper_su || e.is_mul_upper_ss;
             let mlo_active = np_64 && e.is_mul_lo;

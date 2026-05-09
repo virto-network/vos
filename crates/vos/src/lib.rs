@@ -31,6 +31,13 @@ extern crate alloc;
 
 pub use rkyv;
 
+// Re-export the `log` facade so actors and workers can write
+// `use vos::log;` and `log::info!(...)` without taking a direct
+// dependency on the `log` crate. `log_impl.rs` installs the
+// per-target `Log` impl (PVM debug_write / worker stderr / wasm
+// no-op) at entry-point time so records have somewhere to land.
+pub use ::log;
+
 // --- ABI (hostcall IDs, error codes, ecall wrappers) ---
 
 pub mod abi;
@@ -40,8 +47,8 @@ pub mod abi;
 pub mod actors;
 pub mod refine_payload;
 
-pub mod effects;
 pub mod effect_log;
+pub mod effects;
 pub mod worker;
 
 // ── WASM bootstrap (allocator + panic handler) ───────────────────────
@@ -70,19 +77,58 @@ pub mod data_layer;
 pub mod pvm_image;
 
 // Re-export core actor types at crate root for `use vos::*`
-pub use actors::{Actor, Message, Context, WorkerActor, WorkerCtx, Yield, Ask, RunResult, try_poll, run_blocking, metadata};
-pub use actors::{Encode, Decode};
-pub use actors::{service_code_hash, STATUS_DONE, STATUS_YIELDED, STATUS_PANICKED, STATUS_NOT_FOUND, STATUS_OOG};
 pub use actors::InvokeError;
 pub use actors::init;
 pub use actors::lifecycle;
-pub use actors::value;
-#[cfg(feature = "macros")]
-pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 #[cfg(feature = "pvm")]
 pub use actors::run_refine;
+pub use actors::value;
+pub use actors::{
+    Actor, Ask, Context, Message, RunResult, WorkerActor, WorkerCtx, Yield, metadata, run_blocking,
+    try_poll,
+};
+pub use actors::{Decode, Encode};
+pub use actors::{
+    STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED, service_code_hash,
+};
 #[cfg(feature = "pvm")]
-pub use actors::{run_refine_entry, run_accumulate_entry};
+pub use actors::{run_accumulate_entry, run_refine_entry};
+#[cfg(feature = "macros")]
+pub use vos_macros::{actor, actor as agent, actor as document, actor as skill, messages};
+
+/// One-stop import for actor / worker source files:
+///
+/// ```ignore
+/// use vos::prelude::*;
+///
+/// #[actor]
+/// struct Foo { count: u32 }
+///
+/// #[messages]
+/// impl Foo {
+///     #[msg]
+///     async fn inc(&mut self) { self.count += 1; }
+/// }
+/// ```
+///
+/// Exposes the `#[actor]` / `#[messages]` macros (when the `macros`
+/// feature is on), the core `Actor` / `Context` / `Encode` / `Decode`
+/// types, the `lifecycle` module, and the `log` facade so a single
+/// glob covers the surface a typical actor or worker needs.
+pub mod prelude {
+    pub use crate::lifecycle;
+    pub use crate::value::Msg;
+    pub use crate::{Actor, Context, Decode, Encode, Message, WorkerCtx};
+    #[cfg(feature = "macros")]
+    pub use crate::{actor, agent, document, messages, skill};
+    // Guest-side stdout shims backed by DEBUG_WRITE. Available at
+    // crate root as `vos::println` etc. via `#[macro_export]` on
+    // `pvm` builds; re-exporting them through the prelude lets a
+    // single glob cover both `log::info!` and `println!`.
+    #[cfg(feature = "pvm")]
+    pub use crate::{eprint, eprintln, print, println};
+    pub use ::log;
+}
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
@@ -109,7 +155,7 @@ macro_rules! pvm_main {
     ($actor:ty) => {
         #[cfg(target_arch = "riscv64")]
         #[allow(unused_imports)]
-        use $crate::{print, println, eprint, eprintln};
+        use $crate::{eprint, eprintln, print, println};
 
         #[cfg(target_arch = "riscv64")]
         #[unsafe(no_mangle)]
@@ -132,9 +178,8 @@ macro_rules! pvm_main {
         // `_start`. The const is recomputed from the actor's
         // `Message::META` rather than referenced from the lib.
         #[cfg(target_arch = "riscv64")]
-        const __VOS_PVM_MAIN_META: ([u8; 4096], usize) = $crate::metadata::encode::<4096>(
-            &<<$actor as $crate::Actor>::Message>::META
-        );
+        const __VOS_PVM_MAIN_META: ([u8; 4096], usize) =
+            $crate::metadata::encode::<4096>(&<<$actor as $crate::Actor>::Message>::META);
 
         #[cfg(target_arch = "riscv64")]
         #[unsafe(link_section = ".vos_meta")]
@@ -143,7 +188,10 @@ macro_rules! pvm_main {
             let (src, len) = __VOS_PVM_MAIN_META;
             let mut out = [0u8; __VOS_PVM_MAIN_META.1];
             let mut i = 0;
-            while i < len { out[i] = src[i]; i += 1; }
+            while i < len {
+                out[i] = src[i];
+                i += 1;
+            }
             out
         };
     };

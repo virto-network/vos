@@ -5,13 +5,8 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use stwo::{
-    core::{
-        air::Component,
-        channel::Blake2sChannel,
-        fields::qm31::SecureField,
-        pcs::TreeVec,
-    },
+use stwo::core::{
+    air::Component, channel::Blake2sChannel, fields::qm31::SecureField, pcs::TreeVec,
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -82,7 +77,12 @@ pub mod create_verifier_components {
             .zip(claimed_sums)
             .zip(log_sizes.iter())
             .map(|((&i, claimed_sum), &log_size)| {
-                BASE_COMPONENTS[i].to_component(tree_span_provider, lookup_elements, log_size, *claimed_sum)
+                BASE_COMPONENTS[i].to_component(
+                    tree_span_provider,
+                    lookup_elements,
+                    log_size,
+                    *claimed_sum,
+                )
             })
             .collect()
     }

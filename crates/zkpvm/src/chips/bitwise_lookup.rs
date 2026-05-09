@@ -3,13 +3,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -22,16 +19,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{BitwiseAndLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::BitwiseAndLookupElements};
 
 /// BitwiseLookupChip: 16×16 table for nibble-level AND.
 ///
@@ -134,7 +128,8 @@ impl BuiltInProverComponent for BitwiseLookupChip {
                 trace.fill_columns(row, b, Column::B);
                 trace.fill_columns(row, a & b, Column::AndResult);
 
-                let mult = side_note.bitwise_and_counts
+                let mult = side_note
+                    .bitwise_and_counts
                     .get(&(a, b))
                     .copied()
                     .unwrap_or(0);

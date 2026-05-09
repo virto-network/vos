@@ -34,13 +34,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
         backend::simd::SimdBackend,
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -53,16 +50,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::ProgramMemoryLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::ProgramMemoryLookupElements};
 
 pub struct ProgramMemoryChip;
 
@@ -107,17 +101,24 @@ pub enum PreprocessedColumn {
     /// `PROG_MEMORY_N_FLAG_BYTES`.  CpuChip's matching FlagByte0..5
     /// main columns carry the same packing; a byte-to-bits lookup per
     /// row pins individual flag columns to their bit slot.
-    #[size = 1] FlagByte0,
-    #[size = 1] FlagByte1,
-    #[size = 1] FlagByte2,
-    #[size = 1] FlagByte3,
-    #[size = 1] FlagByte4,
-    #[size = 1] FlagByte5,
+    #[size = 1]
+    FlagByte0,
+    #[size = 1]
+    FlagByte1,
+    #[size = 1]
+    FlagByte2,
+    #[size = 1]
+    FlagByte3,
+    #[size = 1]
+    FlagByte4,
+    #[size = 1]
+    FlagByte5,
     /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
     /// tuple lookup.
-    #[size = 4] ImmYCanon,
+    #[size = 4]
+    ImmYCanon,
     /// Phase 15-branch-target-fix: canonical absolute target for static
     /// jumps/branches at this PC, as 4 little-endian bytes.  Computed
     /// from bytecode as `pc + sign_extend(signed_offset)`.  For ops
@@ -125,7 +126,8 @@ pub enum PreprocessedColumn {
     /// — runtime-dependent on regs) and for non-branch/jump ops, this
     /// is 0.  Bound to CpuChip's BranchTarget column via the prog_mem
     /// tuple lookup, so a prover can't forge a static-jump destination.
-    #[size = 4] BranchTargetCanon,
+    #[size = 4]
+    BranchTargetCanon,
 }
 
 impl BuiltInComponent for ProgramMemoryChip {
@@ -141,7 +143,8 @@ impl BuiltInComponent for ProgramMemoryChip {
     ) {
         let pc = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Pc);
         let opcode = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Opcode);
-        let skip_len = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::SkipLen);
+        let skip_len =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::SkipLen);
         let reg_a = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegA);
         let reg_b = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegB);
         let reg_d = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegD);
@@ -152,9 +155,11 @@ impl BuiltInComponent for ProgramMemoryChip {
         let fb3 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte3);
         let fb4 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte4);
         let fb5 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte5);
-        let imm_y_canon = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
+        let imm_y_canon =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_trace_eval!(
-            trace_eval, PreprocessedColumn::BranchTargetCanon
+            trace_eval,
+            PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
@@ -192,11 +197,7 @@ impl BuiltInComponent for ProgramMemoryChip {
 impl BuiltInProverComponent for ProgramMemoryChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = chip_log_size(side_note.code.len());
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -219,11 +220,13 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                 trace.fill_columns(row, d.rd, PreprocessedColumn::RegD);
                 trace.fill_columns(row, d.imm, PreprocessedColumn::Imm);
                 trace.fill_columns_bytes(
-                    row, &d.branch_target_canon.to_le_bytes(),
+                    row,
+                    &d.branch_target_canon.to_le_bytes(),
                     PreprocessedColumn::BranchTargetCanon,
                 );
                 trace.fill_columns_bytes(
-                    row, &d.imm_y_canon.to_le_bytes(),
+                    row,
+                    &d.imm_y_canon.to_le_bytes(),
                     PreprocessedColumn::ImmYCanon,
                 );
                 // Phase 55b: pack the 48 canonical flags into 6 bytes
@@ -275,21 +278,34 @@ impl BuiltInProverComponent for ProgramMemoryChip {
 
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Pc);
-        let opcode = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Opcode);
-        let skip_len = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::SkipLen);
-        let reg_a = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegA);
-        let reg_b = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegB);
-        let reg_d = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegD);
+        let opcode =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Opcode);
+        let skip_len =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::SkipLen);
+        let reg_a =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegA);
+        let reg_b =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegB);
+        let reg_d =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegD);
         let imm = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Imm);
-        let fb0 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte0);
-        let fb1 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte1);
-        let fb2 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte2);
-        let fb3 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte3);
-        let fb4 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte4);
-        let fb5 = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte5);
-        let imm_y_canon = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
+        let fb0 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte0);
+        let fb1 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte1);
+        let fb2 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte2);
+        let fb3 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte3);
+        let fb4 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte4);
+        let fb5 =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte5);
+        let imm_y_canon =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ImmYCanon);
         let branch_target_canon = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::BranchTargetCanon
+            component_trace,
+            PreprocessedColumn::BranchTargetCanon
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
@@ -311,12 +327,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.extend_from_slice(&branch_target_canon);
 
         // Producer (negative multiplicity).
-        logup.add_to_relation_with(
-            prog_mem,
-            [mult[0].clone()],
-            |[m]| (-m).into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(prog_mem, [mult[0].clone()], |[m]| (-m).into(), &tuple);
 
         logup.finalize()
     }

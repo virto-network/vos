@@ -143,7 +143,7 @@ run-actor name="greeter": build-pvm
 
 # Host-side no_std build of the verifier surface.  Catches std-only imports
 # leaking into the always-compiled path without needing the wasm toolchain.
-check-no-std:
+check-zkpvm-no-std:
     cargo build -p zkpvm --no-default-features
     cargo build -p zkpvm-verifier
 
@@ -185,7 +185,7 @@ check:
 
 # Run all checks the pre-commit + pre-push hooks run, in one go
 verify:
-    cargo fmt --all -- --check
+    cargo fmt -- --check
     cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::result_unit_err -A clippy::manual_async_fn
     cargo test --workspace --lib
     just build-pvm

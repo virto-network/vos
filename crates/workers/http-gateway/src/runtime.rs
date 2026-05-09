@@ -64,10 +64,7 @@ pub(crate) async fn drain_in_flight(inner: &Inner) {
 /// returns the thread's join handle so callers can wait for it to
 /// fully exit on shutdown (otherwise a fast restart races against
 /// the listener still holding the port).
-pub(crate) fn spawn_on_thread<F, Fut>(
-    name: String,
-    work: F,
-) -> IoResult<thread::JoinHandle<()>>
+pub(crate) fn spawn_on_thread<F, Fut>(name: String, work: F) -> IoResult<thread::JoinHandle<()>>
 where
     F: FnOnce(mpsc::SyncSender<IoResult<()>>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
@@ -90,7 +87,9 @@ where
             rt.block_on(work(ready_tx_for_work));
         })
         .map_err(|e| format!("spawn thread: {e}"))?;
-    ready_rx.recv().map_err(|e| format!("ready signal: {e}"))??;
+    ready_rx
+        .recv()
+        .map_err(|e| format!("ready signal: {e}"))??;
     Ok(handle)
 }
 
@@ -133,9 +132,7 @@ where
         );
     }
     if config::admin_token().is_none() {
-        log::info!(
-            "http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled"
-        );
+        log::info!("http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled");
     }
 
     let stop_msg = drain_jobs(&job_rx, &inner, ctx).await;

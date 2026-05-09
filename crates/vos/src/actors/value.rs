@@ -36,12 +36,7 @@ impl core::fmt::Display for InvokeError {
 ///
 /// Flat by design — no recursive nesting. Covers the types expressible
 /// in TOML manifests and useful for cross-actor communication.
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    Debug, Clone, PartialEq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[rkyv(crate = rkyv)]
 pub enum Value {
     Unit,
@@ -61,55 +56,155 @@ pub enum Value {
 // ── Typed accessors ──────────────────────────────────────────────
 
 impl Value {
-    pub fn as_u8(&self) -> Option<u8> { match self { Value::U8(v) => Some(*v), _ => None } }
-    pub fn as_u16(&self) -> Option<u16> { match self { Value::U16(v) => Some(*v), _ => None } }
-    pub fn as_u32(&self) -> Option<u32> { match self { Value::U32(v) => Some(*v), _ => None } }
-    pub fn as_u64(&self) -> Option<u64> { match self { Value::U64(v) => Some(*v), _ => None } }
-    pub fn as_i32(&self) -> Option<i32> { match self { Value::I32(v) => Some(*v), _ => None } }
-    pub fn as_i64(&self) -> Option<i64> { match self { Value::I64(v) => Some(*v), _ => None } }
-    pub fn as_bool(&self) -> Option<bool> { match self { Value::Bool(v) => Some(*v), _ => None } }
+    pub fn as_u8(&self) -> Option<u8> {
+        match self {
+            Value::U8(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_u16(&self) -> Option<u16> {
+        match self {
+            Value::U16(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            Value::U32(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Value::U64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Value::I32(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::I64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
 
     pub fn as_str(&self) -> Option<&str> {
-        match self { Value::Str(v) => Some(v), _ => None }
+        match self {
+            Value::Str(v) => Some(v),
+            _ => None,
+        }
     }
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self { Value::Bytes(v) => Some(v), _ => None }
+        match self {
+            Value::Bytes(v) => Some(v),
+            _ => None,
+        }
     }
     pub fn as_list_u32(&self) -> Option<&[u32]> {
-        match self { Value::ListU32(v) => Some(v), _ => None }
+        match self {
+            Value::ListU32(v) => Some(v),
+            _ => None,
+        }
     }
     pub fn as_list_str(&self) -> Option<&[String]> {
-        match self { Value::ListStr(v) => Some(v), _ => None }
+        match self {
+            Value::ListStr(v) => Some(v),
+            _ => None,
+        }
     }
 }
 
 // ── From impls for ergonomic construction ────────────────────────
 
-impl From<()> for Value { fn from(_: ()) -> Self { Value::Unit } }
-impl From<bool> for Value { fn from(v: bool) -> Self { Value::Bool(v) } }
-impl From<u8> for Value { fn from(v: u8) -> Self { Value::U8(v) } }
-impl From<u16> for Value { fn from(v: u16) -> Self { Value::U16(v) } }
-impl From<u32> for Value { fn from(v: u32) -> Self { Value::U32(v) } }
-impl From<u64> for Value { fn from(v: u64) -> Self { Value::U64(v) } }
-impl From<i32> for Value { fn from(v: i32) -> Self { Value::I32(v) } }
-impl From<i64> for Value { fn from(v: i64) -> Self { Value::I64(v) } }
-impl From<String> for Value { fn from(v: String) -> Self { Value::Str(v) } }
-impl From<&str> for Value { fn from(v: &str) -> Self { Value::Str(String::from(v)) } }
-impl From<Vec<u8>> for Value { fn from(v: Vec<u8>) -> Self { Value::Bytes(v) } }
-impl From<Vec<u32>> for Value { fn from(v: Vec<u32>) -> Self { Value::ListU32(v) } }
-impl From<Vec<String>> for Value { fn from(v: Vec<String>) -> Self { Value::ListStr(v) } }
+impl From<()> for Value {
+    fn from(_: ()) -> Self {
+        Value::Unit
+    }
+}
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+impl From<u8> for Value {
+    fn from(v: u8) -> Self {
+        Value::U8(v)
+    }
+}
+impl From<u16> for Value {
+    fn from(v: u16) -> Self {
+        Value::U16(v)
+    }
+}
+impl From<u32> for Value {
+    fn from(v: u32) -> Self {
+        Value::U32(v)
+    }
+}
+impl From<u64> for Value {
+    fn from(v: u64) -> Self {
+        Value::U64(v)
+    }
+}
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::I32(v)
+    }
+}
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::I64(v)
+    }
+}
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::Str(v)
+    }
+}
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::Str(String::from(v))
+    }
+}
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
+    }
+}
+impl From<Vec<u32>> for Value {
+    fn from(v: Vec<u32>) -> Self {
+        Value::ListU32(v)
+    }
+}
+impl From<Vec<String>> for Value {
+    fn from(v: Vec<String>) -> Self {
+        Value::ListStr(v)
+    }
+}
 
 // ── Args ─────────────────────────────────────────────────────────
 
 /// A named collection of values — used for message arguments and init args.
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    Debug, Clone,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(crate = rkyv)]
 pub struct Args(pub Vec<(String, Value)>);
+
+impl Default for Args {
+    fn default() -> Self {
+        Args::new()
+    }
+}
 
 impl Args {
     pub fn new() -> Self {
@@ -125,17 +220,39 @@ impl Args {
         self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
-    pub fn get_u8(&self, key: &str) -> Option<u8> { self.get(key)?.as_u8() }
-    pub fn get_u16(&self, key: &str) -> Option<u16> { self.get(key)?.as_u16() }
-    pub fn get_u32(&self, key: &str) -> Option<u32> { self.get(key)?.as_u32() }
-    pub fn get_u64(&self, key: &str) -> Option<u64> { self.get(key)?.as_u64() }
-    pub fn get_i32(&self, key: &str) -> Option<i32> { self.get(key)?.as_i32() }
-    pub fn get_i64(&self, key: &str) -> Option<i64> { self.get(key)?.as_i64() }
-    pub fn get_bool(&self, key: &str) -> Option<bool> { self.get(key)?.as_bool() }
-    pub fn get_str(&self, key: &str) -> Option<String> { self.get(key)?.as_str().map(String::from) }
-    pub fn get_bytes(&self, key: &str) -> Option<Vec<u8>> { self.get(key)?.as_bytes().map(Vec::from) }
-    pub fn get_list_u32(&self, key: &str) -> Option<Vec<u32>> { self.get(key)?.as_list_u32().map(Vec::from) }
-    pub fn get_list_str(&self, key: &str) -> Option<Vec<String>> { self.get(key)?.as_list_str().map(Vec::from) }
+    pub fn get_u8(&self, key: &str) -> Option<u8> {
+        self.get(key)?.as_u8()
+    }
+    pub fn get_u16(&self, key: &str) -> Option<u16> {
+        self.get(key)?.as_u16()
+    }
+    pub fn get_u32(&self, key: &str) -> Option<u32> {
+        self.get(key)?.as_u32()
+    }
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.get(key)?.as_u64()
+    }
+    pub fn get_i32(&self, key: &str) -> Option<i32> {
+        self.get(key)?.as_i32()
+    }
+    pub fn get_i64(&self, key: &str) -> Option<i64> {
+        self.get(key)?.as_i64()
+    }
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.get(key)?.as_bool()
+    }
+    pub fn get_str(&self, key: &str) -> Option<String> {
+        self.get(key)?.as_str().map(String::from)
+    }
+    pub fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.get(key)?.as_bytes().map(Vec::from)
+    }
+    pub fn get_list_u32(&self, key: &str) -> Option<Vec<u32>> {
+        self.get(key)?.as_list_u32().map(Vec::from)
+    }
+    pub fn get_list_str(&self, key: &str) -> Option<Vec<String>> {
+        self.get(key)?.as_list_str().map(Vec::from)
+    }
 }
 
 // ── Msg ──────────────────────────────────────────────────────────
@@ -152,12 +269,7 @@ pub trait FromDynamic: Sized {
 }
 
 /// A dynamic message: target message name + arguments.
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    Debug, Clone,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(crate = rkyv)]
 pub struct Msg {
     pub name: String,
@@ -268,13 +380,34 @@ pub mod desc {
     fn write_value(out: &mut Vec<u8>, value: &Value) {
         match value {
             Value::Unit => out.push(TAG_UNIT),
-            Value::Bool(b) => { out.push(TAG_BOOL); out.push(if *b { 1 } else { 0 }); }
-            Value::U8(v) => { out.push(TAG_U8); out.push(*v); }
-            Value::U16(v) => { out.push(TAG_U16); out.extend_from_slice(&v.to_le_bytes()); }
-            Value::U32(v) => { out.push(TAG_U32); out.extend_from_slice(&v.to_le_bytes()); }
-            Value::U64(v) => { out.push(TAG_U64); out.extend_from_slice(&v.to_le_bytes()); }
-            Value::I32(v) => { out.push(TAG_I32); out.extend_from_slice(&v.to_le_bytes()); }
-            Value::I64(v) => { out.push(TAG_I64); out.extend_from_slice(&v.to_le_bytes()); }
+            Value::Bool(b) => {
+                out.push(TAG_BOOL);
+                out.push(if *b { 1 } else { 0 });
+            }
+            Value::U8(v) => {
+                out.push(TAG_U8);
+                out.push(*v);
+            }
+            Value::U16(v) => {
+                out.push(TAG_U16);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::U32(v) => {
+                out.push(TAG_U32);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::U64(v) => {
+                out.push(TAG_U64);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::I32(v) => {
+                out.push(TAG_I32);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::I64(v) => {
+                out.push(TAG_I64);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             Value::Str(s) => {
                 out.push(TAG_STR);
                 let b = s.as_bytes();
@@ -289,7 +422,9 @@ pub mod desc {
             Value::ListU32(items) => {
                 out.push(TAG_LIST_U32);
                 out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                for v in items { out.extend_from_slice(&v.to_le_bytes()); }
+                for v in items {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
             }
             Value::ListStr(items) => {
                 out.push(TAG_LIST_STR);
@@ -303,29 +438,42 @@ pub mod desc {
         }
     }
 
-    struct Cursor<'a> { buf: &'a [u8], pos: usize }
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
     impl<'a> Cursor<'a> {
-        fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
+        fn new(buf: &'a [u8]) -> Self {
+            Self { buf, pos: 0 }
+        }
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-            if self.pos + n > self.buf.len() { return None; }
+            if self.pos + n > self.buf.len() {
+                return None;
+            }
             let s = &self.buf[self.pos..self.pos + n];
             self.pos += n;
             Some(s)
         }
-        fn read_u8(&mut self) -> Option<u8> { self.take(1).map(|b| b[0]) }
+        fn read_u8(&mut self) -> Option<u8> {
+            self.take(1).map(|b| b[0])
+        }
         fn read_u16(&mut self) -> Option<u16> {
             self.take(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
         }
         fn read_u32(&mut self) -> Option<u32> {
-            self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            self.take(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         }
         fn read_u64(&mut self) -> Option<u64> {
-            self.take(8).map(|b| u64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
-            ]))
+            self.take(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         }
-        fn read_i32(&mut self) -> Option<i32> { self.read_u32().map(|v| v as i32) }
-        fn read_i64(&mut self) -> Option<i64> { self.read_u64().map(|v| v as i64) }
+        fn read_i32(&mut self) -> Option<i32> {
+            self.read_u32().map(|v| v as i32)
+        }
+        fn read_i64(&mut self) -> Option<i64> {
+            self.read_u64().map(|v| v as i64)
+        }
         fn read_str(&mut self) -> Option<String> {
             let len = self.read_u32()? as usize;
             let b = self.take(len)?;
@@ -349,13 +497,17 @@ pub mod desc {
                 TAG_LIST_U32 => {
                     let count = self.read_u32()? as usize;
                     let mut items = Vec::with_capacity(count);
-                    for _ in 0..count { items.push(self.read_u32()?); }
+                    for _ in 0..count {
+                        items.push(self.read_u32()?);
+                    }
                     Some(Value::ListU32(items))
                 }
                 TAG_LIST_STR => {
                     let count = self.read_u32()? as usize;
                     let mut items = Vec::with_capacity(count);
-                    for _ in 0..count { items.push(self.read_str()?); }
+                    for _ in 0..count {
+                        items.push(self.read_str()?);
+                    }
                     Some(Value::ListStr(items))
                 }
                 _ => None,

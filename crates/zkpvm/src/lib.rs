@@ -86,27 +86,48 @@
 // lints crate-wide when prover is off; on the default build the lints
 // remain active and catch genuine dead code.
 #![cfg_attr(not(feature = "prover"), allow(dead_code, unused_imports))]
+// Stylistic lints carried over from the Nexus port — fixing them
+// touches a wide swath of generated chip code and would obscure the
+// upstream diff. Allowed crate-wide so the workspace's `-D warnings`
+// gate doesn't reject the verbatim port. Correctness-relevant lints
+// (e.g. `unsound_*`, `correctness::*`) remain active.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::needless_lifetimes,
+    clippy::uninlined_format_args,
+    clippy::manual_div_ceil,
+    clippy::nonminimal_bool,
+    clippy::no_effect,
+    clippy::manual_range_patterns,
+    clippy::derivable_impls,
+    clippy::field_reassign_with_default,
+    clippy::new_without_default,
+    clippy::unnecessary_cast,
+    clippy::duplicated_attributes,
+    clippy::doc_overindented_list_items,
+    clippy::identity_op
+)]
 
 extern crate alloc;
 
 pub mod air_column;
-pub mod core;
-pub mod trace;
 pub mod chips;
+pub mod core;
 mod framework;
-mod lookups;
 pub mod framework_access;
+mod lookups;
 pub mod proof;
+pub mod trace;
 
 #[cfg(feature = "prover")]
 pub mod side_note;
 
 #[cfg(feature = "prover")]
+mod program_id;
+#[cfg(feature = "prover")]
 mod prove;
 #[cfg(feature = "prover")]
 mod verify;
-#[cfg(feature = "prover")]
-mod program_id;
 
 // Re-export AirColumn + PreprocessedAirColumn at crate root so the derive-
 // generated impls (which target `::zkpvm::AirColumn`) resolve correctly.
@@ -134,13 +155,13 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
-    &chips::PopcountChip, // Phase 33 — per-byte popcount lookup table
-    &chips::BitcountChip, // Phase 34 — per-byte (lz, tz) lookup table
+    &chips::PopcountChip,           // Phase 33 — per-byte popcount lookup table
+    &chips::BitcountChip,           // Phase 34 — per-byte (lz, tz) lookup table
     &chips::ByteToBitsChip, // Phase 55a — per-byte 8-bit decomposition lookup table (dormant in 55a; consumers added in 55b)
-    &chips::MulChip,      // Phase 54a — consumer of MultiplicationLookup
-    &chips::BitwiseChip,  // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip,  // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,   // Phase 54g — consumer of DivRemLookup
+    &chips::MulChip,        // Phase 54a — consumer of MultiplicationLookup
+    &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip, // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,  // Phase 54g — consumer of DivRemLookup
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, gated by activity.ristretto
     &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, gated by activity.ristretto_ecall
     &chips::RistrettoCombTableChip, // Session 2.1 step 4 — OPTIONAL, gated by activity.ristretto_comb
@@ -196,9 +217,9 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
 /// the current implementation.  When more chips become conditional
 /// (Phase 60+ followups), each gains a corresponding index check.
 #[cfg(feature = "prover")]
-pub(crate) fn active_components(side_note: &side_note::SideNote)
-    -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent>
-{
+pub(crate) fn active_components(
+    side_note: &side_note::SideNote,
+) -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent> {
     let a = activity_from_steps(side_note);
     BASE_COMPONENTS
         .iter()
@@ -218,9 +239,8 @@ pub(crate) fn active_components(side_note: &side_note::SideNote)
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
     use crate::core::ecall::{
-        ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_SCALAR_MULT,
-        ECALL_RISTRETTO_POINT_ADD, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
-        ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L,
+        ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
+        ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
     };
     use crate::core::opcode::Opcode;
     let mut a = ChipActivity::default();
@@ -254,20 +274,45 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
             a.ristretto_ecall = true;
         }
         let f = classify(step.opcode);
-        if f.is_jump_ind || f.is_load_imm_jump_ind { a.jump_table = true; }
-        if f.is_count_set_bits { a.popcount = true; }
-        if f.is_lzb || f.is_tzb { a.bitcount = true; }
-        if f.is_mul || f.is_mul_upper_uu || f.is_mul_upper_su || f.is_mul_upper_ss
-            || f.is_rotate_l64 || f.is_rotate_r64 || f.is_rotate_l32 || f.is_rotate_r32
-        { a.mul = true; }
-        if f.is_and || f.is_or || f.is_xor || f.is_and_inv || f.is_or_inv || f.is_xnor
-        { a.bitwise = true; }
+        if f.is_jump_ind || f.is_load_imm_jump_ind {
+            a.jump_table = true;
+        }
+        if f.is_count_set_bits {
+            a.popcount = true;
+        }
+        if f.is_lzb || f.is_tzb {
+            a.bitcount = true;
+        }
+        if f.is_mul
+            || f.is_mul_upper_uu
+            || f.is_mul_upper_su
+            || f.is_mul_upper_ss
+            || f.is_rotate_l64
+            || f.is_rotate_r64
+            || f.is_rotate_l32
+            || f.is_rotate_r32
+        {
+            a.mul = true;
+        }
+        if f.is_and || f.is_or || f.is_xor || f.is_and_inv || f.is_or_inv || f.is_xnor {
+            a.bitwise = true;
+        }
         // Compare = SetLt*/Cmov*/Min/Max + branches.
-        if f.is_set_lt_u || f.is_set_lt_s || f.is_cmov_iz || f.is_cmov_nz
-            || f.is_min_s || f.is_min_u || f.is_max_s || f.is_max_u
+        if f.is_set_lt_u
+            || f.is_set_lt_s
+            || f.is_cmov_iz
+            || f.is_cmov_nz
+            || f.is_min_s
+            || f.is_min_u
+            || f.is_max_s
+            || f.is_max_u
             || f.is_branch
-        { a.compare = true; }
-        if f.is_div_rem { a.divrem = true; }
+        {
+            a.compare = true;
+        }
+        if f.is_div_rem {
+            a.divrem = true;
+        }
     }
     // Chip-level tests that bypass the ECALL path can pre-populate
     // ristretto_field_rows directly.
@@ -329,7 +374,9 @@ pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
     let a = activity_from_steps(side_note);
     let mut mask = 0u32;
     for i in 0..BASE_COMPONENTS.len() {
-        if a.is_active(i) { mask |= 1 << i; }
+        if a.is_active(i) {
+            mask |= 1 << i;
+        }
     }
     mask
 }
@@ -337,9 +384,9 @@ pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
 /// Phase 60: verifier-side mirror of `active_components`, returning the
 /// same selection upcast to `&dyn MachineComponent`.
 #[cfg(feature = "prover")]
-pub(crate) fn active_components_verifier(side_note: &side_note::SideNote)
-    -> alloc::vec::Vec<&'static dyn framework::MachineComponent>
-{
+pub(crate) fn active_components_verifier(
+    side_note: &side_note::SideNote,
+) -> alloc::vec::Vec<&'static dyn framework::MachineComponent> {
     let a = activity_from_steps(side_note);
     BASE_COMPONENTS
         .iter()
@@ -355,29 +402,27 @@ pub(crate) fn active_components_verifier(side_note: &side_note::SideNote)
 }
 
 pub use proof::{
-    check_pcs_policy, PcsPolicy, Proof, SegmentState, PROOF_FORMAT_VERSION,
-    STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
-    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS,
+    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS, PROOF_FORMAT_VERSION,
+    PcsPolicy, Proof, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
+    SegmentState, check_pcs_policy,
 };
 #[cfg(feature = "prover")]
 pub use prove::{
-    prove, prove_mobile, prove_with_config, prove_profiled, prove_profiled_with_config,
+    ProveProfile, install_thread_pool, production_pcs_config, production_pcs_config_mobile, prove,
+    prove_mobile, prove_profiled, prove_profiled_with_config, prove_with_config,
     prove_with_explicit_components,
-    ProveProfile, production_pcs_config, production_pcs_config_mobile,
-    install_thread_pool,
 };
 #[cfg(feature = "debug-internals")]
-pub use prove::{debug_claimed_sums, debug_assert_constraints_explicit};
-pub use stwo::core::pcs::PcsConfig;
-pub use stwo::core::fri::FriConfig;
-#[cfg(feature = "prover")]
-pub use verify::{
-    verify, verify_chain, verify_with_max_log_size, verify_with_options,
-    verify_with_pcs_policy, verify_with_explicit_components,
-    DEFAULT_MAX_LOG_SIZE,
-};
+pub use prove::{debug_assert_constraints_explicit, debug_claimed_sums};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
+pub use stwo::core::fri::FriConfig;
+pub use stwo::core::pcs::PcsConfig;
+#[cfg(feature = "prover")]
+pub use verify::{
+    DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_explicit_components,
+    verify_with_max_log_size, verify_with_options, verify_with_pcs_policy,
+};
 
 /// Phase I.0 chip-isolated harness surface — re-exports the trait
 /// objects callers need to assemble an explicit component slice for
@@ -391,4 +436,4 @@ pub mod harness {
     pub use crate::framework::{MachineComponent, MachineProverComponent};
 }
 #[cfg(feature = "prover")]
-pub use program_id::{program_commitment_of_proof, program_commitment_hex, ProgramCommitment};
+pub use program_id::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};

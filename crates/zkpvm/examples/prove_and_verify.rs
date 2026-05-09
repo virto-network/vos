@@ -18,15 +18,15 @@
 //!
 //! Reads ~5 seconds on a modern x86 desktop.
 
-use javm::instruction::Opcode;
-use javm::interpreter::Interpreter;
 use javm::ExitReason;
 use javm::PVM_REGISTER_COUNT;
+use javm::instruction::Opcode;
+use javm::interpreter::Interpreter;
 
 use zkpvm::core::tracing::TracingPvm;
 use zkpvm::{
-    program_commitment_hex, program_commitment_of_proof, prove, verify, verify_chain, SideNote,
-    PROOF_FORMAT_VERSION,
+    PROOF_FORMAT_VERSION, SideNote, program_commitment_hex, program_commitment_of_proof, prove,
+    verify, verify_chain,
 };
 use zkpvm_verifier::verify_standalone;
 
@@ -38,10 +38,7 @@ fn main() {
     // ── Step 1: program ────────────────────────────────────────────
     // Add64 ra=0 rb=1 rd=2: regs[2] = regs[0] + regs[1].
     // Then Trap to terminate.
-    let code = vec![
-        Opcode::Add64 as u8, 0x10, 2,
-        Opcode::Trap as u8,
-    ];
+    let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
 
     // ── Step 2: trace ──────────────────────────────────────────────
@@ -51,17 +48,21 @@ fn main() {
     let pvm = Interpreter::new(
         code.clone(),
         bitmask.clone(),
-        vec![],                        // ECALL args
+        vec![], // ECALL args
         regs,
-        vec![0u8; 4 * 1024 * 1024],    // 4 MiB flat memory
-        10_000,                        // gas budget
-        25,                            // max steps
+        vec![0u8; 4 * 1024 * 1024], // 4 MiB flat memory
+        10_000,                     // gas budget
+        25,                         // max steps
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, ExitReason::Trap, "expected Trap exit");
     let steps = tracing.into_trace();
-    println!("Traced {} step(s); regs[2] = {}", steps.len(), steps[0].regs_after[2]);
+    println!(
+        "Traced {} step(s); regs[2] = {}",
+        steps.len(),
+        steps[0].regs_after[2]
+    );
 
     // ── Step 3 + 4: SideNote → prove ───────────────────────────────
     let mut side_note = SideNote::new(steps, code.clone(), bitmask.clone());

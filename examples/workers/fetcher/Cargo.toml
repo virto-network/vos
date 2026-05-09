@@ -5,12 +5,15 @@ edition = "2024"
 
 [features]
 # `bin` enables the cdylib's `vos_worker_*` extern-fn exports.
-# Default-on so a plain `cargo build` produces a loadable
+# `worker` is matched by `#[actor]` to emit `impl WorkerActor`
+# (which unlocks `ctx.fetch(...)` etc.) and the dispatch glue.
+# Both default-on so a plain `cargo build` produces a loadable
 # worker .so; consumers depending on this crate as a Ref source
-# turn it off via `default-features = false` so no symbols
+# turn them off via `default-features = false` so no symbols
 # clash in their link.
-default = ["bin"]
+default = ["bin", "worker"]
 bin = []
+worker = []
 
 [lints.rust.unexpected_cfgs]
 level = "allow"

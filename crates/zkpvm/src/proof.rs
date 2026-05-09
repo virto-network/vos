@@ -6,9 +6,7 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use stwo::core::{
-    fields::qm31::SecureField,
-    pcs::PcsConfig,
-    proof::StarkProof,
+    fields::qm31::SecureField, pcs::PcsConfig, proof::StarkProof,
     vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
 };
 

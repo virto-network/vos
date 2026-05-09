@@ -292,9 +292,8 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     eval.add_constraint(real_mul_h[0].clone() * full_carry(63));
 
     // ── R1c-5-b: pass-1 reduction `lo + 38·hi` ──
-    let pass1_full_carry = |k: usize| -> E::F {
-        pass1_carry[k].clone() + pass1_carry_mid[k].clone() * f256.clone()
-    };
+    let pass1_full_carry =
+        |k: usize| -> E::F { pass1_carry[k].clone() + pass1_carry_mid[k].clone() * f256.clone() };
     let pass1_hi_value = || -> E::F { pass1_hi[0].clone() + pass1_hi[1].clone() * f256.clone() };
     for k in 0..32 {
         let carry_in = if k == 0 {
@@ -361,9 +360,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     eval.add_constraint(real_mul_h[0].clone() * after_top_carry[31].clone());
 
     // pass2_carry_out, pass2_top_bit ∈ {0, 1}.
-    eval.add_constraint(
-        pass2_carry_out[0].clone() * (E::F::one() - pass2_carry_out[0].clone()),
-    );
+    eval.add_constraint(pass2_carry_out[0].clone() * (E::F::one() - pass2_carry_out[0].clone()));
     eval.add_constraint(pass2_top_bit[0].clone() * (E::F::one() - pass2_top_bit[0].clone()));
 
     // ── R1c-5-b: final FieldOut = after_top_bit − is_overflow·p (is_mul rows) ──

@@ -113,10 +113,7 @@ fn main() {
 
     println!("\nMessages: {}", alice.state().len());
     println!("DAG nodes: {}", alice.store().len());
-    println!(
-        "Roots: {} (concurrent heads)",
-        alice.roots().len()
-    );
+    println!("Roots: {} (concurrent heads)", alice.roots().len());
 
     // Demonstrate that a third peer can join and cold-sync the entire history
     println!("\n--- Carol joins and syncs everything from Alice ---\n");

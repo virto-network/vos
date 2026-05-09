@@ -16,10 +16,14 @@
 use crate::ecalls::{ECALL_BLAKE2B_COMPRESS, VOS_OBJECT_CAP};
 
 const BLAKE2B_IV: [u64; 8] = [
-    0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+    0x6A09E667F3BCC908,
+    0xBB67AE8584CAA73B,
+    0x3C6EF372FE94F82B,
+    0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1,
+    0x9B05688C2B3E6C1F,
+    0x1F83D9ABFB41BD6B,
+    0x5BE0CD19137E2179,
 ];
 
 /// One blake2b compression: in-place update of `h` (64 bytes = 8 u64
@@ -63,33 +67,33 @@ fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
 fn compress_host(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let mut h_words = [0u64; 8];
     for i in 0..8 {
-        h_words[i] = u64::from_le_bytes(h[i*8..i*8+8].try_into().unwrap());
+        h_words[i] = u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
     }
     let mut m_words = [0u64; 16];
     for i in 0..16 {
-        m_words[i] = u64::from_le_bytes(m[i*8..i*8+8].try_into().unwrap());
+        m_words[i] = u64::from_le_bytes(m[i * 8..i * 8 + 8].try_into().unwrap());
     }
     let result = compress_inner(&h_words, &m_words, t, f);
     for i in 0..8 {
-        h[i*8..i*8+8].copy_from_slice(&result[i].to_le_bytes());
+        h[i * 8..i * 8 + 8].copy_from_slice(&result[i].to_le_bytes());
     }
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
     const SIGMA: [[usize; 16]; 12] = [
-        [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
-        [14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3],
-        [11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4],
-        [7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8],
-        [9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13],
-        [2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9],
-        [12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11],
-        [13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10],
-        [6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5],
-        [10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0],
-        [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
-        [14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
     ];
     fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: u64) {
         v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
@@ -106,7 +110,9 @@ fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
     v[8..].copy_from_slice(&BLAKE2B_IV);
     v[12] ^= t as u64;
     v[13] ^= (t >> 64) as u64;
-    if f { v[14] = !v[14]; }
+    if f {
+        v[14] = !v[14];
+    }
     for round in 0..12 {
         let s = &SIGMA[round];
         g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
@@ -119,7 +125,9 @@ fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
         g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
     }
     let mut result = [0u64; 8];
-    for i in 0..8 { result[i] = h[i] ^ v[i] ^ v[i + 8]; }
+    for i in 0..8 {
+        result[i] = h[i] ^ v[i] ^ v[i + 8];
+    }
     result
 }
 
@@ -132,40 +140,37 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
     // Parameter block: byte0 = digest_length, byte2 = fanout(1), byte3 = depth(1).
     // h[0] = IV[0] XOR param_block[0..8].
-    let mut param_lo: u64 = 0x0101_0000 | (OUT_LEN as u64);  // bytes [3]=1, [2]=1, [0]=N
+    let mut param_lo: u64 = 0x0101_0000 | (OUT_LEN as u64); // bytes [3]=1, [2]=1, [0]=N
     let mut h_words = BLAKE2B_IV;
     h_words[0] ^= param_lo;
     let _ = &mut param_lo; // suppress unused_mut
 
     let mut h = [0u8; 64];
     for i in 0..8 {
-        h[i*8..i*8+8].copy_from_slice(&h_words[i].to_le_bytes());
+        h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
     }
 
     let mut buf = [0u8; 128];
     let mut buf_len = 0usize;
     let mut t: u128 = 0;
 
-    let feed = |bytes: &[u8],
-                    buf: &mut [u8; 128],
-                    buf_len: &mut usize,
-                    h: &mut [u8; 64],
-                    t: &mut u128| {
-        let mut i = 0;
-        while i < bytes.len() {
-            // If the buffer is FULL and there's at least one more byte
-            // remaining (so this isn't the final block), compress.
-            if *buf_len == 128 {
-                *t += 128;
-                blake2b_compress(h, buf, *t, false);
-                *buf_len = 0;
+    let feed =
+        |bytes: &[u8], buf: &mut [u8; 128], buf_len: &mut usize, h: &mut [u8; 64], t: &mut u128| {
+            let mut i = 0;
+            while i < bytes.len() {
+                // If the buffer is FULL and there's at least one more byte
+                // remaining (so this isn't the final block), compress.
+                if *buf_len == 128 {
+                    *t += 128;
+                    blake2b_compress(h, buf, *t, false);
+                    *buf_len = 0;
+                }
+                let take = (128 - *buf_len).min(bytes.len() - i);
+                buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i + take]);
+                *buf_len += take;
+                i += take;
             }
-            let take = (128 - *buf_len).min(bytes.len() - i);
-            buf[*buf_len..*buf_len + take].copy_from_slice(&bytes[i..i+take]);
-            *buf_len += take;
-            i += take;
-        }
-    };
+        };
 
     feed(domain, &mut buf, &mut buf_len, &mut h, &mut t);
     for p in parts {
@@ -173,7 +178,9 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     }
 
     // Final block: pad with zeros, set finalize flag.
-    for i in buf_len..128 { buf[i] = 0; }
+    for i in buf_len..128 {
+        buf[i] = 0;
+    }
     t += buf_len as u128;
     blake2b_compress(&mut h, &buf, t, true);
 
@@ -188,7 +195,7 @@ mod tests {
 
     #[test]
     fn blake2b_512_matches_blake2_crate() {
-        use blake2::digest::{consts::U64, Digest};
+        use blake2::digest::{Digest, consts::U64};
         type Blake2b512 = blake2::Blake2b<U64>;
 
         let ours: [u8; 64] = blake2b_hash(b"", &[]);
@@ -218,13 +225,15 @@ mod tests {
 
     #[test]
     fn blake2b_256_matches_blake2_crate() {
-        use blake2::digest::{consts::U32, Digest};
+        use blake2::digest::{Digest, consts::U32};
         type Blake2b256 = blake2::Blake2b<U32>;
 
         let ours: [u8; 32] = blake2b_hash(b"hash-test", &[b"a", b"b", b"c"]);
         let mut h = Blake2b256::new();
         h.update(b"hash-test");
-        h.update(b"a"); h.update(b"b"); h.update(b"c");
+        h.update(b"a");
+        h.update(b"b");
+        h.update(b"c");
         let theirs = h.finalize();
         assert_eq!(&ours[..], &theirs[..]);
     }
@@ -232,7 +241,7 @@ mod tests {
     #[test]
     fn blake2b_exactly_one_block_boundary() {
         // 128 bytes total → exactly one compression block.
-        use blake2::digest::{consts::U64, Digest};
+        use blake2::digest::{Digest, consts::U64};
         type B = blake2::Blake2b<U64>;
         let data = alloc::vec![0x42u8; 128];
         let ours: [u8; 64] = blake2b_hash(b"", &[&data]);

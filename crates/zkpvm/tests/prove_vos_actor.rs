@@ -1,11 +1,13 @@
 //! End-to-end test: trace a real VOS actor compiled from Rust.
 
+use javm::PVM_REGISTER_COUNT;
 use javm::interpreter::Interpreter;
 use javm::program::{self, CapEntryType};
-use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, prove_profiled, prove_profiled_with_config, production_pcs_config_mobile, verify};
+use zkpvm::{
+    production_pcs_config_mobile, prove, prove_profiled, prove_profiled_with_config, verify,
+};
 
 /// Load fibonacci PVM blob (transpiled from ELF).
 fn load_fibonacci_blob() -> Vec<u8> {
@@ -68,8 +70,8 @@ fn interpreter_from_blob(blob: &[u8], gas: u64) -> (Interpreter, Vec<u8>) {
     let mut registers = [0u64; PVM_REGISTER_COUNT];
     for entry in &parsed.caps {
         if entry.cap_type == CapEntryType::Data {
-            let top = (entry.base_page as u64 + entry.page_count as u64)
-                * javm::PVM_PAGE_SIZE as u64;
+            let top =
+                (entry.base_page as u64 + entry.page_count as u64) * javm::PVM_PAGE_SIZE as u64;
             if top > registers[1] {
                 registers[1] = top;
             }
@@ -97,8 +99,11 @@ fn trace_fibonacci_actor() {
     eprintln!("PVM blob: {} bytes", blob.len());
 
     let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
-    eprintln!("Interpreter: code={} bytes, flat_mem={} bytes",
-        interp.code.len(), interp.flat_mem.len());
+    eprintln!(
+        "Interpreter: code={} bytes, flat_mem={} bytes",
+        interp.code.len(),
+        interp.flat_mem.len()
+    );
 
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run();
@@ -107,7 +112,11 @@ fn trace_fibonacci_actor() {
 
     assert!(!steps.is_empty(), "should have executed some steps");
     eprintln!("First: pc={} {:?}", steps[0].pc, steps[0].opcode);
-    eprintln!("Last:  pc={} {:?}", steps.last().unwrap().pc, steps.last().unwrap().opcode);
+    eprintln!(
+        "Last:  pc={} {:?}",
+        steps.last().unwrap().pc,
+        steps.last().unwrap().opcode
+    );
 
     // Count opcode categories
     let mut counts = std::collections::HashMap::new();
@@ -144,11 +153,9 @@ fn prove_fibonacci_actor() {
     let steps = tracing.into_trace();
     eprintln!("Traced {} steps, exit={exit:?}", steps.len());
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps,
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-    ).with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_jump_table(code_blob.jump_table.to_vec());
     let proof = prove(&mut side_note).expect("proving failed");
     eprintln!("Proof generated: {} claimed sums", proof.claimed_sums.len());
 
@@ -179,7 +186,10 @@ fn profile_fibonacci_actor() {
     let trace_time = t0.elapsed();
 
     eprintln!("=== Fibonacci Actor Profile ===");
-    eprintln!("PVM execution: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+    eprintln!(
+        "PVM execution: {} steps in {trace_time:?}, exit={exit:?}",
+        steps.len()
+    );
 
     // Opcode distribution
     let mut counts = std::collections::HashMap::new();
@@ -187,8 +197,12 @@ fn profile_fibonacci_actor() {
     let mut branches = 0u32;
     for s in &steps {
         *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
-        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
-        if s.branch_taken { branches += 1; }
+        if s.mem_read.is_some() || s.mem_write.is_some() {
+            mem_ops += 1;
+        }
+        if s.branch_taken {
+            branches += 1;
+        }
     }
     eprintln!("Memory ops: {mem_ops}, Branches taken: {branches}");
     let mut sorted: Vec<_> = counts.into_iter().collect();
@@ -197,18 +211,20 @@ fn profile_fibonacci_actor() {
         eprintln!("  {op}: {count}");
     }
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps,
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-    ).with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     eprintln!("\n=== Prove Pipeline Profile ===");
     let (proof, _profile) = prove_profiled(&mut side_note).expect("proving failed");
 
     // Proof size
     let proof_bytes = bincode::serialize(&proof).expect("serialize");
-    eprintln!("Proof size: {} bytes ({:.1} KB)", proof_bytes.len(), proof_bytes.len() as f64 / 1024.0);
+    eprintln!(
+        "Proof size: {} bytes ({:.1} KB)",
+        proof_bytes.len(),
+        proof_bytes.len() as f64 / 1024.0
+    );
 
     let t = std::time::Instant::now();
     verify(proof, &side_note).expect("verification failed");
@@ -224,8 +240,8 @@ fn load_actor_blob(name: &str) -> Vec<u8> {
         return data;
     }
     let elf_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.elf");
-    let elf_data = std::fs::read(&elf_path)
-        .unwrap_or_else(|_| panic!("{name} ELF not found — build first"));
+    let elf_data =
+        std::fs::read(&elf_path).unwrap_or_else(|_| panic!("{name} ELF not found — build first"));
     grey_transpiler::link_elf(&elf_data).expect("failed to transpile ELF")
 }
 
@@ -264,11 +280,17 @@ fn profile_actor(name: &str, gas: u64) {
     let trace_time = t0.elapsed();
 
     eprintln!("=== {name} actor ===");
-    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+    eprintln!(
+        "PVM: {} steps in {trace_time:?}, exit={exit:?}",
+        steps.len()
+    );
     eprintln!(
         "Precompile ECALLs: blake2b={}, ristretto_scalar_mult={}, ristretto_point_add={}, scalar_reduce_wide={}, scalar_binop={}",
-        blake2b_calls.len(), ristretto_calls.len(), ristretto_add_records.len(),
-        scalar_reduce_records.len(), scalar_binop_records.len(),
+        blake2b_calls.len(),
+        ristretto_calls.len(),
+        ristretto_add_records.len(),
+        scalar_reduce_records.len(),
+        scalar_binop_records.len(),
     );
 
     // Opcode stats
@@ -277,8 +299,12 @@ fn profile_actor(name: &str, gas: u64) {
     let mut counts = std::collections::HashMap::new();
     for s in &steps {
         *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
-        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
-        if s.branch_taken { branches += 1; }
+        if s.mem_read.is_some() || s.mem_write.is_some() {
+            mem_ops += 1;
+        }
+        if s.branch_taken {
+            branches += 1;
+        }
     }
     eprintln!("Memory ops: {mem_ops}, Branches taken: {branches}");
     let mut sorted: Vec<_> = counts.into_iter().collect();
@@ -287,17 +313,21 @@ fn profile_actor(name: &str, gas: u64) {
         eprintln!("  {op}: {count}");
     }
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     // Steps 9-18: install precompile ECALL records on side_note.
     for c in &blake2b_calls {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: c.h, m: c.m, t: c.t, f: c.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: c.h,
+                m: c.m,
+                t: c.t,
+                f: c.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
     side_note.ristretto_calls = ristretto_calls;
@@ -351,17 +381,24 @@ fn profile_actor_with_config(name: &str, gas: u64, config: zkpvm::PcsConfig) {
     let trace_time = t0.elapsed();
 
     eprintln!("=== {name} actor (custom PcsConfig) ===");
-    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+    eprintln!(
+        "PVM: {} steps in {trace_time:?}, exit={exit:?}",
+        steps.len()
+    );
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
     for c in &blake2b_calls {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: c.h, m: c.m, t: c.t, f: c.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: c.h,
+                m: c.m,
+                t: c.t,
+                f: c.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
     side_note.ristretto_calls = ristretto_calls;
@@ -375,8 +412,7 @@ fn profile_actor_with_config(name: &str, gas: u64, config: zkpvm::PcsConfig) {
     side_note.ingest_ristretto_boundary();
 
     eprintln!("\nProve:");
-    let (proof, _) = prove_profiled_with_config(&mut side_note, config)
-        .expect("proving failed");
+    let (proof, _) = prove_profiled_with_config(&mut side_note, config).expect("proving failed");
     let proof_bytes = bincode::serialize(&proof).expect("serialize");
     eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
 
@@ -411,7 +447,10 @@ fn trace_clerk_refine_bench() {
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run_with_vos_stubs();
     let steps = tracing.into_trace();
-    eprintln!("clerk-refine-bench: {} PVM steps, exit={exit:?}", steps.len());
+    eprintln!(
+        "clerk-refine-bench: {} PVM steps, exit={exit:?}",
+        steps.len()
+    );
 }
 
 /// Real-workload prove: clerk-private-pay-bench — the on-device
@@ -462,16 +501,20 @@ fn analyze_register_dedup(name: &str, gas: u64) {
     let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
     let steps = tracing.into_trace();
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     for c in &blake2b_calls {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: c.h, m: c.m, t: c.t, f: c.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: c.h,
+                m: c.m,
+                t: c.t,
+                f: c.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
     side_note.ristretto_calls = ristretto_calls;
@@ -488,13 +531,19 @@ fn analyze_register_dedup(name: &str, gas: u64) {
 
     eprintln!("=== {name} register-memory dedup feasibility ===");
     eprintln!("PVM steps:           {}", side_note.steps.len());
-    eprintln!("Total ledger entries: {} ({} reads + {} writes)",
-        report.total_entries, report.total_reads, report.total_writes);
-    eprintln!("After dedup:         {} ({} merged rows)",
-        report.after_dedup, report.run_count);
-    eprintln!("Saved:               {} entries ({:.1}%)",
+    eprintln!(
+        "Total ledger entries: {} ({} reads + {} writes)",
+        report.total_entries, report.total_reads, report.total_writes
+    );
+    eprintln!(
+        "After dedup:         {} ({} merged rows)",
+        report.after_dedup, report.run_count
+    );
+    eprintln!(
+        "Saved:               {} entries ({:.1}%)",
         report.saved,
-        100.0 * report.saved as f64 / report.total_entries as f64);
+        100.0 * report.saved as f64 / report.total_entries as f64
+    );
     eprintln!("Current log_size:    {}", report.current_log_size);
     eprintln!("After-dedup log_size: {}", report.after_dedup_log_size);
     eprintln!("Longest run:         {}", report.longest_run);
@@ -503,11 +552,14 @@ fn analyze_register_dedup(name: &str, gas: u64) {
     let mut cumulative = 0usize;
     for (len, cnt) in &report.run_length_histogram {
         cumulative += cnt;
-        eprintln!("  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
-            len, cnt,
+        eprintln!(
+            "  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
+            len,
+            cnt,
             100.0 * (*cnt as f64) / total_runs,
             cumulative,
-            100.0 * (cumulative as f64) / total_runs);
+            100.0 * (cumulative as f64) / total_runs
+        );
     }
     eprintln!("\nFixed-cap merge sweep (M = max-merge per row):");
     eprintln!("  M  rows-after-dedup  log_size");
@@ -552,16 +604,20 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
     let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
     let steps = tracing.into_trace();
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     for c in &blake2b_calls {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: c.h, m: c.m, t: c.t, f: c.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: c.h,
+                m: c.m,
+                t: c.t,
+                f: c.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
     side_note.ristretto_calls = ristretto_calls;
@@ -578,9 +634,11 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
 
     eprintln!("=== {name} memory dedup feasibility ===");
     eprintln!("Total ledger entries:    {}", report.total_entries);
-    eprintln!("Bytes in flood groups:   {} ({:.1}%)",
+    eprintln!(
+        "Bytes in flood groups:   {} ({:.1}%)",
         report.bytes_in_flood_groups,
-        100.0 * report.bytes_in_flood_groups as f64 / report.total_entries as f64);
+        100.0 * report.bytes_in_flood_groups as f64 / report.total_entries as f64
+    );
     eprintln!("After unbounded dedup:   {}", report.after_dedup);
     eprintln!("Current log_size:        {}", report.current_log_size);
     eprintln!("After-dedup log_size:    {}", report.after_dedup_log_size);
@@ -590,11 +648,14 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
     let mut cumulative = 0usize;
     for (len, cnt) in &report.flood_length_histogram {
         cumulative += cnt;
-        eprintln!("  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
-            len, cnt,
+        eprintln!(
+            "  {:>5}: {:>8}  ({:5.1}%)  [cum {:>8} = {:5.1}%]",
+            len,
+            cnt,
             100.0 * (*cnt as f64) / total_groups,
             cumulative,
-            100.0 * (cumulative as f64) / total_groups);
+            100.0 * (cumulative as f64) / total_groups
+        );
     }
     eprintln!("\nFixed-cap merge sweep (M = max bytes per row):");
     eprintln!("  M  rows-after-dedup  log_size");
@@ -616,7 +677,10 @@ fn trace_clerk_private_pay_bench() {
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run_with_vos_stubs();
     let steps = tracing.into_trace();
-    eprintln!("clerk-private-pay-bench: {} PVM steps, exit={exit:?}", steps.len());
+    eprintln!(
+        "clerk-private-pay-bench: {} PVM steps, exit={exit:?}",
+        steps.len()
+    );
 }
 
 #[test]
@@ -640,15 +704,22 @@ fn profile_hash_bench() {
     let trace_time = t0.elapsed();
 
     eprintln!("=== hash-bench (bare metal) ===");
-    eprintln!("PVM: {} steps in {trace_time:?}, exit={exit:?}", steps.len());
+    eprintln!(
+        "PVM: {} steps in {trace_time:?}, exit={exit:?}",
+        steps.len()
+    );
 
     let mut mem_ops = 0u32;
     let mut branches = 0u32;
     let mut counts = std::collections::HashMap::new();
     for s in &steps {
         *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
-        if s.mem_read.is_some() || s.mem_write.is_some() { mem_ops += 1; }
-        if s.branch_taken { branches += 1; }
+        if s.mem_read.is_some() || s.mem_write.is_some() {
+            mem_ops += 1;
+        }
+        if s.branch_taken {
+            branches += 1;
+        }
     }
     eprintln!("Memory ops: {mem_ops}, Branches: {branches}");
     let mut sorted: Vec<_> = counts.into_iter().collect();
@@ -657,9 +728,10 @@ fn profile_hash_bench() {
         eprintln!("  {op}: {count}");
     }
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof = prove(&mut side_note).expect("proving failed");
@@ -669,17 +741,24 @@ fn profile_hash_bench() {
     let t = std::time::Instant::now();
     verify(proof, &side_note).expect("verification failed");
     let verify_time = t.elapsed();
-    eprintln!("Prove: {prove_time:.2?}, Proof: {:.1} KB, Verify: {verify_time:.2?}", proof_bytes.len() as f64 / 1024.0);
+    eprintln!(
+        "Prove: {prove_time:.2?}, Proof: {:.1} KB, Verify: {verify_time:.2?}",
+        proof_bytes.len() as f64 / 1024.0
+    );
 }
 
 /// Profile a specific hash variant by PVM blob name
 fn profile_hash_variant(name: &str) {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/actors/hash-bench/"
+    );
     let pvm_path = format!("{base}hash-{name}.pvm");
     let elf_path = format!("{base}hash-{name}.elf");
     let blob = std::fs::read(&pvm_path)
         .or_else(|_| {
-            let elf = std::fs::read(&elf_path).unwrap_or_else(|_| panic!("hash-{name} ELF not found"));
+            let elf =
+                std::fs::read(&elf_path).unwrap_or_else(|_| panic!("hash-{name} ELF not found"));
             Ok::<_, std::io::Error>(grey_transpiler::link_elf(&elf).expect("transpile"))
         })
         .unwrap();
@@ -702,14 +781,25 @@ fn profile_hash_variant(name: &str) {
     let n = steps.len();
 
     let mut side_note = zkpvm::SideNote::new(
-        steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
+        steps.clone(),
+        code_blob.code.to_vec(),
+        code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
 
     let mut counts = std::collections::HashMap::new();
-    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+    }
     let mut sorted: Vec<_> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    let top_ops: String = sorted.iter().take(5).map(|(op, c)| format!("{op}:{c}")).collect::<Vec<_>>().join(" ");
+    let top_ops: String = sorted
+        .iter()
+        .take(5)
+        .map(|(op, c)| format!("{op}:{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let t = std::time::Instant::now();
     match prove(&mut side_note) {
@@ -717,7 +807,9 @@ fn profile_hash_variant(name: &str) {
             let prove_time = t.elapsed();
             let kb = bincode::serialize(&proof).unwrap().len() as f64 / 1024.0;
             verify(proof, &side_note).expect("verify");
-            eprintln!("  {name:>10}: {n:>5} steps | prove={prove_time:>8.2?} | proof={kb:>5.1} KB | {top_ops}");
+            eprintln!(
+                "  {name:>10}: {n:>5} steps | prove={prove_time:>8.2?} | proof={kb:>5.1} KB | {top_ops}"
+            );
         }
         Err(_) => {
             eprintln!("  {name:>10}: {n:>5} steps | CONSTRAINT FAIL | {top_ops}");
@@ -735,7 +827,10 @@ fn compare_hash_algorithms() {
 
 #[test]
 fn debug_blake2s_prefix() {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/actors/hash-bench/"
+    );
     let blob = std::fs::read(format!("{base}hash-blake2s.pvm")).expect("blake2s PVM");
     let parsed = program::parse_blob(&blob).expect("parse");
     let mut code_data = None;
@@ -752,39 +847,59 @@ fn debug_blake2s_prefix() {
     let steps = tracing.into_trace();
     eprintln!("blake2s: {} total steps", steps.len());
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     // Scan for first failing prefix (fresh side_note each time)
     let test_sizes = [steps.len()];
     for &n in &test_sizes {
         let n = n.min(steps.len());
         let trunc: Vec<_> = steps.iter().take(n).cloned().collect();
-        let mut sn = zkpvm::SideNote::new(trunc, code_blob.code.to_vec(), code_blob.bitmask.to_vec()).with_memory(flat_mem.clone()).with_jump_table(code_blob.jump_table.to_vec());
+        let mut sn =
+            zkpvm::SideNote::new(trunc, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+                .with_memory(flat_mem.clone())
+                .with_jump_table(code_blob.jump_table.to_vec());
         let ok = zkpvm::prove_with_config(&mut sn, config).is_ok();
-        eprintln!("  {n:>5} steps: {}", if ok {"OK"} else {"FAIL"});
-        if !ok { break; }
+        eprintln!("  {n:>5} steps: {}", if ok { "OK" } else { "FAIL" });
+        if !ok {
+            break;
+        }
     }
     // Try the full trace
     eprintln!("Trying full trace ({} steps):", steps.len());
     let mut sn = zkpvm::SideNote::new(
-        steps.clone(), code_blob.code.to_vec(), code_blob.bitmask.to_vec()
-    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
+        steps.clone(),
+        code_blob.code.to_vec(),
+        code_blob.bitmask.to_vec(),
+    )
+    .with_memory(flat_mem)
+    .with_jump_table(code_blob.jump_table.to_vec());
     match zkpvm::prove_with_config(&mut sn, config) {
         Ok(proof) => {
             // Use a permissive policy matching the test config —
             // STANDARD floor would trip on pow_bits=5 / fri_log_blowup=0.
             let policy = zkpvm::PcsPolicy {
-                min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0,
+                min_pow_bits: 5,
+                min_fri_queries: 3,
+                min_fri_log_blowup: 0,
             };
             zkpvm::verify_with_pcs_policy(proof, &sn, &policy).expect("verify");
             eprintln!("  PASS!");
         }
-        Err(e) => { eprintln!("  FAIL: {e}"); }
+        Err(e) => {
+            eprintln!("  FAIL: {e}");
+        }
     }
 }
 
 #[test]
 fn prove_diverse() {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/actors/hash-bench/"
+    );
     let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
@@ -800,9 +915,10 @@ fn prove_diverse() {
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     eprintln!("Diverse: {} steps", steps.len());
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec()
-    ).with_memory(flat_mem).with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
     let t = std::time::Instant::now();
     match prove(&mut side_note) {
         Ok(p) => {
@@ -810,13 +926,16 @@ fn prove_diverse() {
             verify(p, &side_note).expect("verify");
             eprintln!("PROVED in {:?} ({kb:.1} KB)", t.elapsed());
         }
-        Err(e) => eprintln!("FAIL: {e}")
+        Err(e) => eprintln!("FAIL: {e}"),
     }
 }
 
 #[test]
 fn trace_diverse_steps() {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/actors/hash-bench/"
+    );
     let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
@@ -824,15 +943,22 @@ fn trace_diverse_steps() {
     let steps = tracing.into_trace();
     eprintln!("Diverse: {} steps", steps.len());
     let mut counts = std::collections::HashMap::new();
-    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+    }
     let mut sorted: Vec<_> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    for (op, c) in sorted.iter() { eprintln!("  {op}: {c}"); }
+    for (op, c) in sorted.iter() {
+        eprintln!("  {op}: {c}");
+    }
 }
 
 #[test]
 fn trace_keccak_steps() {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/hash-bench/");
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/actors/hash-bench/"
+    );
     let blob = std::fs::read(format!("{base}hash-keccak.pvm")).expect("keccak PVM");
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
@@ -840,10 +966,14 @@ fn trace_keccak_steps() {
     let steps = tracing.into_trace();
     eprintln!("Keccak: {} steps", steps.len());
     let mut counts = std::collections::HashMap::new();
-    for s in &steps { *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1; }
+    for s in &steps {
+        *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
+    }
     let mut sorted: Vec<_> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    for (op, c) in sorted.iter().take(10) { eprintln!("  {op}: {c}"); }
+    for (op, c) in sorted.iter().take(10) {
+        eprintln!("  {op}: {c}");
+    }
 }
 
 #[test]
@@ -865,22 +995,32 @@ fn prove_segmented_hash_bench() {
     let all_steps = tracing.into_trace();
 
     let split = all_steps.len() / 2;
-    eprintln!("=== Segmented proving: {} steps split at {} ===", all_steps.len(), split);
+    eprintln!(
+        "=== Segmented proving: {} steps split at {} ===",
+        all_steps.len(),
+        split
+    );
 
     let code = code_blob.code.to_vec();
     let bitmask = code_blob.bitmask.to_vec();
 
     // Segment 1: steps 0..split
     let seg1_steps: Vec<_> = all_steps[..split].to_vec();
-    let mut seg1_sn = zkpvm::SideNote::new(
-        seg1_steps, code.clone(), bitmask.clone()
-    ).with_memory(flat_mem.clone()).with_jump_table(code_blob.jump_table.to_vec());
+    let mut seg1_sn = zkpvm::SideNote::new(seg1_steps, code.clone(), bitmask.clone())
+        .with_memory(flat_mem.clone())
+        .with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof1 = prove(&mut seg1_sn).expect("segment 1 proving failed");
     eprintln!("Segment 1: {} steps, proved in {:?}", split, t.elapsed());
-    eprintln!("  initial: pc={} ts={}", proof1.initial_state.pc, proof1.initial_state.timestamp);
-    eprintln!("  final:   pc={} ts={}", proof1.final_state.pc, proof1.final_state.timestamp);
+    eprintln!(
+        "  initial: pc={} ts={}",
+        proof1.initial_state.pc, proof1.initial_state.timestamp
+    );
+    eprintln!(
+        "  final:   pc={} ts={}",
+        proof1.final_state.pc, proof1.final_state.timestamp
+    );
 
     // Compute final memory of segment 1 for segment 2's initial memory
     let mut seg2_mem = flat_mem.clone();
@@ -889,31 +1029,44 @@ fn prove_segmented_hash_bench() {
             let addr = w.address as usize;
             let bytes = w.value.to_le_bytes();
             let sz = w.size as usize;
-            if addr + sz > seg2_mem.len() { seg2_mem.resize(addr + sz, 0); }
+            if addr + sz > seg2_mem.len() {
+                seg2_mem.resize(addr + sz, 0);
+            }
             seg2_mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
         }
     }
 
     // Segment 2: steps split..end
     let seg2_steps: Vec<_> = all_steps[split..].to_vec();
-    let mut seg2_sn = zkpvm::SideNote::new(
-        seg2_steps, code.clone(), bitmask.clone()
-    ).with_memory(seg2_mem).with_jump_table(code_blob.jump_table.to_vec());
+    let mut seg2_sn = zkpvm::SideNote::new(seg2_steps, code.clone(), bitmask.clone())
+        .with_memory(seg2_mem)
+        .with_jump_table(code_blob.jump_table.to_vec());
 
     let t = std::time::Instant::now();
     let proof2 = prove(&mut seg2_sn).expect("segment 2 proving failed");
-    eprintln!("Segment 2: {} steps, proved in {:?}", all_steps.len() - split, t.elapsed());
-    eprintln!("  initial: pc={} ts={}", proof2.initial_state.pc, proof2.initial_state.timestamp);
-    eprintln!("  final:   pc={} ts={}", proof2.final_state.pc, proof2.final_state.timestamp);
+    eprintln!(
+        "Segment 2: {} steps, proved in {:?}",
+        all_steps.len() - split,
+        t.elapsed()
+    );
+    eprintln!(
+        "  initial: pc={} ts={}",
+        proof2.initial_state.pc, proof2.initial_state.timestamp
+    );
+    eprintln!(
+        "  final:   pc={} ts={}",
+        proof2.final_state.pc, proof2.final_state.timestamp
+    );
 
     // Verify chain
     eprintln!("\nChain verification:");
-    eprintln!("  seg1.final  == seg2.initial ? {}", proof1.final_state == proof2.initial_state);
+    eprintln!(
+        "  seg1.final  == seg2.initial ? {}",
+        proof1.final_state == proof2.initial_state
+    );
 
-    zkpvm::verify_chain(
-        &[proof1, proof2],
-        &[&seg1_sn, &seg2_sn],
-    ).expect("chain verification failed");
+    zkpvm::verify_chain(&[proof1, proof2], &[&seg1_sn, &seg2_sn])
+        .expect("chain verification failed");
     eprintln!("  CHAIN VERIFIED!");
 }
 
@@ -927,10 +1080,14 @@ fn prove_blake2b_precompile() {
     // step (Phase 8c producer) and the tracer captures the matching
     // blake2b_mem_op (Phase 8a/8b consumer pre-image).
     let h = [
-        0x6A09E667F3BCC908u64, 0xBB67AE8584CAA73B,
-        0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
-        0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
-        0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+        0x6A09E667F3BCC908u64,
+        0xBB67AE8584CAA73B,
+        0x3C6EF372FE94F82B,
+        0xA54FF53A5F1D36F1,
+        0x510E527FADE682D1,
+        0x9B05688C2B3E6C1F,
+        0x1F83D9ABFB41BD6B,
+        0x5BE0CD19137E2179,
     ];
     let m = [0u64; 16];
     let expected = blake2b_compress(&h, &m, 0, true);
@@ -940,13 +1097,17 @@ fn prove_blake2b_precompile() {
     let m_addr: u64 = 0x1040;
     let mut flat_mem = vec![0u8; 0x2000];
     for i in 0..8 {
-        flat_mem[h_addr as usize + i*8 .. h_addr as usize + i*8+8]
+        flat_mem[h_addr as usize + i * 8..h_addr as usize + i * 8 + 8]
             .copy_from_slice(&h[i].to_le_bytes());
     }
     // m left all zero.
 
     let code = vec![
-        javm::instruction::Opcode::Ecalli as u8, ECALL_BLAKE2B_COMPRESS as u8, 0, 0, 0,
+        javm::instruction::Opcode::Ecalli as u8,
+        ECALL_BLAKE2B_COMPRESS as u8,
+        0,
+        0,
+        0,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
@@ -958,7 +1119,13 @@ fn prove_blake2b_precompile() {
     regs[10] = 1;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run_with_precompiles();
@@ -966,19 +1133,30 @@ fn prove_blake2b_precompile() {
     let blake2b_records = tracing.blake2b_records.clone();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code, bitmask,
-    ).with_memory(flat_mem);
+    let mut side_note = zkpvm::SideNote::new(steps, code, bitmask).with_memory(flat_mem);
     for rec in &blake2b_records {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: rec.h, m: rec.m, t: rec.t, f: rec.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: rec.h,
+                m: rec.m,
+                t: rec.t,
+                f: rec.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("blake2b verification failed");
     eprintln!("Blake2b precompile: PROVED!");
 }
@@ -1005,13 +1183,13 @@ fn prove_ristretto_chip_field_add() {
 
     // Empty PVM trace — the chip-on test exercises only RistrettoChip
     // rows, not any CPU steps.
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Single field-add row: 1 + 2 = 3 mod p.
-    let mut a = [0u8; 32]; a[0] = 1;
-    let mut b = [0u8; 32]; b[0] = 2;
+    let mut a = [0u8; 32];
+    a[0] = 1;
+    let mut b = [0u8; 32];
+    b[0] = 2;
     let row = fill_add(a, b);
     assert_eq!(row.out[0], 3);
     side_note.add_ristretto_field_row(row);
@@ -1030,7 +1208,7 @@ fn prove_ristretto_chip_field_add() {
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0
+        min_fri_log_blowup: 0,
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-add verification failed");
@@ -1048,15 +1226,15 @@ fn prove_ristretto_chip_field_add() {
 fn prove_ristretto_chip_field_mul() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Smallest non-zero case: 1 · 1 = 1.  Currently fails (see
     // doc above); the all-zero case 0·0=0 passes via
     // prove_ristretto_chip_field_mul_zero below.
-    let mut a = [0u8; 32]; a[0] = 1;
-    let mut b = [0u8; 32]; b[0] = 1;
+    let mut a = [0u8; 32];
+    a[0] = 1;
+    let mut b = [0u8; 32];
+    b[0] = 1;
     let row = fill_mul(a, b);
     assert_eq!(row.out[0], 1);
     side_note.add_ristretto_field_row(row);
@@ -1071,7 +1249,7 @@ fn prove_ristretto_chip_field_mul() {
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0
+        min_fri_log_blowup: 0,
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul verification failed");
@@ -1082,8 +1260,10 @@ fn prove_ristretto_chip_field_mul() {
 #[ignore]
 fn debug_fill_mul_one_times_one() {
     use zkpvm::chips::ristretto::witness::fill_mul;
-    let mut a = [0u8; 32]; a[0] = 1;
-    let mut b = [0u8; 32]; b[0] = 1;
+    let mut a = [0u8; 32];
+    a[0] = 1;
+    let mut b = [0u8; 32];
+    b[0] = 1;
     let r = fill_mul(a, b);
     eprintln!("a[0]={}, b[0]={}, out[0]={}", r.a[0], r.b[0], r.out[0]);
     eprintln!("mul_product[0..4]={:?}", &r.mul_product[..4]);
@@ -1093,12 +1273,20 @@ fn debug_fill_mul_one_times_one() {
     eprintln!("pass1_lo[0..4]={:?}", &r.pass1_lo[..4]);
     eprintln!("pass1_hi={:?}", r.pass1_hi);
     eprintln!("pass2_lo[0..4]={:?}", &r.pass2_lo[..4]);
-    eprintln!("pass2_carry_out={}, pass2_top_bit={}", r.pass2_carry_out, r.pass2_top_bit);
+    eprintln!(
+        "pass2_carry_out={}, pass2_top_bit={}",
+        r.pass2_carry_out, r.pass2_top_bit
+    );
     eprintln!("after_top_bit[0..4]={:?}", &r.after_top_bit[..4]);
-    eprintln!("is_overflow={}, sub_borrow[0]={}", r.is_overflow, r.sub_borrow[0]);
+    eprintln!(
+        "is_overflow={}, sub_borrow[0]={}",
+        r.is_overflow, r.sub_borrow[0]
+    );
     eprintln!("ff_borrow[31]={}", r.final_form_borrow[31]);
-    eprintln!("flags: is_add={}, is_sub={}, is_mul={}, is_real={}",
-        r.is_add, r.is_sub, r.is_mul, r.is_real);
+    eprintln!(
+        "flags: is_add={}, is_sub={}, is_mul={}, is_real={}",
+        r.is_add, r.is_sub, r.is_mul, r.is_real
+    );
 }
 
 /// R1f-soundness: negative tests confirming the chip's per-row
@@ -1114,24 +1302,29 @@ fn debug_fill_mul_one_times_one() {
 #[test]
 #[ignore]
 fn ristretto_chip_negative_per_row_soundness_audit() {
-    use zkpvm::chips::ristretto::witness::{fill_add, fill_mul, fill_sub, FieldOpRow};
+    use zkpvm::chips::ristretto::witness::{FieldOpRow, fill_add, fill_mul, fill_sub};
 
     fn try_prove(row: FieldOpRow) -> bool {
         let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
+            pow_bits: 5,
+            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+            lifting_log_size: None,
         };
         zkpvm::prove_with_config(&mut side_note, config).is_ok()
     }
 
-    let mut a_small = [0u8; 32]; a_small[0] = 5;
-    let mut b_small = [0u8; 32]; b_small[0] = 3;
+    let mut a_small = [0u8; 32];
+    a_small[0] = 5;
+    let mut b_small = [0u8; 32];
+    b_small[0] = 3;
 
     // Baseline: honest add witness proves.
-    assert!(try_prove(fill_add(a_small, b_small)),
-        "honest add witness must prove");
+    assert!(
+        try_prove(fill_add(a_small, b_small)),
+        "honest add witness must prove"
+    );
 
     // Tamper #1: flip out byte → fail (sum chain rejects).
     let mut bad = fill_add(a_small, b_small);
@@ -1149,13 +1342,15 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     assert!(!try_prove(bad), "tampered add_carry[0] must fail");
 
     // Tamper #4: is_sub witness with wrong is_underflow.
-    let mut bad = fill_sub([0u8; 32], a_small);  // 0 - 5 (underflows)
-    bad.is_overflow = 0;  // claim no underflow — wrong
+    let mut bad = fill_sub([0u8; 32], a_small); // 0 - 5 (underflows)
+    bad.is_overflow = 0; // claim no underflow — wrong
     assert!(!try_prove(bad), "tampered is_underflow on is_sub must fail");
 
     // Tamper #5: mul row with wrong mul_product byte.
-    let mut a = [0u8; 32]; a[0] = 7;
-    let mut b = [0u8; 32]; b[0] = 11;
+    let mut a = [0u8; 32];
+    a[0] = 7;
+    let mut b = [0u8; 32];
+    b[0] = 11;
     let mut bad = fill_mul(a, b);
     bad.mul_product[0] = bad.mul_product[0].wrapping_add(1);
     assert!(!try_prove(bad), "tampered mul_product[0] must fail");
@@ -1173,8 +1368,14 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     eprintln!("All 7 negative-witness cases correctly REJECTED.");
 
     // Tamper #8: is_sub two-sided chain — flip a sub_chain_borrow bit.
-    let mut a = [0u8; 32]; a[0] = 0x10; a[1] = 0xd1; a[2] = 0x1f;
-    let mut b = [0u8; 32]; b[0] = 0x20; b[1] = 0xa2; b[2] = 0x3f;
+    let mut a = [0u8; 32];
+    a[0] = 0x10;
+    a[1] = 0xd1;
+    a[2] = 0x1f;
+    let mut b = [0u8; 32];
+    b[0] = 0x20;
+    b[1] = 0xa2;
+    b[2] = 0x3f;
     let mut bad = fill_sub(a, b);
     bad.sub_chain_borrow[1] = 1 - bad.sub_chain_borrow[1];
     assert!(!try_prove(bad), "tampered sub_chain_borrow must fail");
@@ -1187,9 +1388,14 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     // Tamper #10: is_mul reduction — flip pass1_lo byte.
     let mut a_big = [0u8; 32];
     let mut b_big = [0u8; 32];
-    for i in 0..32 { a_big[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
-    for i in 0..32 { b_big[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
-    a_big[31] &= 0x7f; b_big[31] &= 0x7f;
+    for i in 0..32 {
+        a_big[i] = (0xa3u8).wrapping_mul((i + 1) as u8);
+    }
+    for i in 0..32 {
+        b_big[i] = (0x71u8).wrapping_mul((i + 1) as u8);
+    }
+    a_big[31] &= 0x7f;
+    b_big[31] &= 0x7f;
     let mut bad = fill_mul(a_big, b_big);
     bad.pass1_lo[5] = bad.pass1_lo[5].wrapping_add(1);
     assert!(!try_prove(bad), "tampered pass1_lo must fail");
@@ -1262,18 +1468,22 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
 #[test]
 fn ristretto_chip_per_payment_row_sequence_composes() {
     use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity, ExtendedPoint,
-        ED25519_TWO_D
+        ED25519_TWO_D, ExtendedPoint, point_add_rows, point_identity, scalar_mult_rows,
     };
-    use zkpvm::chips::ristretto::witness::{validate_row_sequence_composes, FieldOpRow};
+    use zkpvm::chips::ristretto::witness::{FieldOpRow, validate_row_sequence_composes};
 
     let scalar_v: [u8; 32] = {
-        let mut s = [0u8; 32]; s[0] = 50; s
+        let mut s = [0u8; 32];
+        s[0] = 50;
+        s
     };
     let scalar_b: [u8; 32] = {
         let mut s = [0u8; 32];
-        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
-        s[31] &= 0x7f; s
+        for i in 0..32 {
+            s[i] = 0xa5u8.wrapping_mul((i + 1) as u8);
+        }
+        s[31] &= 0x7f;
+        s
     };
     let id = point_identity();
 
@@ -1282,12 +1492,17 @@ fn ristretto_chip_per_payment_row_sequence_composes() {
     // for setup) and one (the "1" field element constant).  These are
     // the values rows can legitimately consume from "outside".
     let zero = [0u8; 32];
-    let mut one = [0u8; 32]; one[0] = 1;
+    let mut one = [0u8; 32];
+    one[0] = 1;
     let boundary_inputs = vec![
         zero,
         one,
-        scalar_v, scalar_b,
-        id.x, id.y, id.z, id.t,
+        scalar_v,
+        scalar_b,
+        id.x,
+        id.y,
+        id.z,
+        id.t,
         // Curve constant 2·d used inside point_add_rows.
         ED25519_TWO_D,
     ];
@@ -1310,8 +1525,10 @@ fn ristretto_chip_per_payment_row_sequence_composes() {
     // re-use boundary constants (zero, one) or earlier outputs.
     validate_row_sequence_composes(&rows, &boundary_inputs)
         .expect("per-payment row sequence must compose");
-    eprintln!("Per-payment row sequence COMPOSES correctly ({} rows).",
-        rows.len());
+    eprintln!(
+        "Per-payment row sequence COMPOSES correctly ({} rows).",
+        rows.len()
+    );
 
     // Negative case: replace one row's `a` with a sentinel value
     // that's NOT in seen_outs — must reject.  (Tampering by a single
@@ -1319,10 +1536,17 @@ fn ristretto_chip_per_payment_row_sequence_composes() {
     // so we use an unmistakably-foreign value.)
     let mut bad_rows = rows.clone();
     bad_rows[100].a = [0xab; 32];
-    assert!(validate_row_sequence_composes(&bad_rows, &boundary_inputs).is_err(),
-        "tampered row's input must be flagged");
+    assert!(
+        validate_row_sequence_composes(&bad_rows, &boundary_inputs).is_err(),
+        "tampered row's input must be flagged"
+    );
     eprintln!("Tampered row sequence correctly REJECTED by composer.");
-    let _ = ExtendedPoint { x: zero, y: one, z: one, t: zero };
+    let _ = ExtendedPoint {
+        x: zero,
+        y: one,
+        z: one,
+        t: zero,
+    };
 }
 
 /// R1e-pent: confirms the inter-row binding gap is now CLOSED.
@@ -1334,32 +1558,35 @@ fn ristretto_chip_per_payment_row_sequence_composes() {
 fn ristretto_chip_unrelated_rows_now_rejected() {
     use zkpvm::chips::ristretto::witness::fill_add;
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     for n in 0..100u8 {
-        let mut a = [0u8; 32]; a[0] = 1;
-        let mut b = [0u8; 32]; b[0] = n;
+        let mut a = [0u8; 32];
+        a[0] = 1;
+        let mut b = [0u8; 32];
+        b[0] = n;
         side_note.add_ristretto_field_row(fill_add(a, b));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     let rejected = match prove_result {
         Err(_) => true,
-        Ok(proof) => {
-            zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_err()
-        }
+        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_err(),
     };
-    assert!(rejected,
+    assert!(
+        rejected,
         "R1e-pent must reject unrelated rows at prove or verify: \
          chip has no producer for the consumed input bytes, \
-         so logup balance fails.");
+         so logup balance fails."
+    );
     eprintln!("100 unrelated rows correctly REJECTED.");
     eprintln!("R1e-pent inter-row binding: CLOSED.");
 }
@@ -1373,16 +1600,16 @@ fn ristretto_chip_unrelated_rows_now_rejected() {
 fn prove_ristretto_chip_with_input_producers() {
     use zkpvm::chips::ristretto::witness::{fill_add, fill_input};
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Row 0: input row producing value [1, 0, ...].
-    let mut v1 = [0u8; 32]; v1[0] = 1;
+    let mut v1 = [0u8; 32];
+    v1[0] = 1;
     side_note.add_ristretto_field_row(fill_input(v1));
 
     // Row 1: input row producing value [2, 0, ...].
-    let mut v2 = [0u8; 32]; v2[0] = 2;
+    let mut v2 = [0u8; 32];
+    v2[0] = 2;
     side_note.add_ristretto_field_row(fill_input(v2));
 
     // Row 2: fill_add(1, 2) consuming a from row 0, b from row 1.
@@ -1403,17 +1630,17 @@ fn prove_ristretto_chip_with_input_producers() {
     // Row 0 produces [1, 0, ...]; row 2's output is [3, 0, ...].
     // Chain: consumer_row's a = row 2 (out=3), b = some 0-producer.
     // We need a 0-producer:
-    side_note.add_ristretto_field_row(fill_input([0u8; 32]));  // row 3: zero
+    side_note.add_ristretto_field_row(fill_input([0u8; 32])); // row 3: zero
     consumer_row.a_source_row = 2;
     consumer_row.b_source_row = 3;
-    side_note.add_ristretto_field_row(consumer_row);  // row 4
+    side_note.add_ristretto_field_row(consumer_row); // row 4
 
     // Row 4 has unmatched out (no further consumer).  Add a final
     // consumer that drains it:
     let mut drain = fill_add(consumer_row.out, [0u8; 32]);
     drain.a_source_row = 4;
-    drain.b_source_row = 3;  // re-use the zero producer
-    side_note.add_ristretto_field_row(drain);  // row 5
+    drain.b_source_row = 3; // re-use the zero producer
+    side_note.add_ristretto_field_row(drain); // row 5
 
     // Row 5 is also unmatched...  this chain doesn't close in
     // chip-only mode.  In R1f the FINAL row's output is consumed
@@ -1423,23 +1650,28 @@ fn prove_ristretto_chip_with_input_producers() {
     // structurally correct (even if the trailing consumer is
     // missing) by checking the prove path.
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
     let prove_result = zkpvm::prove_with_config(&mut side_note, config);
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     let chain_balanced = match prove_result {
         Err(_) => false,
-        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_ok()
+        Ok(proof) => zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).is_ok(),
     };
     // Without an external OUTPUT boundary consumer, the trailing
     // out from row 5 is unmatched.  Lookup balance fails — and
     // the verifier correctly rejects.  This is the SAME mechanism
     // that closes the inter-row binding gap.
-    assert!(!chain_balanced,
-        "without external output boundary consumer, chain doesn't close");
+    assert!(
+        !chain_balanced,
+        "without external output boundary consumer, chain doesn't close"
+    );
     eprintln!("Input-producer mechanism + open-ended chain: correctly rejected.");
     eprintln!("Inter-row binding + boundary-input mechanism: COMPOSABLE.");
 }
@@ -1452,16 +1684,16 @@ fn prove_ristretto_chip_with_input_producers() {
 fn prove_ristretto_chip_closed_chain_input_output() {
     use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Row 0: input(1)
-    let mut v1 = [0u8; 32]; v1[0] = 1;
+    let mut v1 = [0u8; 32];
+    v1[0] = 1;
     side_note.add_ristretto_field_row(fill_input(v1));
 
     // Row 1: input(2)
-    let mut v2 = [0u8; 32]; v2[0] = 2;
+    let mut v2 = [0u8; 32];
+    v2[0] = 2;
     side_note.add_ristretto_field_row(fill_input(v2));
 
     // Row 2: add(1, 2) = 3, sources (R0, R1).
@@ -1474,16 +1706,18 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     side_note.add_ristretto_field_row(fill_output(row.out, 2));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("closed chain should prove");
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("closed chain should prove");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("closed chain should verify");
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("closed chain should verify");
     eprintln!("Closed chain (1 input + 1 input + 1 op + 1 output): PROVED + VERIFIED.");
     eprintln!("Soundness chain: per-row + inter-row + boundary all CLOSED.");
 }
@@ -1498,16 +1732,15 @@ fn prove_ristretto_chip_closed_chain_input_output() {
 /// per N row chip operations" measurement that R1f answers.
 #[test]
 fn bench_ristretto_chip_soundness_complete_chain() {
-    use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
     use std::time::Instant;
+    use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
 
     let n_ops: usize = 10000;
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Row 0: initial accumulator value.
-    let mut acc = [0u8; 32]; acc[0] = 1;
+    let mut acc = [0u8; 32];
+    acc[0] = 1;
     side_note.add_ristretto_field_row(fill_input(acc));
     let mut row_idx: u16 = 1;
 
@@ -1537,7 +1770,8 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     eprintln!("Composed {n_ops} ops + boundary rows in {:?}", t0.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
     let t = Instant::now();
@@ -1546,7 +1780,9 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     let prove_time = t.elapsed();
 
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     let t = Instant::now();
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
@@ -1556,11 +1792,17 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     eprintln!();
     eprintln!("=== R1f: SOUNDNESS-COMPLETE chip prove-time benchmark ===");
     eprintln!("Operations: {n_ops}");
-    eprintln!("Total chip rows: {} (1 init + n_ops·2 + 1 output)", 1 + n_ops * 2 + 1);
+    eprintln!(
+        "Total chip rows: {} (1 init + n_ops·2 + 1 output)",
+        1 + n_ops * 2 + 1
+    );
     eprintln!("Prove:  {:>6.2} s", prove_time.as_secs_f64());
     eprintln!("Verify: {:?}", verify_time);
     eprintln!();
-    eprintln!("Per-op cost: {:.2} ms", prove_time.as_secs_f64() * 1000.0 / n_ops as f64);
+    eprintln!(
+        "Per-op cost: {:.2} ms",
+        prove_time.as_secs_f64() * 1000.0 / n_ops as f64
+    );
 }
 
 /// R1f-bug-bisect: scalar_mult_rows([N, 0, ...], id) bug — bisect by
@@ -1569,24 +1811,31 @@ fn bench_ristretto_chip_soundness_complete_chain() {
 #[test]
 #[ignore]
 fn debug_scalar_mult_bisect_first_set_bit_position() {
-    use zkpvm::chips::ristretto::point::{scalar_mult_rows, point_identity};
+    use zkpvm::chips::ristretto::point::{point_identity, scalar_mult_rows};
 
     // Test scalars: each has a single set bit at varying positions.
     for scalar_val in [1u8, 2, 4, 8, 16, 32, 64, 128] {
-        let mut scalar = [0u8; 32]; scalar[0] = scalar_val;
+        let mut scalar = [0u8; 32];
+        scalar[0] = scalar_val;
         let id = point_identity();
 
         let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         let (rows, _) = scalar_mult_rows(&scalar, &id);
-        for r in rows { side_note.add_ristretto_field_row(r); }
+        for r in rows {
+            side_note.add_ristretto_field_row(r);
+        }
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
+            pow_bits: 5,
+            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+            lifting_log_size: None,
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
-        eprintln!("scalar={:>3}: {}", scalar_val,
-            if result.is_ok() { "PASS" } else { "FAIL" });
+        eprintln!(
+            "scalar={:>3}: {}",
+            scalar_val,
+            if result.is_ok() { "PASS" } else { "FAIL" }
+        );
     }
 }
 
@@ -1596,9 +1845,10 @@ fn debug_scalar_mult_bisect_first_set_bit_position() {
 #[test]
 #[ignore]
 fn debug_scalar_mult_truncate_to_find_failing_row() {
-    use zkpvm::chips::ristretto::point::{scalar_mult_rows, point_identity};
+    use zkpvm::chips::ristretto::point::{point_identity, scalar_mult_rows};
 
-    let mut scalar = [0u8; 32]; scalar[0] = 32;
+    let mut scalar = [0u8; 32];
+    scalar[0] = 32;
     let id = point_identity();
     let (full_rows, _) = scalar_mult_rows(&scalar, &id);
     let total = full_rows.len();
@@ -1616,22 +1866,35 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
             side_note.add_ristretto_field_row(r.clone());
         }
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
+            pow_bits: 5,
+            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+            lifting_log_size: None,
         };
         let result = zkpvm::prove_with_config(&mut side_note, config);
-        if result.is_ok() { lo = mid + 1; }
-        else { hi = mid; }
+        if result.is_ok() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     eprintln!("First failing prefix length: {} (out of {})", lo, total);
     if lo > 0 && lo <= total {
         let r = &full_rows[lo - 1];
-        eprintln!("Failing row: is_add={} is_sub={} is_mul={}",
-            r.is_add, r.is_sub, r.is_mul);
-        eprintln!("  a[0..4]={:?}, b[0..4]={:?}, out[0..4]={:?}",
-            &r.a[..4], &r.b[..4], &r.out[..4]);
-        eprintln!("  is_overflow={}, mul_product[0..4]={:?}",
-            r.is_overflow, &r.mul_product[..4]);
+        eprintln!(
+            "Failing row: is_add={} is_sub={} is_mul={}",
+            r.is_add, r.is_sub, r.is_mul
+        );
+        eprintln!(
+            "  a[0..4]={:?}, b[0..4]={:?}, out[0..4]={:?}",
+            &r.a[..4],
+            &r.b[..4],
+            &r.out[..4]
+        );
+        eprintln!(
+            "  is_overflow={}, mul_product[0..4]={:?}",
+            r.is_overflow,
+            &r.mul_product[..4]
+        );
     }
 }
 
@@ -1645,11 +1908,9 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
 #[test]
 #[ignore]
 fn bench_ristretto_chip_combined_with_cpu_baseline() {
-    use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity
-    };
-    use zkpvm::core::tracing::TracingPvm;
     use std::time::Instant;
+    use zkpvm::chips::ristretto::point::{point_add_rows, point_identity, scalar_mult_rows};
+    use zkpvm::core::tracing::TracingPvm;
 
     // CpuChip baseline: clerk-private-pay-bench actor (~37K PVM
     // steps, log17 trace) — the realistic per-payment baseline.
@@ -1669,20 +1930,24 @@ fn bench_ristretto_chip_combined_with_cpu_baseline() {
     let steps = tracing.into_trace();
     eprintln!("CpuChip baseline: {} PVM steps", steps.len());
 
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
+            .with_memory(flat_mem)
+            .with_jump_table(code_blob.jump_table.to_vec());
 
     // Push one private payment's worth of chip rows on top.
     let scalar_v: [u8; 32] = {
-        let mut s = [0u8; 32]; s[0] = 50; s
+        let mut s = [0u8; 32];
+        s[0] = 50;
+        s
     };
     let scalar_b: [u8; 32] = {
         let mut s = [0u8; 32];
-        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
-        s[31] &= 0x7f; s
+        for i in 0..32 {
+            s[i] = 0xa5u8.wrapping_mul((i + 1) as u8);
+        }
+        s[31] &= 0x7f;
+        s
     };
     let id = point_identity();
     let (vg_rows, vg_pt) = scalar_mult_rows(&scalar_v, &id);
@@ -1731,18 +1996,21 @@ fn bench_ristretto_chip_combined_with_cpu_baseline() {
 #[test]
 #[ignore]
 fn bench_ristretto_chip_one_private_payment() {
-    use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity
-    };
     use std::time::Instant;
+    use zkpvm::chips::ristretto::point::{point_add_rows, point_identity, scalar_mult_rows};
 
     let scalar_v: [u8; 32] = {
-        let mut s = [0u8; 32]; s[0] = 50; s
+        let mut s = [0u8; 32];
+        s[0] = 50;
+        s
     };
     let scalar_b: [u8; 32] = {
         let mut s = [0u8; 32];
-        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
-        s[31] &= 0x7f; s
+        for i in 0..32 {
+            s[i] = 0xa5u8.wrapping_mul((i + 1) as u8);
+        }
+        s[31] &= 0x7f;
+        s
     };
     let id = point_identity();
 
@@ -1762,11 +2030,13 @@ fn bench_ristretto_chip_one_private_payment() {
     rows.extend(kg_rows);
     let (skg_rows, _) = scalar_mult_rows(&scalar_b, &id);
     rows.extend(skg_rows);
-    eprintln!("Composed {} field-op rows in {:?}", rows.len(), t0.elapsed());
-
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
+    eprintln!(
+        "Composed {} field-op rows in {:?}",
+        rows.len(),
+        t0.elapsed()
     );
+
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let t1 = Instant::now();
     for row in rows {
         side_note.add_ristretto_field_row(row);
@@ -1774,21 +2044,22 @@ fn bench_ristretto_chip_one_private_payment() {
     eprintln!("Pushed rows + bumped Range256 counts in {:?}", t1.elapsed());
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
     let t2 = Instant::now();
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("proving failed");
+    let proof = zkpvm::prove_with_config(&mut side_note, config).expect("proving failed");
     let prove_time = t2.elapsed();
     eprintln!("Prove time: {:?}", prove_time);
 
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     let t3 = Instant::now();
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("verify failed");
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify failed");
     eprintln!("Verify time: {:?}", t3.elapsed());
 
     eprintln!();
@@ -1804,18 +2075,23 @@ fn bench_ristretto_chip_one_private_payment() {
 #[test]
 fn project_ristretto_chip_size_for_one_payment() {
     use zkpvm::chips::ristretto::point::{
-        scalar_mult_rows, point_add_rows, point_identity, ED25519_TWO_D
+        ED25519_TWO_D, point_add_rows, point_identity, scalar_mult_rows,
     };
 
     // One Pedersen amount commit needs 2 scalar mults + 1 point add:
     //   v · G + b · H  (where v is the value, b the blinding)
     let scalar_v: [u8; 32] = {
-        let mut s = [0u8; 32]; s[0] = 50; s
+        let mut s = [0u8; 32];
+        s[0] = 50;
+        s
     };
     let scalar_b: [u8; 32] = {
         let mut s = [0u8; 32];
-        for i in 0..32 { s[i] = 0xa5u8.wrapping_mul((i + 1) as u8); }
-        s[31] &= 0x7f; s
+        for i in 0..32 {
+            s[i] = 0xa5u8.wrapping_mul((i + 1) as u8);
+        }
+        s[31] &= 0x7f;
+        s
     };
     let id = point_identity();
     let (rows_vg, _vg_pt) = scalar_mult_rows(&scalar_v, &id);
@@ -1827,8 +2103,8 @@ fn project_ristretto_chip_size_for_one_payment() {
     let (rows_kg, _) = scalar_mult_rows(&scalar_v, &id);
     let (rows_skg, _) = scalar_mult_rows(&scalar_b, &id);
 
-    let total_rows = rows_vg.len() + rows_bh.len() + rows_add.len()
-                   + rows_kg.len() + rows_skg.len();
+    let total_rows =
+        rows_vg.len() + rows_bh.len() + rows_add.len() + rows_kg.len() + rows_skg.len();
     let log_n = 32 - (total_rows as u32).saturating_sub(1).leading_zeros();
     eprintln!("=== Per-payment RistrettoChip row projection ===");
     eprintln!("Pedersen v·G:    {} rows", rows_vg.len());
@@ -1854,12 +2130,19 @@ fn project_ristretto_chip_size_for_one_payment() {
     let total_cells = baseline_cells + chip_cells;
     let projected_secs = total_cells as f64 / throughput;
     eprintln!();
-    eprintln!("Cells:  baseline {} M + chip {} M = total {} M",
-        baseline_cells / 1_000_000, chip_cells / 1_000_000, total_cells / 1_000_000);
+    eprintln!(
+        "Cells:  baseline {} M + chip {} M = total {} M",
+        baseline_cells / 1_000_000,
+        chip_cells / 1_000_000,
+        total_cells / 1_000_000
+    );
     eprintln!("Throughput: {:.1} M cells/s", throughput / 1e6);
     eprintln!("Projected total prove: ~{:.1}s on CPU", projected_secs);
     eprintln!("With GPU (3×):  ~{:.1}s", projected_secs / 3.0);
-    eprintln!("With NAF-w4 (-30% rows) + GPU: ~{:.1}s", projected_secs * 0.7 / 3.0);
+    eprintln!(
+        "With NAF-w4 (-30% rows) + GPU: ~{:.1}s",
+        projected_secs * 0.7 / 3.0
+    );
 }
 
 /// R1e-quat diagnostic: bisect over the COLUMN that triggers the
@@ -1872,43 +2155,157 @@ fn debug_mul_column_bisect() {
     use zkpvm::chips::ristretto::witness::FieldOpRow;
 
     let cases: Vec<(&str, Box<dyn Fn(&mut FieldOpRow)>)> = vec![
-        ("a[0]",                Box::new(|r| { r.a[0] = 1; })),
-        ("b[0]",                Box::new(|r| { r.b[0] = 1; })),
-        ("out[0]",              Box::new(|r| { r.out[0] = 1; })),
-        ("add_intermediate[0]", Box::new(|r| { r.add_intermediate[0] = 1; })),
-        ("add_carry[0]",        Box::new(|r| { r.add_carry[0] = 1; })),
-        ("sub_borrow[0]",       Box::new(|r| { r.sub_borrow[0] = 1; })),
-        ("ff_borrow[0]",        Box::new(|r| { r.final_form_borrow[0] = 1; })),
-        ("sub_chain_brw[0]",    Box::new(|r| { r.sub_chain_borrow[0] = 1; })),
-        ("mul_product[0]",      Box::new(|r| { r.mul_product[0] = 1; })),
-        ("mul_carry[0]",        Box::new(|r| { r.mul_carry[0] = 1; })),
-        ("mul_carry_mid[0]",    Box::new(|r| { r.mul_carry_mid[0] = 1; })),
-        ("mul_carry_hi[0]",     Box::new(|r| { r.mul_carry_hi[0] = 1; })),
-        ("pass1_lo[0]",         Box::new(|r| { r.pass1_lo[0] = 1; })),
-        ("pass1_hi[0]",         Box::new(|r| { r.pass1_hi[0] = 1; })),
-        ("pass1_carry[0]",      Box::new(|r| { r.pass1_carry[0] = 1; })),
-        ("pass1_carry_mid[0]",  Box::new(|r| { r.pass1_carry_mid[0] = 1; })),
-        ("pass2_lo[0]",         Box::new(|r| { r.pass2_lo[0] = 1; })),
-        ("pass2_carry[0]",      Box::new(|r| { r.pass2_carry[0] = 1; })),
-        ("pass2_carry_out",     Box::new(|r| { r.pass2_carry_out = 1; })),
-        ("pass2_top_bit",       Box::new(|r| { r.pass2_top_bit = 1; })),
-        ("after_top_bit[0]",    Box::new(|r| { r.after_top_bit[0] = 1; })),
-        ("after_top_carry[0]",  Box::new(|r| { r.after_top_carry[0] = 1; })),
-        ("is_overflow",         Box::new(|r| { r.is_overflow = 1; })),
+        (
+            "a[0]",
+            Box::new(|r| {
+                r.a[0] = 1;
+            }),
+        ),
+        (
+            "b[0]",
+            Box::new(|r| {
+                r.b[0] = 1;
+            }),
+        ),
+        (
+            "out[0]",
+            Box::new(|r| {
+                r.out[0] = 1;
+            }),
+        ),
+        (
+            "add_intermediate[0]",
+            Box::new(|r| {
+                r.add_intermediate[0] = 1;
+            }),
+        ),
+        (
+            "add_carry[0]",
+            Box::new(|r| {
+                r.add_carry[0] = 1;
+            }),
+        ),
+        (
+            "sub_borrow[0]",
+            Box::new(|r| {
+                r.sub_borrow[0] = 1;
+            }),
+        ),
+        (
+            "ff_borrow[0]",
+            Box::new(|r| {
+                r.final_form_borrow[0] = 1;
+            }),
+        ),
+        (
+            "sub_chain_brw[0]",
+            Box::new(|r| {
+                r.sub_chain_borrow[0] = 1;
+            }),
+        ),
+        (
+            "mul_product[0]",
+            Box::new(|r| {
+                r.mul_product[0] = 1;
+            }),
+        ),
+        (
+            "mul_carry[0]",
+            Box::new(|r| {
+                r.mul_carry[0] = 1;
+            }),
+        ),
+        (
+            "mul_carry_mid[0]",
+            Box::new(|r| {
+                r.mul_carry_mid[0] = 1;
+            }),
+        ),
+        (
+            "mul_carry_hi[0]",
+            Box::new(|r| {
+                r.mul_carry_hi[0] = 1;
+            }),
+        ),
+        (
+            "pass1_lo[0]",
+            Box::new(|r| {
+                r.pass1_lo[0] = 1;
+            }),
+        ),
+        (
+            "pass1_hi[0]",
+            Box::new(|r| {
+                r.pass1_hi[0] = 1;
+            }),
+        ),
+        (
+            "pass1_carry[0]",
+            Box::new(|r| {
+                r.pass1_carry[0] = 1;
+            }),
+        ),
+        (
+            "pass1_carry_mid[0]",
+            Box::new(|r| {
+                r.pass1_carry_mid[0] = 1;
+            }),
+        ),
+        (
+            "pass2_lo[0]",
+            Box::new(|r| {
+                r.pass2_lo[0] = 1;
+            }),
+        ),
+        (
+            "pass2_carry[0]",
+            Box::new(|r| {
+                r.pass2_carry[0] = 1;
+            }),
+        ),
+        (
+            "pass2_carry_out",
+            Box::new(|r| {
+                r.pass2_carry_out = 1;
+            }),
+        ),
+        (
+            "pass2_top_bit",
+            Box::new(|r| {
+                r.pass2_top_bit = 1;
+            }),
+        ),
+        (
+            "after_top_bit[0]",
+            Box::new(|r| {
+                r.after_top_bit[0] = 1;
+            }),
+        ),
+        (
+            "after_top_carry[0]",
+            Box::new(|r| {
+                r.after_top_carry[0] = 1;
+            }),
+        ),
+        (
+            "is_overflow",
+            Box::new(|r| {
+                r.is_overflow = 1;
+            }),
+        ),
     ];
 
     for (name, mutate) in cases {
-        let mut side_note = zkpvm::SideNote::new(
-            Vec::new(), Vec::new(), Vec::new(),
-        );
+        let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         let mut row = FieldOpRow::default();
         row.is_mul = 1;
         row.is_real = 1;
         mutate(&mut row);
         side_note.add_ristretto_field_row(row);
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
+            pow_bits: 5,
+            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+            lifting_log_size: None,
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
         eprintln!("{:>22}: {}", name, if r.is_ok() { "PASS" } else { "FAIL" });
@@ -1922,20 +2319,21 @@ fn debug_mul_column_bisect() {
 #[ignore]
 fn debug_seventeen_mul_zero_rows() {
     use zkpvm::chips::ristretto::witness::fill_mul;
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     for _ in 0..17 {
         side_note.add_ristretto_field_row(fill_mul([0u8; 32], [0u8; 32]));
     }
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("17 mul-zero rows: prove failed");
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("17 mul-zero rows: prove failed");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("17 mul-zero rows: verify failed");
@@ -1951,25 +2349,63 @@ fn debug_mul_cell_bisect() {
     use zkpvm::chips::ristretto::witness::FieldOpRow;
 
     let scenarios: Vec<(&str, Box<dyn Fn(&mut FieldOpRow)>)> = vec![
-        ("only_a0",       Box::new(|r| { r.a[0] = 1; })),
-        ("a0_and_mp0",    Box::new(|r| { r.a[0] = 1; r.mul_product[0] = 1; })),
-        ("a0b0_mp0",      Box::new(|r| { r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1; })),
-        ("a0b0_mp0_p1lo0",Box::new(|r| { r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1; r.pass1_lo[0] = 1; })),
-        ("full_chain_no_out",  Box::new(|r| {
-            r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1;
-            r.pass1_lo[0] = 1; r.pass2_lo[0] = 1; r.after_top_bit[0] = 1;
-        })),
-        ("full_chain",    Box::new(|r| {
-            r.a[0] = 1; r.b[0] = 1; r.mul_product[0] = 1;
-            r.pass1_lo[0] = 1; r.pass2_lo[0] = 1; r.after_top_bit[0] = 1;
-            r.out[0] = 1;
-        })),
+        (
+            "only_a0",
+            Box::new(|r| {
+                r.a[0] = 1;
+            }),
+        ),
+        (
+            "a0_and_mp0",
+            Box::new(|r| {
+                r.a[0] = 1;
+                r.mul_product[0] = 1;
+            }),
+        ),
+        (
+            "a0b0_mp0",
+            Box::new(|r| {
+                r.a[0] = 1;
+                r.b[0] = 1;
+                r.mul_product[0] = 1;
+            }),
+        ),
+        (
+            "a0b0_mp0_p1lo0",
+            Box::new(|r| {
+                r.a[0] = 1;
+                r.b[0] = 1;
+                r.mul_product[0] = 1;
+                r.pass1_lo[0] = 1;
+            }),
+        ),
+        (
+            "full_chain_no_out",
+            Box::new(|r| {
+                r.a[0] = 1;
+                r.b[0] = 1;
+                r.mul_product[0] = 1;
+                r.pass1_lo[0] = 1;
+                r.pass2_lo[0] = 1;
+                r.after_top_bit[0] = 1;
+            }),
+        ),
+        (
+            "full_chain",
+            Box::new(|r| {
+                r.a[0] = 1;
+                r.b[0] = 1;
+                r.mul_product[0] = 1;
+                r.pass1_lo[0] = 1;
+                r.pass2_lo[0] = 1;
+                r.after_top_bit[0] = 1;
+                r.out[0] = 1;
+            }),
+        ),
     ];
 
     for (name, mutate) in scenarios {
-        let mut side_note = zkpvm::SideNote::new(
-            Vec::new(), Vec::new(), Vec::new(),
-        );
+        let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
         let mut row = FieldOpRow::default();
         row.is_mul = 1;
         row.is_real = 1;
@@ -1980,7 +2416,13 @@ fn debug_mul_cell_bisect() {
         // Recompute final_form_borrow for the chosen out:
         let mut bw: i16 = 1;
         for i in 0..32 {
-            let p_i = if i == 0 { 0xed } else if i == 31 { 0x7f } else { 0xff };
+            let p_i = if i == 0 {
+                0xed
+            } else if i == 31 {
+                0x7f
+            } else {
+                0xff
+            };
             let v = p_i as i16 - row.out[i] as i16 - bw;
             bw = if v < 0 { 1 } else { 0 };
             row.final_form_borrow[i] = bw as u8;
@@ -1988,11 +2430,16 @@ fn debug_mul_cell_bisect() {
         side_note.add_ristretto_field_row(row);
 
         let config = zkpvm::PcsConfig {
-            pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
+            pow_bits: 5,
+            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+            lifting_log_size: None,
         };
         let r = zkpvm::prove_with_config(&mut side_note, config);
-        eprintln!("scenario {}: {}", name, if r.is_ok() { "OK" } else { "FAIL" });
+        eprintln!(
+            "scenario {}: {}",
+            name,
+            if r.is_ok() { "OK" } else { "FAIL" }
+        );
     }
 }
 
@@ -2002,9 +2449,7 @@ fn debug_mul_cell_bisect() {
 fn prove_ristretto_chip_field_mul_zero() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let row = fill_mul([0u8; 32], [0u8; 32]);
     assert_eq!(row.is_mul, 1);
     assert_eq!(row.out, [0u8; 32]);
@@ -2020,7 +2465,7 @@ fn prove_ristretto_chip_field_mul_zero() {
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
-        min_fri_log_blowup: 0
+        min_fri_log_blowup: 0,
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul (zero) verification failed");
@@ -2037,24 +2482,30 @@ fn prove_ristretto_chip_field_mul_zero() {
 fn prove_ristretto_chip_field_mul_with_reduction() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(
-        Vec::new(), Vec::new(), Vec::new(),
-    );
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let mut a = [0u8; 32];
     let mut b = [0u8; 32];
-    for i in 0..32 { a[i] = (0xa3u8).wrapping_mul((i + 1) as u8); }
-    for i in 0..32 { b[i] = (0x71u8).wrapping_mul((i + 1) as u8); }
-    a[31] &= 0x7f; b[31] &= 0x7f;
+    for i in 0..32 {
+        a[i] = (0xa3u8).wrapping_mul((i + 1) as u8);
+    }
+    for i in 0..32 {
+        b[i] = (0x71u8).wrapping_mul((i + 1) as u8);
+    }
+    a[31] &= 0x7f;
+    b[31] &= 0x7f;
     side_note.add_ristretto_field_row(fill_mul(a, b));
 
     let config = zkpvm::PcsConfig {
-        pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("RistrettoChip field-mul (with reduction) proving failed");
     let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
     };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("RistrettoChip field-mul (with reduction) verification failed");
@@ -2075,7 +2526,7 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
     // output at 0x1040 (32 B).  Scalar is `2`, point is the canonical
     // basepoint compressed encoding so the expected output is `2*G`.
     let scalar_addr: u64 = 0x1000;
-    let point_addr:  u64 = 0x1020;
+    let point_addr: u64 = 0x1020;
     let output_addr: u64 = 0x1040;
 
     let scalar_bytes: [u8; 32] = {
@@ -2083,19 +2534,22 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
         s[0] = 2;
         s
     };
-    let point_bytes: [u8; 32] = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let point_bytes: [u8; 32] =
+        curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
 
     let mut flat_mem = vec![0u8; 0x2000];
-    flat_mem[scalar_addr as usize .. scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
-    flat_mem[point_addr  as usize .. point_addr  as usize + 32].copy_from_slice(&point_bytes);
+    flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
+    flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
     // ecalli 200, then trap.  Ecalli is a 5-byte instruction
     // (opcode + 4-byte little-endian immediate).
     let imm = ECALL_RISTRETTO_SCALAR_MULT;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
@@ -2105,45 +2559,57 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
     regs[8] = point_addr;
     regs[9] = output_addr;
 
-    let pvm = javm::interpreter::Interpreter::new(
-        code, bitmask, vec![], regs, flat_mem, 10_000, 25,
-    );
+    let pvm =
+        javm::interpreter::Interpreter::new(code, bitmask, vec![], regs, flat_mem, 10_000, 25);
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run_with_precompiles();
-    eprintln!("Exit: {exit:?}, steps: {}, ristretto_calls: {}",
-        tracing.steps.len(), tracing.ristretto_records.len());
+    eprintln!(
+        "Exit: {exit:?}, steps: {}, ristretto_calls: {}",
+        tracing.steps.len(),
+        tracing.ristretto_records.len()
+    );
 
-    assert_eq!(tracing.ristretto_records.len(), 1, "expected 1 Ristretto ECALL");
+    assert_eq!(
+        tracing.ristretto_records.len(),
+        1,
+        "expected 1 Ristretto ECALL"
+    );
     assert_eq!(tracing.ristretto_mem_ops.len(), 1);
 
     // Expected: 2 * G, computed independently via dalek.
     let expected_out: [u8; 32] = {
         let scalar = curve25519_dalek::scalar::Scalar::from_canonical_bytes(scalar_bytes)
-            .into_option().expect("scalar canonical");
-        let point  = curve25519_dalek::ristretto::CompressedRistretto::from_slice(&point_bytes)
-            .ok().and_then(|c| c.decompress()).expect("point decompresses");
+            .into_option()
+            .expect("scalar canonical");
+        let point = curve25519_dalek::ristretto::CompressedRistretto::from_slice(&point_bytes)
+            .ok()
+            .and_then(|c| c.decompress())
+            .expect("point decompresses");
         (scalar * point).compress().to_bytes()
     };
 
     let rec = &tracing.ristretto_records[0];
     assert_eq!(rec.scalar, scalar_bytes);
-    assert_eq!(rec.point,  point_bytes);
+    assert_eq!(rec.point, point_bytes);
     assert_eq!(rec.output, expected_out, "RistrettoRecord.output mismatch");
 
     let mem_op = &tracing.ristretto_mem_ops[0];
     assert_eq!(mem_op.scalar_ptr, scalar_addr as u32);
-    assert_eq!(mem_op.point_ptr,  point_addr  as u32);
+    assert_eq!(mem_op.point_ptr, point_addr as u32);
     assert_eq!(mem_op.output_ptr, output_addr as u32);
     assert_eq!(mem_op.scalar_bytes, scalar_bytes);
-    assert_eq!(mem_op.point_bytes,  point_bytes);
-    assert_eq!(mem_op.out_bytes,    expected_out);
+    assert_eq!(mem_op.point_bytes, point_bytes);
+    assert_eq!(mem_op.out_bytes, expected_out);
 
     // Confirm the precompile actually wrote the result back into flat_mem
     // (so a follow-up PVM instruction could read it).
-    let written = &tracing.pvm.flat_mem[output_addr as usize .. output_addr as usize + 32];
+    let written = &tracing.pvm.flat_mem[output_addr as usize..output_addr as usize + 32];
     assert_eq!(written, &expected_out[..], "flat_mem write mismatch");
 
-    eprintln!("Ristretto scalar mult via ECALL: TRACED ({} bytes output)", expected_out.len());
+    eprintln!(
+        "Ristretto scalar mult via ECALL: TRACED ({} bytes output)",
+        expected_out.len()
+    );
 }
 
 #[test]
@@ -2154,10 +2620,14 @@ fn prove_blake2b_via_ecall() {
     // For simplicity: manually set up interpreter with h/m in memory and call ecall
 
     let iv: [u64; 8] = [
-        0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
-        0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
-        0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
-        0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+        0x6A09E667F3BCC908,
+        0xBB67AE8584CAA73B,
+        0x3C6EF372FE94F82B,
+        0xA54FF53A5F1D36F1,
+        0x510E527FADE682D1,
+        0x9B05688C2B3E6C1F,
+        0x1F83D9ABFB41BD6B,
+        0x5BE0CD19137E2179,
     ];
 
     // Lay out memory: h at 0x1000 (64 bytes), m at 0x1040 (128 bytes)
@@ -2165,14 +2635,19 @@ fn prove_blake2b_via_ecall() {
     let m_addr: u64 = 0x1040;
     let mut flat_mem = vec![0u8; 0x2000];
     for i in 0..8 {
-        flat_mem[h_addr as usize + i*8 .. h_addr as usize + i*8+8].copy_from_slice(&iv[i].to_le_bytes());
+        flat_mem[h_addr as usize + i * 8..h_addr as usize + i * 8 + 8]
+            .copy_from_slice(&iv[i].to_le_bytes());
     }
     // m is all zeros (already)
 
     // PVM program: ecalli 100 (blake2b), then trap
     // ecalli encoding: opcode byte + immediate
     let code = vec![
-        javm::instruction::Opcode::Ecalli as u8, ECALL_BLAKE2B_COMPRESS as u8, 0, 0, 0,
+        javm::instruction::Opcode::Ecalli as u8,
+        ECALL_BLAKE2B_COMPRESS as u8,
+        0,
+        0,
+        0,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
@@ -2182,47 +2657,75 @@ fn prove_blake2b_via_ecall() {
     // zkpvm-precompiles shim's `in("a0") h_ptr, in("a1") m_ptr,
     // in("a2") t_low, in("a3") f_flag` lands the actor's blake2b
     // arguments in φ[7/8/9/10], where the host handler now reads them.
-    regs[7] = h_addr;  // a0 = h pointer
-    regs[8] = m_addr;  // a1 = m pointer
-    regs[9] = 0;       // a2 = t (counter)
-    regs[10] = 1;      // a3 = f (finalize flag)
+    regs[7] = h_addr; // a0 = h pointer
+    regs[8] = m_addr; // a1 = m pointer
+    regs[9] = 0; // a2 = t (counter)
+    regs[10] = 1; // a3 = f (finalize flag)
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10000, 25
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run_with_precompiles();
-    eprintln!("Exit: {exit:?}, steps: {}, blake2b_calls: {}",
-        tracing.steps.len(), tracing.blake2b_records.len());
+    eprintln!(
+        "Exit: {exit:?}, steps: {}, blake2b_calls: {}",
+        tracing.steps.len(),
+        tracing.blake2b_records.len()
+    );
 
-    assert_eq!(tracing.blake2b_records.len(), 1, "should have 1 blake2b call");
+    assert_eq!(
+        tracing.blake2b_records.len(),
+        1,
+        "should have 1 blake2b call"
+    );
 
     let steps = tracing.steps.clone();
     let blake2b_records = tracing.blake2b_records.clone();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
 
     // Build SideNote with blake2b calls
-    let mut side_note = zkpvm::SideNote::new(
-        steps, code.clone(), bitmask.clone()
-    ).with_memory(flat_mem);
+    let mut side_note =
+        zkpvm::SideNote::new(steps, code.clone(), bitmask.clone()).with_memory(flat_mem);
 
     for rec in &blake2b_records {
-        side_note.blake2b_calls.push(zkpvm::chips::blake2b::Blake2bCall {
-            h: rec.h, m: rec.m, t: rec.t, f: rec.f
-        });
+        side_note
+            .blake2b_calls
+            .push(zkpvm::chips::blake2b::Blake2bCall {
+                h: rec.h,
+                m: rec.m,
+                t: rec.t,
+                f: rec.f,
+            });
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("proving failed");
     // Test config uses pow_bits=5 / fri_log_blowup=0, well below the
     // STANDARD policy floor.  Use a permissive policy so the verify
     // step exercises the algebraic check, not the policy gate.  This
     // was a pre-existing failure mode; pure-test fix.
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verification failed");
-    eprintln!("Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
-        side_note.steps.len(), blake2b_records.len() * 96);
+    eprintln!(
+        "Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
+        side_note.steps.len(),
+        blake2b_records.len() * 96
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2243,7 +2746,8 @@ fn prove_ristretto_via_ecall_boundary() {
     let scalar_addr: u64 = 0x1000;
     let point_addr: u64 = 0x1020;
     let output_addr: u64 = 0x1040;
-    let mut scalar_bytes = [0u8; 32]; scalar_bytes[0] = 1;
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
@@ -2252,16 +2756,26 @@ fn prove_ristretto_via_ecall_boundary() {
     let imm = ECALL_RISTRETTO_SCALAR_MULT;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = output_addr;
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2271,14 +2785,23 @@ fn prove_ristretto_via_ecall_boundary() {
     let r_records = tracing.ristretto_records.clone();
     let r_mem_ops = tracing.ristretto_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.ristretto_calls = r_records;
     side_note.ristretto_mem_ops = r_mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("ristretto via ECALL boundary proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
         .expect("ristretto via ECALL boundary verification failed");
 }
@@ -2300,17 +2823,27 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     let imm = ECALL_RISTRETTO_POINT_ADD;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
-    regs[7] = p_addr; regs[8] = q_addr; regs[9] = output_addr;
+    regs[7] = p_addr;
+    regs[8] = q_addr;
+    regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2320,14 +2853,22 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     let records = tracing.ristretto_add_records.clone();
     let mem_ops = tracing.ristretto_add_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.ristretto_add_calls = records;
     side_note.ristretto_add_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("point_add proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config).expect("point_add proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2338,25 +2879,35 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
 
     let wide_addr: u64 = 0x1000;
     let output_addr: u64 = 0x1040;
-    let mut wide_bytes = [0u8; 64]; wide_bytes[0] = 7;
+    let mut wide_bytes = [0u8; 64];
+    wide_bytes[0] = 7;
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[wide_addr as usize..wide_addr as usize + 64].copy_from_slice(&wide_bytes);
 
     let imm = ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM mapping.
     // Aligns with the post-fix handler reads.
-    regs[7] = wide_addr; regs[8] = output_addr;
+    regs[7] = wide_addr;
+    regs[8] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2366,14 +2917,23 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     let records = tracing.scalar_reduce_wide_records.clone();
     let mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.scalar_reduce_wide_calls = records;
     side_note.scalar_reduce_wide_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar_reduce_wide proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2385,8 +2945,10 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     let a_addr: u64 = 0x1000;
     let b_addr: u64 = 0x1020;
     let output_addr: u64 = 0x1040;
-    let mut a_bytes = [0u8; 32]; a_bytes[0] = 7;
-    let mut b_bytes = [0u8; 32]; b_bytes[0] = 13;
+    let mut a_bytes = [0u8; 32];
+    a_bytes[0] = 7;
+    let mut b_bytes = [0u8; 32];
+    b_bytes[0] = 13;
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
@@ -2394,17 +2956,27 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     let imm = ECALL_SCALAR_MUL_MOD_L;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
-    regs[7] = a_addr; regs[8] = b_addr; regs[9] = output_addr;
+    regs[7] = a_addr;
+    regs[8] = b_addr;
+    regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2414,27 +2986,38 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     let records = tracing.scalar_binop_records.clone();
     let mem_ops = tracing.scalar_binop_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.scalar_binop_calls = records;
     side_note.scalar_binop_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("scalar_mul_mod_l proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("scalar_mul_mod_l proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
 /// Step 18: scalar mul + add (back-to-back, both binops fire).
 #[test]
 fn prove_scalar_mul_then_add_mod_l() {
-    use zkpvm::core::tracing::{ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L};
+    use zkpvm::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
 
     let a_addr: u64 = 0x1000;
     let b_addr: u64 = 0x1020;
     let out_addr: u64 = 0x1040;
-    let mut a_bytes = [0u8; 32]; a_bytes[0] = 7;
-    let mut b_bytes = [0u8; 32]; b_bytes[0] = 13;
+    let mut a_bytes = [0u8; 32];
+    a_bytes[0] = 7;
+    let mut b_bytes = [0u8; 32];
+    b_bytes[0] = 13;
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
@@ -2443,20 +3026,32 @@ fn prove_scalar_mul_then_add_mod_l() {
     let imm2 = ECALL_SCALAR_ADD_MOD_L;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm1 & 0xff) as u8, ((imm1 >> 8) & 0xff) as u8,
-        ((imm1 >> 16) & 0xff) as u8, ((imm1 >> 24) & 0xff) as u8,
+        (imm1 & 0xff) as u8,
+        ((imm1 >> 8) & 0xff) as u8,
+        ((imm1 >> 16) & 0xff) as u8,
+        ((imm1 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Ecalli as u8,
-        (imm2 & 0xff) as u8, ((imm2 >> 8) & 0xff) as u8,
-        ((imm2 >> 16) & 0xff) as u8, ((imm2 >> 24) & 0xff) as u8,
+        (imm2 & 0xff) as u8,
+        ((imm2 >> 8) & 0xff) as u8,
+        ((imm2 >> 16) & 0xff) as u8,
+        ((imm2 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
-    regs[7] = a_addr; regs[8] = b_addr; regs[9] = out_addr;
+    regs[7] = a_addr;
+    regs[8] = b_addr;
+    regs[9] = out_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2466,14 +3061,23 @@ fn prove_scalar_mul_then_add_mod_l() {
     let records = tracing.scalar_binop_records.clone();
     let mem_ops = tracing.scalar_binop_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.scalar_binop_calls = records;
     side_note.scalar_binop_mem_ops = mem_ops;
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("scalar mul+add proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("scalar mul+add proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2481,12 +3085,13 @@ fn prove_scalar_mul_then_add_mod_l() {
 /// the new chip handles multiple ECALL types in one trace.
 #[test]
 fn prove_scalar_mult_then_point_add() {
-    use zkpvm::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, ECALL_RISTRETTO_POINT_ADD};
+    use zkpvm::core::tracing::{ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT};
 
     let scalar_addr: u64 = 0x1000;
     let point_addr: u64 = 0x1020;
     let a_addr: u64 = 0x1040;
-    let mut scalar_bytes = [0u8; 32]; scalar_bytes[0] = 1;
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
@@ -2496,11 +3101,15 @@ fn prove_scalar_mult_then_point_add() {
     let imm2 = ECALL_RISTRETTO_POINT_ADD;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm1 & 0xff) as u8, ((imm1 >> 8) & 0xff) as u8,
-        ((imm1 >> 16) & 0xff) as u8, ((imm1 >> 24) & 0xff) as u8,
+        (imm1 & 0xff) as u8,
+        ((imm1 >> 8) & 0xff) as u8,
+        ((imm1 >> 16) & 0xff) as u8,
+        ((imm1 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Ecalli as u8,
-        (imm2 & 0xff) as u8, ((imm2 >> 8) & 0xff) as u8,
-        ((imm2 >> 16) & 0xff) as u8, ((imm2 >> 24) & 0xff) as u8,
+        (imm2 & 0xff) as u8,
+        ((imm2 >> 8) & 0xff) as u8,
+        ((imm2 >> 16) & 0xff) as u8,
+        ((imm2 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
@@ -2508,10 +3117,18 @@ fn prove_scalar_mult_then_point_add() {
     // PVM A0/A1/A2 = φ[7/8/9] for both scalar_mult and point_add
     // (off-by-three fixed for both — scalar_mult in 02922c4, point_add
     // in this commit).
-    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = a_addr;
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = a_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2520,16 +3137,25 @@ fn prove_scalar_mult_then_point_add() {
 
     let steps = tracing.steps.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.ristretto_calls = tracing.ristretto_records.clone();
     side_note.ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
     side_note.ristretto_add_calls = tracing.ristretto_add_records.clone();
     side_note.ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config)
         .expect("scalar_mult + point_add proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2541,7 +3167,8 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     let scalar_addr: u64 = 0x1000;
     let point_addr: u64 = 0x1020;
     let output_addr: u64 = 0x1040;
-    let mut scalar_bytes = [0u8; 32]; scalar_bytes[0] = 1;
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
@@ -2550,19 +3177,31 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     let imm = ECALL_RISTRETTO_SCALAR_MULT;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Ecalli as u8,
-        (imm & 0xff) as u8, ((imm >> 8) & 0xff) as u8,
-        ((imm >> 16) & 0xff) as u8, ((imm >> 24) & 0xff) as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    regs[7] = scalar_addr; regs[8] = point_addr; regs[9] = output_addr;
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2570,25 +3209,36 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
 
     let steps = tracing.steps.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.ristretto_calls = tracing.ristretto_records.clone();
     side_note.ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("two-ecall proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
 /// Step 18 chained: mul output consumed by add (Schnorr-shaped pattern).
 #[test]
 fn prove_scalar_mul_chained_add() {
-    use zkpvm::core::tracing::{ECALL_SCALAR_MUL_MOD_L, ECALL_SCALAR_ADD_MOD_L};
+    use zkpvm::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
     let a_addr: u64 = 0x1000;
     let b_addr: u64 = 0x1020;
     let out_addr: u64 = 0x1040;
-    let mut a_bytes = [0u8; 32]; a_bytes[0] = 7;
-    let mut b_bytes = [0u8; 32]; b_bytes[0] = 13;
+    let mut a_bytes = [0u8; 32];
+    a_bytes[0] = 7;
+    let mut b_bytes = [0u8; 32];
+    b_bytes[0] = 13;
     let mut flat_mem = vec![0u8; 0x2000];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
@@ -2597,20 +3247,32 @@ fn prove_scalar_mul_chained_add() {
     let imm2 = ECALL_SCALAR_ADD_MOD_L;
     let code = vec![
         javm::instruction::Opcode::Ecalli as u8,
-        (imm1 & 0xff) as u8, ((imm1 >> 8) & 0xff) as u8,
-        ((imm1 >> 16) & 0xff) as u8, ((imm1 >> 24) & 0xff) as u8,
+        (imm1 & 0xff) as u8,
+        ((imm1 >> 8) & 0xff) as u8,
+        ((imm1 >> 16) & 0xff) as u8,
+        ((imm1 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Ecalli as u8,
-        (imm2 & 0xff) as u8, ((imm2 >> 8) & 0xff) as u8,
-        ((imm2 >> 16) & 0xff) as u8, ((imm2 >> 24) & 0xff) as u8,
+        (imm2 & 0xff) as u8,
+        ((imm2 >> 8) & 0xff) as u8,
+        ((imm2 >> 16) & 0xff) as u8,
+        ((imm2 >> 24) & 0xff) as u8,
         javm::instruction::Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
-    regs[7] = a_addr; regs[8] = b_addr; regs[9] = out_addr;
+    regs[7] = a_addr;
+    regs[8] = b_addr;
+    regs[9] = out_addr;
 
     let pvm = javm::interpreter::Interpreter::new(
-        code.clone(), bitmask.clone(), vec![], regs, flat_mem.clone(), 10_000, 25,
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
@@ -2618,14 +3280,23 @@ fn prove_scalar_mul_chained_add() {
 
     let steps = tracing.steps.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
-        .with_memory(flat_mem).with_initial_regs(regs);
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
     side_note.scalar_binop_calls = tracing.scalar_binop_records.clone();
     side_note.scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("chained mul+add proving failed");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("chained mul+add proving failed");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2639,10 +3310,10 @@ fn prove_scalar_mul_chained_add() {
 #[test]
 #[ignore]
 fn prove_ristretto_chip_double_chained() {
-    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
     use zkpvm::chips::ristretto::point::{
         ExtendedPointSources, point_double_rows_chained, point_identity,
     };
+    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
 
     let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let p = point_identity();
@@ -2660,24 +3331,36 @@ fn prove_ristretto_chip_double_chained() {
     side_note.add_ristretto_field_row(fill_input(zero_b));
 
     let in_sources = ExtendedPointSources {
-        x_source: x_row, y_source: y_row, z_source: z_row, t_source: t_row,
+        x_source: x_row,
+        y_source: y_row,
+        z_source: z_row,
+        t_source: t_row,
     };
 
     let start_row = side_note.ristretto_field_rows.len() as u16;
-    let (rows, doubled, out_sources) = point_double_rows_chained(
-        &p, &in_sources, zero_row, start_row,
-    );
-    for r in rows { side_note.add_ristretto_field_row(r); }
+    let (rows, doubled, out_sources) =
+        point_double_rows_chained(&p, &in_sources, zero_row, start_row);
+    for r in rows {
+        side_note.add_ristretto_field_row(r);
+    }
 
     side_note.add_ristretto_field_row(fill_output(doubled.x, out_sources.x_source));
     side_note.add_ristretto_field_row(fill_output(doubled.y, out_sources.y_source));
     side_note.add_ristretto_field_row(fill_output(doubled.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(doubled.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("doubling-chained should prove");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("doubling-chained should prove");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2686,10 +3369,10 @@ fn prove_ristretto_chip_double_chained() {
 #[test]
 #[ignore]
 fn prove_ristretto_chip_add_chained() {
-    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
     use zkpvm::chips::ristretto::point::{
-        ExtendedPointSources, ED25519_TWO_D, point_add_rows_chained, point_identity,
+        ED25519_TWO_D, ExtendedPointSources, point_add_rows_chained, point_identity,
     };
+    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
 
     let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let p = point_identity();
@@ -2715,27 +3398,41 @@ fn prove_ristretto_chip_add_chained() {
     side_note.add_ristretto_field_row(fill_input(ED25519_TWO_D));
 
     let p_sources = ExtendedPointSources {
-        x_source: px_row, y_source: py_row, z_source: pz_row, t_source: pt_row,
+        x_source: px_row,
+        y_source: py_row,
+        z_source: pz_row,
+        t_source: pt_row,
     };
     let q_sources = ExtendedPointSources {
-        x_source: qx_row, y_source: qy_row, z_source: qz_row, t_source: qt_row,
+        x_source: qx_row,
+        y_source: qy_row,
+        z_source: qz_row,
+        t_source: qt_row,
     };
 
     let start_row = side_note.ristretto_field_rows.len() as u16;
-    let (rows, sum, out_sources) = point_add_rows_chained(
-        &p, &p_sources, &q, &q_sources, two_d_row, start_row,
-    );
-    for r in rows { side_note.add_ristretto_field_row(r); }
+    let (rows, sum, out_sources) =
+        point_add_rows_chained(&p, &p_sources, &q, &q_sources, two_d_row, start_row);
+    for r in rows {
+        side_note.add_ristretto_field_row(r);
+    }
 
     side_note.add_ristretto_field_row(fill_output(sum.x, out_sources.x_source));
     side_note.add_ristretto_field_row(fill_output(sum.y, out_sources.y_source));
     side_note.add_ristretto_field_row(fill_output(sum.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(sum.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("add-chained should prove");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config).expect("add-chained should prove");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2745,10 +3442,10 @@ fn prove_ristretto_chip_add_chained() {
 #[test]
 #[ignore]
 fn prove_ristretto_chip_scalar_mult_chained_small() {
-    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
     use zkpvm::chips::ristretto::point::{
-        ExtendedPointSources, ED25519_TWO_D, point_identity, scalar_mult_rows_chained,
+        ED25519_TWO_D, ExtendedPointSources, point_identity, scalar_mult_rows_chained,
     };
+    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
 
     let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let id = point_identity();
@@ -2768,22 +3465,36 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     side_note.add_ristretto_field_row(fill_input(ED25519_TWO_D));
 
     let p_sources = ExtendedPointSources {
-        x_source: id_x_row, y_source: id_y_row, z_source: id_z_row, t_source: id_t_row,
+        x_source: id_x_row,
+        y_source: id_y_row,
+        z_source: id_z_row,
+        t_source: id_t_row,
     };
     let id_sources = p_sources;
-    let mut k = [0u8; 32]; k[0] = 5;
+    let mut k = [0u8; 32];
+    k[0] = 5;
 
     let start = side_note.ristretto_field_rows.len() as u16;
     let (rows, result, out_sources) = scalar_mult_rows_chained(
-        &k, &id, &p_sources, &id_sources, zero_row, two_d_row, start, 3,
+        &k,
+        &id,
+        &p_sources,
+        &id_sources,
+        zero_row,
+        two_d_row,
+        start,
+        3,
     );
-    for r in rows { side_note.add_ristretto_field_row(r); }
+    for r in rows {
+        side_note.add_ristretto_field_row(r);
+    }
 
     use zkpvm::chips::ristretto::field;
     let z_inv = field::inv(&result.z);
     let x_aff = field::mul(&result.x, &z_inv);
     let y_aff = field::mul(&result.y, &z_inv);
-    let mut one_b = [0u8; 32]; one_b[0] = 1;
+    let mut one_b = [0u8; 32];
+    one_b[0] = 1;
     assert_eq!(x_aff, [0u8; 32], "5·O affine x must be 0");
     assert_eq!(y_aff, one_b, "5·O affine y must be 1");
 
@@ -2792,10 +3503,18 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     side_note.add_ristretto_field_row(fill_output(result.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(result.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig { pow_bits: 5, fri_config: zkpvm::FriConfig::new(0, 1, 3, 1), lifting_log_size: None };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("scalar-mult-chained should prove");
-    let policy = zkpvm::PcsPolicy { min_pow_bits: 5, min_fri_queries: 3, min_fri_log_blowup: 0 };
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof =
+        zkpvm::prove_with_config(&mut side_note, config).expect("scalar-mult-chained should prove");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
@@ -2816,11 +3535,17 @@ fn profile_hot_pcs_clerk_private_pay_bench() {
     eprintln!("Phase-2 trace: {} PVM steps", steps.len());
     eprintln!(
         "ECALLs: blake2b={}, ristretto_scalar_mult={}, ristretto_point_add={}, scalar_reduce_wide={}, scalar_binop={}",
-        blake2b_count, ristretto_count, ristretto_add_count, scalar_reduce_count, scalar_binop_count,
+        blake2b_count,
+        ristretto_count,
+        ristretto_add_count,
+        scalar_reduce_count,
+        scalar_binop_count,
     );
 
     let mut pc_count = std::collections::HashMap::<u32, u32>::new();
-    for s in &steps { *pc_count.entry(s.pc).or_insert(0) += 1; }
+    for s in &steps {
+        *pc_count.entry(s.pc).or_insert(0) += 1;
+    }
     let mut top: Vec<_> = pc_count.iter().map(|(&pc, &c)| (pc, c)).collect();
     top.sort_by(|a, b| b.1.cmp(&a.1));
     eprintln!("\nTop 10 hot PCs:");
@@ -2841,7 +3566,9 @@ fn profile_hot_pcs_clerk_private_pay_bench() {
         cum += c;
         let pct = 100.0 * (*c as f64) / (total as f64);
         let cum_pct = 100.0 * (cum as f64) / (total as f64);
-        eprintln!("  pc=0x{pc:08x}..0x{:08x}  hits={c} ({pct:.1}% of trace, cum {cum_pct:.1}%)",
-            pc + 0xff);
+        eprintln!(
+            "  pc=0x{pc:08x}..0x{:08x}  hits={c} ({pct:.1}% of trace, cum {cum_pct:.1}%)",
+            pc + 0xff
+        );
     }
 }

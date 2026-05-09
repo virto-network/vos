@@ -19,28 +19,25 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 #[cfg(feature = "prover")]
-pub mod field;
-#[cfg(feature = "prover")]
-pub mod witness;
-#[cfg(feature = "prover")]
-pub mod point;
-#[cfg(feature = "prover")]
 pub mod comb_table;
 #[cfg(feature = "prover")]
 pub mod compress;
+#[cfg(feature = "prover")]
+pub mod field;
 pub mod field_op_constraints;
+#[cfg(feature = "prover")]
+pub mod point;
+#[cfg(feature = "prover")]
+pub mod witness;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
@@ -50,16 +47,16 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{Range256LookupElements, RistrettoRegisterFileLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{Range256LookupElements, RistrettoRegisterFileLookupElements},
+};
 
 pub struct RistrettoChip;
 
@@ -284,7 +281,6 @@ pub enum Column {
     // Lookup multiplicities `is_real · (1 - is_input) · (1 - is_output)`
     // reach deg 3, which combined with deg-1 tuple yields paired-batch
     // deg 4 — too high once the chip is dialed back to bound 1.
-
     /// `IsReal · IsAdd` — full add-row selector.
     #[size = 1]
     RealAddH,
@@ -348,7 +344,10 @@ const _: () = {
     let c = field_op_constraints::P_BYTE_CONSTS;
     let mut i = 0;
     while i < 32 {
-        assert!(h[i] == c[i], "field_op_constraints::P_BYTE_CONSTS diverged from field::P_BYTES");
+        assert!(
+            h[i] == c[i],
+            "field_op_constraints::P_BYTE_CONSTS diverged from field::P_BYTES"
+        );
         i += 1;
     }
 };
@@ -377,40 +376,43 @@ impl BuiltInComponent for RistrettoChip {
         let (range_lookup, regfile_lookup) = lookup_elements;
         let lookup_elements = range_lookup;
         let _ = regfile_lookup; // referenced in producer/consumer emissions below
-        let a       = crate::trace::trace_eval!(trace_eval, Column::FieldA);
-        let b       = crate::trace::trace_eval!(trace_eval, Column::FieldB);
-        let out     = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
-        let interm  = crate::trace::trace_eval!(trace_eval, Column::AddIntermediate);
-        let carry   = crate::trace::trace_eval!(trace_eval, Column::AddCarry);
-        let borrow  = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
-        let ff_brw  = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
+        let a = crate::trace::trace_eval!(trace_eval, Column::FieldA);
+        let b = crate::trace::trace_eval!(trace_eval, Column::FieldB);
+        let out = crate::trace::trace_eval!(trace_eval, Column::FieldOut);
+        let interm = crate::trace::trace_eval!(trace_eval, Column::AddIntermediate);
+        let carry = crate::trace::trace_eval!(trace_eval, Column::AddCarry);
+        let borrow = crate::trace::trace_eval!(trace_eval, Column::SubBorrow);
+        let ff_brw = crate::trace::trace_eval!(trace_eval, Column::FinalFormBorrow);
         let sub_chain_brw = crate::trace::trace_eval!(trace_eval, Column::SubChainBorrow);
         let sub_chain_aip = crate::trace::trace_eval!(trace_eval, Column::SubChainCarryAip);
         let a_src_lo = crate::trace::trace_eval!(trace_eval, Column::ASourceRowLo);
         let a_src_hi = crate::trace::trace_eval!(trace_eval, Column::ASourceRowHi);
         let b_src_lo = crate::trace::trace_eval!(trace_eval, Column::BSourceRowLo);
         let b_src_hi = crate::trace::trace_eval!(trace_eval, Column::BSourceRowHi);
-        let row_idx_lo = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
-        let row_idx_hi = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
-        let byte_idx_pp = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
-        let mul_product   = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
-        let mul_carry     = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
+        let row_idx_lo =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexLo);
+        let row_idx_hi =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RowIndexHi);
+        let byte_idx_pp =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ByteIdx);
+        let mul_product = crate::trace::trace_eval!(trace_eval, Column::MulProduct);
+        let mul_carry = crate::trace::trace_eval!(trace_eval, Column::MulCarry);
         let mul_carry_mid = crate::trace::trace_eval!(trace_eval, Column::MulCarryMid);
-        let mul_carry_hi  = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
-        let pass1_lo      = crate::trace::trace_eval!(trace_eval, Column::Pass1Lo);
-        let pass1_hi      = crate::trace::trace_eval!(trace_eval, Column::Pass1Hi);
-        let pass1_carry   = crate::trace::trace_eval!(trace_eval, Column::Pass1Carry);
+        let mul_carry_hi = crate::trace::trace_eval!(trace_eval, Column::MulCarryHi);
+        let pass1_lo = crate::trace::trace_eval!(trace_eval, Column::Pass1Lo);
+        let pass1_hi = crate::trace::trace_eval!(trace_eval, Column::Pass1Hi);
+        let pass1_carry = crate::trace::trace_eval!(trace_eval, Column::Pass1Carry);
         let pass1_carry_mid = crate::trace::trace_eval!(trace_eval, Column::Pass1CarryMid);
-        let pass2_lo      = crate::trace::trace_eval!(trace_eval, Column::Pass2Lo);
+        let pass2_lo = crate::trace::trace_eval!(trace_eval, Column::Pass2Lo);
         let pass2_carry_out = crate::trace::trace_eval!(trace_eval, Column::Pass2CarryOut);
-        let pass2_carry   = crate::trace::trace_eval!(trace_eval, Column::Pass2Carry);
+        let pass2_carry = crate::trace::trace_eval!(trace_eval, Column::Pass2Carry);
         let pass2_top_bit = crate::trace::trace_eval!(trace_eval, Column::Pass2TopBit);
         let after_top_bit = crate::trace::trace_eval!(trace_eval, Column::AfterTopBit);
         let after_top_carry = crate::trace::trace_eval!(trace_eval, Column::AfterTopCarry);
-        let is_ovf  = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
-        let is_add  = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
-        let is_sub  = crate::trace::trace_eval!(trace_eval, Column::IsSub);
-        let is_mul  = crate::trace::trace_eval!(trace_eval, Column::IsMul);
+        let is_ovf = crate::trace::trace_eval!(trace_eval, Column::IsOverflow);
+        let is_add = crate::trace::trace_eval!(trace_eval, Column::IsAdd);
+        let is_sub = crate::trace::trace_eval!(trace_eval, Column::IsSub);
+        let is_mul = crate::trace::trace_eval!(trace_eval, Column::IsMul);
         let is_input = crate::trace::trace_eval!(trace_eval, Column::IsInput);
         let is_output = crate::trace::trace_eval!(trace_eval, Column::IsOutput);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
@@ -419,14 +421,10 @@ impl BuiltInComponent for RistrettoChip {
         let real_add_h = crate::trace::trace_eval!(trace_eval, Column::RealAddH);
         let real_sub_h = crate::trace::trace_eval!(trace_eval, Column::RealSubH);
         let real_mul_h = crate::trace::trace_eval!(trace_eval, Column::RealMulH);
-        let producer_gate_h =
-            crate::trace::trace_eval!(trace_eval, Column::ProducerGateH);
-        let consumer_a_gate_h =
-            crate::trace::trace_eval!(trace_eval, Column::ConsumerAGateH);
-        let consumer_b_gate_h =
-            crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
-        let mul_partial_sum =
-            crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
+        let producer_gate_h = crate::trace::trace_eval!(trace_eval, Column::ProducerGateH);
+        let consumer_a_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerAGateH);
+        let consumer_b_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
+        let mul_partial_sum = crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
 
         // ── R1c-3..R1c-5-b: shared FieldOp algebra ──
         // Lifted into `field_op_constraints` so RistrettoFixedBaseConsumerChip
@@ -518,9 +516,13 @@ impl BuiltInComponent for RistrettoChip {
         }
         // Loop 3: 32-byte reduction + sub-aux cols — 256.
         for cells_32 in [
-            &pass1_lo, &pass1_carry, &pass1_carry_mid,
-            &pass2_lo, &pass2_carry,
-            &after_top_bit, &after_top_carry,
+            &pass1_lo,
+            &pass1_carry,
+            &pass1_carry_mid,
+            &pass2_lo,
+            &pass2_carry,
+            &after_top_bit,
+            &after_top_carry,
             &sub_chain_aip,
         ] {
             for byte in cells_32.iter() {
@@ -615,11 +617,7 @@ impl BuiltInComponent for RistrettoChip {
 impl BuiltInProverComponent for RistrettoChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = ristretto_log_size(side_note);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
@@ -652,50 +650,62 @@ impl BuiltInProverComponent for RistrettoChip {
         // hide them from the verifier and trigger a chip-set
         // mismatch.
         for row_i in 0..num_rows {
-            let r = side_note.ristretto_field_rows.get(row_i).copied().unwrap_or_default();
+            let r = side_note
+                .ristretto_field_rows
+                .get(row_i)
+                .copied()
+                .unwrap_or_default();
 
             // 32-byte cells.
-            trace.fill_columns_bytes(row_i, &r.a,                  Column::FieldA);
-            trace.fill_columns_bytes(row_i, &r.b,                  Column::FieldB);
-            trace.fill_columns_bytes(row_i, &r.out,                Column::FieldOut);
-            trace.fill_columns_bytes(row_i, &r.add_intermediate,   Column::AddIntermediate);
-            trace.fill_columns_bytes(row_i, &r.add_carry,          Column::AddCarry);
-            trace.fill_columns_bytes(row_i, &r.sub_borrow,         Column::SubBorrow);
-            trace.fill_columns_bytes(row_i, &r.final_form_borrow,  Column::FinalFormBorrow);
-            trace.fill_columns_bytes(row_i, &r.sub_chain_borrow,   Column::SubChainBorrow);
+            trace.fill_columns_bytes(row_i, &r.a, Column::FieldA);
+            trace.fill_columns_bytes(row_i, &r.b, Column::FieldB);
+            trace.fill_columns_bytes(row_i, &r.out, Column::FieldOut);
+            trace.fill_columns_bytes(row_i, &r.add_intermediate, Column::AddIntermediate);
+            trace.fill_columns_bytes(row_i, &r.add_carry, Column::AddCarry);
+            trace.fill_columns_bytes(row_i, &r.sub_borrow, Column::SubBorrow);
+            trace.fill_columns_bytes(row_i, &r.final_form_borrow, Column::FinalFormBorrow);
+            trace.fill_columns_bytes(row_i, &r.sub_chain_borrow, Column::SubChainBorrow);
             trace.fill_columns_bytes(row_i, &r.sub_chain_carry_aip, Column::SubChainCarryAip);
-            trace.fill_columns_bytes(row_i, &r.pass1_lo,           Column::Pass1Lo);
-            trace.fill_columns_bytes(row_i, &r.pass1_carry,        Column::Pass1Carry);
-            trace.fill_columns_bytes(row_i, &r.pass1_carry_mid,    Column::Pass1CarryMid);
-            trace.fill_columns_bytes(row_i, &r.pass2_lo,           Column::Pass2Lo);
-            trace.fill_columns_bytes(row_i, &r.pass2_carry,        Column::Pass2Carry);
-            trace.fill_columns_bytes(row_i, &r.after_top_bit,      Column::AfterTopBit);
-            trace.fill_columns_bytes(row_i, &r.after_top_carry,    Column::AfterTopCarry);
+            trace.fill_columns_bytes(row_i, &r.pass1_lo, Column::Pass1Lo);
+            trace.fill_columns_bytes(row_i, &r.pass1_carry, Column::Pass1Carry);
+            trace.fill_columns_bytes(row_i, &r.pass1_carry_mid, Column::Pass1CarryMid);
+            trace.fill_columns_bytes(row_i, &r.pass2_lo, Column::Pass2Lo);
+            trace.fill_columns_bytes(row_i, &r.pass2_carry, Column::Pass2Carry);
+            trace.fill_columns_bytes(row_i, &r.after_top_bit, Column::AfterTopBit);
+            trace.fill_columns_bytes(row_i, &r.after_top_carry, Column::AfterTopCarry);
 
             // 64-byte cells (mul witnesses).
-            trace.fill_columns_bytes(row_i, &r.mul_product,        Column::MulProduct);
-            trace.fill_columns_bytes(row_i, &r.mul_carry,          Column::MulCarry);
-            trace.fill_columns_bytes(row_i, &r.mul_carry_mid,      Column::MulCarryMid);
-            trace.fill_columns_bytes(row_i, &r.mul_carry_hi,       Column::MulCarryHi);
+            trace.fill_columns_bytes(row_i, &r.mul_product, Column::MulProduct);
+            trace.fill_columns_bytes(row_i, &r.mul_carry, Column::MulCarry);
+            trace.fill_columns_bytes(row_i, &r.mul_carry_mid, Column::MulCarryMid);
+            trace.fill_columns_bytes(row_i, &r.mul_carry_hi, Column::MulCarryHi);
 
             // 2-byte (Pass1Hi).
-            trace.fill_columns_bytes(row_i, &r.pass1_hi,           Column::Pass1Hi);
+            trace.fill_columns_bytes(row_i, &r.pass1_hi, Column::Pass1Hi);
 
             // 1-byte flag/bit cells.
-            trace.fill_columns(row_i, r.is_overflow,     Column::IsOverflow);
+            trace.fill_columns(row_i, r.is_overflow, Column::IsOverflow);
             trace.fill_columns(row_i, r.pass2_carry_out, Column::Pass2CarryOut);
-            trace.fill_columns(row_i, r.pass2_top_bit,   Column::Pass2TopBit);
-            trace.fill_columns(row_i, r.is_add,          Column::IsAdd);
-            trace.fill_columns(row_i, r.is_sub,          Column::IsSub);
-            trace.fill_columns(row_i, r.is_mul,          Column::IsMul);
-            trace.fill_columns(row_i, r.is_input,        Column::IsInput);
-            trace.fill_columns(row_i, r.is_output,       Column::IsOutput);
-            trace.fill_columns(row_i, r.is_real,         Column::IsReal);
+            trace.fill_columns(row_i, r.pass2_top_bit, Column::Pass2TopBit);
+            trace.fill_columns(row_i, r.is_add, Column::IsAdd);
+            trace.fill_columns(row_i, r.is_sub, Column::IsSub);
+            trace.fill_columns(row_i, r.is_mul, Column::IsMul);
+            trace.fill_columns(row_i, r.is_input, Column::IsInput);
+            trace.fill_columns(row_i, r.is_output, Column::IsOutput);
+            trace.fill_columns(row_i, r.is_real, Column::IsReal);
             // R1e-pent: source row IDs (2 bytes each).
             trace.fill_columns(row_i, (r.a_source_row & 0xff) as u8, Column::ASourceRowLo);
-            trace.fill_columns(row_i, ((r.a_source_row >> 8) & 0xff) as u8, Column::ASourceRowHi);
+            trace.fill_columns(
+                row_i,
+                ((r.a_source_row >> 8) & 0xff) as u8,
+                Column::ASourceRowHi,
+            );
             trace.fill_columns(row_i, (r.b_source_row & 0xff) as u8, Column::BSourceRowLo);
-            trace.fill_columns(row_i, ((r.b_source_row >> 8) & 0xff) as u8, Column::BSourceRowHi);
+            trace.fill_columns(
+                row_i,
+                ((r.b_source_row >> 8) & 0xff) as u8,
+                Column::BSourceRowHi,
+            );
 
             // ── Phase I-ristretto helper fills ──
             // Selectors: bool products (each in {0, 1}).
@@ -757,19 +767,19 @@ impl BuiltInProverComponent for RistrettoChip {
         let field_b = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let field_out = crate::trace::original_base_column!(component_trace, Column::FieldOut);
         let interm = crate::trace::original_base_column!(component_trace, Column::AddIntermediate);
-        let mul_p   = crate::trace::original_base_column!(component_trace, Column::MulProduct);
-        let mul_c   = crate::trace::original_base_column!(component_trace, Column::MulCarry);
-        let mul_cm  = crate::trace::original_base_column!(component_trace, Column::MulCarryMid);
-        let mul_ch  = crate::trace::original_base_column!(component_trace, Column::MulCarryHi);
-        let p1_lo   = crate::trace::original_base_column!(component_trace, Column::Pass1Lo);
-        let p1_hi   = crate::trace::original_base_column!(component_trace, Column::Pass1Hi);
-        let p1_c    = crate::trace::original_base_column!(component_trace, Column::Pass1Carry);
-        let p1_cm   = crate::trace::original_base_column!(component_trace, Column::Pass1CarryMid);
-        let p2_lo   = crate::trace::original_base_column!(component_trace, Column::Pass2Lo);
-        let p2_c    = crate::trace::original_base_column!(component_trace, Column::Pass2Carry);
-        let atb     = crate::trace::original_base_column!(component_trace, Column::AfterTopBit);
-        let atc     = crate::trace::original_base_column!(component_trace, Column::AfterTopCarry);
-        let scaip   = crate::trace::original_base_column!(component_trace, Column::SubChainCarryAip);
+        let mul_p = crate::trace::original_base_column!(component_trace, Column::MulProduct);
+        let mul_c = crate::trace::original_base_column!(component_trace, Column::MulCarry);
+        let mul_cm = crate::trace::original_base_column!(component_trace, Column::MulCarryMid);
+        let mul_ch = crate::trace::original_base_column!(component_trace, Column::MulCarryHi);
+        let p1_lo = crate::trace::original_base_column!(component_trace, Column::Pass1Lo);
+        let p1_hi = crate::trace::original_base_column!(component_trace, Column::Pass1Hi);
+        let p1_c = crate::trace::original_base_column!(component_trace, Column::Pass1Carry);
+        let p1_cm = crate::trace::original_base_column!(component_trace, Column::Pass1CarryMid);
+        let p2_lo = crate::trace::original_base_column!(component_trace, Column::Pass2Lo);
+        let p2_c = crate::trace::original_base_column!(component_trace, Column::Pass2Carry);
+        let atb = crate::trace::original_base_column!(component_trace, Column::AfterTopBit);
+        let atc = crate::trace::original_base_column!(component_trace, Column::AfterTopCarry);
+        let scaip = crate::trace::original_base_column!(component_trace, Column::SubChainCarryAip);
 
         // EMISSION ORDER MUST MATCH `add_constraints` exactly —
         // finalize_logup_in_pairs pairs adjacent emissions (see
@@ -779,7 +789,8 @@ impl BuiltInProverComponent for RistrettoChip {
         for cells in [&field_a, &field_b, &field_out, &interm] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
-                    range256, [is_real[0].clone()],
+                    range256,
+                    [is_real[0].clone()],
                     |[real]| real.into(),
                     &[col.clone()],
                 );
@@ -789,22 +800,19 @@ impl BuiltInProverComponent for RistrettoChip {
         for cells in [&mul_p, &mul_c, &mul_cm, &mul_ch] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
-                    range256, [is_real[0].clone()],
+                    range256,
+                    [is_real[0].clone()],
                     |[real]| real.into(),
                     &[col.clone()],
                 );
             }
         }
         // Loop 3: 32-byte reduction + sub-aux cols.
-        for cells in [
-            &p1_lo, &p1_c, &p1_cm,
-            &p2_lo, &p2_c,
-            &atb, &atc,
-            &scaip,
-        ] {
+        for cells in [&p1_lo, &p1_c, &p1_cm, &p2_lo, &p2_c, &atb, &atc, &scaip] {
             for col in cells.iter() {
                 logup.add_to_relation_with(
-                    range256, [is_real[0].clone()],
+                    range256,
+                    [is_real[0].clone()],
                     |[real]| real.into(),
                     &[col.clone()],
                 );
@@ -813,7 +821,8 @@ impl BuiltInProverComponent for RistrettoChip {
         // Loop 4: 2-byte pass1_hi.
         for col in p1_hi.iter() {
             logup.add_to_relation_with(
-                range256, [is_real[0].clone()],
+                range256,
+                [is_real[0].clone()],
                 |[real]| real.into(),
                 &[col.clone()],
             );
@@ -826,31 +835,30 @@ impl BuiltInProverComponent for RistrettoChip {
         // finalize_logup_in_pairs() pairs adjacent emissions.
         let regfile: &RistrettoRegisterFileLookupElements = lookup_elements.as_ref();
         let row_idx_lo_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::RowIndexLo);
+            component_trace,
+            PreprocessedColumn::RowIndexLo
+        );
         let row_idx_hi_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::RowIndexHi);
-        let byte_idx_pp = crate::trace::preprocessed_base_column!(
-            component_trace, PreprocessedColumn::ByteIdx);
-        let a_src_lo_col = crate::trace::original_base_column!(
-            component_trace, Column::ASourceRowLo);
-        let a_src_hi_col = crate::trace::original_base_column!(
-            component_trace, Column::ASourceRowHi);
-        let b_src_lo_col = crate::trace::original_base_column!(
-            component_trace, Column::BSourceRowLo);
-        let b_src_hi_col = crate::trace::original_base_column!(
-            component_trace, Column::BSourceRowHi);
-        let out_cols = crate::trace::original_base_column!(
-            component_trace, Column::FieldOut);
-        let a_cols = crate::trace::original_base_column!(
-            component_trace, Column::FieldA);
-        let b_cols = crate::trace::original_base_column!(
-            component_trace, Column::FieldB);
-        let is_input_col = crate::trace::original_base_column!(
-            component_trace, Column::IsInput);
-        let is_output_col = crate::trace::original_base_column!(
-            component_trace, Column::IsOutput);
-        let one_packed = || stwo::prover::backend::simd::m31::PackedM31::broadcast(
-            BaseField::from(1u32));
+            component_trace,
+            PreprocessedColumn::RowIndexHi
+        );
+        let byte_idx_pp =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::ByteIdx);
+        let a_src_lo_col =
+            crate::trace::original_base_column!(component_trace, Column::ASourceRowLo);
+        let a_src_hi_col =
+            crate::trace::original_base_column!(component_trace, Column::ASourceRowHi);
+        let b_src_lo_col =
+            crate::trace::original_base_column!(component_trace, Column::BSourceRowLo);
+        let b_src_hi_col =
+            crate::trace::original_base_column!(component_trace, Column::BSourceRowHi);
+        let out_cols = crate::trace::original_base_column!(component_trace, Column::FieldOut);
+        let a_cols = crate::trace::original_base_column!(component_trace, Column::FieldA);
+        let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
+        let is_input_col = crate::trace::original_base_column!(component_trace, Column::IsInput);
+        let is_output_col = crate::trace::original_base_column!(component_trace, Column::IsOutput);
+        let one_packed =
+            || stwo::prover::backend::simd::m31::PackedM31::broadcast(BaseField::from(1u32));
         for k in 0..32 {
             // Producer: is_real * (1 - is_output)
             logup.add_to_relation_with(
@@ -879,7 +887,11 @@ impl BuiltInProverComponent for RistrettoChip {
             // Consumer B: is_real * (1 - is_input) * (1 - is_output)
             logup.add_to_relation_with(
                 regfile,
-                [is_real[0].clone(), is_input_col[0].clone(), is_output_col[0].clone()],
+                [
+                    is_real[0].clone(),
+                    is_input_col[0].clone(),
+                    is_output_col[0].clone(),
+                ],
                 |[real, input_flag, output_flag]| {
                     (-(real * (one_packed() - input_flag) * (one_packed() - output_flag))).into()
                 },

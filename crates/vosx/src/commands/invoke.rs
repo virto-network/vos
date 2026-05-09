@@ -6,9 +6,9 @@
 use std::path::Path;
 use std::time::Duration;
 
+use vos::Encode;
 use vos::abi::service::ServiceId;
 use vos::value::{Msg, TAG_DYNAMIC};
-use vos::Encode;
 
 use crate::manifest::Manifest;
 use crate::query::with_query_node;

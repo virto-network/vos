@@ -18,19 +18,16 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
-use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -41,16 +38,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::MemoryAccessLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 
 pub struct RistrettoEcallChip;
 
@@ -165,7 +159,8 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
                 out.push(ByteAccess {
                     addr: op.scalar_ptr + i,
                     value: op.scalar_bytes[i as usize],
-                    ts: op.ts, is_write: false,
+                    ts: op.ts,
+                    is_write: false,
                 });
             }
         }
@@ -173,7 +168,8 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
             out.push(ByteAccess {
                 addr: op.point_ptr + i,
                 value: op.point_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         // Output-byte producers: skipped for FixedBasepoint records —
@@ -185,7 +181,8 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
                 out.push(ByteAccess {
                     addr: op.output_ptr + i,
                     value: op.out_bytes[i as usize],
-                    ts: op.ts, is_write: true,
+                    ts: op.ts,
+                    is_write: true,
                 });
             }
         }
@@ -195,21 +192,24 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
             out.push(ByteAccess {
                 addr: op.p_ptr + i,
                 value: op.p_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
                 addr: op.q_ptr + i,
                 value: op.q_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
                 addr: op.output_ptr + i,
                 value: op.out_bytes[i as usize],
-                ts: op.ts, is_write: true,
+                ts: op.ts,
+                is_write: true,
             });
         }
     }
@@ -218,14 +218,16 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
             out.push(ByteAccess {
                 addr: op.wide_ptr + i,
                 value: op.wide_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
                 addr: op.output_ptr + i,
                 value: op.out_bytes[i as usize],
-                ts: op.ts, is_write: true,
+                ts: op.ts,
+                is_write: true,
             });
         }
     }
@@ -234,21 +236,24 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
             out.push(ByteAccess {
                 addr: op.a_ptr + i,
                 value: op.a_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
                 addr: op.b_ptr + i,
                 value: op.b_bytes[i as usize],
-                ts: op.ts, is_write: false,
+                ts: op.ts,
+                is_write: false,
             });
         }
         for i in 0..32u32 {
             out.push(ByteAccess {
                 addr: op.output_ptr + i,
                 value: op.out_bytes[i as usize],
-                ts: op.ts, is_write: true,
+                ts: op.ts,
+                is_write: true,
             });
         }
     }
@@ -259,11 +264,7 @@ fn collect_accesses(side_note: &SideNote) -> Vec<ByteAccess> {
 impl BuiltInProverComponent for RistrettoEcallChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(
-        &self,
-        _log_size: u32,
-        side_note: &SideNote,
-    ) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let log_size = ristretto_ecall_log_size(side_note);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();

@@ -4,13 +4,10 @@ use num_traits::Zero;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
         backend::simd::SimdBackend,
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -24,16 +21,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{RegisterMemoryLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 
 /// RegisterMemoryBoundaryChip: produces 13 register-memory logup entries for
 /// the initial register state at ts=0.  Mirrors MemoryBoundaryChip but for
@@ -76,8 +70,12 @@ impl BuiltInComponent for RegisterMemoryBoundaryChip {
 
         let mut tuple: Vec<E::F> = Vec::with_capacity(17);
         tuple.push(reg_addr[0].clone());
-        for col in &reg_val { tuple.push(col.clone()); }
-        for _ in 0..8 { tuple.push(E::F::zero()); }
+        for col in &reg_val {
+            tuple.push(col.clone());
+        }
+        for _ in 0..8 {
+            tuple.push(E::F::zero());
+        }
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -135,8 +133,12 @@ impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
             |vec_idx| {
                 let mut tuple = Vec::with_capacity(17);
                 tuple.push(reg_addr[0].at(vec_idx));
-                for col in &reg_val { tuple.push(col.at(vec_idx)); }
-                for _ in 0..8 { tuple.push(PackedBaseField::zero()); }
+                for col in &reg_val {
+                    tuple.push(col.at(vec_idx));
+                }
+                for _ in 0..8 {
+                    tuple.push(PackedBaseField::zero());
+                }
                 tuple
             },
         );

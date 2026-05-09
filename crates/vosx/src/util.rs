@@ -72,7 +72,7 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for b in bytes {
         use core::fmt::Write;
-        let _ = write!(&mut out, "{:02x}", b);
+        let _ = write!(&mut out, "{b:02x}");
     }
     out
 }

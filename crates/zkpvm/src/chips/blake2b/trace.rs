@@ -8,17 +8,26 @@ use super::consts::IV;
 
 /// A single G-function row with all intermediate witness data.
 pub(super) struct GRow {
-    pub a_in: [u8; 8], pub b_in: [u8; 8], pub c_in: [u8; 8], pub d_in: [u8; 8],
-    pub mx: [u8; 8], pub my: [u8; 8],
-    pub a1: [u8; 8], pub carry1: [u8; 8],
+    pub a_in: [u8; 8],
+    pub b_in: [u8; 8],
+    pub c_in: [u8; 8],
+    pub d_in: [u8; 8],
+    pub mx: [u8; 8],
+    pub my: [u8; 8],
+    pub a1: [u8; 8],
+    pub carry1: [u8; 8],
     pub and1: [u8; 8], // d & a1
-    pub c1: [u8; 8], pub carry2: [u8; 8],
+    pub c1: [u8; 8],
+    pub carry2: [u8; 8],
     pub and2: [u8; 8], // b & c1
-    pub a_out: [u8; 8], pub carry3: [u8; 8],
+    pub a_out: [u8; 8],
+    pub carry3: [u8; 8],
     pub and3: [u8; 8], // d1 & a_out
-    pub c_out: [u8; 8], pub carry4: [u8; 8],
+    pub c_out: [u8; 8],
+    pub carry4: [u8; 8],
     pub and4: [u8; 8], // b1 & c_out
-    pub b_out: [u8; 8], pub rot63_carry: [u8; 8],
+    pub b_out: [u8; 8],
+    pub rot63_carry: [u8; 8],
     /// d_out = (d1 ^ a_out) rotated right 16.  Materialised so the row-chain
     /// constraint can forward it into V_next[di].
     pub d_out: [u8; 8],
@@ -26,10 +35,18 @@ pub(super) struct GRow {
     // operands (in the byte ordering used by AndN); ResxHi is the hi nibble of
     // the AND result byte.  For And3/And4 the A-side input is a derived byte
     // (d1/b1), so AxHi is the hi nibble of that derived byte.
-    pub and1_a_hi: [u8; 8], pub and1_b_hi: [u8; 8], pub and1_res_hi: [u8; 8],
-    pub and2_a_hi: [u8; 8], pub and2_b_hi: [u8; 8], pub and2_res_hi: [u8; 8],
-    pub and3_a_hi: [u8; 8], pub and3_b_hi: [u8; 8], pub and3_res_hi: [u8; 8],
-    pub and4_a_hi: [u8; 8], pub and4_b_hi: [u8; 8], pub and4_res_hi: [u8; 8],
+    pub and1_a_hi: [u8; 8],
+    pub and1_b_hi: [u8; 8],
+    pub and1_res_hi: [u8; 8],
+    pub and2_a_hi: [u8; 8],
+    pub and2_b_hi: [u8; 8],
+    pub and2_res_hi: [u8; 8],
+    pub and3_a_hi: [u8; 8],
+    pub and3_b_hi: [u8; 8],
+    pub and3_res_hi: [u8; 8],
+    pub and4_a_hi: [u8; 8],
+    pub and4_b_hi: [u8; 8],
+    pub and4_res_hi: [u8; 8],
     /// Snapshot of v[0..16] as LE bytes at the START of this row's G-call.
     pub v: [[u8; 8]; 16],
     /// Full message m[0..16] (LE bytes) for the compression this row belongs
@@ -76,7 +93,12 @@ pub(super) fn g_traced(
     call_h: &[u64; 8],
     call_t: u128,
     call_f: bool,
-    a: u64, b: u64, c: u64, d: u64, mx: u64, my: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    mx: u64,
+    my: u64,
 ) -> GRow {
     let a_in = a.to_le_bytes();
     let b_in = b.to_le_bytes();
@@ -147,14 +169,22 @@ pub(super) fn g_traced(
     let d_out = d_out_val.to_le_bytes();
 
     let mut v_bytes = [[0u8; 8]; 16];
-    for k in 0..16 { v_bytes[k] = v_snapshot[k].to_le_bytes(); }
+    for k in 0..16 {
+        v_bytes[k] = v_snapshot[k].to_le_bytes();
+    }
     let mut m_bytes = [[0u8; 8]; 16];
-    for k in 0..16 { m_bytes[k] = m_full[k].to_le_bytes(); }
+    for k in 0..16 {
+        m_bytes[k] = m_full[k].to_le_bytes();
+    }
     let mut h_bytes = [[0u8; 8]; 8];
-    for k in 0..8 { h_bytes[k] = call_h[k].to_le_bytes(); }
+    for k in 0..8 {
+        h_bytes[k] = call_h[k].to_le_bytes();
+    }
     let t_bytes = call_t.to_le_bytes();
     let mut t_hi_bytes = [0u8; 16];
-    for i in 0..16 { t_hi_bytes[i] = t_bytes[i] >> 4; }
+    for i in 0..16 {
+        t_hi_bytes[i] = t_bytes[i] >> 4;
+    }
     let mut and_t_lo = [0u8; 8];
     let mut and_t_hi = [0u8; 8];
     for i in 0..8 {
@@ -169,14 +199,39 @@ pub(super) fn g_traced(
     }
 
     GRow {
-        a_in, b_in, c_in, d_in, mx: mx_b, my: my_b,
-        a1, carry1, and1, c1, carry2, and2,
-        a_out, carry3, and3, c_out, carry4, and4,
-        b_out, rot63_carry, d_out,
-        and1_a_hi, and1_b_hi, and1_res_hi,
-        and2_a_hi, and2_b_hi, and2_res_hi,
-        and3_a_hi, and3_b_hi, and3_res_hi,
-        and4_a_hi, and4_b_hi, and4_res_hi,
+        a_in,
+        b_in,
+        c_in,
+        d_in,
+        mx: mx_b,
+        my: my_b,
+        a1,
+        carry1,
+        and1,
+        c1,
+        carry2,
+        and2,
+        a_out,
+        carry3,
+        and3,
+        c_out,
+        carry4,
+        and4,
+        b_out,
+        rot63_carry,
+        d_out,
+        and1_a_hi,
+        and1_b_hi,
+        and1_res_hi,
+        and2_a_hi,
+        and2_b_hi,
+        and2_res_hi,
+        and3_a_hi,
+        and3_b_hi,
+        and3_res_hi,
+        and4_a_hi,
+        and4_b_hi,
+        and4_res_hi,
         v: v_bytes,
         m: m_bytes,
         h: h_bytes,
@@ -225,7 +280,9 @@ pub(super) fn row_v_after(r: &GRow) -> [[u8; 8]; 16] {
 /// compression.  `v_after` is the v[0..16] state AFTER this row's G-call.
 pub(super) fn fill_output_witnesses(row: &mut GRow, v_after: &[u64; 16]) {
     let mut v_after_bytes = [[0u8; 8]; 16];
-    for k in 0..16 { v_after_bytes[k] = v_after[k].to_le_bytes(); }
+    for k in 0..16 {
+        v_after_bytes[k] = v_after[k].to_le_bytes();
+    }
 
     for i in 0..8 {
         for j in 0..8 {
@@ -255,13 +312,17 @@ pub(super) fn fill_output_witnesses(row: &mut GRow, v_after: &[u64; 16]) {
 
 fn hi_nibbles(bytes: &[u8; 8]) -> [u8; 8] {
     let mut r = [0u8; 8];
-    for i in 0..8 { r[i] = bytes[i] >> 4; }
+    for i in 0..8 {
+        r[i] = bytes[i] >> 4;
+    }
     r
 }
 
 fn byte_and(a: &[u8; 8], b: &[u8; 8]) -> [u8; 8] {
     let mut r = [0u8; 8];
-    for i in 0..8 { r[i] = a[i] & b[i]; }
+    for i in 0..8 {
+        r[i] = a[i] & b[i];
+    }
     r
 }
 
@@ -286,6 +347,8 @@ fn add_carry_chain_2(a: &[u8; 8], b: &[u8; 8]) -> [u8; 8] {
 /// Carry bits for left-rotate-by-1 (= right-rotate by 63)
 fn rot63_carries(input: &[u8; 8]) -> [u8; 8] {
     let mut carry = [0u8; 8];
-    for i in 0..8 { carry[i] = input[i] >> 7; }
+    for i in 0..8 {
+        carry[i] = input[i] >> 7;
+    }
     carry
 }

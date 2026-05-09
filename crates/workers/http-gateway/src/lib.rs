@@ -171,13 +171,17 @@ impl HttpGateway {
     /// Bound port, or 0 when the gateway isn't running.
     #[msg]
     async fn port(&self, _ctx: &mut Context<Self>) -> u32 {
-        state::inner().bound_port.load(std::sync::atomic::Ordering::Relaxed) as u32
+        state::inner()
+            .bound_port
+            .load(std::sync::atomic::Ordering::Relaxed) as u32
     }
 
     /// Total HTTP requests served since process boot.
     #[msg]
     async fn requests(&self, _ctx: &mut Context<Self>) -> u64 {
-        state::inner().requests.load(std::sync::atomic::Ordering::Relaxed)
+        state::inner()
+            .requests
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `true` when a `serve*` is in flight and hasn't been asked to stop.

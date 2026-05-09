@@ -4,7 +4,7 @@ use javm::interpreter::Interpreter;
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, verify, SideNote};
+use zkpvm::{SideNote, prove, verify};
 
 #[test]
 fn prove_verify_add64() {
@@ -38,8 +38,13 @@ fn prove_verify_add64() {
     let steps = tracing.into_trace();
     eprintln!("Steps: {}", steps.len());
     for (i, s) in steps.iter().enumerate() {
-        eprintln!("  step {i}: pc={} opcode={:?} regs_after[0..3]={:?} reg_write={:?}",
-            s.pc, s.opcode, &s.regs_after[..3], s.reg_write);
+        eprintln!(
+            "  step {i}: pc={} opcode={:?} regs_after[0..3]={:?} reg_write={:?}",
+            s.pc,
+            s.opcode,
+            &s.regs_after[..3],
+            s.reg_write
+        );
     }
     assert_eq!(steps.len(), 2);
     // φ[rd] = φ[ra] + φ[rb] => φ[2] = φ[0] + φ[1] = 300

@@ -1,31 +1,34 @@
 use stwo::{
     core::{
+        ColumnVec,
         channel::{Blake2sChannel, Channel},
         fields::{m31::BaseField, qm31::SecureField},
         fri::FriConfig,
         pcs::PcsConfig,
         poly::circle::CanonicCoset,
         vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
-        ColumnVec,
     },
     prover::{
+        CommitmentSchemeProver, ComponentProver, ProvingError,
         backend::simd::SimdBackend,
-        poly::{circle::{CircleEvaluation, PolyOps}, BitReversedOrder},
-        CommitmentSchemeProver, ComponentProver, ProvingError
-    }
+        poly::{
+            BitReversedOrder,
+            circle::{CircleEvaluation, PolyOps},
+        },
+    },
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
 use crate::trace::{
     component::ComponentTrace,
-    eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX}
+    eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX},
 };
 
 // Phase 60: prove_impl uses super::active_components(side_note) instead
 // of the static BASE_COMPONENTS list to skip dormant chips.
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
-pub use crate::proof::{Proof, SegmentState, PROOF_FORMAT_VERSION};
+pub use crate::proof::{PROOF_FORMAT_VERSION, Proof, SegmentState};
 
 /// Timing breakdown of the proving pipeline.
 #[derive(Clone, Debug)]
@@ -38,22 +41,60 @@ pub struct ProveProfile {
     pub stark_prove: std::time::Duration,
     pub log_sizes: Vec<u32>,
     pub total_main_columns: usize,
-    pub total_interaction_columns: usize
+    pub total_interaction_columns: usize,
 }
 
 impl std::fmt::Display for ProveProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total = self.trace_gen + self.preprocess_commit + self.main_commit
-            + self.interaction_gen + self.interaction_commit + self.stark_prove;
-        writeln!(f, "  trace_gen:          {:>10.2?}  ({:.0}%)", self.trace_gen, pct(self.trace_gen, total))?;
-        writeln!(f, "  preprocess_commit:  {:>10.2?}  ({:.0}%)", self.preprocess_commit, pct(self.preprocess_commit, total))?;
-        writeln!(f, "  main_commit:        {:>10.2?}  ({:.0}%)", self.main_commit, pct(self.main_commit, total))?;
-        writeln!(f, "  interaction_gen:    {:>10.2?}  ({:.0}%)", self.interaction_gen, pct(self.interaction_gen, total))?;
-        writeln!(f, "  interaction_commit: {:>10.2?}  ({:.0}%)", self.interaction_commit, pct(self.interaction_commit, total))?;
-        writeln!(f, "  stark_prove (FRI):  {:>10.2?}  ({:.0}%)", self.stark_prove, pct(self.stark_prove, total))?;
+        let total = self.trace_gen
+            + self.preprocess_commit
+            + self.main_commit
+            + self.interaction_gen
+            + self.interaction_commit
+            + self.stark_prove;
+        writeln!(
+            f,
+            "  trace_gen:          {:>10.2?}  ({:.0}%)",
+            self.trace_gen,
+            pct(self.trace_gen, total)
+        )?;
+        writeln!(
+            f,
+            "  preprocess_commit:  {:>10.2?}  ({:.0}%)",
+            self.preprocess_commit,
+            pct(self.preprocess_commit, total)
+        )?;
+        writeln!(
+            f,
+            "  main_commit:        {:>10.2?}  ({:.0}%)",
+            self.main_commit,
+            pct(self.main_commit, total)
+        )?;
+        writeln!(
+            f,
+            "  interaction_gen:    {:>10.2?}  ({:.0}%)",
+            self.interaction_gen,
+            pct(self.interaction_gen, total)
+        )?;
+        writeln!(
+            f,
+            "  interaction_commit: {:>10.2?}  ({:.0}%)",
+            self.interaction_commit,
+            pct(self.interaction_commit, total)
+        )?;
+        writeln!(
+            f,
+            "  stark_prove (FRI):  {:>10.2?}  ({:.0}%)",
+            self.stark_prove,
+            pct(self.stark_prove, total)
+        )?;
         writeln!(f, "  total:              {total:>10.2?}")?;
         writeln!(f, "  log_sizes: {:?}", self.log_sizes)?;
-        writeln!(f, "  main_cols: {}, interaction_cols: {}", self.total_main_columns, self.total_interaction_columns)?;
+        writeln!(
+            f,
+            "  main_cols: {}, interaction_cols: {}",
+            self.total_main_columns, self.total_interaction_columns
+        )?;
         Ok(())
     }
 }
@@ -158,7 +199,10 @@ pub fn prove_mobile(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     Ok(proof)
 }
 
-pub fn prove_with_config(side_note: &mut SideNote, config: PcsConfig) -> Result<Proof, ProvingError> {
+pub fn prove_with_config(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+) -> Result<Proof, ProvingError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, config, false)?;
     Ok(proof)
@@ -169,7 +213,10 @@ pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile),
     prove_impl(side_note, production_pcs_config(), true)
 }
 
-pub fn prove_profiled_with_config(side_note: &mut SideNote, config: PcsConfig) -> Result<(Proof, ProveProfile), ProvingError> {
+pub fn prove_profiled_with_config(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+) -> Result<(Proof, ProveProfile), ProvingError> {
     install_thread_pool();
     prove_impl(side_note, config, true)
 }
@@ -187,11 +234,20 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) {
     use num_traits::Zero;
     let components = crate::BASE_COMPONENTS;
     let component_names = [
-        "CpuChip", "Blake2b", "MemoryChip", "MemBoundary",
-        "RegMemory", "RegMemBoundary",
-        "ProgBoundary", "ProgMemory", "JumpTable",
-        "Range256", "BitwiseLookup", "PowerOfTwo",
-        "Popcount", "Bitcount",
+        "CpuChip",
+        "Blake2b",
+        "MemoryChip",
+        "MemBoundary",
+        "RegMemory",
+        "RegMemBoundary",
+        "ProgBoundary",
+        "ProgMemory",
+        "JumpTable",
+        "Range256",
+        "BitwiseLookup",
+        "PowerOfTwo",
+        "Popcount",
+        "Bitcount",
     ];
 
     let traces: Vec<ComponentTrace> = components
@@ -201,7 +257,9 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) {
 
     let mut lookup_elements = AllLookupElements::default();
     let channel = &mut Blake2sChannel::default();
-    for c in components { c.draw_lookup_elements(&mut lookup_elements, channel); }
+    for c in components {
+        c.draw_lookup_elements(&mut lookup_elements, channel);
+    }
 
     let mut total = SecureField::zero();
     for (i, (c, trace)) in components.iter().zip(traces).enumerate() {
@@ -235,7 +293,9 @@ pub fn debug_assert_constraints_explicit(
 
     let mut lookup_elements = AllLookupElements::default();
     let channel = &mut Blake2sChannel::default();
-    for c in components { c.draw_lookup_elements(&mut lookup_elements, channel); }
+    for c in components {
+        c.draw_lookup_elements(&mut lookup_elements, channel);
+    }
 
     for (i, (c, trace)) in components.iter().zip(traces.iter()).enumerate() {
         let (interaction_trace, claimed_sum) =
@@ -254,7 +314,10 @@ pub fn debug_assert_constraints_explicit(
 /// regions this dominates `prove`'s memory footprint.  Future work
 /// could swap this for an in-place Merkle commitment over the byte-
 /// level memory ledger (which we already build for the MemoryChip).
-fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::step::PvmStep]) -> [u8; 32] {
+fn compute_final_memory_commitment(
+    initial_memory: &[u8],
+    steps: &[crate::core::step::PvmStep],
+) -> [u8; 32] {
     let mut mem = initial_memory.to_vec();
     for step in steps {
         if let Some(ref w) = step.mem_write {
@@ -274,7 +337,11 @@ fn compute_final_memory_commitment(initial_memory: &[u8], steps: &[crate::core::
     *blake3::hash(&mem).as_bytes()
 }
 
-fn prove_impl(side_note: &mut SideNote, config: PcsConfig, profile: bool) -> Result<(Proof, ProveProfile), ProvingError> {
+fn prove_impl(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+    profile: bool,
+) -> Result<(Proof, ProveProfile), ProvingError> {
     // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
     let components_owned = super::active_components(side_note);
@@ -313,9 +380,7 @@ fn prove_impl_with_components(
     // caller left it at the default all-zero but the tracer recorded non-zero
     // initial state.  Pre-Phase-9 tests won't notice since nothing consumes
     // this yet; downstream RegisterMemoryBoundaryChip (9b) needs it populated.
-    if !side_note.steps.is_empty()
-        && side_note.initial_regs.iter().all(|&r| r == 0)
-    {
+    if !side_note.steps.is_empty() && side_note.initial_regs.iter().all(|&r| r == 0) {
         let first = &side_note.steps[0];
         let n = crate::core::step::NUM_REGS.min(first.regs_before.len());
         side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
@@ -331,8 +396,7 @@ fn prove_impl_with_components(
     // below.  Measured saving on log17 clerk-private-pay-bench (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
-    let mut traces: Vec<Option<ComponentTrace>> =
-        (0..components.len()).map(|_| None).collect();
+    let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
     for (i, c) in components.iter().enumerate() {
         if c.is_producer() {
             traces[i] = Some(c.generate_component_trace(side_note));
@@ -476,10 +540,15 @@ fn prove_impl_with_components(
 
     let num_components = components.len();
     let prof = ProveProfile {
-        trace_gen, preprocess_commit, main_commit,
-        interaction_gen, interaction_commit, stark_prove,
+        trace_gen,
+        preprocess_commit,
+        main_commit,
+        interaction_gen,
+        interaction_commit,
+        stark_prove,
         log_sizes: log_sizes.clone(),
-        total_main_columns, total_interaction_columns
+        total_main_columns,
+        total_interaction_columns,
     };
 
     if profile {
@@ -488,44 +557,62 @@ fn prove_impl_with_components(
 
     // Compute segment boundary states
     let initial_state = if side_note.steps.is_empty() {
-        SegmentState { pc: 0, timestamp: 0, registers: [0; 13], memory_commitment: [0; 32] }
+        SegmentState {
+            pc: 0,
+            timestamp: 0,
+            registers: [0; 13],
+            memory_commitment: [0; 32],
+        }
     } else {
         let first = &side_note.steps[0];
         let mut regs = [0u64; 13];
-        regs[..first.regs_before.len().min(13)].copy_from_slice(&first.regs_before[..13.min(first.regs_before.len())]);
+        regs[..first.regs_before.len().min(13)]
+            .copy_from_slice(&first.regs_before[..13.min(first.regs_before.len())]);
         SegmentState {
             pc: first.pc,
             timestamp: first.timestamp,
             registers: regs,
-            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes()
+            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
         }
     };
     let final_state = if side_note.steps.is_empty() {
-        SegmentState { pc: 0, timestamp: 0, registers: [0; 13], memory_commitment: [0; 32] }
+        SegmentState {
+            pc: 0,
+            timestamp: 0,
+            registers: [0; 13],
+            memory_commitment: [0; 32],
+        }
     } else {
         let last = &side_note.steps[side_note.steps.len() - 1];
         let mut regs = [0u64; 13];
-        regs[..last.regs_after.len().min(13)].copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
+        regs[..last.regs_after.len().min(13)]
+            .copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
         // Final memory = initial memory with all writes applied
         // For now, hash the initial memory (full memory tracking is future work)
         SegmentState {
             pc: last.next_pc,
             timestamp: last.timestamp + 1,
             registers: regs,
-            memory_commitment: compute_final_memory_commitment(&side_note.initial_memory, &side_note.steps)
+            memory_commitment: compute_final_memory_commitment(
+                &side_note.initial_memory,
+                &side_note.steps,
+            ),
         }
     };
 
     // Phase 60: caller supplies the bitmask (empty for chip-isolated harness).
-    Ok((Proof {
-        format_version: PROOF_FORMAT_VERSION,
-        stark_proof: proof,
-        claimed_sums,
-        num_components,
-        log_sizes,
-        component_mask,
-        pcs_config: config,
-        initial_state,
-        final_state
-    }, prof))
+    Ok((
+        Proof {
+            format_version: PROOF_FORMAT_VERSION,
+            stark_proof: proof,
+            claimed_sums,
+            num_components,
+            log_sizes,
+            component_mask,
+            pcs_config: config,
+            initial_state,
+            final_state,
+        },
+        prof,
+    ))
 }

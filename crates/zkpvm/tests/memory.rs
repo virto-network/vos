@@ -8,9 +8,13 @@ use zkpvm::{prove, verify};
 
 fn prove_and_verify(steps: Vec<zkpvm::core::step::PvmStep>, code: &[u8], bitmask: &[u8]) {
     for (i, s) in steps.iter().enumerate() {
-        eprintln!("  step {i}: pc={} opcode={:?} mem_r={:?} mem_w={:?}",
-            s.pc, s.opcode, s.mem_read.as_ref().map(|r| (r.address, r.value, r.size)),
-            s.mem_write.as_ref().map(|w| (w.address, w.value, w.size)));
+        eprintln!(
+            "  step {i}: pc={} opcode={:?} mem_r={:?} mem_w={:?}",
+            s.pc,
+            s.opcode,
+            s.mem_read.as_ref().map(|r| (r.address, r.value, r.size)),
+            s.mem_write.as_ref().map(|w| (w.address, w.value, w.size))
+        );
     }
     let mut side_note = zkpvm::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
     match prove(&mut side_note) {
@@ -29,12 +33,25 @@ fn prove_store_only() {
     let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -51,7 +68,7 @@ fn prove_store_and_load_u8() {
     //   LoadIndU8:  φ[2] = mem[φ[1] + 0] (load byte back)
     //   Trap
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[0] = 42;    // value to store
+    regs[0] = 42; // value to store
     regs[1] = 0x1000; // base address
 
     let mut memory = vec![0u8; 4 * 1024 * 1024];
@@ -61,13 +78,31 @@ fn prove_store_and_load_u8() {
     // LoadIndU8 (opcode 124): TwoRegOneImm [opcode, ra|(rb<<4), imm...]
     //   ra=2 (dest), rb=1 (base addr), imm=0 (offset)
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,  // offset 0: StoreIndU8 ra=0,rb=1,imm=0
-        Opcode::LoadIndU8 as u8, 0x12, 0, 0, 0, 0,   // offset 6: LoadIndU8 ra=2,rb=1,imm=0
-        Opcode::Trap as u8,                            // offset 12
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0, // offset 0: StoreIndU8 ra=0,rb=1,imm=0
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,                  // offset 6: LoadIndU8 ra=2,rb=1,imm=0
+        Opcode::Trap as u8, // offset 12
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -103,13 +138,31 @@ fn prove_store_and_load_u64() {
     let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU64 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndU64 as u8, 0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU64 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndU64 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -124,29 +177,57 @@ fn prove_store_and_load_u64() {
 fn prove_multiple_stores_same_addr() {
     // Write twice to the same address, then read
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[0] = 10;     // first value
-    regs[1] = 0x1000;  // address
-    regs[3] = 20;      // second value
+    regs[0] = 10; // first value
+    regs[1] = 0x1000; // address
+    regs[3] = 20; // second value
 
     let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     // Store 10, store 20, load (should get 20)
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,  // mem[φ[1]+0] = φ[0]=10 (ra=0,rb=1)
-        Opcode::StoreIndU8 as u8, 0x13, 0, 0, 0, 0,  // mem[φ[1]+0] = φ[3]=20 (ra=3,rb=1)
-        Opcode::LoadIndU8 as u8, 0x12, 0, 0, 0, 0,   // φ[2] = mem[φ[1]+0] (ra=2,rb=1)
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0, // mem[φ[1]+0] = φ[0]=10 (ra=0,rb=1)
+        Opcode::StoreIndU8 as u8,
+        0x13,
+        0,
+        0,
+        0,
+        0, // mem[φ[1]+0] = φ[3]=20 (ra=3,rb=1)
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0, // φ[2] = mem[φ[1]+0] (ra=2,rb=1)
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     eprintln!("exit: {exit:?}");
 
     let steps = tracing.into_trace();
     for (i, s) in steps.iter().enumerate() {
-        eprintln!("  step {i}: pc={} opcode={:?} regs[0..4]={:?}", s.pc, s.opcode, &s.regs_after[..4]);
+        eprintln!(
+            "  step {i}: pc={} opcode={:?} regs[0..4]={:?}",
+            s.pc,
+            s.opcode,
+            &s.regs_after[..4]
+        );
     }
     assert_eq!(exit, javm::ExitReason::Trap);
     assert_eq!(steps.len(), 4);
@@ -176,23 +257,35 @@ fn prove_store_imm_u8_then_load() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreImmU8 as u8,            // 30
-        4,                                    // lx_byte: imm_x is 4 bytes
-        0x00, 0x10, 0x00, 0x00,              // imm_x = 0x1000 LE
-        0x42,                                 // imm_y = 0x42
-        Opcode::LoadIndU8 as u8, 0x12, 0, 0, 0, 0,
+        Opcode::StoreImmU8 as u8, // 30
+        4,                        // lx_byte: imm_x is 4 bytes
+        0x00,
+        0x10,
+        0x00,
+        0x00, // imm_x = 0x1000 LE
+        0x42, // imm_y = 0x42
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     // Bitmask: instruction 0 is 7 bytes (opcode + 6 payload),
     //          instruction 1 is 6 bytes (opcode + 5 payload),
     //          instruction 2 is 1 byte.
-    let bitmask = vec![
-        1, 0, 0, 0, 0, 0, 0,
-        1, 0, 0, 0, 0, 0,
-        1,
-    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), javm::ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -215,14 +308,34 @@ fn prove_store_load_with_alu() {
     let mut memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::Add64 as u8, 0x10, 2,                   // φ[2] = φ[0]+φ[1] = 150
-        Opcode::StoreIndU8 as u8, 0x42, 0, 0, 0, 0,    // mem[φ[4]+0] = φ[2] (ra=2,rb=4)
-        Opcode::LoadIndU8 as u8, 0x43, 0, 0, 0, 0,     // φ[3] = mem[φ[4]+0] (ra=3,rb=4)
+        Opcode::Add64 as u8,
+        0x10,
+        2, // φ[2] = φ[0]+φ[1] = 150
+        Opcode::StoreIndU8 as u8,
+        0x42,
+        0,
+        0,
+        0,
+        0, // mem[φ[4]+0] = φ[2] (ra=2,rb=4)
+        Opcode::LoadIndU8 as u8,
+        0x43,
+        0,
+        0,
+        0,
+        0, // φ[3] = mem[φ[4]+0] (ra=3,rb=4)
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);

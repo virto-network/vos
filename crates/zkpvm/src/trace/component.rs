@@ -2,10 +2,10 @@ use std::rc::Rc;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use stwo::{
-    core::{fields::m31::BaseField, poly::circle::CanonicCoset, ColumnVec},
+    core::{ColumnVec, fields::m31::BaseField, poly::circle::CanonicCoset},
     prover::{
-        backend::simd::{column::BaseColumn, m31::PackedBaseField, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, column::BaseColumn, m31::PackedBaseField},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
@@ -100,15 +100,11 @@ impl ComponentTrace {
 /// Returns an array of references to finalized column parts from original trace.
 #[macro_export]
 macro_rules! original_base_column {
-    ($component_trace:expr, $col:expr) => {{
-        $component_trace.original_base_column::<{ $col.const_size() }, _>($col)
-    }};
+    ($component_trace:expr, $col:expr) => {{ $component_trace.original_base_column::<{ $col.const_size() }, _>($col) }};
 }
 
 /// Returns an array of references to finalized preprocessed column parts.
 #[macro_export]
 macro_rules! preprocessed_base_column {
-    ($component_trace:expr, $col:expr) => {{
-        $component_trace.preprocessed_base_column::<{ $col.const_size() }, _>($col)
-    }};
+    ($component_trace:expr, $col:expr) => {{ $component_trace.preprocessed_base_column::<{ $col.const_size() }, _>($col) }};
 }

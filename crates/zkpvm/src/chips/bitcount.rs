@@ -20,13 +20,10 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -39,16 +36,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::BitcountLookupElements,
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::BitcountLookupElements};
 
 pub struct BitcountChip;
 
@@ -112,8 +106,16 @@ impl BuiltInProverComponent for BitcountChip {
 
         for row in 0..256usize {
             let byte = row as u8;
-            let lz: u8 = if byte == 0 { 8 } else { byte.leading_zeros() as u8 };
-            let tz: u8 = if byte == 0 { 8 } else { byte.trailing_zeros() as u8 };
+            let lz: u8 = if byte == 0 {
+                8
+            } else {
+                byte.leading_zeros() as u8
+            };
+            let tz: u8 = if byte == 0 {
+                8
+            } else {
+                byte.trailing_zeros() as u8
+            };
             trace.fill_columns(row, byte, PreprocessedColumn::Byte);
             trace.fill_columns(row, lz, PreprocessedColumn::LzByte);
             trace.fill_columns(row, tz, PreprocessedColumn::TzByte);
@@ -147,18 +149,16 @@ impl BuiltInProverComponent for BitcountChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let bitcount: &BitcountLookupElements = lookup_elements.as_ref();
-        let byte = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
-        let lz = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::LzByte);
-        let tz = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::TzByte);
+        let byte =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Byte);
+        let lz =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::LzByte);
+        let tz =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::TzByte);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         let tuple = vec![byte[0].clone(), lz[0].clone(), tz[0].clone()];
-        logup.add_to_relation_with(
-            bitcount,
-            [mult[0].clone()],
-            |[m]| (-m).into(),
-            &tuple,
-        );
+        logup.add_to_relation_with(bitcount, [mult[0].clone()], |[m]| (-m).into(), &tuple);
 
         logup.finalize()
     }

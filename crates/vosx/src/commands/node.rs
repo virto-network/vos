@@ -95,7 +95,11 @@ fn parse_cli_value(s: &str) -> Value {
         return Value::Bool(b);
     }
     if let Ok(n) = s.parse::<i64>() {
-        return if n >= 0 { Value::U64(n as u64) } else { Value::I64(n) };
+        return if n >= 0 {
+            Value::U64(n as u64)
+        } else {
+            Value::I64(n)
+        };
     }
     Value::Str(s.into())
 }

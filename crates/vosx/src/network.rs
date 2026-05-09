@@ -32,7 +32,13 @@ pub fn start_network_if_needed(
         .iter()
         .filter_map(|s| parse(s, "listen"))
         .collect();
-    listen.extend(manifest.node.listen.iter().filter_map(|s| parse(s, "listen")));
+    listen.extend(
+        manifest
+            .node
+            .listen
+            .iter()
+            .filter_map(|s| parse(s, "listen")),
+    );
 
     let connect: Vec<libp2p::Multiaddr> = connect_cli
         .iter()
@@ -43,11 +49,9 @@ pub fn start_network_if_needed(
         return None;
     }
 
-    let keypair = vos::network::load_or_generate_identity(
-        manifest.node.identity.as_deref(),
-        data_dir,
-    )
-    .unwrap_or_else(|e| die(&format!("identity: {e}")));
+    let keypair =
+        vos::network::load_or_generate_identity(manifest.node.identity.as_deref(), data_dir)
+            .unwrap_or_else(|e| die(&format!("identity: {e}")));
 
     let peer_id = libp2p::PeerId::from(keypair.public());
     let local_prefix = vos::network::derive_node_prefix(&peer_id);

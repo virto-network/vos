@@ -1,5 +1,5 @@
-use core::fmt::Debug;
 use crate::encode::Decode;
+use core::fmt::Debug;
 
 /// A cryptographic hash function used for content addressing.
 ///

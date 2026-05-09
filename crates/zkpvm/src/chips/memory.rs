@@ -1,17 +1,14 @@
+use alloc::collections::BTreeMap;
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use alloc::collections::BTreeMap;
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -24,16 +21,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{MemoryAccessLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 
 /// MemoryChip: proves read/write consistency of RAM accesses.
 ///
@@ -87,21 +81,28 @@ struct MemEntry {
 }
 
 /// Decompose a multi-byte access into individual byte entries.
-fn decompose_access(address: u32, value: u64, timestamp: u64, is_write: bool, size: u8) -> Vec<MemEntry> {
+fn decompose_access(
+    address: u32,
+    value: u64,
+    timestamp: u64,
+    is_write: bool,
+    size: u8,
+) -> Vec<MemEntry> {
     let bytes = value.to_le_bytes();
-    (0..size as usize).map(|i| MemEntry {
-        address: address + i as u32,
-        value: bytes[i],
-        timestamp,
-        is_write,
-    }).collect()
+    (0..size as usize)
+        .map(|i| MemEntry {
+            address: address + i as u32,
+            value: bytes[i],
+            timestamp,
+            is_write,
+        })
+        .collect()
 }
 
 impl BuiltInComponent for MemoryChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = MemoryAccessLookupElements;
-
 
     fn add_constraints<E: EvalAtRow>(
         &self,
@@ -122,9 +123,7 @@ impl BuiltInComponent for MemoryChip {
         // RealReadH = is_real · (1 - is_write)).  On padding rows
         // value=prev_value=0 so 1·0=0 holds.
         let is_read = E::F::one() - is_write[0].clone();
-        eval.add_constraint(
-            is_read * (value[0].clone() - prev_value[0].clone())
-        );
+        eval.add_constraint(is_read * (value[0].clone() - prev_value[0].clone()));
 
         // Consumer lookup (negative multiplicity)
         // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
@@ -178,62 +177,144 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
 
     for step in &side_note.steps {
         if let Some(ref r) = step.mem_read {
-            entries.extend(decompose_access(r.address, r.value, step.timestamp, false, r.size));
+            entries.extend(decompose_access(
+                r.address,
+                r.value,
+                step.timestamp,
+                false,
+                r.size,
+            ));
         }
         if let Some(ref w) = step.mem_write {
-            entries.extend(decompose_access(w.address, w.value, step.timestamp, true, w.size));
+            entries.extend(decompose_access(
+                w.address,
+                w.value,
+                step.timestamp,
+                true,
+                w.size,
+            ));
         }
     }
     for op in &side_note.blake2b_mem_ops {
         for (i, &b) in op.h_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.h_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.h_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.m_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.m_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.m_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.h_ptr + i as u32, value: b, timestamp: op.ts, is_write: true });
+            entries.push(MemEntry {
+                address: op.h_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: true,
+            });
         }
     }
     for op in &side_note.ristretto_mem_ops {
         for (i, &b) in op.scalar_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.scalar_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.scalar_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.point_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.point_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.point_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.output_ptr + i as u32, value: b, timestamp: op.ts, is_write: true });
+            entries.push(MemEntry {
+                address: op.output_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: true,
+            });
         }
     }
     for op in &side_note.ristretto_add_mem_ops {
         for (i, &b) in op.p_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.p_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.p_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.q_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.q_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.q_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.output_ptr + i as u32, value: b, timestamp: op.ts, is_write: true });
+            entries.push(MemEntry {
+                address: op.output_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: true,
+            });
         }
     }
     for op in &side_note.scalar_binop_mem_ops {
         for (i, &b) in op.a_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.a_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.a_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.b_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.b_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.b_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.output_ptr + i as u32, value: b, timestamp: op.ts, is_write: true });
+            entries.push(MemEntry {
+                address: op.output_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: true,
+            });
         }
     }
     for op in &side_note.scalar_reduce_wide_mem_ops {
         for (i, &b) in op.wide_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.wide_ptr + i as u32, value: b, timestamp: op.ts, is_write: false });
+            entries.push(MemEntry {
+                address: op.wide_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: false,
+            });
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry { address: op.output_ptr + i as u32, value: b, timestamp: op.ts, is_write: true });
+            entries.push(MemEntry {
+                address: op.output_ptr + i as u32,
+                value: b,
+                timestamp: op.ts,
+                is_write: true,
+            });
         }
     }
 
@@ -244,10 +325,17 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         let flat_mem = &side_note.initial_memory;
         for (&addr, &first_is_write) in &first_access {
-            if first_is_write { continue; }
+            if first_is_write {
+                continue;
+            }
             let a = addr as usize;
             let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
-            entries.push(MemEntry { address: addr, value, timestamp: 0, is_write: true });
+            entries.push(MemEntry {
+                address: addr,
+                value,
+                timestamp: 0,
+                is_write: true,
+            });
         }
     }
 
@@ -280,8 +368,12 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         after_dedup += 1;
         *histogram.entry(run_len).or_default() += 1;
-        if run_len > longest_flood { longest_flood = run_len; }
-        if run_len >= 2 { bytes_in_flood_groups += run_len; }
+        if run_len > longest_flood {
+            longest_flood = run_len;
+        }
+        if run_len >= 2 {
+            bytes_in_flood_groups += run_len;
+        }
         i += run_len;
     }
 
@@ -321,10 +413,22 @@ impl BuiltInProverComponent for MemoryChip {
         // Collect step memory accesses, decomposed to individual bytes
         for step in &side_note.steps {
             if let Some(ref r) = step.mem_read {
-                entries.extend(decompose_access(r.address, r.value, step.timestamp, false, r.size));
+                entries.extend(decompose_access(
+                    r.address,
+                    r.value,
+                    step.timestamp,
+                    false,
+                    r.size,
+                ));
             }
             if let Some(ref w) = step.mem_write {
-                entries.extend(decompose_access(w.address, w.value, step.timestamp, true, w.size));
+                entries.extend(decompose_access(
+                    w.address,
+                    w.value,
+                    step.timestamp,
+                    true,
+                    w.size,
+                ));
             }
         }
 
@@ -368,19 +472,25 @@ impl BuiltInProverComponent for MemoryChip {
             for (i, &b) in op.scalar_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.scalar_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.point_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.point_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.output_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: true,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: true,
                 });
             }
         }
@@ -391,19 +501,25 @@ impl BuiltInProverComponent for MemoryChip {
             for (i, &b) in op.p_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.p_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.q_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.q_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.output_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: true,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: true,
                 });
             }
         }
@@ -414,19 +530,25 @@ impl BuiltInProverComponent for MemoryChip {
             for (i, &b) in op.a_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.a_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.b_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.b_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.output_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: true,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: true,
                 });
             }
         }
@@ -437,13 +559,17 @@ impl BuiltInProverComponent for MemoryChip {
             for (i, &b) in op.wide_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.wide_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: false,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: false,
                 });
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
                     address: op.output_ptr + i as u32,
-                    value: b, timestamp: op.ts, is_write: true,
+                    value: b,
+                    timestamp: op.ts,
+                    is_write: true,
                 });
             }
         }
@@ -457,7 +583,9 @@ impl BuiltInProverComponent for MemoryChip {
 
             let flat_mem = &side_note.initial_memory;
             for (&addr, &first_is_write) in &first_access {
-                if first_is_write { continue; }
+                if first_is_write {
+                    continue;
+                }
                 let a = addr as usize;
                 let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
                 entries.push(MemEntry {

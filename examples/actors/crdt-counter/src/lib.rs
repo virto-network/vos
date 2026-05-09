@@ -49,20 +49,4 @@ impl CrdtCounter {
     async fn boom(&self) {
         panic!("crdt-counter: boom — deliberate panic for test");
     }
-
-    /// Resolve `name` against the per-space registry via the
-    /// `Context::resolve` utility. No dep on space-registry's
-    /// typed Ref — `ctx.resolve` sends a dynamic message to
-    /// the well-known `ServiceId::REGISTRY` and returns the
-    /// asking node's local svc_id (or 0 if not installed).
-    #[msg]
-    async fn whois(&self, ctx: &mut Context<Self>, name: String) -> u32 {
-        let id = ctx.resolve(name.clone()).await;
-        if id == 0 {
-            log::info!("crdt-counter: whois({name}) -> not found");
-        } else {
-            log::info!("crdt-counter: whois({name}) -> {id}");
-        }
-        id
-    }
 }

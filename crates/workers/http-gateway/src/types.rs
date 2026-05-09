@@ -34,15 +34,27 @@ pub(crate) struct Response {
 
 impl Response {
     pub(crate) fn json(status: u16, body: Vec<u8>) -> Self {
-        Self { status, content_type: "application/json", body }
+        Self {
+            status,
+            content_type: "application/json",
+            body,
+        }
     }
 
     pub(crate) fn text(status: u16, msg: impl Into<String>) -> Self {
-        Self { status, content_type: "text/plain", body: msg.into().into_bytes() }
+        Self {
+            status,
+            content_type: "text/plain",
+            body: msg.into().into_bytes(),
+        }
     }
 
     pub(crate) fn empty(status: u16) -> Self {
-        Self { status, content_type: "text/plain", body: Vec::new() }
+        Self {
+            status,
+            content_type: "text/plain",
+            body: Vec::new(),
+        }
     }
 }
 

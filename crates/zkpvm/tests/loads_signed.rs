@@ -10,10 +10,10 @@
 mod common;
 use common::*;
 
-use javm::interpreter::Interpreter;
-use javm::instruction::Opcode;
-use javm::PVM_REGISTER_COUNT;
 use javm::ExitReason;
+use javm::PVM_REGISTER_COUNT;
+use javm::instruction::Opcode;
+use javm::interpreter::Interpreter;
 
 use zkpvm::core::tracing::TracingPvm;
 
@@ -27,13 +27,31 @@ fn load_i8_negative_sign_extends() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndI8 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndI8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -51,13 +69,31 @@ fn load_i16_negative_sign_extends() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU16 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndI16 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU16 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndI16 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -74,13 +110,31 @@ fn load_i32_negative_sign_extends() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU32 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndI32 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU32 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndI32 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -98,13 +152,31 @@ fn load_i8_positive_zero_extends() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndI8 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndI8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -125,13 +197,31 @@ fn load_i8_negative_forged_high_byte_rejected() {
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
-        Opcode::StoreIndU8 as u8, 0x10, 0, 0, 0, 0,
-        Opcode::LoadIndI8 as u8,  0x12, 0, 0, 0, 0,
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndI8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
         Opcode::Trap as u8,
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Trap);
     let mut steps = tracing.into_trace();

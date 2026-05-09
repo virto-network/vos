@@ -15,9 +15,9 @@
 //! mismatch. libp2p's own `cbor::Codec` uses the same trick.
 
 use async_trait::async_trait;
+use libp2p::StreamProtocol;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
-use libp2p::StreamProtocol;
 use std::io;
 
 use super::wire::{Frame, MAX_FRAME_BYTES};
@@ -76,7 +76,10 @@ where
 {
     let bytes = frame.encode();
     if bytes.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     io.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     io.write_all(&bytes).await?;

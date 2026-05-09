@@ -9,9 +9,7 @@ use stwo::{
         vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher},
         verifier::VerificationError,
     },
-    prover::{
-        backend::simd::SimdBackend, poly::circle::PolyOps, CommitmentSchemeProver,
-    },
+    prover::{CommitmentSchemeProver, backend::simd::SimdBackend, poly::circle::PolyOps},
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -31,10 +29,10 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
     // Check segment continuity
     for window in proofs.windows(2) {
         if window[0].final_state != window[1].initial_state {
-            return Err(VerificationError::InvalidStructure(
-                format!("segment chain broken: final state at ts={} doesn't match next initial at ts={}",
-                    window[0].final_state.timestamp, window[1].initial_state.timestamp),
-            ));
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} doesn't match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp
+            )));
         }
     }
     // Verify each segment independently
@@ -66,7 +64,12 @@ pub fn verify_with_max_log_size(
     side_note: &SideNote,
     max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    verify_with_options(proof, side_note, max_log_size, &crate::proof::PcsPolicy::STANDARD)
+    verify_with_options(
+        proof,
+        side_note,
+        max_log_size,
+        &crate::proof::PcsPolicy::STANDARD,
+    )
 }
 
 /// Phase 49: enforce a custom `PcsPolicy` (FRI shape + PoW floor)
@@ -96,7 +99,12 @@ pub fn verify_with_options(
     let prover_components: &[&dyn crate::framework::MachineProverComponent] =
         &prover_components_owned;
     verify_with_options_explicit_components(
-        proof, side_note, max_log_size, policy, components, prover_components,
+        proof,
+        side_note,
+        max_log_size,
+        policy,
+        components,
+        prover_components,
     )
 }
 
@@ -120,9 +128,12 @@ pub fn verify_with_explicit_components(
     policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
     verify_with_options_explicit_components(
-        proof, side_note, DEFAULT_MAX_LOG_SIZE,
+        proof,
+        side_note,
+        DEFAULT_MAX_LOG_SIZE,
         policy,
-        components, prover_components,
+        components,
+        prover_components,
     )
 }
 
@@ -183,7 +194,11 @@ fn verify_with_options_explicit_components(
 
     // Verify preprocessed trace commitment
     verify_preprocessed_trace(
-        &proof, side_note, verifier_channel, &claimed_log_sizes, &config,
+        &proof,
+        side_note,
+        verifier_channel,
+        &claimed_log_sizes,
+        &config,
         prover_components,
     )?;
 

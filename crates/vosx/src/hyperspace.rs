@@ -56,8 +56,8 @@ pub fn flush_registry_announces(node: &VosNode, plans: &[AnnouncePlan]) {
 /// `InvokeHandle` (off the main thread, after `run_forever`
 /// has the `&VosNode`).
 pub fn heartbeat_loop(handle: InvokeHandle, names: Vec<String>, interval: Duration) {
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
 
     // Sleep up front so we don't double-announce immediately
     // after the initial flush.
@@ -81,11 +81,8 @@ pub fn heartbeat_loop(handle: InvokeHandle, names: Vec<String>, interval: Durati
             let mut payload = Vec::with_capacity(1 + encoded.len());
             payload.push(TAG_DYNAMIC);
             payload.extend_from_slice(&encoded);
-            let _ = handle.invoke_with_timeout(
-                ServiceId::REGISTRY,
-                payload,
-                Duration::from_secs(2),
-            );
+            let _ =
+                handle.invoke_with_timeout(ServiceId::REGISTRY, payload, Duration::from_secs(2));
         }
     }
 }

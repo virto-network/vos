@@ -136,9 +136,14 @@ impl<A: Actor> Context<A> {
     /// On non-guest builds (host tests, etc.) this returns
     /// `InvokeError::NotFound` since there is no PVM to dispatch into.
     pub fn ask_raw(&mut self, target: ServiceId, payload: &[u8]) -> super::run::Ask {
-        #[cfg(feature = "pvm")]
+        // The PVM path issues a real `INVOKE` ecall, which requires the
+        // riscv64 target. Build flavours that pull `pvm` for the *types*
+        // but compile for a host arch (workers loaded into vosx tests
+        // when registry pulls `service = ["pvm"]`) need the worker
+        // fallback to avoid hitting the panic-stub `_ecall`.
+        #[cfg(all(feature = "pvm", target_arch = "riscv64"))]
         {
-            use super::lifecycle::{invoke_raw, InvokeResult};
+            use super::lifecycle::{InvokeResult, invoke_raw};
             use super::value::InvokeError;
             match invoke_raw(target.0, payload, &[]) {
                 InvokeResult::Done { reply, .. } | InvokeResult::Yielded { reply, .. } => {
@@ -150,10 +155,11 @@ impl<A: Actor> Context<A> {
                 InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
         }
-        #[cfg(not(feature = "pvm"))]
+        #[cfg(not(all(feature = "pvm", target_arch = "riscv64")))]
         {
-            // Worker / WASM: yield to host with an EFFECT_ASK request.
-            // Wire format: [tag:u8=EFFECT_ASK][target:u32 LE][payload...]
+            // Worker / WASM / host: yield to host with an EFFECT_ASK
+            // request. Wire format:
+            //   [tag:u8=EFFECT_ASK][target:u32 LE][payload...]
             let mut request = Vec::with_capacity(5 + payload.len());
             request.push(crate::effects::EFFECT_ASK);
             request.extend_from_slice(&target.0.to_le_bytes());
@@ -263,7 +269,9 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __set_reply(&mut self, value: super::value::Value) {
         // Don't store Unit replies — they carry no information
-        if matches!(value, super::value::Value::Unit) { return; }
+        if matches!(value, super::value::Value::Unit) {
+            return;
+        }
         self.reply = Some(super::codec::Encode::encode(&value));
     }
 
@@ -368,7 +376,12 @@ impl<A: Actor> Context<A> {
         for code_hash in self.pending_spawns.drain(..) {
             effects.push(Effect::New { code_hash });
         }
-        RefinePayload { state, reply, effects, continue_next: self.self_schedule }
+        RefinePayload {
+            state,
+            reply,
+            effects,
+            continue_next: self.self_schedule,
+        }
     }
 }
 
@@ -390,12 +403,24 @@ impl<'ctx, A: Actor> FetchBuilder<'ctx, A> {
         self
     }
 
-    pub fn get(self) -> Self    { self.method(crate::effects::HttpMethod::Get) }
-    pub fn post(self) -> Self   { self.method(crate::effects::HttpMethod::Post) }
-    pub fn put(self) -> Self    { self.method(crate::effects::HttpMethod::Put) }
-    pub fn delete(self) -> Self { self.method(crate::effects::HttpMethod::Delete) }
-    pub fn patch(self) -> Self  { self.method(crate::effects::HttpMethod::Patch) }
-    pub fn head(self) -> Self   { self.method(crate::effects::HttpMethod::Head) }
+    pub fn get(self) -> Self {
+        self.method(crate::effects::HttpMethod::Get)
+    }
+    pub fn post(self) -> Self {
+        self.method(crate::effects::HttpMethod::Post)
+    }
+    pub fn put(self) -> Self {
+        self.method(crate::effects::HttpMethod::Put)
+    }
+    pub fn delete(self) -> Self {
+        self.method(crate::effects::HttpMethod::Delete)
+    }
+    pub fn patch(self) -> Self {
+        self.method(crate::effects::HttpMethod::Patch)
+    }
+    pub fn head(self) -> Self {
+        self.method(crate::effects::HttpMethod::Head)
+    }
 
     /// Add a header. Repeat to add multiple values.
     pub fn header(
@@ -490,18 +515,16 @@ impl<A: WorkerActor> WorkerCtx<A> for Context<A> {
 
 impl<'ctx, A: Actor> core::future::IntoFuture for FetchBuilder<'ctx, A> {
     type Output = crate::effects::FetchResponse;
-    type IntoFuture = core::pin::Pin<
-        alloc::boxed::Box<dyn core::future::Future<Output = Self::Output> + 'ctx>
-    >;
+    type IntoFuture =
+        core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Self::Output> + 'ctx>>;
 
     fn into_future(self) -> Self::IntoFuture {
         alloc::boxed::Box::pin(async move {
             let bytes = self.request.to_effect_bytes();
             let result = self.ctx.host_call(bytes).await;
-            crate::effects::FetchResponse::decode(&result)
-                .unwrap_or_else(|| {
-                    crate::effects::FetchResponse::host_error("malformed host response")
-                })
+            crate::effects::FetchResponse::decode(&result).unwrap_or_else(|| {
+                crate::effects::FetchResponse::host_error("malformed host response")
+            })
         })
     }
 }

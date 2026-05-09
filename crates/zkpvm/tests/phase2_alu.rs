@@ -4,15 +4,29 @@ use javm::interpreter::Interpreter;
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
-use zkpvm::{prove, prove_mobile, verify, verify_with_pcs_policy, PcsPolicy};
+use zkpvm::{PcsPolicy, prove, prove_mobile, verify, verify_with_pcs_policy};
 
 /// Helper: build a PVM with a single three-register instruction followed by Trap.
 /// Bytecode: [opcode, ra | (rb<<4), rd, Trap]
 /// Bitmask:  [1, 0, 0, 1]
-fn run_three_reg(opcode: Opcode, ra: u8, rb: u8, rd: u8, regs: [u64; PVM_REGISTER_COUNT]) -> Vec<zkpvm::core::step::PvmStep> {
+fn run_three_reg(
+    opcode: Opcode,
+    ra: u8,
+    rb: u8,
+    rd: u8,
+    regs: [u64; PVM_REGISTER_COUNT],
+) -> Vec<zkpvm::core::step::PvmStep> {
     let code = vec![opcode as u8, ra | (rb << 4), rd, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
-    let pvm = Interpreter::new(code, bitmask, vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code,
+        bitmask,
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -20,7 +34,13 @@ fn run_three_reg(opcode: Opcode, ra: u8, rb: u8, rd: u8, regs: [u64; PVM_REGISTE
 }
 
 #[allow(dead_code)]
-fn run_two_reg_imm(opcode: Opcode, ra: u8, rb: u8, imm: i64, regs: [u64; PVM_REGISTER_COUNT]) -> Vec<zkpvm::core::step::PvmStep> {
+fn run_two_reg_imm(
+    opcode: Opcode,
+    ra: u8,
+    rb: u8,
+    imm: i64,
+    regs: [u64; PVM_REGISTER_COUNT],
+) -> Vec<zkpvm::core::step::PvmStep> {
     // Encode: opcode, reg_byte, imm (up to 4 bytes LE), trap
     let imm_bytes = (imm as u64).to_le_bytes();
     let imm_len = 4usize; // use 4-byte immediate
@@ -31,7 +51,15 @@ fn run_two_reg_imm(opcode: Opcode, ra: u8, rb: u8, imm: i64, regs: [u64; PVM_REG
     let mut bitmask = vec![1u8];
     bitmask.extend(vec![0u8; 1 + imm_len]); // reg_byte + imm
     bitmask.push(1);
-    let pvm = Interpreter::new(code, bitmask, vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code,
+        bitmask,
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -51,7 +79,11 @@ fn test_three_reg_op(opcode: Opcode, r0: u64, r1: u64, expected: u64) {
     regs[0] = r0;
     regs[1] = r1;
     let steps = run_three_reg(opcode, 0, 1, 2, regs);
-    assert_eq!(steps[0].regs_after[2], expected, "opcode {:?}: {} op {} != {}", opcode, r0, r1, expected);
+    assert_eq!(
+        steps[0].regs_after[2], expected,
+        "opcode {:?}: {} op {} != {}",
+        opcode, r0, r1, expected
+    );
     let code = vec![opcode as u8, 0x10, 2, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
@@ -115,7 +147,12 @@ fn prove_sub32() {
 
 #[test]
 fn prove_and() {
-    test_three_reg_op(Opcode::And, 0xFF00_FF00_FF00_FF00, 0x0F0F_0F0F_0F0F_0F0F, 0x0F00_0F00_0F00_0F00);
+    test_three_reg_op(
+        Opcode::And,
+        0xFF00_FF00_FF00_FF00,
+        0x0F0F_0F0F_0F0F_0F0F,
+        0x0F00_0F00_0F00_0F00,
+    );
 }
 
 #[test]
@@ -140,7 +177,15 @@ fn prove_move_reg() {
     regs[0] = 42;
     let code = vec![Opcode::MoveReg as u8, 0x02, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -161,7 +206,15 @@ fn prove_load_imm() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -186,31 +239,46 @@ fn prove_multi_op_program() {
     regs[1] = 50;
 
     let code = vec![
-        Opcode::Add64 as u8, 0x10, 2,      // Add64 ra=0, rb=1, rd=2
-        Opcode::Sub64 as u8, 0x02, 3,      // Sub64 ra=2, rb=0, rd=3
-        Opcode::And as u8, 0x12, 4,        // And ra=2, rb=1, rd=4
-        Opcode::MoveReg as u8, 0x45,       // MoveReg rd=5, ra=4 => reg_byte = 5 | (4<<4) = 0x45
+        Opcode::Add64 as u8,
+        0x10,
+        2, // Add64 ra=0, rb=1, rd=2
+        Opcode::Sub64 as u8,
+        0x02,
+        3, // Sub64 ra=2, rb=0, rd=3
+        Opcode::And as u8,
+        0x12,
+        4, // And ra=2, rb=1, rd=4
+        Opcode::MoveReg as u8,
+        0x45, // MoveReg rd=5, ra=4 => reg_byte = 5 | (4<<4) = 0x45
         Opcode::Trap as u8,
     ];
     let bitmask = vec![
-        1, 0, 0,  // Add64
-        1, 0, 0,  // Sub64
-        1, 0, 0,  // And
-        1, 0,     // MoveReg
-        1,        // Trap
+        1, 0, 0, // Add64
+        1, 0, 0, // Sub64
+        1, 0, 0, // And
+        1, 0, // MoveReg
+        1, // Trap
     ];
 
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
     let steps = tracing.into_trace();
 
     assert_eq!(steps.len(), 5); // Add64 + Sub64 + And + MoveReg + Trap
-    assert_eq!(steps[0].regs_after[2], 150);     // 100 + 50
-    assert_eq!(steps[1].regs_after[3], 50);      // 150 - 100
+    assert_eq!(steps[0].regs_after[2], 150); // 100 + 50
+    assert_eq!(steps[1].regs_after[3], 50); // 150 - 100
     assert_eq!(steps[2].regs_after[4], 150 & 50); // 18
-    assert_eq!(steps[3].regs_after[5], 18);       // MoveReg
+    assert_eq!(steps[3].regs_after[5], 18); // MoveReg
 
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -227,7 +295,15 @@ fn prove_add_imm64() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1u8, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -245,7 +321,15 @@ fn prove_neg_add_imm64() {
     code.push(Opcode::Trap as u8);
     let mut bitmask = vec![1u8, 0, 0, 0, 0, 0];
     bitmask.push(1);
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -302,8 +386,12 @@ fn prove_or_inv() {
 
 #[test]
 fn prove_bitwise_large() {
-    test_three_reg_op(Opcode::And, 0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0,
-        0xDEAD_BEEF_CAFE_BABE & 0x1234_5678_9ABC_DEF0);
+    test_three_reg_op(
+        Opcode::And,
+        0xDEAD_BEEF_CAFE_BABE,
+        0x1234_5678_9ABC_DEF0,
+        0xDEAD_BEEF_CAFE_BABE & 0x1234_5678_9ABC_DEF0,
+    );
 }
 
 #[test]
@@ -386,7 +474,15 @@ fn prove_reverse_bytes() {
     regs[0] = 0x0102030405060708;
     let code = vec![Opcode::ReverseBytes as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, javm::ExitReason::Trap);
@@ -405,7 +501,15 @@ fn prove_count_set_bits_64_smoke() {
     regs[0] = 0x0F0F_0F0F_0F0F_0F0Fu64; // 8 bytes × 4 bits each = 32 ones
     let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), javm::ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -421,7 +525,15 @@ fn prove_count_set_bits_64_full() {
     regs[0] = u64::MAX; // all 64 bits set
     let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -437,7 +549,15 @@ fn prove_count_set_bits_64_zero() {
     regs[0] = 0;
     let code = vec![Opcode::CountSetBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -454,7 +574,15 @@ fn prove_count_set_bits_32_smoke() {
     regs[0] = 0xFFFF_FFFF_0000_00FFu64;
     let code = vec![Opcode::CountSetBits32 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -471,7 +599,15 @@ fn prove_leading_zero_bits_64_smoke() {
     regs[0] = 0x0000_0000_0001_0000u64; // bit 16 set → LZ = 47
     let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), javm::ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -487,7 +623,15 @@ fn prove_leading_zero_bits_64_zero() {
     regs[0] = 0;
     let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -503,7 +647,15 @@ fn prove_leading_zero_bits_64_msb() {
     regs[0] = 1u64 << 63; // MSB set → LZ = 0
     let code = vec![Opcode::LeadingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -520,7 +672,15 @@ fn prove_leading_zero_bits_32_smoke() {
     regs[0] = 0xDEAD_BEEF_0000_0001u64;
     let code = vec![Opcode::LeadingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -537,7 +697,15 @@ fn prove_leading_zero_bits_32_zero_low() {
     regs[0] = 0xFFFF_FFFF_0000_0000u64;
     let code = vec![Opcode::LeadingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -553,7 +721,15 @@ fn prove_trailing_zero_bits_64_smoke() {
     regs[0] = 0x0000_0000_0010_0000u64; // bit 20 set → TZ = 20
     let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -569,7 +745,15 @@ fn prove_trailing_zero_bits_64_zero() {
     regs[0] = 0;
     let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -585,7 +769,15 @@ fn prove_trailing_zero_bits_64_lsb() {
     regs[0] = 1; // LSB set → TZ = 0
     let code = vec![Opcode::TrailingZeroBits64 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -602,7 +794,15 @@ fn prove_trailing_zero_bits_32_zero_low() {
     regs[0] = 0xFFFF_FFFF_0000_0000u64;
     let code = vec![Opcode::TrailingZeroBits32 as u8, 0x01, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -618,7 +818,15 @@ fn prove_sign_extend_8() {
     regs[0] = 0x80; // -128 as i8
     let code = vec![Opcode::SignExtend8 as u8, 0x01, Opcode::Trap as u8]; // rd=1, ra=0
     let bitmask = vec![1, 0, 1];
-    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![0u8; 4 * 1024 * 1024], 10000, 25);
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+        25,
+    );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
@@ -634,9 +842,9 @@ fn prove_sign_extend_8() {
 fn prove_cmov_iz_taken() {
     // CmovIz(ra=0, rb=1, rd=2): if φ[1]==0, φ'[2] = φ[0]
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[0] = 42;  // value to move
-    regs[1] = 0;   // condition (zero → move)
-    regs[2] = 99;  // old value
+    regs[0] = 42; // value to move
+    regs[1] = 0; // condition (zero → move)
+    regs[2] = 99; // old value
     let steps = run_three_reg(Opcode::CmovIz, 0, 1, 2, regs);
     assert_eq!(steps[0].regs_after[2], 42);
     let code = vec![Opcode::CmovIz as u8, 0x10, 2, Opcode::Trap as u8];
@@ -648,8 +856,8 @@ fn prove_cmov_iz_taken() {
 fn prove_cmov_iz_not_taken() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 42;
-    regs[1] = 1;   // not zero → don't move
-    regs[2] = 99;  // should stay 99
+    regs[1] = 1; // not zero → don't move
+    regs[2] = 99; // should stay 99
     let steps = run_three_reg(Opcode::CmovIz, 0, 1, 2, regs);
     assert_eq!(steps[0].regs_after[2], 99);
     let code = vec![Opcode::CmovIz as u8, 0x10, 2, Opcode::Trap as u8];
@@ -661,7 +869,7 @@ fn prove_cmov_iz_not_taken() {
 fn prove_cmov_nz_taken() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 42;
-    regs[1] = 5;   // not zero → move
+    regs[1] = 5; // not zero → move
     let steps = run_three_reg(Opcode::CmovNz, 0, 1, 2, regs);
     assert_eq!(steps[0].regs_after[2], 42);
     let code = vec![Opcode::CmovNz as u8, 0x10, 2, Opcode::Trap as u8];
@@ -709,7 +917,6 @@ fn prove_mul_upper_uu_small() {
 
 #[test]
 // ── Shift tests ──
-
 #[test]
 fn prove_shlo_l64() {
     // ShloL64: φ[rd] = φ[ra] << (φ[rb] % 64)
@@ -740,7 +947,12 @@ fn prove_shlo_r64() {
 
 #[test]
 fn prove_shlo_r64_large() {
-    test_three_reg_op(Opcode::ShloR64, 0xDEAD_BEEF_CAFE_BABE, 16, 0xDEAD_BEEF_CAFE_BABE >> 16);
+    test_three_reg_op(
+        Opcode::ShloR64,
+        0xDEAD_BEEF_CAFE_BABE,
+        16,
+        0xDEAD_BEEF_CAFE_BABE >> 16,
+    );
 }
 
 #[test]
@@ -784,8 +996,12 @@ fn prove_set_lt_s_pos_vs_neg() {
 
 fn prove_mul_upper_uu_large() {
     // Large but not max: schoolbook carries stay within u8
-    test_three_reg_op(Opcode::MulUpperUU, 0x0102030405060708, 0x0807060504030201,
-        ((0x0102030405060708u128 * 0x0807060504030201u128) >> 64) as u64);
+    test_three_reg_op(
+        Opcode::MulUpperUU,
+        0x0102030405060708,
+        0x0807060504030201,
+        ((0x0102030405060708u128 * 0x0807060504030201u128) >> 64) as u64,
+    );
 }
 
 // ── Phase 32: RotL64 ──
@@ -801,7 +1017,12 @@ fn prove_rotate_l64_smoke() {
 #[test]
 fn prove_rotate_l64_zero() {
     // n = 0 → identity.
-    test_three_reg_op(Opcode::RotL64, 0xDEAD_BEEF_CAFE_BABE, 0, 0xDEAD_BEEF_CAFE_BABE);
+    test_three_reg_op(
+        Opcode::RotL64,
+        0xDEAD_BEEF_CAFE_BABE,
+        0,
+        0xDEAD_BEEF_CAFE_BABE,
+    );
 }
 
 #[test]
@@ -832,7 +1053,12 @@ fn prove_rotate_r64_smoke() {
 #[test]
 fn prove_rotate_r64_zero() {
     // n = 0 → identity.
-    test_three_reg_op(Opcode::RotR64, 0xDEAD_BEEF_CAFE_BABE, 0, 0xDEAD_BEEF_CAFE_BABE);
+    test_three_reg_op(
+        Opcode::RotR64,
+        0xDEAD_BEEF_CAFE_BABE,
+        0,
+        0xDEAD_BEEF_CAFE_BABE,
+    );
 }
 
 #[test]
@@ -921,10 +1147,21 @@ fn prove_rotate_r64_imm_alt_smoke() {
     regs[1] = n;
     let steps = run_two_reg_imm(Opcode::RotR64ImmAlt, 0, 1, imm as i64, regs);
     let expected = (imm as i64 as u64).rotate_right(n as u32);
-    assert_eq!(steps[0].regs_after[0], expected,
-        "RotR64ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}", steps[0].regs_after[0], expected);
+    assert_eq!(
+        steps[0].regs_after[0], expected,
+        "RotR64ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}",
+        steps[0].regs_after[0], expected
+    );
     let imm_bytes = (imm as u32).to_le_bytes();
-    let code = vec![Opcode::RotR64ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let code = vec![
+        Opcode::RotR64ImmAlt as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -940,10 +1177,21 @@ fn prove_rotate_r32_imm_alt_smoke() {
     let steps = run_two_reg_imm(Opcode::RotR32ImmAlt, 0, 1, imm as i64, regs);
     let rotated = (imm as u32).rotate_right(n as u32);
     let expected = ((rotated as i32) as i64) as u64;
-    assert_eq!(steps[0].regs_after[0], expected,
-        "RotR32ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}", steps[0].regs_after[0], expected);
+    assert_eq!(
+        steps[0].regs_after[0], expected,
+        "RotR32ImmAlt: regs[0] = 0x{:x}, expected 0x{:x}",
+        steps[0].regs_after[0], expected
+    );
     let imm_bytes = (imm as u32).to_le_bytes();
-    let code = vec![Opcode::RotR32ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let code = vec![
+        Opcode::RotR32ImmAlt as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -961,7 +1209,15 @@ fn prove_rotate_r32_imm_alt_negative_imm() {
     // 0xFFFFFFFF rotated by anything = 0xFFFFFFFF; sign-ext to u64 = u64::MAX.
     assert_eq!(steps[0].regs_after[0], u64::MAX);
     let imm_bytes = (imm as u32).to_le_bytes();
-    let code = vec![Opcode::RotR32ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let code = vec![
+        Opcode::RotR32ImmAlt as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -975,7 +1231,15 @@ fn prove_rotate_r64_imm_alt_zero_shift() {
     let steps = run_two_reg_imm(Opcode::RotR64ImmAlt, 0, 1, imm as i64, regs);
     assert_eq!(steps[0].regs_after[0], imm as i64 as u64);
     let imm_bytes = (imm as u32).to_le_bytes();
-    let code = vec![Opcode::RotR64ImmAlt as u8, 0x10, imm_bytes[0], imm_bytes[1], imm_bytes[2], imm_bytes[3], Opcode::Trap as u8];
+    let code = vec![
+        Opcode::RotR64ImmAlt as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -989,7 +1253,15 @@ fn prove_shlo_l64_negative_value() {
     let steps = run_two_reg_imm(Opcode::ShloLImm64, 0, 0, 16, regs);
     let expected = 0xFFFF_FFFF_B363_2DF8u64.wrapping_shl(16);
     assert_eq!(steps[0].regs_after[0], expected);
-    let code = vec![Opcode::ShloLImm64 as u8, 0x00, 16, 0, 0, 0, Opcode::Trap as u8];
+    let code = vec![
+        Opcode::ShloLImm64 as u8,
+        0x00,
+        16,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
     prove_and_verify(steps, &code, &bitmask);
 }

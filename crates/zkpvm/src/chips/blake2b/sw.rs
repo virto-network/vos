@@ -10,7 +10,9 @@ pub fn blake2b_compress(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 
     v[8..].copy_from_slice(&IV);
     v[12] ^= t as u64;
     v[13] ^= (t >> 64) as u64;
-    if f { v[14] = !v[14]; }
+    if f {
+        v[14] = !v[14];
+    }
 
     for round in 0..12 {
         let s = &SIGMA[round];
@@ -22,7 +24,9 @@ pub fn blake2b_compress(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 
     }
 
     let mut result = [0u64; 8];
-    for i in 0..8 { result[i] = h[i] ^ v[i] ^ v[i + 8]; }
+    for i in 0..8 {
+        result[i] = h[i] ^ v[i] ^ v[i + 8];
+    }
     result
 }
 

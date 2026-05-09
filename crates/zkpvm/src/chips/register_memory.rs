@@ -4,13 +4,10 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -24,16 +21,13 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::{BuiltInComponent},
-    lookups::{RegisterMemoryLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 
 /// RegisterMemoryChip: PVM register-file ledger, analogous to MemoryChip but
 /// indexed by register number (0..NUM_REGS-1) and valued as full u64s.
@@ -115,7 +109,6 @@ impl BuiltInComponent for RegisterMemoryChip {
     type MainColumn = Column;
     type LookupElements = RegisterMemoryLookupElements;
 
-
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
@@ -163,9 +156,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         // B3 audit: read consistency unconditional per byte.
         let is_read = E::F::one() - is_write[0].clone();
         for i in 0..8 {
-            eval.add_constraint(
-                is_read.clone() * (value[i].clone() - prev_value[i].clone())
-            );
+            eval.add_constraint(is_read.clone() * (value[i].clone() - prev_value[i].clone()));
         }
 
         // ── Per-slot consumer emissions ─────────────────────────────────
@@ -175,8 +166,12 @@ impl BuiltInComponent for RegisterMemoryChip {
         // EMISSION ORDER MUST MATCH `generate_interaction_trace` exactly.
         let push_tuple = |dst: &mut Vec<E::F>, ts: &[E::F; 8]| {
             dst.push(reg_addr[0].clone());
-            for col in &value { dst.push(col.clone()); }
-            for col in ts { dst.push(col.clone()); }
+            for col in &value {
+                dst.push(col.clone());
+            }
+            for col in ts {
+                dst.push(col.clone());
+            }
         };
         // Slot 0.
         let mut tuple0: Vec<E::F> = Vec::with_capacity(17);
@@ -272,8 +267,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             };
             trace.fill_columns(row, prev_value, Column::PrevValue);
 
-            let same_reg_next = row + 1 < num_rows_real
-                && merged[row + 1].reg_addr == m.reg_addr;
+            let same_reg_next = row + 1 < num_rows_real && merged[row + 1].reg_addr == m.reg_addr;
             trace.fill_columns(row, same_reg_next, Column::IsSameRegNext);
             trace.fill_columns(row, false, Column::IsPadding);
         }
@@ -331,34 +325,19 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         tuple1.push(reg_addr[0].clone());
         tuple1.extend_from_slice(&value);
         tuple1.extend_from_slice(&ts1);
-        logup.add_to_relation_with(
-            reg_lookup,
-            [slot1[0].clone()],
-            |[s]| (-s).into(),
-            &tuple1,
-        );
+        logup.add_to_relation_with(reg_lookup, [slot1[0].clone()], |[s]| (-s).into(), &tuple1);
 
         let mut tuple2: Vec<_> = Vec::with_capacity(17);
         tuple2.push(reg_addr[0].clone());
         tuple2.extend_from_slice(&value);
         tuple2.extend_from_slice(&ts2);
-        logup.add_to_relation_with(
-            reg_lookup,
-            [slot2[0].clone()],
-            |[s]| (-s).into(),
-            &tuple2,
-        );
+        logup.add_to_relation_with(reg_lookup, [slot2[0].clone()], |[s]| (-s).into(), &tuple2);
 
         let mut tuple3: Vec<_> = Vec::with_capacity(17);
         tuple3.push(reg_addr[0].clone());
         tuple3.extend_from_slice(&value);
         tuple3.extend_from_slice(&ts3);
-        logup.add_to_relation_with(
-            reg_lookup,
-            [slot3[0].clone()],
-            |[s]| (-s).into(),
-            &tuple3,
-        );
+        logup.add_to_relation_with(reg_lookup, [slot3[0].clone()], |[s]| (-s).into(), &tuple3);
 
         logup.finalize()
     }
@@ -426,20 +405,50 @@ pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> V
     for step in &side_note.steps {
         let acc = crate::chips::cpu::step_reg_accesses(step);
         if let Some((reg_idx, val)) = acc.val_b_read {
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: false,
+            });
         }
         if let Some((reg_idx, val)) = acc.val_d_read {
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: false,
+            });
         }
         if let Some((reg_idx, val)) = acc.val_a_read {
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: false,
+            });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: false,
+            });
         }
         if let Some((reg_idx, val)) = acc.result_write {
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: true });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: true,
+            });
         }
         for &(reg_idx, val) in &acc.ecall_reads {
-            entries.push(RegEntry { reg_addr: reg_idx, value: val, timestamp: step.timestamp, is_write: false });
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: false,
+            });
         }
     }
 
@@ -482,7 +491,9 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> RegisterDedupRep
         }
         after_dedup += 1;
         run_count += 1;
-        if run_len > longest_run { longest_run = run_len; }
+        if run_len > longest_run {
+            longest_run = run_len;
+        }
         *histogram.entry(run_len).or_default() += 1;
         i += run_len;
     }
@@ -645,10 +656,20 @@ mod tests {
     use super::*;
 
     fn r(reg: u8, val: u64, ts: u64) -> RegEntry {
-        RegEntry { reg_addr: reg, value: val, timestamp: ts, is_write: false }
+        RegEntry {
+            reg_addr: reg,
+            value: val,
+            timestamp: ts,
+            is_write: false,
+        }
     }
     fn w(reg: u8, val: u64, ts: u64) -> RegEntry {
-        RegEntry { reg_addr: reg, value: val, timestamp: ts, is_write: true }
+        RegEntry {
+            reg_addr: reg,
+            value: val,
+            timestamp: ts,
+            is_write: true,
+        }
     }
 
     #[test]
@@ -752,14 +773,30 @@ mod tests {
             vec![],
             vec![r(0, 0, 0)],
             vec![w(0, 100, 0), r(0, 100, 1), r(0, 100, 2), r(0, 100, 3)],
-            vec![w(0, 100, 0), r(0, 100, 1), r(0, 100, 2), r(0, 100, 3), r(0, 100, 4)],
+            vec![
+                w(0, 100, 0),
+                r(0, 100, 1),
+                r(0, 100, 2),
+                r(0, 100, 3),
+                r(0, 100, 4),
+            ],
             // Mixed sequence covering: writes, reads at multiple regs,
             // run that exceeds cap, value change, register change.
             {
                 let mut v = vec![
-                    w(0, 5, 0), r(0, 5, 1), r(0, 5, 2),
-                    w(1, 7, 0), r(1, 7, 3), r(1, 7, 5), r(1, 7, 7), r(1, 7, 9), r(1, 7, 11),
-                    w(2, 9, 0), r(2, 9, 4), w(2, 11, 6), r(2, 11, 8),
+                    w(0, 5, 0),
+                    r(0, 5, 1),
+                    r(0, 5, 2),
+                    w(1, 7, 0),
+                    r(1, 7, 3),
+                    r(1, 7, 5),
+                    r(1, 7, 7),
+                    r(1, 7, 9),
+                    r(1, 7, 11),
+                    w(2, 9, 0),
+                    r(2, 9, 4),
+                    w(2, 11, 6),
+                    r(2, 11, 8),
                 ];
                 v.sort_by_key(|e| (e.reg_addr, e.timestamp));
                 v
@@ -777,14 +814,15 @@ mod tests {
     #[test]
     fn merged_rows_obey_invariants() {
         // 1030-entry run (the longest from canonical bench) across cap.
-        let mut entries: Vec<_> = (0..1030u64)
-            .map(|k| r(5, 0xCAFE, k + 1))
-            .collect();
+        let mut entries: Vec<_> = (0..1030u64).map(|k| r(5, 0xCAFE, k + 1)).collect();
         entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
         let merged = merge_entries(&entries);
         for m in &merged {
             assert!(m.mult >= 1, "mult must be >= 1");
-            assert!(m.mult as usize <= B5_MERGE_CAP, "mult must be <= B5_MERGE_CAP");
+            assert!(
+                m.mult as usize <= B5_MERGE_CAP,
+                "mult must be <= B5_MERGE_CAP"
+            );
             if m.is_write {
                 assert_eq!(m.mult, 1, "writes always have mult=1");
             }
@@ -794,8 +832,10 @@ mod tests {
             }
             // Active slots must be strictly increasing.
             for k in 1..m.mult as usize {
-                assert!(m.timestamps[k] > m.timestamps[k - 1],
-                    "slot timestamps must strictly increase");
+                assert!(
+                    m.timestamps[k] > m.timestamps[k - 1],
+                    "slot timestamps must strictly increase"
+                );
             }
         }
         // 1030 / 4 = 257.5 → 258 merged rows (last row has mult=2).
@@ -814,7 +854,9 @@ mod tests {
         // pulling rand as a dev-dep.
         let mut state: u64 = 0xDEADBEEF_CAFEBABE;
         let mut next = || -> u64 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state
         };
 
@@ -828,7 +870,12 @@ mod tests {
                 let value = next() % n_values;
                 let timestamp = next() % 256;
                 let is_write = next() % 4 == 0; // ~25% writes, 75% reads
-                entries.push(RegEntry { reg_addr: reg, value, timestamp, is_write });
+                entries.push(RegEntry {
+                    reg_addr: reg,
+                    value,
+                    timestamp,
+                    is_write,
+                });
             }
             entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
             // Dedup duplicate (reg_addr, timestamp) pairs — the chip never
@@ -838,7 +885,10 @@ mod tests {
 
             let merged = merge_entries(&entries);
             let restored = unmerge_entries(&merged);
-            assert_eq!(restored, entries, "case {case} (n={n}, regs={n_regs}, vals={n_values}) failed roundtrip");
+            assert_eq!(
+                restored, entries,
+                "case {case} (n={n}, regs={n_regs}, vals={n_values}) failed roundtrip"
+            );
             for m in &merged {
                 assert!(m.mult >= 1);
                 assert!(m.mult as usize <= B5_MERGE_CAP);
@@ -846,8 +896,10 @@ mod tests {
                     assert_eq!(m.mult, 1);
                 }
                 for k in 1..m.mult as usize {
-                    assert!(m.timestamps[k] > m.timestamps[k - 1],
-                        "case {case}: slot timestamps must strictly increase");
+                    assert!(
+                        m.timestamps[k] > m.timestamps[k - 1],
+                        "case {case}: slot timestamps must strictly increase"
+                    );
                 }
                 for k in m.mult as usize..B5_MERGE_CAP {
                     assert_eq!(m.timestamps[k], 0);
@@ -868,9 +920,13 @@ mod tests {
         // Construct a bench-like trace: 100 reads of (r2=V), interrupted
         // by one write halfway through, plus a tail of 50 more reads.
         let mut entries: Vec<RegEntry> = Vec::new();
-        for k in 0..50u64 { entries.push(r(2, 0xABCD, k + 1)); }
+        for k in 0..50u64 {
+            entries.push(r(2, 0xABCD, k + 1));
+        }
         entries.push(w(2, 0xABCD, 51));
-        for k in 0..50u64 { entries.push(r(2, 0xABCD, k + 52)); }
+        for k in 0..50u64 {
+            entries.push(r(2, 0xABCD, k + 52));
+        }
         entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
 
         // Replicate analyze_dedup's cap-sweep math for M=B5_MERGE_CAP.
@@ -893,15 +949,24 @@ mod tests {
             *histogram.entry(run_len).or_default() += 1;
             i += run_len;
         }
-        let predicted: usize = histogram.iter()
+        let predicted: usize = histogram
+            .iter()
             .map(|(&len, &count)| {
-                let rows_per_run = if len == 1 { 1 } else { (len + B5_MERGE_CAP - 1) / B5_MERGE_CAP };
+                let rows_per_run = if len == 1 {
+                    1
+                } else {
+                    (len + B5_MERGE_CAP - 1) / B5_MERGE_CAP
+                };
                 rows_per_run * count
-            }).sum();
+            })
+            .sum();
 
         let merged = merge_entries(&entries);
-        assert_eq!(merged.len(), predicted,
-            "merger produced {} rows; cap-sweep predicted {predicted}", merged.len());
+        assert_eq!(
+            merged.len(),
+            predicted,
+            "merger produced {} rows; cap-sweep predicted {predicted}",
+            merged.len()
+        );
     }
 }
-

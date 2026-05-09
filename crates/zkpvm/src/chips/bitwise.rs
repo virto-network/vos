@@ -15,13 +15,10 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
-    core::{
-        fields::qm31::SecureField,
-        ColumnVec,
-    },
+    core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{m31::LOG_N_LANES, SimdBackend},
-        poly::{circle::CircleEvaluation, BitReversedOrder},
+        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
@@ -35,16 +32,16 @@ use crate::trace::{
     component::ComponentTrace,
 };
 
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{BitwiseAndLookupElements, BitwiseLookupElements},
-};
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{BitwiseAndLookupElements, BitwiseLookupElements},
+};
 
 pub struct BitwiseChip;
 
@@ -117,12 +114,24 @@ impl BuiltInComponent for BitwiseChip {
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
         // Boolean constraints on flag columns.
-        for flag in [&is_and, &is_or, &is_xor, &is_and_inv, &is_or_inv, &is_xnor, &is_padding] {
+        for flag in [
+            &is_and,
+            &is_or,
+            &is_xor,
+            &is_and_inv,
+            &is_or_inv,
+            &is_xnor,
+            &is_padding,
+        ] {
             eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
         }
         let is_real = E::F::one() - is_padding[0].clone();
-        let variant_sum = is_and[0].clone() + is_or[0].clone() + is_xor[0].clone()
-            + is_and_inv[0].clone() + is_or_inv[0].clone() + is_xnor[0].clone();
+        let variant_sum = is_and[0].clone()
+            + is_or[0].clone()
+            + is_xor[0].clone()
+            + is_and_inv[0].clone()
+            + is_or_inv[0].clone()
+            + is_xnor[0].clone();
         eval.add_constraint(is_real.clone() * (variant_sum.clone() - E::F::one()));
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
@@ -138,15 +147,24 @@ impl BuiltInComponent for BitwiseChip {
             // op=0 (AND):     r = ar
             eval.add_constraint(is_and[0].clone() * (r.clone() - ar.clone()));
             // op=1 (OR):      r = a + b - ar
-            eval.add_constraint(is_or[0].clone() * (r.clone() - a.clone() - b.clone() + ar.clone()));
+            eval.add_constraint(
+                is_or[0].clone() * (r.clone() - a.clone() - b.clone() + ar.clone()),
+            );
             // op=2 (XOR):     r = a + b - 2*ar
-            eval.add_constraint(is_xor[0].clone() * (r.clone() - a.clone() - b.clone() + f2.clone() * ar.clone()));
+            eval.add_constraint(
+                is_xor[0].clone() * (r.clone() - a.clone() - b.clone() + f2.clone() * ar.clone()),
+            );
             // op=3 (AndInv):  r = a - ar
             eval.add_constraint(is_and_inv[0].clone() * (r.clone() - a.clone() + ar.clone()));
             // op=4 (OrInv):   r = 255 - b + ar
-            eval.add_constraint(is_or_inv[0].clone() * (r.clone() - f255.clone() + b.clone() - ar.clone()));
+            eval.add_constraint(
+                is_or_inv[0].clone() * (r.clone() - f255.clone() + b.clone() - ar.clone()),
+            );
             // op=5 (Xnor):    r = 255 - a - b + 2*ar
-            eval.add_constraint(is_xnor[0].clone() * (r.clone() - f255.clone() + a.clone() + b.clone() - f2.clone() * ar.clone()));
+            eval.add_constraint(
+                is_xnor[0].clone()
+                    * (r.clone() - f255.clone() + a.clone() + b.clone() - f2.clone() * ar.clone()),
+            );
         }
 
         // ── Bitwise AND nibble-level lookups (16 per real row) ──
@@ -156,7 +174,11 @@ impl BuiltInComponent for BitwiseChip {
             eval.add_to_relation(RelationEntry::new(
                 bitwise_and_lookup,
                 is_real.clone().into(),
-                &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
+                &[
+                    val_b_hi_nib[i].clone(),
+                    val_d_hi_nib[i].clone(),
+                    and_result_hi_nib[i].clone(),
+                ],
             ));
             // Low nibble: lo = byte - hi*16
             let b_lo = val_b[i].clone() - val_b_hi_nib[i].clone() * sixteen.clone();
@@ -212,7 +234,8 @@ impl BuiltInProverComponent for BitwiseChip {
             return trace.finalize_bit_reversed();
         }
 
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
+        let log_size =
+            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -262,7 +285,8 @@ impl BuiltInProverComponent for BitwiseChip {
         let and_result = crate::trace::original_base_column!(component_trace, Column::AndResult);
         let val_b_hi_nib = crate::trace::original_base_column!(component_trace, Column::ValBHiNib);
         let val_d_hi_nib = crate::trace::original_base_column!(component_trace, Column::ValDHiNib);
-        let and_result_hi_nib = crate::trace::original_base_column!(component_trace, Column::AndResultHiNib);
+        let and_result_hi_nib =
+            crate::trace::original_base_column!(component_trace, Column::AndResultHiNib);
         let is_and = crate::trace::original_base_column!(component_trace, Column::IsAnd);
         let is_or = crate::trace::original_base_column!(component_trace, Column::IsOr);
         let is_xor = crate::trace::original_base_column!(component_trace, Column::IsXor);
@@ -280,7 +304,11 @@ impl BuiltInProverComponent for BitwiseChip {
                 bitwise_and,
                 [pad_c.clone()],
                 |[pad]| (PackedBaseField::one() - pad).into(),
-                &[val_b_hi_nib[i].clone(), val_d_hi_nib[i].clone(), and_result_hi_nib[i].clone()],
+                &[
+                    val_b_hi_nib[i].clone(),
+                    val_d_hi_nib[i].clone(),
+                    and_result_hi_nib[i].clone(),
+                ],
             );
             // Low nibble lookup
             let val_b_col_i = val_b[i].clone();

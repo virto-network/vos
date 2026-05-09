@@ -15,8 +15,7 @@ use vos::actors::value::Value;
 use crate::types::IoResult;
 
 pub(crate) fn parse_flat_json(body: &[u8]) -> IoResult<Vec<(String, Value)>> {
-    let json: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("{e}"))?;
+    let json: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("{e}"))?;
     let serde_json::Value::Object(map) = json else {
         return Err("expected a top-level JSON object".into());
     };
@@ -43,7 +42,11 @@ fn json_to_value(j: serde_json::Value) -> IoResult<Value> {
 
 fn json_number_to_value(n: serde_json::Number) -> IoResult<Value> {
     if let Some(u) = n.as_u64() {
-        return Ok(if u <= u32::MAX as u64 { Value::U32(u as u32) } else { Value::U64(u) });
+        return Ok(if u <= u32::MAX as u64 {
+            Value::U32(u as u32)
+        } else {
+            Value::U64(u)
+        });
     }
     if let Some(i) = n.as_i64() {
         return Ok(Value::I64(i));
@@ -58,13 +61,21 @@ fn json_array_to_value(xs: Vec<serde_json::Value>) -> IoResult<Value> {
         return Ok(Value::ListStr(Vec::new()));
     }
     if xs.iter().all(serde_json::Value::is_string) {
-        let strings = xs.into_iter()
-            .map(|v| match v { serde_json::Value::String(s) => s, _ => unreachable!() })
+        let strings = xs
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                _ => unreachable!(),
+            })
             .collect();
         return Ok(Value::ListStr(strings));
     }
-    if xs.iter().all(|v| v.as_u64().is_some_and(|u| u <= u32::MAX as u64)) {
-        let nums = xs.into_iter()
+    if xs
+        .iter()
+        .all(|v| v.as_u64().is_some_and(|u| u <= u32::MAX as u64))
+    {
+        let nums = xs
+            .into_iter()
             .map(|v| v.as_u64().expect("checked") as u32)
             .collect();
         return Ok(Value::ListU32(nums));
@@ -114,7 +125,10 @@ mod tests {
 
     #[test]
     fn parse_string() {
-        assert_eq!(v(br#"{"k":"hello"}"#), vec![("k".into(), Value::Str("hello".into()))]);
+        assert_eq!(
+            v(br#"{"k":"hello"}"#),
+            vec![("k".into(), Value::Str("hello".into()))]
+        );
     }
 
     #[test]
@@ -192,10 +206,7 @@ mod tests {
 
     #[test]
     fn render_lists() {
-        assert_eq!(
-            value_to_json(&Value::ListU32(vec![1, 2, 3])),
-            b"[1,2,3]"
-        );
+        assert_eq!(value_to_json(&Value::ListU32(vec![1, 2, 3])), b"[1,2,3]");
         assert_eq!(
             value_to_json(&Value::ListStr(vec!["a".into(), "b".into()])),
             br#"["a","b"]"#

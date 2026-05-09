@@ -128,13 +128,19 @@ enum AskInner {
 
 impl Ask {
     pub fn ready(result: alloc::vec::Vec<u8>) -> Self {
-        Self { inner: AskInner::Immediate(Ok(result)) }
+        Self {
+            inner: AskInner::Immediate(Ok(result)),
+        }
     }
     pub fn ready_err(err: super::value::InvokeError) -> Self {
-        Self { inner: AskInner::Immediate(Err(err)) }
+        Self {
+            inner: AskInner::Immediate(Err(err)),
+        }
     }
     pub fn host_io(io: HostIo) -> Self {
-        Self { inner: AskInner::HostIo(io) }
+        Self {
+            inner: AskInner::HostIo(io),
+        }
     }
 }
 
@@ -153,21 +159,16 @@ impl Future for Ask {
         let this = self.get_mut();
         match &mut this.inner {
             AskInner::Immediate(result) => {
-                let result = core::mem::replace(
-                    result,
-                    Err(super::value::InvokeError::Panicked),
-                );
+                let result = core::mem::replace(result, Err(super::value::InvokeError::Panicked));
                 match result {
                     Ok(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
                     Err(e) => Poll::Ready(Err(e)),
                 }
             }
-            AskInner::HostIo(io) => {
-                match Pin::new(io).poll(cx) {
-                    Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            AskInner::HostIo(io) => match Pin::new(io).poll(cx) {
+                Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }
@@ -196,7 +197,10 @@ impl HostIo {
     /// - Only one `HostIo` is in flight per context at a time
     ///   (guaranteed: single-threaded, one dispatch at a time).
     pub(crate) fn new(result_slot: *mut Option<alloc::vec::Vec<u8>>) -> Self {
-        Self { polled: false, result_slot }
+        Self {
+            polled: false,
+            result_slot,
+        }
     }
 }
 
@@ -239,7 +243,9 @@ static mut IN_REFINE: bool = false;
 
 #[cfg(feature = "service")]
 pub fn set_refine_mode(v: bool) {
-    unsafe { IN_REFINE = v; }
+    unsafe {
+        IN_REFINE = v;
+    }
 }
 
 #[cfg(feature = "service")]
@@ -249,7 +255,9 @@ pub fn is_refine_mode() -> bool {
 
 /// Stub for non-service builds so framework code can call it unconditionally.
 #[cfg(not(feature = "service"))]
-pub fn is_refine_mode() -> bool { false }
+pub fn is_refine_mode() -> bool {
+    false
+}
 
 // ── Halt ──────────────────────────────────────────────────────────────
 
@@ -319,8 +327,8 @@ pub const STATUS_OOG: u8 = 0x04;
 /// 5. `halt_with_output(payload)`.
 #[cfg(feature = "service")]
 pub fn run_refine_service<A: super::Actor>() {
-    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
     use super::context::ServiceId;
+    use super::lifecycle::{self, BUF_SIZE, DispatchResult};
     use alloc::boxed::Box;
     use core::ptr::addr_of_mut;
 
@@ -387,7 +395,9 @@ pub fn run_refine_service<A: super::Actor>() {
     if started {
         loop {
             let n = lifecycle::fetch_raw(&mut buf);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let result = lifecycle::dispatch_one::<A>(&buf[..n], actor_ref, &mut ctx);
             if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
                 break;
@@ -455,9 +465,11 @@ pub fn run_accumulate_service<A: super::Actor>() {
         if let Some(payload) = RefinePayload::decode(&buf[..n]) {
             // Deserialize the actor from refine state for on_commit.
             // With rkyv this is essentially zero-copy (pointer cast).
-            let actor = lifecycle::load_or_create::<A>(
-                if payload.state.is_empty() { None } else { Some(&payload.state) }
-            );
+            let actor = lifecycle::load_or_create::<A>(if payload.state.is_empty() {
+                None
+            } else {
+                Some(&payload.state)
+            });
             actor.on_commit(&payload);
         }
     }
@@ -476,8 +488,8 @@ pub fn run_accumulate_service<A: super::Actor>() {
 /// Output: `[status:u8][state_len:u32 LE][state_bytes]`
 #[cfg(feature = "pvm")]
 pub fn run_refine<A: super::Actor>() {
-    use super::lifecycle::{self, DispatchResult, BUF_SIZE};
     use super::context::ServiceId;
+    use super::lifecycle::{self, BUF_SIZE, DispatchResult};
 
     // FETCH 1: state
     let mut buf = [0u8; BUF_SIZE];
@@ -490,7 +502,9 @@ pub fn run_refine<A: super::Actor>() {
     // FETCH 2+: messages (same loop as accumulate)
     loop {
         let n = lifecycle::fetch_raw(&mut buf);
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
         if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
             break;

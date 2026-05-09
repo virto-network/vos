@@ -27,8 +27,8 @@ use crate::config;
 use crate::limits::{
     HEADER_READ_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
 };
-use crate::runtime::{self, InFlightGuard, drain_in_flight};
 use crate::routing::{Policy, dispatch_request};
+use crate::runtime::{self, InFlightGuard, drain_in_flight};
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
 
@@ -43,32 +43,32 @@ pub(crate) fn spawn(
     inner: Arc<Inner>,
 ) -> IoResult<thread::JoinHandle<()>> {
     let bind = config::bind_ip();
-    runtime::spawn_on_thread(format!("http-gateway-rt:{port}"), move |ready_tx| async move {
-        let listener = match TcpListener::bind((bind, port)).await {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("bind {bind}:{port}: {e}")));
-                return;
-            }
-        };
-        let _ = ready_tx.send(Ok(()));
-        accept_loop(listener, job_tx, inner).await;
-    })
+    runtime::spawn_on_thread(
+        format!("http-gateway-rt:{port}"),
+        move |ready_tx| async move {
+            let listener = match TcpListener::bind((bind, port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("bind {bind}:{port}: {e}")));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+            accept_loop(listener, job_tx, inner).await;
+        },
+    )
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    job_tx: mpsc::SyncSender<Job>,
-    inner: Arc<Inner>,
-) {
+async fn accept_loop(listener: TcpListener, job_tx: mpsc::SyncSender<Job>, inner: Arc<Inner>) {
     // One builder shared across connections; sniffs the protocol
     // preface and dispatches to h1 or h2c.
-    let mut conn_builder =
-        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    let mut conn_builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     // Slow-loris mitigation: cap the time spent reading the request
     // line + headers. Hyper closes the connection if this elapses
     // without progress.
-    conn_builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
+    conn_builder
+        .http1()
+        .header_read_timeout(HEADER_READ_TIMEOUT);
     // Per-protocol connection cap. Connections beyond this are
     // dropped; clients see an immediate close rather than queuing
     // FDs in the kernel.
@@ -88,7 +88,9 @@ async fn accept_loop(
         let permit = match conn_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                log::warn!("http-gateway: conn limit ({MAX_CONCURRENT_CONNS}) hit; dropping {peer}");
+                log::warn!(
+                    "http-gateway: conn limit ({MAX_CONCURRENT_CONNS}) hit; dropping {peer}"
+                );
                 drop(stream);
                 continue;
             }
@@ -138,7 +140,10 @@ async fn serve_request(
 
     // `Limited` aborts the body stream once `MAX_BODY_BYTES` is
     // exceeded, so an attacker can't OOM us with a huge payload.
-    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(c) => c.to_bytes().to_vec(),
         Err(_) => {
             return into_hyper(Response::text(
@@ -148,7 +153,13 @@ async fn serve_request(
         }
     };
 
-    let our_req = Request { method, path, query, headers, body };
+    let our_req = Request {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    };
     let policy = Policy {
         admin_token: config::admin_token(),
         auth_token: config::auth_token(),

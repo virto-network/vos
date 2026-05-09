@@ -66,13 +66,13 @@
 //! therefore ceremonial for VOS: cap dispatch is done by the kernel
 //! over the flat window, not the φ[12] value.
 
+use crate::abi::error;
+use crate::abi::hostcall;
+use crate::abi::service::ServiceId;
 use javm::kernel::{InvocationKernel, KernelResult};
 use std::collections::HashMap;
 use std::io::Write;
 use tracing::error;
-use crate::abi::error;
-use crate::abi::hostcall;
-use crate::abi::service::ServiceId;
 
 use crate::data_layer::{DataLayer, MemoryDataLayer};
 use crate::refine_payload::{Effect, RefinePayload};
@@ -199,7 +199,9 @@ impl ServiceStorage {
     }
 
     pub fn read(&self, service: ServiceId, key: &[u8]) -> Option<&[u8]> {
-        self.data.get(&(service.0, key.to_vec())).map(|v| v.as_slice())
+        self.data
+            .get(&(service.0, key.to_vec()))
+            .map(|v| v.as_slice())
     }
 
     pub fn write(&mut self, service: ServiceId, key: &[u8], value: &[u8]) {
@@ -321,9 +323,8 @@ impl<D: DataLayer> VosRuntime<D> {
     /// returned by [`finish_recording`](Self::finish_recording)
     /// after the dispatch completes.
     pub fn begin_recording(&mut self, msg: Vec<u8>) {
-        self.effect_mode = crate::effect_log::EffectMode::Recording(
-            crate::effect_log::EffectSession::new(msg),
-        );
+        self.effect_mode =
+            crate::effect_log::EffectMode::Recording(crate::effect_log::EffectSession::new(msg));
     }
 
     /// Begin recording with a custom per-reply size cap (overrides
@@ -354,9 +355,8 @@ impl<D: DataLayer> VosRuntime<D> {
     /// of running the child. Use this when restoring a CRDT actor
     /// from its DAG.
     pub fn begin_replay(&mut self, log: crate::effect_log::EffectLog) {
-        self.effect_mode = crate::effect_log::EffectMode::Replaying(
-            crate::effect_log::EffectReplay::new(log),
-        );
+        self.effect_mode =
+            crate::effect_log::EffectMode::Replaying(crate::effect_log::EffectReplay::new(log));
     }
 
     /// Take the replay state and return to the inactive mode. The
@@ -404,16 +404,26 @@ impl<D: DataLayer> VosRuntime<D> {
     pub fn register_service(&mut self, blob_idx: usize) -> ServiceId {
         let id = self.next_id;
         self.next_id += 1;
-        self.services
-            .insert(id, ServiceInfo { blob_idx, alive: true });
+        self.services.insert(
+            id,
+            ServiceInfo {
+                blob_idx,
+                alive: true,
+            },
+        );
         ServiceId(id)
     }
 
     /// Register a service with a specific externally-assigned ID.
     /// Used by [`crate::node::VosNode`] to assign node-global IDs.
     pub fn register_service_with_id(&mut self, blob_idx: usize, id: ServiceId) -> ServiceId {
-        self.services
-            .insert(id.0, ServiceInfo { blob_idx, alive: true });
+        self.services.insert(
+            id.0,
+            ServiceInfo {
+                blob_idx,
+                alive: true,
+            },
+        );
         // Keep next_id above any externally assigned ID to avoid collisions
         if id.0 >= self.next_id {
             self.next_id = id.0 + 1;
@@ -447,7 +457,9 @@ impl<D: DataLayer> VosRuntime<D> {
 
     /// Check whether a service has a live continuation in the data layer.
     pub fn is_suspended(&self, id: ServiceId) -> bool {
-        let Some(header_bytes) = self.storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)
+        let Some(header_bytes) = self
+            .storage
+            .read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)
         else {
             return false;
         };
@@ -514,7 +526,12 @@ impl<D: DataLayer> VosRuntime<D> {
             for iteration in 0..MAX_REFINE_ITERATIONS {
                 let mut kernel = if let Some((ref flat_mem, heap_base, heap_top)) = warm_mem {
                     match InvocationKernel::new_warm(
-                        blob, &[], refine_gas, flat_mem, heap_base, heap_top,
+                        blob,
+                        &[],
+                        refine_gas,
+                        flat_mem,
+                        heap_base,
+                        heap_top,
                         Some(&mut self.code_cache),
                     ) {
                         Ok(k) => k,
@@ -524,7 +541,8 @@ impl<D: DataLayer> VosRuntime<D> {
                         }
                     }
                 } else {
-                    match InvocationKernel::new_cached(blob, &[], refine_gas, &mut self.code_cache) {
+                    match InvocationKernel::new_cached(blob, &[], refine_gas, &mut self.code_cache)
+                    {
                         Ok(k) => k,
                         Err(e) => {
                             error!(svc_id, error = %e, "service: kernel init failed");
@@ -599,15 +617,20 @@ impl<D: DataLayer> VosRuntime<D> {
                     // state instead of stale bytes from the previous
                     // dispatch. Empty state means nothing changed.
                     if !actor_state.is_empty() {
-                        journal.writes.push((
-                            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                            actor_state,
-                        ));
+                        journal
+                            .writes
+                            .push((crate::lifecycle::STATE_KEY_BYTES.to_vec(), actor_state));
                     }
 
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
-                        save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
+                        save_continuation(
+                            flat_mem,
+                            heap_base,
+                            heap_top,
+                            &mut self.data,
+                            &mut journal,
+                        );
                         // Spill any self-directed transfers from the
                         // payload's effects as pending transfers for next
                         // tick. On a JAM host, accumulate would replay
@@ -625,12 +648,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     if journal.self_messages.is_empty() {
                         // Guest signalled it's done; clear any prior
                         // continuation and exit the refine loop.
-                        clear_continuation(
-                            &mut journal,
-                            storage,
-                            &mut self.data,
-                            svc_id,
-                        );
+                        clear_continuation(&mut journal, storage, &mut self.data, svc_id);
                         break;
                     }
                 } else {
@@ -669,8 +687,8 @@ impl<D: DataLayer> VosRuntime<D> {
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);
             }
-            new_transfers.extend(journal.transfers.drain(..));
-            new_services_to_register.extend(journal.new_services.drain(..));
+            new_transfers.append(&mut journal.transfers);
+            new_services_to_register.append(&mut journal.new_services);
         }
 
         // Register services created via NEW during this tick.
@@ -678,7 +696,13 @@ impl<D: DataLayer> VosRuntime<D> {
         for (code_hash, assigned_id) in new_services_to_register {
             if let Some(blob) = self.preimages.get(&code_hash).cloned() {
                 let blob_idx = self.register_blob(blob);
-                self.services.insert(assigned_id, ServiceInfo { blob_idx, alive: true });
+                self.services.insert(
+                    assigned_id,
+                    ServiceInfo {
+                        blob_idx,
+                        alive: true,
+                    },
+                );
             }
         }
 
@@ -743,7 +767,11 @@ fn run_refine_kernel(
                 return None;
             }
             KernelResult::PageFault(addr) => {
-                error!(svc_id, addr = format!("{addr:#x}"), "service: page fault in refine");
+                error!(
+                    svc_id,
+                    addr = format!("{addr:#x}"),
+                    "service: page fault in refine"
+                );
                 return None;
             }
             KernelResult::ProtocolCall { slot } => {
@@ -854,7 +882,9 @@ fn handle_refine_hostcall(
             let hash = kread_hash(kernel, a0 as u32);
             let buf_ptr = a1 as u32;
             let buf_len = a2 as usize;
-            let data = journal.preimages.iter()
+            let data = journal
+                .preimages
+                .iter()
                 .find(|(h, _)| *h == hash)
                 .map(|(_, d)| d.as_slice())
                 .or_else(|| preimages.get(&hash).map(|d| d.as_slice()));
@@ -879,7 +909,9 @@ fn handle_refine_hostcall(
             // new service ID, and record it for commit.
             let code_hash = kread_hash(kernel, a0 as u32);
             // Look up in journal preimages first (PROVIDE'd this refine)
-            let blob = journal.preimages.iter()
+            let blob = journal
+                .preimages
+                .iter()
                 .find(|(h, _)| *h == code_hash)
                 .map(|(_, d)| d.clone());
             if let Some(_blob) = blob {
@@ -1039,9 +1071,7 @@ fn handle_invoke(
                     let input = kread(caller, input_ptr, input_len);
                     // Extract message from invoke input: [state_len:u32][state][msg]
                     let msg = if input.len() >= 4 {
-                        let state_len = u32::from_le_bytes(
-                            input[..4].try_into().unwrap()
-                        ) as usize;
+                        let state_len = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
                         let msg_start = (4 + state_len).min(input.len());
                         input[msg_start..].to_vec()
                     } else {
@@ -1056,7 +1086,13 @@ fn handle_invoke(
                         return record_and_write_invoke(caller, output_ptr, &output, depth, mode);
                     }
                 }
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    &[STATUS_NOT_FOUND],
+                    depth,
+                    mode,
+                );
             }
         }
     } else {
@@ -1094,8 +1130,7 @@ fn handle_invoke(
     // children (run_refine_service) can cold-start via READ. Also
     // deliver as FETCH items for legacy children (run_refine).
     let mut child_items = if input.len() >= 4 {
-        let state_len =
-            u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+        let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let state_end = (4 + state_len).min(input.len());
         let state = &input[4..state_end];
 
@@ -1118,13 +1153,25 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 error!(pc, ?target_svc_id, "child invoke panicked");
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    &[STATUS_PANICKED],
+                    depth,
+                    mode,
+                );
             }
             KernelResult::OutOfGas => {
                 return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
             }
             KernelResult::PageFault(_addr) => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    &[STATUS_PANICKED],
+                    depth,
+                    mode,
+                );
             }
             KernelResult::ProtocolCall { slot } => {
                 // Nested invokes by the child actor are not part
@@ -1247,14 +1294,12 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
     if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
         pollster::block_on(data.remove(&header.commitment));
     }
-    journal.writes.push((
-        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
-        vec![],
-    ));
-    journal.writes.push((
-        crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-        vec![],
-    ));
+    journal
+        .writes
+        .push((crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(), vec![]));
+    journal
+        .writes
+        .push((crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
 }
 
 fn simple_hash(data: &[u8]) -> [u8; 32] {
@@ -1338,7 +1383,13 @@ mod tests {
         rt.next_id += 1;
         let blob = rt.preimages.get(&code_hash).cloned().unwrap();
         let blob_idx = rt.register_blob(blob);
-        rt.services.insert(assigned_id, ServiceInfo { blob_idx, alive: true });
+        rt.services.insert(
+            assigned_id,
+            ServiceInfo {
+                blob_idx,
+                alive: true,
+            },
+        );
 
         assert!(rt.services.contains_key(&assigned_id));
         assert!(rt.services.get(&assigned_id).unwrap().alive);

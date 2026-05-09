@@ -69,7 +69,11 @@ fn print_registry(node: &vos::node::VosNode) {
         println!("registry: (empty) clock={}", page.clock);
         return;
     }
-    println!("registry: {} entries  clock={}", page.entries.len(), page.clock);
+    println!(
+        "registry: {} entries  clock={}",
+        page.entries.len(),
+        page.clock
+    );
 
     // Roles histogram + age range.
     let mut role_counts = std::collections::BTreeMap::<&str, usize>::new();
@@ -105,9 +109,6 @@ fn print_registry(node: &vos::node::VosNode) {
         } else {
             format!(" {:?}", entry.roles)
         };
-        println!(
-            "  {} → {id} (age={age}){roles}",
-            entry.name,
-        );
+        println!("  {} → {id} (age={age}){roles}", entry.name,);
     }
 }

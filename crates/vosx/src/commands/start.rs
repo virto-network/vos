@@ -11,10 +11,10 @@ use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode, WorkerConfig};
 use vos::value::Args;
 
-use crate::hyperspace::{flush_registry_announces, heartbeat_loop, AnnouncePlan};
+use crate::hyperspace::{AnnouncePlan, flush_registry_announces, heartbeat_loop};
 use crate::manifest::{
-    apply_init, encode_on_start, resolve_entry_path, resolve_replication_id, toml_to_value,
-    ConsistencyDef, Manifest,
+    ConsistencyDef, Manifest, apply_init, encode_on_start, resolve_entry_path,
+    resolve_replication_id, toml_to_value,
 };
 use crate::network::start_network_if_needed;
 use crate::util::{die, exit_with_status, format_provides, hex32, load_blob, load_file};
@@ -66,15 +66,28 @@ pub fn run(
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
     let mut provides_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
 
-    let registry_active = spawn_registry_if_declared(manifest, dir, state_dir.as_deref(), &mut node);
+    let registry_active =
+        spawn_registry_if_declared(manifest, dir, state_dir.as_deref(), &mut node);
     let mut announces: Vec<AnnouncePlan> = Vec::new();
 
-    register_workers(manifest, dir, state_dir.as_deref(), &mut node,
-        &mut name_ids, &mut provides_map);
+    register_workers(
+        manifest,
+        dir,
+        state_dir.as_deref(),
+        &mut node,
+        &mut name_ids,
+        &mut provides_map,
+    );
 
     register_agents(
-        manifest, dir, state_dir.as_deref(), &mut node,
-        &mut name_ids, &mut provides_map, registry_active, &mut announces,
+        manifest,
+        dir,
+        state_dir.as_deref(),
+        &mut node,
+        &mut name_ids,
+        &mut provides_map,
+        registry_active,
+        &mut announces,
     );
 
     // Hand the network off to the node — both die together at
@@ -230,18 +243,20 @@ fn register_agents(
                 cfg = cfg.persist(d);
             }
             if a.consistency == ConsistencyDef::Crdt {
-                if let Some(rep_id) = resolve_replication_id(
-                    &child.name,
-                    child.replication_id.as_deref(),
-                    &blob,
-                ) {
+                if let Some(rep_id) =
+                    resolve_replication_id(&child.name, child.replication_id.as_deref(), &blob)
+                {
                     cfg = cfg.with_replication_id(rep_id);
                 }
             }
             cfg = apply_init(cfg, &child.init, &elf_data, name_ids, provides_map);
             if !child.on_start.is_empty() {
                 let payloads = encode_on_start(
-                    &child.name, &child.on_start, &elf_data, name_ids, provides_map,
+                    &child.name,
+                    &child.on_start,
+                    &elf_data,
+                    name_ids,
+                    provides_map,
                 );
                 cfg = cfg.with_init_payloads(payloads);
             }
@@ -276,23 +291,24 @@ fn register_agents(
             cfg = cfg.persist(d);
         }
         if a.consistency == ConsistencyDef::Crdt {
-            if let Some(rep_id) = resolve_replication_id(
-                &a.name, a.replication_id.as_deref(), &blob,
-            ) {
+            if let Some(rep_id) =
+                resolve_replication_id(&a.name, a.replication_id.as_deref(), &blob)
+            {
                 cfg = cfg.with_replication_id(rep_id);
             }
         }
         cfg = apply_init(cfg, &a.init, &elf_data, name_ids, provides_map);
         if !a.on_start.is_empty() {
-            let payloads = encode_on_start(
-                &a.name, &a.on_start, &elf_data, name_ids, provides_map,
-            );
+            let payloads = encode_on_start(&a.name, &a.on_start, &elf_data, name_ids, provides_map);
             cfg = cfg.with_init_payloads(payloads);
         }
 
         let id = node.register(cfg);
         let role_tag = format_provides(&a.provides);
-        eprintln!("vosx: agent '{}' as {id} ({:?}){role_tag}", a.name, a.consistency);
+        eprintln!(
+            "vosx: agent '{}' as {id} ({:?}){role_tag}",
+            a.name, a.consistency
+        );
         name_ids.insert(a.name.clone(), id.0);
         for role in &a.provides {
             provides_map.entry(role.clone()).or_default().push(id.0);
@@ -334,5 +350,7 @@ fn spawn_heartbeat(
         "vosx: auto-heartbeat every {interval_secs}s for {} service(s)",
         names.len(),
     );
-    Some(std::thread::spawn(move || heartbeat_loop(handle, names, interval)))
+    Some(std::thread::spawn(move || {
+        heartbeat_loop(handle, names, interval)
+    }))
 }
