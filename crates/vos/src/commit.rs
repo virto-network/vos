@@ -146,6 +146,16 @@ pub trait CommitStrategy: Send {
     fn roots(&self) -> Vec<[u8; 32]> {
         Vec::new()
     }
+
+    /// Can this strategy currently accept new state-changing
+    /// dispatches? `false` means the agent thread should refuse
+    /// the invoke before running it (drop the reply channel so
+    /// the caller sees a transport-shaped failure) — typical for
+    /// a Raft replica that isn't currently the leader. Default:
+    /// `true` (every other strategy is always writable).
+    fn is_writable(&self) -> bool {
+        true
+    }
 }
 
 /// No-op strategy — state lives only in memory and is lost on exit.
@@ -235,7 +245,7 @@ mod local {
 #[cfg(feature = "storage")]
 mod crdt {
     use super::*;
-    use crate::effect_log::EffectLog;
+    use crate::effect_log::{CrdtEvent, EffectLog};
     use alloc::collections::{BTreeMap, BTreeSet};
     use alloc::vec::Vec;
     use merkle_crdt::{Cid, DagNode, Decode as McDecode, Encode as McEncode, Hasher, MerkleClock};
@@ -260,24 +270,27 @@ mod crdt {
         }
     }
 
-    // ── merkle-crdt Encode/Decode for EffectLog ─────────────────────
+    // ── merkle-crdt Encode/Decode for CrdtEvent ─────────────────────
     //
-    // EffectLog carries its own self-describing encoding via to_bytes
-    // / from_bytes. Inside a DagNode the payload sits in its own
-    // length-prefixed slot, so the decoder receives exactly the
-    // payload bytes — we can consume the whole slice and re-parse.
+    // The DagNode payload is `CrdtEvent`, which wraps an EffectLog
+    // with `(origin, seq)` metadata so two replicas independently
+    // producing byte-identical EffectLogs land on distinct CIDs.
+    // CrdtEvent carries its own self-describing encoding via
+    // to_bytes / from_bytes; inside a DagNode the payload sits in
+    // its own length-prefixed slot, so the decoder receives exactly
+    // the payload bytes and we can consume the whole slice.
 
-    impl McEncode for EffectLog {
+    impl McEncode for CrdtEvent {
         fn encode_to(&self, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&self.to_bytes());
         }
     }
 
-    impl McDecode for EffectLog {
+    impl McDecode for CrdtEvent {
         fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
             let slice = &buf[*pos..];
             *pos = buf.len();
-            EffectLog::from_bytes(slice)
+            CrdtEvent::from_bytes(slice)
         }
     }
 
@@ -289,6 +302,13 @@ mod crdt {
     /// Row key in [`STATE_TABLE`](super::STATE_TABLE) for the
     /// serialized Merkle-Clock roots.
     pub const ROOTS_KEY: &str = "crdt_roots";
+
+    /// Row key in [`STATE_TABLE`](super::STATE_TABLE) for the
+    /// per-origin monotone sequence counter. Allocated under the
+    /// commit lock when the strategy writes a new DAG node;
+    /// persisted alongside `STATE_KEY` and `ROOTS_KEY` so a crash
+    /// can't reuse a `seq` value across restarts.
+    pub const NEXT_SEQ_KEY: &str = "crdt_next_seq";
 
     /// Merkle-CRDT commit strategy.
     ///
@@ -314,23 +334,44 @@ mod crdt {
         /// node Local-style use), the lock is a fresh per-instance
         /// `Mutex` that's always uncontended.
         commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
+        /// Per-replica origin id stamped onto every `CrdtEvent` we
+        /// produce. Distinct per replica (typically derived from
+        /// the host node's identity), so two replicas of the *same*
+        /// replication group still write events with different
+        /// origins — the merkle-DAG keeps both as separate nodes
+        /// instead of dedup'ing them by content. Stable across
+        /// restarts of the same replica so warm-starts continue
+        /// the same `(origin, seq)` chain.
+        replica_origin: [u8; 32],
+        /// Per-origin monotone counter. Loaded from
+        /// `STATE_TABLE/NEXT_SEQ_KEY` on open and incremented under
+        /// `commit_lock` for every state-changing commit. Persisted
+        /// in the same write-txn as the new DAG node so a crash
+        /// can't reuse a `seq` value.
+        next_seq: u64,
     }
 
     impl CrdtCommit {
         /// Open (or create) the redb database at `path` and load the
-        /// Merkle-Clock roots from its `state` table.
-        pub fn open(path: &std::path::Path) -> Result<Self, CommitError> {
+        /// Merkle-Clock roots from its `state` table. `replica_origin`
+        /// is required and gets stamped onto every event this strategy
+        /// produces. It must differ across replicas of the same group
+        /// — pick it from the host's identity (e.g. node prefix or
+        /// libp2p peer-id hash); the replication-group id is the wrong
+        /// choice because every replica in a group shares it.
+        pub fn open(path: &std::path::Path, replica_origin: [u8; 32]) -> Result<Self, CommitError> {
             let db = alloc::sync::Arc::new(redb::Database::create(path)?);
             Ok(Self::with_state(
                 db,
                 alloc::sync::Arc::new(std::sync::Mutex::new(())),
+                replica_origin,
             ))
         }
 
         /// Build a `CrdtCommit` on a pre-opened, shared
         /// `Arc<redb::Database>`. Used when the host wants the
         /// same database exposed to a parallel reader (e.g. a
-        /// `SyncProvider`) without double-opening — redb is
+        /// `SyncHandler`) without double-opening — redb is
         /// exclusive on file open, so this is the only way to
         /// share access.
         ///
@@ -338,8 +379,12 @@ mod crdt {
         /// lock; use [`from_db_arc_locked`](Self::from_db_arc_locked)
         /// when multiple `CrdtCommit`s over the same db need to
         /// serialize their writes (agent thread + sync ticker).
-        pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>) -> Self {
-            Self::with_state(db, alloc::sync::Arc::new(std::sync::Mutex::new(())))
+        pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>, replica_origin: [u8; 32]) -> Self {
+            Self::with_state(
+                db,
+                alloc::sync::Arc::new(std::sync::Mutex::new(())),
+                replica_origin,
+            )
         }
 
         /// Build a `CrdtCommit` sharing both an `Arc<Database>`
@@ -351,21 +396,26 @@ mod crdt {
         pub fn from_db_arc_locked(
             db: alloc::sync::Arc<redb::Database>,
             commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
+            replica_origin: [u8; 32],
         ) -> Self {
-            Self::with_state(db, commit_lock)
+            Self::with_state(db, commit_lock, replica_origin)
         }
 
         fn with_state(
             db: alloc::sync::Arc<redb::Database>,
             commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
+            replica_origin: [u8; 32],
         ) -> Self {
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
+            let next_seq = load_next_seq(&db).unwrap_or(0);
             Self {
                 db,
                 clock,
                 last_state,
                 commit_lock,
+                replica_origin,
+                next_seq,
             }
         }
 
@@ -479,7 +529,7 @@ mod crdt {
                 let Some(val) = table.get(cid.as_ref())? else {
                     continue;
                 };
-                let node: DagNode<Blake2b, EffectLog> = DagNode::from_bytes(val.value())
+                let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(val.value())
                     .ok_or_else(|| {
                         CommitError::Config(alloc::format!(
                             "compact_roots: node {cid:?} could not be decoded",
@@ -525,7 +575,7 @@ mod crdt {
     }
 
     /// Read a single DAG node's serialized bytes by CID from a
-    /// shared redb database. Public so a `SyncProvider` (or any
+    /// shared redb database. Public so a `SyncHandler` (or any
     /// other reader) can serve fetches without holding a
     /// `CrdtCommit` mutex.
     pub fn read_dag_node(
@@ -601,8 +651,12 @@ mod crdt {
         fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {
             // BFS from roots, collect all reachable nodes, then
             // topological sort so predecessors come before
-            // successors.
-            let mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, EffectLog>> = BTreeMap::new();
+            // successors. Each node's payload is a `CrdtEvent`;
+            // we unwrap to its inner `EffectLog` for the runtime,
+            // which only cares about the dispatch + replies.
+            // `(origin, seq)` stay on disk — replays don't
+            // re-stamp them.
+            let mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, CrdtEvent>> = BTreeMap::new();
             let mut stack: Vec<Cid<Blake2b>> = self.clock.roots().iter().cloned().collect();
 
             let txn = self.db.begin_read()?;
@@ -622,7 +676,7 @@ mod crdt {
                     ))
                 })?;
                 let bytes = val.value();
-                let node: DagNode<Blake2b, EffectLog> =
+                let node: DagNode<Blake2b, CrdtEvent> =
                     DagNode::from_bytes(bytes).ok_or_else(|| {
                         CommitError::Config(alloc::format!(
                             "DAG node {cid:?} could not be decoded — db corruption",
@@ -655,32 +709,45 @@ mod crdt {
             // pollute consensus history with no-op events. Replay
             // can skip this dispatch entirely; the next state-
             // changing commit will produce a fresh DAG node.
+            // Skipping also means we don't allocate a `seq` value
+            // for read-only dispatches — `next_seq` only advances
+            // when a real event lands on the DAG.
             if state == self.last_state.as_slice() {
                 return Ok(());
             }
 
             // Hold the commit lock across "compute new DAG node
             // referencing current roots" + "write {state, ROOTS_KEY,
-            // new node}" so a concurrent sync ticker can't insert
-            // a peer node and update ROOTS_KEY between the read of
-            // self.clock.roots() and our write back. Refresh the
-            // clock from disk under the lock so we see anything
-            // the ticker just merged in.
+            // NEXT_SEQ_KEY, new node}" so a concurrent sync ticker
+            // can't insert a peer node and update ROOTS_KEY between
+            // the read of self.clock.roots() and our write back.
+            // Refresh the clock and next_seq from disk under the
+            // lock so we see anything the ticker just merged in
+            // and don't reuse a `seq` after an out-of-band restart.
             let _guard = self.commit_lock.lock().expect("commit_lock poisoned");
             self.clock = load_clock(&self.db).unwrap_or_default();
+            // `next_seq` lives only in our own writes — the sync
+            // ticker never advances it — but reload defensively in
+            // case a separate process touched the file.
+            self.next_seq = load_next_seq(&self.db).unwrap_or(self.next_seq);
 
             // Compute the new DAG node (if any) off-transaction so
-            // the write txn is short.
-            let new_cid_and_bytes = log.map(|log| {
+            // the write txn is short. Wrap the EffectLog in a
+            // CrdtEvent stamped with our origin + the next seq so
+            // the resulting CID is globally unique even when other
+            // replicas commit byte-identical EffectLogs concurrently.
+            let new_cid_bytes_seq = log.map(|log| {
+                let event = CrdtEvent::new(self.replica_origin, self.next_seq, log.clone());
                 let children = self.clock.roots().clone();
-                let node = DagNode::new(log.clone(), children);
+                let node = DagNode::new(event, children);
                 let cid = node.cid();
                 let bytes = node.to_bytes();
-                (cid, bytes)
+                let allocated_seq = self.next_seq;
+                (cid, bytes, allocated_seq)
             });
 
-            let roots_bytes = match &new_cid_and_bytes {
-                Some((cid, _)) => {
+            let roots_bytes = match &new_cid_bytes_seq {
+                Some((cid, _, _)) => {
                     let mut roots = BTreeSet::new();
                     roots.insert(cid.clone());
                     encode_roots(&roots)
@@ -688,13 +755,16 @@ mod crdt {
                 None => encode_roots(self.clock.roots()),
             };
 
+            let next_seq_after = self.next_seq + new_cid_bytes_seq.is_some() as u64;
+
             let txn = self.db.begin_write()?;
             {
                 let mut state_table = txn.open_table(STATE_TABLE)?;
                 state_table.insert(STATE_KEY, state)?;
                 state_table.insert(ROOTS_KEY, roots_bytes.as_slice())?;
+                state_table.insert(NEXT_SEQ_KEY, next_seq_after.to_le_bytes().as_slice())?;
 
-                if let Some((cid, bytes)) = &new_cid_and_bytes {
+                if let Some((cid, bytes, _)) = &new_cid_bytes_seq {
                     let mut dag_table = txn.open_table(DAG_TABLE)?;
                     dag_table.insert(cid.as_ref(), bytes.as_slice())?;
                 }
@@ -703,10 +773,11 @@ mod crdt {
 
             // Update in-memory clock to reflect the newly committed
             // roots. For a log-less commit the roots are unchanged.
-            if let Some((cid, _)) = new_cid_and_bytes {
+            if let Some((cid, _, _)) = new_cid_bytes_seq {
                 self.clock = MerkleClock::new();
                 self.clock.add_roots(core::iter::once(cid));
             }
+            self.next_seq = next_seq_after;
             self.last_state = state.to_vec();
             Ok(())
         }
@@ -731,6 +802,19 @@ mod crdt {
             c.add_roots(roots);
             c
         })
+    }
+
+    fn load_next_seq(db: &redb::Database) -> Option<u64> {
+        let txn = db.begin_read().ok()?;
+        let table = txn.open_table(STATE_TABLE).ok()?;
+        let val = table.get(NEXT_SEQ_KEY).ok().flatten()?;
+        let bytes = val.value();
+        if bytes.len() != 8 {
+            return None;
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(bytes);
+        Some(u64::from_le_bytes(arr))
     }
 
     /// Encode a root set as `[count:u64 LE][cid_bytes (32 each)...]`.
@@ -768,8 +852,13 @@ mod crdt {
     /// Kahn's purposes points from each child (predecessor) to the
     /// node that lists it. A node with 0 children is an origin and
     /// is emitted first.
+    ///
+    /// Returns just the inner [`EffectLog`]s — the runtime's
+    /// replay path consumes those directly. The wrapping
+    /// [`CrdtEvent::origin`] / `seq` stays on disk; it's metadata
+    /// for CID stability, not for handler execution.
     fn topological_order(
-        mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, EffectLog>>,
+        mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, CrdtEvent>>,
     ) -> Vec<EffectLog> {
         // indegree[n] = number of children of n — i.e. how many
         // predecessors it depends on.
@@ -793,7 +882,7 @@ mod crdt {
         let mut sorted = Vec::with_capacity(nodes.len());
         while let Some(cid) = queue.pop_front() {
             if let Some(node) = nodes.remove(&cid) {
-                sorted.push(node.payload);
+                sorted.push(node.payload.log);
             }
             if let Some(successors) = reverse.get(&cid) {
                 for succ in successors {
@@ -846,7 +935,7 @@ mod tests {
         // state blob and a distinct effect log.
         let mut logs = Vec::new();
         {
-            let mut cc = CrdtCommit::open(&path).unwrap();
+            let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
             assert!(cc.restore().is_none(), "fresh db has no state");
 
             let mk = |msg: &[u8], replies: &[&[u8]]| -> EffectLog {
@@ -871,7 +960,7 @@ mod tests {
         // Reopen: state + roots restore, replay_logs walks the DAG
         // and hands back all three logs in causal order.
         {
-            let mut cc = CrdtCommit::open(&path).unwrap();
+            let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
             assert_eq!(cc.restore().as_deref(), Some(&b"state-v3"[..]));
             assert_eq!(cc.clock().roots().len(), 1);
 
@@ -901,8 +990,8 @@ mod tests {
         let path = temp_db_path("crdt_reload");
         let arc = alloc::sync::Arc::new(redb::Database::create(&path).unwrap());
 
-        let mut agent = CrdtCommit::from_db_arc(arc.clone());
-        let mut sync = CrdtCommit::from_db_arc(arc.clone());
+        let mut agent = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]);
+        let mut sync = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]);
 
         // Agent commits one log. After this, agent.clock has one root,
         // sync's clock is still empty (won't see it without reload).
@@ -918,10 +1007,14 @@ mod tests {
         // Build a "remote" log node manually and feed it through
         // sync.insert_node — mimics what the cycle-3 ticker does.
         // It should be a sibling of the agent's existing root
-        // (no children → concurrent).
+        // (no children → concurrent). The remote replica's
+        // origin/seq just need to differ from ours; a fixed
+        // [1u8; 32] origin is enough to distinguish.
+        use crate::effect_log::CrdtEvent;
         let log_b = EffectLog::for_msg(b"remote".to_vec());
-        let remote_node: merkle_crdt::DagNode<Blake2b, EffectLog> =
-            merkle_crdt::DagNode::new(log_b.clone(), BTreeSet::new());
+        let remote_event = CrdtEvent::new([1u8; 32], 0, log_b.clone());
+        let remote_node: merkle_crdt::DagNode<Blake2b, CrdtEvent> =
+            merkle_crdt::DagNode::new(remote_event, BTreeSet::new());
         let remote_cid = remote_node.cid();
         let remote_bytes = remote_node.to_bytes();
         let was_new = sync.insert_node(&remote_cid.0, &remote_bytes).unwrap();
@@ -956,7 +1049,7 @@ mod tests {
         // pull A's DAG nodes via the new sync accessors and
         // verify B converges (same roots, replay_logs returns the
         // same logs in the same order).
-        use crate::effect_log::EffectLog;
+        use crate::effect_log::{CrdtEvent, EffectLog};
         use merkle_crdt::DagNode;
         use std::collections::BTreeSet;
 
@@ -964,7 +1057,7 @@ mod tests {
         let path_b = temp_db_path("crdt_sync_b");
 
         // ── Drive A ────────────────────────────────────────────────
-        let mut a = CrdtCommit::open(&path_a).unwrap();
+        let mut a = CrdtCommit::open(&path_a, [0u8; 32]).unwrap();
         let log1 = EffectLog::for_msg(b"first".to_vec());
         let log2 = EffectLog::for_msg(b"second".to_vec());
         a.commit_with_log(b"state-1", &log1).unwrap();
@@ -974,7 +1067,7 @@ mod tests {
         assert_eq!(a_roots.len(), 1, "linear chain → one head");
 
         // ── Replica B: pull A's nodes via accessors ────────────────
-        let mut b = CrdtCommit::open(&path_b).unwrap();
+        let mut b = CrdtCommit::open(&path_b, [0u8; 32]).unwrap();
         assert!(b.restore().is_none());
         assert!(b.root_bytes().is_empty());
 
@@ -989,7 +1082,7 @@ mod tests {
             let was_new = b.insert_node(&cid, &bytes).unwrap();
             assert!(was_new);
             // Children to walk next
-            let node: DagNode<Blake2b, EffectLog> = DagNode::from_bytes(&bytes).unwrap();
+            let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(&bytes).unwrap();
             for child in node.children {
                 frontier.push(child.0);
             }
@@ -1030,7 +1123,7 @@ mod tests {
         use crate::effect_log::EffectLog;
 
         let path = temp_db_path("crdt_skip");
-        let mut cc = CrdtCommit::open(&path).unwrap();
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
 
         let log = EffectLog::for_msg(b"first".to_vec());
         cc.commit_with_log(b"state", &log).unwrap();

@@ -9,27 +9,45 @@ license.workspace = true
 vos = { path = "../vos", features = ["std", "http", "storage", "network"] }
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
-grey-transpiler = { path = "../../../../jar/jar/grey/crates/grey-transpiler" }
-# Registry actor lib + the macro-generated host `RegistryClient`.
-# Used by `flush_registry_announces`, the auto-heartbeat thread,
-# and `cmd_invoke`'s name-resolution path. Now that vosx is a
-# separate crate the old `vos → registry → vos` cycle is gone:
-# `registry → vos` and `vosx → {vos, registry}` is acyclic.
-registry = { path = "../actors/registry", features = ["host"] }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6" }
+# Per-space catalog of programs / agents / members. Source of
+# truth that the new `space *` subcommands operate on.
+space-registry = { path = "../actors/space-registry", default-features = false }
+# Content-addressed cache + IPFS resolver dependency for the
+# blob store. Stays a thin dep — no daemon required for `Path`
+# and `Hash` sources, only `Cid` and `Url` resolution touch
+# external services.
+hex = "0.4"
+# anyhow is the existing project's only convenience-error crate;
+# the new `space *` commands return Result for clean error
+# bubbling through the clap dispatcher.
+anyhow = "1"
+# Read the registry's genesis DAG root from its redb during
+# `space new`. Mirrors the dev-dep usage in vos's
+# elf_integration tests; vos uses redb internally but doesn't
+# re-export it.
+redb = "2"
+# `kill -0` to detect stale endpoint files left by a crashed
+# `space up` daemon.
+libc = "0.2"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+# UTC `created_at` formatting in spaces.toml. `formatting` for
+# the `format` API; `macros` so the format-description literal
+# is checked at compile time.
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Used only by the auto-derive replication-id helper for
-# CRDT actors that don't pin a group manually. The registry's
-# own group-id derivation lives behind `registry::replication_id`.
-blake2b_simd = "1"
+# Bridges the `log` facade (vos's actor-side `vos::log::*` calls
+# such as the warnings inside `Context::resolve`) into tracing
+# so they surface through the same subscriber.
+tracing-log = "0.2"
 
 # libp2p multiaddr parsing for `--listen` / `--connect`. The
 # rest of the network plumbing is owned by `vos::network`.

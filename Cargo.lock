@@ -1494,20 +1494,6 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "grey-crypto"
 version = "0.1.0"
-dependencies = [
- "ark-vrf",
- "blake2",
- "blst",
- "ed25519-dalek",
- "grey-types 0.1.0",
- "rand 0.8.5",
- "scale 0.1.0",
- "sha3 0.10.8",
-]
-
-[[package]]
-name = "grey-crypto"
-version = "0.1.0"
 source = "git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168d4021cd924d13e1a6963af77049055a47"
 dependencies = [
  "ark-vrf",
@@ -1538,17 +1524,6 @@ dependencies = [
 [[package]]
 name = "grey-transpiler"
 version = "0.1.0"
-dependencies = [
- "javm 0.4.0",
- "scale 0.1.0",
- "thiserror 2.0.18",
- "tracing",
- "tracing-test",
-]
-
-[[package]]
-name = "grey-transpiler"
-version = "0.1.0"
 source = "git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168d4021cd924d13e1a6963af77049055a47"
 dependencies = [
  "javm 0.4.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
@@ -1568,15 +1543,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-test",
-]
-
-[[package]]
-name = "grey-types"
-version = "0.1.0"
-dependencies = [
- "hex",
- "scale 0.1.0",
- "serde",
 ]
 
 [[package]]
@@ -2156,18 +2122,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "javm"
-version = "0.4.0"
-dependencies = [
- "grey-crypto 0.1.0",
- "libc",
- "memoffset",
- "scale 0.1.0",
- "thiserror 2.0.18",
- "tracing",
-]
 
 [[package]]
 name = "javm"
@@ -3499,14 +3453,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
-name = "registry"
-version = "0.1.0"
-dependencies = [
- "blake2b_simd",
- "vos",
-]
-
-[[package]]
 name = "rend"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3698,14 +3644,6 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "scale"
 version = "0.1.0"
-dependencies = [
- "scale-derive 0.1.0",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "scale"
-version = "0.1.0"
 source = "git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168d4021cd924d13e1a6963af77049055a47"
 dependencies = [
  "scale-derive 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
@@ -3719,15 +3657,6 @@ source = "git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079a
 dependencies = [
  "scale-derive 0.1.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "scale-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -3934,6 +3863,13 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "space-registry"
+version = "0.1.0"
+dependencies = [
+ "vos",
 ]
 
 [[package]]
@@ -4628,14 +4564,20 @@ dependencies = [
 name = "vosx"
 version = "0.1.0"
 dependencies = [
- "blake2b_simd",
+ "anyhow",
  "clap",
- "grey-transpiler 0.1.0",
+ "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
+ "hex",
+ "libc",
  "libp2p",
- "registry",
+ "redb",
  "serde",
+ "serde_json",
+ "space-registry",
+ "time",
  "toml",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "vos",
 ]

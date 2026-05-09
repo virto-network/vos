@@ -136,12 +136,7 @@ impl<A: Actor> Context<A> {
     /// On non-guest builds (host tests, etc.) this returns
     /// `InvokeError::NotFound` since there is no PVM to dispatch into.
     pub fn ask_raw(&mut self, target: ServiceId, payload: &[u8]) -> super::run::Ask {
-        // The PVM path issues a real `INVOKE` ecall, which requires the
-        // riscv64 target. Build flavours that pull `pvm` for the *types*
-        // but compile for a host arch (workers loaded into vosx tests
-        // when registry pulls `service = ["pvm"]`) need the worker
-        // fallback to avoid hitting the panic-stub `_ecall`.
-        #[cfg(all(feature = "pvm", target_arch = "riscv64"))]
+        #[cfg(feature = "pvm")]
         {
             use super::lifecycle::{InvokeResult, invoke_raw};
             use super::value::InvokeError;
@@ -155,11 +150,10 @@ impl<A: Actor> Context<A> {
                 InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
         }
-        #[cfg(not(all(feature = "pvm", target_arch = "riscv64")))]
+        #[cfg(not(feature = "pvm"))]
         {
-            // Worker / WASM / host: yield to host with an EFFECT_ASK
-            // request. Wire format:
-            //   [tag:u8=EFFECT_ASK][target:u32 LE][payload...]
+            // Worker / WASM: yield to host with an EFFECT_ASK request.
+            // Wire format: [tag:u8=EFFECT_ASK][target:u32 LE][payload...]
             let mut request = Vec::with_capacity(5 + payload.len());
             request.push(crate::effects::EFFECT_ASK);
             request.extend_from_slice(&target.0.to_le_bytes());
@@ -168,12 +162,43 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    // Name resolution belongs to the registry actor, not vos. To
-    // resolve from a PVM actor handler, depend on the `registry`
-    // crate and call `ctx.ask(ServiceId::REGISTRY, ...)`
-    // directly. A future macro-generated `RegistryActorClient`
-    // will wrap this; for now it stays explicit so vos doesn't
-    // know about any specific service.
+    /// Resolve an installed agent's name to its node-local
+    /// `ServiceId` (packed as u32) by asking the well-known
+    /// `ServiceId::REGISTRY` service. Returns 0 when no agent
+    /// with that name is installed **or** when the registry
+    /// invoke fails for any reason — the two cases are
+    /// indistinguishable from the return value alone, so
+    /// failures emit a `log::warn!` for debugging. Callers that
+    /// need explicit error handling should use
+    /// [`Context::ask`] against `ServiceId::REGISTRY` directly.
+    ///
+    /// Thin convenience over `ctx.ask(REGISTRY, Msg::new("resolve")…)`
+    /// so actor crates don't need to depend on the registry's
+    /// typed Ref to use it. The returned id is dispatchable via
+    /// `ctx.tell` / `ctx.send` — same formula `space up` uses
+    /// when registering installed agents on this node.
+    ///
+    /// **Eventual consistency**: if the local registry replica
+    /// hasn't yet seen a fresh `install` from another node
+    /// (CRDT replication lag), `resolve` returns 0 transiently
+    /// even though the agent exists in the space. Callers that
+    /// need stronger semantics should retry, or watch for the
+    /// agent's appearance via subscriptions.
+    ///
+    /// ```ignore
+    /// let counter = ctx.resolve("counter").await;
+    /// if counter != 0 {
+    ///     ctx.tell(ServiceId(counter), &Msg::new("inc"));
+    /// }
+    /// ```
+    pub fn resolve(&mut self, name: impl Into<alloc::string::String>) -> super::run::Resolve {
+        let prefix = self.id.node_prefix();
+        let mut msg = super::value::Msg::new("resolve");
+        msg = msg.with("name", name.into());
+        msg = msg.with("caller_prefix", prefix as u64);
+        let ask = self.ask(ServiceId::REGISTRY, &msg);
+        super::run::Resolve::new(ask)
+    }
 
     // --- Host I/O (worker mode) ---
 

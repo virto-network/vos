@@ -90,6 +90,49 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
+    // PVM entry-point block — emitted only on riscv64 actor builds
+    // with the `bin` feature on. Same shape `pvm_main!` used to
+    // produce; lives here so the user's lib.rs needs neither a
+    // `pvm_main!()` invocation nor a separate `main.rs`. The
+    // helper symbols (`__VOS_ACTOR_META_ENCODED`,
+    // `_KEEP_ACCUMULATE`) are named with leading underscores /
+    // a `__VOS_` prefix so they don't shadow anything in the
+    // user's module.
+    let pvm_entries = quote! {
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() {
+            vos::run_refine_entry::<#name>();
+        }
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn accumulate() {
+            vos::run_accumulate_entry::<#name>();
+        }
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[used]
+        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        const __VOS_ACTOR_META_ENCODED: ([u8; 4096], usize) =
+            vos::metadata::encode::<4096>(
+                &<<#name as vos::Actor>::Message>::META,
+            );
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(link_section = ".vos_meta")]
+        #[used]
+        static _VOS_META: [u8; __VOS_ACTOR_META_ENCODED.1] = {
+            let (src, len) = __VOS_ACTOR_META_ENCODED;
+            let mut out = [0u8; __VOS_ACTOR_META_ENCODED.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
+    };
+
     let expanded = quote! {
         #struct_def
 
@@ -113,11 +156,21 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 msg: Self::Message,
                 ctx: &mut vos::Context<Self>,
             ) -> vos::RunResult<bool> {
-                vos::try_poll(async {
-                    msg.deliver(self, ctx).await
-                })
+                // Pass `deliver`'s future to `try_poll` directly. Wrapping
+                // it in an `async {}` block compiles to a second state
+                // machine that holds `deliver`'s state machine plus its
+                // own resume slot — doubling the on-stack frame for no
+                // semantic gain. Actors with large async handlers
+                // (branchy `match` or `if/else if` chains) overflow the
+                // PVM's 64 KiB stack on warm-restart specifically because
+                // the warm path already adds two more frames beyond the
+                // cold-start `on_start` path; this redundancy is what
+                // pushes them over the edge.
+                vos::try_poll(msg.deliver(self, ctx))
             }
         }
+
+        #pvm_entries
     };
 
     expanded.into()
@@ -164,9 +217,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
-    // (gated on `feature = "host"`) needs to generate a typed
-    // method per message — the wire name and the unwrapped
-    // success type.
+    // (gated on vos's `std` feature inside `__vos_emit_host_client!`)
+    // needs to generate a typed method per message — the wire
+    // name and the unwrapped success type.
     let mut client_methods: Vec<ClientMethodInfo> = Vec::new();
     let mut has_start_handler = false;
     let mut start_returns_result = false;
@@ -520,10 +573,29 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #enum_name {
             /// Dispatch this message to the actor. Returns `true` if the actor
             /// should stop processing further messages (i.e. `on_error` returned `true`).
-            pub async fn deliver(self, actor: &mut #actor_name, ctx: &mut vos::Context<#actor_name>) -> bool {
-                match self {
-                    #( #deliver_arms )*
-                }
+            ///
+            /// The return is a heap-boxed `Pin<Box<dyn Future>>` rather than
+            /// a bare `async fn` future. The bare form's auto-generated state
+            /// machine is sized to fit the **largest** arm (so it can hold any
+            /// handler's future across an await), which on warm-restart stacks
+            /// alongside `dispatch`'s own future and the caller's frame —
+            /// large branchy handlers (e.g. `if/else if/else` chains) overflow
+            /// the PVM's 64 KiB stack at frame allocation, faulting at
+            /// `0xfffffff8`. Boxing moves the per-arm future onto the heap
+            /// so only a fat pointer rides the stack; one extra alloc per
+            /// dispatch is cheap relative to the failure mode.
+            pub fn deliver<'a>(
+                self,
+                actor: &'a mut #actor_name,
+                ctx: &'a mut vos::Context<#actor_name>,
+            ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
+                dyn ::core::future::Future<Output = bool> + 'a,
+            >> {
+                vos::__alloc::boxed::Box::pin(async move {
+                    match self {
+                        #( #deliver_arms )*
+                    }
+                })
             }
 
             pub fn is_query(&self) -> bool {
@@ -580,16 +652,23 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // PVM service path reads init args from storage. Worker/WASM
         // builds receive args via __vos_create_with_args; bare create()
         // is an error there.
+        //
+        // The cfg gate is target-based, not feature-based: every PVM
+        // actor crate is built for `riscv64`, the service feature is
+        // enabled on `vos` (not on the user crate). A previous version
+        // checked `cfg(feature = "service")` against the *user* crate
+        // — which never has that feature — and `__vos_create` always
+        // hit the panic branch.
         quote! {
             fn __vos_create() -> Self {
-                #[cfg(feature = "service")]
+                #[cfg(target_arch = "riscv64")]
                 {
                     let args: vos::value::Args = vos::lifecycle::load(vos::lifecycle::INIT_KEY)
                         .expect("actor init args not found in storage");
                     #( #extractions )*
                     return Self::new(#( #names ),*);
                 }
-                #[cfg(not(feature = "service"))]
+                #[cfg(not(target_arch = "riscv64"))]
                 panic!(
                     "actor has constructor parameters — workers and WASM \
                      must be created with init args (see vos_worker_create / \
@@ -678,7 +757,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Preamble — always emitted. Worker/WASM entry blocks below
     // reference `_VOS_META_ENCODED` to embed the actor's metadata
     // into their respective `.vos_meta`-shaped exports. The PVM
-    // entries (now in `vos::pvm_main!`) compute their own meta.
+    // entries (auto-emitted by `#[actor]`) compute their own meta.
     let preamble = quote! {
         extern crate alloc;
 
@@ -693,589 +772,55 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             vos::metadata::encode::<4096>(&#enum_name::META);
     };
 
-    // PVM entry points used to land here, gated on
-    // `target_arch = "riscv64"`. They moved to the
-    // `vos::pvm_main!` decl-macro: lib.rs of an actor crate
-    // can now define `#[actor]` + `#[messages]` (so consumers
-    // can import its types and the generated `Client`/
-    // `ActorClient`) without duplicating `_start` /
-    // `accumulate` symbols when another actor crate links
-    // against it. The bin's `main.rs` invokes
-    // `vos::pvm_main!(crate::Foo)` once to materialize the
-    // entries + meta static.
+    // PVM entry points (`_start`, `accumulate`, `.vos_meta`) are
+    // auto-emitted by the `#[actor]` macro itself, gated on
+    // `cfg(all(target_arch = "riscv64", feature = "bin"))` so:
+    //   - host / worker / wasm builds skip them (different arch),
+    //   - cross-actor lib deps skip them (`bin` feature off).
+    // The user's lib.rs no longer needs `pvm_main!()`; one
+    // `#[actor]` is the whole story.
     let pvm_entries = quote! {};
 
     // Worker entry points — native .so plugins (poll-based async ABI).
     //
-    // Building with the `worker` feature also marks the actor as a
-    // [`vos::WorkerActor`], which unlocks the [`vos::WorkerCtx`]
-    // extension methods (`ctx.fetch`, etc.) inside handler bodies.
-    // The trait import below brings those methods into scope so user
-    // handlers can call `ctx.fetch(...)` without an extra `use`.
+    // The decl-macro itself is gated on vos's `worker` feature
+    // (expands to nothing when worker glue isn't relevant for
+    // this build target). Inside its expansion, the `vos_worker_*`
+    // extern fns are further gated on the user crate's `bin`
+    // feature, so cross-actor lib deps don't collide on those
+    // symbols at link time. The `WorkerActor` impl and
+    // `WorkerCtx` use stay unconditional so handler bodies can
+    // reach `ctx.fetch` / etc. regardless.
     let worker_entries = quote! {
-        #[cfg(feature = "worker")]
-        impl vos::WorkerActor for #actor_name {}
-
-        #[cfg(feature = "worker")]
-        #[allow(unused_imports)]
-        use vos::WorkerCtx as _;
-
-        #[cfg(feature = "worker")]
-        mod __vos_worker {
-            use super::*;
-            use core::future::Future;
-            use core::pin::Pin;
-
-            /// Persistent worker state: actor + context + in-flight future.
-            /// One dispatch at a time per instance.
-            struct WorkerState {
-                actor: #actor_name,
-                ctx: vos::Context<#actor_name>,
-                in_flight: Option<Pin<Box<dyn Future<Output = bool>>>>,
-            }
-
-            static _VOS_WORKER_META: [u8; _VOS_META_ENCODED.1] = {
-                let (src, len) = _VOS_META_ENCODED;
-                let mut out = [0u8; _VOS_META_ENCODED.1];
-                let mut i = 0;
-                while i < len { out[i] = src[i]; i += 1; }
-                out
-            };
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_meta(
-                out_ptr: *mut *const u8,
-                out_len: *mut usize,
-            ) {
-                unsafe {
-                    *out_ptr = _VOS_WORKER_META.as_ptr();
-                    *out_len = _VOS_WORKER_META.len();
-                }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_create(
-                args_ptr: *const u8,
-                args_len: usize,
-            ) -> *mut () {
-                use vos::Actor as _;
-                let mut actor = if args_ptr.is_null() || args_len == 0 {
-                    <#actor_name as vos::Actor>::create()
-                } else {
-                    let args_bytes = unsafe {
-                        core::slice::from_raw_parts(args_ptr, args_len)
-                    };
-                    #actor_name::__vos_create_with_args(args_bytes)
-                };
-                let mut ctx = vos::Context::<#actor_name>::new(
-                    vos::actors::context::ServiceId(0),
-                );
-                // Run on_start to completion (blocking).
-                let _ = vos::run_blocking(actor.on_start(&mut ctx));
-                let state = Box::new(WorkerState {
-                    actor,
-                    ctx,
-                    in_flight: None,
-                });
-                Box::into_raw(state) as *mut ()
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_dispatch(
-                state: *mut (),
-                msg_ptr: *const u8,
-                msg_len: usize,
-            ) {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
-
-                // Decode: TAG_DYNAMIC prefix → dynamic Msg → typed enum
-                let msg = if !raw.is_empty() && raw[0] == vos::value::TAG_DYNAMIC {
-                    let dynamic: vos::value::Msg = vos::Decode::decode(&raw[1..]);
-                    match <#enum_name as vos::value::FromDynamic>::from_dynamic(&dynamic) {
-                        Some(m) => m,
-                        None => return, // poll will return error
-                    }
-                } else {
-                    vos::Decode::decode(raw)
-                };
-
-                // Create the handler future. Uses raw pointers because
-                // the future borrows actor+ctx from the same WorkerState.
-                // SAFETY: WorkerState is heap-allocated and never moved
-                // while a future is in flight. Single-threaded.
-                let actor_ptr = &mut ws.actor as *mut #actor_name;
-                let ctx_ptr = &mut ws.ctx as *mut vos::Context<#actor_name>;
-                let future: Pin<Box<dyn Future<Output = bool>>> = Box::pin(async move {
-                    let actor = unsafe { &mut *actor_ptr };
-                    let ctx = unsafe { &mut *ctx_ptr };
-                    msg.deliver(actor, ctx).await
-                });
-                ws.in_flight = Some(future);
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_poll(
-                state: *mut (),
-            ) -> vos::worker::WorkerPollResult {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                let Some(future) = ws.in_flight.as_mut() else {
-                    return vos::worker::WorkerPollResult::error(
-                        vos::worker::POLL_ERR_NO_FUTURE,
-                    );
-                };
-
-                // Poll the future once
-                let waker = vos::__worker::noop_waker();
-                let mut cx = core::task::Context::from_waker(&waker);
-                match future.as_mut().poll(&mut cx) {
-                    core::task::Poll::Ready(_stop) => {
-                        ws.in_flight = None;
-                        let reply_bytes = ws.ctx.take_reply_bytes();
-                        if reply_bytes.is_empty() {
-                            vos::worker::WorkerPollResult::ready_empty()
-                        } else {
-                            vos::worker::WorkerPollResult::ready(reply_bytes)
-                        }
-                    }
-                    core::task::Poll::Pending => {
-                        vos::worker::WorkerPollResult::pending()
-                    }
-                }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_pending_effect(
-                state: *mut (),
-                out_ptr: *mut *const u8,
-                out_len: *mut usize,
-            ) {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                // Peek — pointer valid until next dispatch/poll
-                if let Some(request) = ws.ctx.peek_host_io_request() {
-                    unsafe {
-                        *out_ptr = request.as_ptr();
-                        *out_len = request.len();
-                    }
-                } else {
-                    unsafe {
-                        *out_ptr = core::ptr::null();
-                        *out_len = 0;
-                    }
-                }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_provide_result(
-                state: *mut (),
-                ptr: *const u8,
-                len: usize,
-            ) {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                let result = if ptr.is_null() || len == 0 {
-                    Vec::new()
-                } else {
-                    unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
-                };
-                ws.ctx.set_host_io_result(result);
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_drop(state: *mut ()) {
-                if !state.is_null() {
-                    unsafe { drop(Box::from_raw(state as *mut WorkerState)) };
-                }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_free(ptr: *mut u8, len: usize, cap: usize) {
-                if !ptr.is_null() && cap > 0 {
-                    unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
-                }
-            }
-
-            /// Restore a worker instance from previously saved state.
-            /// Caller takes ownership of the returned pointer.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_load(
-                state_ptr: *const u8,
-                state_len: usize,
-            ) -> *mut () {
-                use vos::Actor as _;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(state_ptr, state_len)
-                };
-                let mut actor: #actor_name = vos::Decode::decode(bytes);
-                let mut ctx = vos::Context::<#actor_name>::new(
-                    vos::actors::context::ServiceId(0),
-                );
-                let _ = vos::run_blocking(actor.on_start(&mut ctx));
-                let state = Box::new(WorkerState {
-                    actor,
-                    ctx,
-                    in_flight: None,
-                });
-                Box::into_raw(state) as *mut ()
-            }
-
-            /// Serialize the current actor state. Returns a heap-allocated
-            /// buffer; caller frees via `vos_worker_free(ptr, len, len)`.
-            ///
-            /// out_ptr / out_len receive the buffer location and size.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_state(
-                state: *mut (),
-                out_ptr: *mut *mut u8,
-                out_len: *mut usize,
-            ) {
-                use vos::Encode;
-                let ws = unsafe { &*(state as *const WorkerState) };
-                let mut bytes = ws.actor.encode();
-                bytes.shrink_to_fit();
-                unsafe {
-                    *out_ptr = bytes.as_mut_ptr();
-                    *out_len = bytes.len();
-                }
-                core::mem::forget(bytes);
-            }
-        }
+        vos::__vos_emit_worker_glue!(#actor_name, #enum_name);
     };
 
-    // WASM entry points — for browser / WASI hosts.
-    //
-    // WASM is 32-bit and lacks multi-value returns in many toolchains,
-    // so we pack two u32s (ptr + len) into a u64 for "buffer" returns:
-    //   high 32 bits = ptr, low 32 bits = len
-    //
-    // The host (JS/WASI) drives the poll loop just like the worker host,
-    // reading effects from WASM linear memory directly.
+    // WASM cdylib entry points (`vos_wasm_*` extern fns). Same
+    // bin-gating shape as worker_entries — the gate lives inside
+    // the decl-macro so the surrounding scope sees the right
+    // symbols regardless of `bin`.
     let wasm_entries = quote! {
-        #[cfg(feature = "wasm")]
-        mod __vos_wasm {
-            use super::*;
-            use core::future::Future;
-            use core::pin::Pin;
-
-            /// Persistent WASM actor state: actor + context + in-flight future.
-            /// Mirrors the worker model — one dispatch at a time.
-            ///
-            /// `last_reply` holds the bytes from the most recent Ready poll
-            /// so the host can read them via `vos_wasm_take_reply`.
-            struct WasmState {
-                actor: #actor_name,
-                ctx: vos::Context<#actor_name>,
-                in_flight: Option<Pin<Box<dyn Future<Output = bool>>>>,
-                last_reply: Option<Vec<u8>>,
-            }
-
-            static _VOS_WASM_META: [u8; _VOS_META_ENCODED.1] = {
-                let (src, len) = _VOS_META_ENCODED;
-                let mut out = [0u8; _VOS_META_ENCODED.1];
-                let mut i = 0;
-                while i < len { out[i] = src[i]; i += 1; }
-                out
-            };
-
-            /// Pack (ptr, len) into a u64 for returning across the WASM ABI.
-            #[inline]
-            fn pack_buf(ptr: u32, len: u32) -> u64 {
-                ((ptr as u64) << 32) | (len as u64)
-            }
-
-            /// Returns metadata bytes as packed (ptr, len).
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_meta() -> u64 {
-                pack_buf(
-                    _VOS_WASM_META.as_ptr() as u32,
-                    _VOS_WASM_META.len() as u32,
-                )
-            }
-
-            /// Allocate a buffer in WASM memory. Used by the host to write
-            /// init args / messages / I/O results before passing pointers
-            /// to other functions. Caller must free via `vos_wasm_free`.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_alloc(size: u32) -> u32 {
-                let mut buf: Vec<u8> = Vec::with_capacity(size as usize);
-                // SAFETY: capacity is at least size; bytes are uninitialized
-                // but the host writes to them before reading.
-                unsafe { buf.set_len(size as usize); }
-                let ptr = buf.as_mut_ptr() as u32;
-                core::mem::forget(buf);
-                ptr
-            }
-
-            /// Free a buffer previously returned by `vos_wasm_alloc` or
-            /// `vos_wasm_take_reply`.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_free(ptr: u32, size: u32) {
-                if ptr != 0 && size > 0 {
-                    unsafe {
-                        drop(Vec::from_raw_parts(
-                            ptr as *mut u8,
-                            size as usize,
-                            size as usize,
-                        ));
-                    }
-                }
-            }
-
-            /// Create a new actor instance. `args_ptr` may be 0 (no init args).
-            /// Returns the state pointer (opaque handle).
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_create(args_ptr: u32, args_len: u32) -> u32 {
-                use vos::Actor as _;
-                let mut actor = if args_ptr == 0 || args_len == 0 {
-                    <#actor_name as vos::Actor>::create()
-                } else {
-                    let args_bytes = unsafe {
-                        core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize)
-                    };
-                    #actor_name::__vos_create_with_args(args_bytes)
-                };
-                let mut ctx = vos::Context::<#actor_name>::new(
-                    vos::actors::context::ServiceId(0),
-                );
-                let _ = vos::run_blocking(actor.on_start(&mut ctx));
-                let state = Box::new(WasmState {
-                    actor,
-                    ctx,
-                    in_flight: None,
-                    last_reply: None,
-                });
-                Box::into_raw(state) as u32
-            }
-
-            /// Start dispatching a message. Caller must drive with `vos_wasm_poll`.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_dispatch(state: u32, msg_ptr: u32, msg_len: u32) {
-                let ws = unsafe { &mut *(state as *mut WasmState) };
-                let raw = unsafe {
-                    core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize)
-                };
-
-                let msg = if !raw.is_empty() && raw[0] == vos::value::TAG_DYNAMIC {
-                    let dynamic: vos::value::Msg = vos::Decode::decode(&raw[1..]);
-                    match <#enum_name as vos::value::FromDynamic>::from_dynamic(&dynamic) {
-                        Some(m) => m,
-                        None => return,
-                    }
-                } else {
-                    vos::Decode::decode(raw)
-                };
-
-                let actor_ptr = &mut ws.actor as *mut #actor_name;
-                let ctx_ptr = &mut ws.ctx as *mut vos::Context<#actor_name>;
-                let future: Pin<Box<dyn Future<Output = bool>>> = Box::pin(async move {
-                    let actor = unsafe { &mut *actor_ptr };
-                    let ctx = unsafe { &mut *ctx_ptr };
-                    msg.deliver(actor, ctx).await
-                });
-                ws.in_flight = Some(future);
-            }
-
-            /// Poll the in-flight handler once.
-            /// Returns: 0 = Ready, 1 = Pending, -1 = no future, -2 = decode error
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_poll(state: u32) -> i32 {
-                let ws = unsafe { &mut *(state as *mut WasmState) };
-                let Some(future) = ws.in_flight.as_mut() else {
-                    return -1;
-                };
-                let waker = vos::__worker::noop_waker();
-                let mut cx = core::task::Context::from_waker(&waker);
-                match future.as_mut().poll(&mut cx) {
-                    core::task::Poll::Ready(_stop) => {
-                        ws.in_flight = None;
-                        let reply = ws.ctx.take_reply_bytes();
-                        ws.last_reply = if reply.is_empty() { None } else { Some(reply) };
-                        0
-                    }
-                    core::task::Poll::Pending => 1,
-                }
-            }
-
-            /// Take the reply bytes from the last Ready poll. Returns
-            /// packed (ptr, len) — caller owns the buffer and must free
-            /// via `vos_wasm_free(ptr, len)`.
-            ///
-            /// Returns 0 if no reply is available.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_take_reply(state: u32) -> u64 {
-                let ws = unsafe { &mut *(state as *mut WasmState) };
-                match ws.last_reply.take() {
-                    Some(bytes) => {
-                        // Shrink to exact size so cap == len for free
-                        let mut bytes = bytes;
-                        bytes.shrink_to_fit();
-                        let len = bytes.len();
-                        let ptr = bytes.as_mut_ptr();
-                        core::mem::forget(bytes);
-                        pack_buf(ptr as u32, len as u32)
-                    }
-                    None => 0,
-                }
-            }
-
-            /// Read the pending host I/O request. Returns packed (ptr, len)
-            /// into worker memory — pointer valid until next dispatch/poll.
-            /// Returns 0 if no pending effect.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_pending_effect(state: u32) -> u64 {
-                let ws = unsafe { &mut *(state as *mut WasmState) };
-                match ws.ctx.peek_host_io_request() {
-                    Some(bytes) => pack_buf(bytes.as_ptr() as u32, bytes.len() as u32),
-                    None => 0,
-                }
-            }
-
-            /// Provide the result for the pending host I/O request.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_provide_result(state: u32, ptr: u32, len: u32) {
-                let ws = unsafe { &mut *(state as *mut WasmState) };
-                let result = if ptr == 0 || len == 0 {
-                    Vec::new()
-                } else {
-                    unsafe {
-                        core::slice::from_raw_parts(ptr as *const u8, len as usize)
-                    }.to_vec()
-                };
-                ws.ctx.set_host_io_result(result);
-            }
-
-            /// Drop the actor instance.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_drop(state: u32) {
-                if state != 0 {
-                    unsafe { drop(Box::from_raw(state as *mut WasmState)) };
-                }
-            }
-
-            /// Restore an actor instance from previously saved state.
-            /// Returns the new state pointer.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_load(state_ptr: u32, state_len: u32) -> u32 {
-                use vos::Actor as _;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(state_ptr as *const u8, state_len as usize)
-                };
-                let mut actor: #actor_name = vos::Decode::decode(bytes);
-                let mut ctx = vos::Context::<#actor_name>::new(
-                    vos::actors::context::ServiceId(0),
-                );
-                let _ = vos::run_blocking(actor.on_start(&mut ctx));
-                let state = Box::new(WasmState {
-                    actor,
-                    ctx,
-                    in_flight: None,
-                    last_reply: None,
-                });
-                Box::into_raw(state) as u32
-            }
-
-            /// Serialize the current actor state. Returns packed (ptr, len).
-            /// Caller frees via `vos_wasm_free(ptr, len)`.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_state(state: u32) -> u64 {
-                use vos::Encode;
-                let ws = unsafe { &*(state as *const WasmState) };
-                let mut bytes = ws.actor.encode();
-                bytes.shrink_to_fit();
-                let len = bytes.len();
-                let ptr = bytes.as_mut_ptr();
-                core::mem::forget(bytes);
-                pack_buf(ptr as u32, len as u32)
-            }
-
-            /// Encode a JS-friendly MsgDesc into a TAG_DYNAMIC-prefixed
-            /// rkyv-encoded Msg, ready to pass to `vos_wasm_dispatch`.
-            ///
-            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
-            /// Returns 0 on decode error.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_encode_msg(desc_ptr: u32, desc_len: u32) -> u64 {
-                if desc_ptr == 0 || desc_len == 0 { return 0; }
-                let desc = unsafe {
-                    core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
-                };
-                let Some(msg) = vos::value::desc::decode_msg(desc) else {
-                    return 0;
-                };
-                use vos::Encode;
-                let encoded = msg.encode();
-                let mut out: Vec<u8> = Vec::with_capacity(1 + encoded.len());
-                out.push(vos::value::TAG_DYNAMIC);
-                out.extend_from_slice(&encoded);
-                out.shrink_to_fit();
-                let len = out.len();
-                let ptr = out.as_mut_ptr();
-                core::mem::forget(out);
-                pack_buf(ptr as u32, len as u32)
-            }
-
-            /// Encode an ArgsDesc into rkyv-encoded `Args` bytes, ready
-            /// to pass to `vos_wasm_create` as init args.
-            ///
-            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
-            /// Returns 0 on decode error.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_encode_args(desc_ptr: u32, desc_len: u32) -> u64 {
-                if desc_ptr == 0 || desc_len == 0 { return 0; }
-                let desc = unsafe {
-                    core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
-                };
-                let Some(args) = vos::value::desc::decode_args(desc) else {
-                    return 0;
-                };
-                use vos::Encode;
-                let mut encoded = args.encode();
-                encoded.shrink_to_fit();
-                let len = encoded.len();
-                let ptr = encoded.as_mut_ptr();
-                core::mem::forget(encoded);
-                pack_buf(ptr as u32, len as u32)
-            }
-
-            /// Decode a rkyv-encoded Value into the JS-friendly ValueDesc format.
-            ///
-            /// Returns packed (ptr, len). Caller frees via `vos_wasm_free`.
-            /// Returns 0 on empty input or decode error.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_wasm_decode_value(value_ptr: u32, value_len: u32) -> u64 {
-                if value_ptr == 0 || value_len == 0 { return 0; }
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
-                };
-                let value: vos::value::Value = vos::Decode::decode(bytes);
-                let mut out = vos::value::desc::encode_value(&value);
-                out.shrink_to_fit();
-                let len = out.len();
-                let ptr = out.as_mut_ptr();
-                core::mem::forget(out);
-                pack_buf(ptr as u32, len as u32)
-            }
-        }
+        vos::__vos_emit_wasm_glue!(#actor_name, #enum_name);
     };
 
-    // ── Host client emission ────────────────────────────────────
+    // ── Unified Ref emission ────────────────────────────────────
     //
-    // For consumers compiled with `feature = "host"`, generate a
-    // `{Actor}Client` struct + impl with one typed method per
-    // `#[msg]`. Each method calls `VosNode::invoke` on a target
-    // ServiceId (set at construction time), encodes args into a
-    // dynamic `Msg`, and decodes the reply based on the
-    // handler's declared return type.
+    // `{Actor}Ref` is the typed reference for both call sites:
     //
-    // Caller crates that don't declare a `host` feature get
-    // nothing — the cfg evaluates false and the items disappear.
-    let client_struct_name = format_ident!("{}Client", actor_name);
-    let client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
+    //   - inside a PVM actor handler, with `ctx` as the invoker
+    //     (`Context<A>: Invoker`),
+    //   - from host code, with `&node` as the invoker (gated on
+    //     vos's `std` feature where `&VosNode: Invoker` lives).
+    //
+    // Holds only a `ServiceId`, no_std + dep-free. Each method
+    // takes `&mut impl Invoker` as its first parameter. Methods
+    // are `async`; host callers wrap them with `vos::block_on`.
+    let ref_struct_name = format_ident!("{}Ref", actor_name);
+    let ref_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
         .iter()
         .map(|m| {
             let method_ident = &m.wire_name;
             let wire_name = m.wire_name.to_string();
-            let arg_idents: Vec<&syn::Ident> = m.args.iter().map(|(n, _)| n).collect();
-            let arg_types: Vec<&syn::Type> = m.args.iter().map(|(_, t)| t).collect();
             let arg_decls: Vec<proc_macro2::TokenStream> = m
                 .args
                 .iter()
@@ -1297,10 +842,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             let value_ident = format_ident!("__value");
             let decode = client_decode_body(&m.success_ty, &value_ident);
-            let _ = (arg_idents, arg_types); // silence unused — used inline
             quote! {
-                pub fn #method_ident(
+                pub async fn #method_ident<__I: vos::actors::client::Invoker>(
                     &self,
+                    __inv: &mut __I,
                     #( #arg_decls ),*
                 ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
                     use vos::Encode;
@@ -1310,120 +855,32 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
                     __payload.push(vos::value::TAG_DYNAMIC);
                     __payload.extend_from_slice(&__encoded);
-                    let __reply_bytes = self.node
-                        .invoke(self.target, __payload)
-                        .ok_or(vos::actors::client::ClientError::Unreachable)?;
-                    // Unit-returning handlers reply with zero bytes;
-                    // shape that as `Value::Unit` so the per-return-type
-                    // decoder below doesn't panic in `Decode::decode`.
-                    let #value_ident: vos::value::Value = if __reply_bytes.is_empty() {
-                        vos::value::Value::Unit
-                    } else {
-                        vos::Decode::decode(&__reply_bytes)
-                    };
+                    let #value_ident: vos::value::Value =
+                        __inv.invoke(self.target, __payload).await?;
                     #decode
                 }
             }
         })
         .collect();
 
-    let client_emission = quote! {
-        #[cfg(feature = "host")]
-        pub struct #client_struct_name<'a> {
-            node: &'a vos::node::VosNode,
+    let ref_emission = quote! {
+        #[derive(Copy, Clone)]
+        pub struct #ref_struct_name {
             target: vos::abi::service::ServiceId,
         }
 
-        #[cfg(feature = "host")]
-        impl<'a> #client_struct_name<'a> {
-            /// Bind to an explicit `ServiceId`.
-            pub fn at(
-                node: &'a vos::node::VosNode,
-                target: vos::abi::service::ServiceId,
-            ) -> Self {
-                Self { node, target }
+        impl #ref_struct_name {
+            /// Bind to an explicit `ServiceId`. Cheap; copy freely.
+            pub const fn at(target: vos::abi::service::ServiceId) -> Self {
+                Self { target }
             }
 
-            #( #client_methods_emit )*
-        }
-    };
-
-    // ── Actor-side client emission ──────────────────────────────
-    //
-    // Same shape as the host client, but for use from inside
-    // another actor's handler. Holds `&mut Context<A>` and the
-    // target ServiceId. Methods are async; they call
-    // `ctx.ask_raw(target, payload).await`, get back a `Value`,
-    // and decode against the handler's declared return type.
-    //
-    // No feature gate — the actor framework that's needed is
-    // always available when `vos` is in the dep graph (which is
-    // a hard requirement for `#[messages]`).
-    let actor_client_struct_name = format_ident!("{}ActorClient", actor_name);
-    let actor_client_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
-        .iter()
-        .map(|m| {
-            let method_ident = &m.wire_name;
-            let wire_name = m.wire_name.to_string();
-            let arg_decls: Vec<proc_macro2::TokenStream> = m
-                .args
-                .iter()
-                .map(|(n, t)| {
-                    quote! { #n: #t }
-                })
-                .collect();
-            let with_calls: Vec<proc_macro2::TokenStream> = m
-                .args
-                .iter()
-                .map(|(n, _)| {
-                    let n_str = n.to_string();
-                    quote! { .with(#n_str, #n) }
-                })
-                .collect();
-            let return_ty: proc_macro2::TokenStream = match &m.success_ty {
-                None => quote! { () },
-                Some(t) => quote! { #t },
-            };
-            let value_ident = format_ident!("__value");
-            let decode = client_decode_body(&m.success_ty, &value_ident);
-            quote! {
-                pub async fn #method_ident(
-                    &mut self,
-                    #( #arg_decls ),*
-                ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                    use vos::Encode;
-                    let __msg = vos::value::Msg::new(#wire_name)
-                        #( #with_calls )*;
-                    let __encoded = __msg.encode();
-                    let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                    __payload.push(vos::value::TAG_DYNAMIC);
-                    __payload.extend_from_slice(&__encoded);
-                    let __reply_value = self.ctx.ask_raw(self.target, &__payload).await
-                        .map_err(|_| vos::actors::client::ClientError::Unreachable)?;
-                    let #value_ident: vos::value::Value = __reply_value;
-                    #decode
-                }
-            }
-        })
-        .collect();
-
-    let actor_client_emission = quote! {
-        pub struct #actor_client_struct_name<'a, __A: vos::Actor> {
-            ctx: &'a mut vos::Context<__A>,
-            target: vos::abi::service::ServiceId,
-        }
-
-        impl<'a, __A: vos::Actor> #actor_client_struct_name<'a, __A> {
-            /// Bind to an explicit `ServiceId` from inside another
-            /// actor's handler.
-            pub fn at(
-                ctx: &'a mut vos::Context<__A>,
-                target: vos::abi::service::ServiceId,
-            ) -> Self {
-                Self { ctx, target }
+            /// The `ServiceId` this ref points at.
+            pub const fn id(&self) -> vos::abi::service::ServiceId {
+                self.target
             }
 
-            #( #actor_client_methods_emit )*
+            #( #ref_methods_emit )*
         }
     };
 
@@ -1436,8 +893,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #pvm_entries
         #worker_entries
         #wasm_entries
-        #client_emission
-        #actor_client_emission
+        #ref_emission
     };
 
     expanded.into()

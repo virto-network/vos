@@ -140,10 +140,19 @@ fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
 }
 
 // --- Per-service refine journal ---
+//
+// One journal spans a top-level service's tick. It accumulates effects
+// from the service itself **and** from any children it INVOKEs — JAM
+// semantics make every effect produced under one refine a structural
+// part of that refine's commit. The journal still tracks *which*
+// service each entry belongs to so they land on the right storage row
+// at commit time and `journaled_read` can serve read-your-own-writes
+// without a parent's writes shadowing a child's lookup.
 
 #[derive(Default)]
 struct RefineJournal {
-    writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Pending writes, scoped per service: `(svc_id, key, value)`.
+    writes: Vec<(u32, Vec<u8>, Vec<u8>)>,
     transfers: Vec<(ServiceId, Vec<u8>)>,
     preimages: Vec<([u8; 32], Vec<u8>)>,
     self_messages: Vec<Vec<u8>>,
@@ -153,20 +162,24 @@ struct RefineJournal {
 }
 
 impl RefineJournal {
-    /// Read-your-own-writes: latest journaled value for `key`, if any.
-    fn journaled_read(&self, key: &[u8]) -> Option<&[u8]> {
+    /// Read-your-own-writes for `svc_id`: latest journaled value for
+    /// `key` written by *this* service, if any. Other services' writes
+    /// to the same key are intentionally ignored — STATE_KEY collides
+    /// across services and would otherwise let a parent's encoded
+    /// state shadow a child's STORAGE_R during a nested INVOKE.
+    fn journaled_read(&self, svc_id: u32, key: &[u8]) -> Option<&[u8]> {
         self.writes
             .iter()
             .rev()
-            .find(|(k, _)| k.as_slice() == key)
-            .map(|(_, v)| v.as_slice())
+            .find(|(s, k, _)| *s == svc_id && k.as_slice() == key)
+            .map(|(_, _, v)| v.as_slice())
     }
 
     fn absorb_effects(&mut self, effects: Vec<Effect>, self_id: u32) {
         for eff in effects {
             match eff {
                 Effect::Write { key, value } => {
-                    self.writes.push((key, value));
+                    self.writes.push((self_id, key, value));
                 }
                 Effect::Transfer { target, memo } => {
                     if target == self_id {
@@ -220,14 +233,37 @@ struct ServiceInfo {
     alive: bool,
 }
 
+/// Reply from an external invoke handler.
+///
+/// `Done` covers the common case (workers, completed agent dispatches):
+/// just reply bytes. `Yielded` carries the post-dispatch state + reply
+/// so the calling actor's `lifecycle::invoke_raw` decodes it as
+/// `InvokeResult::Yielded { state, reply }` and can keep driving the
+/// yielded child on subsequent ticks. The runtime packs whichever
+/// variant the handler returns into the same wire envelope a
+/// same-runtime INVOKE would produce.
+#[derive(Debug, Clone)]
+pub enum ExternalInvokeReply {
+    Done(Vec<u8>),
+    Yielded { state: Vec<u8>, reply: Vec<u8> },
+}
+
+impl ExternalInvokeReply {
+    /// Common case: a non-yielding reply. Equivalent to
+    /// `ExternalInvokeReply::Done(reply)`.
+    pub fn done(reply: Vec<u8>) -> Self {
+        ExternalInvokeReply::Done(reply)
+    }
+}
+
 /// Callback for handling INVOKE hostcalls to services not in this runtime.
 ///
-/// Receives `(target_service_id, message_bytes)`. Returns `Some(reply_bytes)`
-/// if the target is handled externally (e.g. a worker), or `None` to fall
-/// through to STATUS_NOT_FOUND.
-///
-/// The reply bytes are rkyv-encoded Value (same format as `ctx.take_reply_bytes()`).
-pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<Vec<u8>> + Send>;
+/// Receives `(target_service_id, message_bytes)`. Returns
+/// `Some(ExternalInvokeReply)` when the external target serviced the
+/// request, or `None` to fall through to `STATUS_NOT_FOUND`. Workers
+/// and one-shot handlers return `Done(reply)`; agents that propagate
+/// yields across thread boundaries return `Yielded { state, reply }`.
+pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<ExternalInvokeReply> + Send>;
 
 pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
@@ -594,11 +630,16 @@ impl<D: DataLayer> VosRuntime<D> {
                             let cn = payload.continue_next;
                             let state = payload.state;
                             // Capture the reply bytes for the host's
-                            // synchronous-invoke path. take_last_reply
-                            // pulls them out after run_blocking.
-                            if !payload.reply.is_empty() {
-                                self.last_reply.insert(svc_id, payload.reply.clone());
-                            }
+                            // synchronous-invoke path. Always insert,
+                            // even for empty replies (Unit-returning
+                            // handlers): callers distinguish "handler
+                            // returned ()" from "handler panicked" by
+                            // looking at whether `take_last_reply`
+                            // returns `Some(_)` or `None`. A `None`
+                            // here would conflate the two and let
+                            // panics surface to the host as silent
+                            // success.
+                            self.last_reply.insert(svc_id, payload.reply.clone());
                             journal.absorb_effects(payload.effects, svc_id);
                             (cn, state)
                         } else {
@@ -617,14 +658,17 @@ impl<D: DataLayer> VosRuntime<D> {
                     // state instead of stale bytes from the previous
                     // dispatch. Empty state means nothing changed.
                     if !actor_state.is_empty() {
-                        journal
-                            .writes
-                            .push((crate::lifecycle::STATE_KEY_BYTES.to_vec(), actor_state));
+                        journal.writes.push((
+                            svc_id,
+                            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                            actor_state,
+                        ));
                     }
 
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
                         save_continuation(
+                            svc_id,
                             flat_mem,
                             heap_base,
                             heap_top,
@@ -638,10 +682,14 @@ impl<D: DataLayer> VosRuntime<D> {
                         for msg in journal.self_messages.drain(..) {
                             new_transfers.push((ServiceId(svc_id), msg));
                         }
-                        // Enqueue a wake-up transfer so the service is
-                        // re-ticked next round (continuation resumes it
-                        // with warm memory).
-                        new_transfers.push((ServiceId(svc_id), Vec::new()));
+                        // No automatic wake-up: a yielded service that
+                        // produced no self-message has nothing more to
+                        // do under its own steam. The continuation is
+                        // saved so a future external message
+                        // (typically an INVOKE from a parent agent
+                        // that owns the dispatch loop) can resume it.
+                        // The host is intentionally dumb — orchestration
+                        // is the caller's responsibility.
                         break;
                     }
 
@@ -670,7 +718,14 @@ impl<D: DataLayer> VosRuntime<D> {
                     // for the next tick. Capture a continuation so the
                     // service warm-restarts with its current heap/actor.
                     let (flat_mem, heap_base, heap_top) = captured;
-                    save_continuation(flat_mem, heap_base, heap_top, &mut self.data, &mut journal);
+                    save_continuation(
+                        svc_id,
+                        flat_mem,
+                        heap_base,
+                        heap_top,
+                        &mut self.data,
+                        &mut journal,
+                    );
                     // Re-queue leftover self-messages for next tick.
                     for msg in items.drain(..) {
                         new_transfers.push((ServiceId(svc_id), msg));
@@ -681,8 +736,12 @@ impl<D: DataLayer> VosRuntime<D> {
             }
 
             // Commit the journal (accumulate as a direct replay).
-            for (key, value) in journal.writes.drain(..) {
-                storage.write(ServiceId(svc_id), &key, &value);
+            // Each entry carries its origin service_id — children
+            // INVOKEd inside this refine produced their own writes,
+            // and they need to land on the child's storage row, not
+            // the dispatching service's.
+            for (write_svc_id, key, value) in journal.writes.drain(..) {
+                storage.write(ServiceId(write_svc_id), &key, &value);
             }
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);
@@ -842,7 +901,12 @@ fn handle_refine_hostcall(
                 let copy_len = item.len().min(buf_len);
                 kwrite(kernel, buf_ptr, &item[..copy_len]);
                 items.remove(0);
-                (copy_len as u64, 0)
+                // Return the full item length, not copy_len. The guest
+                // pairs this with `n <= buf_len` to detect truncation:
+                // n > buf_len means the value didn't fit. Returning
+                // copy_len here would conflate "fit exactly" with "was
+                // truncated", silently dropping items of size buf_len.
+                (item.len() as u64, 0)
             } else {
                 (0, 0)
             }
@@ -850,13 +914,16 @@ fn handle_refine_hostcall(
         hostcall::INFO => (svc_id as u64, 0),
         hostcall::STORAGE_R => {
             let key = kread(kernel, a0 as u32, a1 as usize);
-            let journaled = journal.journaled_read(&key).map(|v| v.to_vec());
+            let journaled = journal.journaled_read(svc_id, &key).map(|v| v.to_vec());
             let value = journaled.or_else(|| storage.read(id, &key).map(|v| v.to_vec()));
             match value {
                 Some(v) => {
                     let copy_len = v.len().min(a3 as usize);
                     kwrite(kernel, a2 as u32, &v[..copy_len]);
-                    (copy_len as u64, 0)
+                    // Return the full value length so the guest can
+                    // detect truncation (n > buf_len). See FETCH for
+                    // the rationale.
+                    (v.len() as u64, 0)
                 }
                 None => (error::HOST_NONE, 0),
             }
@@ -864,7 +931,7 @@ fn handle_refine_hostcall(
         hostcall::STORAGE_W => {
             let key = kread(kernel, a0 as u32, a1 as usize);
             let value = kread(kernel, a2 as u32, a3 as usize);
-            journal.writes.push((key, value));
+            journal.writes.push((svc_id, key, value));
             (error::HOST_OK, 0)
         }
         hostcall::TRANSFER => {
@@ -892,7 +959,11 @@ fn handle_refine_hostcall(
                 Some(d) => {
                     let copy_len = d.len().min(buf_len);
                     kwrite(kernel, buf_ptr, &d[..copy_len]);
-                    (copy_len as u64, 0)
+                    // Return the full preimage length (mirrors STORAGE_R
+                    // / FETCH) so guests can detect truncation. No
+                    // current caller in vos but the contract should be
+                    // consistent across the read-into-buffer hostcalls.
+                    (d.len() as u64, 0)
                 }
                 None => (error::HOST_NONE, 0),
             }
@@ -924,6 +995,29 @@ fn handle_refine_hostcall(
             }
         }
         hostcall::OUTPUT | hostcall::CHECKPOINT => (error::HOST_OK, 0),
+        crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+            // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B
+            // in/out), a1=m_ptr (128B in), a2=t_low (counter low
+            // 64 bits), a3=f flag. The compress primitive itself
+            // lives inside vos::crypto as `host_compress_block`
+            // — `blake2b_simd` doesn't expose a public single-
+            // block API, so this glue stays in-tree.
+            let h_ptr = a0 as u32;
+            let m_ptr = a1 as u32;
+            let t_low = a2;
+            let f_flag = a3 != 0;
+            let h_bytes = kread(kernel, h_ptr, 64);
+            let m_bytes = kread(kernel, m_ptr, 128);
+            if h_bytes.len() != 64 || m_bytes.len() != 128 {
+                (error::HOST_WHAT, 0)
+            } else {
+                let mut h: [u8; 64] = h_bytes.try_into().unwrap();
+                let m: [u8; 128] = m_bytes.try_into().unwrap();
+                crate::crypto::blake2b::host_compress_block(&mut h, &m, t_low as u128, f_flag);
+                kwrite(kernel, h_ptr, &h);
+                (error::HOST_OK, 0)
+            }
+        }
         hostcall::INVOKE => {
             let result = handle_invoke(
                 kernel,
@@ -955,33 +1049,59 @@ fn handle_refine_hostcall(
 /// Nested invokes (depth >= 2) belong to a child's refine and
 /// are irrelevant to the caller's session.
 ///
-/// **Cap enforcement.** When recording, the session carries a
-/// per-reply byte cap (16 KiB by default). Outputs larger than the
-/// cap are replaced — both in the log and in the caller's buffer —
-/// with a single STATUS_PANICKED byte. The caller's PVM observes
-/// `InvokeError::Panicked`; replay reproduces the same observation
-/// bit-for-bit. The intent is to keep DAG nodes bounded so a
-/// runaway worker can't poison consensus replicas with multi-MB
+/// **Buffer cap enforcement.** When the caller's `output` register
+/// carries a non-zero length in its high 32 bits (`output_buf_len`),
+/// the runtime refuses to write more than that into the caller's
+/// PVM memory. An over-cap reply is replaced with a one-byte
+/// `STATUS_PANICKED` envelope at the caller's `output_ptr`, so the
+/// guest sees `InvokeError::Panicked` rather than having its stack
+/// silently overrun. A length of 0 means a legacy guest predating
+/// the ABI extension — fall through to the unbounded write.
+///
+/// **Recording cap enforcement.** When recording, the session
+/// carries a per-reply byte cap (16 KiB by default). Outputs larger
+/// than that cap are replaced — both in the log and in the caller's
+/// buffer — with a single STATUS_PANICKED byte. The caller's PVM
+/// observes `InvokeError::Panicked`; replay reproduces the same
+/// observation bit-for-bit. The intent is to keep DAG nodes bounded
+/// so a runaway worker can't poison consensus replicas with multi-MB
 /// payloads.
 fn record_and_write_invoke(
     caller: &mut InvocationKernel,
     output_ptr: u32,
+    output_buf_len: usize,
     output: &[u8],
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
     use crate::actors::run::STATUS_PANICKED;
 
-    if depth == 1 {
-        if let crate::effect_log::EffectMode::Recording(s) = mode {
-            if output.len() > s.cap() {
-                let truncated = alloc::vec![STATUS_PANICKED];
-                s.record(truncated.clone());
-                kwrite(caller, output_ptr, &truncated);
-                return truncated.len() as u64;
-            }
-            s.record(output.to_vec());
+    // Buffer cap fires first — if the reply doesn't fit in the
+    // caller's PVM buffer, kwrite would overrun. Surface it as a
+    // panic. This also feeds the recording log a STATUS_PANICKED
+    // marker (see Recording branch below), so replay sees the
+    // same observation.
+    if output_buf_len > 0 && output.len() > output_buf_len {
+        let truncated = alloc::vec![STATUS_PANICKED];
+        if depth == 1
+            && let crate::effect_log::EffectMode::Recording(s) = mode
+        {
+            s.record(truncated.clone());
         }
+        kwrite(caller, output_ptr, &truncated);
+        return truncated.len() as u64;
+    }
+
+    if depth == 1
+        && let crate::effect_log::EffectMode::Recording(s) = mode
+    {
+        if output.len() > s.cap() {
+            let truncated = alloc::vec![STATUS_PANICKED];
+            s.record(truncated.clone());
+            kwrite(caller, output_ptr, &truncated);
+            return truncated.len() as u64;
+        }
+        s.record(output.to_vec());
     }
     kwrite(caller, output_ptr, output);
     output.len() as u64
@@ -1011,7 +1131,14 @@ fn handle_invoke(
     let input_ptr = caller.active_reg(8) as u32;
     let input_len = caller.active_reg(9) as usize;
     let gas_limit = caller.active_reg(10);
-    let output_ptr = caller.active_reg(11) as u32;
+    // Output register is packed: low 32 bits are the PVM address,
+    // high 32 bits are the buffer length. Legacy guests that
+    // predate this packing pass 0 in the high bits, in which case
+    // `record_and_write_invoke` skips the buffer cap and writes
+    // unbounded (preserving prior behaviour).
+    let output_packed = caller.active_reg(11);
+    let output_ptr = output_packed as u32;
+    let output_buf_len = (output_packed >> 32) as u32 as usize;
 
     // Replay fast path: at the top-level invoke under a replay
     // session, return the next recorded output instead of running
@@ -1019,19 +1146,26 @@ fn handle_invoke(
     // — the handler has become non-deterministic (asking more than
     // we recorded), and the caller should treat the whole rebuild
     // as a failure.
-    if depth == 1 {
-        if let crate::effect_log::EffectMode::Replaying(replay) = mode {
-            let out: alloc::vec::Vec<u8> = match replay.next_reply() {
-                Some(bytes) => bytes.to_vec(),
-                None => alloc::vec![STATUS_PANICKED],
-            };
-            kwrite(caller, output_ptr, &out);
-            return out.len() as u64;
-        }
+    if depth == 1
+        && let crate::effect_log::EffectMode::Replaying(replay) = mode
+    {
+        let out: alloc::vec::Vec<u8> = match replay.next_reply() {
+            Some(bytes) => bytes.to_vec(),
+            None => alloc::vec![STATUS_PANICKED],
+        };
+        kwrite(caller, output_ptr, &out);
+        return out.len() as u64;
     }
 
     if depth >= MAX_INVOKE_DEPTH {
-        return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_OOG],
+            depth,
+            mode,
+        );
     }
 
     let code_hash = kread_hash(caller, hash_ptr);
@@ -1066,7 +1200,12 @@ fn handle_invoke(
         match services.get(&target_svc_id.0) {
             Some(info) => info.blob_idx,
             None => {
-                // Target not in this runtime — try external invoke (e.g. worker)
+                // Target not in this runtime — try external invoke
+                // (worker on another thread, agent on another thread,
+                // or peer over the network). The handler reports
+                // whether the target yielded so the caller's PVM
+                // sees the same status it would for a same-runtime
+                // INVOKE; the runtime packs the wire envelope here.
                 if let Some(handler) = external_invoke {
                     let input = kread(caller, input_ptr, input_len);
                     // Extract message from invoke input: [state_len:u32][state][msg]
@@ -1078,17 +1217,33 @@ fn handle_invoke(
                         input
                     };
                     if let Some(reply) = handler(target_svc_id, &msg) {
-                        // Pack as invoke output: [STATUS_DONE][state_len=0:u32][reply]
-                        let mut output = Vec::with_capacity(5 + reply.len());
-                        output.push(crate::actors::run::STATUS_DONE);
-                        output.extend_from_slice(&0u32.to_le_bytes());
-                        output.extend_from_slice(&reply);
-                        return record_and_write_invoke(caller, output_ptr, &output, depth, mode);
+                        let (status, state, reply_bytes) = match reply {
+                            ExternalInvokeReply::Done(r) => {
+                                (crate::actors::run::STATUS_DONE, Vec::new(), r)
+                            }
+                            ExternalInvokeReply::Yielded { state, reply } => {
+                                (crate::actors::run::STATUS_YIELDED, state, reply)
+                            }
+                        };
+                        let mut output = Vec::with_capacity(5 + state.len() + reply_bytes.len());
+                        output.push(status);
+                        output.extend_from_slice(&(state.len() as u32).to_le_bytes());
+                        output.extend_from_slice(&state);
+                        output.extend_from_slice(&reply_bytes);
+                        return record_and_write_invoke(
+                            caller,
+                            output_ptr,
+                            output_buf_len,
+                            &output,
+                            depth,
+                            mode,
+                        );
                     }
                 }
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
+                    output_buf_len,
                     &[STATUS_NOT_FOUND],
                     depth,
                     mode,
@@ -1096,12 +1251,26 @@ fn handle_invoke(
             }
         }
     } else {
-        return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_NOT_FOUND],
+            depth,
+            mode,
+        );
     };
     let blob = match blobs.get(blob_idx) {
         Some(b) => b,
         None => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_NOT_FOUND], depth, mode);
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_NOT_FOUND],
+                depth,
+                mode,
+            );
         }
     };
 
@@ -1116,7 +1285,14 @@ fn handle_invoke(
     let mut child = match InvocationKernel::new_cached(blob, &[], gas, code_cache) {
         Ok(k) => k,
         Err(_) => {
-            return record_and_write_invoke(caller, output_ptr, &[STATUS_PANICKED], depth, mode);
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_PANICKED],
+                depth,
+                mode,
+            );
         }
     };
     child.set_active_reg(7, 0); // refine
@@ -1156,18 +1332,27 @@ fn handle_invoke(
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
+                    output_buf_len,
                     &[STATUS_PANICKED],
                     depth,
                     mode,
                 );
             }
             KernelResult::OutOfGas => {
-                return record_and_write_invoke(caller, output_ptr, &[STATUS_OOG], depth, mode);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_OOG],
+                    depth,
+                    mode,
+                );
             }
             KernelResult::PageFault(_addr) => {
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
+                    output_buf_len,
                     &[STATUS_PANICKED],
                     depth,
                     mode,
@@ -1228,12 +1413,13 @@ fn handle_invoke(
         raw_output
     };
 
-    record_and_write_invoke(caller, output_ptr, &output, depth, mode)
+    record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode)
 }
 
 /// Capture a continuation: hash flat_mem, store in the data layer,
 /// and push a ContinuationHeader to the journal.
 fn save_continuation<D: crate::data_layer::DataLayer>(
+    svc_id: u32,
     flat_mem: Vec<u8>,
     heap_base: u32,
     heap_top: u32,
@@ -1254,6 +1440,7 @@ fn save_continuation<D: crate::data_layer::DataLayer>(
         registers: [0; 13],
     };
     journal.writes.push((
+        svc_id,
         crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
         header.encode(),
     ));
@@ -1294,12 +1481,14 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
     if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
         pollster::block_on(data.remove(&header.commitment));
     }
+    journal.writes.push((
+        svc_id,
+        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
+        vec![],
+    ));
     journal
         .writes
-        .push((crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(), vec![]));
-    journal
-        .writes
-        .push((crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
+        .push((svc_id, crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
 }
 
 fn simple_hash(data: &[u8]) -> [u8; 32] {

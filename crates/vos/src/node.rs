@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,10 +56,11 @@ impl AgentResult {
 }
 
 /// Replication / persistence semantics selected per agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Consistency {
     /// In-memory only — state is lost when the agent exits. The
     /// default; matches the pre-persistence behaviour.
+    #[default]
     Ephemeral,
     /// redb-backed local persistence (no replication, no log).
     Local,
@@ -67,12 +68,13 @@ pub enum Consistency {
     /// atomically on every dispatch, and the observed-effect log
     /// is attached to each DAG node for deterministic replay.
     Crdt,
-}
-
-impl Default for Consistency {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
+    /// Raft consensus — every state-changing dispatch appends a
+    /// committed log entry. Phase 1 runs as a single-node
+    /// "self-quorum" mode (durable persistence + replay equivalent
+    /// to `Local` + a log); the cluster machinery (election,
+    /// AppendEntries, leader-forwarding `commit_with_log`) lands
+    /// in later phases.
+    Raft,
 }
 
 /// Configuration for registering an agent in the node.
@@ -98,7 +100,7 @@ pub struct AgentConfig {
     pub replication_id: Option<[u8; 32]>,
     /// Pre-opened, shared `redb::Database` for the agent's
     /// `CrdtCommit`. When `register` plans to wire this actor
-    /// into the network's `SyncProvider`, it opens the file
+    /// into the network's `SyncHandler`, it opens the file
     /// here, hands the same `Arc` to the agent's commit
     /// strategy *and* to the sync layer — redb is exclusive on
     /// file open, so this is the only way to share. `None`
@@ -114,6 +116,26 @@ pub struct AgentConfig {
     #[cfg(feature = "storage")]
     #[doc(hidden)]
     pub pre_opened_lock: Option<Arc<Mutex<()>>>,
+    /// Static cluster membership (list of `node_prefix`es) for
+    /// `Consistency::Raft`. Empty = single-node degenerate mode.
+    /// All cluster members must list the same set in the same
+    /// order.
+    pub members: Vec<u16>,
+    /// Pre-spawned Raft worker for `Consistency::Raft` multi-mode
+    /// replication. `register` spawns this when the right
+    /// conditions hold (multi-member + network attached + storage
+    /// feature on) and hands it to the agent thread, which builds
+    /// `RaftCommit::from_worker` with it. Caller code shouldn't
+    /// set this directly.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[doc(hidden)]
+    pub raft_worker: Option<crate::raft::RaftWorker>,
+    /// Apply-receiver paired with `raft_worker`. Drained by
+    /// `RaftCommit::commit_with_log` while waiting for an
+    /// in-flight propose to commit.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[doc(hidden)]
+    pub raft_apply_rx: Option<std::sync::mpsc::Receiver<u64>>,
 }
 
 impl AgentConfig {
@@ -130,7 +152,19 @@ impl AgentConfig {
             pre_opened_db: None,
             #[cfg(feature = "storage")]
             pre_opened_lock: None,
+            members: Vec::new(),
+            #[cfg(all(feature = "storage", feature = "network"))]
+            raft_worker: None,
+            #[cfg(all(feature = "storage", feature = "network"))]
+            raft_apply_rx: None,
         }
+    }
+
+    /// Set the static cluster membership for `Consistency::Raft`
+    /// — list of `node_prefix`es. Same list on every replica.
+    pub fn with_members(mut self, members: Vec<u16>) -> Self {
+        self.members = members;
+        self
     }
 
     /// Attach initial payloads dispatched on cold start.
@@ -167,7 +201,7 @@ impl AgentConfig {
     }
 
     /// Convenience: derive a replication id from the agent's blob
-    /// and a logical name. Replicas with identical (blob, name)
+    /// plus a logical name. Replicas with identical (blob, name)
     /// automatically share an id without manifest coordination.
     pub fn auto_replication_id(mut self, name: &str) -> Self {
         let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
@@ -372,12 +406,22 @@ pub struct VosNode {
     pub(crate) shared_network: SharedNetwork,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
-    /// `replication_id` is added. Read by [`NodeSyncProvider`]
-    /// (db only) to answer inbound sync queries; the agent
-    /// thread and sync ticker share the `commit_lock` to
-    /// serialize their writes against each other.
+    /// `replication_id` is added. Read by [`NodeService`] (db
+    /// only) to answer inbound sync queries; the agent thread
+    /// and sync ticker share the `commit_lock` to serialize
+    /// their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
     pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// Optional manifest payload exposed to peers via
+    /// [`Frame::ManifestReq`](crate::network::Frame::ManifestReq).
+    /// Populated by [`set_manifest`](Self::set_manifest) before
+    /// [`attach_network`](Self::attach_network) — vosx loads the
+    /// space.toml + actor blobs and stashes them here so the
+    /// `NetworkService` impl can serve them when a `vosx join`er
+    /// asks. Set-once; `None` for nodes that don't expose a
+    /// manifest (transient peers, manifest-less raw `vosx run`).
+    #[cfg(feature = "network")]
+    pub(crate) manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     /// Join handles for the per-replica sync threads spawned
     /// by [`spawn_sync_thread`]. We keep these so [`collect`]
     /// can wait for the threads to exit before returning —
@@ -391,7 +435,7 @@ pub struct VosNode {
 
 /// Shared handle for one CRDT replication group. The same
 /// `Arc<Database>` powers the agent's `CrdtCommit` and the
-/// sync layer's `SyncProvider`; the `commit_lock` serializes
+/// sync layer's `SyncHandler`; the `commit_lock` serializes
 /// the agent's `commit_with_log` against the sync ticker's
 /// `insert_node` + `compact_roots`.
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -438,7 +482,12 @@ impl InvokeHandle {
             chain: Vec::new(),
         })
         .ok()?;
-        reply_rx.recv_timeout(timeout).ok()
+        // Strip the cross-thread invoke envelope down to reply
+        // bytes for host-side callers — see `VosNode::invoke`.
+        reply_rx
+            .recv_timeout(timeout)
+            .ok()
+            .and_then(|env| unwrap_invoke_envelope(&env))
     }
 
     /// `true` once the owning [`VosNode`] has been told to shut
@@ -456,34 +505,88 @@ impl InvokeHandle {
 #[cfg(feature = "network")]
 type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 
-/// `InvokeDispatcher` impl that routes inbound cross-node invokes
-/// into this node's local invoke-route table. The network thread
-/// runs `dispatch` on a `tokio::task::spawn_blocking`, so blocking
-/// on the std `mpsc` reply channel here is fine.
+/// Single inbound-frame service for the node. Combines what used
+/// to be three separate trait impls (invoke / sync / manifest)
+/// behind one [`NetworkService`](crate::network::NetworkService)
+/// installation. Each method either delegates to a node-owned
+/// table (invoke routes, CRDT replicas) or returns the data the
+/// host pre-stashed (manifest).
+///
+/// Constructed in [`VosNode::attach_network`] from the node's
+/// already-existing tables; the manifest slot is populated by the
+/// host (`vosx up`) before `attach_network` runs.
 #[cfg(feature = "network")]
-struct LocalInvokeDispatcher {
+struct NodeService {
     invoke_routes: InvokeRoutes,
-}
-
-/// `SyncProvider` impl backed by the node's `crdt_replicas` map.
-/// Looks up the shared `Arc<Database>` for the replication group
-/// and reads roots / DAG nodes directly through the public
-/// `commit::read_roots` / `commit::read_dag_node` helpers. Reads
-/// are pure redb read txns — they don't need the commit lock.
-#[cfg(all(feature = "network", feature = "storage"))]
-struct NodeSyncProvider {
+    #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    manifest: Arc<OnceLock<crate::network::ManifestReply>>,
 }
 
-#[cfg(all(feature = "network", feature = "storage"))]
-impl crate::network::SyncProvider for NodeSyncProvider {
-    fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+#[cfg(feature = "network")]
+impl crate::network::NetworkService for NodeService {
+    fn dispatch_invoke(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
+        // The chain arrived already including the original caller's
+        // ID (the remote peer's agent). The receiver's own
+        // external_invoke prepends *this* agent's ID when dispatching
+        // further hops, so we don't need to touch the chain here.
+        //
+        // Cross-network targets carry the receiver's `node_prefix` in
+        // the upper 16 bits. Many agents (notably the well-known
+        // registry at local_id 0) register themselves as unscoped
+        // (`ServiceId(0, local_id)`), so a literal lookup of `to`
+        // misses. Fall back to the unscoped form when the prefix
+        // matches our own node — same routing decision the local
+        // path makes via `is_on_node || is_local`.
+        let to_unscoped = to & 0xFFFF;
+        let tx = self.invoke_routes.lock().ok().and_then(|m| {
+            m.get(&to).cloned().or_else(|| {
+                if to != to_unscoped {
+                    m.get(&to_unscoped).cloned()
+                } else {
+                    None
+                }
+            })
+        });
+        let Some(tx) = tx else {
+            return Vec::new();
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(InvokeRequest {
+                msg,
+                reply_tx,
+                chain,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        // The receiver replies with the full invoke envelope; the
+        // libp2p protocol still ships only reply bytes, so unwrap
+        // here. A future protocol bump can carry the envelope so
+        // remote yielded children become drivable cross-node.
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .ok()
+            .and_then(|env| unwrap_invoke_envelope(&env))
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "storage")]
+    fn sync_roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_roots(&slot.db).ok()
     }
-    fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+
+    #[cfg(feature = "storage")]
+    fn sync_get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
         crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
+    }
+
+    fn manifest(&self) -> Option<crate::network::ManifestReply> {
+        self.manifest.get().cloned()
     }
 }
 
@@ -633,8 +736,7 @@ fn sync_loop(
         // the gossipsub topic and register our hint channel so
         // peer head announcements wake us up.
         if !subscribed {
-            net.subscribe_rep(rep_id);
-            net.register_hint_sender(rep_id, hint_tx.clone());
+            net.join_replication(rep_id, hint_tx.clone());
             subscribed = true;
         }
         let local = net.peer_id();
@@ -660,7 +762,7 @@ fn sync_loop(
         // confirmed members yet) hit every connected peer to
         // find new group hosts. Otherwise stick to the cache
         // plus any hinted peers from the gossipsub side.
-        let reprobe = tick % SYNC_REPROBE_EVERY == 0 || confirmed.is_empty();
+        let reprobe = tick.is_multiple_of(SYNC_REPROBE_EVERY) || confirmed.is_empty();
         tick = tick.wrapping_add(1);
 
         let mut targets: Vec<libp2p::PeerId> = if reprobe {
@@ -692,10 +794,8 @@ fn sync_loop(
                 Err(e) => warn!(error = %e, "sync: per-peer cycle failed"),
             }
         }
-        if any_inserted {
-            if let Some(n) = &notifier {
-                let _ = n.send(());
-            }
+        if any_inserted && let Some(n) = &notifier {
+            let _ = n.send(());
         }
     }
 }
@@ -720,10 +820,10 @@ fn sync_with_peer(
     slot: &ReplicaSlot,
 ) -> Result<SyncOutcome, crate::commit::CommitError> {
     use crate::commit::CrdtCommit;
-    use crate::effect_log::EffectLog;
+    use crate::effect_log::CrdtEvent;
     use merkle_crdt::DagNode;
 
-    let heads_rx = net.fetch_heads(peer, *rep_id);
+    let heads_rx = net.send_fetch_heads(peer, *rep_id);
     let heads = match heads_rx.recv_timeout(SYNC_FETCH_TIMEOUT) {
         Ok(v) => v,
         Err(_) => return Ok(SyncOutcome::PeerEmpty),
@@ -732,7 +832,15 @@ fn sync_with_peer(
         return Ok(SyncOutcome::PeerEmpty);
     }
 
-    let mut cc = CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone());
+    // Sync only inserts peer-produced DAG nodes; it never allocates
+    // a fresh `(origin, seq)`. The replica_origin we hand the
+    // strategy here would only matter if a local write slipped in
+    // — derive it the same way the agent thread does so the two
+    // CrdtCommits over the same redb agree on origin if they ever
+    // both write.
+    let replica_origin = derive_replica_origin(rep_id, net.local_prefix());
+    let mut cc =
+        CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone(), replica_origin);
     let mut frontier: Vec<[u8; 32]> = heads.clone();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut inserted_any = false;
@@ -744,7 +852,7 @@ fn sync_with_peer(
         if cc.get_node_bytes(&cid)?.is_some() {
             continue;
         }
-        let node_rx = net.fetch_node(peer, *rep_id, cid);
+        let node_rx = net.send_fetch_node(peer, *rep_id, cid);
         let Ok(Some(node_bytes)) = node_rx.recv_timeout(SYNC_FETCH_TIMEOUT) else {
             continue;
         };
@@ -757,7 +865,7 @@ fn sync_with_peer(
             }
         }
         // Walk children so the BFS keeps going.
-        if let Some(node) = DagNode::<crate::commit::Blake2b, EffectLog>::from_bytes(&node_bytes) {
+        if let Some(node) = DagNode::<crate::commit::Blake2b, CrdtEvent>::from_bytes(&node_bytes) {
             for child in node.children {
                 frontier.push(child.0);
             }
@@ -770,38 +878,6 @@ fn sync_with_peer(
     Ok(SyncOutcome::PeerHasGroup {
         inserted: inserted_any,
     })
-}
-
-#[cfg(feature = "network")]
-impl crate::network::InvokeDispatcher for LocalInvokeDispatcher {
-    fn dispatch(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
-        // The chain arrived already including the original caller's
-        // ID (the remote peer's agent). The receiver's own
-        // external_invoke prepends *this* agent's ID when dispatching
-        // further hops, so we don't need to touch the chain here.
-        let tx = self
-            .invoke_routes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&to).cloned());
-        let Some(tx) = tx else {
-            return Vec::new();
-        };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(InvokeRequest {
-                msg,
-                reply_tx,
-                chain,
-            })
-            .is_err()
-        {
-            return Vec::new();
-        }
-        reply_rx
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap_or_default()
-    }
 }
 
 /// Shared "last activity" instant, bumped on every dispatch. The
@@ -833,9 +909,24 @@ impl VosNode {
             shared_network: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "network")]
+            manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
             sync_threads: Vec::new(),
         }
+    }
+
+    /// Pre-populate the manifest payload exposed to peers via
+    /// `Frame::ManifestReq`. Set-once: a second call is a
+    /// programming error and is silently ignored. Call before
+    /// [`attach_network`](Self::attach_network) — the
+    /// `NetworkService` snapshot taken there reads from this slot.
+    /// `vosx up` calls this with the parsed `space.toml` bytes
+    /// plus every actor blob so `vosx join`ers can fetch the
+    /// cluster's manifest without `--manifest`.
+    #[cfg(feature = "network")]
+    pub fn set_manifest(&self, reply: crate::network::ManifestReply) {
+        let _ = self.manifest.set(reply);
     }
 
     /// Attach a libp2p [`Network`](crate::network::Network) so the
@@ -855,25 +946,18 @@ impl VosNode {
     /// being collected).
     #[cfg(feature = "network")]
     pub fn attach_network(&mut self, network: crate::network::Network) {
-        // Install the dispatcher first so any inbound InvokeRequest
+        // Install the unified service first so any inbound frame
         // that arrives between now and the bridge starting gets
-        // resolved against this node's invoke_routes rather than
-        // the empty-reply default.
-        let dispatcher = Arc::new(LocalInvokeDispatcher {
+        // resolved against this node's tables (invoke_routes,
+        // crdt_replicas, host-supplied manifest) rather than the
+        // trait's empty-reply defaults.
+        let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
+            #[cfg(feature = "storage")]
+            replicas: self.crdt_replicas.clone(),
+            manifest: self.manifest.clone(),
         });
-        network.set_invoke_dispatcher(dispatcher);
-
-        // Same story for the sync provider — answers inbound
-        // FetchHeads/FetchNode against the local CRDT replicas
-        // already opened by `register`.
-        #[cfg(feature = "storage")]
-        {
-            let sync_provider = Arc::new(NodeSyncProvider {
-                replicas: self.crdt_replicas.clone(),
-            });
-            network.set_sync_provider(sync_provider);
-        }
+        network.set_service(service);
 
         let inbox_rx = match network.take_inbox() {
             Some(rx) => rx,
@@ -942,7 +1026,7 @@ impl VosNode {
         // Pre-open the redb database for CRDT actors that declare
         // a replication group, so the same `Arc<Database>` powers
         // both the agent's `CrdtCommit` and the network's
-        // `SyncProvider`. redb is exclusive on file open, so this
+        // `SyncHandler`. redb is exclusive on file open, so this
         // is the only way to share the file across threads.
         //
         // When the file opens cleanly we also create a one-shot-
@@ -977,6 +1061,67 @@ impl VosNode {
                     }
                 }
             })
+        } else if config.consistency == Consistency::Raft && config.members.len() > 1 {
+            // Multi-mode Raft: spawn a worker, install it as the
+            // network's RaftRpcHandler, and bridge the worker's
+            // apply notifications into both (a) the agent's
+            // sync_rx (so the soft-restart path catches up state
+            // on followers) and (b) the strategy's apply_rx (so
+            // the leader's commit_with_log unblocks once its
+            // proposed entry commits).
+            let network = self.shared_network.lock().ok().and_then(|g| g.clone());
+            let rep_id = config.replication_id.unwrap_or([0u8; 32]);
+            match config
+                .db_path(id)
+                .map(|p| (p, redb::Database::create(config.db_path(id).unwrap())))
+            {
+                Some((_path, Ok(db))) => {
+                    let db = Arc::new(db);
+                    config.pre_opened_db = Some(db.clone());
+
+                    let worker_cfg = crate::raft::WorkerConfig {
+                        me: id.node_prefix(),
+                        members: config.members.clone(),
+                        replication_id: rep_id,
+                        election_timeout_ms: (150, 300),
+                        heartbeat_interval_ms: 50,
+                    };
+                    let (worker_tx, worker_rx) = mpsc::channel::<u64>();
+                    let worker = crate::raft::RaftWorker::spawn(
+                        db.clone(),
+                        worker_cfg,
+                        network.clone(),
+                        Some(worker_tx),
+                    );
+                    if let Some(net) = network.as_ref() {
+                        net.register_raft_handler(rep_id, Arc::new(worker.handler()));
+                    }
+                    // Relay: each commit advance fans out to both
+                    // the strategy's apply_rx and the agent's
+                    // sync_rx. Lives until the worker drops its
+                    // sender (either side closing is fine).
+                    let (commit_tx, commit_rx) = mpsc::channel::<u64>();
+                    let (sync_tx, sync_rx) = mpsc::channel::<()>();
+                    thread::Builder::new()
+                        .name(format!("raft-relay-{:08x}", id.0))
+                        .spawn(move || {
+                            while let Ok(idx) = worker_rx.recv() {
+                                let _ = commit_tx.send(idx);
+                                let _ = sync_tx.send(());
+                            }
+                        })
+                        .expect("spawn raft relay");
+                    config.raft_worker = Some(worker);
+                    config.raft_apply_rx = Some(commit_rx);
+                    Some(sync_rx)
+                }
+                Some((path, Err(e))) => {
+                    error!(%id, path = %path.display(), error = %e,
+                        "register: failed to open Raft db; replication will be inactive");
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1226,7 +1371,11 @@ impl VosNode {
         thread::spawn(move || {
             for req in rx {
                 let reply = handler(req.msg);
-                let _ = req.reply_tx.send(reply);
+                // Test responders never yield — pack as DONE so
+                // the reply parses as `InvokeResult::Done` on the
+                // caller side, matching real worker/agent shape.
+                let envelope = encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
+                let _ = req.reply_tx.send(envelope);
             }
         });
         id
@@ -1265,10 +1414,24 @@ impl VosNode {
         msg: Vec<u8>,
         timeout: Duration,
     ) -> Option<Vec<u8>> {
-        // 1. Local
+        // 1. Local. Same fallback `dispatch_invoke` uses: when
+        //    `target` carries this node's prefix but the agent
+        //    was registered as unscoped (`ServiceId(0, local_id)`),
+        //    retry with the prefix stripped. The well-known
+        //    registry registers at `ServiceId::REGISTRY` (= 0),
+        //    so a local invoke from an in-process Ref pointed
+        //    at `(self.node_prefix, 0)` wouldn't find it
+        //    otherwise.
         let local_tx = {
             let map = self.invoke_routes.lock().ok()?;
-            map.get(&target.0).cloned()
+            let direct = map.get(&target.0).cloned();
+            if direct.is_some() {
+                direct
+            } else if target.is_on_node(self.node_prefix) {
+                map.get(&(target.0 & 0xFFFF)).cloned()
+            } else {
+                None
+            }
         };
         if let Some(tx) = local_tx {
             let (reply_tx, reply_rx) = mpsc::channel();
@@ -1278,7 +1441,14 @@ impl VosNode {
                 chain: Vec::new(),
             })
             .ok()?;
-            return reply_rx.recv_timeout(timeout).ok();
+            // Cross-thread channel now carries the full invoke
+            // envelope (status + state + reply); host callers
+            // don't care about YIELDED/DONE so unwrap to just
+            // reply bytes.
+            return reply_rx
+                .recv_timeout(timeout)
+                .ok()
+                .and_then(|env| unwrap_invoke_envelope(&env));
         }
 
         // 2. Cross-node fallback.
@@ -1286,14 +1456,17 @@ impl VosNode {
         {
             if !target.is_on_node(self.node_prefix) && !target.is_local() {
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone());
-                if let Some(net) = net {
-                    if let Some(peer) = net.peer_for_prefix(target.node_prefix()) {
-                        // `from = 0` because this is host-side; it
-                        // never participates in chain detection.
-                        let reply_rx =
-                            net.send_invoke(peer, ServiceId::REGISTRY.0, target.0, Vec::new(), msg);
-                        return reply_rx.recv_timeout(timeout).ok();
-                    }
+                if let Some(net) = net
+                    && let Some(peer) = net.peer_for_prefix(target.node_prefix())
+                {
+                    // `from = 0` because this is host-side; it
+                    // never participates in chain detection.
+                    let reply_rx =
+                        net.send_invoke(peer, ServiceId::REGISTRY.0, target.0, Vec::new(), msg);
+                    // Daemon's `dispatch_invoke` already strips
+                    // the envelope back to raw reply bytes, so
+                    // we just forward them.
+                    return reply_rx.recv_timeout(timeout).ok();
                 }
             }
         }
@@ -1396,7 +1569,7 @@ impl Default for VosNode {
 
 fn agent_thread(
     id: ServiceId,
-    config: AgentConfig,
+    mut config: AgentConfig,
     inbox: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
@@ -1470,14 +1643,27 @@ fn agent_thread(
                 chain: chain_snapshot,
             })
             .ok()?;
-            return reply_rx
+            // The receiver replies with the full invoke envelope;
+            // unpack it back to (status, state, reply) so the
+            // runtime can repack into the local invoke wire format
+            // — preserving STATUS_YIELDED across the thread
+            // boundary so the calling actor can keep driving a
+            // yielded child.
+            let envelope = reply_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
-                .ok();
+                .ok()?;
+            return decode_invoke_envelope(&envelope);
         }
 
         // 2. Cross-node invoke — target on a different node and we
         //    have a `Network` attached. Reuses the chain so the
         //    far side detects cycles that span multiple hosts.
+        //
+        // The libp2p protocol still ships only reply bytes (no
+        // YIELDED/state plumbing across the wire yet), so we wrap
+        // them in a DONE envelope here. A future protocol bump
+        // can carry the full envelope so cross-node yielded
+        // children are drivable too.
         #[cfg(feature = "network")]
         {
             if !target.is_on_node(local_prefix) && !target.is_local() {
@@ -1489,7 +1675,8 @@ fn agent_thread(
                             net.send_invoke(peer, id.0, target.0, chain_snapshot, msg.to_vec());
                         return reply_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
-                            .ok();
+                            .ok()
+                            .map(crate::runtime::ExternalInvokeReply::Done);
                     }
                 }
             }
@@ -1499,12 +1686,49 @@ fn agent_thread(
     }));
 
     let consistency = config.consistency;
-    let recording_enabled = consistency == Consistency::Crdt;
+    // Recording captures the per-dispatch `EffectLog` payload the
+    // strategy needs to replay deterministically on cold start.
+    // Both replicating strategies want it; the non-replicating ones
+    // ignore the log if handed.
+    let recording_enabled = matches!(consistency, Consistency::Crdt | Consistency::Raft,);
     // Capture rep_id up front — config is consumed below.
     #[cfg(all(feature = "network", feature = "storage"))]
     let agent_rep_id: Option<[u8; 32]> = config.replication_id;
-    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        match build_agent_strategy(&config, id) {
+    // Multi-mode Raft: register() pre-spawned the worker and
+    // handed it to us through the config; build the Multi-flavour
+    // strategy here while we still own `config` mutably.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    let raft_multi: Option<Box<dyn crate::commit::CommitStrategy>> =
+        if consistency == Consistency::Raft && config.raft_worker.is_some() {
+            let db = config.pre_opened_db.clone();
+            let worker = config.raft_worker.take();
+            let apply_rx = config.raft_apply_rx.take();
+            match (db, worker, apply_rx) {
+                (Some(db), Some(worker), Some(apply_rx)) => {
+                    let cfg = crate::raft::RaftConfig {
+                        me: id.node_prefix(),
+                        members: config.members.clone(),
+                        replication_id: agent_rep_id.unwrap_or([0u8; 32]),
+                        ..crate::raft::RaftConfig::default()
+                    };
+                    match crate::raft::RaftCommit::from_worker(db, cfg, worker, apply_rx) {
+                        Ok(s) => Some(Box::new(s) as Box<dyn crate::commit::CommitStrategy>),
+                        Err(e) => {
+                            error!(%id, error = %e, "raft multi: failed to construct strategy");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+    #[cfg(not(all(feature = "network", feature = "storage")))]
+    let raft_multi: Option<Box<dyn crate::commit::CommitStrategy>> = None;
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> = match raft_multi {
+        Some(s) => s,
+        None => match build_agent_strategy(&config, id, id.node_prefix()) {
             Ok(s) => s,
             Err(e) => {
                 let err = format!("strategy build failed: {e}");
@@ -1515,7 +1739,8 @@ fn agent_thread(
                     error: Some(err),
                 };
             }
-        };
+        },
+    };
 
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
@@ -1553,16 +1778,16 @@ fn agent_thread(
                     .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
-                if !state.is_empty() {
-                    if let Err(e) = strategy.commit(&state) {
-                        let err = format!("post-replay commit failed: {e}");
-                        error!(%id, "{err}");
-                        return AgentResult {
-                            id,
-                            panics: runtime.panics,
-                            error: Some(err),
-                        };
-                    }
+                if !state.is_empty()
+                    && let Err(e) = strategy.commit(&state)
+                {
+                    let err = format!("post-replay commit failed: {e}");
+                    error!(%id, "{err}");
+                    return AgentResult {
+                        id,
+                        panics: runtime.panics,
+                        error: Some(err),
+                    };
                 }
             }
             Ok(_) => {}
@@ -1580,7 +1805,10 @@ fn agent_thread(
 
     // Queue initial payloads. When no init payloads are supplied we
     // still kick the actor with an empty envelope so `on_start`
-    // fires — matches the pre-refactor behaviour.
+    // fires — matches the pre-refactor behaviour. On a Raft
+    // follower the commit_with_log triggered by on_start will
+    // return NotLeader, and the inbox-loop's commit-fail handler
+    // soft-restarts the runtime to bring it back in sync.
     let mut pending: VecDeque<Vec<u8>> = config.init_payloads.into_iter().collect();
     if pending.is_empty() {
         pending.push_back(Vec::new());
@@ -1670,10 +1898,16 @@ fn agent_thread(
             // Fresh inbox-style dispatch; chain starts at us.
             *current_chain.lock().unwrap() = vec![id.0];
             m
-        } else if runtime.has_work() || runtime.is_suspended(svc_id) {
+        } else if runtime.has_work() {
             bump();
-            // Residual work — keep the chain set by the dispatch
-            // that produced it.
+            // Residual work — pending self-messages or transfers
+            // queued by the previous dispatch. A merely suspended
+            // service (continuation saved, no pending message)
+            // no longer counts as residual: under the dumb-host
+            // model it sleeps until a parent agent invokes it
+            // again. Including `is_suspended` here would busy-spin
+            // on yielded children.
+            // Keep the chain set by the dispatch that produced it.
             if let Err(e) = dispatch_once(
                 &mut runtime,
                 svc_id,
@@ -1683,8 +1917,18 @@ fn agent_thread(
                 strategy.as_mut(),
                 recording_enabled,
             ) {
-                fatal_error = Some(format!("commit failed during residual work: {e}"));
-                break;
+                // On a Raft follower the commit can return
+                // NotLeader. Log, soft-restart to bring the runtime
+                // back in sync, continue. CRDT failures are still
+                // unexpected but the same recovery applies.
+                warn!(%id, error = %e, "residual-work commit failed; soft-restarting");
+                #[cfg(all(feature = "network", feature = "storage"))]
+                if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut())
+                {
+                    fatal_error = Some(format!("residual soft restart: {restart_err}"));
+                    break;
+                }
+                continue;
             }
             #[cfg(all(feature = "network", feature = "storage"))]
             publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
@@ -1711,8 +1955,18 @@ fn agent_thread(
             strategy.as_mut(),
             recording_enabled,
         ) {
-            fatal_error = Some(format!("commit failed: {e}"));
-            break;
+            // Tell-style dispatch on a follower will return
+            // NotLeader. Soft-restart and continue rather than
+            // killing the agent; the message is effectively
+            // dropped (which is OK — clients should target the
+            // leader).
+            warn!(%id, error = %e, "tell-style commit failed; soft-restarting");
+            #[cfg(all(feature = "network", feature = "storage"))]
+            if let Err(restart_err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {
+                fatal_error = Some(format!("soft restart: {restart_err}"));
+                break;
+            }
+            continue;
         }
         #[cfg(all(feature = "network", feature = "storage"))]
         publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
@@ -1787,27 +2041,132 @@ fn handle_invoke_request(
         });
     }
 
-    // Send the raw reply (or empty Vec if the handler had no
-    // reply, e.g. a `start() -> ()` returning Value::Unit). The
-    // caller's external_invoke unwraps this Option<Vec<u8>> and
-    // packs it into the wire frame. Cap enforced producer-side
-    // — see send_reply_capped.
-    let reply_payload = runtime.take_last_reply(svc_id).unwrap_or_default();
-    send_reply_capped(req.reply_tx, reply_payload, svc_id);
-
-    // Persist whatever state changed (same path as a regular dispatch).
+    // Persist before replying. If the commit fails (e.g. Raft
+    // `NotLeader` because we lost leadership between dispatch
+    // and commit), we drop the reply so the caller sees
+    // `Unreachable` and can retry against the new leader. Doing
+    // it in this order means the client only sees success when
+    // the state is durable.
     let state = runtime
         .storage
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
-    if recording_enabled {
+    let commit_result = if recording_enabled {
         let log = runtime.finish_recording().expect("recording was started");
-        strategy.commit_with_log(&state, &log)?;
+        strategy.commit_with_log(&state, &log)
     } else if !state.is_empty() {
-        strategy.commit(&state)?;
+        strategy.commit(&state)
+    } else {
+        Ok(())
+    };
+
+    if let Err(e) = commit_result {
+        // Drop the reply (caller surfaces `Unreachable`) and
+        // soft-restart to bring the runtime back in sync with
+        // the durable log. Don't bubble the error — a transient
+        // `NotLeader` shouldn't kill the agent thread.
+        warn!(%svc_id, error = %e, "commit failed; soft-restarting and dropping reply");
+        drop(req.reply_tx);
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Err(restart_err) = soft_restart_crdt(runtime, svc_id, strategy) {
+            error!(%svc_id, "soft restart after commit failure: {restart_err}");
+        }
+        return Ok(());
     }
+
+    // Commit succeeded. Pack the reply as the full invoke wire
+    // envelope `[status][state_len:u32][state][reply]` so the
+    // caller's PVM sees the same shape it would for a local
+    // INVOKE. `is_suspended` after `run_blocking` tells us the
+    // handler yielded with a continuation still alive — STATUS_YIELDED
+    // surfaces upstream so a parent agent can keep driving us tick
+    // by tick. Without this distinction every cross-thread invoke
+    // looks like STATUS_DONE and the caller drops yielded children
+    // from its run queue.
+    //
+    // `take_last_reply` returns `None` only when the handler
+    // panicked; we signal that to the caller by dropping
+    // `reply_tx`, which surfaces upstream as `InvokeError::Panicked`.
+    let reply = match runtime.take_last_reply(svc_id) {
+        Some(bytes) => bytes,
+        None => {
+            drop(req.reply_tx);
+            return Ok(());
+        }
+    };
+    let status = if runtime.is_suspended(svc_id) {
+        crate::actors::run::STATUS_YIELDED
+    } else {
+        crate::actors::run::STATUS_DONE
+    };
+    let envelope = encode_invoke_envelope(status, &state, &reply);
+    send_reply_capped(req.reply_tx, envelope, svc_id);
     Ok(())
+}
+
+/// Encode the invoke wire envelope `[status][state_len:u32 LE][state][reply]`
+/// — the same format `runtime::handle_invoke` writes for a same-runtime
+/// INVOKE. Used by the cross-thread invoke path so a yielded child on
+/// another agent thread surfaces as `STATUS_YIELDED` (with its post-
+/// dispatch state) to the calling actor's `lifecycle::invoke_raw`,
+/// not as `STATUS_DONE`.
+fn encode_invoke_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + state.len() + reply.len());
+    out.push(status);
+    out.extend_from_slice(&(state.len() as u32).to_le_bytes());
+    out.extend_from_slice(state);
+    out.extend_from_slice(reply);
+    out
+}
+
+/// Strip the invoke envelope back to just the rkyv-encoded reply
+/// bytes for host-side callers (`VosNode::invoke`, peer invoke
+/// forwarding) who don't care about YIELDED/DONE — they only want
+/// the handler's return value. A short envelope (just a status byte
+/// from `STATUS_NOT_FOUND` / `STATUS_PANICKED`) decodes as `None`.
+fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
+    if envelope.len() < 5 {
+        return None;
+    }
+    let state_len =
+        u32::from_le_bytes([envelope[1], envelope[2], envelope[3], envelope[4]]) as usize;
+    let reply_start = 5 + state_len;
+    if reply_start > envelope.len() {
+        return None;
+    }
+    Some(envelope[reply_start..].to_vec())
+}
+
+/// Decode a cross-thread invoke envelope back into the
+/// [`runtime::ExternalInvokeReply`] enum the runtime's
+/// `external_invoke` callback expects, so a yielded child on one
+/// agent thread surfaces as [`runtime::ExternalInvokeReply::Yielded`]
+/// to the calling actor's PVM.
+///
+/// A short envelope (just a status byte — `STATUS_NOT_FOUND` /
+/// `STATUS_PANICKED`) returns `None`; the runtime then falls
+/// through to its own NOT_FOUND path.
+fn decode_invoke_envelope(envelope: &[u8]) -> Option<crate::runtime::ExternalInvokeReply> {
+    use crate::actors::run::{STATUS_DONE, STATUS_YIELDED};
+    use crate::runtime::ExternalInvokeReply;
+    if envelope.len() < 5 {
+        return None;
+    }
+    let status = envelope[0];
+    let state_len =
+        u32::from_le_bytes([envelope[1], envelope[2], envelope[3], envelope[4]]) as usize;
+    let state_end = 5 + state_len;
+    if state_end > envelope.len() {
+        return None;
+    }
+    let state = envelope[5..state_end].to_vec();
+    let reply = envelope[state_end..].to_vec();
+    match status {
+        STATUS_YIELDED => Some(ExternalInvokeReply::Yielded { state, reply }),
+        STATUS_DONE => Some(ExternalInvokeReply::Done(reply)),
+        _ => None,
+    }
 }
 
 /// Run one dispatch cycle: optionally begin recording, deliver the
@@ -1866,13 +2225,35 @@ fn dispatch_once(
 /// without a `data_dir`. We deliberately do not silently downgrade
 /// to `NoCommit` — a CRDT actor that can't open its DAG file
 /// shouldn't pretend to be replicated.
+/// Derive the per-replica `CrdtEvent.origin` from the group's
+/// replication_id and the host node's 16-bit prefix.
+///
+/// `blake2b("vos-replica-origin/v1" || replication_id || prefix)`
+/// — the prefix domain-separates replicas of the same group
+/// running on different nodes, while the replication_id
+/// domain-separates groups that happen to share a node. The
+/// prefix string keeps this hash from colliding with other vos
+/// blake2b uses (registry rep_id derivation, etc).
+#[cfg(feature = "storage")]
+fn derive_replica_origin(replication_id: &[u8; 32], node_prefix: u16) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"vos-replica-origin/v1");
+    h.update(&[0u8]);
+    h.update(replication_id);
+    h.update(&node_prefix.to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
 fn build_agent_strategy(
     config: &AgentConfig,
     id: ServiceId,
+    self_node_prefix: u16,
 ) -> Result<Box<dyn crate::commit::CommitStrategy>, crate::commit::CommitError> {
     #[cfg(feature = "storage")]
     {
-        let _ = id;
+        let _ = (id, self_node_prefix);
         match config.consistency {
             Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
             Consistency::Local => {
@@ -1884,12 +2265,40 @@ fn build_agent_strategy(
                 Ok(Box::new(crate::commit::LocalCommit::open(&path)?))
             }
             Consistency::Crdt => {
+                // CRDT events are tagged with a per-replica origin
+                // so peer replicas can tell our events apart from
+                // theirs by content alone. Two replicas of the same
+                // group share the *replication_id* (it's the group
+                // identity for sync/discovery), so we can't reuse
+                // that — the per-replica origin is derived from
+                // `(replication_id, node_prefix)` so:
+                //   - replicas on different nodes get different
+                //     origins (different prefixes),
+                //   - a replica's origin is stable across restarts
+                //     of the same node (same prefix),
+                //   - origins are domain-separated by group, so
+                //     two unrelated groups on the same node never
+                //     share origins.
+                // We still require `replication_id` to be set
+                // explicitly: an unconfigured Crdt agent has no
+                // group identity to sync against, which is a
+                // silent determinism failure waiting to happen.
+                let replication_id = config.replication_id.ok_or_else(|| {
+                    crate::commit::CommitError::Config(
+                        "Crdt consistency requires AgentConfig::replication_id; \
+                         set one explicitly or use `auto_replication_id(name)`"
+                            .into(),
+                    )
+                })?;
+                let replica_origin = derive_replica_origin(&replication_id, self_node_prefix);
                 if let Some(arc) = &config.pre_opened_db {
                     let cc = match &config.pre_opened_lock {
-                        Some(lock) => {
-                            crate::commit::CrdtCommit::from_db_arc_locked(arc.clone(), lock.clone())
-                        }
-                        None => crate::commit::CrdtCommit::from_db_arc(arc.clone()),
+                        Some(lock) => crate::commit::CrdtCommit::from_db_arc_locked(
+                            arc.clone(),
+                            lock.clone(),
+                            replica_origin,
+                        ),
+                        None => crate::commit::CrdtCommit::from_db_arc(arc.clone(), replica_origin),
                     };
                     return Ok(Box::new(cc));
                 }
@@ -1898,7 +2307,27 @@ fn build_agent_strategy(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
-                Ok(Box::new(crate::commit::CrdtCommit::open(&path)?))
+                Ok(Box::new(crate::commit::CrdtCommit::open(
+                    &path,
+                    replica_origin,
+                )?))
+            }
+            Consistency::Raft => {
+                // Single-node-only path: agent_thread handles the
+                // multi-mode case before reaching here (it owns
+                // the pre-spawned worker via `config.raft_worker`).
+                let cfg = crate::raft::RaftConfig {
+                    me: self_node_prefix,
+                    members: config.members.clone(),
+                    replication_id: config.replication_id.unwrap_or([0u8; 32]),
+                    ..crate::raft::RaftConfig::default()
+                };
+                let path = config.db_path(id).ok_or_else(|| {
+                    crate::commit::CommitError::Config(
+                        "Raft consistency requires data_dir on AgentConfig".into(),
+                    )
+                })?;
+                Ok(Box::new(crate::raft::RaftCommit::open(&path, cfg)?))
             }
         }
     }
@@ -1989,7 +2418,12 @@ fn worker_thread(
                         id,
                         &mut deferred,
                     );
-                    send_reply_capped(req.reply_tx, reply, id);
+                    // Workers don't yield — pack as DONE with no
+                    // state so the caller's invoke_raw decodes
+                    // `InvokeResult::Done { state: empty, reply }`.
+                    let envelope =
+                        encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
+                    send_reply_capped(req.reply_tx, envelope, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,

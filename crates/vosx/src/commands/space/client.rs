@@ -199,8 +199,7 @@ impl DaemonClient {
             .invoke_with_timeout(target, payload, INVOKE_TIMEOUT)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "daemon at {target} didn't reply within {:?} (target unreachable or timed out)",
-                    INVOKE_TIMEOUT,
+                    "daemon at {target} didn't reply within {INVOKE_TIMEOUT:?} (target unreachable or timed out)",
                 )
             })?;
         if reply.is_empty() {

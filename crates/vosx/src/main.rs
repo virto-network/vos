@@ -1,66 +1,76 @@
 //! `vosx` — JAM-aligned PVM executor + space orchestrator.
 //!
-//! The single binary covers five subcommands:
+//! Top-level surface is intentionally tiny: every space-related
+//! operation lives under `vosx space *`. The remaining
+//! top-level commands are for things that don't fit the space
+//! model — currently just `run` for raw ELF/PVM execution.
 //!
-//! - `run` — execute a single ELF/PVM blob (no manifest, no
-//!   networking). Useful for raw smoke-testing.
-//! - `node` — run several ELFs side-by-side without a manifest;
-//!   the simplest way to wire a few actors + workers together.
-//! - `start` — boot a space described by a `space.toml`. The
-//!   primary entry point; auto-spawns the hyperspace registry
-//!   when declared, announces every local service, runs
-//!   `run_forever` when the network's attached.
-//! - `list` — print a manifest's actors + workers + their
-//!   declared messages, recovered from each ELF's `.vos_meta`.
-//! - `invoke` — send a typed message to any actor in the
-//!   hyperspace from a transient peer, print the reply.
-//!
-//! Each subcommand lives in `commands/`; this file owns the
-//! CLI surface (clap structs) and dispatch.
+//! The earlier manifest-driven commands (`new`, `up`, `join`,
+//! `ls`, `ps`, `call`) folded into `vosx space *`; they had
+//! different semantics (`up` started a node from a TOML
+//! template; `space up` boots the registry-driven daemon)
+//! and the registry-as-truth model supersedes the
+//! manifest-as-truth model that originally drove them.
+//! `space up --manifest <path>` (declarative reconciliation
+//! of a manifest into a space's registry) is a future addition.
 
-use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use clap::{CommandFactory, Parser, Subcommand};
+use std::path::PathBuf;
 
+mod blob_store;
+mod bundled;
 mod commands;
-mod hyperspace;
-mod manifest;
-mod network;
-mod query;
-mod util;
+mod help_schema;
+mod output;
+mod paths;
+mod spaces_index;
 
-use manifest::manifest_from;
-use util::init_tracing;
+use output::Format;
+use spaces_index::IndexError;
+
+/// Exit codes. Anything not listed here is `0` (success).
+///
+/// - `1` — runtime error (I/O, network, daemon hung, registry
+///   returned an error status). The default; agents can retry.
+/// - `2` — usage error. Clap exits 2 on parse failures, and we
+///   reuse the same code when the binary is invoked with no
+///   command.
+/// - `3` — not found. The space, agent, or program named in
+///   the command doesn't exist locally / on the daemon. Agents
+///   can treat this as "fix your input" rather than "retry".
+const EXIT_RUNTIME_ERROR: i32 = 1;
+const EXIT_USAGE_ERROR: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 3;
 
 #[derive(Parser)]
-#[command(name = "vosx", about = "JAM-aligned PVM executor")]
+#[command(name = "vosx", about = "JAM-aligned PVM executor + space orchestrator")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Program or manifest to run (auto-detected by extension).
+    /// Raw ELF/PVM blob to run as a one-shot. Equivalent to
+    /// `vosx run <file>`. Anything space-related needs an
+    /// explicit `vosx space *` subcommand.
     file: Option<PathBuf>,
-}
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum ConsistencyArg {
-    Ephemeral,
-    Local,
-    Crdt,
-}
+    /// Output format. `text` (default) is human-readable;
+    /// `json` emits a single JSON value per command for scripts
+    /// and LLM consumption. Inherited by all subcommands.
+    #[arg(long, value_enum, default_value_t = Format::Text, global = true)]
+    format: Format,
 
-impl From<ConsistencyArg> for vos::node::Consistency {
-    fn from(a: ConsistencyArg) -> Self {
-        match a {
-            ConsistencyArg::Ephemeral => vos::node::Consistency::Ephemeral,
-            ConsistencyArg::Local => vos::node::Consistency::Local,
-            ConsistencyArg::Crdt => vos::node::Consistency::Crdt,
-        }
-    }
+    /// Enable progress / status chatter on stderr. Off by
+    /// default — only warnings and errors print. Inherited by
+    /// all subcommands.
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a PVM/ELF program.
+    /// Run a single PVM/ELF program with no manifest (one-shot).
+    /// No registry, no networking — just boot the kernel,
+    /// deliver the supplied work items, halt.
     Run {
         program: PathBuf,
         /// Deliver file contents as a FETCH work item (repeatable).
@@ -73,88 +83,40 @@ enum Command {
         #[arg(long, default_value_t = 100_000_000)]
         gas: u64,
     },
-    /// Run multiple agents concurrently.
-    Node {
-        programs: Vec<PathBuf>,
-        /// Load a registry service at ServiceId(0).
-        #[arg(long, value_name = "FILE")]
-        registry: Option<PathBuf>,
-        /// Load native worker plugins. Optional init args after a colon:
-        ///   --worker libfoo.so
-        ///   --worker libfoo.so:key=hello,n=42
-        #[arg(long, value_name = "FILE[:KEY=VAL,...]")]
-        worker: Vec<String>,
-        /// Data directory for state persistence. Workers are stored in
-        /// `{data_dir}/workers/{name}.redb`. Default: no persistence.
-        #[arg(long, value_name = "DIR", default_value = "data")]
-        data_dir: Option<PathBuf>,
-        /// Disable state persistence (overrides --data-dir).
-        #[arg(long)]
-        no_persist: bool,
-        /// Replication / persistence semantics for the PVM agents.
-        #[arg(long, value_name = "MODE", default_value = "ephemeral")]
-        consistency: ConsistencyArg,
+    /// Per-space lifecycle and operations.
+    Space {
+        #[command(subcommand)]
+        command: commands::space::SpaceCommand,
     },
-    /// Start the space defined by a manifest. With no path, looks
-    /// for `space.toml` in the current directory.
-    Start {
-        manifest: Option<PathBuf>,
-        /// Override the data directory (default: `data`).
-        #[arg(long, value_name = "DIR", default_value = "data")]
-        data_dir: Option<PathBuf>,
-        /// Disable state persistence entirely (overrides --data-dir).
-        #[arg(long)]
-        no_persist: bool,
-        /// libp2p multiaddr to listen on.
-        #[arg(long, value_name = "MULTIADDR")]
-        listen: Vec<String>,
-        /// libp2p multiaddr to dial at startup. Repeatable.
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-    },
-    /// List actors in a manifest.
-    List { manifest: Option<PathBuf> },
-    /// Snapshot of a hyperspace: local identity, connected
-    /// peers, and the registry's contents. Joins the manifest's
-    /// hyperspace as a transient peer (same model as `invoke`).
-    Status {
-        manifest: Option<PathBuf>,
-        /// libp2p multiaddr to dial at startup. Repeatable.
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-        /// Seconds to wait for registry sync before printing.
-        #[arg(long, default_value_t = 3)]
-        sync_timeout: u64,
-    },
-    /// Resolve a service name (or accept a `0x…` ServiceId) and
-    /// invoke a typed message on it. Joins the manifest's
-    /// hyperspace as a transient peer, looks the name up via
-    /// the registry actor, then forwards the call.
-    Invoke {
-        /// Service name (looked up in registry) or a literal
-        /// `0xHEX` ServiceId.
-        target: String,
-        /// Message name (e.g. `inc`, `get`, `lookup`).
-        msg: String,
-        /// Repeatable: `--arg key=value`. Auto-typed: integer
-        /// → u64, `true`/`false` → bool, everything else → str.
-        #[arg(long, value_name = "KEY=VALUE")]
-        arg: Vec<String>,
-        /// Manifest path. Defaults to `space.toml`.
-        manifest: Option<PathBuf>,
-        /// libp2p multiaddr to dial at startup. Repeatable.
-        #[arg(long, value_name = "MULTIADDR")]
-        connect: Vec<String>,
-        /// Seconds to wait for registry sync before resolving
-        /// the target name. Ignored when target is `0x…`.
-        #[arg(long, default_value_t = 3)]
-        sync_timeout: u64,
-    },
+    /// Emit the full CLI schema as pretty-printed JSON. Walks
+    /// every subcommand + argument from clap's introspection,
+    /// so the dump always matches what the binary accepts.
+    /// Designed for LLM and tooling consumption — pipe into
+    /// `jq '.subcommands[] | .name'` to enumerate verbs.
+    HelpSchema,
+}
+
+/// Initialize the global tracing subscriber. Default level is
+/// `warn` (quiet); `-v` raises it to `info` for one-time state
+/// changes; `RUST_LOG` overrides everything for power users
+/// who want `debug` or per-target filtering. Also bridges the
+/// `log` facade so vos's actor-side `log::*` calls reach the
+/// same subscriber.
+fn init_tracing(verbose: bool) {
+    let default_level = if verbose { "info" } else { "warn" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let _ = tracing_log::LogTracer::init();
 }
 
 fn main() {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
+    output::set(cli.format);
 
     match cli.command {
         Some(Command::Run {
@@ -165,66 +127,60 @@ fn main() {
         }) => {
             commands::run::run(&program, &payload, &hex, gas);
         }
-        Some(Command::Node {
-            programs,
-            registry,
-            worker,
-            data_dir,
-            no_persist,
-            consistency,
-        }) => {
-            let dir = if no_persist {
-                None
-            } else {
-                data_dir.as_deref()
-            };
-            commands::node::run(
-                &programs,
-                registry.as_deref(),
-                &worker,
-                dir,
-                consistency.into(),
-            );
+        Some(Command::Space { command }) => {
+            if let Err(e) = commands::space::run(command) {
+                report_error(e);
+            }
         }
-        Some(Command::Start {
-            manifest,
-            data_dir,
-            no_persist,
-            listen,
-            connect,
-        }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::start::run(&m, &dir, data_dir.as_deref(), no_persist, &listen, &connect);
+        Some(Command::HelpSchema) => {
+            let schema = help_schema::build(&Cli::command());
+            match serde_json::to_string_pretty(&schema) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(EXIT_RUNTIME_ERROR);
+                }
+            }
         }
-        Some(Command::List { manifest }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::list::run(&m, &dir);
-        }
-        Some(Command::Status {
-            manifest,
-            connect,
-            sync_timeout,
-        }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::status::run(&m, &dir, &connect, sync_timeout);
-        }
-        Some(Command::Invoke {
-            target,
-            msg,
-            arg,
-            manifest,
-            connect,
-            sync_timeout,
-        }) => {
-            let (m, dir) = manifest_from(manifest);
-            commands::invoke::run(&m, &dir, &target, &msg, &arg, &connect, sync_timeout);
-        }
-        None if cli.file.as_ref().is_some_and(|p| !manifest::is_manifest(p)) => {
-            commands::run::run(cli.file.as_ref().unwrap(), &[], &[], 100_000_000);
-        }
-        None => {
-            let (m, dir) = manifest_from(cli.file);
-            commands::start::run(&m, &dir, Some(Path::new("data")), false, &[], &[]);
-        }
+        None => match cli.file {
+            Some(p) => commands::run::run(&p, &[], &[], 100_000_000),
+            None => {
+                eprintln!(
+                    "vosx: no command. Try `vosx space new --name foo`, \
+                     `vosx run path/to.elf`, or `vosx --help`."
+                );
+                std::process::exit(EXIT_USAGE_ERROR);
+            }
+        },
     }
+}
+
+/// Print an error and exit with the appropriate code. In JSON
+/// mode the error envelope goes to stderr too — tools parsing
+/// stdout get nothing on the failure path, and structured
+/// failure detail is one line away on fd 2.
+fn report_error(e: anyhow::Error) -> ! {
+    let code = exit_code_for(&e);
+    if output::is_json() {
+        let envelope = serde_json::json!({
+            "error": e.to_string(),
+            "code": code,
+        });
+        eprintln!("{envelope}");
+    } else {
+        eprintln!("error: {e}");
+    }
+    std::process::exit(code)
+}
+
+/// Inspect the error chain to pick a code. `IndexError::NotFound`
+/// is the only "not found" we can detect typed today (returned
+/// by `spaces_index::find` when a space name/id doesn't match);
+/// registry-status not-founds still surface as plain anyhow
+/// strings and map to runtime-error.
+fn exit_code_for(e: &anyhow::Error) -> i32 {
+    if let Some(IndexError::NotFound(_)) = e.downcast_ref::<IndexError>() {
+        return EXIT_NOT_FOUND;
+    }
+    EXIT_RUNTIME_ERROR
 }

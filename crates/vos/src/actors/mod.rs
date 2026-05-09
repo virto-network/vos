@@ -58,11 +58,8 @@ pub fn run_accumulate_entry<A: Actor>() {
 pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */
 }
 
-// --- Guest I/O macros and panic handler ---
-
-#[cfg(feature = "pvm")]
-mod guest_io;
-
+// --- Guest panic handler ---
+//
 // Guest-only #[panic_handler]. Include only when we're a no_std
 // guest build — when both `pvm` and `std` are enabled (which
 // happens to vos itself when an actor crate is dev-deped from
@@ -70,3 +67,11 @@ mod guest_io;
 // here is a duplicate-lang-item error.
 #[cfg(all(feature = "pvm", not(feature = "std")))]
 mod guest_panic;
+
+// Guest-side stdout shims (`print!`/`println!`/`eprint!`/`eprintln!`)
+// backed by the DEBUG_WRITE hostcall. The macros are `#[macro_export]`
+// so they're exposed at the vos crate root regardless; the prelude
+// re-exports them under `pvm` so a single `use vos::prelude::*;`
+// covers both `log::info!` and `println!` for actor source files.
+#[cfg(feature = "pvm")]
+mod guest_io;

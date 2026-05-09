@@ -43,6 +43,31 @@ const TAG_FETCH_HEADS: u8 = 0x20;
 const TAG_HEADS: u8 = 0x21;
 const TAG_FETCH_NODE: u8 = 0x22;
 const TAG_NODE_REPLY: u8 = 0x23;
+// Raft RPCs. 0x30..=0x35 reserved for the basic election +
+// replication round; 0x36 reserved for follower→leader propose
+// forwarding (later phase); 0x37..=0x38 for snapshot install
+// (phase 7).
+const TAG_RAFT_APPEND_REQ: u8 = 0x30;
+const TAG_RAFT_APPEND_RESP: u8 = 0x31;
+const TAG_RAFT_VOTE_REQ: u8 = 0x32;
+const TAG_RAFT_VOTE_RESP: u8 = 0x33;
+const TAG_RAFT_INSTALL_REQ: u8 = 0x37;
+const TAG_RAFT_INSTALL_RESP: u8 = 0x38;
+// Dynamic membership / cluster discovery (Phase B, second half).
+// `RAFT_JOIN_*` lets a fresh node ask an existing replica to
+// add it as a voter. `MANIFEST_*` lets a fresh node fetch the
+// space.toml + actor blobs from a bootnode so `vosx join`
+// works without the operator pre-distributing the manifest.
+const TAG_RAFT_JOIN_REQ: u8 = 0x40;
+const TAG_RAFT_JOIN_RESP: u8 = 0x41;
+const TAG_MANIFEST_REQ: u8 = 0x42;
+const TAG_MANIFEST_RESP: u8 = 0x43;
+// `vosx ps` queries each peer for the per-group Raft state
+// (role, term, last_applied, commit_index, members, leader
+// hint) so the operator can see who's leader and whether
+// followers are caught up.
+const TAG_RAFT_STATUS_REQ: u8 = 0x44;
+const TAG_RAFT_STATUS_RESP: u8 = 0x45;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -59,6 +84,31 @@ pub const REPLICATION_ID_BYTES: usize = 32;
 /// number; this stops a malicious peer from forcing a large
 /// alloc. Realistic actor traffic stays in single digits.
 const MAX_HEADS: usize = 256;
+
+/// Cap on the number of log entries carried in one
+/// `AppendEntriesReq`. Healthy replication uses small batches;
+/// a bigger payload should be split across multiple RPCs.
+/// Bounds the per-frame allocation a malicious peer can force.
+const MAX_RAFT_ENTRIES: usize = 1024;
+
+/// Cap on the number of voters listed inside a single
+/// `RaftEntryKind::ConfigChange` (per-list — applies to
+/// `members` and to `joint_old` independently). Realistic Raft
+/// clusters stay in single digits; this bounds the alloc a
+/// malicious peer can force in either list.
+const MAX_RAFT_MEMBERS: usize = 256;
+
+/// Wire-side discriminant for [`RaftEntry::kind`]. Mirrors
+/// `vos_raft::log_entry::EntryKind`'s reserved tag values: `0`
+/// for application data, `1` for membership transitions.
+const RAFT_ENTRY_KIND_DATA: u8 = 0;
+const RAFT_ENTRY_KIND_CONFIG_CHANGE: u8 = 1;
+
+/// Cap on the number of actor blobs ferried in a single
+/// [`Frame::ManifestResp`]. A space declaring more agents than
+/// this should land them via a follow-up streaming protocol;
+/// realistic spaces stay well under the cap.
+const MANIFEST_MAX_BLOBS: usize = 256;
 
 /// Hard cap on a single encoded frame. Matches the producer-side
 /// reply cap in `node.rs` so an oversized payload is rejected at
@@ -118,6 +168,190 @@ pub enum Frame {
     /// fire-and-forget `Tell` so the request_response behaviour
     /// has something to deliver.
     Ack,
+    /// Raft `AppendEntries` RPC — leader replicating log entries
+    /// to followers. Heartbeats use the same frame with an empty
+    /// `entries` vec.
+    RaftAppendReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    },
+    /// Reply to [`Frame::RaftAppendReq`]. `match_index` is the
+    /// last log index the follower has replicated when `success`
+    /// is true; ignored otherwise.
+    RaftAppendResp {
+        term: u64,
+        success: bool,
+        match_index: u64,
+    },
+    /// Raft `RequestVote` RPC — candidate soliciting votes.
+    RaftVoteReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Reply to [`Frame::RaftVoteReq`].
+    RaftVoteResp {
+        term: u64,
+        vote_granted: bool,
+    },
+    /// Raft `InstallSnapshot` RPC — the leader hands a far-behind
+    /// follower the actor state at `last_included_index`/term so
+    /// the follower doesn't need a log replay it can no longer
+    /// reconstruct (the entries have been compacted away).
+    /// Single-shot for now; chunked support is a later phase.
+    RaftInstallSnapshotReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        /// Opaque actor state at `last_included_index`. Bounded
+        /// by `MAX_FRAME_BYTES` (1 MB) like every other length-
+        /// prefixed payload.
+        snapshot: Vec<u8>,
+    },
+    /// Reply to [`Frame::RaftInstallSnapshotReq`].
+    RaftInstallSnapshotResp {
+        term: u64,
+    },
+    /// Cluster join request — a fresh node asks an existing
+    /// replica of `replication_id` to add it as a voter via
+    /// joint consensus. Receivers that aren't the leader respond
+    /// with [`RaftJoinResult::NotLeader`] + a leader hint;
+    /// leaders compute `new_members = current ∪ {joiner_prefix}`
+    /// and reply with the joint-entry index once it commits.
+    RaftJoinReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        joiner_prefix: u16,
+    },
+    /// Reply to [`Frame::RaftJoinReq`].
+    RaftJoinResp {
+        result: RaftJoinResult,
+    },
+    /// Manifest fetch — joiner asks bootnode "what space.toml
+    /// are you running, and what actor blobs do I need to match
+    /// it?". No replication_id; one manifest per node.
+    ManifestReq,
+    /// Reply to [`Frame::ManifestReq`]. `toml_bytes` is the raw
+    /// `space.toml` content; `blobs` is one entry per actor
+    /// referenced by the manifest carrying the actor's NAME (as
+    /// it appears in `[[agent]] name = …`) and its compiled PVM
+    /// blob bytes. Joiners write the blobs into a local cache
+    /// keyed by `name` so the actor binary on disk matches the
+    /// bootnode's exactly — important for replication_id
+    /// derivation (`blake2b(blob || name)`).
+    ManifestResp {
+        toml_bytes: Vec<u8>,
+        blobs: Vec<ManifestBlob>,
+    },
+    /// Raft status query — `vosx ps` asks each peer "what's
+    /// your view of replication group X?". Receiver answers
+    /// from its [`vos_raft::WorkerSnapshot`].
+    RaftStatusReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+    },
+    /// Reply to [`Frame::RaftStatusReq`]. `present = false`
+    /// means the receiver isn't running this group; the other
+    /// fields are zero in that case. Otherwise they mirror
+    /// the worker's snapshot.
+    RaftStatusResp {
+        present: bool,
+        role: u8, // 0 = Follower, 1 = PreCandidate, 2 = Candidate, 3 = Leader
+        current_term: u64,
+        commit_index: u64,
+        last_log_index: u64,
+        members: Vec<u16>,
+        leader_hint: Option<u16>,
+    },
+}
+
+/// One actor's name + compiled PVM blob, as ferried by
+/// [`Frame::ManifestResp`]. Each blob is bounded by
+/// `MAX_FRAME_BYTES` like every other length-prefixed payload —
+/// large actor bundles need a follow-up streaming protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestBlob {
+    pub name: String,
+    pub blob: Vec<u8>,
+}
+
+/// Outcome of a [`Frame::RaftJoinReq`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftJoinResult {
+    /// The leader proposed a joint-consensus entry adding the
+    /// joiner as a voter. `joint_index` is the log index of the
+    /// joint entry; the joiner can poll its own
+    /// `WorkerSnapshot::commit_index >= joint_index + 1` to know
+    /// the retire entry has committed and it's now a steady-state
+    /// voter.
+    Accepted { joint_index: u64 },
+    /// The receiver is not the leader of this replication group.
+    /// `leader_hint` is the prefix it last saw as leader, if any —
+    /// the joiner should retry the request against that peer.
+    NotLeader { leader_hint: Option<u16> },
+    /// The receiver isn't running the requested replication group
+    /// at all. Joiner picks another bootnode.
+    UnknownGroup,
+    /// `change_membership` rejected the proposal — typically
+    /// because another joint-consensus change is in flight.
+    /// Joiner backs off and retries.
+    Busy,
+}
+
+/// One log entry carried inside an [`Frame::RaftAppendReq`].
+///
+/// `Data` entries ferry the raw `EffectLog::to_bytes()` blob
+/// the leader has in its `raft_log` table — the receiver
+/// writes it straight back out without re-encoding.
+/// `ConfigChange` entries carry the new membership view (and,
+/// for joint-consensus phases, the previous view too); the
+/// vos-raft worker consumes them to update its quorum
+/// computation and the host's apply path skips them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftEntry {
+    pub term: u64,
+    pub kind: RaftEntryKind,
+}
+
+/// Variant tag inside a [`RaftEntry`]. Mirrors
+/// `vos_raft::log_entry::EntryKind` over the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftEntryKind {
+    /// Application data — opaque to the consensus layer.
+    Data { payload: Vec<u8> },
+    /// Cluster membership transition (Ongaro thesis §4.3).
+    /// `members` is the configuration the cluster transitions
+    /// *to*. `joint_old = Some(...)` indicates the joint phase;
+    /// `None` retires it.
+    ConfigChange {
+        joint_old: Option<Vec<u16>>,
+        members: Vec<u16>,
+    },
+}
+
+impl RaftEntry {
+    /// Convenience — build a `Data` variant.
+    pub fn data(term: u64, payload: Vec<u8>) -> Self {
+        Self {
+            term,
+            kind: RaftEntryKind::Data { payload },
+        }
+    }
+
+    /// Convenience — build a `ConfigChange` variant.
+    pub fn config_change(term: u64, joint_old: Option<Vec<u16>>, members: Vec<u16>) -> Self {
+        Self {
+            term,
+            kind: RaftEntryKind::ConfigChange { joint_old, members },
+        }
+    }
 }
 
 impl Frame {
@@ -195,6 +429,177 @@ impl Frame {
             Frame::Ack => {
                 out.push(TAG_ACK);
             }
+            Frame::RaftAppendReq {
+                replication_id,
+                term,
+                leader_prefix,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                entries,
+            } => {
+                out.push(TAG_RAFT_APPEND_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&leader_prefix.to_le_bytes());
+                out.extend_from_slice(&prev_log_index.to_le_bytes());
+                out.extend_from_slice(&prev_log_term.to_le_bytes());
+                out.extend_from_slice(&leader_commit.to_le_bytes());
+                out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for e in entries {
+                    out.extend_from_slice(&e.term.to_le_bytes());
+                    match &e.kind {
+                        RaftEntryKind::Data { payload } => {
+                            out.push(RAFT_ENTRY_KIND_DATA);
+                            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                            out.extend_from_slice(payload);
+                        }
+                        RaftEntryKind::ConfigChange { joint_old, members } => {
+                            out.push(RAFT_ENTRY_KIND_CONFIG_CHANGE);
+                            match joint_old {
+                                Some(prev) => {
+                                    out.push(1);
+                                    out.extend_from_slice(&(prev.len() as u16).to_le_bytes());
+                                    for n in prev {
+                                        out.extend_from_slice(&n.to_le_bytes());
+                                    }
+                                }
+                                None => out.push(0),
+                            }
+                            out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+                            for n in members {
+                                out.extend_from_slice(&n.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+            Frame::RaftAppendResp {
+                term,
+                success,
+                match_index,
+            } => {
+                out.push(TAG_RAFT_APPEND_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.push(if *success { 1 } else { 0 });
+                out.extend_from_slice(&match_index.to_le_bytes());
+            }
+            Frame::RaftVoteReq {
+                replication_id,
+                term,
+                candidate_prefix,
+                last_log_index,
+                last_log_term,
+            } => {
+                out.push(TAG_RAFT_VOTE_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&candidate_prefix.to_le_bytes());
+                out.extend_from_slice(&last_log_index.to_le_bytes());
+                out.extend_from_slice(&last_log_term.to_le_bytes());
+            }
+            Frame::RaftVoteResp { term, vote_granted } => {
+                out.push(TAG_RAFT_VOTE_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.push(if *vote_granted { 1 } else { 0 });
+            }
+            Frame::RaftInstallSnapshotReq {
+                replication_id,
+                term,
+                leader_prefix,
+                last_included_index,
+                last_included_term,
+                snapshot,
+            } => {
+                out.push(TAG_RAFT_INSTALL_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&leader_prefix.to_le_bytes());
+                out.extend_from_slice(&last_included_index.to_le_bytes());
+                out.extend_from_slice(&last_included_term.to_le_bytes());
+                out.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
+                out.extend_from_slice(snapshot);
+            }
+            Frame::RaftInstallSnapshotResp { term } => {
+                out.push(TAG_RAFT_INSTALL_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+            }
+            Frame::RaftJoinReq {
+                replication_id,
+                joiner_prefix,
+            } => {
+                out.push(TAG_RAFT_JOIN_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&joiner_prefix.to_le_bytes());
+            }
+            Frame::RaftJoinResp { result } => {
+                out.push(TAG_RAFT_JOIN_RESP);
+                match result {
+                    RaftJoinResult::Accepted { joint_index } => {
+                        out.push(0);
+                        out.extend_from_slice(&joint_index.to_le_bytes());
+                    }
+                    RaftJoinResult::NotLeader { leader_hint } => {
+                        out.push(1);
+                        match leader_hint {
+                            Some(p) => {
+                                out.push(1);
+                                out.extend_from_slice(&p.to_le_bytes());
+                            }
+                            None => out.push(0),
+                        }
+                    }
+                    RaftJoinResult::UnknownGroup => out.push(2),
+                    RaftJoinResult::Busy => out.push(3),
+                }
+            }
+            Frame::ManifestReq => {
+                out.push(TAG_MANIFEST_REQ);
+            }
+            Frame::ManifestResp { toml_bytes, blobs } => {
+                out.push(TAG_MANIFEST_RESP);
+                out.extend_from_slice(&(toml_bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(toml_bytes);
+                out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+                for b in blobs {
+                    let name_bytes = b.name.as_bytes();
+                    out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(name_bytes);
+                    out.extend_from_slice(&(b.blob.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&b.blob);
+                }
+            }
+            Frame::RaftStatusReq { replication_id } => {
+                out.push(TAG_RAFT_STATUS_REQ);
+                out.extend_from_slice(replication_id);
+            }
+            Frame::RaftStatusResp {
+                present,
+                role,
+                current_term,
+                commit_index,
+                last_log_index,
+                members,
+                leader_hint,
+            } => {
+                out.push(TAG_RAFT_STATUS_RESP);
+                out.push(if *present { 1 } else { 0 });
+                out.push(*role);
+                out.extend_from_slice(&current_term.to_le_bytes());
+                out.extend_from_slice(&commit_index.to_le_bytes());
+                out.extend_from_slice(&last_log_index.to_le_bytes());
+                out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+                for m in members {
+                    out.extend_from_slice(&m.to_le_bytes());
+                }
+                match leader_hint {
+                    Some(h) => {
+                        out.push(1);
+                        out.extend_from_slice(&h.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
         }
         out
     }
@@ -265,6 +670,194 @@ impl Frame {
                 Frame::NodeReply { node }
             }
             TAG_ACK => Frame::Ack,
+            TAG_RAFT_APPEND_REQ => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let term = r.u64()?;
+                let leader_prefix = r.u16()?;
+                let prev_log_index = r.u64()?;
+                let prev_log_term = r.u64()?;
+                let leader_commit = r.u64()?;
+                let n = r.u32()? as usize;
+                if n > MAX_RAFT_ENTRIES {
+                    return Err(FrameError::RaftEntriesTooMany(n));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let entry_term = r.u64()?;
+                    let kind_tag = r.u8()?;
+                    let kind = match kind_tag {
+                        RAFT_ENTRY_KIND_DATA => {
+                            let payload = r.bytes_with_len_prefix()?;
+                            RaftEntryKind::Data { payload }
+                        }
+                        RAFT_ENTRY_KIND_CONFIG_CHANGE => {
+                            let joint_old_present = r.u8()?;
+                            let joint_old = match joint_old_present {
+                                0 => None,
+                                1 => {
+                                    let len = r.u16()? as usize;
+                                    if len > MAX_RAFT_MEMBERS {
+                                        return Err(FrameError::RaftMembersTooMany(len));
+                                    }
+                                    let mut v = Vec::with_capacity(len);
+                                    for _ in 0..len {
+                                        v.push(r.u16()?);
+                                    }
+                                    Some(v)
+                                }
+                                other => return Err(FrameError::BadOption(other)),
+                            };
+                            let len = r.u16()? as usize;
+                            if len > MAX_RAFT_MEMBERS {
+                                return Err(FrameError::RaftMembersTooMany(len));
+                            }
+                            let mut members = Vec::with_capacity(len);
+                            for _ in 0..len {
+                                members.push(r.u16()?);
+                            }
+                            RaftEntryKind::ConfigChange { joint_old, members }
+                        }
+                        other => return Err(FrameError::BadRaftEntryKind(other)),
+                    };
+                    entries.push(RaftEntry {
+                        term: entry_term,
+                        kind,
+                    });
+                }
+                Frame::RaftAppendReq {
+                    replication_id,
+                    term,
+                    leader_prefix,
+                    prev_log_index,
+                    prev_log_term,
+                    leader_commit,
+                    entries,
+                }
+            }
+            TAG_RAFT_APPEND_RESP => {
+                let term = r.u64()?;
+                let success = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                let match_index = r.u64()?;
+                Frame::RaftAppendResp {
+                    term,
+                    success,
+                    match_index,
+                }
+            }
+            TAG_RAFT_VOTE_REQ => Frame::RaftVoteReq {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+                term: r.u64()?,
+                candidate_prefix: r.u16()?,
+                last_log_index: r.u64()?,
+                last_log_term: r.u64()?,
+            },
+            TAG_RAFT_VOTE_RESP => {
+                let term = r.u64()?;
+                let vote_granted = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftVoteResp { term, vote_granted }
+            }
+            TAG_RAFT_INSTALL_REQ => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let term = r.u64()?;
+                let leader_prefix = r.u16()?;
+                let last_included_index = r.u64()?;
+                let last_included_term = r.u64()?;
+                let snapshot = r.bytes_with_len_prefix()?;
+                Frame::RaftInstallSnapshotReq {
+                    replication_id,
+                    term,
+                    leader_prefix,
+                    last_included_index,
+                    last_included_term,
+                    snapshot,
+                }
+            }
+            TAG_RAFT_INSTALL_RESP => Frame::RaftInstallSnapshotResp { term: r.u64()? },
+            TAG_RAFT_JOIN_REQ => Frame::RaftJoinReq {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+                joiner_prefix: r.u16()?,
+            },
+            TAG_RAFT_JOIN_RESP => {
+                let variant = r.u8()?;
+                let result = match variant {
+                    0 => RaftJoinResult::Accepted {
+                        joint_index: r.u64()?,
+                    },
+                    1 => {
+                        let leader_hint = match r.u8()? {
+                            0 => None,
+                            1 => Some(r.u16()?),
+                            other => return Err(FrameError::BadOption(other)),
+                        };
+                        RaftJoinResult::NotLeader { leader_hint }
+                    }
+                    2 => RaftJoinResult::UnknownGroup,
+                    3 => RaftJoinResult::Busy,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftJoinResp { result }
+            }
+            TAG_MANIFEST_REQ => Frame::ManifestReq,
+            TAG_MANIFEST_RESP => {
+                let toml_bytes = r.bytes_with_len_prefix()?;
+                let n_blobs = r.u32()? as usize;
+                if n_blobs > MANIFEST_MAX_BLOBS {
+                    return Err(FrameError::ManifestTooManyBlobs(n_blobs));
+                }
+                let mut blobs = Vec::with_capacity(n_blobs);
+                for _ in 0..n_blobs {
+                    let name_bytes = r.bytes_with_len_prefix()?;
+                    let name =
+                        String::from_utf8(name_bytes).map_err(|_| FrameError::ManifestBadName)?;
+                    let blob = r.bytes_with_len_prefix()?;
+                    blobs.push(ManifestBlob { name, blob });
+                }
+                Frame::ManifestResp { toml_bytes, blobs }
+            }
+            TAG_RAFT_STATUS_REQ => Frame::RaftStatusReq {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+            },
+            TAG_RAFT_STATUS_RESP => {
+                let present = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                let role = r.u8()?;
+                let current_term = r.u64()?;
+                let commit_index = r.u64()?;
+                let last_log_index = r.u64()?;
+                let n = r.u16()? as usize;
+                if n > MAX_RAFT_MEMBERS {
+                    return Err(FrameError::RaftMembersTooMany(n));
+                }
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(r.u16()?);
+                }
+                let leader_hint = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u16()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftStatusResp {
+                    present,
+                    role,
+                    current_term,
+                    commit_index,
+                    last_log_index,
+                    members,
+                    leader_hint,
+                }
+            }
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -283,6 +876,11 @@ pub enum FrameError {
     TrailingBytes(usize),
     HeadsTooMany(usize),
     BadOption(u8),
+    RaftEntriesTooMany(usize),
+    RaftMembersTooMany(usize),
+    BadRaftEntryKind(u8),
+    ManifestTooManyBlobs(usize),
+    ManifestBadName,
 }
 
 impl core::fmt::Display for FrameError {
@@ -301,6 +899,27 @@ impl core::fmt::Display for FrameError {
                 write!(f, "heads count {n} exceeds cap {MAX_HEADS}")
             }
             FrameError::BadOption(b) => write!(f, "invalid Option discriminant {b}"),
+            FrameError::RaftEntriesTooMany(n) => {
+                write!(f, "raft entry count {n} exceeds cap {MAX_RAFT_ENTRIES}")
+            }
+            FrameError::RaftMembersTooMany(n) => {
+                write!(
+                    f,
+                    "raft member list length {n} exceeds cap {MAX_RAFT_MEMBERS}"
+                )
+            }
+            FrameError::BadRaftEntryKind(b) => {
+                write!(f, "invalid raft entry kind discriminant {b}")
+            }
+            FrameError::ManifestTooManyBlobs(n) => {
+                write!(
+                    f,
+                    "manifest blob count {n} exceeds cap {MANIFEST_MAX_BLOBS}"
+                )
+            }
+            FrameError::ManifestBadName => {
+                write!(f, "manifest blob name was not valid UTF-8")
+            }
         }
     }
 }
@@ -340,6 +959,12 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, FrameError> {
         let s = self.take(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, FrameError> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
     fn bytes_with_len_prefix(&mut self) -> Result<Vec<u8>, FrameError> {
         let len = self.u32()? as usize;
@@ -538,6 +1163,147 @@ mod tests {
         assert!(matches!(
             Frame::decode(&bad),
             Err(FrameError::PayloadTooLarge(_))
+        ));
+    }
+
+    // ── Raft frames ─────────────────────────────────────────────
+
+    #[test]
+    fn raft_append_req_roundtrip_empty_entries_is_heartbeat() {
+        roundtrip(Frame::RaftAppendReq {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            term: 7,
+            leader_prefix: 0x1234,
+            prev_log_index: 42,
+            prev_log_term: 6,
+            leader_commit: 41,
+            entries: vec![],
+        });
+    }
+
+    #[test]
+    fn raft_append_req_roundtrip_with_entries() {
+        roundtrip(Frame::RaftAppendReq {
+            replication_id: [0xAA; REPLICATION_ID_BYTES],
+            term: 7,
+            leader_prefix: 0x1234,
+            prev_log_index: 42,
+            prev_log_term: 6,
+            leader_commit: 43,
+            entries: vec![
+                RaftEntry::data(6, vec![]),
+                RaftEntry::data(7, b"first entry".to_vec()),
+                RaftEntry::data(7, vec![0x99; 4096]),
+                // ConfigChange variant — joint phase carrying the
+                // previous member set + the new one.
+                RaftEntry::config_change(
+                    7,
+                    Some(vec![0xAAAA, 0xBBBB]),
+                    vec![0xAAAA, 0xBBBB, 0xCCCC],
+                ),
+                // ConfigChange retire — joint_old=None, just the
+                // final members list.
+                RaftEntry::config_change(8, None, vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            ],
+        });
+    }
+
+    #[test]
+    fn raft_append_resp_roundtrip_success_and_failure() {
+        roundtrip(Frame::RaftAppendResp {
+            term: 7,
+            success: true,
+            match_index: 42,
+        });
+        roundtrip(Frame::RaftAppendResp {
+            term: 7,
+            success: false,
+            match_index: 0,
+        });
+    }
+
+    #[test]
+    fn raft_vote_req_roundtrip() {
+        roundtrip(Frame::RaftVoteReq {
+            replication_id: [0x11; REPLICATION_ID_BYTES],
+            term: 9,
+            candidate_prefix: 0xBEEF,
+            last_log_index: 100,
+            last_log_term: 8,
+        });
+    }
+
+    #[test]
+    fn raft_vote_resp_roundtrip() {
+        roundtrip(Frame::RaftVoteResp {
+            term: 9,
+            vote_granted: true,
+        });
+        roundtrip(Frame::RaftVoteResp {
+            term: 9,
+            vote_granted: false,
+        });
+    }
+
+    #[test]
+    fn raft_append_resp_bad_success_byte_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_APPEND_RESP);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.push(2); // not 0 or 1
+        bad.extend_from_slice(&0u64.to_le_bytes()); // match_index
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
+    }
+
+    #[test]
+    fn raft_vote_resp_bad_granted_byte_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_VOTE_RESP);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.push(7); // not 0 or 1
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(7))));
+    }
+
+    #[test]
+    fn raft_install_snapshot_req_roundtrip() {
+        roundtrip(Frame::RaftInstallSnapshotReq {
+            replication_id: [0x22; REPLICATION_ID_BYTES],
+            term: 9,
+            leader_prefix: 0xAAAA,
+            last_included_index: 100,
+            last_included_term: 8,
+            snapshot: b"opaque actor state".to_vec(),
+        });
+        // Empty snapshot — degenerate but valid.
+        roundtrip(Frame::RaftInstallSnapshotReq {
+            replication_id: [0x22; REPLICATION_ID_BYTES],
+            term: 1,
+            leader_prefix: 0,
+            last_included_index: 0,
+            last_included_term: 0,
+            snapshot: vec![],
+        });
+    }
+
+    #[test]
+    fn raft_install_snapshot_resp_roundtrip() {
+        roundtrip(Frame::RaftInstallSnapshotResp { term: 9 });
+    }
+
+    #[test]
+    fn raft_append_entries_count_capped() {
+        let mut bad = Vec::new();
+        bad.push(TAG_RAFT_APPEND_REQ);
+        bad.extend_from_slice(&[0u8; REPLICATION_ID_BYTES]);
+        bad.extend_from_slice(&0u64.to_le_bytes()); // term
+        bad.extend_from_slice(&0u16.to_le_bytes()); // leader_prefix
+        bad.extend_from_slice(&0u64.to_le_bytes()); // prev_log_index
+        bad.extend_from_slice(&0u64.to_le_bytes()); // prev_log_term
+        bad.extend_from_slice(&0u64.to_le_bytes()); // leader_commit
+        bad.extend_from_slice(&100_000u32.to_le_bytes()); // entries count
+        assert!(matches!(
+            Frame::decode(&bad),
+            Err(FrameError::RaftEntriesTooMany(100_000))
         ));
     }
 }

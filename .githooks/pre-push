@@ -1,8 +1,10 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Heavier checks before pushing. Skip in emergencies with `git push --no-verify`.
 #
 # Install via: just install-hooks  (sets core.hooksPath = .githooks)
-set -e
+# pipefail propagates a failure through the `tee` pipe below — without
+# it `just build-pvm` could fail and the hook would still pass clean.
+set -euo pipefail
 
 echo "→ pre-push: workspace tests"
 cargo test --workspace --lib --quiet

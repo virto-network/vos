@@ -43,10 +43,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let elf = match blob_store::cache_get(&hash)? {
         Some(b) => b,
         None => anyhow::bail!(
-            "registry blob {} not in local cache. Re-fetch with \
-             `vosx space pull-blob {}` once that command lands.",
-            hash,
-            hash,
+            "registry blob {hash} not in local cache. Re-fetch with \
+             `vosx space pull-blob {hash}` once that command lands.",
         ),
     };
     // Cache stores raw ELF bytes (hash addresses the source); the

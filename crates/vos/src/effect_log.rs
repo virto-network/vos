@@ -123,6 +123,90 @@ impl EffectLog {
     }
 }
 
+/// One CRDT-replicated event: an [`EffectLog`] tagged with the
+/// replica that produced it and a per-origin sequence number.
+///
+/// `(origin, seq)` is the authoritative identity of the event. Two
+/// replicas independently producing byte-identical `EffectLog`s
+/// (e.g. both calling `counter.inc()`) end up with distinct
+/// `CrdtEvent`s because their origins differ. The DAG-node CID
+/// hashes the event bytes — origin/seq included — so the merkle
+/// DAG stores both as separate nodes that merge cleanly across
+/// replicas. Replays preserve each event's recorded `(origin, seq)`,
+/// so a replicated DAG round-trips through any replica without
+/// re-numbering.
+///
+/// Replay reads `event.log` and feeds it through the runtime
+/// exactly as the originating replica did; `origin` and `seq` are
+/// metadata for the merkle layer, not visible to handlers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrdtEvent {
+    /// Replica id of the producer — typically the CRDT
+    /// replication-id the agent is registered under.
+    pub origin: [u8; 32],
+    /// Per-origin monotone counter. Allocated by the producing
+    /// replica's [`CrdtCommit`](crate::commit::CrdtCommit) on
+    /// each state-changing dispatch and persisted alongside the
+    /// new DAG node.
+    pub seq: u64,
+    /// The recorded effect log — incoming dispatch + observed
+    /// replies. Replays feed this through the runtime to rebuild
+    /// state.
+    pub log: EffectLog,
+}
+
+/// Wire format version byte at the head of [`CrdtEvent::to_bytes`].
+/// Reserved for future additions (e.g. embedding a parent-vector
+/// or a deletion tombstone). Bumping invalidates existing CIDs;
+/// downstream stores must be drained on upgrade.
+pub const CRDT_EVENT_VERSION: u8 = 1;
+
+impl CrdtEvent {
+    /// Build a fresh event tagged with the producing replica's
+    /// id and a freshly allocated `seq`.
+    pub fn new(origin: [u8; 32], seq: u64, log: EffectLog) -> Self {
+        Self { origin, seq, log }
+    }
+
+    /// Serialize for storage in a merkle-crdt DAG node.
+    ///
+    /// Format:
+    /// ```text
+    /// [version:u8][origin:32B][seq:u64 LE][effect_log_bytes…]
+    /// ```
+    ///
+    /// The encoding is deterministic — replicas with identical
+    /// origins, seqs, and logs produce identical bytes. Different
+    /// origins or seqs produce different bytes (and thus different
+    /// CIDs), which is the whole point.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let log_bytes = self.log.to_bytes();
+        let mut buf = Vec::with_capacity(1 + 32 + 8 + log_bytes.len());
+        buf.push(CRDT_EVENT_VERSION);
+        buf.extend_from_slice(&self.origin);
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&log_bytes);
+        buf
+    }
+
+    /// Deserialize from bytes produced by [`to_bytes`]. Returns
+    /// `None` on a version mismatch, malformed prefix, or any
+    /// EffectLog decode failure.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 1 + 32 + 8 {
+            return None;
+        }
+        if bytes[0] != CRDT_EVENT_VERSION {
+            return None;
+        }
+        let mut origin = [0u8; 32];
+        origin.copy_from_slice(&bytes[1..33]);
+        let seq = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
+        let log = EffectLog::from_bytes(&bytes[41..])?;
+        Some(Self { origin, seq, log })
+    }
+}
+
 /// Side-channel state for one dispatch under a CRDT/Raft strategy.
 ///
 /// Exactly one mode is active at a time — a dispatch is either

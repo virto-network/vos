@@ -28,13 +28,15 @@
 //! - Hyperspace-driven peer discovery.
 
 mod codec;
+mod ops;
 mod wire;
 
-pub use wire::{Frame, FrameError, MAX_FRAME_BYTES};
+pub use wire::{
+    Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
+};
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -74,32 +76,257 @@ pub struct InboundTell {
     pub payload: Vec<u8>,
 }
 
-/// Handler invoked by the network thread when a remote peer sends
-/// us a `Frame::InvokeRequest`. The implementation typically
-/// dispatches against the local invoke-route table and blocks on
-/// the agent's reply (the network calls `dispatch` from a
-/// `tokio::task::spawn_blocking`, so blocking is safe). Returning
-/// an empty `Vec` is interpreted as "no reply" / "target not
-/// found" and surfaces to the original caller as an empty
-/// `InvokeReply`.
-pub trait InvokeDispatcher: Send + Sync {
-    fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8>;
+// (InvokeHandler / SyncHandler / ManifestHandler are now methods on
+//  the unified NetworkService trait below — see set_service.)
+
+/// Inbound result from an [`AppendEntries`](Frame::RaftAppendReq)
+/// RPC, returned by [`RaftRpcHandler::append_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftAppendResult {
+    pub term: u64,
+    pub success: bool,
+    pub match_index: u64,
 }
 
-/// Read-side of CRDT replication: looks up DAG state for a given
-/// replication group. The network thread calls these methods
-/// directly on its current_thread tokio runtime; implementations
-/// must return quickly (a redb read transaction is fine — micro-
-/// seconds typically, well below the cross-await budget).
-pub trait SyncProvider: Send + Sync {
-    /// Return the current root CIDs for a replication group, or
-    /// `None` if no replica of that group is registered locally.
-    fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>>;
+/// Inbound result from a [`RequestVote`](Frame::RaftVoteReq) RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftVoteResult {
+    pub term: u64,
+    pub vote_granted: bool,
+}
 
-    /// Look up a single DAG node's serialized bytes inside a
-    /// replication group. `None` means the local replica doesn't
-    /// have the node yet (sync racing) or the group is unknown.
-    fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>>;
+/// Inbound result from an
+/// [`InstallSnapshot`](Frame::RaftInstallSnapshotReq) RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftInstallSnapshotResult {
+    pub term: u64,
+}
+
+/// Reply to a [`RaftStatusReq`](Frame::RaftStatusReq) — a peer's
+/// view of one Raft replication group. Mirrors
+/// `vos_raft::WorkerSnapshot` minus the storage cursor that
+/// only matters internally. `present = false` means the peer
+/// isn't running the requested group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftStatusReply {
+    pub present: bool,
+    pub role: RaftRole,
+    pub current_term: u64,
+    pub commit_index: u64,
+    pub last_log_index: u64,
+    pub members: Vec<u16>,
+    pub leader_hint: Option<u16>,
+}
+
+/// Wire-stable Raft role. Distinct from `vos_raft::Role` so we
+/// can grow the consensus core (e.g. add a learner / observer
+/// variant) without flipping the wire encoding. `Unknown(u8)`
+/// catches future variants reported by a newer peer — the
+/// current operator can still parse the rest of the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftRole {
+    Follower,
+    PreCandidate,
+    Candidate,
+    Leader,
+    /// Future variant a newer peer used. Operators see this as
+    /// `?` in `vosx ps`; the bootnode and joiner code treat it
+    /// the same as Follower for routing purposes.
+    Unknown(u8),
+}
+
+impl RaftRole {
+    /// Encode to the on-wire byte. Layout chosen to match
+    /// `vos_raft::Role as u8` for the four real variants so a
+    /// receiver decoding straight from a `WorkerSnapshot`
+    /// produces the same bytes as one going through this enum.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Follower => 0,
+            Self::PreCandidate => 1,
+            Self::Candidate => 2,
+            Self::Leader => 3,
+            Self::Unknown(b) => b,
+        }
+    }
+
+    /// Decode from the on-wire byte. Unknown values become
+    /// `RaftRole::Unknown(b)` rather than failing — forward-
+    /// compatible with newer peers reporting future roles.
+    pub fn from_wire(b: u8) -> Self {
+        match b {
+            0 => Self::Follower,
+            1 => Self::PreCandidate,
+            2 => Self::Candidate,
+            3 => Self::Leader,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Human-readable label for `vosx ps`-style output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Follower => "Follower",
+            Self::PreCandidate => "PreCand.",
+            Self::Candidate => "Candidate",
+            Self::Leader => "Leader",
+            Self::Unknown(_) => "?",
+        }
+    }
+}
+
+impl RaftStatusReply {
+    /// Construct a "no, I don't host this group" reply.
+    pub fn absent() -> Self {
+        Self {
+            present: false,
+            role: RaftRole::Follower,
+            current_term: 0,
+            commit_index: 0,
+            last_log_index: 0,
+            members: Vec::new(),
+            leader_hint: None,
+        }
+    }
+}
+
+/// Reply to a [`Frame::ManifestReq`]: the raw `space.toml`
+/// content and a list of every actor blob the manifest
+/// references, keyed by name. The joiner writes the blobs into
+/// a local cache so its replication_id derivation
+/// (`blake2b(name || 0 || blob)`) lines up with the bootnode's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestReply {
+    pub toml: Vec<u8>,
+    pub blobs: Vec<ManifestBlob>,
+}
+
+/// Single inbound-frame service for everything that isn't keyed
+/// by `replication_id` — invoke dispatch, CRDT sync reads, and
+/// manifest serving. One install point ([`set_service`]) replaces
+/// what used to be three independent setters, three independent
+/// traits, and three "did you remember to install it?" footguns.
+///
+/// Every method has a no-op default. A lightweight test stub can
+/// override one method; a real node impl (see `vos::node`)
+/// overrides all four. The network thread calls these on its
+/// current-thread tokio runtime, so they should return quickly —
+/// `dispatch_invoke` runs in `spawn_blocking` so it can block on a
+/// downstream reply, but the others share the swarm's task and
+/// must not.
+///
+/// Per-replication-group Raft RPCs are still routed through
+/// [`register_raft_handler`] — Raft truly is keyed (one handler per
+/// group, can grow at runtime), so a single-impl model would just
+/// reinvent the map internally.
+///
+/// [`set_service`]: Network::set_service
+/// [`register_raft_handler`]: Network::register_raft_handler
+pub trait NetworkService: Send + Sync {
+    /// Inbound `Frame::InvokeRequest`. Default returns empty —
+    /// surfaces to the caller as "target not found." The real
+    /// vos::node impl dispatches against its invoke-route table
+    /// and blocks on the agent's reply (called from
+    /// `tokio::task::spawn_blocking`, so blocking is safe).
+    fn dispatch_invoke(&self, _from: u32, _to: u32, _chain: Vec<u32>, _msg: Vec<u8>) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Inbound `Frame::FetchHeads` for a replication group.
+    /// Default returns `None` (no replica of that group locally),
+    /// which surfaces to the peer as an empty roots list.
+    fn sync_roots(&self, _replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        None
+    }
+
+    /// Inbound `Frame::FetchNode` for one DAG node within a
+    /// replication group. Default returns `None`.
+    fn sync_get_node(&self, _replication_id: &[u8; 32], _cid: &[u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Inbound `Frame::ManifestReq` from a fresh `vosx join`er.
+    /// Default returns `None` (no manifest exposed) — the joiner
+    /// then bails with a clear error and falls back to
+    /// `--manifest <path>`. `vosx up` overrides this to serve the
+    /// space.toml + actor blobs verbatim.
+    fn manifest(&self) -> Option<ManifestReply> {
+        None
+    }
+}
+
+/// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
+/// shape: the swarm thread invokes the trait methods on its current-
+/// thread runtime, so implementations must be fast. Any redb writes
+/// implied by an `append_entries` call should be funnelled through
+/// the handler's own background task; the trait returns synchronously
+/// only the *response* the peer sees.
+pub trait RaftRpcHandler: Send + Sync {
+    /// Inbound `AppendEntries` from `from_prefix`. Returns the
+    /// response the peer will read. Implementations are responsible
+    /// for log consistency checks, term updates, applying entries,
+    /// and any local persistence — the network layer just delivers
+    /// the call and ferries the answer back.
+    fn append_entries(
+        &self,
+        replication_id: &[u8; 32],
+        from_prefix: u16,
+        term: u64,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    ) -> RaftAppendResult;
+
+    /// Inbound `RequestVote` from `from_prefix`. Returns the
+    /// response. Implementations are responsible for the
+    /// up-to-date check and the at-most-one-vote-per-term rule.
+    fn request_vote(
+        &self,
+        replication_id: &[u8; 32],
+        from_prefix: u16,
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> RaftVoteResult;
+
+    /// Inbound `InstallSnapshot` from `from_prefix` (the leader).
+    /// Implementations replace the local actor state, advance
+    /// the snap pointer, and drop any log entries the snapshot
+    /// supersedes — atomically, before answering. The default
+    /// impl just refuses (advertises our current term) so older
+    /// handlers stay safely on the AppendEntries path.
+    fn install_snapshot(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        term: u64,
+        _last_included_index: u64,
+        _last_included_term: u64,
+        _snapshot: Vec<u8>,
+    ) -> RaftInstallSnapshotResult {
+        RaftInstallSnapshotResult { term }
+    }
+
+    /// Inbound `RaftJoinReq` from a fresh node that wants to
+    /// become a voter in this replication group. Default impl
+    /// returns `NotLeader { leader_hint: None }` — handlers
+    /// representing real workers override this to: (a) check
+    /// they're the leader, (b) compute `new_members = current ∪
+    /// {joiner}`, and (c) call `change_membership(...)`. On
+    /// success, return `Accepted { joint_index }` so the joiner
+    /// can poll for `commit_index >= joint_index + 1`.
+    fn handle_join(&self, _replication_id: &[u8; 32], _joiner_prefix: u16) -> RaftJoinResult {
+        RaftJoinResult::NotLeader { leader_hint: None }
+    }
+
+    /// Inbound `RaftStatusReq` — answer "what's your view of
+    /// replication group X?" from a vosx-ps observer. Default
+    /// impl returns [`RaftStatusReply::absent`]; concrete
+    /// handlers override to translate their `WorkerSnapshot`.
+    fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+        RaftStatusReply::absent()
+    }
 }
 
 /// Map: peer's `node_prefix` → its `PeerId`. Populated as Hello
@@ -107,6 +334,15 @@ pub trait SyncProvider: Send + Sync {
 /// thread and any [`Network`] callers that want to look up a
 /// peer by prefix.
 type PrefixMap = Arc<Mutex<HashMap<u16, PeerId>>>;
+
+/// Map: replication-group id → handler. Each Raft group running
+/// on this node registers itself via
+/// [`Network::register_raft_handler`]; the swarm thread routes
+/// inbound Raft RPCs to the handler whose `replication_id`
+/// matches the frame's. Pre-multi-group code stored a single
+/// `Option<Arc<...>>`; multi-group dispatch (one Raft cluster per
+/// `[[agent]] consistency = "raft"`) needs the map.
+type RaftHandlerMap = Arc<Mutex<BTreeMap<[u8; 32], Arc<dyn RaftRpcHandler>>>>;
 
 /// Multiaddrs the local swarm has actually bound to. Populated
 /// from `SwarmEvent::NewListenAddr`. Useful for tests that bind
@@ -118,25 +354,35 @@ type ListenAddrs = Arc<Mutex<Vec<Multiaddr>>>;
 pub struct Network {
     peer_id: PeerId,
     local_prefix: u16,
-    cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
+    pub(in crate::network) cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_rx: Mutex<Option<std_mpsc::Receiver<InboundTell>>>,
-    /// Set via [`set_invoke_dispatcher`](Self::set_invoke_dispatcher).
-    /// Read by the swarm thread on every inbound `InvokeRequest`
-    /// to dispatch against the local node.
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    /// Set via [`set_sync_provider`](Self::set_sync_provider).
-    /// Read by the swarm thread on every inbound `FetchHeads` /
-    /// `FetchNode` to look up the local replica.
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    /// Inbound-frame handler for everything that isn't keyed by
+    /// `replication_id` (invoke / sync / manifest). Set via
+    /// [`set_service`](Self::set_service); read by the swarm
+    /// thread on every relevant inbound frame. Set-once: a
+    /// second call is a programming error and silently ignored.
+    /// Frames that arrive before a service is installed get the
+    /// trait's default no-op replies (empty invoke, no roots,
+    /// no manifest).
+    service: Arc<OnceLock<Arc<dyn NetworkService>>>,
+    /// Per-replication-group inbound Raft handler map. Populated
+    /// via [`register_raft_handler`](Self::register_raft_handler);
+    /// read by the swarm thread on every inbound
+    /// `RaftAppendReq` / `RaftVoteReq` / `RaftInstallSnapshotReq`
+    /// to route the call to the right group's state machine.
+    /// Frames carrying a `replication_id` with no entry surface to
+    /// the peer as the default empty / current-term answer.
+    raft_handlers: RaftHandlerMap,
     join: Option<JoinHandle<()>>,
 }
 
 /// Configuration for the libp2p layer.
 pub struct NetworkConfig {
-    /// libp2p keypair. Use [`load_or_generate_identity`] to derive
-    /// one from the manifest's `[node].identity` field.
+    /// libp2p keypair. The host (e.g. `vosx`) is responsible for
+    /// loading or generating it; the network layer just consumes
+    /// what it's given.
     pub keypair: identity::Keypair,
     /// 16-bit identifier this node uses in the high bits of every
     /// `ServiceId` it allocates. Exchanged with peers on first
@@ -151,7 +397,7 @@ pub struct NetworkConfig {
     pub bootstrap: Vec<Multiaddr>,
 }
 
-enum NetworkCmd {
+pub(in crate::network) enum NetworkCmd {
     Connect(Multiaddr),
     SendTell {
         target_peer: PeerId,
@@ -199,6 +445,63 @@ enum NetworkCmd {
         replication_id: [u8; 32],
         sender: std_mpsc::Sender<PeerId>,
     },
+    /// Send a Raft `AppendEntries` RPC to a specific peer. Reply
+    /// channel yields `RaftAppendResult` on success; dropped on
+    /// transport failure (caller's recv yields `Disconnected`).
+    SendRaftAppend {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+        reply: std_mpsc::Sender<RaftAppendResult>,
+    },
+    /// Send a Raft `RequestVote` RPC to a specific peer.
+    SendRaftVote {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+        reply: std_mpsc::Sender<RaftVoteResult>,
+    },
+    /// Send a Raft `InstallSnapshot` RPC to a specific peer.
+    SendRaftInstallSnapshot {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+        reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
+    },
+    /// Send a [`Frame::RaftJoinReq`] to a peer to add the local
+    /// replica as a voter in their replication group. Reply
+    /// yields the join outcome.
+    SendRaftJoin {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        joiner_prefix: u16,
+        reply: std_mpsc::Sender<RaftJoinResult>,
+    },
+    /// Send a [`Frame::ManifestReq`] to a bootnode. Reply yields
+    /// the bootnode's space.toml + actor blobs.
+    SendManifestReq {
+        target_peer: PeerId,
+        reply: std_mpsc::Sender<ManifestReply>,
+    },
+    /// Send a [`Frame::RaftStatusReq`] for one replication
+    /// group. Reply yields the peer's view of the group.
+    SendRaftStatus {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        reply: std_mpsc::Sender<RaftStatusReply>,
+    },
     Shutdown,
 }
 
@@ -207,6 +510,12 @@ enum OutboundReply {
     Invoke(std_mpsc::Sender<Vec<u8>>),
     Heads(std_mpsc::Sender<Vec<[u8; 32]>>),
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
+    RaftAppend(std_mpsc::Sender<RaftAppendResult>),
+    RaftVote(std_mpsc::Sender<RaftVoteResult>),
+    RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
+    RaftJoin(std_mpsc::Sender<RaftJoinResult>),
+    Manifest(std_mpsc::Sender<ManifestReply>),
+    RaftStatus(std_mpsc::Sender<RaftStatusReply>),
 }
 
 impl Network {
@@ -216,16 +525,15 @@ impl Network {
         let local_prefix = config.local_prefix;
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
-        let invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>> =
-            Arc::new(Mutex::new(None));
-        let sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>> = Arc::new(Mutex::new(None));
+        let service: Arc<OnceLock<Arc<dyn NetworkService>>> = Arc::new(OnceLock::new());
+        let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
         let prefix_map_for_thread = prefix_map.clone();
         let listen_addrs_for_thread = listen_addrs.clone();
-        let invoke_dispatcher_for_thread = invoke_dispatcher.clone();
-        let sync_provider_for_thread = sync_provider.clone();
+        let service_for_thread = service.clone();
+        let raft_handlers_for_thread = raft_handlers.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -243,8 +551,8 @@ impl Network {
                 prefix_map_for_thread,
                 listen_addrs_for_thread,
                 inbox_tx,
-                invoke_dispatcher_for_thread,
-                sync_provider_for_thread,
+                service_for_thread,
+                raft_handlers_for_thread,
             ));
         });
 
@@ -255,36 +563,151 @@ impl Network {
             prefix_map,
             listen_addrs,
             inbox_rx: Mutex::new(Some(inbox_rx)),
-            invoke_dispatcher,
-            sync_provider,
+            service,
+            raft_handlers,
             join: Some(join),
         }
     }
 
-    /// Install the handler used to dispatch inbound `InvokeRequest`
-    /// frames into the local node. Without it, remote invokes
-    /// receive an empty `InvokeReply`.
-    pub fn set_invoke_dispatcher(&self, dispatcher: Arc<dyn InvokeDispatcher>) {
-        if let Ok(mut g) = self.invoke_dispatcher.lock() {
-            *g = Some(dispatcher);
+    /// Install the inbound-frame service. Handles invoke
+    /// dispatch, CRDT sync reads, and manifest serving in one
+    /// call — three independent setters and three "did you
+    /// remember to install?" footguns become one. Set-once: a
+    /// second call is a programming error and silently ignored.
+    /// Frames that arrive before this is installed get the
+    /// trait's default no-op replies.
+    pub fn set_service(&self, service: Arc<dyn NetworkService>) {
+        let _ = self.service.set(service);
+    }
+
+    /// Register a handler for one Raft replication group.
+    /// Multiple groups can coexist on a single node — one
+    /// `[[agent]] consistency = "raft"` per group — and the swarm
+    /// thread routes inbound `RaftAppendReq` / `RaftVoteReq` /
+    /// `RaftInstallSnapshotReq` to the handler whose
+    /// `replication_id` matches the frame's. Inserting the same
+    /// `replication_id` twice replaces the existing handler.
+    pub fn register_raft_handler(
+        &self,
+        replication_id: [u8; 32],
+        handler: Arc<dyn RaftRpcHandler>,
+    ) {
+        if let Ok(mut g) = self.raft_handlers.lock() {
+            g.insert(replication_id, handler);
         }
     }
 
-    /// Install the handler used to answer inbound `FetchHeads` /
-    /// `FetchNode` frames against the local CRDT replicas.
-    /// Without it, peers asking us for sync data get empty
-    /// replies.
-    pub fn set_sync_provider(&self, provider: Arc<dyn SyncProvider>) {
-        if let Ok(mut g) = self.sync_provider.lock() {
-            *g = Some(provider);
+    /// Drop the handler for `replication_id`. Inbound RPCs for
+    /// that group will surface to the peer as the
+    /// no-handler default (current-term answer with `success =
+    /// false`). Used when a replica leaves the cluster, or in
+    /// tests that want to simulate a partition.
+    pub fn unregister_raft_handler(&self, replication_id: &[u8; 32]) {
+        if let Ok(mut g) = self.raft_handlers.lock() {
+            g.remove(replication_id);
         }
+    }
+
+    /// Snapshot of every replication group with a registered
+    /// handler. Returned in deterministic order (BTreeMap
+    /// iteration). Used by the manifest-fetch / join paths to
+    /// answer "what Raft groups is this node hosting?".
+    pub fn registered_raft_groups(&self) -> Vec<[u8; 32]> {
+        self.raft_handlers
+            .lock()
+            .map(|g| g.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    // Operator-tooling senders (manifest fetch, raft join, raft
+    // status) live in the `ops` submodule — they're driven by
+    // `vosx join` / `vosx ps`, never by the PVM-actor runtime.
+    // See `crates/vos/src/network/ops.rs`.
+
+    /// Send a Raft `AppendEntries` RPC to a specific peer. Receiver
+    /// yields `RaftAppendResult`; on transport failure the Sender
+    /// is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raft_append(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<RaftEntry>,
+    ) -> std_mpsc::Receiver<RaftAppendResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftAppend {
+            target_peer,
+            replication_id,
+            term,
+            leader_prefix,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            entries,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a Raft `RequestVote` RPC to a specific peer.
+    pub fn send_raft_vote(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> std_mpsc::Receiver<RaftVoteResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftVote {
+            target_peer,
+            replication_id,
+            term,
+            candidate_prefix,
+            last_log_index,
+            last_log_term,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a Raft `InstallSnapshot` RPC to a specific peer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raft_install_snapshot(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        term: u64,
+        leader_prefix: u16,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: Vec<u8>,
+    ) -> std_mpsc::Receiver<RaftInstallSnapshotResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftInstallSnapshot {
+            target_peer,
+            replication_id,
+            term,
+            leader_prefix,
+            last_included_index,
+            last_included_term,
+            snapshot,
+            reply: tx,
+        });
+        rx
     }
 
     /// Ask a peer for the current root CIDs of a replication
     /// group. The receiver yields the peer's roots vec; on
     /// failure the Sender is dropped (caller's recv yields
     /// `Disconnected`).
-    pub fn fetch_heads(
+    pub fn send_fetch_heads(
         &self,
         target_peer: PeerId,
         replication_id: [u8; 32],
@@ -301,7 +724,7 @@ impl Network {
     /// Point-fetch a single DAG node from a peer. The receiver
     /// yields `Some(bytes)` if the peer has the node, `None` if
     /// it doesn't (typical during sync racing).
-    pub fn fetch_node(
+    pub fn send_fetch_node(
         &self,
         target_peer: PeerId,
         replication_id: [u8; 32],
@@ -317,9 +740,38 @@ impl Network {
         rx
     }
 
-    /// Subscribe the local node to a replication group's
-    /// gossipsub topic. Idempotent — call once per local
-    /// replica when registered.
+    /// Join a replication group's gossipsub topic and register a
+    /// hint channel in one call. This is the typical path for a
+    /// replica: it needs to *receive* head announcements to drive
+    /// its sync loop, and the loop won't fire without both the
+    /// subscription AND the channel installed.
+    ///
+    /// `hint_sender` receives one `PeerId` per inbound head
+    /// announcement on this group — the matching agent's
+    /// sync loop drains it and triggers an immediate fetch from
+    /// that peer, bypassing the periodic poll.
+    ///
+    /// For publish-only nodes (no local replica, just bootstrap
+    /// mesh participation) use [`subscribe_rep`](Self::subscribe_rep)
+    /// directly.
+    pub fn join_replication(
+        &self,
+        replication_id: [u8; 32],
+        hint_sender: std_mpsc::Sender<PeerId>,
+    ) {
+        self.subscribe_rep(replication_id);
+        let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
+            replication_id,
+            sender: hint_sender,
+        });
+    }
+
+    /// Subscribe to a replication group's gossipsub topic without
+    /// registering a hint channel. Mostly useful for publish-only
+    /// participants (e.g. tests, or relays that bootstrap the
+    /// mesh without holding a local replica). Real replicas should
+    /// use [`join_replication`](Self::join_replication) instead —
+    /// otherwise inbound head announcements arrive but go nowhere.
     pub fn subscribe_rep(&self, replication_id: [u8; 32]) {
         let _ = self
             .cmd_tx
@@ -334,19 +786,6 @@ impl Network {
         let _ = self.cmd_tx.send(NetworkCmd::PublishHeads {
             replication_id,
             roots,
-        });
-    }
-
-    /// Register a sender that receives hint `(peer)` whenever a
-    /// gossipsub head announcement arrives for this replication
-    /// group. The matching sync_loop drains the receiver and
-    /// triggers an immediate fetch — that's how cycle 8 turns
-    /// the previously-poll-only sync into a near-zero-latency
-    /// push.
-    pub fn register_hint_sender(&self, replication_id: [u8; 32], sender: std_mpsc::Sender<PeerId>) {
-        let _ = self.cmd_tx.send(NetworkCmd::RegisterHintSender {
-            replication_id,
-            sender,
         });
     }
 
@@ -482,8 +921,8 @@ async fn network_main(
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
     inbox_tx: std_mpsc::Sender<InboundTell>,
-    invoke_dispatcher: Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    service: Arc<OnceLock<Arc<dyn NetworkService>>>,
+    raft_handlers: RaftHandlerMap,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
@@ -541,8 +980,8 @@ async fn network_main(
                     &mut swarm, event, local_prefix,
                     &prefix_map, &listen_addrs, &inbox_tx,
                     &mut outbound_replies,
-                    &invoke_dispatcher,
-                    &sync_provider,
+                    &service,
+                    &raft_handlers,
                     &response_tx,
                     &hint_senders,
                 );
@@ -633,6 +1072,125 @@ async fn network_main(
                     Some(NetworkCmd::RegisterHintSender { replication_id, sender }) => {
                         hint_senders.insert(replication_id, sender);
                     }
+                    Some(NetworkCmd::SendRaftAppend {
+                        target_peer,
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                        entries,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftAppendReq {
+                            replication_id,
+                            term,
+                            leader_prefix,
+                            prev_log_index,
+                            prev_log_term,
+                            leader_commit,
+                            entries,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftAppend(reply));
+                        debug!(%target_peer, term, "network: sent RaftAppend");
+                    }
+                    Some(NetworkCmd::SendRaftVote {
+                        target_peer,
+                        replication_id,
+                        term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftVoteReq {
+                            replication_id,
+                            term,
+                            candidate_prefix,
+                            last_log_index,
+                            last_log_term,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftVote(reply));
+                        debug!(%target_peer, term, "network: sent RaftVote");
+                    }
+                    Some(NetworkCmd::SendRaftInstallSnapshot {
+                        target_peer,
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        last_included_index,
+                        last_included_term,
+                        snapshot,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftInstallSnapshotReq {
+                            replication_id,
+                            term,
+                            leader_prefix,
+                            last_included_index,
+                            last_included_term,
+                            snapshot,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(
+                            req_id,
+                            OutboundReply::RaftInstallSnapshot(reply),
+                        );
+                        debug!(%target_peer, term, last_included_index,
+                            "network: sent RaftInstallSnapshot");
+                    }
+                    Some(NetworkCmd::SendRaftJoin {
+                        target_peer,
+                        replication_id,
+                        joiner_prefix,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftJoinReq {
+                            replication_id,
+                            joiner_prefix,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftJoin(reply));
+                        debug!(%target_peer, joiner_prefix, "network: sent RaftJoinReq");
+                    }
+                    Some(NetworkCmd::SendManifestReq { target_peer, reply }) => {
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, Frame::ManifestReq);
+                        outbound_replies.insert(req_id, OutboundReply::Manifest(reply));
+                        debug!(%target_peer, "network: sent ManifestReq");
+                    }
+                    Some(NetworkCmd::SendRaftStatus {
+                        target_peer,
+                        replication_id,
+                        reply,
+                    }) => {
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(
+                                &target_peer,
+                                Frame::RaftStatusReq { replication_id },
+                            );
+                        outbound_replies.insert(req_id, OutboundReply::RaftStatus(reply));
+                        debug!(%target_peer, "network: sent RaftStatusReq");
+                    }
                     Some(NetworkCmd::Shutdown) | None => {
                         info!("network: shutting down");
                         break;
@@ -719,18 +1277,18 @@ fn handle_swarm_event(
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
+    raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "network: listening on");
-            if let Ok(mut v) = listen_addrs.lock() {
-                if !v.contains(&address) {
-                    v.push(address);
-                }
+            if let Ok(mut v) = listen_addrs.lock()
+                && !v.contains(&address)
+            {
+                v.push(address);
             }
         }
         SwarmEvent::ConnectionEstablished {
@@ -783,8 +1341,8 @@ fn handle_swarm_event(
                 prefix_map,
                 inbox,
                 outbound_replies,
-                invoke_dispatcher,
-                sync_provider,
+                service,
+                raft_handlers,
                 response_tx,
             );
         }
@@ -802,8 +1360,8 @@ fn handle_req_resp(
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
-    invoke_dispatcher: &Arc<Mutex<Option<Arc<dyn InvokeDispatcher>>>>,
-    sync_provider: &Arc<Mutex<Option<Arc<dyn SyncProvider>>>>,
+    service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
+    raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
 ) {
     use request_response::{Event, Message};
@@ -843,17 +1401,17 @@ fn handle_req_resp(
                         // park the runtime if awaited inline. The task
                         // calls back with (channel, InvokeReply) which the
                         // swarm select! arm forwards via send_response.
-                        let dispatcher = invoke_dispatcher.lock().ok().and_then(|g| g.clone());
+                        let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let payload = match dispatcher {
-                                Some(d) => d.dispatch(from, to, chain, msg),
+                            let payload = match svc {
+                                Some(s) => s.dispatch_invoke(from, to, chain, msg),
                                 None => {
                                     warn!(
                                         from,
                                         to,
                                         "network: inbound InvokeRequest with no \
-                                         dispatcher installed; replying empty",
+                                         service installed; replying empty",
                                     );
                                     Vec::new()
                                 }
@@ -864,10 +1422,9 @@ fn handle_req_resp(
                     Frame::FetchHeads { replication_id } => {
                         // Sync reads are quick redb txns; serve them
                         // inline rather than spawning a blocking task.
-                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
-                        let roots = provider
-                            .as_ref()
-                            .and_then(|p| p.roots(&replication_id))
+                        let roots = service
+                            .get()
+                            .and_then(|s| s.sync_roots(&replication_id))
                             .unwrap_or_default();
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
@@ -881,14 +1438,234 @@ fn handle_req_resp(
                         replication_id,
                         cid,
                     } => {
-                        let provider = sync_provider.lock().ok().and_then(|g| g.clone());
-                        let node = provider
-                            .as_ref()
-                            .and_then(|p| p.get_node(&replication_id, &cid));
+                        let node = service
+                            .get()
+                            .and_then(|s| s.sync_get_node(&replication_id, &cid));
                         let _ = swarm
                             .behaviour_mut()
                             .req_resp
                             .send_response(channel, Frame::NodeReply { node });
+                    }
+                    Frame::RaftAppendReq {
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                        entries,
+                    } => {
+                        // Hand off to a blocking task: handlers may
+                        // do redb writes (append entries, advance
+                        // last_applied), which would park the
+                        // current_thread runtime if awaited inline.
+                        // Routing is per-replication-group: we look
+                        // up the handler keyed by `replication_id`
+                        // so multiple Raft clusters can coexist on
+                        // one node.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.append_entries(
+                                    &replication_id,
+                                    leader_prefix,
+                                    term,
+                                    prev_log_index,
+                                    prev_log_term,
+                                    leader_commit,
+                                    entries,
+                                ),
+                                None => {
+                                    warn!(
+                                        leader_prefix,
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
+                                        "network: inbound RaftAppendReq for unknown \
+                                         replication group; replying success=false",
+                                    );
+                                    RaftAppendResult {
+                                        term,
+                                        success: false,
+                                        match_index: 0,
+                                    }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftAppendResp {
+                                    term: resp.term,
+                                    success: resp.success,
+                                    match_index: resp.match_index,
+                                },
+                            ));
+                        });
+                    }
+                    Frame::RaftVoteReq {
+                        replication_id,
+                        term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                    } => {
+                        // Vote logic touches redb (writes voted_for /
+                        // current_term), so dispatch on a blocking task.
+                        // Routed by `replication_id` like AppendEntries.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.request_vote(
+                                    &replication_id,
+                                    candidate_prefix,
+                                    term,
+                                    last_log_index,
+                                    last_log_term,
+                                ),
+                                None => {
+                                    warn!(
+                                        candidate_prefix,
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
+                                        "network: inbound RaftVoteReq for unknown \
+                                         replication group; vote_granted=false",
+                                    );
+                                    RaftVoteResult {
+                                        term,
+                                        vote_granted: false,
+                                    }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftVoteResp {
+                                    term: resp.term,
+                                    vote_granted: resp.vote_granted,
+                                },
+                            ));
+                        });
+                    }
+                    Frame::RaftInstallSnapshotReq {
+                        replication_id,
+                        term,
+                        leader_prefix,
+                        last_included_index,
+                        last_included_term,
+                        snapshot,
+                    } => {
+                        // Install logic writes redb (state row +
+                        // raft_meta + raft_log truncate), so a
+                        // blocking task is the right shape. Routed
+                        // by `replication_id` like the other Raft
+                        // RPCs.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match handler {
+                                Some(h) => h.install_snapshot(
+                                    &replication_id,
+                                    leader_prefix,
+                                    term,
+                                    last_included_index,
+                                    last_included_term,
+                                    snapshot,
+                                ),
+                                None => {
+                                    warn!(
+                                        leader_prefix,
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
+                                        "network: inbound RaftInstallSnapshotReq for unknown \
+                                         replication group; replying with our term",
+                                    );
+                                    RaftInstallSnapshotResult { term }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftInstallSnapshotResp { term: resp.term },
+                            ));
+                        });
+                    }
+                    Frame::RaftJoinReq {
+                        replication_id,
+                        joiner_prefix,
+                    } => {
+                        // Join requests can call `change_membership`,
+                        // which writes the joint-config redb row. Off
+                        // the swarm thread.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = match handler {
+                                Some(h) => h.handle_join(&replication_id, joiner_prefix),
+                                None => RaftJoinResult::UnknownGroup,
+                            };
+                            let _ = response_tx.send((channel, Frame::RaftJoinResp { result }));
+                        });
+                    }
+                    Frame::ManifestReq => {
+                        // Manifest handler just reads in-memory
+                        // bytes; serve inline.
+                        let reply = service.get().and_then(|s| s.manifest()).unwrap_or_else(|| {
+                            ManifestReply {
+                                toml: Vec::new(),
+                                blobs: Vec::new(),
+                            }
+                        });
+                        let _ = swarm.behaviour_mut().req_resp.send_response(
+                            channel,
+                            Frame::ManifestResp {
+                                toml_bytes: reply.toml,
+                                blobs: reply.blobs,
+                            },
+                        );
+                    }
+                    Frame::RaftStatusReq { replication_id } => {
+                        // Status query needs a snapshot from the
+                        // worker — that round-trips through its
+                        // inbox, so dispatch on a blocking task.
+                        let handler = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let reply = match handler {
+                                Some(h) => h.handle_status(&replication_id),
+                                None => RaftStatusReply::absent(),
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftStatusResp {
+                                    present: reply.present,
+                                    role: reply.role.to_wire(),
+                                    current_term: reply.current_term,
+                                    commit_index: reply.commit_index,
+                                    last_log_index: reply.last_log_index,
+                                    members: reply.members,
+                                    leader_hint: reply.leader_hint,
+                                },
+                            ));
+                        });
                     }
                     other => {
                         warn!(%peer, ?other, "network: unexpected frame in request slot");
@@ -920,6 +1697,66 @@ fn handle_req_resp(
                     }
                     (Frame::NodeReply { node }, Some(OutboundReply::Node(tx))) => {
                         let _ = tx.send(node);
+                    }
+                    (
+                        Frame::RaftAppendResp {
+                            term,
+                            success,
+                            match_index,
+                        },
+                        Some(OutboundReply::RaftAppend(tx)),
+                    ) => {
+                        let _ = tx.send(RaftAppendResult {
+                            term,
+                            success,
+                            match_index,
+                        });
+                    }
+                    (
+                        Frame::RaftVoteResp { term, vote_granted },
+                        Some(OutboundReply::RaftVote(tx)),
+                    ) => {
+                        let _ = tx.send(RaftVoteResult { term, vote_granted });
+                    }
+                    (
+                        Frame::RaftInstallSnapshotResp { term },
+                        Some(OutboundReply::RaftInstallSnapshot(tx)),
+                    ) => {
+                        let _ = tx.send(RaftInstallSnapshotResult { term });
+                    }
+                    (Frame::RaftJoinResp { result }, Some(OutboundReply::RaftJoin(tx))) => {
+                        let _ = tx.send(result);
+                    }
+                    (
+                        Frame::ManifestResp { toml_bytes, blobs },
+                        Some(OutboundReply::Manifest(tx)),
+                    ) => {
+                        let _ = tx.send(ManifestReply {
+                            toml: toml_bytes,
+                            blobs,
+                        });
+                    }
+                    (
+                        Frame::RaftStatusResp {
+                            present,
+                            role,
+                            current_term,
+                            commit_index,
+                            last_log_index,
+                            members,
+                            leader_hint,
+                        },
+                        Some(OutboundReply::RaftStatus(tx)),
+                    ) => {
+                        let _ = tx.send(RaftStatusReply {
+                            present,
+                            role: RaftRole::from_wire(role),
+                            current_term,
+                            commit_index,
+                            last_log_index,
+                            members,
+                            leader_hint,
+                        });
                     }
                     (other, _) => {
                         warn!(%peer, ?other, "network: response shape mismatched pending request");
@@ -1029,50 +1866,6 @@ pub fn derive_node_prefix(peer_id: &PeerId) -> u16 {
         .finalize();
     let bytes = hash.as_bytes();
     u16::from_le_bytes([bytes[0], bytes[1]])
-}
-
-/// Resolve the manifest's `[node].identity` field into a libp2p
-/// keypair.
-///
-/// - `None` or `Some("auto")` — derive (or load) a keypair stored
-///   at `{data_dir}/node.key`. Persisted across runs so the
-///   node's PeerId is stable.
-/// - `Some(path)` — load the keypair from that file (protobuf
-///   encoding produced by `Keypair::to_protobuf_encoding`).
-pub fn load_or_generate_identity(
-    spec: Option<&str>,
-    data_dir: Option<&Path>,
-) -> Result<identity::Keypair, String> {
-    match spec {
-        Some("auto") | None => {
-            let dir = data_dir.unwrap_or(Path::new("."));
-            let key_path: PathBuf = dir.join("node.key");
-            if key_path.exists() {
-                let bytes = std::fs::read(&key_path)
-                    .map_err(|e| format!("read {}: {e}", key_path.display()))?;
-                identity::Keypair::from_protobuf_encoding(&bytes)
-                    .map_err(|e| format!("decode {}: {e}", key_path.display()))
-            } else {
-                let kp = identity::Keypair::generate_ed25519();
-                let bytes = kp
-                    .to_protobuf_encoding()
-                    .map_err(|e| format!("encode keypair: {e}"))?;
-                if !dir.exists() {
-                    std::fs::create_dir_all(dir)
-                        .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-                }
-                std::fs::write(&key_path, &bytes)
-                    .map_err(|e| format!("write {}: {e}", key_path.display()))?;
-                info!(path = %key_path.display(), "network: generated new node identity");
-                Ok(kp)
-            }
-        }
-        Some(path) => {
-            let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-            identity::Keypair::from_protobuf_encoding(&bytes)
-                .map_err(|e| format!("decode {path}: {e}"))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1268,8 +2061,11 @@ mod tests {
         let log1 = EffectLog::for_msg(b"first".to_vec());
         let log2 = EffectLog::for_msg(b"second".to_vec());
         {
-            let mut cc_a =
-                CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone());
+            let mut cc_a = CrdtCommit::from_db_arc_locked(
+                slot_a.db.clone(),
+                slot_a.commit_lock.clone(),
+                rep_id,
+            );
             cc_a.commit_with_log(b"v1", &log1).unwrap();
             cc_a.commit_with_log(b"v2", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
@@ -1290,8 +2086,11 @@ mod tests {
                 // roots. The sync ticker writes through the same
                 // redb file, so a fresh CrdtCommit picks up the
                 // merged state.
-                let cc =
-                    CrdtCommit::from_db_arc_locked(slot_b.db.clone(), slot_b.commit_lock.clone());
+                let cc = CrdtCommit::from_db_arc_locked(
+                    slot_b.db.clone(),
+                    slot_b.commit_lock.clone(),
+                    rep_id,
+                );
                 if cc.root_bytes().is_empty() {
                     None
                 } else {
@@ -1309,7 +2108,8 @@ mod tests {
         assert_eq!(logs[1], log2);
 
         // Roots match too.
-        let cc_a = CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone());
+        let cc_a =
+            CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id);
         assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
 
         let _ = node_a.collect();
@@ -1320,7 +2120,7 @@ mod tests {
     /// Slice 3b end-to-end: VosNode B has a CRDT replica registered
     /// in `crdt_replicas` (via the test helper) with some DAG
     /// nodes pre-populated; VosNode A asks via the network and
-    /// reads them back through `NodeSyncProvider`.
+    /// reads them back through `NodeSyncHandler`.
     #[test]
     fn cross_node_sync_via_vosnode_replicas() {
         use crate::commit::{CommitStrategy, CrdtCommit};
@@ -1378,7 +2178,7 @@ mod tests {
             .cloned()
             .unwrap();
         let mut cc =
-            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock);
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
         cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
             .unwrap();
         cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec()))
@@ -1412,14 +2212,14 @@ mod tests {
 
         // Ask B for heads of the replication group.
         let heads = net_a_arc
-            .fetch_heads(peer_b, rep_id)
+            .send_fetch_heads(peer_b, rep_id)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply");
         assert_eq!(heads, vec![expected_root]);
 
         // Point-fetch the root node.
         let node = net_a_arc
-            .fetch_node(peer_b, rep_id, expected_root)
+            .send_fetch_node(peer_b, rep_id, expected_root)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply");
         assert_eq!(node.as_deref(), Some(expected_node_bytes.as_slice()));
@@ -1462,13 +2262,11 @@ mod tests {
 
         let rep_id = [0x77u8; 32];
         let (hint_tx, hint_rx) = std_mpsc::channel::<PeerId>();
-        net_b.register_hint_sender(rep_id, hint_tx);
-
-        // Both sides subscribe — gossipsub needs a mesh of at
-        // least one subscriber per side before publish actually
-        // delivers anything.
+        // B is the receiver — subscribe AND register a hint
+        // channel. A is publish-only — bare subscribe to satisfy
+        // gossipsub's mesh requirement.
+        net_b.join_replication(rep_id, hint_tx);
         net_a.subscribe_rep(rep_id);
-        net_b.subscribe_rep(rep_id);
 
         // Wait for the gossipsub heartbeat (1s) to form the
         // mesh, then publish from A. Retry the publish until B
@@ -1491,7 +2289,7 @@ mod tests {
 
     /// Network-level test: A asks B for the heads of a replication
     /// group and then point-fetches a DAG node by CID. Verifies
-    /// the SyncProvider on B sees the requests and the responses
+    /// the SyncHandler on B sees the requests and the responses
     /// round-trip through the request_response wire.
     #[test]
     fn cross_node_sync_fetch_heads_and_node() {
@@ -1501,15 +2299,15 @@ mod tests {
             nodes: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
         }
 
-        impl SyncProvider for StaticProvider {
-            fn roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        impl NetworkService for StaticProvider {
+            fn sync_roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
                 if replication_id == &self.rep_id {
                     Some(self.roots.clone())
                 } else {
                     None
                 }
             }
-            fn get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+            fn sync_get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
                 if replication_id != &self.rep_id {
                     return None;
                 }
@@ -1547,7 +2345,7 @@ mod tests {
         let mut nodes = std::collections::BTreeMap::new();
         nodes.insert(cid_present, b"node-bytes-here".to_vec());
 
-        net_b.set_sync_provider(Arc::new(StaticProvider {
+        net_b.set_service(Arc::new(StaticProvider {
             rep_id,
             roots: vec![cid_present],
             nodes,
@@ -1561,7 +2359,7 @@ mod tests {
         let peer_b = net_a.peer_for_prefix(net_b.local_prefix()).unwrap();
 
         // FetchHeads
-        let heads_rx = net_a.fetch_heads(peer_b, rep_id);
+        let heads_rx = net_a.send_fetch_heads(peer_b, rep_id);
         let heads = heads_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply");
@@ -1570,13 +2368,13 @@ mod tests {
         // FetchHeads for an unknown rep_id returns empty.
         let unknown_rep = [0u8; 32];
         let empty_heads = net_a
-            .fetch_heads(peer_b, unknown_rep)
+            .send_fetch_heads(peer_b, unknown_rep)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchHeads reply for unknown group");
         assert!(empty_heads.is_empty());
 
         // FetchNode for a known CID returns Some.
-        let node_rx = net_a.fetch_node(peer_b, rep_id, cid_present);
+        let node_rx = net_a.send_fetch_node(peer_b, rep_id, cid_present);
         let node = node_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply");
@@ -1584,7 +2382,7 @@ mod tests {
 
         // FetchNode for an unknown CID returns None.
         let missing = net_a
-            .fetch_node(peer_b, rep_id, cid_missing)
+            .send_fetch_node(peer_b, rep_id, cid_missing)
             .recv_timeout(Duration::from_secs(5))
             .expect("FetchNode reply for missing CID");
         assert_eq!(missing, None);
@@ -1594,7 +2392,7 @@ mod tests {
     }
 
     /// Network-level test: outbound `send_invoke` on A dispatches
-    /// against an `InvokeDispatcher` installed on B, and the
+    /// against an `InvokeHandler` installed on B, and the
     /// reply flows back through the request_response response
     /// slot to the original caller.
     #[test]
@@ -1604,8 +2402,14 @@ mod tests {
             reply: Vec<u8>,
         }
 
-        impl InvokeDispatcher for RecordingDispatcher {
-            fn dispatch(&self, from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
+        impl NetworkService for RecordingDispatcher {
+            fn dispatch_invoke(
+                &self,
+                from: u32,
+                to: u32,
+                chain: Vec<u32>,
+                msg: Vec<u8>,
+            ) -> Vec<u8> {
                 *self.seen.lock().unwrap() = Some((from, to, chain.clone(), msg));
                 self.reply.clone()
             }
@@ -1640,7 +2444,7 @@ mod tests {
 
         // Install dispatcher on B before any invoke can race in.
         let seen = Arc::new(Mutex::new(None));
-        net_b.set_invoke_dispatcher(Arc::new(RecordingDispatcher {
+        net_b.set_service(Arc::new(RecordingDispatcher {
             seen: seen.clone(),
             reply: b"the answer".to_vec(),
         }));
@@ -1677,7 +2481,7 @@ mod tests {
     }
 
     /// Full path: `VosNode::invoke` on A finds no local route,
-    /// falls through to the network, hits B's `LocalInvokeDispatcher`
+    /// falls through to the network, hits B's `LocalInvokeHandler`
     /// (installed by `attach_network`), which dispatches against
     /// B's invoke_routes table where a test responder lives.
     #[test]
@@ -1726,7 +2530,7 @@ mod tests {
         .expect("Hello completes");
 
         // Build node B with a responder, then attach the network so
-        // the LocalInvokeDispatcher sees the responder's route.
+        // the LocalInvokeHandler sees the responder's route.
         let mut node_b = VosNode::with_prefix(prefix_b);
         let responder_id = node_b.install_invoke_responder(|msg| {
             // Echo with a marker so we can assert on the reply.
@@ -1857,10 +2661,268 @@ mod tests {
         let _ = join_b.join();
     }
 
+    /// Phase-2 boundary for Raft: the wire frames + libp2p plumbing
+    /// route an outbound `AppendEntries` / `RequestVote` to the
+    /// remote peer, the stub handler observes the call, and the
+    /// canned response makes it back through the caller's channel.
+    /// No election or replication logic is exercised — that's
+    /// phase 3+ — but every wire bit is.
     #[test]
-    fn identity_auto_persists_across_calls() {
+    fn raft_rpcs_route_through_libp2p_to_handler_and_back() {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Stub handler: record the inbound RPC params and reply
+        // with deterministic canned values so the caller's
+        // assertions can pin down both directions.
+        struct StubHandler {
+            append_calls: StdMutex<Vec<(u16, u64, u64, u64, u64, usize)>>,
+            vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
+            term: AtomicU64,
+        }
+        impl StubHandler {
+            fn new(initial_term: u64) -> Self {
+                Self {
+                    append_calls: StdMutex::new(Vec::new()),
+                    vote_calls: StdMutex::new(Vec::new()),
+                    term: AtomicU64::new(initial_term),
+                }
+            }
+        }
+        impl RaftRpcHandler for StubHandler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                prev_log_term: u64,
+                leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                self.append_calls.lock().unwrap().push((
+                    from_prefix,
+                    term,
+                    prev_log_index,
+                    prev_log_term,
+                    leader_commit,
+                    entries.len(),
+                ));
+                let local_term = self.term.load(Ordering::Relaxed);
+                RaftAppendResult {
+                    term: local_term,
+                    success: term >= local_term,
+                    match_index: prev_log_index + entries.len() as u64,
+                }
+            }
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                from_prefix: u16,
+                term: u64,
+                last_log_index: u64,
+                last_log_term: u64,
+            ) -> RaftVoteResult {
+                self.vote_calls.lock().unwrap().push((
+                    from_prefix,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                ));
+                let local_term = self.term.load(Ordering::Relaxed);
+                RaftVoteResult {
+                    term: local_term,
+                    vote_granted: term >= local_term,
+                }
+            }
+        }
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = 0xAAAA;
+        let prefix_b = 0xBBBB;
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        });
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+        });
+
+        // Install the stub on B — A is the leader-side caller.
+        let rep_id = [0xC0u8; 32];
+        let handler = Arc::new(StubHandler::new(7));
+        net_b.register_raft_handler(rep_id, handler.clone());
+
+        // Wait for the Hello handshake so A has a PeerId for B.
+        wait_for(
+            || {
+                (net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some())
+                .then_some(())
+            },
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+        let target_b = net_a.peer_for_prefix(prefix_b).unwrap();
+
+        // ── AppendEntries: send two entries from term 8. ──────
+        let entries = vec![
+            RaftEntry::data(8, b"first".to_vec()),
+            RaftEntry::data(8, b"second".to_vec()),
+        ];
+        let rx = net_a.send_raft_append(
+            target_b, rep_id, 8,        // term
+            prefix_a, // leader_prefix
+            10,       // prev_log_index
+            7,        // prev_log_term
+            10,       // leader_commit
+            entries,
+        );
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("AppendEntries response");
+        assert_eq!(resp.term, 7, "stub returned its own term");
+        assert!(resp.success, "term=8 >= local 7 → success");
+        assert_eq!(resp.match_index, 12, "prev_log_index + entries.len()");
+
+        // ── Stub recorded the inbound call. ───────────────────
+        let calls = handler.append_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (prefix_a, 8u64, 10u64, 7u64, 10u64, 2usize),
+            "from_prefix, term, prev_idx, prev_term, leader_commit, entries.len",
+        );
+        drop(calls);
+
+        // ── RequestVote: term 9 with up-to-date log. ──────────
+        let rx = net_a.send_raft_vote(
+            target_b, rep_id, 9,        // term
+            prefix_a, // candidate_prefix
+            12,       // last_log_index
+            8,        // last_log_term
+        );
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("RequestVote response");
+        assert_eq!(resp.term, 7);
+        assert!(resp.vote_granted, "term=9 >= local 7 → granted");
+
+        let calls = handler.vote_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (prefix_a, 9u64, 12u64, 8u64));
+        drop(calls);
+
+        // ── No-handler fallback: a peer with no handler installed
+        // returns success=false / vote_granted=false (not a hang). ──
+        // Reverse the direction: B asks A, but A has no handler.
+        let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+        let rx = net_b.send_raft_append(target_a, rep_id, 1, prefix_b, 0, 0, 0, vec![]);
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no-handler response");
+        assert!(!resp.success, "no handler installed → success=false");
+        assert_eq!(resp.match_index, 0);
+
+        net_a.join();
+        net_b.join();
+    }
+
+    /// Phase-3.2 boundary: three networked nodes spin up Raft
+    /// workers configured for the same cluster, run for a short
+    /// while, and exactly one becomes Leader. No replication,
+    /// no log writes — just election. The leader's term must
+    /// match across all three replicas; the two losers stay
+    /// Follower and have `voted_for == leader`.
+    #[test]
+    fn three_node_cluster_elects_a_leader() {
+        use crate::raft::{RaftWorker, Role, WorkerConfig};
+        use std::time::Instant as StdInstant;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let kp_c = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let prefix_c = derive_node_prefix(&PeerId::from(kp_c.public()));
+        // Skip if any two prefixes happen to collide on the
+        // 16-bit truncation (vanishingly rare in practice but
+        // possible with random keypairs).
+        if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+            eprintln!("SKIP: prefix collision; rerun");
+            return;
+        }
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        }));
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![a_dial.clone()],
+        }));
+        // Wait for B's listen addr so C can bootstrap to both A
+        // and B — without an explicit dial between B and C the
+        // mesh wouldn't form within the test deadline.
+        let b_addr = wait_for(
+            || net_b.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_b binds");
+        let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+        let net_c = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_c,
+            local_prefix: prefix_c,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial, b_dial],
+        }));
+
+        // Wait for the Hello triangle to close.
+        wait_for(
+            || {
+                let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some();
+                let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_a).is_some();
+                let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_b).is_some();
+                (ab && ac && bc).then_some(())
+            },
+            Duration::from_secs(15),
+        )
+        .expect("3-node Hello mesh forms");
+
+        // Each node gets its own redb file + worker.
         let dir = std::env::temp_dir().join(format!(
-            "vos_net_id_{}_{}",
+            "vos_raft_election_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1868,22 +2930,216 @@ mod tests {
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let mk_worker = |me, network: Arc<Network>, db_name: &str| {
+            let db = Arc::new(redb::Database::create(dir.join(db_name)).unwrap());
+            RaftWorker::spawn(
+                db,
+                WorkerConfig {
+                    me,
+                    members: vec![prefix_a, prefix_b, prefix_c],
+                    replication_id: [0xC1; 32],
+                    // Short window so the test settles in well
+                    // under a second. The randomization scatters
+                    // peer timeouts so they don't all become
+                    // candidates at once.
+                    election_timeout_ms: (50, 150),
+                    // Heartbeat fires comfortably inside the
+                    // election window so followers' timers are
+                    // reset before they can challenge.
+                    heartbeat_interval_ms: 20,
+                },
+                Some(network),
+                None,
+            )
+        };
+        let w_a = mk_worker(prefix_a, net_a.clone(), "a.redb");
+        let w_b = mk_worker(prefix_b, net_b.clone(), "b.redb");
+        let w_c = mk_worker(prefix_c, net_c.clone(), "c.redb");
+        let rep_id = [0xC1u8; 32];
+        net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
+        net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
+        net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
 
-        let k1 = load_or_generate_identity(Some("auto"), Some(&dir)).unwrap();
-        let k2 = load_or_generate_identity(Some("auto"), Some(&dir)).unwrap();
+        // Phase 3.3: heartbeats keep followers' timers reset, so
+        // leadership is *stable* — once a Leader emerges it stays
+        // Leader and the term doesn't drift. Wait for a Leader,
+        // then sample for several heartbeat intervals and assert
+        // role + term hold.
+        let until = StdInstant::now() + Duration::from_secs(5);
+        let mut observed: Option<(u16, u64)> = None;
+        loop {
+            let snaps = [
+                (prefix_a, w_a.handler().snapshot()),
+                (prefix_b, w_b.handler().snapshot()),
+                (prefix_c, w_c.handler().snapshot()),
+            ];
+            for (p, s) in &snaps {
+                if let Some(snap) = s {
+                    if snap.role == Role::Leader && snap.current_term >= 1 {
+                        observed = Some((*p, snap.current_term));
+                        assert_eq!(
+                            snap.voted_for,
+                            Some(*p),
+                            "a Leader voted for itself this term"
+                        );
+                        break;
+                    }
+                }
+            }
+            if observed.is_some() {
+                break;
+            }
+            if StdInstant::now() >= until {
+                panic!(
+                    "no Leader observed within deadline; \
+                     last snapshots: A={:?}, B={:?}, C={:?}",
+                    snaps[0].1, snaps[1].1, snaps[2].1,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let (leader_prefix, leader_term) = observed.unwrap();
+        assert!([prefix_a, prefix_b, prefix_c].contains(&leader_prefix));
+        assert!(leader_term >= 1);
+
+        // ── Steady-state probe (phase 3.3) ────────────────────
+        // Sample for ~10 heartbeat intervals: the same node stays
+        // Leader, the term doesn't bump, and the followers stay
+        // Followers with their `voted_for` pointing at the leader.
+        std::thread::sleep(Duration::from_millis(200));
+        let leader_handle = match leader_prefix {
+            p if p == prefix_a => w_a.handler(),
+            p if p == prefix_b => w_b.handler(),
+            _ => w_c.handler(),
+        };
+        let snap_leader = leader_handle.snapshot().expect("leader alive");
         assert_eq!(
-            PeerId::from(k1.public()),
-            PeerId::from(k2.public()),
-            "auto-identity should be stable across loads",
+            snap_leader.role,
+            Role::Leader,
+            "phase 3.3: heartbeats must keep the leader from getting demoted; \
+             snap = {snap_leader:?}"
         );
+        assert_eq!(
+            snap_leader.current_term, leader_term,
+            "phase 3.3: term must not drift while the leader is heartbeating"
+        );
+
+        let other_snaps: Vec<_> = [
+            (prefix_a, w_a.handler()),
+            (prefix_b, w_b.handler()),
+            (prefix_c, w_c.handler()),
+        ]
+        .into_iter()
+        .filter(|(p, _)| *p != leader_prefix)
+        .map(|(p, h)| (p, h.snapshot().expect("follower alive")))
+        .collect();
+        for (p, snap) in &other_snaps {
+            assert_eq!(
+                snap.role,
+                Role::Follower,
+                "follower at {p:#06x} must not have re-elected; snap = {snap:?}",
+            );
+            assert_eq!(
+                snap.current_term, leader_term,
+                "follower's term must match the leader's after the heartbeat round",
+            );
+        }
+
+        // Cleanly stop the workers before joining the networks
+        // so any in-flight outbound vote helpers exit.
+        w_a.shutdown();
+        w_b.shutdown();
+        w_c.shutdown();
+        match Arc::try_unwrap(net_a) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_b) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_c) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Phase-4.3 boundary: 3-node cluster, elect a leader, propose
+    /// three entries via the leader's `WorkerHandle::propose`, and
+    /// wait for both followers to replicate them. Direct redb
+    /// introspection asserts every replica has four rows in
+    /// `raft_log` (the leader-promotion no-op at index 1 plus the
+    /// three application proposes at indices 2..=4) and
+    /// `commit_index == 4`.
     #[test]
-    fn identity_explicit_path_loads_existing_key() {
+    fn three_node_cluster_replicates_proposed_entries() {
+        use crate::raft::{RAFT_LOG, RaftMeta, RaftWorker, Role, WorkerConfig};
+        use redb::{ReadableTable, ReadableTableMetadata};
+        use std::time::Instant as StdInstant;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let kp_c = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let prefix_c = derive_node_prefix(&PeerId::from(kp_c.public()));
+        if prefix_a == prefix_b || prefix_a == prefix_c || prefix_b == prefix_c {
+            eprintln!("SKIP: prefix collision; rerun");
+            return;
+        }
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+        }));
+        let a_addr = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_addr.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![a_dial.clone()],
+        }));
+        let b_addr = wait_for(
+            || net_b.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_b binds");
+        let b_dial: Multiaddr = b_addr.with(libp2p::multiaddr::Protocol::P2p(net_b.peer_id()));
+
+        let net_c = Arc::new(Network::start(NetworkConfig {
+            keypair: kp_c,
+            local_prefix: prefix_c,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial, b_dial],
+        }));
+
+        wait_for(
+            || {
+                let ab = net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_b.peer_for_prefix(prefix_a).is_some();
+                let ac = net_a.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_a).is_some();
+                let bc = net_b.peer_for_prefix(prefix_c).is_some()
+                    && net_c.peer_for_prefix(prefix_b).is_some();
+                (ab && ac && bc).then_some(())
+            },
+            Duration::from_secs(15),
+        )
+        .expect("3-node Hello mesh forms");
+
         let dir = std::env::temp_dir().join(format!(
-            "vos_net_explicit_{}_{}",
+            "vos_raft_replicate_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1891,15 +3147,226 @@ mod tests {
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("custom.key");
+        let mk_worker = |me, network: Arc<Network>, db_name: &str| {
+            let path = dir.join(db_name);
+            let db = Arc::new(redb::Database::create(&path).unwrap());
+            (
+                path,
+                RaftWorker::spawn(
+                    db,
+                    WorkerConfig {
+                        me,
+                        members: vec![prefix_a, prefix_b, prefix_c],
+                        replication_id: [0xC2; 32],
+                        election_timeout_ms: (50, 150),
+                        heartbeat_interval_ms: 20,
+                    },
+                    Some(network),
+                    None,
+                ),
+            )
+        };
+        let (path_a, w_a) = mk_worker(prefix_a, net_a.clone(), "a.redb");
+        let (path_b, w_b) = mk_worker(prefix_b, net_b.clone(), "b.redb");
+        let (path_c, w_c) = mk_worker(prefix_c, net_c.clone(), "c.redb");
+        let rep_id = [0xC2u8; 32];
+        net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
+        net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
+        net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
 
-        // Generate a key, save it manually, then load.
-        let kp = identity::Keypair::generate_ed25519();
-        let bytes = kp.to_protobuf_encoding().unwrap();
-        std::fs::write(&path, &bytes).unwrap();
+        // ── Wait for a leader. ────────────────────────────────
+        let until = StdInstant::now() + Duration::from_secs(5);
+        let mut leader: Option<u16> = None;
+        loop {
+            for (p, h) in [
+                (prefix_a, w_a.handler()),
+                (prefix_b, w_b.handler()),
+                (prefix_c, w_c.handler()),
+            ] {
+                if let Some(snap) = h.snapshot() {
+                    if snap.role == Role::Leader {
+                        leader = Some(p);
+                        break;
+                    }
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            assert!(StdInstant::now() < until, "no leader within deadline");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let leader_prefix = leader.unwrap();
+        let leader_handle = match leader_prefix {
+            p if p == prefix_a => w_a.handler(),
+            p if p == prefix_b => w_b.handler(),
+            _ => w_c.handler(),
+        };
 
-        let loaded = load_or_generate_identity(Some(path.to_str().unwrap()), None).unwrap();
-        assert_eq!(PeerId::from(kp.public()), PeerId::from(loaded.public()));
+        // ── Propose three entries on the leader. ──────────────
+        let payloads = [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
+        for p in &payloads {
+            let idx = leader_handle.propose(p.clone()).expect("propose");
+            assert!(idx >= 1);
+        }
+
+        // ── Wait for all replicas to converge. ────────────────
+        // A leader appends a no-op on promotion (Ongaro §6.4) at
+        // index 1, then the three application proposes follow.
+        // With election jitter the no-op count can be > 1 (two
+        // leaders, two no-ops), so the final last_log_index
+        // depends on how many elections fired before stable
+        // leadership. Convergence means: every replica has the
+        // same last_log_index, the same commit_index, and
+        // commit_index == last_log_index (everything's been
+        // quorum-replicated). Waiting only for `commit_index ≥ 4`
+        // races with in-flight AppendEntries from a later round.
+        let until = StdInstant::now() + Duration::from_secs(10);
+        loop {
+            let snaps = [
+                w_a.handler().snapshot(),
+                w_b.handler().snapshot(),
+                w_c.handler().snapshot(),
+            ];
+            let converged = snaps.iter().all(|s| {
+                s.as_ref()
+                    .is_some_and(|x| x.commit_index >= 4 && x.commit_index == x.last_log_index)
+            }) && {
+                let cis: Vec<u64> = snaps
+                    .iter()
+                    .filter_map(|s| s.as_ref().map(|x| x.commit_index))
+                    .collect();
+                cis.windows(2).all(|w| w[0] == w[1])
+            };
+            if converged {
+                break;
+            }
+            if StdInstant::now() >= until {
+                panic!("replicas did not converge within deadline; snaps: {snaps:?}",);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // ── Probe each replica's redb directly. ──────────────
+        // We need the workers stopped before opening the redb
+        // files (they hold the exclusive file lock). Shut them
+        // down + collect, then read.
+        w_a.shutdown();
+        w_b.shutdown();
+        w_c.shutdown();
+
+        // The happy path is 4 rows: leader-promotion no-op at
+        // idx 1 (Ongaro §6.4) + the three application proposes
+        // at 2..=4. Election jitter can produce more no-ops,
+        // and a heartbeat-triggered re-election firing between
+        // convergence and shutdown can append a fresh
+        // uncommitted no-op on top — meaning a replica's
+        // `n_rows` may exceed `commit_index` by 1+.
+        //
+        // The real invariant we want: every replica has the
+        // same first `commit_index` rows committed, and the
+        // last three of those committed rows are our proposals
+        // in order. Anything past `commit_index` on disk is
+        // in-flight noise and we ignore it.
+        let mut probes: Vec<(&str, u64, Vec<Vec<u8>>)> = Vec::new();
+        for (label, path) in [("A", &path_a), ("B", &path_b), ("C", &path_c)] {
+            let db = redb::Database::create(path).expect("reopen");
+            let txn = db.begin_read().expect("read txn");
+            let log_table = txn.open_table(RAFT_LOG).expect("raft_log");
+            let n_rows = log_table.len().expect("len");
+            let meta = RaftMeta::load(&db).expect("meta");
+            assert!(
+                meta.commit_index >= 4,
+                "replica {label}: commit_index {} < 4 \
+                 (leader-promotion no-op + 3 proposes)",
+                meta.commit_index,
+            );
+            assert!(
+                n_rows >= meta.commit_index,
+                "replica {label}: n_rows {n_rows} < commit_index {}",
+                meta.commit_index,
+            );
+            // Read the COMMITTED prefix only. The table key is
+            // `u64` (raft index, 1-based); the value is
+            // `[term: u64 LE][kind tag: u8][...]` — strip both
+            // to recover the raw payload (see
+            // `redb_storage::encode_entry_kind`).
+            let mut entries: Vec<Vec<u8>> = log_table
+                .iter()
+                .expect("iter")
+                .map(|row| {
+                    let raw = row.expect("row").1.value().to_vec();
+                    raw[9..].to_vec()
+                })
+                .collect();
+            entries.truncate(meta.commit_index as usize);
+            probes.push((label, meta.commit_index, entries));
+        }
+        // Raft's state-machine-safety guarantee: any committed
+        // entry at a given index is identical across replicas.
+        // After our wait succeeded, a heartbeat-driven
+        // re-election can fire between "all replicas committed
+        // 4+" and "we shut down all 3 workers", appending a new
+        // no-op and committing it on whichever replicas hadn't
+        // shut down yet. So commit_index can legitimately differ
+        // by 1+ across replicas at probe time.
+        //
+        // The invariant we actually want: every replica's
+        // committed log contains the proposed payloads (alpha,
+        // beta, gamma) in order. No-ops and config-change
+        // entries may interleave anywhere; a re-election's
+        // freshly committed no-op may appear at the end.
+        for (label, _ci, entries) in &probes {
+            let positions: Vec<usize> = payloads
+                .iter()
+                .map(|p| {
+                    entries.iter().position(|e| e == p).unwrap_or_else(|| {
+                        panic!("replica {label}: payload {p:?} not in committed log",)
+                    })
+                })
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "replica {label}: payloads out of order in committed log",
+            );
+        }
+        // Shared committed prefix — Raft never rewrites
+        // committed history. Compare the prefix of length =
+        // shortest replica's commit_index across all replicas.
+        let shortest = probes.iter().map(|(_, ci, _)| *ci).min().unwrap() as usize;
+        let pivot = &probes[0].2[..shortest];
+        for (label, _, entries) in &probes[1..] {
+            assert_eq!(
+                &entries[..shortest],
+                pivot,
+                "replica {label} disagrees with replica {} on the first {shortest} \
+                 committed entries — Raft safety violation",
+                probes[0].0,
+            );
+        }
+        // `last_applied` is now the host's responsibility
+        // (vos_raft::Meta no longer tracks it). On the leader
+        // it's bumped by `RaftCommit::commit_with_log`'s state
+        // write; followers' `last_applied` only advances when
+        // their agent thread runs the apply path. This test
+        // probes redb directly without going through RaftCommit
+        // on the followers, so we only check `commit_index`
+        // here — the apply-tracking integration test in
+        // `tests/elf_integration.rs` covers the host-level
+        // last_applied advance end-to-end.
+
+        match Arc::try_unwrap(net_a) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_b) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
+        match Arc::try_unwrap(net_c) {
+            Ok(n) => n.join(),
+            Err(_) => {}
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

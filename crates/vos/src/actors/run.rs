@@ -225,6 +225,51 @@ impl Future for HostIo {
     }
 }
 
+/// Future returned by [`super::context::Context::resolve`].
+///
+/// Wraps a registry `Ask`, decoding the reply into a u32.
+/// Returns 0 for **both** "not installed" and any failure path
+/// (invoke error, unexpected reply variant) — callers can't
+/// distinguish them from the return value alone. Failure paths
+/// emit a `log::warn!` so the cause is visible in actor logs;
+/// callers that need to branch on the error should use
+/// [`super::context::Context::ask`] against `ServiceId::REGISTRY`
+/// directly.
+pub struct Resolve {
+    ask: Ask,
+}
+
+impl Resolve {
+    pub(crate) fn new(ask: Ask) -> Self {
+        Self { ask }
+    }
+}
+
+impl Unpin for Resolve {}
+
+impl Future for Resolve {
+    type Output = u32;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        match Pin::new(&mut self.ask).poll(cx) {
+            Poll::Ready(Ok(super::value::Value::U32(n))) => Poll::Ready(n),
+            Poll::Ready(Ok(other)) => {
+                crate::log::warn!(
+                    "Context::resolve: registry returned non-U32 reply ({other:?}); treating as not-found",
+                );
+                Poll::Ready(0)
+            }
+            Poll::Ready(Err(e)) => {
+                crate::log::warn!(
+                    "Context::resolve: registry invoke failed: {e}; treating as not-found",
+                );
+                Poll::Ready(0)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 // ── Refine-mode flag (service framework) ──────────────────────────────
 
 /// Global flag: are we currently inside `run_refine_service`?
@@ -331,6 +376,12 @@ pub fn run_refine_service<A: super::Actor>() {
     use super::lifecycle::{self, BUF_SIZE, DispatchResult};
     use alloc::boxed::Box;
     use core::ptr::addr_of_mut;
+
+    // Install the PVM `log::Log` impl on the first refine call.
+    // `set_logger` returns Err on duplicate install — we ignore it
+    // so warm restarts (which re-enter `_start` without flat_mem
+    // reset) don't trip on the second call.
+    crate::log_impl::install_pvm_logger();
 
     set_refine_mode(true);
 

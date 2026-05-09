@@ -101,7 +101,7 @@ pub trait Actor: Sized + Encode + Decode {
                     Ok(())
                 }
             }
-            let _ = core::fmt::write(&mut ErrorWriter, format_args!("error: {error:?}\n"));
+            let _ = core::fmt::write(&mut ErrorWriter, format_args!("error: {:?}\n", error));
         }
         true
     }

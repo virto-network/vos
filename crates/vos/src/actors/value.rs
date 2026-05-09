@@ -196,19 +196,13 @@ impl From<Vec<String>> for Value {
 // ── Args ─────────────────────────────────────────────────────────
 
 /// A named collection of values — used for message arguments and init args.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Default)]
 #[rkyv(crate = rkyv)]
 pub struct Args(pub Vec<(String, Value)>);
 
-impl Default for Args {
-    fn default() -> Self {
-        Args::new()
-    }
-}
-
 impl Args {
     pub fn new() -> Self {
-        Args(Vec::new())
+        Self::default()
     }
 
     pub fn with(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {

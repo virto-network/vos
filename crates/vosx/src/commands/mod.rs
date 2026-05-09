@@ -1,10 +1,10 @@
-//! Per-subcommand implementations. Each file has a single
-//! `pub fn run(...)` matching the clap subcommand's signature
-//! shape; `main` dispatches to them.
+//! Per-subcommand implementations.
+//!
+//! - `run` — raw PVM/ELF execution, no space context.
+//! - `space::*` — everything space-related: lifecycle (new,
+//!   list, info, up, join, delete), program/agent management
+//!   (publish, install, upgrade, uninstall, programs, agents),
+//!   members, generic invoke (`call`), export.
 
-pub mod invoke;
-pub mod list;
-pub mod node;
 pub mod run;
-pub mod start;
-pub mod status;
+pub mod space;
