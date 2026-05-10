@@ -1,0 +1,25 @@
+[package]
+name = "echo-extension"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` enables the cdylib's `vos_extension_*` extern-fn exports.
+# `extension` is matched by `#[actor]` to emit `impl Extension`
+# and the dispatch glue. Both default-on so a plain `cargo build`
+# produces a loadable extension .so; consumers depending on this
+# crate as a Ref source turn them off via `default-features = false`
+# so no symbols clash in their link.
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["extension"] }

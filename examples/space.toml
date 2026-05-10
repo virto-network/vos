@@ -64,15 +64,15 @@ actors = [
   { name = "fizzbuzz", path = "actors/fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf" },
 ]
 
-# ── Workers ──────────────────────────────────────────────────────
+# ── Extensions ───────────────────────────────────────────────────
 #
 # Native plugins (.so / .dylib) — the I/O surface of the space.
 # PVM agents that need HTTP, the wall clock, the filesystem, or
-# hardware access route through workers via ctx.ask / ctx.tell.
+# hardware access route through extensions via ctx.ask / ctx.tell.
 # Each observed reply is captured in the calling actor's effect
 # log so CRDT actors replay deterministically across replicas.
 
-# [[worker]]
+# [[extension]]
 # name = "rate-oracle"
 # path = "target/debug/librate_oracle.so"
 # provides = ["rates"]

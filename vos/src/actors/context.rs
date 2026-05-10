@@ -203,8 +203,8 @@ impl<A: Actor> Context<A> {
     // --- Host I/O (worker mode) ---
 
     /// Issue an async host call. The handler yields `Pending`; the host
-    /// reads the request via `vos_worker_pending_effect`, fulfills it,
-    /// writes the result via `vos_worker_provide_result`, then re-polls.
+    /// reads the request via `vos_extension_pending_effect`, fulfills it,
+    /// writes the result via `vos_extension_provide_result`, then re-polls.
     ///
     /// Used internally by `ask()`, `fetch()`, etc.
     pub fn host_call(&mut self, request: Vec<u8>) -> super::run::HostIo {
@@ -481,7 +481,7 @@ impl<'ctx, A: Actor> FetchBuilder<'ctx, A> {
 /// Marker trait declaring an actor is a **native worker** — i.e.,
 /// runs as a host plugin (`.so`/dylib) rather than as a deterministic
 /// PVM service. Implementations get access to non-deterministic I/O
-/// methods via [`WorkerCtx`]: HTTP `fetch`, raw `host_call`, etc.
+/// methods via [`ExtensionCtx`]: HTTP `fetch`, raw `host_call`, etc.
 ///
 /// PVM actors deliberately do not implement this. A PVM actor that
 /// needs HTTP routes through a worker via `ctx.ask`/`ctx.tell`; the
@@ -489,16 +489,16 @@ impl<'ctx, A: Actor> FetchBuilder<'ctx, A> {
 ///
 /// The `#[actor]`/`#[messages]` macro emits the `impl` automatically
 /// when the actor crate is built with the `worker` feature on.
-pub trait WorkerActor: Actor {}
+pub trait Extension: Actor {}
 
 /// HTTP / host-call API exposed only on actors that implement
-/// [`WorkerActor`].
+/// [`Extension`].
 ///
 /// Bring this trait into scope inside a worker crate to get access
 /// to `ctx.fetch(...)` and friends:
 ///
 /// ```ignore
-/// use vos::WorkerCtx;
+/// use vos::ExtensionCtx;
 ///
 /// #[messages]
 /// impl MyWorker {
@@ -511,14 +511,14 @@ pub trait WorkerActor: Actor {}
 ///
 /// In a PVM actor crate the trait is unavailable, so `ctx.fetch`
 /// produces a clear "method not found" error at compile time.
-pub trait WorkerCtx<A: Actor> {
+pub trait ExtensionCtx<A: Actor> {
     /// Build an HTTP request via the host. Returns a builder that
     /// implements `IntoFuture`, so awaiting it sends the request
     /// and returns the response.
     fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A>;
 }
 
-impl<A: WorkerActor> WorkerCtx<A> for Context<A> {
+impl<A: Extension> ExtensionCtx<A> for Context<A> {
     /// ```ignore
     /// // GET (default method):
     /// let resp = ctx.fetch("https://api.example.com").await;

@@ -1,4 +1,4 @@
-//! Fetcher worker — demonstrates ctx.fetch() for HTTP requests.
+//! Fetcher extension — demonstrates ctx.fetch() for HTTP requests.
 //!
 //! Same source compiles as a native worker (.so) AND a WASM module.
 //! The fetch effect is handled by the host: ureq for native, the

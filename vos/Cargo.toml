@@ -11,19 +11,19 @@ std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
-worker = ["macros"]
+extension = ["macros"]
 wasm = ["macros"]
 # WASM bootstrap: provides global allocator (dlmalloc) and panic
 # handler so the actor crate just needs `#![no_std]` and `use vos::*`.
 wasm-bootstrap = ["wasm", "dep:dlmalloc"]
-# Enables native HTTP fulfillment (EFFECT_FETCH) in the worker host.
+# Enables native HTTP fulfillment (EFFECT_FETCH) in the extension host.
 http = ["dep:ureq"]
-# Enables redb-backed worker state persistence in the worker host.
+# Enables redb-backed extension state persistence in the extension host.
 storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-channel", "dep:vos-raft"]
 # Enables the libp2p-backed networking layer (peer transport, identity,
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
-# single-node runs (workers, no_std actors) don't need it.
+# single-node runs (extensions, no_std actors) don't need it.
 network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
@@ -62,11 +62,11 @@ futures-executor = { version = "0.3", default-features = false, features = ["std
 futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
 
 # Backs `vos::crypto::blake2b` on every non-riscv64 target —
-# host code, workers, wasm guests. PVM (riscv64) actors hit
+# host code, extensions, wasm guests. PVM (riscv64) actors hit
 # the host via ECALL_BLAKE2B_COMPRESS and never link this dep.
 # Target-conditional so the riscv64 actor build doesn't even
 # compile blake2b_simd. `default-features = false` keeps it
-# usable from no_std (worker / wasm).
+# usable from no_std (extension / wasm).
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 blake2b_simd = { version = "1", default-features = false }
 

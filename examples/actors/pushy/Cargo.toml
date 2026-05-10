@@ -19,7 +19,7 @@ vos = { path = "../../../vos", default-features = false, features = ["macros", "
 vos = { path = "../../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
 
 [target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
-vos = { path = "../../../vos", default-features = false, features = ["macros", "worker"] }
+vos = { path = "../../../vos", default-features = false, features = ["macros", "extension"] }
 
 [profile.release]
 opt-level = "s"

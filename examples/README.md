@@ -4,10 +4,10 @@ Runnable actors, agents, and TOML manifests for exploring VOS.
 
 ```
 examples/
-├── space.toml          # full manifest (scheduler + nested actors + workers)
+├── space.toml          # full manifest (scheduler + nested actors + extensions)
 ├── space-crdt-{a,b}.toml  # two-process CRDT convergence demo
 ├── space-raft.toml     # Raft cluster template
-├── justfile            # build recipes (cargo actor, cargo wasm, cargo worker)
+├── justfile            # build recipes (cargo actor, cargo wasm, cargo extension)
 ├── agents/             # services that orchestrate actors (scheduler/, …)
 └── actors/             # leaf actors (greeter/, counter/, crdt-counter/, …)
 ```

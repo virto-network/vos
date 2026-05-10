@@ -226,20 +226,20 @@ impl AgentConfig {
     }
 }
 
-/// Configuration for registering a native worker in the node.
-pub struct WorkerConfig {
-    /// Path to the worker `.so` file.
+/// Configuration for registering a native extension in the node.
+pub struct ExtensionConfig {
+    /// Path to the extension `.so` file.
     pub path: std::path::PathBuf,
-    /// rkyv-encoded `vos::value::Args` for the worker's constructor.
+    /// rkyv-encoded `vos::value::Args` for the extension's constructor.
     /// Empty if the constructor takes no parameters.
     pub init_args: Vec<u8>,
     /// Optional data directory for state persistence.
-    /// When set, the worker's redb file is created at
-    /// `{data_dir}/workers/{name}.redb`.
+    /// When set, the extension's redb file is created at
+    /// `{data_dir}/extensions/{name}.redb`.
     pub data_dir: Option<std::path::PathBuf>,
 }
 
-impl WorkerConfig {
+impl ExtensionConfig {
     /// Build a config with no init args and no persistence.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -262,7 +262,7 @@ impl WorkerConfig {
     }
 
     /// Enable state persistence under the given data directory.
-    /// The worker's state is stored in `{data_dir}/workers/{name}.redb`
+    /// The extension's state is stored in `{data_dir}/extensions/{name}.redb`
     /// where `name` is derived from the `.so` filename.
     pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
@@ -277,9 +277,9 @@ impl WorkerConfig {
             .path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("worker")
+            .unwrap_or("extension")
             .trim_start_matches("lib");
-        let dir = data_dir.join("workers");
+        let dir = data_dir.join("extensions");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join(format!("{name}.redb")))
     }
@@ -324,7 +324,7 @@ const MAX_PRODUCER_REPLY: usize = 1024 * 1024;
 /// Send `reply` through `reply_tx` if it's within the producer
 /// cap; otherwise log and drop the channel so the caller gets a
 /// disconnect-shaped failure. Pulled out to share between
-/// `handle_invoke_request` and `worker_thread`.
+/// `handle_invoke_request` and `extension_thread`.
 fn send_reply_capped(reply_tx: mpsc::Sender<Vec<u8>>, reply: Vec<u8>, svc_id: ServiceId) {
     if reply.len() > MAX_PRODUCER_REPLY {
         warn!(
@@ -1155,7 +1155,7 @@ impl VosNode {
 
     /// Register a native worker and return its service ID.
     /// The worker starts immediately on a new thread.
-    pub fn register_worker(&mut self, config: WorkerConfig) -> ServiceId {
+    pub fn register_extension(&mut self, config: ExtensionConfig) -> ServiceId {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
@@ -1168,7 +1168,7 @@ impl VosNode {
         let activity = self.last_activity.clone();
 
         let join = thread::spawn(move || {
-            worker_thread(id, config, rx, invoke_rx, outbox, shutdown, activity)
+            extension_thread(id, config, rx, invoke_rx, outbox, shutdown, activity)
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -2011,7 +2011,7 @@ fn publish_heads_if_replicated(
 /// reply channel. The CALLER's `handle_invoke` wraps the reply in
 /// the invoke wire frame (`[STATUS_DONE][state_len=0][reply]`) —
 /// same convention workers use, so this path is symmetric with
-/// `worker_thread`.
+/// `extension_thread`.
 ///
 /// Recording is honored: a CRDT-mode agent records the dispatch
 /// just like any other external message, since from its own
@@ -2348,25 +2348,25 @@ const MAX_DEFERRED: usize = 256;
 
 // ── Worker thread ────────────────────────────────────────────────────
 
-fn worker_thread(
+fn extension_thread(
     id: ServiceId,
-    config: WorkerConfig,
+    config: ExtensionConfig,
     inbox: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult {
-    use crate::worker::WorkerPlugin;
+    use crate::extension::ExtensionPlugin;
     use std::collections::VecDeque;
 
     let bump = || *activity.lock().unwrap() = Instant::now();
 
-    let plugin = match unsafe { WorkerPlugin::load(&config.path) } {
+    let plugin = match unsafe { ExtensionPlugin::load(&config.path) } {
         Ok(p) => p,
         Err(e) => {
             let err = format!("failed to load worker plugin: {e}");
-            error!(%id, "worker: {err}");
+            error!(%id, "extension: {err}");
             return AgentResult {
                 id,
                 panics: 1,
@@ -2376,19 +2376,20 @@ fn worker_thread(
     };
 
     if let Some(meta) = plugin.meta() {
-        info!(%id, actor = %meta.actor_name, path = %config.path.display(), "worker: loaded plugin");
+        info!(%id, actor = %meta.actor_name, path = %config.path.display(), "extension: loaded plugin");
     }
 
     // Pick a persistence strategy. Workers always get LocalCommit
     // when a data directory is configured, NoCommit otherwise;
     // replication strategies (CRDT, Raft) are not available to
     // workers since they live outside the deterministic universe.
-    let mut strategy: Box<dyn crate::commit::CommitStrategy> = build_worker_strategy(&config, id);
+    let mut strategy: Box<dyn crate::commit::CommitStrategy> =
+        build_extension_strategy(&config, id);
     let saved_state = strategy.restore();
 
     let mut instance = match saved_state {
         Some(bytes) => {
-            info!(%id, bytes = bytes.len(), "worker: restored state");
+            info!(%id, bytes = bytes.len(), "extension: restored state");
             plugin.load_state(&bytes)
         }
         None if config.init_args.is_empty() => plugin.create(),
@@ -2473,14 +2474,14 @@ fn worker_thread(
 /// Dispatch a message to a worker instance and poll to completion.
 /// Returns the reply bytes (rkyv-encoded Value).
 fn dispatch_and_poll(
-    instance: &mut crate::worker::WorkerInstance<'_>,
+    instance: &mut crate::extension::ExtensionInstance<'_>,
     msg: &[u8],
     inbox: &mpsc::Receiver<Envelope>,
     outbox: &mpsc::Sender<Envelope>,
-    worker_id: ServiceId,
+    extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
 ) -> Vec<u8> {
-    use crate::worker::{POLL_PENDING, POLL_READY};
+    use crate::extension::{POLL_PENDING, POLL_READY};
 
     instance.dispatch_start(msg);
 
@@ -2498,11 +2499,11 @@ fn dispatch_and_poll(
             }
             POLL_PENDING => {
                 let effect = instance.pending_effect();
-                let result = handle_effect(&effect, inbox, outbox, worker_id, deferred);
+                let result = handle_effect(&effect, inbox, outbox, extension_id, deferred);
                 instance.provide_result(&result);
             }
             _ => {
-                error!(%worker_id, status = result.status, "worker: poll returned error");
+                error!(%extension_id, status = result.status, "extension: poll returned error");
                 return Vec::new();
             }
         }
@@ -2514,7 +2515,7 @@ fn handle_effect(
     effect: &[u8],
     inbox: &mpsc::Receiver<Envelope>,
     outbox: &mpsc::Sender<Envelope>,
-    worker_id: ServiceId,
+    extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
 ) -> Vec<u8> {
     use crate::effects::{EFFECT_ASK, EFFECT_FETCH};
@@ -2534,7 +2535,7 @@ fn handle_effect(
             let target_id = u32::from_le_bytes(rest[..4].try_into().unwrap());
             let payload = rest[4..].to_vec();
             let _ = outbox.send(Envelope {
-                from: worker_id,
+                from: extension_id,
                 to: ServiceId(target_id),
                 payload,
             });
@@ -2555,7 +2556,7 @@ fn handle_effect(
             }
         }
         other => {
-            error!(%worker_id, tag = format!("{other:#04x}"), "worker: unknown effect tag");
+            error!(%extension_id, tag = format!("{other:#04x}"), "extension: unknown effect tag");
             Vec::new()
         }
     }
@@ -2631,8 +2632,8 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
 ///
 /// [`LocalCommit`]: crate::commit::LocalCommit
 /// [`NoCommit`]: crate::commit::NoCommit
-fn build_worker_strategy(
-    config: &WorkerConfig,
+fn build_extension_strategy(
+    config: &ExtensionConfig,
     id: ServiceId,
 ) -> Box<dyn crate::commit::CommitStrategy> {
     #[cfg(feature = "storage")]
@@ -2641,7 +2642,7 @@ fn build_worker_strategy(
             match crate::commit::LocalCommit::open(&path) {
                 Ok(lc) => return Box::new(lc),
                 Err(e) => {
-                    warn!(%id, error = %e, "worker: failed to open storage; continuing without persistence")
+                    warn!(%id, error = %e, "extension: failed to open storage; continuing without persistence")
                 }
             }
         }
@@ -2656,12 +2657,12 @@ fn build_worker_strategy(
 /// Serialize the worker's state and hand it to the commit strategy.
 fn persist(
     strategy: &mut dyn crate::commit::CommitStrategy,
-    instance: &crate::worker::WorkerInstance<'_>,
+    instance: &crate::extension::ExtensionInstance<'_>,
     id: ServiceId,
 ) {
     let bytes = instance.save_state();
     if let Err(e) = strategy.commit(&bytes) {
-        warn!(%id, error = %e, "worker: failed to persist state");
+        warn!(%id, error = %e, "extension: failed to persist state");
     }
 }
 
@@ -2685,11 +2686,11 @@ fn wait_for_reply(
                 if deferred.len() < MAX_DEFERRED {
                     deferred.push_back(other);
                 } else {
-                    warn!(from = %other.from, "worker: deferred queue full, dropping message");
+                    warn!(from = %other.from, "extension: deferred queue full, dropping message");
                 }
             }
             Err(_) => {
-                warn!(target_id, "worker: ask timeout waiting for reply");
+                warn!(target_id, "extension: ask timeout waiting for reply");
                 return Vec::new();
             }
         }
@@ -2801,13 +2802,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "storage")]
-    fn worker_state_persists_across_restarts() {
-        // EchoWorker has a `count` field that increments on each echo.
+    fn extension_state_persists_across_restarts() {
+        // EchoExtension has a `count` field that increments on each echo.
         // Run the worker, send a few messages, shut down. Restart with
         // the same redb path — the count should resume where it left off.
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
@@ -2819,9 +2818,9 @@ mod tests {
         let echo_path = workspace
             .join("target")
             .join(profile)
-            .join("libecho_worker.so");
+            .join("libecho_extension.so");
         if !echo_path.exists() {
-            eprintln!("skipping: build echo-worker first");
+            eprintln!("skipping: build echo-extension first");
             return;
         }
 
@@ -2851,7 +2850,8 @@ mod tests {
         // ── First run: send 2 echoes ────────────────────────────────
         {
             let mut node = VosNode::new();
-            let id = node.register_worker(WorkerConfig::new(echo_path.clone()).persist(&data_dir));
+            let id =
+                node.register_extension(ExtensionConfig::new(echo_path.clone()).persist(&data_dir));
             send_echo(&node, id, "first");
             send_echo(&node, id, "second");
             node.run();
@@ -2861,7 +2861,7 @@ mod tests {
         // ── Second run: state should be restored, count starts at 2 ──
         {
             let mut node = VosNode::new();
-            let id = node.register_worker(WorkerConfig::new(echo_path).persist(&data_dir));
+            let id = node.register_extension(ExtensionConfig::new(echo_path).persist(&data_dir));
             send_echo(&node, id, "third");
             node.run();
             let _ = node.collect();
@@ -2869,7 +2869,7 @@ mod tests {
 
         // Verify by opening the db directly and checking the persisted state
         use crate::commit::STATE_TABLE;
-        let db_path = data_dir.join("workers").join("echo_worker.redb");
+        let db_path = data_dir.join("extensions").join("echo_extension.redb");
         let db = redb::Database::open(&db_path).expect("open db");
         let txn = db.begin_read().unwrap();
         let table = txn.open_table(STATE_TABLE).unwrap();
@@ -2880,9 +2880,9 @@ mod tests {
             .value()
             .to_vec();
 
-        // EchoWorker has a single u32 `count` field — rkyv packs it to
+        // EchoExtension has a single u32 `count` field — rkyv packs it to
         // exactly 4 bytes. After 3 echoes, count = 3.
-        assert_eq!(bytes.len(), 4, "EchoWorker state is one u32");
+        assert_eq!(bytes.len(), 4, "EchoExtension state is one u32");
         let count = u32::from_le_bytes(bytes.try_into().unwrap());
         assert_eq!(count, 3, "expected 3 echoes total across both runs");
 
@@ -2891,12 +2891,10 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http")]
-    fn worker_does_http_fetch() {
-        // Loads fetcher-worker and asks it to GET a URL.
+    fn extension_does_http_fetch() {
+        // Loads fetcher-extension and asks it to GET a URL.
         // Uses example.com which is stable and small. Skips on no network.
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
@@ -2908,14 +2906,14 @@ mod tests {
         let path = workspace
             .join("target")
             .join(profile)
-            .join("libfetcher_worker.so");
+            .join("libfetcher_extension.so");
         if !path.exists() {
-            eprintln!("skipping worker_does_http_fetch: build fetcher-worker first");
+            eprintln!("skipping extension_does_http_fetch: build fetcher-extension first");
             return;
         }
 
         let mut node = VosNode::new();
-        let fetcher_id = node.register_worker(WorkerConfig::new(path));
+        let fetcher_id = node.register_extension(ExtensionConfig::new(path));
 
         use crate::actors::codec::Encode;
         use crate::actors::value::Msg;
@@ -2942,12 +2940,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_to_worker_ask() {
-        // This test requires both echo-worker and proxy-worker to be built.
-        // Run: cargo build -p echo-worker -p proxy-worker
+    fn extension_to_extension_ask() {
+        // This test requires both echo-extension and proxy-extension to be built.
+        // Run: cargo build -p echo-extension -p proxy-extension
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
@@ -2959,27 +2955,27 @@ mod tests {
         let echo_path = workspace
             .join("target")
             .join(profile)
-            .join("libecho_worker.so");
+            .join("libecho_extension.so");
         let proxy_path = workspace
             .join("target")
             .join(profile)
-            .join("libproxy_worker.so");
+            .join("libproxy_extension.so");
 
         if !echo_path.exists() || !proxy_path.exists() {
-            eprintln!("skipping worker_to_worker_ask: build workers first");
+            eprintln!("skipping extension_to_extension_ask: build workers first");
             return;
         }
 
         let mut node = VosNode::new();
 
         // Register echo worker — gets ServiceId 1
-        let echo_id = node.register_worker(WorkerConfig::new(echo_path));
+        let echo_id = node.register_extension(ExtensionConfig::new(echo_path));
 
         // Build init args for proxy: target = echo's ServiceId
         use crate::actors::codec::Encode;
         use crate::actors::value::{Args, Msg};
         let proxy_args = Args::new().with("target", echo_id.0);
-        let proxy_id = node.register_worker(WorkerConfig::with_args(proxy_path, &proxy_args));
+        let proxy_id = node.register_extension(ExtensionConfig::with_args(proxy_path, &proxy_args));
 
         // Send a "proxy" message to the proxy worker (no target arg now —
         // the proxy already knows its target from init args)

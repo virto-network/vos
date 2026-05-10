@@ -12,7 +12,7 @@ wasm = ["vos/wasm"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
-check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 
 [lib]
 crate-type = ["cdylib"]

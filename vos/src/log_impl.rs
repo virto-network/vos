@@ -8,7 +8,7 @@
 //!   `DEBUG_WRITE` hostcall (vosx surfaces these on stderr).
 //!   Installed by `run_refine_service` on first refine call.
 //! - **Worker** (`feature = "worker"`): writes formatted records
-//!   to `std::io::stderr`. Installed by `vos_worker_create`. A
+//!   to `std::io::stderr`. Installed by `vos_extension_create`. A
 //!   downstream worker host that wants tracing integration can
 //!   replace this with `LogTracer` (from `tracing-log`) before
 //!   the worker is dispatched — `set_logger` is idempotent at

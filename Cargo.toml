@@ -12,8 +12,8 @@ members = [
     "zkpvm/precompiles",
     "zkpvm/derive",
     "zkpvm/verifier",
-    "workers/http-gateway",
-    "examples/workers/*",
+    "extensions/http-gateway",
+    "examples/extensions/*",
 ]
 exclude = [
     "examples/agents/*",
@@ -30,9 +30,9 @@ exclude = [
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.
     "zkpvm/fuzz",
-    # `workers` is a parent directory holding worker
+    # `extensions` is a parent directory holding extension
     # plugins; each sub-crate is listed in `members` explicitly.
-    "workers",
+    "extensions",
 ]
 
 [workspace.package]

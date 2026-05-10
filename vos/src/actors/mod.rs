@@ -24,7 +24,7 @@ pub mod value;
 pub use actor::{Actor, Message};
 pub use codec::{Decode, Encode};
 pub mod context;
-pub use context::{Context, WorkerActor, WorkerCtx};
+pub use context::{Context, Extension, ExtensionCtx};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 pub use run::{

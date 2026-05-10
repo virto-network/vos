@@ -18,9 +18,9 @@ the user's critical path.
 | [`merkle-crdt/`](merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
 | [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) |
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
-| [`workers/`](workers/) | Native worker plugins loaded by the runtime (e.g. `http-gateway`) |
+| [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
-| [`examples/`](examples/) | Sample actors, agents, workers, wasm guests, space manifests |
+| [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space manifests |
 | [`book/`](book/) | The VOS Book (architecture, protocols, applications). Source in [`docs/`](docs/) |
 
 ## Quick start

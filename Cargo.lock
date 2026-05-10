@@ -1108,7 +1108,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
-name = "echo-worker"
+name = "echo-extension"
 version = "0.1.0"
 dependencies = [
  "vos",
@@ -1245,7 +1245,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "fetcher-worker"
+name = "fetcher-extension"
 version = "0.1.0"
 dependencies = [
  "vos",
@@ -3170,7 +3170,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "proxy-worker"
+name = "proxy-extension"
 version = "0.1.0"
 dependencies = [
  "vos",

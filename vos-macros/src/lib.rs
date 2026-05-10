@@ -31,7 +31,7 @@ use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_in
 /// PVM actors are deterministic by construction — their `Context`
 /// has no `fetch` / `host_call` / other I/O methods at all. External
 /// I/O lives in workers (build the same actor crate with the
-/// `worker` feature on, and [`vos::WorkerCtx`] unlocks `ctx.fetch`).
+/// `worker` feature on, and [`vos::ExtensionCtx`] unlocks `ctx.fetch`).
 /// PVM actors that need external data route through workers via
 /// `ctx.ask` / `ctx.tell` so each reply is captured in the
 /// CRDT/Raft replay log.
@@ -671,7 +671,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[cfg(not(target_arch = "riscv64"))]
                 panic!(
                     "actor has constructor parameters — workers and WASM \
-                     must be created with init args (see vos_worker_create / \
+                     must be created with init args (see vos_extension_create / \
                      vos_wasm_create with non-null args)"
                 );
             }
@@ -785,11 +785,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //
     // The decl-macro itself is gated on vos's `worker` feature
     // (expands to nothing when worker glue isn't relevant for
-    // this build target). Inside its expansion, the `vos_worker_*`
+    // this build target). Inside its expansion, the `vos_extension_*`
     // extern fns are further gated on the user crate's `bin`
     // feature, so cross-actor lib deps don't collide on those
-    // symbols at link time. The `WorkerActor` impl and
-    // `WorkerCtx` use stay unconditional so handler bodies can
+    // symbols at link time. The `Extension` impl and
+    // `ExtensionCtx` use stay unconditional so handler bodies can
     // reach `ctx.fetch` / etc. regardless.
     let worker_entries = quote! {
         vos::__vos_emit_worker_glue!(#actor_name, #enum_name);

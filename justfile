@@ -1,4 +1,4 @@
-# Root justfile for kunekt — build and test orchestration.
+# Root justfile for vos — build and test orchestration.
 
 # Default: list available recipes
 default:
@@ -6,16 +6,16 @@ default:
 
 # ── Build ───────────────────────────────────────────────────────────
 
-# Build everything: crates, workers, PVM actors, agents
-build: build-crates build-workers build-pvm
+# Build everything: crates, extensions, PVM actors, agents
+build: build-crates build-extensions build-pvm
 
 # Build the workspace (vos, vosx, etc.)
 build-crates:
     cargo build
 
-# Build native worker plugins (.so files)
-build-workers:
-    cargo build -p echo-worker -p proxy-worker -p fetcher-worker
+# Build native extension plugins (.so files)
+build-extensions:
+    cargo build -p echo-extension -p proxy-extension -p fetcher-extension
 
 # Build WASM actors (wasm32-unknown-unknown target)
 build-wasm:
@@ -29,12 +29,12 @@ build-pvm:
 # ── Test ────────────────────────────────────────────────────────────
 
 # Run all tests (workspace + integration)
-test: build-workers
+test: build-extensions
     cargo test --all
 
-# Run only worker tests
-test-workers: build-workers
-    cargo test -p vos worker -- --nocapture
+# Run only extension tests
+test-extensions: build-extensions
+    cargo test -p vos extension -- --nocapture
 
 # Smoke test the WASM actors in Node
 test-wasm: build-wasm
@@ -43,11 +43,11 @@ test-wasm: build-wasm
     node examples/wasm/js/test-persist.mjs
 
 # Run PVM-related integration tests (requires built PVM actors)
-test-pvm: build-workers
+test-pvm: build-extensions
     cargo test -p vos --test elf_integration -- --nocapture
 
 # Run a single test by name
-test-one name: build-workers
+test-one name: build-extensions
     cargo test -p vos {{name}} -- --nocapture
 
 # Build just the crdt-counter actor (cycle-5 example)

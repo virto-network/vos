@@ -11,12 +11,12 @@ wasm = ["vos/wasm"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
-check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 
 [lib]
 crate-type = ["cdylib"]
-# Reuse the shared source from the native worker — same DSL, same code.
-path = "../../workers/fetcher/src/lib.rs"
+# Reuse the shared source from the native extension — same DSL, same code.
+path = "../../extensions/fetcher/src/lib.rs"
 
 [dependencies]
 vos = { path = "../../../vos", default-features = false, features = ["wasm-bootstrap"] }

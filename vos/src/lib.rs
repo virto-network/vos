@@ -33,7 +33,7 @@ pub use rkyv;
 
 /// Re-export of the [`log`](https://docs.rs/log/0.4) facade. The
 /// per-target `Log` impl is auto-installed by the entry point for
-/// each build flavor (PVM `_start`, `vos_worker_create`,
+/// each build flavor (PVM `_start`, `vos_extension_create`,
 /// `vos_wasm_create`), so user code only needs to call
 /// `log::info!(...)` etc. — no manual subscriber setup.
 pub use ::log;
@@ -85,7 +85,7 @@ pub mod refine_payload;
 
 pub mod effect_log;
 pub mod effects;
-pub mod worker;
+pub mod extension;
 // Auto-installed `log::Log` impl for PVM builds. Worker- and
 // wasm-side log impls live in the user crate (emitted by the
 // `__vos_emit_*_glue!` decl macros) because they need std /
@@ -129,8 +129,8 @@ pub use actors::lifecycle;
 pub use actors::run_refine;
 pub use actors::value;
 pub use actors::{
-    Actor, Ask, Context, Message, RunResult, WorkerActor, WorkerCtx, Yield, metadata, run_blocking,
-    try_poll,
+    Actor, Ask, Context, Extension, ExtensionCtx, Message, RunResult, Yield, metadata,
+    run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
@@ -229,7 +229,7 @@ pub mod network;
 
 /// Re-export for use by generated worker entry points.
 #[doc(hidden)]
-pub mod __worker {
+pub mod __extension {
     pub use crate::actors::run::noop_waker;
 }
 
@@ -253,10 +253,10 @@ pub mod __alloc {
 //
 // When the gating feature is off, each macro expands to nothing.
 
-/// Emit the native worker plugin (`vos_worker_*` extern fns).
+/// Emit the native worker plugin (`vos_extension_*` extern fns).
 /// Active when `vos` is built with the `worker` feature; otherwise
 /// expands to nothing.
-#[cfg(feature = "worker")]
+#[cfg(feature = "extension")]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __vos_emit_worker_glue {
@@ -265,16 +265,16 @@ macro_rules! __vos_emit_worker_glue {
         // impl and a use) so they don't conflict across cross-actor
         // lib deps. They need to be visible whenever the worker
         // feature is active so handler bodies can call `ctx.fetch`
-        // / `ctx.fs_read` / etc. through the `WorkerCtx` extension
+        // / `ctx.fs_read` / etc. through the `ExtensionCtx` extension
         // methods, without the user having to remember to import
         // the trait themselves.
-        impl $crate::WorkerActor for $actor_name {}
+        impl $crate::Extension for $actor_name {}
 
         #[allow(unused_imports)]
-        use $crate::WorkerCtx as _;
+        use $crate::ExtensionCtx as _;
 
-        // The extern-fn bits are bin-gated. `vos_worker_create` /
-        // `vos_worker_dispatch` / etc. are exported symbols the
+        // The extern-fn bits are bin-gated. `vos_extension_create` /
+        // `vos_extension_dispatch` / etc. are exported symbols the
         // host's libloading lookup needs; emitting them in a
         // dependency rlib would duplicate them in the dependent
         // worker's link. Top-of-graph builds keep `bin` on; cross-
@@ -304,7 +304,7 @@ macro_rules! __vos_emit_worker_glue {
             };
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_meta(out_ptr: *mut *const u8, out_len: *mut usize) {
+            pub extern "C" fn vos_extension_meta(out_ptr: *mut *const u8, out_len: *mut usize) {
                 unsafe {
                     *out_ptr = _VOS_WORKER_META.as_ptr();
                     *out_len = _VOS_WORKER_META.len();
@@ -344,7 +344,10 @@ macro_rules! __vos_emit_worker_glue {
             static __VOS_WORKER_LOGGER: __VosWorkerLogger = __VosWorkerLogger;
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_create(args_ptr: *const u8, args_len: usize) -> *mut () {
+            pub extern "C" fn vos_extension_create(
+                args_ptr: *const u8,
+                args_len: usize,
+            ) -> *mut () {
                 // Install the worker logger on first create.
                 // Idempotent — subsequent calls are no-ops.
                 let _ = $crate::log::set_logger(&__VOS_WORKER_LOGGER);
@@ -369,7 +372,7 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_dispatch(
+            pub extern "C" fn vos_extension_dispatch(
                 state: *mut (),
                 msg_ptr: *const u8,
                 msg_len: usize,
@@ -398,32 +401,34 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_poll(state: *mut ()) -> $crate::worker::WorkerPollResult {
+            pub extern "C" fn vos_extension_poll(
+                state: *mut (),
+            ) -> $crate::extension::ExtensionPollResult {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
                 let Some(future) = ws.in_flight.as_mut() else {
-                    return $crate::worker::WorkerPollResult::error(
-                        $crate::worker::POLL_ERR_NO_FUTURE,
+                    return $crate::extension::ExtensionPollResult::error(
+                        $crate::extension::POLL_ERR_NO_FUTURE,
                     );
                 };
 
-                let waker = $crate::__worker::noop_waker();
+                let waker = $crate::__extension::noop_waker();
                 let mut cx = core::task::Context::from_waker(&waker);
                 match future.as_mut().poll(&mut cx) {
                     core::task::Poll::Ready(_stop) => {
                         ws.in_flight = None;
                         let reply_bytes = ws.ctx.take_reply_bytes();
                         if reply_bytes.is_empty() {
-                            $crate::worker::WorkerPollResult::ready_empty()
+                            $crate::extension::ExtensionPollResult::ready_empty()
                         } else {
-                            $crate::worker::WorkerPollResult::ready(reply_bytes)
+                            $crate::extension::ExtensionPollResult::ready(reply_bytes)
                         }
                     }
-                    core::task::Poll::Pending => $crate::worker::WorkerPollResult::pending(),
+                    core::task::Poll::Pending => $crate::extension::ExtensionPollResult::pending(),
                 }
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_pending_effect(
+            pub extern "C" fn vos_extension_pending_effect(
                 state: *mut (),
                 out_ptr: *mut *const u8,
                 out_len: *mut usize,
@@ -443,7 +448,7 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_provide_result(
+            pub extern "C" fn vos_extension_provide_result(
                 state: *mut (),
                 ptr: *const u8,
                 len: usize,
@@ -458,21 +463,24 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_drop(state: *mut ()) {
+            pub extern "C" fn vos_extension_drop(state: *mut ()) {
                 if !state.is_null() {
                     unsafe { drop(Box::from_raw(state as *mut WorkerState)) };
                 }
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_free(ptr: *mut u8, len: usize, cap: usize) {
+            pub extern "C" fn vos_extension_free(ptr: *mut u8, len: usize, cap: usize) {
                 if !ptr.is_null() && cap > 0 {
                     unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
                 }
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_load(state_ptr: *const u8, state_len: usize) -> *mut () {
+            pub extern "C" fn vos_extension_load(
+                state_ptr: *const u8,
+                state_len: usize,
+            ) -> *mut () {
                 use $crate::Actor as _;
                 let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
                 let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
@@ -489,7 +497,7 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_worker_state(
+            pub extern "C" fn vos_extension_state(
                 state: *mut (),
                 out_ptr: *mut *mut u8,
                 out_len: *mut usize,
@@ -508,7 +516,7 @@ macro_rules! __vos_emit_worker_glue {
     };
 }
 
-#[cfg(not(feature = "worker"))]
+#[cfg(not(feature = "extension"))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __vos_emit_worker_glue {
@@ -639,7 +647,7 @@ macro_rules! __vos_emit_wasm_glue {
                 let Some(future) = ws.in_flight.as_mut() else {
                     return -1;
                 };
-                let waker = $crate::__worker::noop_waker();
+                let waker = $crate::__extension::noop_waker();
                 let mut cx = core::task::Context::from_waker(&waker);
                 match future.as_mut().poll(&mut cx) {
                     core::task::Poll::Ready(_stop) => {
