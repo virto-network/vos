@@ -26,7 +26,8 @@ use serde::Deserialize;
 use space_registry::{ProgramRow, STATUS_OK, STATUS_TAG_CONFLICT, SpaceRegistryRef};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
-use vos::node::VosNode;
+use vos::node::{ExtensionConfig, VosNode};
+use vos::value::Args;
 
 use crate::blob_store;
 use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
@@ -44,6 +45,31 @@ pub struct Manifest {
     pub space: Option<String>,
     #[serde(rename = "agent", default)]
     pub agents: Vec<AgentDef>,
+    /// Native `.so` extension plugins. Each `[[extension]]` entry
+    /// in a manifest maps onto a single `node.register_extension`
+    /// call when the daemon boots; the host loads the .so, reads
+    /// its meta.kind, and dispatches to actor- or service-mode
+    /// glue accordingly. Phase 5 doesn't surface extensions in the
+    /// space registry — they're host-local; only PVM agents live in
+    /// the registry today.
+    #[serde(rename = "extension", default)]
+    pub extensions: Vec<ExtensionDef>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct ExtensionDef {
+    /// Display name. Logged at boot; not used for routing today
+    /// (extensions get auto-allocated ServiceIds).
+    pub name: String,
+    /// Path to the `.so` — relative to the manifest file's
+    /// directory.
+    pub path: String,
+    /// Constructor args. Encoded as a rkyv `vos::value::Args`
+    /// which the extension's `fn new(args: &[u8])` parses. Strings,
+    /// ints, and bools all flow through as-is; richer types
+    /// (Vec<u32> name-list, etc.) come later if needed.
+    #[serde(default)]
+    pub init: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -93,6 +119,57 @@ fn default_consistency() -> String {
     "crdt".to_string()
 }
 
+/// Resolve an extension's `.so` path against the manifest dir,
+/// build init args (rkyv `Args`), and hand off to
+/// `node.register_extension`. Logs the load + each init arg so
+/// operators can spot misconfigured manifests at boot.
+fn register_extension(
+    node: &mut VosNode,
+    ext: &ExtensionDef,
+    manifest_dir: &Path,
+) -> anyhow::Result<()> {
+    let so_path = manifest_dir.join(&ext.path);
+    if !so_path.exists() {
+        anyhow::bail!(
+            "extension '{}': .so not found at {}",
+            ext.name,
+            so_path.display()
+        );
+    }
+
+    let mut args = Args::new();
+    for (k, v) in &ext.init {
+        args = match v {
+            toml::Value::String(s) => args.with(k.clone(), s.clone()),
+            toml::Value::Integer(i) => args.with(k.clone(), *i as u32),
+            toml::Value::Boolean(b) => args.with(k.clone(), *b),
+            other => {
+                anyhow::bail!(
+                    "extension '{}': init arg '{}' has unsupported type {}; \
+                     supported: string, integer, bool",
+                    ext.name,
+                    k,
+                    other.type_str()
+                );
+            }
+        };
+    }
+
+    let cfg = if ext.init.is_empty() {
+        ExtensionConfig::new(&so_path)
+    } else {
+        ExtensionConfig::with_args(&so_path, &args)
+    };
+
+    let id = node.register_extension(cfg);
+    tracing::info!(
+        "extension '{}' loaded from {} as {id}",
+        ext.name,
+        so_path.display(),
+    );
+    Ok(())
+}
+
 pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
     let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     let manifest: Manifest = toml::from_str(std::str::from_utf8(&bytes)?)
@@ -109,11 +186,25 @@ pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
 /// the registry registered locally (so `&mut &node` can drive
 /// in-process Ref calls).
 pub fn reconcile(
-    node: &VosNode,
+    node: &mut VosNode,
     manifest: &Manifest,
     manifest_dir: &Path,
     daemon_prefix: u16,
 ) -> anyhow::Result<()> {
+    // Extensions land first — they're host-local and don't need
+    // the registry. Doing them up-front lets a service-mode
+    // extension (gateway, etc.) be ready by the time PVM agents
+    // start sending traffic at it.
+    if !manifest.extensions.is_empty() {
+        tracing::info!(
+            "reconciling manifest ({} extension definition(s))",
+            manifest.extensions.len(),
+        );
+        for ext in &manifest.extensions {
+            register_extension(node, ext, manifest_dir)?;
+        }
+    }
+
     if manifest.agents.is_empty() {
         return Ok(());
     }

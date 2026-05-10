@@ -71,12 +71,22 @@ actors = [
 # hardware access route through extensions via ctx.ask / ctx.tell.
 # Each observed reply is captured in the calling actor's effect
 # log so CRDT actors replay deterministically across replicas.
+#
+# Two flavours, picked by the extension's meta blob:
+#   - kind = Actor   — request-driven, looks like a regular actor
+#   - kind = Service — long-running, owns a thread (e.g. http-gateway)
 
+# Example: HTTP gateway exposed on loopback:18080. Init args become
+# rkyv-encoded `vos::value::Args` the extension's `fn new(args: &[u8])`
+# parses. Strings, integers, and bools all flow through as-is.
 # [[extension]]
-# name = "rate-oracle"
-# path = "target/debug/librate_oracle.so"
-# provides = ["rates"]
-# init = { endpoint = "https://api.example.com" }
+# name = "gateway"
+# path = "../target/debug/libhttp_gateway.so"
+# init = {
+#     bind_addr   = "127.0.0.1",
+#     port        = 18080,
+#     admin_token = "dev-only-token",
+# }
 
 # ── Per-instance configuration ────────────────────────────────────
 #

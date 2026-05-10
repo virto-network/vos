@@ -136,7 +136,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let (manifest, manifest_dir) =
             crate::commands::space::reconcile::parse_manifest_file(manifest_path)?;
         crate::commands::space::reconcile::reconcile(
-            &node,
+            &mut node,
             &manifest,
             &manifest_dir,
             local_prefix,
