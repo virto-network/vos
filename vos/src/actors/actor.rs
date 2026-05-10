@@ -58,6 +58,13 @@ pub trait Actor: Sized + Encode + Decode {
     /// always leave this at `0` — services are a host-side concept.
     const KIND_BYTE: u8 = 0;
 
+    /// Capability tokens the actor / extension wants to use. Phase 6
+    /// declarative-only: the host logs them at load time and surfaces
+    /// them in operator-facing tools. PVM actors leave this empty —
+    /// they live in the deterministic universe and have no OS access
+    /// by construction. Override via `#[actor(caps = [...])]`.
+    const CAPS: &'static [&'static str] = &[];
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;

@@ -43,6 +43,14 @@ pub struct ActorMeta {
     /// concept; a PVM actor running inside the deterministic
     /// universe is always `Actor`.
     pub kind: u8,
+    /// Capability tokens the extension wants to use — declarative
+    /// only, not enforced. Phase 6 logs them at load time so
+    /// manifest reviewers can spot a sketchy install. Conventional
+    /// strings: `net.tcp.bind`, `net.tcp.connect`,
+    /// `fs.read:/etc/...`, `tokio-runtime`, `thread.spawn`. PVM
+    /// actors leave this empty — they live in the deterministic
+    /// universe and have no OS access by construction.
+    pub caps: &'static [&'static str],
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -172,6 +180,29 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     buf[pos] = meta.kind;
     pos += 1;
 
+    // Capability list (Phase 6, declarative-only). Same trailing-
+    // append discipline: pre-Phase-6 decoders stop here and read
+    // an empty caps list.
+    let [lo, hi] = (meta.caps.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut k = 0;
+    while k < meta.caps.len() {
+        let cap_bytes = meta.caps[k].as_bytes();
+        let [lo, hi] = (cap_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
+        let mut i = 0;
+        while i < cap_bytes.len() {
+            buf[pos + i] = cap_bytes[i];
+            i += 1;
+        }
+        pos += cap_bytes.len();
+        k += 1;
+    }
+
     (buf, pos)
 }
 
@@ -208,6 +239,7 @@ mod tests {
                 ty: "u32",
             }],
             kind: 0,
+            caps: &[],
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -236,6 +268,7 @@ mod tests {
             messages: &[],
             constructor: &[],
             kind: 1, // Service
+            caps: &[],
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -257,6 +290,47 @@ mod tests {
         let parsed = decode(blob).expect("decode");
         assert_eq!(parsed.actor_name, "X");
         assert_eq!(parsed.kind, 0);
+        assert!(parsed.caps.is_empty());
+    }
+
+    #[test]
+    fn caps_roundtrip() {
+        const META: ActorMeta = ActorMeta {
+            actor_name: "Gateway",
+            messages: &[],
+            constructor: &[],
+            kind: 1,
+            caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
+        };
+        let (buf, len) = encode::<512>(&META);
+        let parsed = decode(&buf[..len]).expect("decode");
+        assert_eq!(parsed.kind, 1);
+        assert_eq!(
+            parsed.caps,
+            vec![
+                "net.tcp.bind".to_string(),
+                "net.tcp.connect".to_string(),
+                "tokio-runtime".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn caps_empty_when_pre_phase_6_blob() {
+        // Pre-Phase-6 blob: name + msg_count=0 + ctor_count=0 +
+        // kind=1, no trailing caps section.
+        let blob: &[u8] = &[
+            1, 0,    // name_len = 1
+            b'Y', // name
+            0, 0, // msg_count = 0
+            0, 0, // ctor_count = 0
+            1, // kind = Service
+               // no caps section
+        ];
+        let parsed = decode(blob).expect("decode");
+        assert_eq!(parsed.actor_name, "Y");
+        assert_eq!(parsed.kind, 1);
+        assert!(parsed.caps.is_empty());
     }
 }
 
@@ -291,6 +365,9 @@ mod decode {
         /// from the trailing byte of the meta blob; absent / unknown
         /// values default to `Actor`.
         pub kind: u8,
+        /// Declared capability tokens (Phase 6). Empty when the
+        /// blob predates the field.
+        pub caps: Vec<String>,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -341,12 +418,30 @@ mod decode {
         // default to Actor). Trailing position so older decoders
         // simply stop before reaching it.
         let kind = data.get(pos).copied().unwrap_or(0);
+        if pos < data.len() {
+            pos += 1;
+        }
+
+        // Capability list (Phase 6). Empty if absent.
+        let mut caps: Vec<String> = Vec::new();
+        if pos < data.len()
+            && let Some(cap_count) = read_u16(data, &mut pos)
+        {
+            for _ in 0..cap_count as usize {
+                if let Some(s) = read_str(data, &mut pos) {
+                    caps.push(s);
+                } else {
+                    break;
+                }
+            }
+        }
 
         Some(ParsedMeta {
             actor_name,
             messages,
             constructor,
             kind,
+            caps,
         })
     }
 

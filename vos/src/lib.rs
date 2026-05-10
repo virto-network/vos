@@ -568,7 +568,8 @@ macro_rules! __vos_emit_worker_glue {
 #[cfg(feature = "extension")]
 #[macro_export]
 macro_rules! service_main {
-    ($actor_ty:ty) => {
+    ($actor_ty:ty) => { $crate::service_main!($actor_ty, caps = []); };
+    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?]) => {
         #[cfg(feature = "bin")]
         const _: () = {
             extern crate alloc;
@@ -581,7 +582,11 @@ macro_rules! service_main {
             //   [msg_count:u16 LE = 0]
             //   [ctor_count:u16 LE = 0]
             //   [kind:u8 = 1]
+            //   [caps_count:u16 LE]
+            //     [cap_len:u16 LE][cap_bytes...]
+            //   ...
             const __VOS_SERVICE_NAME: &str = stringify!($actor_ty);
+            const __VOS_SERVICE_CAPS: &[&str] = &[ $( $cap ),* ];
             const fn __vos_build_service_meta<const N: usize>() -> ([u8; N], usize) {
                 let mut buf = [0u8; N];
                 let mut pos = 0;
@@ -607,10 +612,30 @@ macro_rules! service_main {
                 // kind = 1 (Service)
                 buf[pos] = 1;
                 pos += 1;
+                // caps_count + caps
+                let [lo, hi] = (__VOS_SERVICE_CAPS.len() as u16).to_le_bytes();
+                buf[pos] = lo;
+                buf[pos + 1] = hi;
+                pos += 2;
+                let mut k = 0;
+                while k < __VOS_SERVICE_CAPS.len() {
+                    let cap = __VOS_SERVICE_CAPS[k].as_bytes();
+                    let [lo, hi] = (cap.len() as u16).to_le_bytes();
+                    buf[pos] = lo;
+                    buf[pos + 1] = hi;
+                    pos += 2;
+                    let mut j = 0;
+                    while j < cap.len() {
+                        buf[pos + j] = cap[j];
+                        j += 1;
+                    }
+                    pos += cap.len();
+                    k += 1;
+                }
                 (buf, pos)
             }
-            const __VOS_SERVICE_META_ENCODED: ([u8; 256], usize) =
-                __vos_build_service_meta::<256>();
+            const __VOS_SERVICE_META_ENCODED: ([u8; 1024], usize) =
+                __vos_build_service_meta::<1024>();
             static __VOS_SERVICE_META: [u8; __VOS_SERVICE_META_ENCODED.1] = {
                 let (src, len) = __VOS_SERVICE_META_ENCODED;
                 let mut out = [0u8; __VOS_SERVICE_META_ENCODED.1];

@@ -2381,6 +2381,9 @@ fn extension_thread(
             path = %config.path.display(),
             "extension: loaded plugin"
         );
+        if !meta.caps.is_empty() {
+            info!(%id, actor = %meta.actor_name, caps = ?meta.caps, "extension: declared capabilities");
+        }
     }
 
     // Phase 3: dispatch on plugin kind. Service-mode extensions

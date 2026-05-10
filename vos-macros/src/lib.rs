@@ -50,10 +50,11 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   #[actor]                       — defaults to `Error = ()`, kind = Actor
     //   #[actor(error = Type)]         — custom error type for Actor::Error
     //   #[actor(kind = "service")]     — opt into Service-mode (long-running)
-    //   #[actor(error = Type, kind = "service")] — both
+    //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
     let parsed = parse_actor_attrs(attr);
     let error_ty = parsed.error_ty;
     let kind_byte = parsed.kind_byte;
+    let caps_lits = parsed.caps;
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -147,6 +148,10 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Phase 2 — extension kind discriminant; defaulted on the
             // trait, overridden here from `#[actor(kind = "...")]`.
             const KIND_BYTE: u8 = #kind_byte;
+
+            // Phase 6 — capability declarations. Empty by default;
+            // overridden from `#[actor(caps = [...])]`.
+            const CAPS: &'static [&'static str] = &[ #( #caps_lits ),* ];
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -637,6 +642,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 // #[actor(kind = "service")] sets it via the `KIND_BYTE`
                 // associated const override.
                 kind: <#actor_ty as vos::Actor>::KIND_BYTE,
+                // Phase 6 — declared capability tokens. Defaults to
+                // empty on the trait; overridden by #[actor(caps = [...])].
+                caps: <#actor_ty as vos::Actor>::CAPS,
             };
         }
     };
@@ -935,6 +943,9 @@ struct ActorAttrs {
     /// Encoded kind byte that lands in the `.vos_meta` blob — 0 for
     /// `Actor` (the default), 1 for `Service`.
     kind_byte: u8,
+    /// Declared capability tokens (Phase 6). Each element is a
+    /// string literal that goes into the `Actor::CAPS` slice.
+    caps: Vec<String>,
 }
 
 /// Parse `#[actor(...)]` attributes.
@@ -951,6 +962,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     let mut out = ActorAttrs {
         error_ty: default_err.clone(),
         kind_byte: 0,
+        caps: Vec::new(),
     };
     if attr.is_empty() {
         return out;
@@ -981,6 +993,19 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                     let value = meta.value()?;
                     let lit: syn::LitStr = value.parse()?;
                     out.kind_byte = parse_kind_str(&lit.value());
+                } else if meta.path.is_ident("caps") {
+                    // `caps = ["net.tcp.bind", ...]`
+                    let value = meta.value()?;
+                    let arr: syn::ExprArray = value.parse()?;
+                    for elem in &arr.elems {
+                        if let syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }) = elem
+                        {
+                            out.caps.push(s.value());
+                        }
+                    }
                 }
                 Ok(())
             });

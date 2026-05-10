@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use vos::extension::ExtensionPlugin;
 use vos::node::{ExtensionConfig, VosNode};
 use vos::value::Args;
 
@@ -57,6 +58,25 @@ fn gateway_runs_as_service_extension_and_serves_admin() {
         .with("admin_token", admin_token)
         .with("port", port);
     let cfg = ExtensionConfig::with_args(&so, &args);
+
+    // Phase 6 — sanity-check the .so's declared caps before we
+    // register it. Loading via ExtensionPlugin separately (it's
+    // dropped right after) doesn't disturb the host-side load
+    // that follows.
+    {
+        let plugin = unsafe { ExtensionPlugin::load(&so) }.expect("load gateway plugin");
+        let meta = plugin.meta().expect("gateway should have meta");
+        assert!(
+            meta.caps.iter().any(|c| c == "net.tcp.bind"),
+            "gateway should declare net.tcp.bind; saw {:?}",
+            meta.caps
+        );
+        assert!(
+            meta.caps.iter().any(|c| c == "tokio-runtime"),
+            "gateway should declare tokio-runtime; saw {:?}",
+            meta.caps
+        );
+    }
 
     let mut node = VosNode::new();
     let shutdown_handle = node.shutdown_handle();

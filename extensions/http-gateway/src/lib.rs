@@ -147,4 +147,17 @@ impl HttpGateway {
     }
 }
 
-vos::service_main!(HttpGateway);
+// Phase 6 capability declarations — log-only today, but logged at
+// load time so an operator review can spot the OS access this
+// extension wants. The HTTP gateway needs to bind a TCP port,
+// originate outbound TCP/TLS to peers (h3 + future webhooks), own
+// a tokio runtime + spawn protocol threads.
+vos::service_main!(
+    HttpGateway,
+    caps = [
+        "net.tcp.bind",
+        "net.tcp.connect",
+        "tokio-runtime",
+        "thread.spawn",
+    ]
+);
