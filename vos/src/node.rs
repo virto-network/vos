@@ -1185,9 +1185,19 @@ impl VosNode {
 
         let shutdown = self.shutdown.clone();
         let activity = self.last_activity.clone();
+        let invoke_routes = self.invoke_routes.clone();
 
         let join = thread::spawn(move || {
-            extension_thread(id, config, rx, invoke_rx, outbox, shutdown, activity)
+            extension_thread(
+                id,
+                config,
+                rx,
+                invoke_rx,
+                outbox,
+                invoke_routes,
+                shutdown,
+                activity,
+            )
         });
 
         self.agents.push(AgentHandle { join: Some(join) });
@@ -2373,6 +2383,7 @@ fn extension_thread(
     inbox: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
+    invoke_routes: InvokeRoutes,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult {
@@ -2412,7 +2423,16 @@ fn extension_thread(
     // wired in Phase 3.
     if plugin.kind() == crate::extension::ExtensionKind::Service {
         let _ = invoke_rx;
-        return run_service_extension(id, plugin, config, inbox, outbox, shutdown, activity);
+        return run_service_extension(
+            id,
+            plugin,
+            config,
+            inbox,
+            outbox,
+            invoke_routes,
+            shutdown,
+            activity,
+        );
     }
 
     let bump = || *activity.lock().unwrap() = Instant::now();
@@ -2528,6 +2548,7 @@ fn run_service_extension(
     config: ExtensionConfig,
     inbox: mpsc::Receiver<Envelope>,
     outbox: mpsc::Sender<Envelope>,
+    invoke_routes: InvokeRoutes,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult {
@@ -2537,12 +2558,72 @@ fn run_service_extension(
 
     *activity.lock().unwrap() = Instant::now();
 
+    // Wrap the node's invoke_routes table in a closure the
+    // extension layer can call without knowing about
+    // `InvokeRequest`. The closure: look up target's invoke channel,
+    // send the request with this extension's own id as the chain
+    // root, block on reply with the extension's timeout. Returns
+    // None on transport error / timeout / unknown target.
+    let invoke_routes_for_ctx = invoke_routes.clone();
+    let me = id.0;
+    let invoke_shutdown = shutdown.clone();
+    let invoke_fn: std::sync::Arc<crate::extension::InvokeFn> = std::sync::Arc::new(
+        move |target: u32, payload: &[u8], timeout_ms: u64| -> Option<Vec<u8>> {
+            let tx = invoke_routes_for_ctx
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&target).cloned())?;
+            let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
+            tx.send(InvokeRequest {
+                msg: payload.to_vec(),
+                reply_tx,
+                chain: vec![me],
+            })
+            .ok()?;
+            // Default timeout: a generous 5 minutes; explicit 0
+            // means "wait forever" but we still poll in 50ms ticks
+            // so shutdown signal is honored promptly.
+            let deadline = if timeout_ms == 0 {
+                Instant::now() + Duration::from_secs(300)
+            } else {
+                Instant::now() + Duration::from_millis(timeout_ms)
+            };
+            loop {
+                if invoke_shutdown.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match reply_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(envelope) => {
+                        // PVM agent and actor-mode extension both
+                        // reply with the wrapped invoke envelope
+                        // `[status][state_len:u32][state][reply]`.
+                        // Strip back to just the rkyv reply bytes
+                        // — service extensions don't care about
+                        // YIELDED/DONE, they just want the typed
+                        // return value. A panicked / missing
+                        // handler decodes as None → ask_raw
+                        // surfaces None, gateway maps to 502 (or
+                        // 200 null after the empty-reply branch).
+                        return unwrap_invoke_envelope(&envelope).or(Some(Vec::new()));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                }
+            }
+        },
+    );
+
     let host_ctx = Box::new(HostCtx {
         me: id.0,
         outbox: outbox.clone(),
         inbox: Mutex::new(inbox),
         deferred: Mutex::new(VecDeque::new()),
         shutdown: shutdown.clone(),
+        invoke: invoke_fn,
     });
     let host_ptr = Box::into_raw(host_ctx);
     let handle = HostCtxHandle {

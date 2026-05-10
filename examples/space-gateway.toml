@@ -1,0 +1,93 @@
+# Gateway smoke-test manifest.
+#
+# Stands up:
+#   - the bundled space-registry (auto-installed by `vosx space new`)
+#   - the `counter` and `greeter` PVM actors (built first via
+#     `cd examples && just build`)
+#   - the http-gateway extension on loopback:18080
+#
+# What you can verify
+# -------------------
+#
+# All the example actors here only have `start` handlers that
+# return `()`, so every dispatch responds `200 null`. That's
+# enough to prove the URL → registry → actor wire path is live —
+# look at the daemon's stderr for the `counter: count = N` /
+# `greeter: Hello` log lines to confirm the handler actually ran.
+#
+# For richer reply-type and arg coverage see
+# `extensions/http-gateway/tests/dispatch_e2e.rs` — the kitchen-
+# sink fixture in `extensions/http-gateway/test_fixtures/` has
+# handlers covering String / u32 / bool / Vec types.
+#
+# Walkthrough
+# -----------
+#
+#   # one-time setup
+#   cd examples && just build               # builds the PVM actors
+#   cd ..
+#   cargo build -p http-gateway             # builds the gateway .so
+#   cargo build -p vosx                     # builds vosx if needed
+#   ./target/debug/vosx space new --name gw
+#
+#   # boot — `&` to background, daemon logs to stderr
+#   RUST_LOG=info ./target/debug/vosx space up gw \
+#       --manifest examples/space-gateway.toml &
+#
+#   # exercise it (each returns 200 with body `null`)
+#   curl -s http://localhost:18080/counter/start; echo
+#   curl -s http://localhost:18080/greeter/start; echo
+#
+#   # admin status — JSON object with port, requests counter, uptime
+#   curl -s -H 'X-Admin-Token: dev-only-token' \
+#       http://localhost:18080/__admin/status
+#   echo
+#
+#   # error paths
+#   curl -sw '\n%{http_code}\n' http://localhost:18080/nope/whatever
+#   #   → 404
+#   curl -sw '\n%{http_code}\n' http://localhost:18080/counter/missing
+#   #   → 200 null (handler not found; current behaviour, see
+#   #              dispatch_e2e.rs comments for the gap)
+#   curl -X DELETE -sw '\n%{http_code}\n' http://localhost:18080/counter/start
+#   #   → 405
+#
+#   # graceful stop — POST to admin endpoint
+#   curl -X POST -sw '\n%{http_code}\n' \
+#       -H 'X-Admin-Token: dev-only-token' \
+#       http://localhost:18080/__admin/stop
+#   #   → 204
+#
+#   # daemon will exit; reap it
+#   wait
+
+space = "gw"
+version = "0.1.0"
+
+# ── PVM agents ──────────────────────────────────────────────────
+#
+# Both actors expose only `start` (returns ()). The gateway
+# routes /counter/start and /greeter/start to them; the daemon's
+# stderr shows the handler ran.
+
+[[agent]]
+name = "counter"
+path = "actors/counter/target/riscv64em-javm/release/counter.elf"
+consistency = "local"
+
+[[agent]]
+name = "greeter"
+path = "actors/greeter/target/riscv64em-javm/release/greeter.elf"
+consistency = "ephemeral"
+
+# ── Gateway extension ────────────────────────────────────────────
+#
+# `port` is u32 in the wire format; the gateway clamps to u16
+# internally. `admin_token` gates `/__admin/*`; leave empty to
+# disable admin entirely. `bind_addr = "127.0.0.1"` keeps it
+# loopback-only.
+
+[[extension]]
+name = "gateway"
+path = "../target/debug/libhttp_gateway.so"
+init = { bind_addr = "127.0.0.1", port = 18080, admin_token = "dev-only-token" }

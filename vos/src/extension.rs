@@ -222,8 +222,25 @@ pub struct HostVTable {
     /// exit `run` cleanly when it returns `true`.
     pub shutdown_signaled: unsafe extern "C" fn(host: *mut core::ffi::c_void) -> bool,
     /// Free a buffer previously handed to the extension by
-    /// `recv_reply` / `recv_envelope`.
+    /// `recv_reply` / `recv_envelope` / `invoke`.
     pub free_buf: unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize),
+    /// This extension's own ServiceId (raw u32). Read-only.
+    pub me: unsafe extern "C" fn(host: *mut core::ffi::c_void) -> u32,
+    /// Sync invoke RPC: send `payload` to `target`, block until the
+    /// reply arrives (or `timeout_ms` elapses, or shutdown). Writes
+    /// the reply into `out`; caller frees via `free_buf`.
+    /// `timeout_ms = 0` blocks until shutdown. Use this for
+    /// `ask`-style dispatch — works for both PVM agents (which
+    /// reply through the invoke channel only) and actor-mode
+    /// extensions (which support both invoke and envelope replies).
+    pub invoke: unsafe extern "C" fn(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        payload: *const u8,
+        len: usize,
+        timeout_ms: u64,
+        out: *mut RecvBuf,
+    ) -> i32,
 }
 
 /// Bundle of host state + vtable handed to a service extension's
@@ -291,7 +308,13 @@ impl ServiceCtx {
     }
 
     /// Same as `ask_raw` but with a per-call timeout in milliseconds.
-    /// `0 = no timeout` (block until reply or shutdown).
+    /// `0 = no timeout` (block until reply or shutdown). Goes
+    /// through the host-supplied sync invoke channel — works for
+    /// both PVM agents (which only reply through invoke) and
+    /// actor-mode extensions (which also support envelope replies).
+    /// The legacy `send`/`recv_reply` vtable callbacks stay live
+    /// for fire-and-forget patterns and the existing tests, but
+    /// aren't on the ask hot path.
     pub fn ask_raw_with_timeout(
         &self,
         target: u32,
@@ -300,29 +323,29 @@ impl ServiceCtx {
     ) -> Option<Vec<u8>> {
         let vtable = self.vtable();
         let host = self.host_state();
-        // SAFETY: vtable callbacks are valid for the lifetime of the
-        // host handle.
-        let send_status = unsafe { (vtable.send)(host, target, payload.as_ptr(), payload.len()) };
-        if send_status != HOST_OK {
-            return None;
-        }
         let mut out = RecvBuf::empty();
-        let recv_status =
-            unsafe { (vtable.recv_reply)(host, target, timeout_ms, &mut out as *mut RecvBuf) };
-        if recv_status != HOST_OK {
+        // SAFETY: vtable + handle remain live for the lifetime of
+        // ServiceCtx (the host promises this in `from_raw`).
+        let status = unsafe {
+            (vtable.invoke)(
+                host,
+                target,
+                payload.as_ptr(),
+                payload.len(),
+                timeout_ms,
+                &mut out as *mut RecvBuf,
+            )
+        };
+        if status != HOST_OK {
             return None;
         }
-        // HOST_OK means a reply arrived — even an empty payload is
-        // a valid reply (unit-returning handler, or dispatch-error
-        // recovery from the worker glue's catch_unwind). Distinct
-        // from None, which means transport error / shutdown / no
-        // reply.
+        // HOST_OK means a reply arrived — even empty payload is
+        // valid (unit-returning handler, or dispatch-error recovery
+        // from the worker glue's catch_unwind). Distinct from None,
+        // which means transport error / shutdown / no reply.
         if out.is_empty() {
             return Some(Vec::new());
         }
-        // Copy the bytes into a Vec the extension owns; free the
-        // host buffer immediately. Avoids tying lifetime of the
-        // returned Vec to the host vtable's free_buf.
         let bytes = unsafe { core::slice::from_raw_parts(out.ptr, out.len) }.to_vec();
         unsafe { (vtable.free_buf)(out.ptr, out.len, out.cap) };
         Some(bytes)
@@ -351,6 +374,19 @@ impl ServiceCtx {
         let vtable = self.vtable();
         let host = self.host_state();
         unsafe { (vtable.shutdown_signaled)(host) }
+    }
+
+    /// This extension's own ServiceId (raw `u32`). The high 16 bits
+    /// are the node prefix; the low 16 bits are the local id.
+    /// Useful when the extension needs to identify itself to other
+    /// actors — e.g. the http-gateway passes
+    /// `caller_prefix = me() >> 16` to the registry's `resolve` so
+    /// the registry can derive agent ServiceIds in the gateway's
+    /// node namespace.
+    pub fn me(&self) -> u32 {
+        let vtable = self.vtable();
+        let host = self.host_state();
+        unsafe { (vtable.me)(host) }
     }
 }
 
@@ -743,7 +779,7 @@ pub use host::{ExtensionInstance, ExtensionPlugin};
 // ── Service-mode host-side machinery (std only) ────────────────────────
 
 #[cfg(feature = "std")]
-pub use service_host::{HostCtx, SERVICE_VTABLE};
+pub use service_host::{HostCtx, InvokeFn, SERVICE_VTABLE};
 
 #[cfg(feature = "std")]
 mod service_host {
@@ -755,23 +791,41 @@ mod service_host {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// Sync-invoke closure type the host hands to a service-mode
+    /// extension. Sends `payload` to `target` and blocks until the
+    /// reply arrives (or `timeout_ms` elapses, or shutdown). Returns
+    /// `None` on transport error / timeout / unknown target.
+    ///
+    /// Implemented by `node::run_service_extension` on top of the
+    /// node's `invoke_routes` table — same channel PVM agents and
+    /// actor-mode extensions use. Extensions don't need to know
+    /// about `InvokeRequest` internals.
+    pub type InvokeFn = dyn Fn(u32, &[u8], u64) -> Option<Vec<u8>> + Send + Sync;
+
     /// Internal host state backing a `ServiceCtx`. Exposed to
     /// service-mode extensions via the C ABI as `*mut c_void`.
     pub struct HostCtx {
         /// ServiceId of the extension this ctx belongs to (used as
         /// `from` on outgoing envelopes).
         pub me: u32,
-        /// Outbox: all envelopes the extension originates flow here.
+        /// Outbox: all envelopes the extension originates via the
+        /// fire-and-forget envelope path flow here. `ask`-style
+        /// dispatch goes through `invoke` instead.
         pub outbox: mpsc::Sender<Envelope>,
         /// Inbox + deferred queue, both lock-protected so the host
         /// can serve concurrent vtable calls from extension tokio
         /// runtimes. The deferred queue holds non-reply envelopes
-        /// that arrived while waiting for a `recv_reply`.
+        /// that arrived while waiting on the inbox.
         pub inbox: Mutex<mpsc::Receiver<Envelope>>,
         pub deferred: Mutex<VecDeque<Envelope>>,
         /// Flipped by service_thread when the host wants the
         /// extension to exit.
         pub shutdown: Arc<AtomicBool>,
+        /// Sync-invoke channel targeting any agent or extension on
+        /// the same node. The host wraps `InvokeRequest` plumbing in
+        /// this closure so the extension layer can stay free of
+        /// node internals.
+        pub invoke: Arc<InvokeFn>,
     }
 
     /// Default per-call timeout for `ask` when the extension passes
@@ -791,7 +845,44 @@ mod service_host {
         recv_envelope: vh_recv_envelope,
         shutdown_signaled: vh_shutdown_signaled,
         free_buf: vh_free_buf,
+        me: vh_me,
+        invoke: vh_invoke,
     };
+
+    unsafe extern "C" fn vh_me(host: *mut core::ffi::c_void) -> u32 {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        ctx.me
+    }
+
+    unsafe extern "C" fn vh_invoke(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        payload: *const u8,
+        len: usize,
+        timeout_ms: u64,
+        out: *mut RecvBuf,
+    ) -> i32 {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        let bytes = if payload.is_null() || len == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(payload, len) }
+        };
+        match (ctx.invoke)(target, bytes, timeout_ms) {
+            Some(reply) => {
+                write_recv_buf(out, reply);
+                HOST_OK
+            }
+            None => {
+                clear_recv_buf(out);
+                if ctx.shutdown.load(Ordering::Relaxed) {
+                    HOST_ERR_DISCONNECTED
+                } else {
+                    HOST_TIMEOUT
+                }
+            }
+        }
+    }
 
     unsafe extern "C" fn vh_send(
         host: *mut core::ffi::c_void,

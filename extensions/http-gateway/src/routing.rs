@@ -150,8 +150,15 @@ fn handle(req: &Request, ctx: &ServiceCtx) -> Response {
             Response::json(200, value_to_json(&vos::value::Value::Unit))
         }
         Some(reply_bytes) => {
-            let value: vos::value::Value = vos::value::Value::decode(&reply_bytes);
-            Response::json(200, value_to_json(&value))
+            // try_decode runs rkyv's checked access — handles
+            // arbitrary alignment + validates the buffer. decode
+            // would unsafely access_unchecked, panicking on
+            // misaligned slices that came back through the invoke
+            // envelope unwrap.
+            match <vos::value::Value as vos::Decode>::try_decode(&reply_bytes) {
+                Some(value) => Response::json(200, value_to_json(&value)),
+                None => Response::text(502, "upstream returned malformed reply"),
+            }
         }
         None => Response::text(502, "upstream error or shutdown"),
     }
@@ -204,15 +211,26 @@ fn split_path(path: &str) -> Option<(String, String)> {
 /// Look up an agent's `ServiceId` via the space registry actor.
 /// Returns `None` for unknown names OR for any error from the
 /// registry — collapsing the variants on purpose because both render
-/// the same to the HTTP caller (the gateway can't tell them apart
-/// over `ask_raw` since `None` covers transport errors too).
+/// the same to the HTTP caller.
+///
+/// `caller_prefix` is required by the bundled space-registry's
+/// `resolve(name, caller_prefix)` handler so it can derive the
+/// agent's ServiceId in the gateway's node namespace. We extract
+/// the prefix from the gateway's own ServiceId (high 16 bits via
+/// `ctx.me()`).
 fn resolve(ctx: &ServiceCtx, name: &str) -> Option<ServiceId> {
-    let msg = Msg::new("resolve").with("name", name.to_string());
+    let caller_prefix = (ctx.me() >> 16) as u64;
+    let msg = Msg::new("resolve")
+        .with("name", name.to_string())
+        .with("caller_prefix", caller_prefix);
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(vos::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
     let bytes = ctx.ask_raw(ServiceId::REGISTRY.0, &payload)?;
+    if bytes.is_empty() {
+        return None;
+    }
     let value: vos::value::Value = vos::value::Value::decode(&bytes);
     let id = value.as_u32().unwrap_or(0);
     (id != 0).then_some(ServiceId(id))
