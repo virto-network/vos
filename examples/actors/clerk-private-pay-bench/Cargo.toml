@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-vos = { path = "../../../crates/vos", default-features = false, features = ["macros", "service"] }
+vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "notes", "pvm-precompile"] }
 # cipher-clerk's `signing` feature pulls in rand_core/getrandom for OsRng;
 # we never actually invoke OsRng (we use a deterministic seeded RNG) but
@@ -17,7 +17,7 @@ blake2 = { version = "0.10", default-features = false }
 # Step 1 verification: depend on zkpvm-precompiles (no_std, no
 # host-fallback feature) so the on-target inline-asm path
 # compiles for riscv64em-javm.
-zkpvm-precompiles = { path = "../../../crates/zkpvm/precompiles" }
+zkpvm-precompiles = { path = "../../../zkpvm/precompiles" }
 
 [profile.release]
 opt-level = "s"

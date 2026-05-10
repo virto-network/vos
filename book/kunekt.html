@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Original Kunekt Introduction - The VOS Book</title>
+        <title>Kunekt — Private-by-Default Collaboration - The VOS Book</title>
 
 
         <!-- Custom HTML head -->
@@ -177,103 +177,69 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p>Kunekt is a protocol for building a private-by-default internet.
-It implements the <a href="https://codeberg.org/kusama-zk/RFPs/src/branch/main/rfp/000-privacy-os.md">KryptOS Privacy OS</a>
-vision: a unified system where people communicate, collaborate, store
-data, transact, and govern — all without exposing who they are, what
-they’re doing, or who they’re doing it with.</p>
-<h2 id="the-problem"><a class="header" href="#the-problem">The problem</a></h2>
-<p>The internet was built without privacy. Every message, document, and
-transaction leaves a trail — who sent it, who received it, when, how
-often, from where. Encryption hides content but metadata remains:
-connection graphs, timing patterns, access logs, group membership.</p>
-<p>Existing tools solve pieces: Signal encrypts messages, CRDTs enable
-offline collaboration, zero-knowledge proofs enable anonymous
-credentials. But no system combines them into a coherent whole where
-privacy is the default at every layer.</p>
-<h2 id="what-kunekt-is"><a class="header" href="#what-kunekt-is">What Kunekt is</a></h2>
-<p>Kunekt is three things unified under one protocol:</p>
-<ol>
-<li>
-<p><strong>A private communications protocol.</strong> Groups of people collaborate
-on shared documents, chat, and data in real-time. Content is
-end-to-end encrypted. Members can be anonymous. No central server
-coordinates anything.</p>
-</li>
-<li>
-<p><strong>A decentralized private data store.</strong> Encrypted, content-addressed
-data distributed across untrusted backends. Users own their data.
-Storage providers can’t read it, can’t correlate access patterns,
-can’t even tell what kind of data it is.</p>
-</li>
-<li>
-<p><strong>A privacy application SDK.</strong> Developers build private-by-default
-applications — chat, documents, marketplaces, voting, anything —
-using Kunekt as a library. The protocol handles encryption, sync,
-anonymity, and storage. The developer writes application logic.</p>
-</li>
-</ol>
-<h2 id="core-concepts"><a class="header" href="#core-concepts">Core concepts</a></h2>
+                        <h1 id="kunekt--private-by-default-collaboration"><a class="header" href="#kunekt--private-by-default-collaboration">Kunekt — Private-by-Default Collaboration</a></h1>
+<p>Kunekt is the headline application that the design of VOS was originally
+shaped around. It is a protocol — and a set of built-in actors and
+services — for private, decentralized real-time collaboration.</p>
+<p>If you are looking for the substrate that runs Kunekt, see
+<a href="architecture.html">Part I — Platform</a>. This chapter and the ones below
+it are the protocol-level treatment.</p>
+<h2 id="in-one-paragraph"><a class="header" href="#in-one-paragraph">In one paragraph</a></h2>
 <p>A <strong>space</strong> is a private collaboration group. Inside a space, all shared
-content is represented as <strong>documents</strong>. Each document is a CRDT — a data
-structure that merges concurrent edits without conflicts.</p>
-<p>Participants can be online, offline, or on flaky connections. Everyone
-converges to the same state when they sync. There is no leader election,
-no consensus rounds, no single point of failure.</p>
-<h2 id="design-principles"><a class="header" href="#design-principles">Design principles</a></h2>
-<p>These come directly from the KryptOS philosophy:</p>
-<ul>
-<li><strong>Privacy as default</strong> — protection applies automatically, not through
-opt-in. Encryption, anonymity, and metadata protection are on by
-default. Users choose to reduce privacy (for convenience), never the
-reverse.</li>
-<li><strong>Cryptographic verification</strong> — zero-knowledge proofs replace
-institutional trust. You don’t trust the server, the relay, or the
-storage provider. You verify mathematically.</li>
-<li><strong>System integration</strong> — components function as cohesive layers, not
-isolated tools. Sync, encryption, anonymity, storage, and credentials
-are designed together so there are no gaps between them.</li>
-<li><strong>Developer accessibility</strong> — building a private application should not
-require cryptography expertise. The SDK abstracts the complexity.</li>
-<li><strong>Open standards</strong> — all protocols, specifications, and code are
-community-driven. No vendor lock-in, no proprietary components.</li>
-</ul>
-<h2 id="building-on-what-exists"><a class="header" href="#building-on-what-exists">Building on what exists</a></h2>
-<p>Kunekt is not built from scratch. It composes proven technologies:</p>
+content is represented as <strong>documents</strong> (CRDTs that merge concurrent
+edits without conflicts). Document changes propagate via Merkle-CRDTs
+(no leader, no consensus on the user’s path), are encrypted with a
+group ratchet (only members can decrypt — peers and storage backends
+see only opaque blobs), and persisted on any available untrusted
+backend (relay, DHT, DA layer).</p>
+<h2 id="how-it-maps-onto-vos"><a class="header" href="#how-it-maps-onto-vos">How it maps onto VOS</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Layer</th><th>Technology</th><th>Why</th></tr>
+<tr><th>Kunekt concept</th><th>VOS mechanism</th></tr>
 </thead>
 <tbody>
-<tr><td>Sync</td><td><a href="https://arxiv.org/abs/2004.00107">Merkle-CRDTs</a></td><td>Leaderless replication with efficient anti-entropy</td></tr>
-<tr><td>Document CRDTs</td><td><a href="https://automerge.org">Automerge</a></td><td>Mature conflict-free editing for text, JSON, etc.</td></tr>
-<tr><td>Group encryption</td><td><a href="https://github.com/openmls/openmls">OpenMLS</a></td><td>IETF-standard group key agreement with forward secrecy</td></tr>
-<tr><td>Anonymous credentials</td><td><a href="https://eprint.iacr.org/2024/1260">zk-promises</a></td><td>Anonymous moderation with accountable consequences</td></tr>
-<tr><td>Relay infrastructure</td><td><a href="https://nostr.com">Nostr</a> relays</td><td>Thousands of deployed dumb-storage servers</td></tr>
-<tr><td>Network anonymity</td><td><a href="https://nymtech.net">Nym</a> / Tor</td><td>Metadata-resistant transport</td></tr>
-<tr><td>Zero-knowledge proofs</td><td>Groth16 / PLONK / Nova</td><td>Anonymous credentials, private transactions, verifiable computation</td></tr>
-<tr><td>Content addressing</td><td>CID (hash-based)</td><td>Self-verifying, location-independent, deduplicated storage</td></tr>
+<tr><td>Space</td><td>A VOS space (<code>space_id</code>, registry, daemon)</td></tr>
+<tr><td>Document</td><td>A <code>crdt</code>-mode agent backed by <code>merkle-crdt</code></td></tr>
+<tr><td>Sync</td><td>The standard <code>crdt</code> consistency mode in VOS</td></tr>
+<tr><td>Group encryption</td><td>A built-in actor / service group inside the space</td></tr>
+<tr><td>Persistence backend</td><td>Any storage adapter the daemon’s persistence layer can target</td></tr>
+<tr><td>Anonymous credentials</td><td>zkPVM-backed proofs (see <a href="zkpvm.html">zkPVM</a>)</td></tr>
 </tbody>
 </table>
 </div>
-<p>Each technology is mature on its own. Kunekt’s contribution is the
-integration — making them work together as a seamless private-by-default
-system with no gaps between layers.</p>
-<p>See <a href="./building-blocks.html">Building Blocks</a> for details on each
-technology and how it integrates, and <a href="./roadmap.html">Development Phases</a>
-for the order we build them in.</p>
+<p>In short: <strong>Kunekt is a group of actors and services that runs on the
+plain VOS runtime.</strong> It does not require a fork or a special build —
+it is what you get when you stack the right encryption / authorization
+/ persistence policy on top of <code>crdt</code>-mode agents.</p>
+<h2 id="chapters"><a class="header" href="#chapters">Chapters</a></h2>
+<p>The remaining chapters are the original Kunekt protocol design. They
+predate the VOS-first reframing and still talk in their own vocabulary
+in places — that’s OK as scaffolding; they will be rewritten to lean
+on VOS primitives where they overlap.</p>
+<ul>
+<li><a href="privacy-gap.html">Vision: The Privacy Gap</a></li>
+<li><a href="threat-model.html">Threat Model &amp; Design Principles</a></li>
+<li><a href="user-journey.html">User Journey</a></li>
+<li><a href="sync.html">Sync Layer: Merkle-CRDTs</a></li>
+<li><a href="encryption.html">Encryption Layer: Group Key Management</a></li>
+<li><a href="building-blocks.html">Building Blocks</a></li>
+<li><a href="nostr.html">Nostr Integration</a></li>
+<li><a href="privacy-layers.html">Privacy Analysis by Layer</a></li>
+<li><a href="private-economy.html">Private Economy: Payments, Voting, Governance</a></li>
+<li><a href="zk-promises.html">zk-Promises for Anonymous Moderation</a></li>
+<li><a href="security-analysis.html">Security Analysis &amp; Open Questions</a></li>
+</ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="roadmap.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="applications.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="glossary.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="privacy-gap.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -283,11 +249,11 @@ for the order we build them in.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="roadmap.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="applications.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="glossary.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="privacy-gap.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

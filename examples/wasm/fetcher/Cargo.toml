@@ -19,7 +19,7 @@ crate-type = ["cdylib"]
 path = "../../workers/fetcher/src/lib.rs"
 
 [dependencies]
-vos = { path = "../../../crates/vos", default-features = false, features = ["wasm-bootstrap"] }
+vos = { path = "../../../vos", default-features = false, features = ["wasm-bootstrap"] }
 
 [profile.release]
 opt-level = "z"

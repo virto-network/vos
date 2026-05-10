@@ -1,102 +1,29 @@
-# Kunekt
+# VOS
 
-A protocol for decentralized, private, real-time collaboration.
+A peer-to-peer operating system for collaborative, replicated applications.
 
-## What it does
+VOS runs deterministic actors on a JAM-aligned PVM (RISC-V) and replicates
+them across nodes using either CRDTs (eventual) or Raft (strict). Spaces
+group actors into per-collaboration roots that converge automatically when
+peers come online, with no central server and no coordination protocol on
+the user's critical path.
 
-Kunekt lets groups of people work together on shared documents, chat, and data
-without relying on a central server. Everything is encrypted so only group members
-can read the content. Participants can be online, offline, or on flaky connections
-and the system just works — everyone converges to the same state when they sync.
+## What's in this repo
 
-## How it works
+| Path | What |
+|---|---|
+| [`vos/`](vos/) | Core runtime: PVM host, scheduler, persistence, networking |
+| [`vos-macros/`](vos-macros/) | `#[actor]` / `#[messages]` / `#[msg]` proc-macros |
+| [`vos-raft/`](vos-raft/) | Async Raft implementation used by the `raft` consistency mode |
+| [`merkle-crdt/`](merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
+| [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) |
+| [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
+| [`workers/`](workers/) | Native worker plugins loaded by the runtime (e.g. `http-gateway`) |
+| [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
+| [`examples/`](examples/) | Sample actors, agents, workers, wasm guests, space manifests |
+| [`book/`](book/) | The VOS Book (architecture, protocols, applications). Source in [`docs/`](docs/) |
 
-A **space** is a private collaboration group. Inside a space, all shared content
-is represented as **documents** — text, messages, settings, even the space structure
-itself. Each document is a CRDT (a data structure that merges concurrent edits
-without conflicts).
-
-The protocol has three layers:
-
-1. **Sync** — Changes propagate between peers using
-   [Merkle-CRDTs](https://arxiv.org/abs/2004.00107). Each edit is recorded in a
-   hash-linked DAG that acts as a logical clock. Peers exchange a single hash
-   (root CID) to discover what's new and fetch only what they're missing. No leader
-   election, no consensus, no coordination — any peer can sync with any other peer
-   over any transport.
-
-2. **Encryption** — All document content is encrypted using group ratchet keys
-   (MLS/Megolm). Only space members can decrypt. Keys rotate automatically on
-   membership changes. New members cannot read history from before they joined
-   (forward secrecy). Anyone relaying or storing the data sees only opaque blobs.
-
-3. **Persistence** — Encrypted DAG nodes can be stored on any available backend
-   (a cloud relay, a DHT, a local database, a blockchain data-availability layer)
-   to survive all peers going offline. The storage backend doesn't need to be
-   trusted since it only ever sees encrypted, content-addressed data it cannot
-   tamper with.
-
-## Design goals
-
-- **No servers** — peers connect directly, relay through untrusted infrastructure,
-  or sync via any transport available
-- **No coordination** — no leader, no consensus rounds, no single point of failure
-- **Private by default** — end-to-end encrypted at the group level, storage and
-  relay nodes see nothing
-- **Offline-first** — full local editing, seamless merge on reconnect
-- **Transport-agnostic** — works over WebRTC, libp2p, Bluetooth, USB, or anything
-  that can carry bytes
-- **Document-everything** — messages, files, config, access control are all
-  documents (CRDTs) linked together
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│                   Space                      │
-│                                              │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐     │
-│  │ Doc A    │ │ Doc B    │ │ Doc C    │ ... │
-│  │ (CRDT)   │ │ (CRDT)   │ │ (CRDT)   │     │
-│  └────┬─────┘ └────┬─────┘ └────┬─────┘     │
-│       └─────────┬──┴────────────┘            │
-│           Merkle-CRDT sync layer             │
-│       ┌─────────┴──────────┐                 │
-│       │  MLS group keys    │                 │
-│       │  (encrypt/decrypt) │                 │
-│       └─────────┬──────────┘                 │
-└─────────────────┼───────────────────────────┘
-                  │ encrypted DAG nodes
-    ┌─────────────┼─────────────┐
-    ↓             ↓             ↓
- Peer A        Peer B     Storage backend
- (local)      (direct)    (relay/DHT/DA)
-```
-
-## Building blocks
-
-| Component | Purpose | Candidate |
-|---|---|---|
-| Document CRDTs | Conflict-free editing | [automerge](https://automerge.org) |
-| Sync layer | Merkle-DAG clock + anti-entropy | [merkle-crdt](../merkle-crdt) |
-| Group encryption | Forward-secret group keys | [OpenMLS](https://github.com/openmls/openmls) |
-| Peer transport | Connecting browsers and devices | libp2p, WebRTC |
-| Persistent storage | Survive all-offline | Any content-addressed store |
-
-## Trying it out
-
-This repo includes **VOS**, a working actor runtime, and `vosx`, the
-operator-facing CLI. Actors are written as ordinary Rust, compiled
-to a JAM-aligned PVM (RISC-V) target, and run inside a deterministic
-host so two replicas of the same actor under the same `replication_id`
-converge automatically.
-
-`vosx` has two commands: `vosx run <elf>` for raw one-shot PVM
-execution, and `vosx space *` for everything space-related. A space
-is a per-collaboration root identified by a content-addressed
-`space_id` (= `blake2b("vos-space-id/v1" || genesis_dag_root)`).
-
-Quick start:
+## Quick start
 
 ```bash
 # Create a space. Generates per-space identity, runs the bundled
@@ -126,7 +53,7 @@ just demo-crdt-procs   # creates + dials two daemons, both reach count=2
 just demo-crdt-sync    # in-process variant, no separate processes
 ```
 
-### Consistency modes
+## Consistency modes
 
 Each `[[agent]]` in a manifest picks a `consistency` mode:
 
@@ -149,7 +76,7 @@ Raft requires a cluster membership list (every replica's
 cargo test --all -- --test-threads=1   # full integration suite
 ```
 
-### Multi-node
+## Multi-node
 
 ```bash
 # host A
@@ -168,7 +95,7 @@ truth — the registry is. `space export` re-derives a manifest
 from the live registry; `space up --manifest` is idempotent
 reconciliation.
 
-### Writing an actor
+## Writing an actor
 
 ```rust
 use vos::prelude::*;
@@ -206,7 +133,30 @@ let n = vos::block_on(counter.get(&mut &node))?;
 Compile with the `riscv64em-javm` target — see
 `examples/actors/counter/.cargo/config.toml`.
 
-### Development
+## Applications
+
+VOS is a substrate. Concrete applications are built on top of it as
+groups of actors and services.
+
+### Kunekt — private-by-default collaboration
+
+**Kunekt** is the headline application that the design of VOS was originally
+shaped around: a protocol for private, decentralized real-time collaboration.
+It combines the VOS runtime with three protocol layers:
+
+1. **Sync** — Merkle-CRDT documents propagated via the standard `crdt`
+   consistency mode.
+2. **Encryption** — group ratchet keys (MLS-style) so peers and storage
+   backends only ever see opaque blobs.
+3. **Persistence** — encrypted DAG nodes can ride on any content-addressed
+   backend (relay, DHT, DA layer) since storage doesn't need to be trusted.
+
+Kunekt itself is exposed as a built-in actor/service group inside VOS, with
+its own slice of the book covering the protocol layers, threat model, and
+integrations (Nostr, anonymous credentials, zk-promises). See
+[`book/`](book/) → "Applications → Kunekt".
+
+## Development
 
 Install the in-repo git hooks once after cloning:
 

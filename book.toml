@@ -1,6 +1,6 @@
 [book]
-title = "The Kunekt Book"
-description = "A protocol for building a private-by-default internet"
+title = "The VOS Book"
+description = "A peer-to-peer operating system for collaborative, replicated applications"
 authors = ["Virto"]
 language = "en"
 src = "docs"
@@ -8,5 +8,5 @@ src = "docs"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/nickvdp/kunekt"
+git-repository-url = "https://github.com/virto-network/vos"
 additional-css = []

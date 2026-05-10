@@ -54,10 +54,10 @@ test-one name: build-workers
 build-crdt-counter:
     cd examples/actors/crdt-counter && cargo actor
 
-# Build the hyperspace registry actor — built-in PVM actor that
-# lives under crates/actors/ alongside the workspace crates.
+# Build the space-registry actor — built-in PVM actor that
+# lives under actors/ alongside the workspace crates.
 build-registry:
-    cd crates/actors/registry && cargo +nightly -Zjson-target-spec build --release
+    cd actors/space-registry && cargo +nightly -Zjson-target-spec build --release
 
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both

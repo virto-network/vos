@@ -18,7 +18,7 @@ check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
 crate-type = ["cdylib"]
 
 [dependencies]
-vos = { path = "../../../crates/vos", default-features = false, features = ["wasm-bootstrap"] }
+vos = { path = "../../../vos", default-features = false, features = ["wasm-bootstrap"] }
 
 [profile.release]
 opt-level = "z"

@@ -22,4 +22,4 @@ check-cfg = ['cfg(feature, values("pvm", "service", "worker", "wasm"))']
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-vos = { path = "../../../crates/vos", default-features = false, features = ["worker"] }
+vos = { path = "../../../vos", default-features = false, features = ["worker"] }

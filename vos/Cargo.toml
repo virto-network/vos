@@ -77,7 +77,7 @@ blake2b_simd = { version = "1", default-features = false }
 # pulls vos's own default features (std + http + storage + network)
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.
-crdt-counter = { path = "../../examples/actors/crdt-counter", default-features = false }
+crdt-counter = { path = "../examples/actors/crdt-counter", default-features = false }
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"

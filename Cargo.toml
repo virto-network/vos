@@ -1,14 +1,18 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/*",
+    "vos",
+    "vos-macros",
+    "vos-raft",
+    "vosx",
+    "merkle-crdt",
+    "zkpvm",
     # zkpvm-{precompiles,derive,verifier} live nested inside the
-    # zkpvm crate's directory tree (the `crates/*` glob is one
-    # level deep).
-    "crates/zkpvm/precompiles",
-    "crates/zkpvm/derive",
-    "crates/zkpvm/verifier",
-    "crates/workers/http-gateway",
+    # zkpvm crate's directory tree.
+    "zkpvm/precompiles",
+    "zkpvm/derive",
+    "zkpvm/verifier",
+    "workers/http-gateway",
     "examples/workers/*",
 ]
 exclude = [
@@ -18,17 +22,17 @@ exclude = [
     "examples/wasm/*",
     # Built-in PVM actors (riscv64em-javm target) live alongside
     # the workspace crates but build with their own toolchain.
-    # Listing the directory itself keeps `crates/*` from picking
-    # it up as a workspace member.
-    "crates/actors",
-    "crates/actors/space-registry",
+    # Listing the directory itself keeps it from being picked
+    # up as a workspace member.
+    "actors",
+    "actors/space-registry",
     # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.
-    "crates/zkpvm/fuzz",
-    # `crates/workers` is a parent directory holding worker
+    "zkpvm/fuzz",
+    # `workers` is a parent directory holding worker
     # plugins; each sub-crate is listed in `members` explicitly.
-    "crates/workers",
+    "workers",
 ]
 
 [workspace.package]
@@ -55,9 +59,9 @@ codegen-units = 1
 
 [workspace.dependencies]
 # Internal crates
-zkpvm = { path = "crates/zkpvm" }
-zkpvm-derive = { path = "crates/zkpvm/derive" }
-zkpvm-verifier = { path = "crates/zkpvm/verifier" }
+zkpvm = { path = "zkpvm" }
+zkpvm-derive = { path = "zkpvm/derive" }
+zkpvm-verifier = { path = "zkpvm/verifier" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
 # Stwo — Phase G of the v2.x migration: pinned to upstream HEAD as of

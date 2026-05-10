@@ -82,8 +82,8 @@ Handlers get `&mut Context`:
 - `actors/crdt-counter` — minimal CRDT-replicated state
 - `actors/pipeline` — chained `ctx.ask()` calls
 - `agents/scheduler` — agent driving children via `lifecycle::invoke`
-- `../crates/vos/src/actors/run.rs` — refine/accumulate entry points
-- `../crates/vos/src/runtime.rs` — host journal + continuation wiring
+- `../vos/src/actors/run.rs` — refine/accumulate entry points
+- `../vos/src/runtime.rs` — host journal + continuation wiring
 
 You'll need [`just`](https://github.com/casey/just) and the nightly
 Rust toolchain (per-crate `riscv64em-javm` target spec via
