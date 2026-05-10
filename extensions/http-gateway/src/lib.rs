@@ -1,4 +1,4 @@
-//! HttpGateway worker — exposes other actors over HTTP.
+//! HttpGateway extension — exposes other actors over HTTP.
 //!
 //! ## URL convention
 //!
@@ -11,7 +11,7 @@
 //! [`vos::actors::context::ServiceId::REGISTRY`]. The `<method>`
 //! segment becomes the dynamic [`Msg::name`]; query params (GET) or
 //! top-level JSON keys (POST/PUT/PATCH) become the [`Msg::args`]. The
-//! reply [`Value`] from `ctx.ask` is rendered as JSON.
+//! reply [`Value`] from `ctx.ask_raw` is rendered as JSON.
 //!
 //! ## HTTP stack
 //!
@@ -20,50 +20,41 @@
 //! - **HTTP/3** behind `feature = "http3"` via `h3` + `quinn` +
 //!   `rustls`, with a self-signed cert auto-minted for `localhost`.
 //!
-//! Both protocols share the same `Job → ctx.ask → Response` bridge.
+//! Both protocols share the same `Job → ctx.ask_raw → Response` bridge.
 //!
 //! ## Concurrency
 //!
 //! Each protocol owns a tokio runtime in its own OS thread; per-
 //! connection tasks parse, look up the route, and either short-circuit
-//! into the admin handler or push a `Job` onto an mpsc the actor
-//! drains. Wire-side I/O scales horizontally; the actor's `ctx.ask`
-//! remains serial, so dispatch throughput is bounded by upstream
-//! latency.
+//! into the admin handler or push a `Job` onto an mpsc the gateway
+//! drains in its `run` loop. Wire-side I/O scales horizontally; the
+//! drain loop calling `ctx.ask_raw` is serial, so dispatch throughput
+//! is bounded by upstream latency.
 //!
-//! ## Lifecycle
+//! ## Lifecycle (Phase 4 — service-mode extension)
 //!
-//! - [`HttpGateway::serve`] — bind h1+h2c on `port`; blocks until stop.
-//! - [`HttpGateway::serve_h3`] — bind h3 on `port` (UDP); blocks until stop.
-//! - [`HttpGateway::stop`] — flip the stop flag.
-//! - [`HttpGateway::status`] — JSON snapshot.
-//! - [`HttpGateway::port`] / [`HttpGateway::requests`] /
-//!   [`HttpGateway::running`] — primitive accessors.
+//! The gateway is a **service-mode extension** — the host calls
+//! `vos_extension_run` once and the gateway's `run(ctx)` body owns
+//! the lifecycle until shutdown.
 //!
-//! `serve*` blocks the worker's dispatch loop while running, so other
-//! actor messages can't be delivered to the gateway in the same
-//! window. To preempt a running gateway from outside the host process:
+//! - `run(ctx)` — install config, bind on the configured port, drain
+//!   jobs until shutdown is signalled (via `ctx.is_shutdown()` or
+//!   `POST /__admin/stop`).
+//! - Admin endpoints work mid-flight (tokio runtime always alive):
+//!   - `POST /__admin/stop` — set the stop flag.
+//!   - `GET /__admin/status` — JSON snapshot.
 //!
-//! - `POST /__admin/stop` — set the stop flag (handled in the tokio
-//!   task, so it works even while `serve*` is the only handler in
-//!   flight).
-//! - `GET /__admin/status` — JSON snapshot.
-//!
-//! Both admin routes require `X-Admin-Token` matching
-//! `HTTP_GATEWAY_ADMIN_TOKEN`; with the env var unset, the entire
-//! `/__admin/*` namespace returns 404.
-//!
-//! When vos exposes worker self-pumping, `serve*` can become a
-//! non-blocking bootstrap and the actor messages will work mid-flight.
+//! Both admin routes require `X-Admin-Token` matching the configured
+//! token; with no token, the entire `/__admin/*` namespace returns 404.
 //!
 //! ## Operator config (manifest init args)
 //!
-//! Five `String` knobs are passed to the actor's constructor via the
-//! worker manifest. Each one is empty by default; an empty value
+//! Six knobs are passed via the manifest as a rkyv-encoded
+//! `vos::value::Args`. Each one is empty by default; an empty value
 //! means "use the in-code default":
 //!
 //! ```toml
-//! [[worker]]
+//! [[extension]]
 //! name = "gateway"
 //! path = "target/release/libhttp_gateway.so"
 //! init = {
@@ -72,6 +63,7 @@
 //!     admin_token = "...",
 //!     tls_cert    = "/etc/tls/cert.pem",
 //!     tls_key     = "/etc/tls/key.pem",
+//!     port        = 8080,
 //! }
 //! ```
 //!
@@ -82,12 +74,11 @@
 //! | `admin_token` | none — `/__admin/*` returns 404               |
 //! | `tls_cert`    | none — h3 self-signs `localhost` (dev only)   |
 //! | `tls_key`     | none — paired with `tls_cert`                 |
+//! | `port`        | `8080`                                        |
 //!
 //! Defaults make a bare deployment loopback-only with admin disabled
 //! and dispatch open. A public deployment **must** set both tokens
 //! and override `bind_addr`.
-
-use vos::prelude::*;
 
 mod config;
 mod hyper_io;
@@ -101,116 +92,59 @@ mod types;
 #[cfg(feature = "http3")]
 mod http3;
 
-#[actor]
+use vos::extension::ServiceCtx;
+use vos::log;
+
+/// Default bind port when `init.port` is unset or zero.
+const DEFAULT_PORT: u16 = 8080;
+
 pub struct HttpGateway {
     cfg: config::GatewayConfig,
+    port: u16,
 }
 
-#[messages]
 impl HttpGateway {
-    fn new(
-        bind_addr: String,
-        auth_token: String,
-        admin_token: String,
-        tls_cert: String,
-        tls_key: String,
-    ) -> Self {
-        HttpGateway {
-            cfg: config::GatewayConfig {
-                bind_addr,
-                auth_token,
-                admin_token,
-                tls_cert,
-                tls_key,
-            },
-        }
+    /// Constructor invoked by `vos_extension_create`. Init args are
+    /// rkyv-encoded `vos::value::Args` with the six string knobs +
+    /// `port`. Empty / missing fields fall back to in-code defaults.
+    pub fn new(args: &[u8]) -> Self {
+        use vos::Decode;
+        let parsed: vos::value::Args = if args.is_empty() {
+            vos::value::Args::default()
+        } else {
+            vos::value::Args::decode(args)
+        };
+        let cfg = config::GatewayConfig {
+            bind_addr: parsed.get_str("bind_addr").unwrap_or_default(),
+            auth_token: parsed.get_str("auth_token").unwrap_or_default(),
+            admin_token: parsed.get_str("admin_token").unwrap_or_default(),
+            tls_cert: parsed.get_str("tls_cert").unwrap_or_default(),
+            tls_key: parsed.get_str("tls_key").unwrap_or_default(),
+        };
+        let port = parsed
+            .get_u32("port")
+            .map(|p| p as u16)
+            .unwrap_or(DEFAULT_PORT);
+        Self { cfg, port }
     }
 
-    /// Lifecycle hook — runs on every cold create *and* warm restart
-    /// (after the actor's state is rkyv-restored). Installs the
-    /// per-process config singleton the connection tasks read.
-    #[msg]
-    async fn start(&mut self, _ctx: &mut Context<Self>) {
+    /// Service entry point. Installs the per-process config singleton,
+    /// binds on the configured port, drains jobs until shutdown.
+    /// Returns 0 on clean exit; non-zero on bind failure.
+    pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
         config::install(self.cfg.clone());
-    }
+        let port = self.port;
 
-    /// Bind h1+h2c on `port` and serve until stop. Returns the loop's
-    /// exit reason (`"stopped"`, an mpsc-disconnect message, or a
-    /// bind/runtime error). A second call while a gateway is already
-    /// running short-circuits with an "already listening" string —
-    /// caller should `stop()` first.
-    #[msg]
-    async fn serve(&mut self, port: u32, ctx: &mut Context<Self>) -> String {
-        runtime::serve_with(port as u16, "tcp", hyper_io::spawn, ctx).await
-    }
+        log::info!("http-gateway: starting on port {port}");
 
-    /// Bind h3 (QUIC) on UDP `port` and serve until stop. Available
-    /// only when this crate is built with `--features http3`; without
-    /// the feature it returns a "not enabled" string so the message
-    /// surface stays stable across feature combinations.
-    #[msg]
-    async fn serve_h3(&mut self, port: u32, ctx: &mut Context<Self>) -> String {
-        serve_h3_dispatch(port as u16, ctx).await
-    }
-
-    /// Flip the stop flag; the running `serve*` exits its loop on the
-    /// next iteration. Returns whether the gateway was running at the
-    /// moment of the call.
-    ///
-    /// **Note:** can only be processed when no `serve*` is currently
-    /// in flight on this worker. Use `POST /__admin/stop` to preempt
-    /// from outside the host process.
-    #[msg]
-    async fn stop(&self, _ctx: &mut Context<Self>) -> bool {
-        let i = state::inner();
-        let was_running = i.running();
-        i.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        was_running
-    }
-
-    /// Bound port, or 0 when the gateway isn't running.
-    #[msg]
-    async fn port(&self, _ctx: &mut Context<Self>) -> u32 {
-        state::inner()
-            .bound_port
-            .load(std::sync::atomic::Ordering::Relaxed) as u32
-    }
-
-    /// Total HTTP requests served since process boot.
-    #[msg]
-    async fn requests(&self, _ctx: &mut Context<Self>) -> u64 {
-        state::inner()
-            .requests
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// `true` when a `serve*` is in flight and hasn't been asked to stop.
-    #[msg]
-    async fn running(&self, _ctx: &mut Context<Self>) -> bool {
-        state::inner().running()
-    }
-
-    /// Compact JSON status string: `{"port":N,"running":bool,...}`.
-    /// Same shape as `GET /__admin/status`.
-    #[msg]
-    async fn status(&self, _ctx: &mut Context<Self>) -> String {
-        state::status_json(state::inner())
+        // Hyper (h1+h2c) is the always-on serving path. HTTP/3 is
+        // additive and lives behind a feature flag (Phase 4 keeps
+        // it gated; an h3-aware service mode can spin up both
+        // protocols from inside a single `run` body in a follow-up).
+        let exit = runtime::serve_with(port, "tcp", hyper_io::spawn, &ctx);
+        log::info!("http-gateway: stopped ({exit})");
+        0
     }
 }
 
-// ── serve_h3 dispatch ─────────────────────────────────────────────────
-//
-// `#[messages]` doesn't propagate `#[cfg]` from individual handlers to
-// its dispatch glue, so the `serve_h3` body must always exist. Forward
-// to a free function whose two cfg arms either run the QUIC server or
-// return a "feature not enabled" string.
-
-#[cfg(feature = "http3")]
-async fn serve_h3_dispatch(port: u16, ctx: &mut vos::Context<HttpGateway>) -> String {
-    http3::serve_h3_impl(port, ctx).await
-}
-
-#[cfg(not(feature = "http3"))]
-async fn serve_h3_dispatch(_port: u16, _ctx: &mut vos::Context<HttpGateway>) -> String {
-    "http3 feature not enabled — rebuild with --features http3".into()
-}
+vos::service_main!(HttpGateway);

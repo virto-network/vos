@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use vos::log;
@@ -63,9 +63,13 @@ async fn accept_loop(listener: TcpListener, job_tx: mpsc::SyncSender<Job>, inner
     // One builder shared across connections; sniffs the protocol
     // preface and dispatches to h1 or h2c.
     let mut conn_builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    // Slow-loris mitigation: cap the time spent reading the request
-    // line + headers. Hyper closes the connection if this elapses
-    // without progress.
+    // hyper-1.9's http1::Builder requires an explicit timer set
+    // before serve_connection runs (panics with "timeout
+    // `header_read_timeout` set, but no timer set" otherwise — even
+    // with hyper-util's default 30s timeout). Wire one on both
+    // protocol slots, then layer the slow-loris cap on top.
+    conn_builder.http1().timer(TokioTimer::new());
+    conn_builder.http2().timer(TokioTimer::new());
     conn_builder
         .http1()
         .header_read_timeout(HEADER_READ_TIMEOUT);

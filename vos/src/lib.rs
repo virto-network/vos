@@ -657,12 +657,22 @@ macro_rules! service_main {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_extension_create(
-                _args_ptr: *const u8,
-                _args_len: usize,
+                args_ptr: *const u8,
+                args_len: usize,
             ) -> *mut () {
                 let _ = $crate::log::set_logger(&__VOS_SERVICE_LOGGER);
                 $crate::log::set_max_level($crate::log::LevelFilter::Trace);
-                let state = Box::new(<$actor_ty>::new());
+                let args: &[u8] = if args_ptr.is_null() || args_len == 0 {
+                    &[]
+                } else {
+                    unsafe { core::slice::from_raw_parts(args_ptr, args_len) }
+                };
+                // User-provided constructor takes the raw init-args
+                // byte slice. Constructors that don't need args
+                // declare `fn new(_args: &[u8]) -> Self` and ignore
+                // the slice; constructors that do declare it parse
+                // rkyv-encoded `vos::value::Args` from the bytes.
+                let state = Box::new(<$actor_ty>::new(args));
                 Box::into_raw(state) as *mut ()
             }
 

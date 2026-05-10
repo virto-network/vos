@@ -33,7 +33,7 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    pub fn new() -> Self {
+    pub fn new(_args: &[u8]) -> Self {
         Self::default()
     }
 

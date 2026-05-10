@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use vos::log;
 
-use crate::HttpGateway;
 use crate::config;
 use crate::limits::{DRAIN_TIMEOUT, JOB_QUEUE_CAP};
 use crate::routing::drain_jobs;
 use crate::state::{Inner, inner, now_unix};
 use crate::types::{IoResult, Job};
+use vos::extension::ServiceCtx;
 
 /// RAII guard that decrements `Inner::in_flight` on drop. Bump the
 /// counter just before `tokio::spawn` and place this guard inside the
@@ -93,15 +93,13 @@ where
     Ok(handle)
 }
 
-/// Actor-side bootstrap: claim the port slot, kick off the protocol
-/// thread, then drain jobs through `ctx.ask` until stop. Used by both
-/// `serve` (hyper) and `serve_h3`. Returns the loop's exit reason.
-pub(crate) async fn serve_with<F>(
-    port: u16,
-    proto: &str,
-    spawn_protocol: F,
-    ctx: &mut vos::Context<HttpGateway>,
-) -> String
+/// Service-side bootstrap: claim the port slot, kick off the protocol
+/// thread, then drain jobs through `ctx.ask_raw` until stop. Used by
+/// both the hyper (h1+h2c) and h3 paths. Returns the loop's exit
+/// reason. Synchronous — callers run inside the gateway's `run`
+/// thread, no async runtime here. Per-connection tokio tasks live on
+/// the protocol thread that this function spawns.
+pub(crate) fn serve_with<F>(port: u16, proto: &str, spawn_protocol: F, ctx: &ServiceCtx) -> String
 where
     F: FnOnce(u16, mpsc::SyncSender<Job>, Arc<Inner>) -> IoResult<thread::JoinHandle<()>>,
 {
@@ -135,7 +133,7 @@ where
         log::info!("http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled");
     }
 
-    let stop_msg = drain_jobs(&job_rx, &inner, ctx).await;
+    let stop_msg = drain_jobs(&job_rx, &inner, ctx);
 
     // Wait for the protocol thread to fully exit. The accept loop on
     // that thread polls `in_flight` after stop is signaled, so this

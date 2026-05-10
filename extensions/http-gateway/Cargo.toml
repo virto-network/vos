@@ -57,3 +57,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = { version = "2", optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"], optional = true }
 http = { version = "1", optional = true }
+
+[dev-dependencies]
+# tests/service_mode.rs drives the gateway via VosNode's host APIs
+# (register_extension, run_forever, shutdown), all behind vos's
+# `std` feature. The cdylib build keeps default-features off so the
+# .so stays lean; this dev-dep brings std + storage + http back in
+# just for the test binary.
+vos = { path = "../../vos", default-features = false, features = ["extension", "std", "network", "storage", "http"] }

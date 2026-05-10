@@ -23,9 +23,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use vos::actors::context::ServiceId;
 use vos::actors::value::Msg;
+use vos::extension::ServiceCtx;
 use vos::log;
+use vos::{Decode, Encode};
 
-use crate::HttpGateway;
 use crate::config::{ct_eq, header_value};
 use crate::json::{parse_flat_json, value_to_json};
 use crate::state::{Inner, status_json};
@@ -90,18 +91,22 @@ fn check_auth(req: &Request, expected: Option<&str>) -> Option<Response> {
     }
 }
 
-pub(crate) async fn drain_jobs(
-    job_rx: &mpsc::Receiver<Job>,
-    inner: &Inner,
-    ctx: &mut vos::Context<HttpGateway>,
-) -> String {
+/// Drain loop on the gateway's `run` thread. Pulls Jobs from the
+/// connection-side mpsc, dispatches via `ctx.ask_raw`, sends the
+/// reply back. Synchronous because `ServiceCtx::ask_raw` blocks the
+/// calling thread by design — no async bridge needed at this layer.
+///
+/// Exits when `inner.stop` is flipped (admin endpoint or
+/// `ctx.is_shutdown()` polled by the caller) or when the protocol
+/// thread closes the job channel.
+pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &ServiceCtx) -> String {
     loop {
-        if inner.stop.load(Ordering::Relaxed) {
+        if inner.stop.load(Ordering::Relaxed) || ctx.is_shutdown() {
             return "stopped".into();
         }
         match job_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(job) => {
-                let response = handle(&job.request, ctx).await;
+                let response = handle(&job.request, ctx);
                 inner.requests.fetch_add(1, Ordering::Relaxed);
                 let _ = job.resp_tx.send(response);
             }
@@ -111,15 +116,14 @@ pub(crate) async fn drain_jobs(
     }
 }
 
-async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response {
+fn handle(req: &Request, ctx: &ServiceCtx) -> Response {
     let Some((agent, method)) = split_path(&req.path) else {
         return Response::text(400, "expected /<agent>/<method>");
     };
 
-    let target = match resolve(ctx, &agent).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return Response::text(404, format!("unknown agent '{agent}'")),
-        Err(e) => return Response::text(502, format!("registry: {e}")),
+    let target = match resolve(ctx, &agent) {
+        Some(id) => id,
+        None => return Response::text(404, format!("unknown agent '{agent}'")),
     };
 
     let msg = match build_msg(method, req) {
@@ -127,9 +131,19 @@ async fn handle(req: &Request, ctx: &mut vos::Context<HttpGateway>) -> Response 
         Err(r) => return r,
     };
 
-    match ctx.ask(target, &msg).await {
-        Ok(value) => Response::json(200, value_to_json(&value)),
-        Err(e) => Response::text(502, format!("upstream error: {e}")),
+    // Encode as TAG_DYNAMIC + rkyv'd Msg — same wire format the
+    // existing actor-mode dispatch path produces.
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(vos::value::TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+
+    match ctx.ask_raw(target.0, &payload) {
+        Some(reply_bytes) => {
+            let value: vos::value::Value = vos::value::Value::decode(&reply_bytes);
+            Response::json(200, value_to_json(&value))
+        }
+        None => Response::text(502, "upstream error or shutdown"),
     }
 }
 
@@ -177,17 +191,21 @@ fn split_path(path: &str) -> Option<(String, String)> {
     (!agent.is_empty() && !method.is_empty()).then(|| (agent.to_string(), method.to_string()))
 }
 
-async fn resolve(
-    ctx: &mut vos::Context<HttpGateway>,
-    name: &str,
-) -> core::result::Result<Option<ServiceId>, vos::actors::value::InvokeError> {
+/// Look up an agent's `ServiceId` via the space registry actor.
+/// Returns `None` for unknown names OR for any error from the
+/// registry — collapsing the variants on purpose because both render
+/// the same to the HTTP caller (the gateway can't tell them apart
+/// over `ask_raw` since `None` covers transport errors too).
+fn resolve(ctx: &ServiceCtx, name: &str) -> Option<ServiceId> {
     let msg = Msg::new("resolve").with("name", name.to_string());
-    let id = ctx
-        .ask(ServiceId::REGISTRY, &msg)
-        .await?
-        .as_u32()
-        .unwrap_or(0);
-    Ok((id != 0).then_some(ServiceId(id)))
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(vos::value::TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    let bytes = ctx.ask_raw(ServiceId::REGISTRY.0, &payload)?;
+    let value: vos::value::Value = vos::value::Value::decode(&bytes);
+    let id = value.as_u32().unwrap_or(0);
+    (id != 0).then_some(ServiceId(id))
 }
 
 fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Response> {
