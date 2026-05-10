@@ -7,6 +7,7 @@
 - [Architecture Overview](architecture.md)
 - [Spaces, Actors & Documents](documents.md)
 - [PVM Runtime](runtime.md)
+- [Extensions](extensions.md)
 - [Replication: CRDT vs Raft](replication.md)
 - [Persistence](persistence.md)
 - [Networking & Transport](transport.md)

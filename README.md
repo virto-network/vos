@@ -133,6 +133,49 @@ let n = vos::block_on(counter.get(&mut &node))?;
 Compile with the `riscv64em-javm` target — see
 `examples/actors/counter/.cargo/config.toml`.
 
+## Writing an extension
+
+An **extension** is a native `.so` plugin that runs alongside PVM
+agents and gives them OS access — sockets, filesystem, threads,
+async runtimes. PVM agents reach the outside world by `ctx.ask`-ing
+extensions. Two kinds:
+
+- **Actor** — request-driven, same `#[actor]` / `#[messages]` DSL
+  as PVM agents, just compiled as a cdylib.
+- **Service** — long-running, owns its own thread + runtime. Use
+  `vos::service_main!(MyService, caps = [...])` and provide a
+  `run(&mut self, ctx: ServiceCtx) -> i32`.
+
+```rust
+use vos::extension::ServiceCtx;
+
+pub struct MyGateway { /* ... */ }
+impl MyGateway {
+    pub fn new(_args: &[u8]) -> Self { /* ... */ }
+    pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
+        while !ctx.is_shutdown() {
+            // do work, originate ctx.ask_raw(...) calls
+        }
+        0
+    }
+}
+vos::service_main!(MyGateway, caps = ["net.tcp.bind", "tokio-runtime"]);
+```
+
+Install via the manifest:
+
+```toml
+[[extension]]
+name = "gateway"
+path = "../target/debug/libmy_gateway.so"
+init = { port = 8080 }
+```
+
+See [`extensions/AUTHORING.md`](extensions/AUTHORING.md) for the
+full cookbook and [`docs/extensions.md`](docs/extensions.md) for the
+book chapter. The canonical service-mode example is
+[`extensions/http-gateway/`](extensions/http-gateway/).
+
 ## Applications
 
 VOS is a substrate. Concrete applications are built on top of it as
