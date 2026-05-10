@@ -1,6 +1,9 @@
 target/
 .wt_*
 
+# mdbook build output (source of truth lives in docs/)
+book/
+
 # vosx generated state
 data/
 node.key
