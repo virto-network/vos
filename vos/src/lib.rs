@@ -405,16 +405,29 @@ macro_rules! __vos_emit_worker_glue {
                 state: *mut (),
             ) -> $crate::extension::ExtensionPollResult {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
-                let Some(future) = ws.in_flight.as_mut() else {
+                if ws.in_flight.is_none() {
                     return $crate::extension::ExtensionPollResult::error(
                         $crate::extension::POLL_ERR_NO_FUTURE,
                     );
-                };
+                }
 
-                let waker = $crate::__extension::noop_waker();
-                let mut cx = core::task::Context::from_waker(&waker);
-                match future.as_mut().poll(&mut cx) {
-                    core::task::Poll::Ready(_stop) => {
+                // catch_unwind around the handler poll: panicking
+                // through extern "C" is UB and aborts the host
+                // process. Treat a panic as a completed dispatch
+                // with an empty reply — the caller (gateway via
+                // ServiceCtx::ask_raw) sees Some(empty) and renders
+                // null instead of hanging or crashing the host.
+                // The handler's state is toast either way; clearing
+                // in_flight prevents repeated polls of a poisoned
+                // future.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let future = ws.in_flight.as_mut().unwrap();
+                    let waker = $crate::__extension::noop_waker();
+                    let mut cx = core::task::Context::from_waker(&waker);
+                    future.as_mut().poll(&mut cx)
+                }));
+                match result {
+                    Ok(core::task::Poll::Ready(_stop)) => {
                         ws.in_flight = None;
                         let reply_bytes = ws.ctx.take_reply_bytes();
                         if reply_bytes.is_empty() {
@@ -423,7 +436,13 @@ macro_rules! __vos_emit_worker_glue {
                             $crate::extension::ExtensionPollResult::ready(reply_bytes)
                         }
                     }
-                    core::task::Poll::Pending => $crate::extension::ExtensionPollResult::pending(),
+                    Ok(core::task::Poll::Pending) => {
+                        $crate::extension::ExtensionPollResult::pending()
+                    }
+                    Err(_panic) => {
+                        ws.in_flight = None;
+                        $crate::extension::ExtensionPollResult::ready_empty()
+                    }
                 }
             }
 

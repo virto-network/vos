@@ -38,13 +38,14 @@
 //! | `tls_key`    | none (paired with `tls_cert`)             |
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::OnceLock;
 
 use vos::log;
 
 /// Init-args carried into [`HttpGateway`](crate::HttpGateway). Auto-
 /// derives rkyv via the actor macro, so a warm restart restores the
-/// same config without re-reading the manifest.
+/// same config without re-reading the manifest. Stored on
+/// [`crate::state::Inner`] so each gateway instance gets its own
+/// config — process-globals were a footgun for tests.
 #[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Default)]
 #[rkyv(crate = vos::rkyv)]
 pub(crate) struct GatewayConfig {
@@ -55,52 +56,37 @@ pub(crate) struct GatewayConfig {
     pub(crate) tls_key: String,
 }
 
-static CONFIG: OnceLock<GatewayConfig> = OnceLock::new();
-
-/// Install the actor-supplied config. Idempotent — subsequent calls
-/// are silently ignored so the `start` handler can run on every cold
-/// **and** warm restart without re-installing.
-pub(crate) fn install(cfg: GatewayConfig) {
-    if CONFIG.set(cfg).is_err() {
-        // Set-once semantics; second installer is the same actor on a
-        // warm restart, no need to log loudly.
-        log::debug!("http-gateway: config already installed; ignoring re-install");
+impl GatewayConfig {
+    /// Bind IP. `127.0.0.1` when `bind_addr` is empty / unparseable.
+    pub(crate) fn bind_ip(&self) -> IpAddr {
+        let raw = self.bind_addr.as_str();
+        if raw.is_empty() {
+            return IpAddr::V4(Ipv4Addr::LOCALHOST);
+        }
+        raw.parse().unwrap_or_else(|_| {
+            log::warn!("http-gateway: bind_addr {raw:?} unparseable; falling back to 127.0.0.1");
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        })
     }
-}
 
-fn current() -> &'static GatewayConfig {
-    CONFIG.get_or_init(GatewayConfig::default)
-}
-
-/// Bind IP. `127.0.0.1` when `bind_addr` is empty / unparseable.
-pub(crate) fn bind_ip() -> IpAddr {
-    let raw = current().bind_addr.as_str();
-    if raw.is_empty() {
-        return IpAddr::V4(Ipv4Addr::LOCALHOST);
+    pub(crate) fn auth_token(&self) -> Option<&str> {
+        let t = self.auth_token.as_str();
+        (!t.is_empty()).then_some(t)
     }
-    raw.parse().unwrap_or_else(|_| {
-        log::warn!("http-gateway: bind_addr {raw:?} unparseable; falling back to 127.0.0.1");
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    })
-}
 
-pub(crate) fn auth_token() -> Option<&'static str> {
-    let t = current().auth_token.as_str();
-    (!t.is_empty()).then_some(t)
-}
+    pub(crate) fn admin_token(&self) -> Option<&str> {
+        let t = self.admin_token.as_str();
+        (!t.is_empty()).then_some(t)
+    }
 
-pub(crate) fn admin_token() -> Option<&'static str> {
-    let t = current().admin_token.as_str();
-    (!t.is_empty()).then_some(t)
-}
-
-/// Both PEM paths or `None`. Returns `None` if either is empty so
-/// callers fall back to a self-signed cert.
-#[cfg(feature = "http3")]
-pub(crate) fn tls_paths() -> Option<(&'static str, &'static str)> {
-    let cert = current().tls_cert.as_str();
-    let key = current().tls_key.as_str();
-    (!cert.is_empty() && !key.is_empty()).then_some((cert, key))
+    /// Both PEM paths or `None`. Returns `None` if either is empty so
+    /// callers fall back to a self-signed cert.
+    #[cfg(feature = "http3")]
+    pub(crate) fn tls_paths(&self) -> Option<(&str, &str)> {
+        let cert = self.tls_cert.as_str();
+        let key = self.tls_key.as_str();
+        (!cert.is_empty() && !key.is_empty()).then_some((cert, key))
+    }
 }
 
 /// Constant-time equality check. Length differences leak (early

@@ -2492,13 +2492,17 @@ fn extension_thread(
             id,
             &mut deferred,
         );
-        if !reply.is_empty() {
-            let _ = outbox.send(Envelope {
-                from: id,
-                to: envelope.from,
-                payload: reply,
-            });
-        }
+        // Always reply, even on empty/error returns — otherwise an
+        // ask-style caller (gateway via `ServiceCtx::ask_raw`) hangs
+        // for the full reply timeout when a handler dispatch errors
+        // (type mismatch, no such handler, panic). Empty payload is
+        // a valid reply for unit-returning handlers; callers
+        // already handle the empty-bytes case.
+        let _ = outbox.send(Envelope {
+            from: id,
+            to: envelope.from,
+            payload: reply,
+        });
         persist(strategy.as_mut(), &instance, id);
     }
 

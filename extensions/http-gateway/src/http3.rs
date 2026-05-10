@@ -24,7 +24,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::Semaphore;
 use vos::log;
 
-use crate::config;
 use crate::limits::{
     H3_BODY_CHUNK_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
     MAX_STREAMS_PER_CONN,
@@ -44,11 +43,12 @@ pub(crate) fn spawn(
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> IoResult<thread::JoinHandle<()>> {
-    let addr = SocketAddr::new(config::bind_ip(), port);
+    let addr = SocketAddr::new(inner.cfg.bind_ip(), port);
+    let inner_for_endpoint = inner.clone();
     runtime::spawn_on_thread(
         format!("http-gateway-h3:{port}"),
         move |ready_tx| async move {
-            let endpoint = match build_endpoint(addr) {
+            let endpoint = match build_endpoint(addr, &inner_for_endpoint) {
                 Ok(ep) => ep,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -62,17 +62,17 @@ pub(crate) fn spawn(
 }
 
 /// Build a QUIC endpoint listening on `addr`. Uses the operator-
-/// supplied cert/key when `HTTP_GATEWAY_TLS_CERT` and
-/// `HTTP_GATEWAY_TLS_KEY` are both set; otherwise falls back to a
-/// freshly-minted self-signed cert for `localhost` and logs a WARN
-/// (dev only). ALPN advertises `h3`.
-fn build_endpoint(addr: SocketAddr) -> IoResult<quinn::Endpoint> {
+/// supplied cert/key when both `tls_cert` and `tls_key` are set on
+/// the gateway's config; otherwise falls back to a freshly-minted
+/// self-signed cert for `localhost` and logs a WARN (dev only).
+/// ALPN advertises `h3`.
+fn build_endpoint(addr: SocketAddr, inner: &Inner) -> IoResult<quinn::Endpoint> {
     // rustls 0.23 with the ring provider needs the global crypto
     // provider installed before any cert work. Idempotent — safe to
     // call repeatedly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (cert_chain, key_der) = match config::tls_paths() {
+    let (cert_chain, key_der) = match inner.cfg.tls_paths() {
         Some((cert_path, key_path)) => load_pem(cert_path, key_path)?,
         None => {
             log::warn!(
@@ -268,8 +268,8 @@ async fn handle_request(
             body,
         };
         let policy = Policy {
-            admin_token: config::admin_token(),
-            auth_token: config::auth_token(),
+            admin_token: inner.cfg.admin_token(),
+            auth_token: inner.cfg.auth_token(),
         };
         dispatch_request(our_req, &job_tx, &inner, policy).await
     };

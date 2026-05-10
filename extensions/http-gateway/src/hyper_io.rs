@@ -23,7 +23,6 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use vos::log;
 
-use crate::config;
 use crate::limits::{
     HEADER_READ_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
 };
@@ -42,7 +41,7 @@ pub(crate) fn spawn(
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,
 ) -> IoResult<thread::JoinHandle<()>> {
-    let bind = config::bind_ip();
+    let bind = inner.cfg.bind_ip();
     runtime::spawn_on_thread(
         format!("http-gateway-rt:{port}"),
         move |ready_tx| async move {
@@ -165,8 +164,8 @@ async fn serve_request(
         body,
     };
     let policy = Policy {
-        admin_token: config::admin_token(),
-        auth_token: config::auth_token(),
+        admin_token: inner.cfg.admin_token(),
+        auth_token: inner.cfg.auth_token(),
     };
     let response = dispatch_request(our_req, &job_tx, &inner, policy).await;
     into_hyper(response)

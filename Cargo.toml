@@ -39,6 +39,7 @@ exclude = [
     # (via cargo build -p {name} as a setup step).
     "extensions/http-gateway/test_fixtures/mock-registry",
     "extensions/http-gateway/test_fixtures/counter",
+    "extensions/http-gateway/test_fixtures/kitchen-sink",
 ]
 
 [workspace.package]

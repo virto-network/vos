@@ -309,8 +309,16 @@ impl ServiceCtx {
         let mut out = RecvBuf::empty();
         let recv_status =
             unsafe { (vtable.recv_reply)(host, target, timeout_ms, &mut out as *mut RecvBuf) };
-        if recv_status != HOST_OK || out.is_empty() {
+        if recv_status != HOST_OK {
             return None;
+        }
+        // HOST_OK means a reply arrived — even an empty payload is
+        // a valid reply (unit-returning handler, or dispatch-error
+        // recovery from the worker glue's catch_unwind). Distinct
+        // from None, which means transport error / shutdown / no
+        // reply.
+        if out.is_empty() {
+            return Some(Vec::new());
         }
         // Copy the bytes into a Vec the extension owns; free the
         // host buffer immediately. Avoids tying lifetime of the

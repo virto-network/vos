@@ -130,22 +130,21 @@ impl HttpGateway {
         Self { cfg, port }
     }
 
-    /// Service entry point. Installs the per-process config singleton,
-    /// spins up the protocol threads (h1+h2c always; h3 too when
-    /// built with `feature = "http3"`), drains jobs from the shared
-    /// queue until shutdown, then waits for the protocol threads to
-    /// exit cleanly. Returns 0 on clean exit; non-zero on bind
-    /// failure of the always-on h1 path.
+    /// Service entry point. Builds a per-instance `Inner` carrying
+    /// this gateway's config + atomics, spins up the protocol
+    /// threads (h1+h2c always; h3 too when built with `feature =
+    /// "http3"`) against a shared Job queue, drains jobs through
+    /// `ctx.ask_raw` until shutdown, then waits for protocol
+    /// threads to exit cleanly. Returns 0 on clean exit; non-zero
+    /// on bind failure of the always-on h1 path.
     pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
         use crate::limits::JOB_QUEUE_CAP;
         use std::sync::mpsc;
 
-        config::install(self.cfg.clone());
         let port = self.port;
-
         log::info!("http-gateway: starting on port {port}");
 
-        let inner = state::inner().clone();
+        let inner = state::Inner::new(self.cfg.clone());
         if !runtime::claim_port(&inner, port) {
             return 1;
         }
@@ -156,7 +155,7 @@ impl HttpGateway {
 
         let h1_handle = match hyper_io::spawn(port, job_tx.clone(), inner.clone()) {
             Ok(h) => {
-                runtime::log_listening(port, "tcp");
+                runtime::log_listening(&inner, port, "tcp");
                 h
             }
             Err(e) => {
@@ -174,7 +173,7 @@ impl HttpGateway {
         #[cfg(feature = "http3")]
         let h3_handle = match http3::spawn(port, job_tx.clone(), inner.clone()) {
             Ok(h) => {
-                runtime::log_listening(port, "udp/h3");
+                runtime::log_listening(&inner, port, "udp/h3");
                 Some(h)
             }
             Err(e) => {
@@ -189,7 +188,7 @@ impl HttpGateway {
         drop(job_tx);
 
         runtime::mark_listening(&inner, port);
-        runtime::log_auth_warnings(port);
+        runtime::log_auth_warnings(&inner, port);
 
         let stop_msg = routing::drain_jobs(&job_rx, &inner, &ctx);
 

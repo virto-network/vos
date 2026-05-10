@@ -139,6 +139,16 @@ fn handle(req: &Request, ctx: &ServiceCtx) -> Response {
     payload.extend_from_slice(&encoded);
 
     match ctx.ask_raw(target.0, &payload) {
+        Some(reply_bytes) if reply_bytes.is_empty() => {
+            // Empty reply = handler returned () successfully OR the
+            // worker dispatch errored (no such handler, type
+            // mismatch, panic). Indistinguishable on the wire
+            // today; render as JSON null. The host always sends a
+            // reply for ask-style traffic so the gateway doesn't
+            // hang for the 5-min ask timeout when a dispatch
+            // errors — see vos/src/node.rs's worker reply loop.
+            Response::json(200, value_to_json(&vos::value::Value::Unit))
+        }
         Some(reply_bytes) => {
             let value: vos::value::Value = vos::value::Value::decode(&reply_bytes);
             Response::json(200, value_to_json(&value))
@@ -321,6 +331,7 @@ mod tests {
             requests: AtomicU64::new(0),
             started_unix: AtomicU64::new(1_700_000_000),
             in_flight: AtomicU16::new(0),
+            cfg: crate::config::GatewayConfig::default(),
         }
     }
 

@@ -18,12 +18,9 @@ use std::time::{Duration, Instant};
 
 use vos::log;
 
-use crate::config;
-use crate::limits::{DRAIN_TIMEOUT, JOB_QUEUE_CAP};
-use crate::routing::drain_jobs;
-use crate::state::{Inner, inner, now_unix};
-use crate::types::{IoResult, Job};
-use vos::extension::ServiceCtx;
+use crate::limits::DRAIN_TIMEOUT;
+use crate::state::{Inner, now_unix};
+use crate::types::IoResult;
 
 /// RAII guard that decrements `Inner::in_flight` on drop. Bump the
 /// counter just before `tokio::spawn` and place this guard inside the
@@ -93,45 +90,6 @@ where
     Ok(handle)
 }
 
-/// Service-side bootstrap: claim the port slot, kick off the protocol
-/// thread, then drain jobs through `ctx.ask_raw` until stop. Single-
-/// protocol form — exposed for tests and trivial callers. The real
-/// gateway `run` body composes the lower-level primitives below so
-/// it can run h1+h2c and h3 in parallel against a shared job queue.
-#[allow(dead_code)] // used by tests; kept for the simple-caller story
-pub(crate) fn serve_with<F>(port: u16, proto: &str, spawn_protocol: F, ctx: &ServiceCtx) -> String
-where
-    F: FnOnce(u16, mpsc::SyncSender<Job>, Arc<Inner>) -> IoResult<thread::JoinHandle<()>>,
-{
-    let inner = inner().clone();
-    if !claim_port(&inner, port) {
-        return format!(
-            "already listening on port {}",
-            inner.bound_port.load(Ordering::Relaxed)
-        );
-    }
-
-    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(JOB_QUEUE_CAP);
-    let handle = match spawn_protocol(port, job_tx, inner.clone()) {
-        Ok(h) => h,
-        Err(e) => {
-            log::error!("http-gateway: {e}");
-            inner.bound_port.store(0, Ordering::Relaxed);
-            return e;
-        }
-    };
-    inner.bound_port.store(port, Ordering::Relaxed);
-    inner.started_unix.store(now_unix(), Ordering::Relaxed);
-    log_listening(port, proto);
-
-    let stop_msg = drain_jobs(&job_rx, &inner, ctx);
-    wait_for_thread(handle);
-
-    inner.bound_port.store(0, Ordering::Relaxed);
-    log::info!("http-gateway: {stop_msg}");
-    stop_msg
-}
-
 /// Reset per-bind state and verify nothing is already bound. Returns
 /// `false` if the port slot is already taken (caller should bail
 /// before spawning protocol threads).
@@ -157,19 +115,19 @@ pub(crate) fn mark_listening(inner: &Inner, port: u16) {
 /// Log a single "listening on …" line for one protocol slot. Bind
 /// warnings about open dispatch / disabled admin live alongside —
 /// once per gateway boot, regardless of how many protocols spin up.
-pub(crate) fn log_listening(port: u16, proto: &str) {
-    let bind = config::bind_ip();
+pub(crate) fn log_listening(inner: &Inner, port: u16, proto: &str) {
+    let bind = inner.cfg.bind_ip();
     log::info!("http-gateway: listening on {bind}:{port} ({proto})");
 }
 
-pub(crate) fn log_auth_warnings(port: u16) {
-    let bind = config::bind_ip();
-    if config::auth_token().is_none() {
+pub(crate) fn log_auth_warnings(inner: &Inner, port: u16) {
+    let bind = inner.cfg.bind_ip();
+    if inner.cfg.auth_token().is_none() {
         log::warn!(
             "http-gateway: HTTP_GATEWAY_AUTH_TOKEN not set — dispatch is open to anyone reachable on {bind}:{port}"
         );
     }
-    if config::admin_token().is_none() {
+    if inner.cfg.admin_token().is_none() {
         log::info!("http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled");
     }
 }

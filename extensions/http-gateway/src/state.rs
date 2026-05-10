@@ -1,23 +1,26 @@
-//! Shared runtime state — atomics reachable from both the actor
-//! handlers and the tokio thread.
+//! Shared runtime state — atomics + config reachable from both the
+//! gateway's `run` thread and the tokio connection tasks.
 //!
-//! One per process: there's only meant to be a single gateway
-//! instance per worker `.so` load. The `OnceLock` makes the singleton
-//! lazy and thread-safe; both sides use `Ordering::Relaxed` because
-//! the values they exchange (a stop flag, a port, a few counters)
-//! never establish happens-before relationships with other data.
+//! Per-instance: each gateway extension that boots makes its own
+//! `Arc<Inner>` and threads it everywhere. Process-globals were a
+//! footgun for tests (every test in a single binary shared the same
+//! singleton, even when each one wanted its own port + admin
+//! token). All atomics use `Ordering::Relaxed` because the values
+//! they exchange (a stop flag, a port, a few counters) never
+//! establish happens-before relationships with other data.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::GatewayConfig;
 
 pub(crate) struct Inner {
     /// Set to true to ask the running serve loop to exit.
     pub(crate) stop: AtomicBool,
     /// Bound port, 0 when the gateway isn't running.
     pub(crate) bound_port: AtomicU16,
-    /// Total HTTP requests fully served since process boot.
+    /// Total HTTP requests fully served since gateway boot.
     pub(crate) requests: AtomicU64,
     /// Unix epoch seconds when the gateway last entered the serve
     /// loop; 0 when never started.
@@ -27,16 +30,21 @@ pub(crate) struct Inner {
     /// `accept_loop` polls this on shutdown so connections drain
     /// before the runtime exits.
     pub(crate) in_flight: AtomicU16,
+    /// Operator-supplied config: bind address, tokens, TLS paths.
+    /// Set once at construction; read by both the run thread and
+    /// the per-connection tasks (immutable, no atomics needed).
+    pub(crate) cfg: GatewayConfig,
 }
 
 impl Inner {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new(cfg: GatewayConfig) -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false),
             bound_port: AtomicU16::new(0),
             requests: AtomicU64::new(0),
             started_unix: AtomicU64::new(0),
             in_flight: AtomicU16::new(0),
+            cfg,
         })
     }
 
@@ -46,11 +54,6 @@ impl Inner {
     pub(crate) fn running(&self) -> bool {
         self.bound_port.load(Ordering::Relaxed) != 0 && !self.stop.load(Ordering::Relaxed)
     }
-}
-
-pub(crate) fn inner() -> &'static Arc<Inner> {
-    static INNER: OnceLock<Arc<Inner>> = OnceLock::new();
-    INNER.get_or_init(Inner::new)
 }
 
 pub(crate) fn now_unix() -> u64 {
