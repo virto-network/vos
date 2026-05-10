@@ -30,6 +30,38 @@
 
 use alloc::vec::Vec;
 
+/// What kind of extension this is — `Actor` (request-driven, the
+/// default) or `Service` (long-running, owns its own thread).
+///
+/// Phase 2 introduces this discriminant in the extension metadata
+/// blob. The host loader treats every extension as `Actor` until
+/// Phase 3 wires up the service ABI.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExtensionKind {
+    /// Request-driven: handler runs to completion per-dispatch.
+    /// Today's behavior. The default for unspecified or
+    /// previously-encoded metadata blobs.
+    #[default]
+    Actor = 0,
+    /// Long-running: extension owns a thread + originates calls
+    /// via a host-given `ServiceCtx`. Reserved — the loader does
+    /// not yet route based on this value.
+    Service = 1,
+}
+
+impl ExtensionKind {
+    /// Decode a metadata `kind` byte. Unknown values fall back to
+    /// `Actor` so newer extension blobs stay loadable on older
+    /// hosts.
+    pub const fn from_byte(b: u8) -> Self {
+        match b {
+            1 => Self::Service,
+            _ => Self::Actor,
+        }
+    }
+}
+
 /// Result of polling a extension handler, returned across the C ABI.
 #[repr(C)]
 pub struct ExtensionPollResult {
@@ -401,6 +433,12 @@ mod tests {
         assert_eq!(meta.actor_name, "EchoExtension");
         assert!(meta.messages.iter().any(|m| m.name == "echo"));
         assert!(meta.messages.iter().any(|m| m.name == "count"));
+        // Echo declares no kind — defaults to Actor.
+        assert_eq!(
+            ExtensionKind::from_byte(meta.kind),
+            ExtensionKind::Actor,
+            "echo extension should be Actor-kind"
+        );
 
         // Create instance and dispatch messages
         let mut instance = plugin.create();
@@ -428,5 +466,14 @@ mod tests {
         let count_val: crate::actors::value::Value =
             crate::actors::codec::Decode::decode(&count_bytes);
         assert_eq!(count_val.as_u32().unwrap(), 2);
+    }
+
+    #[test]
+    fn extension_kind_from_byte_round_trip() {
+        assert_eq!(ExtensionKind::from_byte(0), ExtensionKind::Actor);
+        assert_eq!(ExtensionKind::from_byte(1), ExtensionKind::Service);
+        // Unknown values fall back to Actor for forward-compat.
+        assert_eq!(ExtensionKind::from_byte(7), ExtensionKind::Actor);
+        assert_eq!(ExtensionKind::from_byte(255), ExtensionKind::Actor);
     }
 }

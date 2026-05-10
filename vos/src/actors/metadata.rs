@@ -37,6 +37,12 @@ pub struct ActorMeta {
     pub actor_name: &'static str,
     pub messages: &'static [MessageMeta],
     pub constructor: &'static [FieldMeta],
+    /// Extension kind discriminant, encoded as a `u8`. Mirrors
+    /// [`crate::extension::ExtensionKind`]: `0 = Actor`, `1 =
+    /// Service`. PVM actors emit `0` — services are a host-side
+    /// concept; a PVM actor running inside the deterministic
+    /// universe is always `Actor`.
+    pub kind: u8,
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -160,6 +166,12 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
+    // Extension kind discriminant. Trailing byte so decoders that
+    // predate Phase 2 (no kind byte) still parse cleanly — they fall
+    // off the end of the buffer and ParsedMeta defaults to Actor.
+    buf[pos] = meta.kind;
+    pos += 1;
+
     (buf, pos)
 }
 
@@ -195,6 +207,7 @@ mod tests {
                 name: "start",
                 ty: "u32",
             }],
+            kind: 0,
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -213,6 +226,37 @@ mod tests {
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
+        assert_eq!(parsed.kind, 0);
+    }
+
+    #[test]
+    fn kind_byte_roundtrips_for_service() {
+        const META: ActorMeta = ActorMeta {
+            actor_name: "Gateway",
+            messages: &[],
+            constructor: &[],
+            kind: 1, // Service
+        };
+        let (buf, len) = encode::<128>(&META);
+        let parsed = decode(&buf[..len]).expect("decode");
+        assert_eq!(parsed.kind, 1);
+    }
+
+    #[test]
+    fn kind_byte_defaults_to_actor_when_missing() {
+        // Manually craft a meta blob without the trailing kind byte
+        // (simulates a pre-Phase-2 ELF). actor_name "X", 0 messages,
+        // 0 constructor fields. No kind byte.
+        let blob: &[u8] = &[
+            1, 0,    // actor_name_len = 1
+            b'X', // actor_name
+            0, 0, // msg_count = 0
+            0, 0, // ctor_count = 0
+               // no kind byte
+        ];
+        let parsed = decode(blob).expect("decode");
+        assert_eq!(parsed.actor_name, "X");
+        assert_eq!(parsed.kind, 0);
     }
 }
 
@@ -243,6 +287,10 @@ mod decode {
         pub actor_name: String,
         pub messages: Vec<ParsedMessage>,
         pub constructor: Vec<ParsedField>,
+        /// Extension kind byte (0 = Actor, 1 = Service). Decoded
+        /// from the trailing byte of the meta blob; absent / unknown
+        /// values default to `Actor`.
+        pub kind: u8,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -289,10 +337,16 @@ mod decode {
             }
         }
 
+        // Extension kind byte (optional — pre-Phase-2 ELFs lack it,
+        // default to Actor). Trailing position so older decoders
+        // simply stop before reaching it.
+        let kind = data.get(pos).copied().unwrap_or(0);
+
         Some(ParsedMeta {
             actor_name,
             messages,
             constructor,
+            kind,
         })
     }
 

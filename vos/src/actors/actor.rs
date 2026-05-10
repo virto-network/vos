@@ -50,6 +50,14 @@ pub trait Actor: Sized + Encode + Decode {
     /// The message enum dispatched to this actor.
     type Message: Decode + super::value::FromDynamic;
 
+    /// Extension kind discriminant — `0 = Actor` (request-driven,
+    /// the default) or `1 = Service` (long-running). Overridden by
+    /// `#[actor(kind = "service")]`. Mirrors
+    /// [`crate::extension::ExtensionKind`] and lands in the
+    /// `.vos_meta` blob for the loader to read at boot. PVM actors
+    /// always leave this at `0` — services are a host-side concept.
+    const KIND_BYTE: u8 = 0;
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;

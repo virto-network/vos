@@ -4,7 +4,7 @@
 //! - `#[messages]` — message types, dispatch enum, entry points
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
 /// Makes a struct a VOS actor.
@@ -47,9 +47,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let msg_enum = format_ident!("{}Msg", name);
 
     // Parse optional attributes:
-    //   #[actor]               — defaults to `Error = ()`
-    //   #[actor(error = Type)] — custom error type for Actor::Error
-    let error_ty = parse_actor_attrs(attr);
+    //   #[actor]                       — defaults to `Error = ()`, kind = Actor
+    //   #[actor(error = Type)]         — custom error type for Actor::Error
+    //   #[actor(kind = "service")]     — opt into Service-mode (long-running)
+    //   #[actor(error = Type, kind = "service")] — both
+    let parsed = parse_actor_attrs(attr);
+    let error_ty = parsed.error_ty;
+    let kind_byte = parsed.kind_byte;
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -139,6 +143,10 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
             type Message = #msg_enum;
+
+            // Phase 2 — extension kind discriminant; defaulted on the
+            // trait, overridden here from `#[actor(kind = "...")]`.
+            const KIND_BYTE: u8 = #kind_byte;
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -625,6 +633,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
                 constructor: &[ #( #ctor_field_metas ),* ],
+                // The kind byte lives on the Actor trait — Phase 2's
+                // #[actor(kind = "service")] sets it via the `KIND_BYTE`
+                // associated const override.
+                kind: <#actor_ty as vos::Actor>::KIND_BYTE,
             };
         }
     };
@@ -915,34 +927,76 @@ fn is_context_type(ty: &syn::Type) -> bool {
     false
 }
 
-/// Parse `#[actor(...)]` attributes. Returns the actor's error type
-/// token stream — `()` by default, or whatever was specified via
-/// `#[actor(error = Type)]`.
-fn parse_actor_attrs(attr: TokenStream) -> proc_macro2::TokenStream {
+/// Parsed `#[actor(...)]` attribute payload.
+struct ActorAttrs {
+    /// Token stream for the actor's `Error` associated type — `()`
+    /// when not specified.
+    error_ty: proc_macro2::TokenStream,
+    /// Encoded kind byte that lands in the `.vos_meta` blob — 0 for
+    /// `Actor` (the default), 1 for `Service`.
+    kind_byte: u8,
+}
+
+/// Parse `#[actor(...)]` attributes.
+///
+/// Recognised keys:
+/// - `error = Type` — custom Actor::Error type (default `()`)
+/// - `kind = "actor" | "service"` — extension kind discriminant
+///   (default `"actor"`). `"service"` opts into the long-running
+///   shape introduced in Phase 3; in Phase 2 this byte is recorded
+///   in metadata but the loader still treats every extension as
+///   `Actor`.
+fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     let default_err = quote! { () };
+    let mut out = ActorAttrs {
+        error_ty: default_err.clone(),
+        kind_byte: 0,
+    };
     if attr.is_empty() {
-        return default_err;
+        return out;
     }
     let Ok(meta) = syn::parse::<syn::Meta>(attr) else {
-        return default_err;
+        return out;
     };
     match meta {
         syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
             let val = &nv.value;
-            quote! { #val }
+            out.error_ty = quote! { #val };
+        }
+        syn::Meta::NameValue(nv) if nv.path.is_ident("kind") => {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                out.kind_byte = parse_kind_str(&s.value());
+            }
         }
         syn::Meta::List(list) => {
-            let mut err_ty: Option<syn::Type> = None;
             let _ = list.parse_nested_meta(|meta| {
                 if meta.path.is_ident("error") {
                     let value = meta.value()?;
-                    err_ty = Some(value.parse::<syn::Type>()?);
+                    out.error_ty = value.parse::<syn::Type>()?.to_token_stream();
+                } else if meta.path.is_ident("kind") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    out.kind_byte = parse_kind_str(&lit.value());
                 }
                 Ok(())
             });
-            err_ty.map(|t| quote! { #t }).unwrap_or(default_err)
         }
-        _ => default_err,
+        _ => {}
+    }
+    out
+}
+
+fn parse_kind_str(s: &str) -> u8 {
+    match s {
+        "actor" => 0,
+        "service" => 1,
+        _ => 0, // unknown → fall back to actor; macro doesn't fail
+                // at compile time so that older toolchains still
+                // build crates that name future kinds.
     }
 }
 
