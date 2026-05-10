@@ -95,6 +95,8 @@ mod http3;
 use vos::extension::ServiceCtx;
 use vos::log;
 
+use crate::types::Job;
+
 /// Default bind port when `init.port` is unset or zero.
 const DEFAULT_PORT: u16 = 8080;
 
@@ -129,20 +131,80 @@ impl HttpGateway {
     }
 
     /// Service entry point. Installs the per-process config singleton,
-    /// binds on the configured port, drains jobs until shutdown.
-    /// Returns 0 on clean exit; non-zero on bind failure.
+    /// spins up the protocol threads (h1+h2c always; h3 too when
+    /// built with `feature = "http3"`), drains jobs from the shared
+    /// queue until shutdown, then waits for the protocol threads to
+    /// exit cleanly. Returns 0 on clean exit; non-zero on bind
+    /// failure of the always-on h1 path.
     pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
+        use crate::limits::JOB_QUEUE_CAP;
+        use std::sync::mpsc;
+
         config::install(self.cfg.clone());
         let port = self.port;
 
         log::info!("http-gateway: starting on port {port}");
 
-        // Hyper (h1+h2c) is the always-on serving path. HTTP/3 is
-        // additive and lives behind a feature flag (Phase 4 keeps
-        // it gated; an h3-aware service mode can spin up both
-        // protocols from inside a single `run` body in a follow-up).
-        let exit = runtime::serve_with(port, "tcp", hyper_io::spawn, &ctx);
-        log::info!("http-gateway: stopped ({exit})");
+        let inner = state::inner().clone();
+        if !runtime::claim_port(&inner, port) {
+            return 1;
+        }
+
+        // Single shared Job queue feeding all protocol threads. The
+        // drain loop on this thread services both h1 and h3.
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(JOB_QUEUE_CAP);
+
+        let h1_handle = match hyper_io::spawn(port, job_tx.clone(), inner.clone()) {
+            Ok(h) => {
+                runtime::log_listening(port, "tcp");
+                h
+            }
+            Err(e) => {
+                log::error!("http-gateway: h1+h2c bind failed: {e}");
+                inner
+                    .bound_port
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                return 1;
+            }
+        };
+
+        // h3 is additive — bind failure logs a warning and continues
+        // serving h1 only, so an operator misconfiguring TLS doesn't
+        // take down the gateway.
+        #[cfg(feature = "http3")]
+        let h3_handle = match http3::spawn(port, job_tx.clone(), inner.clone()) {
+            Ok(h) => {
+                runtime::log_listening(port, "udp/h3");
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("http-gateway: h3 bind failed (continuing without h3): {e}");
+                None
+            }
+        };
+
+        // Drop the bootstrap sender so the channel auto-closes once
+        // every protocol thread's clone goes away. drain_jobs sees
+        // RecvTimeoutError::Disconnected and exits cleanly.
+        drop(job_tx);
+
+        runtime::mark_listening(&inner, port);
+        runtime::log_auth_warnings(port);
+
+        let stop_msg = routing::drain_jobs(&job_rx, &inner, &ctx);
+
+        // Wait for protocol threads to drain + close. Each accept
+        // loop self-limits via DRAIN_TIMEOUT; the wait is bounded.
+        runtime::wait_for_thread(h1_handle);
+        #[cfg(feature = "http3")]
+        if let Some(h) = h3_handle {
+            runtime::wait_for_thread(h);
+        }
+
+        inner
+            .bound_port
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        log::info!("http-gateway: stopped ({stop_msg})");
         0
     }
 }

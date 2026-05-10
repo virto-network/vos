@@ -24,23 +24,22 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::Semaphore;
 use vos::log;
 
-use crate::HttpGateway;
 use crate::config;
 use crate::limits::{
     H3_BODY_CHUNK_TIMEOUT, MAX_BODY_BYTES, MAX_CONCURRENT_CONNS, MAX_REQUEST_HEADERS,
     MAX_STREAMS_PER_CONN,
 };
 use crate::routing::{Policy, dispatch_request};
-use crate::runtime::{self, InFlightGuard, drain_in_flight, serve_with};
+use crate::runtime::{self, InFlightGuard, drain_in_flight};
 use crate::state::Inner;
 use crate::types::{IoResult, Job, Request, Response};
 
-/// Actor-side entry for `serve_h3` when the feature is on.
-pub(crate) async fn serve_h3_impl(port: u16, ctx: &mut vos::Context<HttpGateway>) -> String {
-    serve_with(port, "udp/h3", spawn, ctx).await
-}
-
-fn spawn(
+/// Spawn the h3 protocol thread. Used by the gateway's `run` body
+/// (Phase 4 follow-up) when built with `feature = "http3"` — feeds
+/// the same Job mpsc the hyper (h1+h2c) thread feeds, so the drain
+/// loop on the gateway's run thread services both protocols off a
+/// single queue.
+pub(crate) fn spawn(
     port: u16,
     job_tx: mpsc::SyncSender<Job>,
     inner: Arc<Inner>,

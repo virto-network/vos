@@ -1,0 +1,21 @@
+[package]
+name = "mock-registry-extension"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../../../vos", default-features = false, features = ["extension"] }

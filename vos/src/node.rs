@@ -1153,10 +1153,29 @@ impl VosNode {
         id
     }
 
-    /// Register a native worker and return its service ID.
-    /// The worker starts immediately on a new thread.
+    /// Register a native extension at a freshly-allocated
+    /// ServiceId. Spawns the extension thread immediately.
     pub fn register_extension(&mut self, config: ExtensionConfig) -> ServiceId {
         let id = self.alloc_id();
+        self.register_extension_inner(config, id)
+    }
+
+    /// Register an extension at an explicit `ServiceId`. Mirrors
+    /// [`register_at_id`](Self::register_at_id) for the actor side
+    /// — used to slot a mock registry into `ServiceId::REGISTRY`
+    /// (= 0) for tests and to install built-in service extensions
+    /// at well-known ids.
+    ///
+    /// Caller is responsible for not double-registering.
+    pub fn register_extension_at_id(
+        &mut self,
+        config: ExtensionConfig,
+        id: ServiceId,
+    ) -> ServiceId {
+        self.register_extension_inner(config, id)
+    }
+
+    fn register_extension_inner(&mut self, config: ExtensionConfig, id: ServiceId) -> ServiceId {
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
         let outbox = self.outbox_tx.clone();

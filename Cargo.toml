@@ -33,6 +33,12 @@ exclude = [
     # `extensions` is a parent directory holding extension
     # plugins; each sub-crate is listed in `members` explicitly.
     "extensions",
+    # http-gateway test fixtures: small in-tree extension crates
+    # the e2e test loads via libloading. Excluded from the main
+    # workspace so they only build when the e2e test asks for them
+    # (via cargo build -p {name} as a setup step).
+    "extensions/http-gateway/test_fixtures/mock-registry",
+    "extensions/http-gateway/test_fixtures/counter",
 ]
 
 [workspace.package]
