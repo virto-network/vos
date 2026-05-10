@@ -123,11 +123,234 @@ impl ExtensionPollResult {
     }
 }
 
+// ── Service-mode C ABI (Phase 3) ───────────────────────────────────────
+//
+// `kind = "service"` extensions own their thread + originate calls to
+// other actors via a host-given `ServiceCtx`. The host hands the
+// extension a `*const HostCtxHandle` pointing at its own state plus a
+// vtable of callbacks the extension uses to send / receive / check
+// shutdown. Function-pointer dispatch (vs symbol resolution against
+// the host process) keeps the .so independent of how the host process
+// exports its own symbols.
+
+/// Host-side reply / envelope buffer. The host allocates; the
+/// extension reads the bytes; the extension calls `free_buf` when
+/// done so the host can deallocate. (The vtable's `free_buf` knows
+/// the layout — extensions must NOT use the system allocator on
+/// these pointers.)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RecvBuf {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl RecvBuf {
+    pub const fn empty() -> Self {
+        Self {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ptr.is_null() || self.len == 0
+    }
+}
+
+/// Host-side envelope (sender + payload). Returned by
+/// `recv_envelope` for control messages addressed to the service
+/// extension that aren't replies to a pending `ask`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RecvEnv {
+    /// Sender ServiceId (raw u32 form).
+    pub from: u32,
+    /// Payload bytes — owned by the host until `free_buf`.
+    pub payload: RecvBuf,
+}
+
+impl RecvEnv {
+    pub const fn empty() -> Self {
+        Self {
+            from: 0,
+            payload: RecvBuf::empty(),
+        }
+    }
+}
+
+/// Status codes returned by host-vtable callbacks. `0 = ok`,
+/// `1 = timeout`, `< 0 = error`.
+pub const HOST_OK: i32 = 0;
+pub const HOST_TIMEOUT: i32 = 1;
+pub const HOST_ERR_DISCONNECTED: i32 = -1;
+pub const HOST_ERR_INVALID: i32 = -2;
+
+/// Vtable exposed by the host to service-mode extensions. Each fn
+/// takes the opaque `*mut HostCtx` as its first arg so the host can
+/// recover its private state.
+#[repr(C)]
+pub struct HostVTable {
+    /// Send a payload to `target`. Returns `HOST_OK` on enqueue,
+    /// `HOST_ERR_DISCONNECTED` if the host's outbox is closed.
+    pub send: unsafe extern "C" fn(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        payload: *const u8,
+        len: usize,
+    ) -> i32,
+    /// Block until a reply from `target` arrives or `timeout_ms`
+    /// elapses. Writes the reply into `out`. Caller frees via
+    /// `free_buf`. `timeout_ms = 0` blocks forever (until shutdown).
+    pub recv_reply: unsafe extern "C" fn(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        timeout_ms: u64,
+        out: *mut RecvBuf,
+    ) -> i32,
+    /// Block until a non-reply envelope arrives or `timeout_ms`
+    /// elapses. Writes the envelope into `out`. Caller frees the
+    /// payload buffer via `free_buf`.
+    pub recv_envelope: unsafe extern "C" fn(
+        host: *mut core::ffi::c_void,
+        timeout_ms: u64,
+        out: *mut RecvEnv,
+    ) -> i32,
+    /// Non-blocking check: has the host signalled shutdown? Service
+    /// extensions should poll this between blocking operations and
+    /// exit `run` cleanly when it returns `true`.
+    pub shutdown_signaled: unsafe extern "C" fn(host: *mut core::ffi::c_void) -> bool,
+    /// Free a buffer previously handed to the extension by
+    /// `recv_reply` / `recv_envelope`.
+    pub free_buf: unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize),
+}
+
+/// Bundle of host state + vtable handed to a service extension's
+/// `vos_extension_run` entry. The extension only needs to dereference
+/// to call methods.
+#[repr(C)]
+pub struct HostCtxHandle {
+    pub state: *mut core::ffi::c_void,
+    pub vtable: *const HostVTable,
+}
+
+// SAFETY: HostCtxHandle is just two pointers; the underlying state
+// is `Sync` by host-side design (Mutex-guarded).
+unsafe impl Send for HostCtxHandle {}
+unsafe impl Sync for HostCtxHandle {}
+
+/// Safe Rust wrapper that service extensions use to talk back to the
+/// host. Constructed inside the macro-emitted `vos_extension_run`
+/// from the raw `*const HostCtxHandle` the host passes in.
+///
+/// All methods are `&self` — internal serialization is the host's
+/// responsibility (the vtable callbacks lock the appropriate
+/// internal channels). One in-flight `ask` per `ServiceCtx` clone
+/// at a time; concurrent callers are serialized inside the host.
+#[derive(Clone, Copy)]
+pub struct ServiceCtx {
+    handle: *const HostCtxHandle,
+}
+
+// SAFETY: ServiceCtx is a wrapper around a pointer to a host-owned
+// struct; the host guarantees the pointer outlives the extension's
+// `run` invocation, and the underlying state is internally
+// synchronised.
+unsafe impl Send for ServiceCtx {}
+unsafe impl Sync for ServiceCtx {}
+
+impl ServiceCtx {
+    /// Build a `ServiceCtx` from a raw `*const HostCtxHandle`. Called
+    /// by macro-generated `vos_extension_run` glue. **Unsafe** because
+    /// the caller must ensure `handle` points at a live HostCtxHandle
+    /// for the entire duration of the wrapping struct.
+    ///
+    /// # Safety
+    /// `handle` must outlive every clone of the returned `ServiceCtx`.
+    pub const unsafe fn from_raw(handle: *const HostCtxHandle) -> Self {
+        Self { handle }
+    }
+
+    fn vtable(&self) -> &HostVTable {
+        // SAFETY: vtable is a 'static reference set up by the host;
+        // see service_thread in node.rs.
+        unsafe { &*(*self.handle).vtable }
+    }
+
+    fn host_state(&self) -> *mut core::ffi::c_void {
+        // SAFETY: same as vtable.
+        unsafe { (*self.handle).state }
+    }
+
+    /// Send a payload to `target` and block until its reply arrives
+    /// (or the host signals shutdown). Returns `None` on shutdown
+    /// or transport error.
+    pub fn ask_raw(&self, target: u32, payload: &[u8]) -> Option<Vec<u8>> {
+        self.ask_raw_with_timeout(target, payload, 0)
+    }
+
+    /// Same as `ask_raw` but with a per-call timeout in milliseconds.
+    /// `0 = no timeout` (block until reply or shutdown).
+    pub fn ask_raw_with_timeout(
+        &self,
+        target: u32,
+        payload: &[u8],
+        timeout_ms: u64,
+    ) -> Option<Vec<u8>> {
+        let vtable = self.vtable();
+        let host = self.host_state();
+        // SAFETY: vtable callbacks are valid for the lifetime of the
+        // host handle.
+        let send_status = unsafe { (vtable.send)(host, target, payload.as_ptr(), payload.len()) };
+        if send_status != HOST_OK {
+            return None;
+        }
+        let mut out = RecvBuf::empty();
+        let recv_status =
+            unsafe { (vtable.recv_reply)(host, target, timeout_ms, &mut out as *mut RecvBuf) };
+        if recv_status != HOST_OK || out.is_empty() {
+            return None;
+        }
+        // Copy the bytes into a Vec the extension owns; free the
+        // host buffer immediately. Avoids tying lifetime of the
+        // returned Vec to the host vtable's free_buf.
+        let bytes = unsafe { core::slice::from_raw_parts(out.ptr, out.len) }.to_vec();
+        unsafe { (vtable.free_buf)(out.ptr, out.len, out.cap) };
+        Some(bytes)
+    }
+
+    /// Block waiting for a non-reply envelope addressed to this
+    /// extension. Returns `None` on timeout or shutdown.
+    pub fn recv_envelope(&self, timeout_ms: u64) -> Option<(u32, Vec<u8>)> {
+        let vtable = self.vtable();
+        let host = self.host_state();
+        let mut out = RecvEnv::empty();
+        let status = unsafe { (vtable.recv_envelope)(host, timeout_ms, &mut out as *mut RecvEnv) };
+        if status != HOST_OK || out.payload.is_empty() {
+            return None;
+        }
+        let bytes =
+            unsafe { core::slice::from_raw_parts(out.payload.ptr, out.payload.len) }.to_vec();
+        unsafe { (vtable.free_buf)(out.payload.ptr, out.payload.len, out.payload.cap) };
+        Some((out.from, bytes))
+    }
+
+    /// Has the host signalled shutdown? Service extensions should
+    /// poll this from their run loop and exit cleanly when it
+    /// returns `true`.
+    pub fn is_shutdown(&self) -> bool {
+        let vtable = self.vtable();
+        let host = self.host_state();
+        unsafe { (vtable.shutdown_signaled)(host) }
+    }
+}
+
 // ── Host-side extension loader (std only) ──────────────────────────────
 
 #[cfg(feature = "std")]
 mod host {
-    use super::ExtensionPollResult;
+    use super::{ExtensionKind, ExtensionPollResult, HostCtxHandle};
     use crate::actors::metadata::ParsedMeta;
 
     /// Type signatures for the C ABI functions exported by extension `.so` files.
@@ -142,27 +365,51 @@ mod host {
     type FreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize);
     type LoadFn = unsafe extern "C" fn(state_ptr: *const u8, state_len: usize) -> *mut ();
     type StateFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *mut u8, out_len: *mut usize);
+    /// Service-mode entry: `vos_extension_run(state, handle) -> i32`.
+    /// Blocks the calling thread until the extension's run loop
+    /// returns. Status: 0 = clean exit, < 0 = error.
+    type RunFn = unsafe extern "C" fn(state: *mut (), handle: *const HostCtxHandle) -> i32;
 
-    /// A loaded extension plugin.
+    /// A loaded extension plugin. Holds either the actor-mode symbol
+    /// set or the service-mode set, depending on what the .so
+    /// declared via `kind` in its meta blob.
     pub struct ExtensionPlugin {
         _lib: libloading::Library,
+        // Always present.
         create_fn: CreateFn,
+        drop_fn: DropFn,
+        meta_bytes: Vec<u8>,
+        kind: ExtensionKind,
+        // Actor-mode symbols. Some(...) only for `kind = Actor`.
+        actor: Option<ActorSymbols>,
+        // Service-mode symbols. Some(...) only for `kind = Service`.
+        service: Option<ServiceSymbols>,
+    }
+
+    struct ActorSymbols {
         dispatch_fn: DispatchFn,
         poll_fn: PollFn,
         pending_effect_fn: PendingEffectFn,
         provide_result_fn: ProvideResultFn,
-        drop_fn: DropFn,
         free_fn: FreeFn,
         load_fn: LoadFn,
         state_fn: StateFn,
-        meta_bytes: Vec<u8>,
+    }
+
+    struct ServiceSymbols {
+        run_fn: RunFn,
     }
 
     impl ExtensionPlugin {
         /// Load an extension from a shared library path.
         ///
+        /// Reads `vos_extension_meta` first, decodes the kind byte,
+        /// then loads either the actor-mode or service-mode symbol
+        /// set.
+        ///
         /// # Safety
-        /// The `.so` must export the correct C ABI symbols.
+        /// The `.so` must export the correct C ABI symbols for its
+        /// declared kind.
         pub unsafe fn load(path: &std::path::Path) -> Result<Self, String> {
             let lib = unsafe {
                 libloading::Library::new(path)
@@ -176,32 +423,12 @@ mod host {
                 let create_fn = *lib
                     .get::<CreateFn>(b"vos_extension_create")
                     .map_err(|e| format!("missing vos_extension_create: {e}"))?;
-                let dispatch_fn = *lib
-                    .get::<DispatchFn>(b"vos_extension_dispatch")
-                    .map_err(|e| format!("missing vos_extension_dispatch: {e}"))?;
-                let poll_fn = *lib
-                    .get::<PollFn>(b"vos_extension_poll")
-                    .map_err(|e| format!("missing vos_extension_poll: {e}"))?;
-                let pending_effect_fn = *lib
-                    .get::<PendingEffectFn>(b"vos_extension_pending_effect")
-                    .map_err(|e| format!("missing vos_extension_pending_effect: {e}"))?;
-                let provide_result_fn = *lib
-                    .get::<ProvideResultFn>(b"vos_extension_provide_result")
-                    .map_err(|e| format!("missing vos_extension_provide_result: {e}"))?;
                 let drop_fn = *lib
                     .get::<DropFn>(b"vos_extension_drop")
                     .map_err(|e| format!("missing vos_extension_drop: {e}"))?;
-                let free_fn = *lib
-                    .get::<FreeFn>(b"vos_extension_free")
-                    .map_err(|e| format!("missing vos_extension_free: {e}"))?;
-                let load_fn = *lib
-                    .get::<LoadFn>(b"vos_extension_load")
-                    .map_err(|e| format!("missing vos_extension_load: {e}"))?;
-                let state_fn = *lib
-                    .get::<StateFn>(b"vos_extension_state")
-                    .map_err(|e| format!("missing vos_extension_state: {e}"))?;
 
-                // Read metadata
+                // Read metadata first so we know which kind-specific
+                // symbol set to expect.
                 let mut meta_ptr: *const u8 = std::ptr::null();
                 let mut meta_len: usize = 0;
                 meta_fn(&mut meta_ptr, &mut meta_len);
@@ -211,20 +438,69 @@ mod host {
                     Vec::new()
                 };
 
+                let kind = crate::actors::metadata::decode(&meta_bytes)
+                    .map(|m| ExtensionKind::from_byte(m.kind))
+                    .unwrap_or(ExtensionKind::Actor);
+
+                let (actor, service) = match kind {
+                    ExtensionKind::Actor => {
+                        let dispatch_fn = *lib
+                            .get::<DispatchFn>(b"vos_extension_dispatch")
+                            .map_err(|e| format!("missing vos_extension_dispatch: {e}"))?;
+                        let poll_fn = *lib
+                            .get::<PollFn>(b"vos_extension_poll")
+                            .map_err(|e| format!("missing vos_extension_poll: {e}"))?;
+                        let pending_effect_fn = *lib
+                            .get::<PendingEffectFn>(b"vos_extension_pending_effect")
+                            .map_err(|e| format!("missing vos_extension_pending_effect: {e}"))?;
+                        let provide_result_fn = *lib
+                            .get::<ProvideResultFn>(b"vos_extension_provide_result")
+                            .map_err(|e| format!("missing vos_extension_provide_result: {e}"))?;
+                        let free_fn = *lib
+                            .get::<FreeFn>(b"vos_extension_free")
+                            .map_err(|e| format!("missing vos_extension_free: {e}"))?;
+                        let load_fn = *lib
+                            .get::<LoadFn>(b"vos_extension_load")
+                            .map_err(|e| format!("missing vos_extension_load: {e}"))?;
+                        let state_fn = *lib
+                            .get::<StateFn>(b"vos_extension_state")
+                            .map_err(|e| format!("missing vos_extension_state: {e}"))?;
+                        (
+                            Some(ActorSymbols {
+                                dispatch_fn,
+                                poll_fn,
+                                pending_effect_fn,
+                                provide_result_fn,
+                                free_fn,
+                                load_fn,
+                                state_fn,
+                            }),
+                            None,
+                        )
+                    }
+                    ExtensionKind::Service => {
+                        let run_fn = *lib
+                            .get::<RunFn>(b"vos_extension_run")
+                            .map_err(|e| format!("missing vos_extension_run: {e}"))?;
+                        (None, Some(ServiceSymbols { run_fn }))
+                    }
+                };
+
                 Ok(ExtensionPlugin {
                     _lib: lib,
                     create_fn,
-                    dispatch_fn,
-                    poll_fn,
-                    pending_effect_fn,
-                    provide_result_fn,
                     drop_fn,
-                    free_fn,
-                    load_fn,
-                    state_fn,
                     meta_bytes,
+                    kind,
+                    actor,
+                    service,
                 })
             }
+        }
+
+        /// Which kind the loaded extension declared.
+        pub fn kind(&self) -> ExtensionKind {
+            self.kind
         }
 
         /// Parse the extension's actor metadata.
@@ -251,12 +527,65 @@ mod host {
         }
 
         /// Restore an extension instance from previously serialized state.
+        /// Actor-mode only.
         pub fn load_state(&self, state: &[u8]) -> ExtensionInstance<'_> {
-            let s = unsafe { (self.load_fn)(state.as_ptr(), state.len()) };
+            let load_fn = self.actor_syms().load_fn;
+            let s = unsafe { load_fn(state.as_ptr(), state.len()) };
             ExtensionInstance {
                 plugin: self,
                 state: s,
             }
+        }
+
+        fn actor_syms(&self) -> &ActorSymbols {
+            self.actor
+                .as_ref()
+                .expect("ExtensionPlugin: actor-mode method called on service-mode plugin")
+        }
+
+        fn service_syms(&self) -> &ServiceSymbols {
+            self.service
+                .as_ref()
+                .expect("ExtensionPlugin: service-mode method called on actor-mode plugin")
+        }
+
+        /// Run a service-mode extension to completion. Blocks the
+        /// calling thread until the extension's `run` returns.
+        /// Returns the exit status (0 = clean, < 0 = error).
+        ///
+        /// # Safety
+        /// `state` must be a live extension instance produced by this
+        /// plugin's `create_state`. `handle` must point at a host
+        /// context handle whose vtable + state remain live for the
+        /// duration of the call.
+        pub unsafe fn run_service(&self, state: *mut (), handle: *const HostCtxHandle) -> i32 {
+            let run_fn = self.service_syms().run_fn;
+            unsafe { run_fn(state, handle) }
+        }
+
+        /// Allocate a fresh state via the extension's `create` symbol
+        /// without wrapping it in an `ExtensionInstance` (which is the
+        /// actor-mode RAII handle). Used by service-mode where the
+        /// state's lifetime is owned by service_thread.
+        ///
+        /// # Safety
+        /// Caller must eventually pair this with `drop_state`.
+        pub unsafe fn create_state(&self, args: &[u8]) -> *mut () {
+            let ptr = if args.is_empty() {
+                std::ptr::null()
+            } else {
+                args.as_ptr()
+            };
+            unsafe { (self.create_fn)(ptr, args.len()) }
+        }
+
+        /// Free a state pointer previously returned by `create_state`.
+        ///
+        /// # Safety
+        /// `state` must be a live state pointer produced by this
+        /// plugin and not already dropped.
+        pub unsafe fn drop_state(&self, state: *mut ()) {
+            unsafe { (self.drop_fn)(state) };
         }
     }
 
@@ -273,13 +602,14 @@ mod host {
         /// For a fully async version, use `dispatch_start` + `poll_once`
         /// + `pending_effect` + `provide_result` manually.
         pub fn dispatch_raw(&mut self, msg: &[u8]) -> Result<Vec<u8>, i32> {
+            let syms = self.plugin.actor_syms();
             // Start the dispatch
             unsafe {
-                (self.plugin.dispatch_fn)(self.state, msg.as_ptr(), msg.len());
+                (syms.dispatch_fn)(self.state, msg.as_ptr(), msg.len());
             }
             // Poll loop
             loop {
-                let result = unsafe { (self.plugin.poll_fn)(self.state) };
+                let result = unsafe { (syms.poll_fn)(self.state) };
                 match result.status {
                     super::POLL_READY => {
                         let bytes = if result.ptr.is_null() || result.len == 0 {
@@ -288,7 +618,7 @@ mod host {
                             unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec()
                         };
                         unsafe {
-                            (self.plugin.free_fn)(result.ptr, result.len, result.cap);
+                            (syms.free_fn)(result.ptr, result.len, result.cap);
                         }
                         return Ok(bytes);
                     }
@@ -299,11 +629,11 @@ mod host {
                         let mut eff_ptr: *const u8 = std::ptr::null();
                         let mut eff_len: usize = 0;
                         unsafe {
-                            (self.plugin.pending_effect_fn)(self.state, &mut eff_ptr, &mut eff_len);
+                            (syms.pending_effect_fn)(self.state, &mut eff_ptr, &mut eff_len);
                         }
                         // For now, provide empty result to unblock
                         unsafe {
-                            (self.plugin.provide_result_fn)(self.state, std::ptr::null(), 0);
+                            (syms.provide_result_fn)(self.state, std::ptr::null(), 0);
                         }
                     }
                     err => return Err(err),
@@ -324,22 +654,24 @@ mod host {
         /// Start dispatching a message without polling.
         /// Use `poll_once`, `pending_effect`, and `provide_result` to drive.
         pub fn dispatch_start(&mut self, msg: &[u8]) {
+            let syms = self.plugin.actor_syms();
             unsafe {
-                (self.plugin.dispatch_fn)(self.state, msg.as_ptr(), msg.len());
+                (syms.dispatch_fn)(self.state, msg.as_ptr(), msg.len());
             }
         }
 
         /// Poll the in-flight handler once.
         pub fn poll_once(&mut self) -> ExtensionPollResult {
-            unsafe { (self.plugin.poll_fn)(self.state) }
+            unsafe { (self.plugin.actor_syms().poll_fn)(self.state) }
         }
 
         /// Read the pending host I/O request (if poll returned Pending).
         pub fn pending_effect(&mut self) -> Vec<u8> {
+            let syms = self.plugin.actor_syms();
             let mut ptr: *const u8 = std::ptr::null();
             let mut len: usize = 0;
             unsafe {
-                (self.plugin.pending_effect_fn)(self.state, &mut ptr, &mut len);
+                (syms.pending_effect_fn)(self.state, &mut ptr, &mut len);
             }
             if ptr.is_null() || len == 0 {
                 Vec::new()
@@ -350,15 +682,17 @@ mod host {
 
         /// Provide the result for the pending host I/O request.
         pub fn provide_result(&mut self, result: &[u8]) {
+            let syms = self.plugin.actor_syms();
             unsafe {
-                (self.plugin.provide_result_fn)(self.state, result.as_ptr(), result.len());
+                (syms.provide_result_fn)(self.state, result.as_ptr(), result.len());
             }
         }
 
         /// Free a reply buffer from a poll result.
         pub fn free_reply(&self, result: &ExtensionPollResult) {
+            let syms = self.plugin.actor_syms();
             unsafe {
-                (self.plugin.free_fn)(result.ptr, result.len, result.cap);
+                (syms.free_fn)(result.ptr, result.len, result.cap);
             }
         }
 
@@ -366,16 +700,17 @@ mod host {
         /// Useful for persistence — write the bytes to your storage,
         /// later restore via `ExtensionPlugin::load_state`.
         pub fn save_state(&self) -> Vec<u8> {
+            let syms = self.plugin.actor_syms();
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let mut len: usize = 0;
             unsafe {
-                (self.plugin.state_fn)(self.state, &mut ptr, &mut len);
+                (syms.state_fn)(self.state, &mut ptr, &mut len);
             }
             if ptr.is_null() || len == 0 {
                 return Vec::new();
             }
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-            unsafe { (self.plugin.free_fn)(ptr, len, len) };
+            unsafe { (syms.free_fn)(ptr, len, len) };
             bytes
         }
     }
@@ -396,6 +731,239 @@ mod host {
 
 #[cfg(feature = "std")]
 pub use host::{ExtensionInstance, ExtensionPlugin};
+
+// ── Service-mode host-side machinery (std only) ────────────────────────
+
+#[cfg(feature = "std")]
+pub use service_host::{HostCtx, SERVICE_VTABLE};
+
+#[cfg(feature = "std")]
+mod service_host {
+    use super::{HOST_ERR_DISCONNECTED, HOST_OK, HOST_TIMEOUT, HostVTable, RecvBuf, RecvEnv};
+    use crate::node::Envelope;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Internal host state backing a `ServiceCtx`. Exposed to
+    /// service-mode extensions via the C ABI as `*mut c_void`.
+    pub struct HostCtx {
+        /// ServiceId of the extension this ctx belongs to (used as
+        /// `from` on outgoing envelopes).
+        pub me: u32,
+        /// Outbox: all envelopes the extension originates flow here.
+        pub outbox: mpsc::Sender<Envelope>,
+        /// Inbox + deferred queue, both lock-protected so the host
+        /// can serve concurrent vtable calls from extension tokio
+        /// runtimes. The deferred queue holds non-reply envelopes
+        /// that arrived while waiting for a `recv_reply`.
+        pub inbox: Mutex<mpsc::Receiver<Envelope>>,
+        pub deferred: Mutex<VecDeque<Envelope>>,
+        /// Flipped by service_thread when the host wants the
+        /// extension to exit.
+        pub shutdown: Arc<AtomicBool>,
+    }
+
+    /// Default per-call timeout for `ask` when the extension passes
+    /// `0` — bounds blocked threads in case a reply never arrives.
+    /// Tuned generously (5 minutes) so legitimate slow upstreams
+    /// aren't cut off; explicit `ask_with_timeout` overrides.
+    const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Polling tick when an `ask`/`recv_envelope` call passes `0`
+    /// (block until something arrives or shutdown). Bounds the
+    /// shutdown latency on idle services to ~50ms.
+    const POLL_TICK: Duration = Duration::from_millis(50);
+
+    pub static SERVICE_VTABLE: HostVTable = HostVTable {
+        send: vh_send,
+        recv_reply: vh_recv_reply,
+        recv_envelope: vh_recv_envelope,
+        shutdown_signaled: vh_shutdown_signaled,
+        free_buf: vh_free_buf,
+    };
+
+    unsafe extern "C" fn vh_send(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        payload: *const u8,
+        len: usize,
+    ) -> i32 {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        let bytes = if payload.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(payload, len) }.to_vec()
+        };
+        match ctx.outbox.send(Envelope {
+            from: super::super::abi::service::ServiceId(ctx.me),
+            to: super::super::abi::service::ServiceId(target),
+            payload: bytes,
+        }) {
+            Ok(()) => HOST_OK,
+            Err(_) => HOST_ERR_DISCONNECTED,
+        }
+    }
+
+    unsafe extern "C" fn vh_recv_reply(
+        host: *mut core::ffi::c_void,
+        target: u32,
+        timeout_ms: u64,
+        out: *mut RecvBuf,
+    ) -> i32 {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        let deadline_total = if timeout_ms == 0 {
+            DEFAULT_ASK_TIMEOUT
+        } else {
+            Duration::from_millis(timeout_ms)
+        };
+        let start = std::time::Instant::now();
+
+        loop {
+            // 1. Drain deferred queue first looking for a reply from `target`.
+            //    Replies are identified by `from == target`.
+            {
+                let mut deferred = ctx.deferred.lock().unwrap();
+                if let Some(pos) = deferred.iter().position(|e| e.from.0 == target) {
+                    let env = deferred.remove(pos).unwrap();
+                    drop(deferred);
+                    write_recv_buf(out, env.payload);
+                    return HOST_OK;
+                }
+            }
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                clear_recv_buf(out);
+                return HOST_ERR_DISCONNECTED;
+            }
+            // 2. Block on the inbox briefly. Non-target messages
+            //    get parked in the deferred queue for `recv_envelope`.
+            let inbox = ctx.inbox.lock().unwrap();
+            match inbox.recv_timeout(POLL_TICK) {
+                Ok(env) => {
+                    drop(inbox);
+                    if env.from.0 == target {
+                        write_recv_buf(out, env.payload);
+                        return HOST_OK;
+                    } else {
+                        ctx.deferred.lock().unwrap().push_back(env);
+                        continue;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    drop(inbox);
+                    if start.elapsed() >= deadline_total {
+                        clear_recv_buf(out);
+                        return HOST_TIMEOUT;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    clear_recv_buf(out);
+                    return HOST_ERR_DISCONNECTED;
+                }
+            }
+        }
+    }
+
+    unsafe extern "C" fn vh_recv_envelope(
+        host: *mut core::ffi::c_void,
+        timeout_ms: u64,
+        out: *mut RecvEnv,
+    ) -> i32 {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        let deadline_total = if timeout_ms == 0 {
+            DEFAULT_ASK_TIMEOUT
+        } else {
+            Duration::from_millis(timeout_ms)
+        };
+        let start = std::time::Instant::now();
+        loop {
+            // 1. Drain deferred queue.
+            {
+                let mut deferred = ctx.deferred.lock().unwrap();
+                if let Some(env) = deferred.pop_front() {
+                    drop(deferred);
+                    write_recv_env(out, env);
+                    return HOST_OK;
+                }
+            }
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                clear_recv_env(out);
+                return HOST_ERR_DISCONNECTED;
+            }
+            let inbox = ctx.inbox.lock().unwrap();
+            match inbox.recv_timeout(POLL_TICK) {
+                Ok(env) => {
+                    drop(inbox);
+                    write_recv_env(out, env);
+                    return HOST_OK;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    drop(inbox);
+                    if start.elapsed() >= deadline_total {
+                        clear_recv_env(out);
+                        return HOST_TIMEOUT;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    clear_recv_env(out);
+                    return HOST_ERR_DISCONNECTED;
+                }
+            }
+        }
+    }
+
+    unsafe extern "C" fn vh_shutdown_signaled(host: *mut core::ffi::c_void) -> bool {
+        let ctx = unsafe { &*(host as *const HostCtx) };
+        ctx.shutdown.load(Ordering::Relaxed)
+    }
+
+    unsafe extern "C" fn vh_free_buf(ptr: *mut u8, len: usize, cap: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            // Reconstitute the Vec we leaked in write_recv_buf so it
+            // gets dropped via the host's allocator (matches what we
+            // allocated with).
+            let _ = Vec::from_raw_parts(ptr, len, cap);
+        }
+    }
+
+    fn write_recv_buf(out: *mut RecvBuf, bytes: Vec<u8>) {
+        let mut leaked = std::mem::ManuallyDrop::new(bytes);
+        unsafe {
+            (*out).ptr = leaked.as_mut_ptr();
+            (*out).len = leaked.len();
+            (*out).cap = leaked.capacity();
+        }
+    }
+
+    fn clear_recv_buf(out: *mut RecvBuf) {
+        unsafe {
+            (*out).ptr = core::ptr::null_mut();
+            (*out).len = 0;
+            (*out).cap = 0;
+        }
+    }
+
+    fn write_recv_env(out: *mut RecvEnv, env: Envelope) {
+        unsafe {
+            (*out).from = env.from.0;
+        }
+        write_recv_buf(unsafe { &raw mut (*out).payload }, env.payload);
+    }
+
+    fn clear_recv_env(out: *mut RecvEnv) {
+        unsafe {
+            (*out).from = 0;
+        }
+        clear_recv_buf(unsafe { &raw mut (*out).payload });
+    }
+}
 
 #[cfg(all(test, feature = "std"))]
 mod tests {

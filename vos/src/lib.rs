@@ -523,6 +523,182 @@ macro_rules! __vos_emit_worker_glue {
     ($($_:tt)*) => {};
 }
 
+/// Declare a service-mode extension entry point.
+///
+/// Service extensions own their thread + originate calls back into
+/// the host's actor address book via a `ServiceCtx` handle. Unlike
+/// actor-mode extensions, they don't dispatch per-message — the
+/// host calls `run` once and the extension blocks until shutdown.
+///
+/// Usage in an extension's `lib.rs`:
+///
+/// ```ignore
+/// use vos::ServiceCtx;
+///
+/// pub struct MyGateway { /* state */ }
+///
+/// impl MyGateway {
+///     pub fn new() -> Self { MyGateway { /* … */ } }
+///
+///     pub async fn run(&mut self, ctx: ServiceCtx) -> i32 {
+///         while !ctx.is_shutdown() {
+///             // do work, originate `ctx.ask_raw(target, payload)` calls,
+///             // sleep, etc.
+///         }
+///         0
+///     }
+/// }
+///
+/// vos::service_main!(MyGateway);
+/// ```
+///
+/// Emits the C ABI symbols (`vos_extension_meta`, `vos_extension_create`,
+/// `vos_extension_drop`, `vos_extension_run`) the host's
+/// `ExtensionPlugin::load` looks up.
+///
+/// V1 limitations:
+/// - Constructor is `fn new() -> Self` (no init args).
+/// - No `#[messages]` integration — control messages arrive via
+///   `ctx.recv_envelope`, the extension dispatches them itself.
+/// - No persistent state — fresh on each boot.
+///
+/// All three lift in later phases (Phase 4 wires init args for the
+/// gateway; Phase 5 adds the CLI dispatch surface; persistence stays
+/// opt-in per service).
+#[cfg(feature = "extension")]
+#[macro_export]
+macro_rules! service_main {
+    ($actor_ty:ty) => {
+        #[cfg(feature = "bin")]
+        const _: () = {
+            extern crate alloc;
+            use alloc::boxed::Box;
+
+            // Service-mode meta blob. Hand-encoded so we don't need
+            // the user to also use #[actor] / #[messages]. Format
+            // matches what `vos::metadata::decode` reads:
+            //   [name_len:u16 LE][name_bytes...]
+            //   [msg_count:u16 LE = 0]
+            //   [ctor_count:u16 LE = 0]
+            //   [kind:u8 = 1]
+            const __VOS_SERVICE_NAME: &str = stringify!($actor_ty);
+            const fn __vos_build_service_meta<const N: usize>() -> ([u8; N], usize) {
+                let mut buf = [0u8; N];
+                let mut pos = 0;
+                let bytes = __VOS_SERVICE_NAME.as_bytes();
+                let [lo, hi] = (bytes.len() as u16).to_le_bytes();
+                buf[pos] = lo;
+                buf[pos + 1] = hi;
+                pos += 2;
+                let mut i = 0;
+                while i < bytes.len() {
+                    buf[pos + i] = bytes[i];
+                    i += 1;
+                }
+                pos += bytes.len();
+                // msg_count = 0
+                buf[pos] = 0;
+                buf[pos + 1] = 0;
+                pos += 2;
+                // ctor_count = 0
+                buf[pos] = 0;
+                buf[pos + 1] = 0;
+                pos += 2;
+                // kind = 1 (Service)
+                buf[pos] = 1;
+                pos += 1;
+                (buf, pos)
+            }
+            const __VOS_SERVICE_META_ENCODED: ([u8; 256], usize) =
+                __vos_build_service_meta::<256>();
+            static __VOS_SERVICE_META: [u8; __VOS_SERVICE_META_ENCODED.1] = {
+                let (src, len) = __VOS_SERVICE_META_ENCODED;
+                let mut out = [0u8; __VOS_SERVICE_META_ENCODED.1];
+                let mut i = 0;
+                while i < len {
+                    out[i] = src[i];
+                    i += 1;
+                }
+                out
+            };
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_meta(out_ptr: *mut *const u8, out_len: *mut usize) {
+                unsafe {
+                    *out_ptr = __VOS_SERVICE_META.as_ptr();
+                    *out_len = __VOS_SERVICE_META.len();
+                }
+            }
+
+            // Same stderr-backed logger pattern as the worker glue.
+            // First-installer wins; gives the host a chance to swap
+            // in tracing-log etc. before run() starts.
+            struct __VosServiceLogger;
+            impl $crate::log::Log for __VosServiceLogger {
+                fn enabled(&self, _: &$crate::log::Metadata<'_>) -> bool {
+                    true
+                }
+                fn log(&self, record: &$crate::log::Record<'_>) {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[{} {}] {}",
+                        record.level(),
+                        record.target(),
+                        record.args(),
+                    );
+                }
+                fn flush(&self) {
+                    use std::io::Write as _;
+                    let _ = std::io::stderr().flush();
+                }
+            }
+            static __VOS_SERVICE_LOGGER: __VosServiceLogger = __VosServiceLogger;
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_create(
+                _args_ptr: *const u8,
+                _args_len: usize,
+            ) -> *mut () {
+                let _ = $crate::log::set_logger(&__VOS_SERVICE_LOGGER);
+                $crate::log::set_max_level($crate::log::LevelFilter::Trace);
+                let state = Box::new(<$actor_ty>::new());
+                Box::into_raw(state) as *mut ()
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_drop(state: *mut ()) {
+                if state.is_null() {
+                    return;
+                }
+                unsafe {
+                    let _ = Box::from_raw(state as *mut $actor_ty);
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_run(
+                state: *mut (),
+                handle: *const $crate::extension::HostCtxHandle,
+            ) -> i32 {
+                let inst = unsafe { &mut *(state as *mut $actor_ty) };
+                let ctx = unsafe { $crate::extension::ServiceCtx::from_raw(handle) };
+                // Service `run` is synchronous — extensions manage
+                // their own runtime (tokio etc.) inside the body if
+                // they need async. Keeps the macro from depending
+                // on a pollster/runtime feature.
+                <$actor_ty>::run(inst, ctx)
+            }
+        };
+    };
+}
+
+#[cfg(not(feature = "extension"))]
+#[macro_export]
+macro_rules! service_main {
+    ($($_:tt)*) => {};
+}
+
 /// Emit the WASM cdylib entry points (`vos_wasm_*` extern fns).
 /// Active when `vos` is built with the `wasm` feature.
 #[cfg(feature = "wasm")]

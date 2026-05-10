@@ -2360,12 +2360,10 @@ fn extension_thread(
     use crate::extension::ExtensionPlugin;
     use std::collections::VecDeque;
 
-    let bump = || *activity.lock().unwrap() = Instant::now();
-
     let plugin = match unsafe { ExtensionPlugin::load(&config.path) } {
         Ok(p) => p,
         Err(e) => {
-            let err = format!("failed to load worker plugin: {e}");
+            let err = format!("failed to load extension plugin: {e}");
             error!(%id, "extension: {err}");
             return AgentResult {
                 id,
@@ -2376,13 +2374,31 @@ fn extension_thread(
     };
 
     if let Some(meta) = plugin.meta() {
-        info!(%id, actor = %meta.actor_name, path = %config.path.display(), "extension: loaded plugin");
+        info!(
+            %id,
+            actor = %meta.actor_name,
+            kind = ?crate::extension::ExtensionKind::from_byte(meta.kind),
+            path = %config.path.display(),
+            "extension: loaded plugin"
+        );
     }
 
-    // Pick a persistence strategy. Workers always get LocalCommit
+    // Phase 3: dispatch on plugin kind. Service-mode extensions
+    // own their thread + originate calls via ServiceCtx; the
+    // actor-mode dispatch loop below is unused for them. Drop
+    // invoke_rx — sync RPC into a service-mode extension isn't
+    // wired in Phase 3.
+    if plugin.kind() == crate::extension::ExtensionKind::Service {
+        let _ = invoke_rx;
+        return run_service_extension(id, plugin, config, inbox, outbox, shutdown, activity);
+    }
+
+    let bump = || *activity.lock().unwrap() = Instant::now();
+
+    // Pick a persistence strategy. Extensions always get LocalCommit
     // when a data directory is configured, NoCommit otherwise;
     // replication strategies (CRDT, Raft) are not available to
-    // workers since they live outside the deterministic universe.
+    // extensions since they live outside the deterministic universe.
     let mut strategy: Box<dyn crate::commit::CommitStrategy> =
         build_extension_strategy(&config, id);
     let saved_state = strategy.restore();
@@ -2471,8 +2487,106 @@ fn extension_thread(
     }
 }
 
-/// Dispatch a message to a worker instance and poll to completion.
-/// Returns the reply bytes (rkyv-encoded Value).
+// ── Service-mode extension runner (Phase 3) ──────────────────────────
+
+/// Drive a service-mode extension: build a HostCtx, hand it to the
+/// extension's `vos_extension_run` entry, block until it returns.
+///
+/// The extension owns its own concurrency (typically tokio inside).
+/// Control flow back here only happens when the extension's run
+/// loop exits — either because `shutdown` was flipped or because
+/// the extension hit an unrecoverable error.
+fn run_service_extension(
+    id: ServiceId,
+    plugin: crate::extension::ExtensionPlugin,
+    config: ExtensionConfig,
+    inbox: mpsc::Receiver<Envelope>,
+    outbox: mpsc::Sender<Envelope>,
+    shutdown: Arc<AtomicBool>,
+    activity: ActivityClock,
+) -> AgentResult {
+    use crate::extension::{HostCtx, HostCtxHandle, SERVICE_VTABLE};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    *activity.lock().unwrap() = Instant::now();
+
+    let host_ctx = Box::new(HostCtx {
+        me: id.0,
+        outbox: outbox.clone(),
+        inbox: Mutex::new(inbox),
+        deferred: Mutex::new(VecDeque::new()),
+        shutdown: shutdown.clone(),
+    });
+    let host_ptr = Box::into_raw(host_ctx);
+    let handle = HostCtxHandle {
+        state: host_ptr as *mut core::ffi::c_void,
+        vtable: &SERVICE_VTABLE as *const _,
+    };
+
+    // SAFETY: create_state pairs with drop_state below; both use
+    // the plugin's symbol pair so the allocator matches.
+    let state = unsafe { plugin.create_state(&config.init_args) };
+    if state.is_null() {
+        // SAFETY: host_ptr was just allocated above; nothing else
+        // observed it, so reclaiming it is safe.
+        unsafe {
+            let _ = Box::from_raw(host_ptr);
+        }
+        let err = "service-mode extension: create_state returned null";
+        error!(%id, "{err}");
+        return AgentResult {
+            id,
+            panics: 1,
+            error: Some(err.into()),
+        };
+    }
+
+    // Capture panics inside run so we can clean up state + host_ptr
+    // even if the extension blows up.
+    let plugin_ref = &plugin;
+    let handle_ptr: *const HostCtxHandle = &handle;
+    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: state is a live instance from create_state above;
+        // handle_ptr lives on this stack frame and outlives the call.
+        unsafe { plugin_ref.run_service(state, handle_ptr) }
+    }));
+
+    // Drop state regardless of panic.
+    // SAFETY: state was returned by this plugin's create_state and
+    // hasn't been dropped yet.
+    unsafe {
+        plugin.drop_state(state);
+    }
+    // SAFETY: host_ptr is the unique live pointer to the HostCtx;
+    // service_thread is single-threaded after run returns.
+    unsafe {
+        let _ = Box::from_raw(host_ptr);
+    }
+
+    *activity.lock().unwrap() = Instant::now();
+
+    match exit {
+        Ok(code) if code >= 0 => AgentResult {
+            id,
+            panics: 0,
+            error: None,
+        },
+        Ok(code) => AgentResult {
+            id,
+            panics: 1,
+            error: Some(format!("service-mode extension: run returned {code}")),
+        },
+        Err(_) => AgentResult {
+            id,
+            panics: 1,
+            error: Some("service-mode extension: run panicked".into()),
+        },
+    }
+}
+
+/// Dispatch a message to an actor-mode extension instance and poll
+/// to completion. Returns the reply bytes (rkyv-encoded Value).
 fn dispatch_and_poll(
     instance: &mut crate::extension::ExtensionInstance<'_>,
     msg: &[u8],
@@ -3010,5 +3124,67 @@ mod tests {
         assert_eq!(format!("{}", ServiceId(3)), "svc:3");
         assert_eq!(format!("{}", ServiceId::new(0x00A3, 5)), "svc:00a3:5");
         assert_eq!(format!("{}", ServiceId::REGISTRY), "svc:0");
+    }
+
+    /// Phase 3 — service-mode extension end-to-end. Loads echo
+    /// (kind=Actor) at id 1, then heartbeat (kind=Service) which
+    /// pings echo every 100ms. After 500ms, asserts that echo's
+    /// reply count grew (heartbeat actually originated calls), then
+    /// signals shutdown and confirms heartbeat exits cleanly.
+    #[test]
+    fn service_extension_originates_asks_via_ctx() {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_extension.so");
+        let heartbeat_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libheartbeat_extension.so");
+
+        if !echo_path.exists() || !heartbeat_path.exists() {
+            eprintln!(
+                "skipping service_extension_originates_asks_via_ctx: \
+                 build echo-extension and heartbeat-extension first"
+            );
+            return;
+        }
+
+        // Heartbeat targets ServiceId(1) by default — register echo
+        // first so it lands at id 1.
+        let mut node = VosNode::new();
+        let echo_id = node.register_extension(ExtensionConfig::new(echo_path));
+        assert_eq!(
+            echo_id.0, 1,
+            "echo should land at id 1 (heartbeat default target)"
+        );
+
+        let _heartbeat_id = node.register_extension(ExtensionConfig::new(heartbeat_path));
+
+        // Let the heartbeat tick for ~500ms — at PING_EVERY=100ms
+        // that's ~5 round trips. Use run_until_idle with a
+        // generous threshold; the heartbeat keeps the node busy so
+        // it won't go idle until shutdown.
+        std::thread::spawn({
+            let shutdown = node.shutdown.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        node.run_forever();
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(r.panics, 0, "extension {} panicked: {:?}", r.id, r.error);
+        }
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "heartbeat-extension"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Same shape as the actor-mode extension examples — `bin` enables
+# the cdylib's `vos_extension_*` extern-fn exports; `extension`
+# enables the role-level glue (the service_main! macro).
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["extension"] }
