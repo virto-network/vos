@@ -251,6 +251,18 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
     }
 
+    /// Fetch the raw `.vos_meta` blob the registry has on file
+    /// for the agent's program. Empty when no meta is
+    /// registered (older binaries) — callers treat that as
+    /// "schema unknown".
+    pub fn meta_for_instance(&self, instance_name: &str) -> anyhow::Result<Vec<u8>> {
+        vos::block_on(
+            self.registry()
+                .meta_for_instance(&mut &self.node, instance_name.to_string()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.meta_for_instance('{instance_name}'): {e}"))
+    }
+
     pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
         vos::block_on(self.registry().members(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))

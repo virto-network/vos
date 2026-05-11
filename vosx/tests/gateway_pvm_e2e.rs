@@ -528,13 +528,46 @@ fn pvm_actors_via_gateway() {
         "GET /__schema/nonexistent should 404, got {status}",
     );
 
-    // 10. Admin counter monotonically advances. Don't pin an exact
+    // 10. `vosx space describe` CLI — operator-facing mirror of
+    //     `/__schema/<agent>`. Uses the same daemon (via
+    //     DaemonClient) so this exercises the registry's
+    //     `meta_for_instance` handler over libp2p, plus the CLI's
+    //     JSON renderer end to end.
+    let out = Command::new(vosx_bin())
+        .args(["--format", "json", "space", "describe", "e2e", "math"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx space describe");
+    assert!(
+        out.status.success(),
+        "vosx space describe failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let cli_meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`describe --format json` stdout not JSON ({e}): {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(cli_meta["actor_name"], "Math");
+    assert!(
+        cli_meta["messages"]
+            .as_array()
+            .map(|a| a.iter().any(|m| m["name"] == "multiply"))
+            .unwrap_or(false),
+        "describe should list math.multiply: {cli_meta}",
+    );
+
+    // 11. Admin counter monotonically advances. Don't pin an exact
     //     number — the readiness poll above can retry an unbounded
     //     number of times depending on install timing — just
     //     require it advanced by at least the dispatch requests
     //     in steps 3–9 (greeter + 3 counter + 3 math + 1 GET +
     //     404 + /__schema + /__schema/math + /__schema/missing
-    //     = 12).
+    //     = 12). Step 10's `describe` invokes the registry via a
+    //     fresh libp2p client, which doesn't go through the
+    //     gateway's request counter, so it doesn't add here.
     let count1 = admin_request_count(&daemon, "test-token");
     assert!(
         count1 >= count0 + 12,

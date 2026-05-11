@@ -23,6 +23,7 @@ pub mod agents;
 pub mod call;
 pub mod client;
 pub mod common;
+pub mod describe;
 pub mod endpoint;
 pub mod export;
 pub mod forget;
@@ -185,6 +186,16 @@ pub enum SpaceCommand {
     },
     /// List installed agents.
     Agents { space: String },
+    /// Show an installed agent's schema — message names, arg
+    /// types, and constructor params. Pulls the `.vos_meta`
+    /// blob the registry has on file (same data the gateway
+    /// serves at `GET /__schema/<agent>`). Use `--format json`
+    /// for machine consumption.
+    Describe {
+        space: String,
+        /// Instance name as it appears in `vosx space agents`.
+        instance: String,
+    },
     /// Manage Node + Identity members. Subcommands: list,
     /// add-node, remove-node, add-identity, remove-identity.
     /// Bare `space members <space>` lists.
@@ -310,6 +321,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             program_ref,
         }),
         SpaceCommand::Agents { space } => agents::run(&space),
+        SpaceCommand::Describe { space, instance } => describe::run(&space, &instance),
         SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
         SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),
         SpaceCommand::Call {
