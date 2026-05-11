@@ -72,6 +72,47 @@ fn gateway_caps_are_declared_on_the_so() {
     );
 }
 
+#[test]
+fn gateway_cli_handlers_round_trip_through_vos_extension_meta() {
+    // `service_main!(..., cli = [stop, status])` emits each name
+    // twice in the meta blob: once as a 0-arg `MessageMeta`, once
+    // in the trailing `cli_methods` cross-reference. The decoder
+    // joins them by name → `ParsedMessage.exposed_to_cli`. This
+    // is what `vosx <ext> <cmd>` will eventually consume, so
+    // assert the shape end-to-end on the real .so.
+    let paths = FixturePaths::discover();
+    if !paths.all_present() {
+        paths.print_skip_hint();
+        return;
+    }
+    let plugin =
+        unsafe { vos::extension::ExtensionPlugin::load(&paths.gateway) }.expect("load gateway");
+    let meta = plugin.meta().expect("meta");
+    let exposed: Vec<&str> = meta
+        .messages
+        .iter()
+        .filter(|m| m.exposed_to_cli)
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(
+        exposed.contains(&"stop"),
+        "gateway should expose `stop` to CLI; saw {exposed:?}",
+    );
+    assert!(
+        exposed.contains(&"status"),
+        "gateway should expose `status` to CLI; saw {exposed:?}",
+    );
+    for name in ["stop", "status"] {
+        let m = meta
+            .messages
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("missing message `{name}`"));
+        assert!(m.fields.is_empty(), "`{name}` should be 0-arg");
+        assert!(!m.is_query, "`{name}` should not be is_query");
+    }
+}
+
 // ── Routing: registry resolution ─────────────────────────────────
 
 #[test]

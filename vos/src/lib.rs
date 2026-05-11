@@ -595,8 +595,16 @@ macro_rules! __vos_emit_worker_glue {
 #[cfg(feature = "extension")]
 #[macro_export]
 macro_rules! service_main {
-    ($actor_ty:ty) => { $crate::service_main!($actor_ty, caps = []); };
-    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?]) => {
+    ($actor_ty:ty $(,)?) => {
+        $crate::service_main!($actor_ty, caps = [], cli = []);
+    };
+    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?] $(,)?) => {
+        $crate::service_main!($actor_ty, caps = [$($cap),*], cli = []);
+    };
+    ($actor_ty:ty, cli = [$($cli:ident),* $(,)?] $(,)?) => {
+        $crate::service_main!($actor_ty, caps = [], cli = [$($cli),*]);
+    };
+    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?], cli = [$($cli:ident),* $(,)?] $(,)?) => {
         #[cfg(feature = "bin")]
         const _: () = {
             extern crate alloc;
@@ -606,14 +614,32 @@ macro_rules! service_main {
             // the user to also use #[actor] / #[messages]. Format
             // matches what `vos::metadata::decode` reads:
             //   [name_len:u16 LE][name_bytes...]
-            //   [msg_count:u16 LE = 0]
+            //   [msg_count:u16 LE]
+            //     [name_len:u16 LE][name_bytes...]
+            //     [is_query:u8 = 0]
+            //     [field_count:u16 LE = 0]
+            //   ...
             //   [ctor_count:u16 LE = 0]
             //   [kind:u8 = 1]
             //   [caps_count:u16 LE]
             //     [cap_len:u16 LE][cap_bytes...]
             //   ...
+            //   [cli_methods_count:u16 LE]
+            //     [name_len:u16 LE][name_bytes...]
+            //   ...
+            //
+            // CLI-exposed handler names ride in both `messages` and
+            // `cli_methods`. The decoder cross-references the latter
+            // against the former by name to set
+            // `ParsedMessage.exposed_to_cli`, so a CLI name without
+            // a matching message entry would silently disappear.
+            // Each emitted message is 0-arg / !is_query — the
+            // service-mode dispatch loop will gain arg types in a
+            // later phase if a CLI command needs them; today's
+            // gateway `stop` / `status` are both nullary.
             const __VOS_SERVICE_NAME: &str = stringify!($actor_ty);
             const __VOS_SERVICE_CAPS: &[&str] = &[ $( $cap ),* ];
+            const __VOS_SERVICE_CLI: &[&str] = &[ $( stringify!($cli) ),* ];
             const fn __vos_build_service_meta<const N: usize>() -> ([u8; N], usize) {
                 let mut buf = [0u8; N];
                 let mut pos = 0;
@@ -628,10 +654,33 @@ macro_rules! service_main {
                     i += 1;
                 }
                 pos += bytes.len();
-                // msg_count = 0
-                buf[pos] = 0;
-                buf[pos + 1] = 0;
+                // msg_count = N (one entry per CLI method, all 0-arg)
+                let [lo, hi] = (__VOS_SERVICE_CLI.len() as u16).to_le_bytes();
+                buf[pos] = lo;
+                buf[pos + 1] = hi;
                 pos += 2;
+                let mut k = 0;
+                while k < __VOS_SERVICE_CLI.len() {
+                    let m = __VOS_SERVICE_CLI[k].as_bytes();
+                    let [lo, hi] = (m.len() as u16).to_le_bytes();
+                    buf[pos] = lo;
+                    buf[pos + 1] = hi;
+                    pos += 2;
+                    let mut j = 0;
+                    while j < m.len() {
+                        buf[pos + j] = m[j];
+                        j += 1;
+                    }
+                    pos += m.len();
+                    // is_query = false
+                    buf[pos] = 0;
+                    pos += 1;
+                    // field_count = 0
+                    buf[pos] = 0;
+                    buf[pos + 1] = 0;
+                    pos += 2;
+                    k += 1;
+                }
                 // ctor_count = 0
                 buf[pos] = 0;
                 buf[pos + 1] = 0;
@@ -657,6 +706,28 @@ macro_rules! service_main {
                         j += 1;
                     }
                     pos += cap.len();
+                    k += 1;
+                }
+                // cli_methods_count + names (cross-references the
+                // messages emitted above; the decoder uses this to
+                // flip `exposed_to_cli` on each named message).
+                let [lo, hi] = (__VOS_SERVICE_CLI.len() as u16).to_le_bytes();
+                buf[pos] = lo;
+                buf[pos + 1] = hi;
+                pos += 2;
+                let mut k = 0;
+                while k < __VOS_SERVICE_CLI.len() {
+                    let m = __VOS_SERVICE_CLI[k].as_bytes();
+                    let [lo, hi] = (m.len() as u16).to_le_bytes();
+                    buf[pos] = lo;
+                    buf[pos + 1] = hi;
+                    pos += 2;
+                    let mut j = 0;
+                    while j < m.len() {
+                        buf[pos + j] = m[j];
+                        j += 1;
+                    }
+                    pos += m.len();
                     k += 1;
                 }
                 (buf, pos)

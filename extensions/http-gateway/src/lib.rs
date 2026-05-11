@@ -214,6 +214,13 @@ impl HttpGateway {
 // extension wants. The HTTP gateway needs to bind a TCP port,
 // originate outbound TCP/TLS to peers (h3 + future webhooks), own
 // a tokio runtime + spawn protocol threads.
+//
+// `cli` lists handlers reachable via `vosx gateway <cmd>` once the
+// dispatcher lands. Today `/__admin/stop` and `/__admin/status`
+// front the same ops over HTTP; the CLI surface is declared now so
+// the registry-served meta carries a non-empty `cli_methods` list,
+// and a later phase swaps the HTTP admin namespace for daemon-side
+// dispatch through the declared names.
 vos::service_main!(
     HttpGateway,
     caps = [
@@ -221,5 +228,6 @@ vos::service_main!(
         "net.tcp.connect",
         "tokio-runtime",
         "thread.spawn",
-    ]
+    ],
+    cli = [stop, status],
 );

@@ -454,6 +454,49 @@ mod tests {
         assert_eq!(parsed.messages.len(), 1);
         assert!(!parsed.messages[0].exposed_to_cli);
     }
+
+    #[test]
+    fn service_main_layout_with_cli_decodes() {
+        // Hand-craft the exact byte layout the `service_main!` macro
+        // emits for `service_main!(Gateway, caps = ["x"], cli = [stop, status])`.
+        // Each CLI handler shows up as a 0-arg / !is_query message AND
+        // as a `cli_methods` entry — the decoder cross-references the
+        // two so `ParsedMessage.exposed_to_cli` flips on for both.
+        let blob: &[u8] = &[
+            // actor name "Gateway"
+            7, 0, b'G', b'a', b't', b'e', b'w', b'a', b'y', // msg_count = 2
+            2, 0, // msg 0: "stop", !is_query, 0 fields
+            4, 0, b's', b't', b'o', b'p', 0, // is_query = false
+            0, 0, // field_count = 0
+            // msg 1: "status", !is_query, 0 fields
+            6, 0, b's', b't', b'a', b't', b'u', b's', 0, // is_query = false
+            0, 0, // field_count = 0
+            // ctor_count = 0
+            0, 0, // kind = 1 (Service)
+            1, // caps_count = 1, "x"
+            1, 0, 1, 0, b'x', // cli_methods_count = 2, "stop", "status"
+            2, 0, 4, 0, b's', b't', b'o', b'p', 6, 0, b's', b't', b'a', b't', b'u', b's',
+        ];
+        let parsed = decode(blob).expect("decode");
+        assert_eq!(parsed.actor_name, "Gateway");
+        assert_eq!(parsed.kind, 1);
+        assert_eq!(parsed.caps, vec!["x".to_string()]);
+        assert_eq!(parsed.messages.len(), 2);
+        let stop = parsed
+            .messages
+            .iter()
+            .find(|m| m.name == "stop")
+            .expect("stop");
+        let status = parsed
+            .messages
+            .iter()
+            .find(|m| m.name == "status")
+            .expect("status");
+        assert!(stop.exposed_to_cli);
+        assert!(status.exposed_to_cli);
+        assert!(stop.fields.is_empty());
+        assert!(status.fields.is_empty());
+    }
 }
 
 /// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
