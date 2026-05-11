@@ -57,6 +57,10 @@ pub(crate) struct Inner {
     /// tasks update them on response shape; the metrics endpoint
     /// reads them lock-free. See [`Metrics`].
     pub(crate) metrics: Metrics,
+    /// Parsed per-agent Bearer tokens map, derived from
+    /// `cfg.agent_tokens`. Populated once at construction so the
+    /// hot path doesn't re-parse on every request.
+    pub(crate) agent_tokens: HashMap<String, String>,
 }
 
 /// Atomic counters powering the `/__metrics` Prometheus
@@ -94,6 +98,7 @@ impl Metrics {
 
 impl Inner {
     pub(crate) fn new(cfg: GatewayConfig) -> Arc<Self> {
+        let agent_tokens = cfg.parse_agent_tokens();
         Arc::new(Self {
             stop: AtomicBool::new(false),
             bound_port: AtomicU16::new(0),
@@ -103,6 +108,7 @@ impl Inner {
             cfg,
             meta_cache: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            agent_tokens,
         })
     }
 

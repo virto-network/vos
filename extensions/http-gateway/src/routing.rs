@@ -36,10 +36,17 @@ use crate::types::{Job, Request, Response};
 /// connection-side glue reads these from [`crate::config`] once and
 /// passes them through; tests construct policies directly to exercise
 /// each combination without touching the global singleton.
+///
+/// `agent_tokens` overrides the global `auth_token` per-agent —
+/// requests to `/<agent>/*` where the agent is in the map require
+/// the matching token, *instead of* the global one. Agents not in
+/// the map fall through to the global gate. Admin/schema/metrics
+/// paths are unaffected.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Policy<'a> {
     pub admin_token: Option<&'a str>,
     pub auth_token: Option<&'a str>,
+    pub agent_tokens: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// Wire-side dispatch. Runs in the connection task; turns one
@@ -73,7 +80,12 @@ async fn dispatch_inner(
     if let Some(response) = handle_metrics(&req, inner) {
         return response;
     }
-    if let Some(response) = check_auth(&req, policy.auth_token) {
+    // Per-agent auth overrides the global gate. If the URL is
+    // `/<agent>/*` and `agent_tokens` has an entry for that
+    // name, the per-agent token replaces the global one for this
+    // request. Falls back to the global token otherwise.
+    let effective_auth = effective_auth_for(&req, &policy);
+    if let Some(response) = check_auth(&req, effective_auth) {
         return response;
     }
     let (resp_tx, resp_rx) = oneshot::channel::<Response>();
@@ -114,6 +126,33 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
         "text/plain; version=0.0.4",
         body,
     ))
+}
+
+/// Pick the auth token to enforce for this request. Inspects
+/// `req.path` for the leading `/<agent>/`; if the agent name has
+/// an entry in `agent_tokens`, returns that token (per-agent
+/// override). Otherwise falls back to the global `auth_token`.
+///
+/// Paths that don't start with `/<agent>/` (the admin / schema /
+/// metrics namespaces, plus the empty path) return `None` here so
+/// `check_auth` immediately allows them — those endpoints have
+/// their own gating (admin token) or are intentionally public.
+fn effective_auth_for<'a>(req: &Request, policy: &Policy<'a>) -> Option<&'a str> {
+    // Only `/<agent>/<method>` URLs receive auth checks. The
+    // dispatch handler will 400 on missing method later anyway.
+    let trimmed = req.path.trim_start_matches('/');
+    let agent_name = trimmed.split_once('/').map(|(a, _)| a).unwrap_or(trimmed);
+    if agent_name.is_empty() || agent_name.starts_with('_') {
+        // `_admin`, `_schema`, `_metrics`, openapi: skip the
+        // dispatch-side auth entirely.
+        return None;
+    }
+    if let Some(tokens) = policy.agent_tokens
+        && let Some(t) = tokens.get(agent_name)
+    {
+        return Some(t.as_str());
+    }
+    policy.auth_token
 }
 
 /// Bearer-token gate. `None` if the request is allowed (either auth
@@ -851,6 +890,7 @@ mod tests {
             cfg: crate::config::GatewayConfig::default(),
             meta_cache: Mutex::new(std::collections::HashMap::new()),
             metrics: crate::state::Metrics::default(),
+            agent_tokens: std::collections::HashMap::new(),
         }
     }
 
@@ -896,6 +936,7 @@ mod tests {
             Policy {
                 admin_token: Some("expected"),
                 auth_token: None,
+                agent_tokens: None,
             },
         )
         .await;
@@ -913,6 +954,7 @@ mod tests {
             Policy {
                 admin_token: Some("expected"),
                 auth_token: None,
+                agent_tokens: None,
             },
         )
         .await;
@@ -935,6 +977,7 @@ mod tests {
             Policy {
                 admin_token: Some("secret"),
                 auth_token: None,
+                agent_tokens: None,
             },
         )
         .await;
@@ -956,6 +999,7 @@ mod tests {
             Policy {
                 admin_token: Some("secret"),
                 auth_token: None,
+                agent_tokens: None,
             },
         )
         .await;
@@ -975,6 +1019,7 @@ mod tests {
             Policy {
                 admin_token: None,
                 auth_token: Some("secret"),
+                agent_tokens: None,
             },
         )
         .await;
@@ -997,6 +1042,7 @@ mod tests {
             Policy {
                 admin_token: None,
                 auth_token: Some("secret"),
+                agent_tokens: None,
             },
         )
         .await;
@@ -1024,6 +1070,7 @@ mod tests {
             Policy {
                 admin_token: None,
                 auth_token: Some("secret"),
+                agent_tokens: None,
             },
         )
         .await;
@@ -1052,6 +1099,7 @@ mod tests {
             Policy {
                 admin_token: None,
                 auth_token: Some("secret"),
+                agent_tokens: None,
             },
         )
         .await;
@@ -1116,9 +1164,159 @@ mod tests {
             Policy {
                 admin_token: Some("secret"),
                 auth_token: None,
+                agent_tokens: None,
             },
         )
         .await;
         assert_eq!(resp.status, 404);
+    }
+
+    // ── Per-agent Bearer auth ─────────────────────────────────────
+    //
+    // Validates the `agent_tokens` override against the global
+    // `auth_token` and the public namespaces.
+
+    fn agent_tokens_for(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn per_agent_token_requires_match_for_that_agent() {
+        let inner = fresh_inner();
+        let (tx, rx) = channel();
+        let actor = tokio::task::spawn_blocking(move || {
+            // Drain whatever job arrives — test only cares about
+            // the auth path, not what the actor returns.
+            if let Ok(job) = rx.recv() {
+                let _ = job.resp_tx.send(Response::text(200, "ok"));
+            }
+        });
+        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
+        let resp = dispatch_request(
+            req(
+                "GET",
+                "/secret-agent/whoami",
+                &[("authorization", "Bearer agent-only-token")],
+                &[],
+            ),
+            &tx,
+            &inner,
+            Policy {
+                admin_token: None,
+                auth_token: None,
+                agent_tokens: Some(&tokens),
+            },
+        )
+        .await;
+        actor.await.expect("actor task");
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn per_agent_token_rejects_wrong_bearer() {
+        let inner = fresh_inner();
+        let (tx, _rx) = channel();
+        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
+        let resp = dispatch_request(
+            req(
+                "GET",
+                "/secret-agent/whoami",
+                &[("authorization", "Bearer wrong")],
+                &[],
+            ),
+            &tx,
+            &inner,
+            Policy {
+                admin_token: None,
+                auth_token: None,
+                agent_tokens: Some(&tokens),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn per_agent_token_overrides_global_for_that_agent() {
+        // Global gate is `global-token`; the per-agent override
+        // for `special` is `agent-token`. Hitting `/special/...`
+        // with the global token must 401 — the agent token is the
+        // only one that opens this agent.
+        let inner = fresh_inner();
+        let (tx, _rx) = channel();
+        let tokens = agent_tokens_for(&[("special", "agent-token")]);
+        let resp = dispatch_request(
+            req(
+                "GET",
+                "/special/foo",
+                &[("authorization", "Bearer global-token")],
+                &[],
+            ),
+            &tx,
+            &inner,
+            Policy {
+                admin_token: None,
+                auth_token: Some("global-token"),
+                agent_tokens: Some(&tokens),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn per_agent_falls_back_to_global_for_other_agents() {
+        // Only `special` is in the per-agent map. `regular` hits
+        // the global gate; the global token works.
+        let inner = fresh_inner();
+        let (tx, rx) = channel();
+        let actor = tokio::task::spawn_blocking(move || {
+            if let Ok(job) = rx.recv() {
+                let _ = job.resp_tx.send(Response::text(200, "ok"));
+            }
+        });
+        let tokens = agent_tokens_for(&[("special", "agent-token")]);
+        let resp = dispatch_request(
+            req(
+                "GET",
+                "/regular/foo",
+                &[("authorization", "Bearer global-token")],
+                &[],
+            ),
+            &tx,
+            &inner,
+            Policy {
+                admin_token: None,
+                auth_token: Some("global-token"),
+                agent_tokens: Some(&tokens),
+            },
+        )
+        .await;
+        actor.await.expect("actor task");
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_ignores_per_agent_tokens() {
+        // `/__metrics`, `/__schema`, `/openapi.json` are public —
+        // a per-agent gate shouldn't accidentally cover them.
+        let inner = fresh_inner();
+        let (tx, _rx) = channel();
+        let tokens = agent_tokens_for(&[("anything", "agent-token")]);
+        let resp = dispatch_request(
+            req("GET", "/__metrics", &[], &[]),
+            &tx,
+            &inner,
+            Policy {
+                admin_token: None,
+                auth_token: Some("global-token"),
+                agent_tokens: Some(&tokens),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, 200);
     }
 }

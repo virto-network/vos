@@ -19,23 +19,25 @@
 //! name = "gateway"
 //! path = "target/release/libhttp_gateway.so"
 //! init = {
-//!     bind_addr   = "0.0.0.0",
-//!     auth_token  = "abc123…",     # production: required for non-loopback
-//!     admin_token = "different…",  # production: required to expose /__admin
-//!     tls_cert    = "/etc/tls/cert.pem",
-//!     tls_key     = "/etc/tls/key.pem",
+//!     bind_addr     = "0.0.0.0",
+//!     auth_token    = "abc123…",     # production: required for non-loopback
+//!     admin_token   = "different…",  # production: required to expose /__admin
+//!     tls_cert      = "/etc/tls/cert.pem",
+//!     tls_key       = "/etc/tls/key.pem",
+//!     agent_tokens  = "math:tok1,greeter:tok2",  # per-agent override (optional)
 //! }
 //! ```
 //!
 //! ## Defaults (when the field is empty)
 //!
-//! | Field         | Default                                   |
-//! |---------------|-------------------------------------------|
-//! | `bind_addr`   | `127.0.0.1`                                |
-//! | `auth_token`  | none (open dispatch + WARN at startup)    |
-//! | `admin_token` | none (`/__admin/*` returns 404)           |
-//! | `tls_cert`    | none (h3 self-signs `localhost`, dev only)|
-//! | `tls_key`    | none (paired with `tls_cert`)             |
+//! | Field          | Default                                   |
+//! |----------------|-------------------------------------------|
+//! | `bind_addr`    | `127.0.0.1`                                |
+//! | `auth_token`   | none (open dispatch + WARN at startup)    |
+//! | `admin_token`  | none (`/__admin/*` returns 404)           |
+//! | `tls_cert`     | none (h3 self-signs `localhost`, dev only)|
+//! | `tls_key`      | none (paired with `tls_cert`)             |
+//! | `agent_tokens` | empty (no per-agent override)             |
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -54,6 +56,14 @@ pub(crate) struct GatewayConfig {
     pub(crate) admin_token: String,
     pub(crate) tls_cert: String,
     pub(crate) tls_key: String,
+    /// Per-agent Bearer tokens. Encoded as
+    /// `agent:token,agent:token` because manifest init args are
+    /// flat (no nested maps). Whitespace around `,` and `:` is
+    /// stripped. Empty entries skipped. When set for an agent,
+    /// requests to `/<agent>/*` require that token instead of
+    /// the global one — pre-`/<agent>/*` URLs (admin, schema,
+    /// metrics) ignore this entirely.
+    pub(crate) agent_tokens: String,
 }
 
 impl GatewayConfig {
@@ -86,6 +96,28 @@ impl GatewayConfig {
         let cert = self.tls_cert.as_str();
         let key = self.tls_key.as_str();
         (!cert.is_empty() && !key.is_empty()).then_some((cert, key))
+    }
+
+    /// Parse `agent_tokens` into a (agent_name → bearer_token) map.
+    /// Tolerant: empty / malformed entries skipped silently. The
+    /// returned map is built fresh on each call; callers cache it
+    /// in `Inner` so the parse is one-shot at boot.
+    pub(crate) fn parse_agent_tokens(&self) -> std::collections::HashMap<String, String> {
+        let raw = self.agent_tokens.trim();
+        if raw.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        raw.split(',')
+            .filter_map(|entry| {
+                let (agent, token) = entry.split_once(':')?;
+                let agent = agent.trim();
+                let token = token.trim();
+                if agent.is_empty() || token.is_empty() {
+                    return None;
+                }
+                Some((agent.to_string(), token.to_string()))
+            })
+            .collect()
     }
 }
 

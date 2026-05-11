@@ -166,6 +166,7 @@ async fn serve_request(
     let policy = Policy {
         admin_token: inner.cfg.admin_token(),
         auth_token: inner.cfg.auth_token(),
+        agent_tokens: (!inner.agent_tokens.is_empty()).then_some(&inner.agent_tokens),
     };
     let response = dispatch_request(our_req, &job_tx, &inner, policy).await;
     into_hyper(response)

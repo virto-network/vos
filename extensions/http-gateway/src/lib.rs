@@ -122,6 +122,7 @@ impl HttpGateway {
             admin_token: parsed.get_str("admin_token").unwrap_or_default(),
             tls_cert: parsed.get_str("tls_cert").unwrap_or_default(),
             tls_key: parsed.get_str("tls_key").unwrap_or_default(),
+            agent_tokens: parsed.get_str("agent_tokens").unwrap_or_default(),
         };
         let port = parsed
             .get_u32("port")
