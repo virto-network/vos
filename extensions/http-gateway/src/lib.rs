@@ -145,7 +145,18 @@ impl HttpGateway {
         let port = self.port;
         log::info!("http-gateway: starting on port {port}");
 
-        let inner = state::Inner::new(self.cfg.clone());
+        let inner = match state::Inner::new(self.cfg.clone()) {
+            Ok(i) => i,
+            Err(e) => {
+                // Bearer-auth config failure: refuse to boot
+                // rather than continue with weakened protection.
+                // `2` distinguishes this from a port-bind failure
+                // (`1`) so an operator inspecting `wait_status`
+                // can tell the two apart without scraping logs.
+                log::error!("http-gateway: config error: {e}");
+                return 2;
+            }
+        };
         if !runtime::claim_port(&inner, port) {
             return 1;
         }

@@ -99,25 +99,71 @@ impl GatewayConfig {
     }
 
     /// Parse `agent_tokens` into a (agent_name → bearer_token) map.
-    /// Tolerant: empty / malformed entries skipped silently. The
-    /// returned map is built fresh on each call; callers cache it
-    /// in `Inner` so the parse is one-shot at boot.
-    pub(crate) fn parse_agent_tokens(&self) -> std::collections::HashMap<String, String> {
+    /// Fails loudly on any malformed entry — a typo'd manifest
+    /// previously yielded a silently-unprotected agent, which is
+    /// the kind of regression a Bearer-auth config absolutely
+    /// shouldn't produce. Entry rules:
+    ///
+    ///   * Must contain exactly one `:` separating the agent name
+    ///     from the token.
+    ///   * Neither side may be empty after trim.
+    ///
+    /// Returns a human-readable error listing every malformed
+    /// position; gateway `run()` logs it and exits non-zero so the
+    /// host treats it as a hard config failure.
+    pub(crate) fn parse_agent_tokens(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
         let raw = self.agent_tokens.trim();
         if raw.is_empty() {
-            return std::collections::HashMap::new();
+            return Ok(std::collections::HashMap::new());
         }
-        raw.split(',')
-            .filter_map(|entry| {
-                let (agent, token) = entry.split_once(':')?;
-                let agent = agent.trim();
-                let token = token.trim();
-                if agent.is_empty() || token.is_empty() {
-                    return None;
-                }
-                Some((agent.to_string(), token.to_string()))
-            })
-            .collect()
+        let mut map = std::collections::HashMap::new();
+        let mut errors: Vec<String> = Vec::new();
+        for (idx, entry) in raw.split(',').enumerate() {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                errors.push(format!("entry #{}: empty (stray comma?)", idx + 1));
+                continue;
+            }
+            let Some((agent, token)) = entry.split_once(':') else {
+                errors.push(format!(
+                    "entry #{}: missing `:` separator in {entry:?}",
+                    idx + 1,
+                ));
+                continue;
+            };
+            let agent = agent.trim();
+            let token = token.trim();
+            if agent.is_empty() {
+                errors.push(format!("entry #{}: empty agent name", idx + 1));
+                continue;
+            }
+            if token.is_empty() {
+                errors.push(format!(
+                    "entry #{}: empty token for agent {agent:?}",
+                    idx + 1,
+                ));
+                continue;
+            }
+            if map.contains_key(agent) {
+                errors.push(format!(
+                    "entry #{}: duplicate agent {agent:?} (later entries would silently shadow)",
+                    idx + 1,
+                ));
+                continue;
+            }
+            map.insert(agent.to_string(), token.to_string());
+        }
+        if !errors.is_empty() {
+            return Err(format!(
+                "agent_tokens has {} malformed entr{}: {}",
+                errors.len(),
+                if errors.len() == 1 { "y" } else { "ies" },
+                errors.join("; "),
+            ));
+        }
+        Ok(map)
     }
 }
 
@@ -183,5 +229,79 @@ mod tests {
     fn header_value_returns_first_match() {
         let headers = vec![("x".into(), "first".into()), ("x".into(), "second".into())];
         assert_eq!(header_value(&headers, "x"), Some("first"));
+    }
+
+    fn cfg_with_tokens(s: &str) -> GatewayConfig {
+        GatewayConfig {
+            agent_tokens: s.to_string(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn parse_agent_tokens_empty_is_ok() {
+        let cfg = cfg_with_tokens("");
+        let m = cfg.parse_agent_tokens().expect("empty parses");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_tokens_happy_path() {
+        let cfg = cfg_with_tokens("math:tok1, greeter: tok2 ");
+        let m = cfg.parse_agent_tokens().expect("parses");
+        assert_eq!(m.get("math"), Some(&"tok1".to_string()));
+        assert_eq!(m.get("greeter"), Some(&"tok2".to_string()));
+    }
+
+    #[test]
+    fn parse_agent_tokens_missing_colon_errors() {
+        let cfg = cfg_with_tokens("math:tok1,malformed");
+        let err = cfg.parse_agent_tokens().expect_err("must reject");
+        assert!(
+            err.contains("missing `:`") && err.contains("malformed"),
+            "error should name the bad entry: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_agent_tokens_empty_token_errors() {
+        let cfg = cfg_with_tokens("math:tok1,greeter:");
+        let err = cfg.parse_agent_tokens().expect_err("must reject");
+        assert!(
+            err.contains("empty token") && err.contains("greeter"),
+            "error should name the offending agent: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_agent_tokens_empty_agent_errors() {
+        let cfg = cfg_with_tokens(":tok1");
+        let err = cfg.parse_agent_tokens().expect_err("must reject");
+        assert!(err.contains("empty agent name"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_agent_tokens_duplicate_agent_errors() {
+        // Without this guard, a typo'd manifest could shadow the
+        // first entry silently and you'd never know which token
+        // is live for the agent.
+        let cfg = cfg_with_tokens("math:tok1,math:tok2");
+        let err = cfg.parse_agent_tokens().expect_err("must reject");
+        assert!(
+            err.contains("duplicate") && err.contains("math"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_agent_tokens_aggregates_multiple_errors() {
+        // Operator deserves a complete diagnosis on one pass, not
+        // a "fix one, re-run, see the next one" loop.
+        let cfg = cfg_with_tokens("math:tok1,bad,:tok,greeter:");
+        let err = cfg.parse_agent_tokens().expect_err("must reject");
+        assert!(err.contains("3 malformed entries"), "got: {err}");
+        assert!(err.contains("missing `:`"), "got: {err}");
+        assert!(err.contains("empty agent name"), "got: {err}");
+        assert!(err.contains("empty token"), "got: {err}");
     }
 }

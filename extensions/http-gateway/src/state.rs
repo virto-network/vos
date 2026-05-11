@@ -117,9 +117,13 @@ impl Metrics {
 }
 
 impl Inner {
-    pub(crate) fn new(cfg: GatewayConfig) -> Arc<Self> {
-        let agent_tokens = cfg.parse_agent_tokens();
-        Arc::new(Self {
+    /// Build the per-instance runtime state. Fails when
+    /// `cfg.agent_tokens` doesn't parse — the gateway must not
+    /// silently boot with weakened auth, so the caller (`run`) is
+    /// expected to log + exit non-zero rather than fall back.
+    pub(crate) fn new(cfg: GatewayConfig) -> Result<Arc<Self>, String> {
+        let agent_tokens = cfg.parse_agent_tokens()?;
+        Ok(Arc::new(Self {
             stop: AtomicBool::new(false),
             bound_port: AtomicU16::new(0),
             requests: AtomicU64::new(0),
@@ -129,7 +133,7 @@ impl Inner {
             meta_cache: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             agent_tokens,
-        })
+        }))
     }
 
     /// `true` once a `serve*` is in flight and hasn't been asked to
