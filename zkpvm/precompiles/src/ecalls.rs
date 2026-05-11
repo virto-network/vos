@@ -4,24 +4,30 @@
 //! Always-on (no feature gate): these are tiny integer constants and
 //! both the `ristretto` and `blake2b` modules reference them.  Mirrors
 //! the corresponding constants in `zkpvm::core::ecall`.
+//!
+//! **Slot range**: javm's `dispatch_ecalli` rejects `imm > 127` with a
+//! fault, so every precompile ID fits in `0..=127` — packed into the
+//! contiguous `100..=114` block within javm's program-cap range
+//! (slots 64..=127). The original categorisation by hundreds
+//! (1xx hash, 2xx asymmetric crypto) didn't survive the imm budget.
 
 /// Ristretto255 scalar-mult precompile.
 /// Mirrors `zkpvm::core::ecall::ECALL_RISTRETTO_SCALAR_MULT`.
-pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 200;
+pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 110;
 
 /// Ristretto255 compressed-point addition precompile.
 /// Mirrors `zkpvm::core::ecall::ECALL_RISTRETTO_POINT_ADD`.
-pub const ECALL_RISTRETTO_POINT_ADD: u32 = 201;
+pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
 
 /// Wide-scalar reduction precompile.
 /// Mirrors `zkpvm::core::ecall::ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE`.
-pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 202;
+pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
 
 /// `Scalar * Scalar mod ℓ`.
-pub const ECALL_SCALAR_MUL_MOD_L: u32 = 203;
+pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 
 /// `Scalar + Scalar mod ℓ`.
-pub const ECALL_SCALAR_ADD_MOD_L: u32 = 204;
+pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 
 /// One blake2b compression per call.
 /// Mirrors `zkpvm::core::ecall::ECALL_BLAKE2B_COMPRESS`.

@@ -134,29 +134,49 @@ fn kread_hash(k: &InvocationKernel, addr: u32) -> [u8; 32] {
 
 /// Install the VOS-specific zkpvm-precompile slots as Protocol caps in
 /// the active VM's cap table. javm auto-installs slots 1..=28 (the
-/// spec-canonical protocol range) but leaves higher slots empty, and
-/// our precompiles squat at slot 100 (blake2b) and would-be 200..=204
-/// (ristretto, once those land via a javm imm > 127 fix). Without this
-/// install, `ecalli imm=100` falls into javm's `handle_call(100)` which
-/// finds no cap and returns RESULT_WHAT — the actor's inline asm
-/// doesn't check the return value, so `blake2b_hash` silently produces
-/// the IV-only hash (same bytes for every input), and any caller that
-/// uses it for keying (e.g. `space-registry`'s `instance_service_id`)
-/// gets a constant garbage ID instead of a per-input one.
+/// spec-canonical protocol range) but leaves higher slots empty, so
+/// each precompile slot has to be slotted in here before the actor's
+/// first `ecalli` against it. Without this, `ecalli imm=N` falls into
+/// `handle_call(N)` which finds no cap and returns RESULT_WHAT — the
+/// actor's inline asm doesn't check the return value, so the
+/// precompile silently no-ops and the actor gets garbage output.
 ///
-/// Call this once per kernel construction, before the first `run()`,
-/// for every refine entry path (`new_cached`, `new_warm`, and child
-/// `handle_invoke`). The chosen slot collides with javm's
-/// program-cap range (29..=63 via CREATE, 64..255 via MOVE); until
-/// javm grows native zkpvm-precompile support, we squat.
+/// Slot layout (`zkpvm/src/core/ecall.rs` is the source of truth):
+///
+///   100 = blake2b_compress
+///   110 = ristretto_scalar_mult
+///   111 = ristretto_point_add
+///   112 = scalar_from_bytes_mod_order_wide
+///   113 = scalar_mul_mod_l
+///   114 = scalar_add_mod_l
+///
+/// All fit in javm's `imm ≤ 127` budget. Call this once per kernel
+/// construction, before the first `run()`, for every refine entry
+/// path (`new_cached`, `new_warm`, and child `handle_invoke`). The
+/// slots collide with javm's program-cap range (29..=63 via CREATE,
+/// 64..=127 via MOVE); until javm grows native zkpvm-precompile
+/// support, we squat.
 fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
     use javm::cap::{Cap, ProtocolCap};
-    let slot = crate::crypto::ECALL_BLAKE2B_COMPRESS as u8;
-    kernel
-        .vm_arena
-        .vm_mut(kernel.active_vm)
-        .cap_table
-        .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+    // Source-of-truth IDs live in `zkpvm::core::ecall`, mirrored on
+    // the guest side in `zkpvm::precompiles::ecalls`. We import
+    // blake2b from `vos::crypto` (it's the only one with a host-side
+    // handler today); ristretto IDs are hardcoded here until vos
+    // grows its own handler — the install is a no-op for slots
+    // whose ECALL never fires.
+    let slots: [u8; 6] = [
+        crate::crypto::ECALL_BLAKE2B_COMPRESS as u8, // 100
+        110,                                         // ristretto_scalar_mult
+        111,                                         // ristretto_point_add
+        112,                                         // scalar_from_bytes_mod_order_wide
+        113,                                         // scalar_mul_mod_l
+        114,                                         // scalar_add_mod_l
+    ];
+    let vm = kernel.vm_arena.vm_mut(kernel.active_vm);
+    for &slot in &slots {
+        vm.cap_table
+            .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+    }
 }
 
 fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {

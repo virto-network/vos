@@ -2,6 +2,14 @@
 //! prover-only tracer.  Hostcall IDs are pure data — no execution semantics
 //! live here — so a no_std verifier can still classify them without pulling
 //! in `core::tracing`.
+//!
+//! **Slot range**: javm's `dispatch_ecalli` rejects `imm > 127` with a fault,
+//! so every precompile ID must fit in `0..=127`. The original layout used
+//! "categories by hundreds" (1xx hash, 2xx asymmetric crypto) but that
+//! exceeded the imm budget; everything is now packed into the contiguous
+//! `100..=114` block within javm's program-cap range (slots 64..=127). The
+//! categorisation is recoverable in comments — the wire ID is the only thing
+//! that matters for the chip surface.
 
 /// Hostcall ID for blake2b_compress precompile.
 /// Convention: φ[10]=ptr_h, φ[11]=ptr_m, φ[12]=t_low (counter bytes in message).
@@ -27,7 +35,7 @@ pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
 /// validate against expected output rather than treating zeros as
 /// "ok").  The chip's constraints will accept this output as the
 /// canonical "input was malformed" branch.
-pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 200;
+pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 110;
 
 /// Hostcall ID for Ristretto255 compressed-point addition precompile.
 ///
@@ -43,7 +51,7 @@ pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 200;
 /// `v·G + b·H` as one scalar-mult ECALL + one scalar-mult ECALL +
 /// one add ECALL — all the curve arithmetic happens host-side
 /// (chip-side under R1f-bis), no PVM-level field ops.
-pub const ECALL_RISTRETTO_POINT_ADD: u32 = 201;
+pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
 
 /// Hostcall ID for the Ristretto255 wide-scalar reduction precompile.
 ///
@@ -57,7 +65,7 @@ pub const ECALL_RISTRETTO_POINT_ADD: u32 = 201;
 /// always a canonical 32-byte scalar in [0, ℓ); the host-side
 /// reference goes through `curve25519-dalek` so the result agrees
 /// bit-for-bit with cipher-clerk's expected scalar values.
-pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 202;
+pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
 
 /// Hostcall ID for scalar multiplication mod ℓ (Schnorr/Ristretto
 /// scalar field).  Mirrors dalek's `Scalar * Scalar` public API.
@@ -66,8 +74,8 @@ pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 202;
 ///   φ[10] = a_ptr      (32 canonical bytes — Scalar mod ℓ)
 ///   φ[11] = b_ptr      (32 canonical bytes)
 ///   φ[12] = output_ptr (32 bytes — `(a * b) mod ℓ`, written)
-pub const ECALL_SCALAR_MUL_MOD_L: u32 = 203;
+pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 
 /// Hostcall ID for scalar addition mod ℓ.  Mirrors dalek's
 /// `Scalar + Scalar` public API.  Same convention as MUL above.
-pub const ECALL_SCALAR_ADD_MOD_L: u32 = 204;
+pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
