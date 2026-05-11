@@ -1,16 +1,14 @@
 //! Request routing.
 //!
-//! Three layers, from outside in:
+//! Two layers, outside in:
 //!
-//! 1. [`dispatch_request`] — wire-side entry. Runs the admin shortcut,
-//!    enforces `Authorization: Bearer <token>` if configured, then
-//!    pushes a `Job` for the actor to handle. Both the hyper and h3
-//!    paths land here after extracting an internal [`Request`] from
-//!    the wire format. Auth happens here so failed requests never
-//!    consume a job-queue slot.
-//! 2. [`handle_admin`] — direct `/__admin/*` routes, never round-trip
-//!    through the actor.
-//! 3. [`handle`] — actor-side. Pulls the `Job`, resolves the agent
+//! 1. [`dispatch_request`] — wire-side entry. Runs the `/__metrics`
+//!    shortcut, enforces `Authorization: Bearer <token>` if
+//!    configured, then pushes a `Job` for the actor to handle.
+//!    Both the hyper and h3 paths land here after extracting an
+//!    internal [`Request`] from the wire format. Auth happens
+//!    here so failed requests never consume a job-queue slot.
+//! 2. [`handle`] — actor-side. Pulls the `Job`, resolves the agent
 //!    name through the registry, dispatches via `ctx.ask`, and packs
 //!    the reply.
 //!
@@ -18,7 +16,7 @@
 //!
 //! ## Built-in routes (precedence + layer + auth)
 //!
-//! Five intercepts handle traffic before it reaches the fallback
+//! Four intercepts handle traffic before it reaches the fallback
 //! `/<agent>/<method>` dispatcher. Connection-side intercepts run
 //! ahead of the auth gate + job-queue admission so they never burn
 //! a job slot; actor-side intercepts need [`ServiceCtx`] for a
@@ -26,19 +24,28 @@
 //!
 //! | # | layer      | path                        | method   | auth          |
 //! |---|------------|-----------------------------|----------|---------------|
-//! | 1 | connection | `/__admin/stop`, `/status`  | POST/GET | `admin_token` |
-//! | 2 | connection | `/__metrics`                | GET      | public        |
-//! | 3 | actor      | `/__schema`, `/__schema/<a>`| GET      | public        |
-//! | 4 | actor      | `/openapi.json`             | GET      | public        |
-//! | 5 | actor      | `/<agent>/<method>`         | any      | varies†       |
+//! | 1 | connection | `/__metrics`                | GET      | public        |
+//! | 2 | actor      | `/__schema`, `/__schema/<a>`| GET      | public        |
+//! | 3 | actor      | `/openapi.json`             | GET      | public        |
+//! | 4 | actor      | `/<agent>/<method>`         | any      | varies†       |
 //!
 //! † `/<agent>/<method>` uses the global `auth_token` unless the
-//! manifest declared a per-agent override in `agent_tokens`. Admin
-//! / schema / metrics are unaffected by either token.
+//! manifest declared a per-agent override in `agent_tokens`.
+//! Schema / metrics are unaffected by either token.
 //!
 //! Adding a built-in: append a row here AND insert the `handle_*`
 //! call in either [`dispatch_inner`] (connection-side) or [`handle`]
 //! (actor-side) in the matching precedence slot.
+//!
+//! ## Removed: `/__admin/*` (Phase 6)
+//!
+//! `POST /__admin/stop` and `GET /__admin/status` previously rode
+//! a connection-side intercept gated by `admin_token`. Both are
+//! now reachable as `vosx gateway stop` / `vosx gateway status`
+//! through the registry-driven dispatch sidecar (Phase 5). The
+//! HTTP namespace is gone; `admin_token` was removed from
+//! [`crate::config::GatewayConfig`]; operators upgrading from a
+//! pre-Phase-6 build should switch their tooling to `vosx`.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -53,7 +60,7 @@ use vos::{Decode, Encode};
 
 use crate::config::{ct_eq, header_value};
 use crate::json::{parse_flat_json, value_to_json};
-use crate::state::{Inner, status_json};
+use crate::state::Inner;
 use crate::types::{Job, Request, Response};
 
 /// Per-request auth policy threaded through the wire path. The
@@ -64,18 +71,17 @@ use crate::types::{Job, Request, Response};
 /// `agent_tokens` overrides the global `auth_token` per-agent —
 /// requests to `/<agent>/*` where the agent is in the map require
 /// the matching token, *instead of* the global one. Agents not in
-/// the map fall through to the global gate. Admin/schema/metrics
+/// the map fall through to the global gate. Schema and metrics
 /// paths are unaffected.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Policy<'a> {
-    pub admin_token: Option<&'a str>,
     pub auth_token: Option<&'a str>,
     pub agent_tokens: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// Wire-side dispatch. Runs in the connection task; turns one
-/// internal [`Request`] into a [`Response`] using the admin shortcut,
-/// the auth gate, and the actor's job queue in that order.
+/// internal [`Request`] into a [`Response`] using the metrics
+/// shortcut, the auth gate, and the actor's job queue in that order.
 pub(crate) async fn dispatch_request(
     req: Request,
     job_tx: &mpsc::SyncSender<Job>,
@@ -83,9 +89,9 @@ pub(crate) async fn dispatch_request(
     policy: Policy<'_>,
 ) -> Response {
     let response = dispatch_inner(req, job_tx, inner, policy).await;
-    // Record every response — admin shortcuts, auth failures,
-    // job-queue rejections, and actor-dispatched results all
-    // count toward `vos_gateway_responses_total{status_class}`.
+    // Record every response — connection-side intercepts, auth
+    // failures, job-queue rejections, and actor-dispatched results
+    // all count toward `vos_gateway_responses_total{status_class}`.
     // `vos_gateway_requests_total` is the narrower
     // dispatched-to-actor counter, bumped inside `drain_jobs`.
     inner.metrics.record_response(response.status);
@@ -98,9 +104,6 @@ async fn dispatch_inner(
     inner: &Inner,
     policy: Policy<'_>,
 ) -> Response {
-    if let Some(response) = handle_admin(&req, inner, policy.admin_token) {
-        return response;
-    }
     if let Some(response) = handle_metrics(&req, inner) {
         return response;
     }
@@ -297,44 +300,6 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
         }
         None => Response::text(502, "upstream error or shutdown"),
     }
-}
-
-/// Direct admin endpoints — bypass `ctx.ask` so they work even while
-/// `serve()` is the only message in flight on the worker.
-///
-/// Auth: with `admin_token = None` the gateway returns 404 for the
-/// entire `/__admin/*` namespace so its existence isn't even
-/// disclosed. With `Some(expected)`, the request must carry a
-/// matching `X-Admin-Token` header (constant-time compared).
-///
-/// - `GET  /__admin/status` → JSON snapshot
-/// - `POST /__admin/stop`   → set the stop flag, reply 204
-pub(crate) fn handle_admin(
-    req: &Request,
-    inner: &Inner,
-    admin_token: Option<&str>,
-) -> Option<Response> {
-    if !req.path.starts_with("/__admin/") {
-        return None;
-    }
-    let Some(expected) = admin_token else {
-        return Some(Response::text(404, "not found"));
-    };
-    let provided = header_value(&req.headers, "x-admin-token");
-    if !provided.is_some_and(|t| ct_eq(t, expected)) {
-        return Some(Response::text(401, "unauthorized"));
-    }
-    Some(match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/__admin/status") => Response::json(200, status_json(inner).into_bytes()),
-        ("POST", "/__admin/stop") => {
-            inner.stop.store(true, Ordering::Relaxed);
-            Response::empty(204)
-        }
-        _ => Response::text(
-            404,
-            format!("unknown admin route {} {}", req.method, req.path),
-        ),
-    })
 }
 
 /// Self-documenting schema endpoints. Public — schema is no more
@@ -1001,102 +966,12 @@ mod tests {
         mpsc::sync_channel::<Job>(4)
     }
 
-    #[tokio::test]
-    async fn admin_disabled_returns_404() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req("GET", "/__admin/status", &[], &[]),
-            &tx,
-            &inner,
-            Policy::default(),
-        )
-        .await;
-        assert_eq!(resp.status, 404);
-    }
-
-    #[tokio::test]
-    async fn admin_no_token_returns_401() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req("GET", "/__admin/status", &[], &[]),
-            &tx,
-            &inner,
-            Policy {
-                admin_token: Some("expected"),
-                auth_token: None,
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn admin_wrong_token_returns_401() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req("GET", "/__admin/status", &[("x-admin-token", "wrong")], &[]),
-            &tx,
-            &inner,
-            Policy {
-                admin_token: Some("expected"),
-                auth_token: None,
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn admin_correct_token_status_returns_json() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/__admin/status",
-                &[("x-admin-token", "secret")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                admin_token: Some("secret"),
-                auth_token: None,
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.content_type, "application/json");
-        // Status JSON should contain the bound port we set in `fresh_inner`.
-        let body = std::str::from_utf8(&resp.body).expect("utf-8 body");
-        assert!(body.contains("\"port\":8080"), "body: {body}");
-    }
-
-    #[tokio::test]
-    async fn admin_stop_sets_flag_and_returns_204() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req("POST", "/__admin/stop", &[("x-admin-token", "secret")], &[]),
-            &tx,
-            &inner,
-            Policy {
-                admin_token: Some("secret"),
-                auth_token: None,
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 204);
-        assert!(resp.body.is_empty());
-        assert!(inner.stop.load(Ordering::Relaxed));
-    }
+    // /__admin/* admin namespace was removed in Phase 6; its
+    // stop / status semantics are now reachable as `vosx gateway
+    // stop` and `vosx gateway status` through the registry-driven
+    // dispatch path. Tests for the HTTP admin namespace deleted
+    // alongside the implementation; `gateway_pvm_e2e` step 12
+    // covers the replacement surface end-to-end.
 
     #[tokio::test]
     async fn auth_required_missing_returns_401() {
@@ -1107,7 +982,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("secret"),
                 agent_tokens: None,
             },
@@ -1130,7 +1004,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("secret"),
                 agent_tokens: None,
             },
@@ -1158,7 +1031,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("secret"),
                 agent_tokens: None,
             },
@@ -1187,7 +1059,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("secret"),
                 agent_tokens: None,
             },
@@ -1238,28 +1109,13 @@ mod tests {
         assert!(resp.body.starts_with(b"gateway saturated"));
     }
 
-    #[tokio::test]
-    async fn admin_path_with_unknown_method_returns_404() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req(
-                "DELETE",
-                "/__admin/whatever",
-                &[("x-admin-token", "secret")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                admin_token: Some("secret"),
-                auth_token: None,
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 404);
-    }
+    // `admin_path_with_unknown_method_returns_404` was removed in
+    // Phase 6 alongside the `/__admin/*` namespace. Such a request
+    // now falls through to the agent dispatcher, where the leading-
+    // underscore name (`__admin`) bypasses auth and hits a registry
+    // lookup that misses — 404. The fall-through itself is exercised
+    // by `unknown_agent_returns_404` in dispatch_e2e against the
+    // real wire path.
 
     // ── Per-agent Bearer auth ─────────────────────────────────────
     //
@@ -1295,7 +1151,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: None,
                 agent_tokens: Some(&tokens),
             },
@@ -1320,7 +1175,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: None,
                 agent_tokens: Some(&tokens),
             },
@@ -1348,7 +1202,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("global-token"),
                 agent_tokens: Some(&tokens),
             },
@@ -1379,7 +1232,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("global-token"),
                 agent_tokens: Some(&tokens),
             },
@@ -1401,7 +1253,6 @@ mod tests {
             &tx,
             &inner,
             Policy {
-                admin_token: None,
                 auth_token: Some("global-token"),
                 agent_tokens: Some(&tokens),
             },

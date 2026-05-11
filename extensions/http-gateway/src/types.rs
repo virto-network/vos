@@ -64,14 +64,6 @@ impl Response {
             body: msg.into().into_bytes(),
         }
     }
-
-    pub(crate) fn empty(status: u16) -> Self {
-        Self {
-            status,
-            content_type: "text/plain",
-            body: Vec::new(),
-        }
-    }
 }
 
 /// Shared error type for the HTTP/codec helpers — distinct from the

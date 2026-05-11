@@ -127,9 +127,6 @@ pub(crate) fn log_auth_warnings(inner: &Inner, port: u16) {
             "http-gateway: HTTP_GATEWAY_AUTH_TOKEN not set — dispatch is open to anyone reachable on {bind}:{port}"
         );
     }
-    if inner.cfg.admin_token().is_none() {
-        log::info!("http-gateway: HTTP_GATEWAY_ADMIN_TOKEN not set — /__admin/* disabled");
-    }
 }
 
 /// Block the caller until the protocol thread exits, with a hard cap.

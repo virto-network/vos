@@ -23,32 +23,15 @@ use common::{FixturePaths, TestNode};
 use serde_json::json;
 
 // ── Fixture sanity ──────────────────────────────────────────────
-
-#[test]
-fn gateway_boots_and_serves_admin_endpoint() {
-    let paths = FixturePaths::discover();
-    if !paths.all_present() {
-        paths.print_skip_hint();
-        return;
-    }
-    let node = TestNode::start(&paths);
-    let http = node.http();
-
-    let resp = http.get_with_header("/__admin/status", ("X-Admin-Token", node.admin_token));
-    resp.assert_status(200);
-    let v = resp.json();
-    assert!(
-        v.get("port").is_some(),
-        "status should include port: {:?}",
-        v
-    );
-
-    let bad = http.get_with_header("/__admin/status", ("X-Admin-Token", "wrong"));
-    bad.assert_status(401);
-
-    let no_token = http.get("/__admin/status");
-    no_token.assert_status(401);
-}
+//
+// `/__admin/stop` and `/__admin/status` (and the
+// `gateway_boots_and_serves_admin_endpoint` test that used to
+// exercise them) were removed in Phase 6. The gateway's
+// dispatch-side lifecycle now rides `vosx gateway stop` /
+// `vosx gateway status`; see the matching assertions in
+// `gateway_pvm_e2e`. Boot-time sanity is still covered by every
+// downstream test that calls `TestNode::start` — a failed boot
+// causes them to fail before their first request.
 
 #[test]
 fn gateway_caps_are_declared_on_the_so() {
@@ -494,7 +477,12 @@ fn mutating_state_persists_across_calls() {
 }
 
 #[test]
-fn admin_status_reflects_request_count() {
+fn metrics_reflect_request_count() {
+    // Replaces the pre-Phase-6 `admin_status_reflects_request_count`
+    // that scraped `GET /__admin/status`. The same dispatched-
+    // request counter now rides `GET /__metrics` as
+    // `vos_gateway_requests_total` — public, scrape-friendly,
+    // and survives the admin-namespace removal.
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -506,43 +494,23 @@ fn admin_status_reflects_request_count() {
     for _ in 0..5 {
         http.get("/counter/inc").assert_status(200);
     }
-    let status = http
-        .get_with_header("/__admin/status", ("X-Admin-Token", node.admin_token))
-        .json();
-    let requests = status
-        .get("requests")
-        .and_then(|v| v.as_u64())
-        .expect("status.requests");
+    let resp = http.get("/__metrics");
+    let body = resp.text();
+    let count = body
+        .lines()
+        .find_map(|l| l.strip_prefix("vos_gateway_requests_total "))
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("vos_gateway_requests_total missing from metrics: {body}"));
     assert!(
-        requests >= 5,
-        "expected >=5 requests counted, got {requests}; status={status}"
+        count >= 5,
+        "expected ≥5 requests counted, got {count}; metrics body:\n{body}",
     );
 }
 
-#[test]
-fn admin_stop_signals_gateway_to_exit() {
-    let paths = FixturePaths::discover();
-    if !paths.all_present() {
-        paths.print_skip_hint();
-        return;
-    }
-    let node = TestNode::start(&paths);
-    let http = node.http();
-
-    // POST /__admin/stop — expect 204 No Content.
-    let resp = http.request(
-        "POST",
-        "/__admin/stop",
-        &[("X-Admin-Token", node.admin_token)],
-        &[],
-    );
-    resp.assert_status(204);
-
-    // After stop, give the gateway a beat to drain. Subsequent
-    // connect attempts will eventually fail (port unbinds). We
-    // don't strictly assert that — the TestNode drop confirms
-    // clean shutdown semantics. Just confirm no panic before drop.
-}
+// `admin_stop_signals_gateway_to_exit` was removed in Phase 6.
+// The replacement assertion (`vosx gateway stop` actually flips
+// the stop flag and the gateway exits) lives in step 12 of
+// `gateway_pvm_e2e` where a real `vosx` daemon is up.
 
 // ── Concurrency ──────────────────────────────────────────────────
 

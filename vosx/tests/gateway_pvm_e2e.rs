@@ -235,7 +235,7 @@ consistency = "ephemeral"
 [[extension]]
 name = "gateway"
 path = "{gateway}"
-init = {{ bind_addr = "127.0.0.1", port = {port}, admin_token = "test-token" }}
+init = {{ bind_addr = "127.0.0.1", port = {port} }}
 "#,
         greeter = actor_elf("greeter").display(),
         counter = actor_elf("counter").display(),
@@ -334,27 +334,19 @@ fn extract_counter(body: &str, name: &str) -> u64 {
     0
 }
 
-/// Pull the running counter value out of the admin/status JSON.
-/// The status body is `{"port":...,"requests":N,...}`. Counted
-/// requests = real wire requests that made it past auth +
-/// admin shortcut, i.e. the dispatched ones.
-fn admin_request_count(daemon: &Daemon, token: &str) -> u64 {
-    let (status, body) = http_request(
-        daemon.port(),
-        "GET",
-        "/__admin/status",
-        Some(("X-Admin-Token", token)),
-        &[],
-    );
-    assert_eq!(status, 200, "admin status returned {status}");
-    let s = std::str::from_utf8(&body).expect("admin body utf-8");
-    let needle = "\"requests\":";
-    let off = s.find(needle).expect("admin body has 'requests' field");
-    let tail = &s[off + needle.len()..];
-    let end = tail
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(tail.len());
-    tail[..end].parse().expect("parse requests count")
+/// Pull the dispatched-request count out of the public
+/// `/__metrics` endpoint (`vos_gateway_requests_total` line).
+/// Replaces the pre-Phase-6 `admin_request_count` which read the
+/// same number from `/__admin/status`; the admin namespace is
+/// gone, the metrics endpoint stays.
+fn dispatch_request_count(daemon: &Daemon) -> u64 {
+    let (status, body) = http_request(daemon.port(), "GET", "/__metrics", None, &[]);
+    assert_eq!(status, 200, "/__metrics returned {status}");
+    let s = std::str::from_utf8(&body).expect("metrics body utf-8");
+    s.lines()
+        .find_map(|l| l.strip_prefix("vos_gateway_requests_total "))
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("vos_gateway_requests_total missing from metrics: {s}"))
 }
 
 #[test]
@@ -374,18 +366,15 @@ fn pvm_actors_via_gateway() {
     // the readiness probe AND the test's real first hit.
     wait_until_ready(daemon.port(), "/greeter/start");
 
-    // 1. Admin endpoint sanity check — confirms the gateway booted
-    //    cleanly and the admin-token wiring is right.
-    let count0 = admin_request_count(&daemon, "test-token");
+    // 1. Sanity check on the public dispatch counter — confirms
+    //    the gateway booted cleanly and counted the readiness
+    //    probe. (Pre-Phase-6 this scraped `/__admin/status`; the
+    //    same number now rides `/__metrics` as
+    //    `vos_gateway_requests_total`.)
+    let count0 = dispatch_request_count(&daemon);
     assert!(count0 >= 1, "readiness probe should have counted");
 
-    // 2. Without the admin token, /__admin/* must reject. Catches
-    //    config regressions where init args didn't reach the
-    //    gateway extension.
-    let (status, _body) = http_request(daemon.port(), "GET", "/__admin/status", None, &[]);
-    assert_eq!(status, 401, "admin without token must 401");
-
-    // 3. Dispatch to greeter. Empty handler returns () → 200 null.
+    // 2. Dispatch to greeter. Empty handler returns () → 200 null.
     //    A 200 here proves the *full* path is alive:
     //      gateway → registry (PVM) resolves "greeter" → invoke →
     //      greeter actor (PVM) runs `start()` → reply envelope →
@@ -780,8 +769,8 @@ fn pvm_actors_via_gateway() {
     //      no token. Asserts both the surface (HELP/TYPE lines)
     //      and a counter actually moved across all the requests
     //      we issued above. `responses_total{status_class="2xx"}`
-    //      must be at least 4 (admin status + 1 + 3 counter +
-    //      3 math + GET + schema + openapi + describe = many 2xx).
+    //      must be at least 4 (greeter + 3 counter + 3 math +
+    //      GET + schema + openapi = many 2xx).
     let (status, body) = http_request(daemon.port(), "GET", "/__metrics", None, &[]);
     assert_eq!(status, 200, "GET /__metrics expected 200, got {status}");
     let metrics_body = String::from_utf8_lossy(&body);
@@ -813,28 +802,28 @@ fn pvm_actors_via_gateway() {
         "expected ≥1 4xx response counted, got {fourxx}"
     );
 
-    // 11. Admin counter monotonically advances. Don't pin an exact
-    //     number — the readiness poll above can retry an unbounded
-    //     number of times depending on install timing — just
-    //     require it advanced by at least the dispatch requests
-    //     in steps 3–9 (greeter + 3 counter + 3 math + 1 GET +
-    //     404 + /__schema + /__schema/math + /__schema/missing
+    // 11. Dispatched-request counter monotonically advances. Don't
+    //     pin an exact number — the readiness poll above can retry
+    //     an unbounded number of times depending on install timing
+    //     — just require it advanced by at least the dispatch
+    //     requests in steps 3–9 (greeter + 3 counter + 3 math + 1
+    //     GET + 404 + /__schema + /__schema/math + /__schema/missing
     //     = 12). Step 10's `describe` invokes the registry via a
     //     fresh libp2p client, which doesn't go through the
     //     gateway's request counter, so it doesn't add here.
-    let count1 = admin_request_count(&daemon, "test-token");
+    let count1 = dispatch_request_count(&daemon);
     assert!(
         count1 >= count0 + 12,
         "expected counter to advance by ≥12, got {count0} → {count1}",
     );
 
     // 12. Phase 5: `vosx gateway status` returns the same JSON
-    //     snapshot `GET /__admin/status` does, and `vosx gateway
-    //     stop` actually flips the gateway's stop flag — same
-    //     wire path as Phase 4 dispatch, but landing on real
-    //     `vos_service_handle_invoke` handlers backed by `Inner`'s
-    //     atomics. Lives at the end of the test because stop
-    //     tears the daemon down.
+    //     snapshot the removed `GET /__admin/status` did, and
+    //     `vosx gateway stop` actually flips the gateway's stop
+    //     flag — same wire path as Phase 4 dispatch, landing on
+    //     real `vos_service_handle_invoke` handlers backed by
+    //     `Inner`'s atomics. Lives at the end of the test
+    //     because stop tears the daemon down.
     let out = Command::new(vosx_bin())
         .args(["--format", "json", "--space", "e2e", "gateway", "status"])
         .env("XDG_DATA_HOME", daemon._data_home.path())

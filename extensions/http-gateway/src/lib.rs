@@ -31,7 +31,7 @@
 //! drain loop calling `ctx.ask_raw` is serial, so dispatch throughput
 //! is bounded by upstream latency.
 //!
-//! ## Lifecycle (Phase 4 — service-mode extension)
+//! ## Lifecycle (service-mode extension)
 //!
 //! The gateway is a **service-mode extension** — the host calls
 //! `vos_extension_run` once and the gateway's `run(ctx)` body owns
@@ -39,17 +39,14 @@
 //!
 //! - `run(ctx)` — install config, bind on the configured port, drain
 //!   jobs until shutdown is signalled (via `ctx.is_shutdown()` or
-//!   `POST /__admin/stop`).
-//! - Admin endpoints work mid-flight (tokio runtime always alive):
-//!   - `POST /__admin/stop` — set the stop flag.
-//!   - `GET /__admin/status` — JSON snapshot.
-//!
-//! Both admin routes require `X-Admin-Token` matching the configured
-//! token; with no token, the entire `/__admin/*` namespace returns 404.
+//!   `vosx gateway stop`).
+//! - `vos_service_handle_invoke` runs on a sidecar dispatch thread
+//!   and handles `stop` / `status` — the operator-facing surface
+//!   reachable as `vosx gateway stop` / `vosx gateway status`.
 //!
 //! ## Operator config (manifest init args)
 //!
-//! Six knobs are passed via the manifest as a rkyv-encoded
+//! Five knobs are passed via the manifest as a rkyv-encoded
 //! `vos::value::Args`. Each one is empty by default; an empty value
 //! means "use the in-code default":
 //!
@@ -60,7 +57,6 @@
 //! init = {
 //!     bind_addr   = "0.0.0.0",
 //!     auth_token  = "...",
-//!     admin_token = "...",
 //!     tls_cert    = "/etc/tls/cert.pem",
 //!     tls_key     = "/etc/tls/key.pem",
 //!     port        = 8080,
@@ -71,14 +67,13 @@
 //! |---------------|-----------------------------------------------|
 //! | `bind_addr`   | `127.0.0.1` (loopback)                        |
 //! | `auth_token`  | none — open dispatch + WARN at startup        |
-//! | `admin_token` | none — `/__admin/*` returns 404               |
 //! | `tls_cert`    | none — h3 self-signs `localhost` (dev only)   |
 //! | `tls_key`     | none — paired with `tls_cert`                 |
 //! | `port`        | `8080`                                        |
 //!
-//! Defaults make a bare deployment loopback-only with admin disabled
-//! and dispatch open. A public deployment **must** set both tokens
-//! and override `bind_addr`.
+//! Defaults make a bare deployment loopback-only with dispatch open.
+//! A public deployment **must** set `auth_token` and override
+//! `bind_addr`.
 
 mod config;
 mod hyper_io;
@@ -106,10 +101,10 @@ pub struct HttpGateway {
     /// Live runtime state, populated by `run()` once the config
     /// passes validation. The dispatch sidecar
     /// (`vos_service_handle_invoke`) reads this through a shared
-    /// reference, so `stop` / `status` invokes see the same
-    /// atomics the HTTP `/__admin/*` shortcut writes/reads. Empty
-    /// until `run()` runs — invokes before then come back
-    /// `STATUS_NOT_FOUND` (handler responds "not ready").
+    /// reference, so `stop` / `status` invokes from
+    /// `vosx gateway stop` / `vosx gateway status` see the same
+    /// atomics. Empty until `run()` runs — invokes before then
+    /// come back `STATUS_NOT_FOUND` (handler responds "not ready").
     inner: std::sync::OnceLock<std::sync::Arc<state::Inner>>,
 }
 
@@ -127,7 +122,6 @@ impl HttpGateway {
         let cfg = config::GatewayConfig {
             bind_addr: parsed.get_str("bind_addr").unwrap_or_default(),
             auth_token: parsed.get_str("auth_token").unwrap_or_default(),
-            admin_token: parsed.get_str("admin_token").unwrap_or_default(),
             tls_cert: parsed.get_str("tls_cert").unwrap_or_default(),
             tls_key: parsed.get_str("tls_key").unwrap_or_default(),
             agent_tokens: parsed.get_str("agent_tokens").unwrap_or_default(),
@@ -144,9 +138,8 @@ impl HttpGateway {
     }
 
     /// Live runtime state, if `run()` has populated it. Used by
-    /// the `vos_service_handle_invoke` sidecar to expose `stop` /
-    /// `status` semantics consistent with the HTTP `/__admin/*`
-    /// shortcuts.
+    /// the `vos_service_handle_invoke` sidecar to back the
+    /// `vosx gateway stop` / `vosx gateway status` handlers.
     pub(crate) fn inner(&self) -> Option<&std::sync::Arc<state::Inner>> {
         self.inner.get()
     }

@@ -21,12 +21,18 @@
 //! init = {
 //!     bind_addr     = "0.0.0.0",
 //!     auth_token    = "abc123…",     # production: required for non-loopback
-//!     admin_token   = "different…",  # production: required to expose /__admin
 //!     tls_cert      = "/etc/tls/cert.pem",
 //!     tls_key       = "/etc/tls/key.pem",
 //!     agent_tokens  = "math:tok1,greeter:tok2",  # per-agent override (optional)
 //! }
 //! ```
+//!
+//! Lifecycle ops (`stop`, `status`) used to live behind a
+//! manifest-issued `admin_token` at `POST /__admin/stop` and
+//! `GET /__admin/status`. Phase 6 dropped that namespace; both
+//! are now `vosx gateway stop` / `vosx gateway status` through
+//! the registry-driven dispatch path. The `admin_token` field is
+//! gone from `GatewayConfig`.
 //!
 //! ## Defaults (when the field is empty)
 //!
@@ -34,7 +40,6 @@
 //! |----------------|-------------------------------------------|
 //! | `bind_addr`    | `127.0.0.1`                                |
 //! | `auth_token`   | none (open dispatch + WARN at startup)    |
-//! | `admin_token`  | none (`/__admin/*` returns 404)           |
 //! | `tls_cert`     | none (h3 self-signs `localhost`, dev only)|
 //! | `tls_key`      | none (paired with `tls_cert`)             |
 //! | `agent_tokens` | empty (no per-agent override)             |
@@ -53,7 +58,6 @@ use vos::log;
 pub(crate) struct GatewayConfig {
     pub(crate) bind_addr: String,
     pub(crate) auth_token: String,
-    pub(crate) admin_token: String,
     pub(crate) tls_cert: String,
     pub(crate) tls_key: String,
     /// Per-agent Bearer tokens. Encoded as
@@ -81,11 +85,6 @@ impl GatewayConfig {
 
     pub(crate) fn auth_token(&self) -> Option<&str> {
         let t = self.auth_token.as_str();
-        (!t.is_empty()).then_some(t)
-    }
-
-    pub(crate) fn admin_token(&self) -> Option<&str> {
-        let t = self.admin_token.as_str();
         (!t.is_empty()).then_some(t)
     }
 

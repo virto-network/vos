@@ -133,7 +133,6 @@ pub fn next_port() -> u16 {
 /// its own node, its own log spam.
 pub struct TestNode {
     pub port: u16,
-    pub admin_token: &'static str,
     shutdown: Arc<AtomicBool>,
     node_thread: Option<thread::JoinHandle<VosNode>>,
 }
@@ -148,10 +147,6 @@ impl TestNode {
     /// Returns once the gateway has bound the port (or after a 3s
     /// timeout, in which case calls to `http.*` will fail loudly).
     pub fn start(paths: &FixturePaths) -> Self {
-        Self::start_with_admin_token(paths, "dispatch-test-token")
-    }
-
-    pub fn start_with_admin_token(paths: &FixturePaths, admin_token: &'static str) -> Self {
         let port = next_port();
         let mut node = VosNode::new();
         let shutdown = node.shutdown_handle();
@@ -173,7 +168,6 @@ impl TestNode {
 
         let args = Args::new()
             .with("bind_addr", "127.0.0.1")
-            .with("admin_token", admin_token)
             .with("port", port as u32);
         node.register_extension(ExtensionConfig::with_args(&paths.gateway, &args));
 
@@ -187,7 +181,6 @@ impl TestNode {
 
         Self {
             port,
-            admin_token,
             shutdown,
             node_thread: Some(node_thread),
         }
@@ -275,6 +268,12 @@ impl HttpResponse {
                 self.body
             )
         })
+    }
+
+    /// Body as a borrowed str. Used by tests that scrape line-based
+    /// formats like Prometheus's `/__metrics`.
+    pub fn text(&self) -> &str {
+        &self.body
     }
 }
 

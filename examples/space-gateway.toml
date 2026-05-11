@@ -38,10 +38,8 @@
 #   curl -s http://localhost:18080/counter/start; echo
 #   curl -s http://localhost:18080/greeter/start; echo
 #
-#   # admin status — JSON object with port, requests counter, uptime
-#   curl -s -H 'X-Admin-Token: dev-only-token' \
-#       http://localhost:18080/__admin/status
-#   echo
+#   # status snapshot — JSON object with port, requests counter, uptime
+#   ./target/debug/vosx --space gw gateway status
 #
 #   # error paths
 #   curl -sw '\n%{http_code}\n' http://localhost:18080/nope/whatever
@@ -52,11 +50,8 @@
 #   curl -X DELETE -sw '\n%{http_code}\n' http://localhost:18080/counter/start
 #   #   → 405
 #
-#   # graceful stop — POST to admin endpoint
-#   curl -X POST -sw '\n%{http_code}\n' \
-#       -H 'X-Admin-Token: dev-only-token' \
-#       http://localhost:18080/__admin/stop
-#   #   → 204
+#   # graceful stop via the CLI dispatch path
+#   ./target/debug/vosx --space gw gateway stop
 #
 #   # daemon will exit; reap it
 #   wait
@@ -83,11 +78,12 @@ consistency = "ephemeral"
 # ── Gateway extension ────────────────────────────────────────────
 #
 # `port` is u32 in the wire format; the gateway clamps to u16
-# internally. `admin_token` gates `/__admin/*`; leave empty to
-# disable admin entirely. `bind_addr = "127.0.0.1"` keeps it
-# loopback-only.
+# internally. `bind_addr = "127.0.0.1"` keeps it loopback-only.
+# Lifecycle ops (`stop` / `status`) are reachable via
+# `vosx <space> gateway <cmd>`; the legacy `/__admin/*` HTTP
+# namespace was removed in Phase 6.
 
 [[extension]]
 name = "gateway"
 path = "../target/debug/libhttp_gateway.so"
-init = { bind_addr = "127.0.0.1", port = 18080, admin_token = "dev-only-token" }
+init = { bind_addr = "127.0.0.1", port = 18080 }
