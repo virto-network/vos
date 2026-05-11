@@ -41,6 +41,22 @@ impl Response {
         }
     }
 
+    /// Plain-text response with a non-default Content-Type. Used by
+    /// `/__metrics` to emit `text/plain; version=0.0.4` —
+    /// Prometheus's convention. `ct` must be a `'static` slice
+    /// (matches the type's storage shape).
+    pub(crate) fn with_content_type(
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
+        }
+    }
+
     pub(crate) fn text(status: u16, msg: impl Into<String>) -> Self {
         Self {
             status,

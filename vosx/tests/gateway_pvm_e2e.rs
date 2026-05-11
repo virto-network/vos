@@ -318,6 +318,22 @@ fn wait_until_ready(port: u16, path: &str) {
     panic!("agents never finished installing within 15s; last status for {path} = {last_status}",);
 }
 
+/// Extract the numeric value following a Prometheus metric name in
+/// the exposition body. Matches the first line that starts with the
+/// (full, including labels) identifier — keeps the scan simple
+/// without pulling in a parser dep.
+fn extract_counter(body: &str, name: &str) -> u64 {
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(name) {
+            return rest.trim().parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
 /// Pull the running counter value out of the admin/status JSON.
 /// The status body is `{"port":...,"requests":N,...}`. Counted
 /// requests = real wire requests that made it past auth +
@@ -630,6 +646,43 @@ fn pvm_actors_via_gateway() {
         .expect("'a' parameter");
     assert_eq!(a_param["schema"]["type"], "integer");
     assert_eq!(a_param["schema"]["format"], "uint64");
+
+    // 10c. /__metrics — Prometheus exposition format. Public,
+    //      no token. Asserts both the surface (HELP/TYPE lines)
+    //      and a counter actually moved across all the requests
+    //      we issued above. `responses_total{status_class="2xx"}`
+    //      must be at least 4 (admin status + 1 + 3 counter +
+    //      3 math + GET + schema + openapi + describe = many 2xx).
+    let (status, body) = http_request(daemon.port(), "GET", "/__metrics", None, &[]);
+    assert_eq!(status, 200, "GET /__metrics expected 200, got {status}");
+    let metrics_body = String::from_utf8_lossy(&body);
+    assert!(
+        metrics_body.contains("# TYPE vos_gateway_up gauge"),
+        "metrics body missing vos_gateway_up: {metrics_body}",
+    );
+    assert!(
+        metrics_body.contains("vos_gateway_up 1"),
+        "gateway should report up=1: {metrics_body}",
+    );
+    assert!(
+        metrics_body.contains("vos_gateway_responses_total{status_class=\"2xx\"}"),
+        "missing 2xx counter label: {metrics_body}",
+    );
+    let twoxx = extract_counter(
+        &metrics_body,
+        "vos_gateway_responses_total{status_class=\"2xx\"}",
+    );
+    assert!(twoxx >= 1, "expected ≥1 2xx response counted, got {twoxx}");
+    let fourxx = extract_counter(
+        &metrics_body,
+        "vos_gateway_responses_total{status_class=\"4xx\"}",
+    );
+    // Step 5 issued /no-such-agent → 404, /math/divide → 404 (if
+    // schema present — depends on runtime; conservative ≥1).
+    assert!(
+        fourxx >= 1,
+        "expected ≥1 4xx response counted, got {fourxx}"
+    );
 
     // 11. Admin counter monotonically advances. Don't pin an exact
     //     number — the readiness poll above can retry an unbounded

@@ -51,7 +51,26 @@ pub(crate) async fn dispatch_request(
     inner: &Inner,
     policy: Policy<'_>,
 ) -> Response {
+    let response = dispatch_inner(req, job_tx, inner, policy).await;
+    // Record every response — admin shortcuts, auth failures,
+    // job-queue rejections, and actor-dispatched results all
+    // count toward `vos_gateway_responses_total{status_class}`.
+    // `vos_gateway_requests_total` is the narrower
+    // dispatched-to-actor counter, bumped inside `drain_jobs`.
+    inner.metrics.record_response(response.status);
+    response
+}
+
+async fn dispatch_inner(
+    req: Request,
+    job_tx: &mpsc::SyncSender<Job>,
+    inner: &Inner,
+    policy: Policy<'_>,
+) -> Response {
     if let Some(response) = handle_admin(&req, inner, policy.admin_token) {
+        return response;
+    }
+    if let Some(response) = handle_metrics(&req, inner) {
         return response;
     }
     if let Some(response) = check_auth(&req, policy.auth_token) {
@@ -73,6 +92,28 @@ pub(crate) async fn dispatch_request(
     resp_rx
         .await
         .unwrap_or_else(|_| Response::text(500, "no response from actor"))
+}
+
+/// `GET /__metrics` — Prometheus exposition format. Public, no
+/// admin gate (matches Prometheus convention: scrapers don't auth).
+/// Connection-side because the render only touches atomics on
+/// `Inner` — no `ServiceCtx` round trip required.
+fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
+    if req.path != "/__metrics" {
+        return None;
+    }
+    if req.method != "GET" {
+        return Some(Response::text(405, "/__metrics is GET-only"));
+    }
+    let body = crate::state::render_prometheus(inner).into_bytes();
+    // Prometheus exposition convention. Some scrapers tolerate
+    // bare `text/plain` too, but the versioned content-type is
+    // the canonical form.
+    Some(Response::with_content_type(
+        200,
+        "text/plain; version=0.0.4",
+        body,
+    ))
 }
 
 /// Bearer-token gate. `None` if the request is allowed (either auth
@@ -809,6 +850,7 @@ mod tests {
             in_flight: AtomicU16::new(0),
             cfg: crate::config::GatewayConfig::default(),
             meta_cache: Mutex::new(std::collections::HashMap::new()),
+            metrics: crate::state::Metrics::default(),
         }
     }
 
