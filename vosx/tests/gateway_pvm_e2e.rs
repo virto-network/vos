@@ -489,6 +489,49 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&body),
     );
 
+    // 6b. Schema-aware error surface: an unknown method on a
+    //     known agent → 404 (not "200 null" like pre-schema).
+    let (status, body) = http_request(
+        daemon.port(),
+        "POST",
+        "/math/divide",
+        None,
+        br#"{"a":4,"b":2}"#,
+    );
+    assert_eq!(
+        status,
+        404,
+        "unknown method should 404 with schema present, got {status} body={:?}",
+        String::from_utf8_lossy(&body),
+    );
+    assert!(
+        body.windows(7).any(|w| w == b"unknown"),
+        "unknown method body should mention 'unknown', got {:?}",
+        String::from_utf8_lossy(&body),
+    );
+
+    // 6c. Schema-aware error surface: type-mismatched arg → 400
+    //     (not "200 null"). math.add expects u64; sending a
+    //     non-numeric string for `a` should fail at the gateway.
+    let (status, body) = http_request(
+        daemon.port(),
+        "GET",
+        "/math/add?a=notanumber&b=3",
+        None,
+        &[],
+    );
+    assert_eq!(
+        status,
+        400,
+        "type mismatch should 400 with schema present, got {status} body={:?}",
+        String::from_utf8_lossy(&body),
+    );
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("'a'") && body_str.contains("u64"),
+        "type-mismatch body should name the bad arg and its expected type, got {body_str:?}",
+    );
+
     // 7. /__schema → list of installed agents (JSON array of
     //    names). Public endpoint, no admin token. Sorted by
     //    instance_name on the registry side.

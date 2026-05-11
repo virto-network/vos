@@ -136,13 +136,22 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
 
     // Look up (and lazily cache) the actor's schema. With it,
     // `build_msg` can coerce query/JSON values to the handler's
-    // declared types; without it the request still flies, but
-    // numeric query args stay as strings and json U32/U64
-    // classification stays leaky.
+    // declared types AND reject unknown methods / type mismatches
+    // up front. Without meta the gateway falls back to today's
+    // permissive pass-through: pass whatever the wire produced
+    // and let the actor's `from_msg` decide.
     let meta = ensure_meta_cached(ctx, inner, target, &agent);
     let method_meta = meta
         .as_ref()
         .and_then(|m| m.messages.iter().find(|msg| msg.name == method).cloned());
+
+    // Typed-error gate: when the actor's schema is known and the
+    // requested method isn't in it, return 404 immediately. The
+    // legacy "200 null" path stays for actors that haven't
+    // registered meta (older binaries, hash drift).
+    if meta.is_some() && method_meta.is_none() {
+        return Response::text(404, format!("unknown method '{method}' on agent '{agent}'"));
+    }
 
     let msg = match build_msg(method, method_meta.as_ref(), req) {
         Ok(m) => m,
@@ -358,13 +367,27 @@ fn build_msg(
 ) -> core::result::Result<Msg, Response> {
     use vos::value::Value;
     let mut msg = Msg::new(method);
-    let coerce = |key: &str, v: Value| -> Value {
+    // Pulls the typed result from `coerce_to_type` when the
+    // schema is known and a field declaration matches; signals
+    // a failed parse via `Err(Response)` so build_msg can 400
+    // instead of silently passing through a wrong-typed value.
+    // When schema is unknown OR the field isn't in the
+    // declared list (typo, gateway-injected key), the original
+    // value passes through — preserves today's permissive
+    // pre-schema behaviour for that codepath.
+    let coerce = |key: &str, v: Value| -> Result<Value, Response> {
         let Some(meta) = method_meta else {
-            return v;
+            return Ok(v);
         };
-        match meta.fields.iter().find(|f| f.name == key) {
-            Some(field) => coerce_to_type(v, &field.ty),
-            None => v,
+        let Some(field) = meta.fields.iter().find(|f| f.name == key) else {
+            return Ok(v);
+        };
+        match coerce_to_type(v, &field.ty) {
+            Some(coerced) => Ok(coerced),
+            None => Err(Response::text(
+                400,
+                format!("arg '{}' expects type '{}'", key, field.ty),
+            )),
         }
     };
     match req.method.as_str() {
@@ -374,7 +397,7 @@ fn build_msg(
             // parse them into the declared type — `?n=5` becomes
             // `Value::U64(5)` when the handler signature is u64.
             for (k, v) in parse_query(&req.query) {
-                let typed = coerce(&k, Value::Str(v));
+                let typed = coerce(&k, Value::Str(v))?;
                 msg = msg.with(k, typed);
             }
         }
@@ -388,7 +411,7 @@ fn build_msg(
                     Response::text(400, "invalid JSON body")
                 })?;
                 for (k, v) in pairs {
-                    let typed = coerce(&k, v);
+                    let typed = coerce(&k, v)?;
                     msg = msg.with(k, typed);
                 }
             }
@@ -399,14 +422,13 @@ fn build_msg(
 }
 
 /// Coerce a `Value` into the variant matching a Rust type string
-/// from `ParsedMeta::messages[i].fields[j].ty`. Used by the gateway
-/// to bridge the JSON / query-string world (`Value::Str(_)` and
-/// untyped numeric `Value::U32/U64`) to the actor's declared
-/// signature. On a failed parse the original value passes through
-/// — the actor will then reject the wrong type and the gateway
-/// renders an empty reply. Bool/string/bytes pass through
-/// unchanged.
-fn coerce_to_type(v: vos::value::Value, ty: &str) -> vos::value::Value {
+/// from `ParsedMeta::messages[i].fields[j].ty`. Returns `Some(v)`
+/// on a successful coercion to the target type, `None` when the
+/// value can't fit. The caller surfaces `None` as a 400 type-
+/// mismatch when schema is known. Bool/string/bytes pass through
+/// when the input variant already matches — there's no narrowing
+/// to do for those.
+fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     use vos::value::Value;
     // Pull a string out for parse-based coercion (the GET path).
     let as_str = if let Value::Str(ref s) = v {
@@ -418,42 +440,41 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> vos::value::Value {
         "u8" => as_str
             .and_then(|s| s.parse::<u8>().ok())
             .map(Value::U8)
-            .or_else(|| v.as_u8().map(Value::U8))
-            .unwrap_or(v),
+            .or_else(|| v.as_u8().map(Value::U8)),
         "u16" => as_str
             .and_then(|s| s.parse::<u16>().ok())
             .map(Value::U16)
-            .or_else(|| v.as_u16().map(Value::U16))
-            .unwrap_or(v),
+            .or_else(|| v.as_u16().map(Value::U16)),
         "u32" => as_str
             .and_then(|s| s.parse::<u32>().ok())
             .map(Value::U32)
-            .or_else(|| v.as_u32().map(Value::U32))
-            .unwrap_or(v),
+            .or_else(|| v.as_u32().map(Value::U32)),
         "u64" => as_str
             .and_then(|s| s.parse::<u64>().ok())
             .map(Value::U64)
-            .or_else(|| v.as_u64().map(Value::U64))
-            .unwrap_or(v),
+            .or_else(|| v.as_u64().map(Value::U64)),
         "i32" => as_str
             .and_then(|s| s.parse::<i32>().ok())
             .map(Value::I32)
-            .or_else(|| v.as_i32().map(Value::I32))
-            .unwrap_or(v),
+            .or_else(|| v.as_i32().map(Value::I32)),
         "i64" => as_str
             .and_then(|s| s.parse::<i64>().ok())
             .map(Value::I64)
-            .or_else(|| v.as_i64().map(Value::I64))
-            .unwrap_or(v),
+            .or_else(|| v.as_i64().map(Value::I64)),
         "bool" => as_str
             .and_then(|s| s.parse::<bool>().ok())
             .map(Value::Bool)
-            .unwrap_or(v),
-        // String and complex types (Vec, bytes) pass through.
-        // The actor's macro-generated `from_msg` runs the typed
-        // accessor and rejects the message if the shape doesn't
-        // match — no silent corruption.
-        _ => v,
+            .or_else(|| v.as_bool().map(Value::Bool)),
+        "String" => match v {
+            Value::Str(_) => Some(v),
+            _ => None,
+        },
+        // Complex types we don't coerce — pass the original
+        // through unchanged so the actor's `from_msg` accessor
+        // gets a chance to evaluate the shape. Returning
+        // `Some(v)` here keeps the 400-on-failure check
+        // restricted to scalars the gateway is confident about.
+        _ => Some(v),
     }
 }
 
