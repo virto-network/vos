@@ -117,11 +117,15 @@ pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &Serv
 }
 
 fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
-    // `/__schema*` paths short-circuit the agent/method dispatcher.
-    // They still consume a job slot (actor-side) because the
-    // lookups need `ServiceCtx` to talk to the registry — handle_admin
-    // can't be used (it's connection-side, no ctx).
+    // `/__schema*` and `/openapi.json` paths short-circuit the
+    // agent/method dispatcher. They still consume a job slot
+    // (actor-side) because the lookups need `ServiceCtx` to talk
+    // to the registry — handle_admin can't be used (it's
+    // connection-side, no ctx).
     if let Some(resp) = handle_schema(req, inner, ctx) {
+        return resp;
+    }
+    if let Some(resp) = handle_openapi(req, inner, ctx) {
         return resp;
     }
 
@@ -324,6 +328,174 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
         "caps": meta.caps,
     })
     .to_string()
+}
+
+/// OpenAPI 3.0 document at `GET /openapi.json`. Walks every agent
+/// the registry knows about, fetches each one's schema (using the
+/// same `ensure_meta_cached` warm path as the dispatcher), and
+/// renders one `paths./<agent>/<method>` entry per `#[msg]`. Public,
+/// no admin token — same threat model as `/__schema/*`.
+///
+/// Type mapping for arg shapes mirrors what `coerce_to_type`
+/// accepts on the way in (so the documented surface and the
+/// reality match):
+///   `u8/u16/u32/u64`  → `integer` (`uint8`/`uint16`/`uint32`/`uint64`)
+///   `i32/i64`         → `integer` (`int32`/`int64`)
+///   `bool`            → `boolean`
+///   `String`          → `string`
+///   `Vec<u8>`         → `string` (`byte`)
+///   `Vec<u32>`        → `array` of integers
+///   `Vec<String>`     → `array` of strings
+///   any other         → `string` (fallback — generic UI still works)
+fn handle_openapi(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Option<Response> {
+    if req.path != "/openapi.json" {
+        return None;
+    }
+    if req.method != "GET" {
+        return Some(Response::text(405, "/openapi.json is GET-only"));
+    }
+    Some(render_openapi(inner, ctx))
+}
+
+fn render_openapi(inner: &Inner, ctx: &ServiceCtx) -> Response {
+    // 1. Get every installed agent's name.
+    let names = {
+        let msg = Msg::new("agent_names");
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(vos::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        let Some(bytes) = ctx.ask_raw(ServiceId::REGISTRY.0, &payload) else {
+            return Response::text(502, "registry unreachable");
+        };
+        if bytes.is_empty() {
+            Vec::new()
+        } else {
+            let value: vos::value::Value = vos::value::Value::decode(&bytes);
+            value.as_list_str().map(|s| s.to_vec()).unwrap_or_default()
+        }
+    };
+
+    // 2. For each agent, fetch its schema (cache-warm) and
+    //    render the per-method routes.
+    let mut paths_obj = serde_json::Map::new();
+    for name in &names {
+        let Some(target) = resolve(ctx, name) else {
+            continue;
+        };
+        let Some(meta) = ensure_meta_cached(ctx, inner, target, name) else {
+            continue;
+        };
+        for msg in &meta.messages {
+            let path_key = format!("/{}/{}", name, msg.name);
+            paths_obj.insert(path_key, openapi_operation_for(&meta.actor_name, msg));
+        }
+    }
+
+    let doc = serde_json::json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "VOS gateway",
+            "version": "1.0",
+            "description": "Auto-generated from installed-agent schemas (see GET /__schema)."
+        },
+        "paths": paths_obj,
+    });
+
+    Response::json(
+        200,
+        serde_json::to_vec(&doc).unwrap_or_else(|_| b"{}".to_vec()),
+    )
+}
+
+/// Render one `#[msg]` as an OpenAPI `pathItem` entry. Picks
+/// GET for `is_query` handlers (read-only `&self`) with args
+/// going into the query string, POST for everything else with
+/// args going into a JSON body. Both shapes match what the
+/// gateway actually dispatches via `build_msg`.
+fn openapi_operation_for(
+    actor_name: &str,
+    msg: &vos::metadata::ParsedMessage,
+) -> serde_json::Value {
+    let http_method = if msg.is_query { "get" } else { "post" };
+    let summary = format!("{actor_name}::{}", msg.name);
+    let operation_id = format!("{actor_name}_{}", msg.name);
+
+    if msg.is_query {
+        let parameters: Vec<_> = msg
+            .fields
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "name": f.name,
+                    "in": "query",
+                    "required": true,
+                    "schema": vos_ty_to_openapi(&f.ty),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            http_method: {
+                "summary": summary,
+                "operationId": operation_id,
+                "parameters": parameters,
+                "responses": { "200": { "description": "JSON-encoded return value" } }
+            }
+        })
+    } else {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for f in &msg.fields {
+            properties.insert(f.name.clone(), vos_ty_to_openapi(&f.ty));
+            required.push(f.name.clone());
+        }
+        serde_json::json!({
+            http_method: {
+                "summary": summary,
+                "operationId": operation_id,
+                "requestBody": {
+                    "required": !msg.fields.is_empty(),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": properties,
+                                "required": required,
+                            }
+                        }
+                    }
+                },
+                "responses": { "200": { "description": "JSON-encoded return value" } }
+            }
+        })
+    }
+}
+
+/// Map a vos type-string to an OpenAPI 3 schema. Mirrors the
+/// types `coerce_to_type` recognises; unknown types fall
+/// through to `{ "type": "string" }` so the operation is
+/// still inspectable, just less precisely typed than ideal.
+fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
+    match ty {
+        "u8" => serde_json::json!({ "type": "integer", "format": "uint8" }),
+        "u16" => serde_json::json!({ "type": "integer", "format": "uint16" }),
+        "u32" => serde_json::json!({ "type": "integer", "format": "uint32" }),
+        "u64" => serde_json::json!({ "type": "integer", "format": "uint64" }),
+        "i32" => serde_json::json!({ "type": "integer", "format": "int32" }),
+        "i64" => serde_json::json!({ "type": "integer", "format": "int64" }),
+        "bool" => serde_json::json!({ "type": "boolean" }),
+        "String" => serde_json::json!({ "type": "string" }),
+        "Vec<u8>" => serde_json::json!({ "type": "string", "format": "byte" }),
+        "Vec<u32>" => serde_json::json!({
+            "type": "array",
+            "items": { "type": "integer", "format": "uint32" }
+        }),
+        "Vec<String>" => serde_json::json!({
+            "type": "array",
+            "items": { "type": "string" }
+        }),
+        _ => serde_json::json!({ "type": "string" }),
+    }
 }
 
 fn split_path(path: &str) -> Option<(String, String)> {

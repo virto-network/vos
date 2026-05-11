@@ -602,6 +602,35 @@ fn pvm_actors_via_gateway() {
         "describe should list math.multiply: {cli_meta}",
     );
 
+    // 10b. /openapi.json — auto-generated from registered schemas.
+    //      Asserts the doc shape: openapi version, math.add /
+    //      math.multiply paths each with the right HTTP method,
+    //      and that the u64 arg type maps to the proper OpenAPI
+    //      integer/format pair.
+    let (status, body) = http_request(daemon.port(), "GET", "/openapi.json", None, &[]);
+    assert_eq!(status, 200, "GET /openapi.json expected 200, got {status}");
+    let doc: serde_json::Value = serde_json::from_slice(&body).expect("/openapi.json returns JSON");
+    assert_eq!(doc["openapi"], "3.0.3");
+    let paths = doc["paths"].as_object().expect("paths is object");
+    assert!(
+        paths.contains_key("/math/add"),
+        "/math/add should be in openapi paths"
+    );
+    let add_op = &paths["/math/add"];
+    // math.add is `&self → u64` so is_query=true → GET.
+    let get_op = &add_op["get"];
+    assert!(
+        !get_op.is_null(),
+        "math.add should expose GET (query handler)"
+    );
+    let params = get_op["parameters"].as_array().expect("parameters array");
+    let a_param = params
+        .iter()
+        .find(|p| p["name"] == "a")
+        .expect("'a' parameter");
+    assert_eq!(a_param["schema"]["type"], "integer");
+    assert_eq!(a_param["schema"]["format"], "uint64");
+
     // 11. Admin counter monotonically advances. Don't pin an exact
     //     number — the readiness poll above can retry an unbounded
     //     number of times depending on install timing — just
