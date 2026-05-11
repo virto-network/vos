@@ -403,21 +403,17 @@ fn malformed_json_body_yields_400() {
 }
 
 #[test]
-fn missing_required_arg_yields_502() {
-    // The gateway's schema-aware coercion catches per-arg type
-    // mismatches at 400, but doesn't yet enforce "all declared
-    // args present" — `{"a":2}` to `add(a, b)` reaches the actor
-    // with only `a` set. The actor's macro-generated `from_msg`
-    // returns None for the missing-`b` case, the worker poll
-    // returns POLL_ERR_NO_FUTURE, the host encodes STATUS_PANICKED
-    // in the invoke envelope, and the gateway maps the failure
-    // to 502. Pre-status-byte this collapsed to "200 null"
-    // alongside legitimate `()` returns.
+fn missing_required_arg_yields_400() {
+    // Schema-aware required-arg check: `add(a, b)` declares both
+    // fields, sending only `{"a":2}` is a malformed request rather
+    // than a server-side failure. Gateway 400s with the missing
+    // field name in the body — clients can fix their request
+    // without round-tripping the actor.
     //
-    // A schema-aware "missing required field" 400 would be a
-    // cleaner surface than 502 — the gateway has the field list
-    // already. Filed as a small follow-up; for now 502 is the
-    // right "something went wrong server-side" code.
+    // Pre-schema this collapsed to "200 null" (actor's from_msg
+    // returns None silently); post-schema-coercion-only it was
+    // 502 (POLL_ERR_NO_FUTURE → STATUS_PANICKED → unwrap None);
+    // now we cut it short at the gateway with a useful body.
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -427,7 +423,12 @@ fn missing_required_arg_yields_502() {
     let http = node.http();
 
     let resp = http.post_json("/kitchen/add", r#"{"a":2}"#); // missing b
-    resp.assert_status(502);
+    resp.assert_status(400);
+    assert!(
+        resp.body.contains("missing required arg") && resp.body.contains("'b'"),
+        "expected missing-arg body, got {:?}",
+        resp.body,
+    );
 }
 
 // ── State + lifecycle ────────────────────────────────────────────

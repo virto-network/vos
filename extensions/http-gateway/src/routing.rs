@@ -539,6 +539,7 @@ fn build_msg(
 ) -> core::result::Result<Msg, Response> {
     use vos::value::Value;
     let mut msg = Msg::new(method);
+    let mut seen_keys: Vec<String> = Vec::new();
     // Pulls the typed result from `coerce_to_type` when the
     // schema is known and a field declaration matches; signals
     // a failed parse via `Err(Response)` so build_msg can 400
@@ -570,6 +571,7 @@ fn build_msg(
             // `Value::U64(5)` when the handler signature is u64.
             for (k, v) in parse_query(&req.query) {
                 let typed = coerce(&k, Value::Str(v))?;
+                seen_keys.push(k.clone());
                 msg = msg.with(k, typed);
             }
         }
@@ -584,11 +586,30 @@ fn build_msg(
                 })?;
                 for (k, v) in pairs {
                     let typed = coerce(&k, v)?;
+                    seen_keys.push(k.clone());
                     msg = msg.with(k, typed);
                 }
             }
         }
         other => return Err(Response::text(405, format!("method {other} not allowed"))),
+    }
+    // Schema-aware missing-arg check. Every field the handler
+    // declares must show up in the parsed args — otherwise the
+    // actor's `from_msg` would silently return None and the
+    // request would round-trip to a 502. Surface as 400 with
+    // the missing field name so clients can fix their request.
+    // Skipped when no schema is registered (legacy permissive
+    // path): without meta the gateway has no way to know what
+    // "required" means.
+    if let Some(meta) = method_meta {
+        for field in &meta.fields {
+            if !seen_keys.iter().any(|k| k.as_str() == field.name) {
+                return Err(Response::text(
+                    400,
+                    format!("missing required arg '{}'", field.name),
+                ));
+            }
+        }
     }
     Ok(msg)
 }
