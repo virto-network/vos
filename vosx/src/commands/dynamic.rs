@@ -85,6 +85,14 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             vos::metadata::decode(&meta_bytes)
         };
 
+        // Side-effect: write the decoded schema back to the
+        // CLI cache so `vosx --help` can discover this target
+        // without dialling the daemon. Strictly an optimisation
+        // — failures are swallowed inside `update_target`.
+        if let Some(m) = &meta {
+            crate::cli_cache::update_target(&space, target, m);
+        }
+
         let Some(method) = method else {
             // `vosx <target>` (or `--help`) → list surface.
             return print_target_surface(target, meta.as_ref(), parsed.wants_help);

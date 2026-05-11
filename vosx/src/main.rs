@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 mod blob_store;
 mod bundled;
+mod cli_cache;
 mod commands;
 mod help_schema;
 mod output;
@@ -133,6 +134,24 @@ fn main() {
     // Anything else falls through to `Cli::parse()` so clap's
     // own --help / --version / parse-error machinery stays intact.
     let raw_argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // Top-level `vosx --help` / `vosx -h` / `vosx help` gets a
+    // post-script with cache-discovered targets so a user
+    // skimming the help can see e.g. `gateway`, `math`,
+    // `counter` listed alongside the built-in subcommands.
+    // Subcommand help (`vosx space --help`) is unchanged —
+    // clap handles those before we'd see them.
+    if is_top_level_help(&raw_argv) {
+        let mut cmd = Cli::command();
+        let _ = cmd.print_help();
+        println!();
+        if let Some(summary) = cli_cache::render_summary() {
+            println!();
+            print!("{summary}");
+        }
+        return;
+    }
+
     if should_dynamic_dispatch(&raw_argv) {
         // Mirror the global-flag side-effects clap would have
         // applied. Verbose + format are read off the same argv
@@ -187,6 +206,32 @@ fn main() {
             }
         },
     }
+}
+
+/// `true` when argv is asking for the top-level `--help` /
+/// `-h` and nothing else of substance — so we can intercept,
+/// print clap's standard help, and append the cache-derived
+/// "discovered targets" section. Subcommand help
+/// (`vosx space --help`) is excluded so clap's own help
+/// machinery handles it cleanly.
+fn is_top_level_help(argv: &[String]) -> bool {
+    let mut saw_help = false;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--help" | "-h" | "help" => saw_help = true,
+            // Global no-value flags we tolerate alongside --help.
+            "-v" | "--verbose" => {}
+            // Global value-taking flags — skip the value too.
+            "--format" => i += 1,
+            s if s.starts_with("--format=") => {}
+            // Anything else (built-in subcommand, dynamic verb,
+            // unknown flag) → not a pure top-level help.
+            _ => return false,
+        }
+        i += 1;
+    }
+    saw_help
 }
 
 /// Decide whether argv should bypass clap into the dynamic
@@ -288,7 +333,7 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::should_dynamic_dispatch;
+    use super::{is_top_level_help, should_dynamic_dispatch};
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -360,5 +405,41 @@ mod routing_tests {
     fn format_before_builtin_verb_still_uses_clap() {
         // `--format json space agents demo` — clap can handle it.
         assert!(!should_dynamic_dispatch(&s(&["--format", "json", "space"])));
+    }
+
+    #[test]
+    fn top_level_help_recognises_flag_variants() {
+        // The intercept point in `main` keys on this to decide
+        // whether to render the extended help (clap output +
+        // cache-derived target list).
+        assert!(is_top_level_help(&s(&["--help"])));
+        assert!(is_top_level_help(&s(&["-h"])));
+        assert!(is_top_level_help(&s(&["help"])));
+    }
+
+    #[test]
+    fn top_level_help_tolerates_globals() {
+        // `vosx --format json --help` is still a top-level
+        // help request; we want the JSON-mode help output too.
+        assert!(is_top_level_help(&s(&["--format", "json", "--help"])));
+        assert!(is_top_level_help(&s(&["-v", "--help"])));
+        assert!(is_top_level_help(&s(&["--format=json", "-h"])));
+    }
+
+    #[test]
+    fn top_level_help_excludes_subcommand_help() {
+        // `vosx space --help` is subcommand help — clap should
+        // handle that path, not our extended renderer.
+        assert!(!is_top_level_help(&s(&["space", "--help"])));
+        assert!(!is_top_level_help(&s(&["run", "--help"])));
+    }
+
+    #[test]
+    fn top_level_help_without_flag_is_not_help() {
+        // Just to make sure tolerating globals didn't accidentally
+        // treat plain `--format json` as a help request.
+        assert!(!is_top_level_help(&s(&[])));
+        assert!(!is_top_level_help(&s(&["--format", "json"])));
+        assert!(!is_top_level_help(&s(&["-v"])));
     }
 }

@@ -678,6 +678,34 @@ fn pvm_actors_via_gateway() {
         "unknown target must give a clear error: {stderr}",
     );
 
+    // 10a-cache. The previous `vosx --space e2e math add` round
+    //            wrote the math schema into the per-space CLI
+    //            cache at `<XDG_CONFIG_HOME>/vosx/cli_cache.toml`.
+    //            `vosx --help` should now surface `math` as a
+    //            discoverable target without re-dialling the
+    //            daemon (proves the cache survives across
+    //            invocations and the post-help renderer reads it).
+    let out = Command::new(vosx_bin())
+        .args(["--help"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx --help");
+    assert!(
+        out.status.success(),
+        "vosx --help failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("Discovered targets"),
+        "vosx --help should include cache-derived section, got:\n{help}",
+    );
+    assert!(
+        help.contains("e2e") && help.contains("math"),
+        "vosx --help should list cached target `math` in space `e2e`, got:\n{help}",
+    );
+
     // 10a. Same CLI, but pointed at the gateway *extension* instead
     //      of a PVM agent. Phase 3 wired vosx reconcile to forward
     //      `[[extension]]` meta to the registry's `register_extension_meta`;
