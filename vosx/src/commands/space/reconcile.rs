@@ -302,6 +302,33 @@ fn reconcile_one(
         }
     };
 
+    // 2b. Forward the program's metadata blob to the registry so
+    //     downstream consumers (gateway, schema CLIs) can fetch a
+    //     per-method type signature. Idempotent — re-registering
+    //     the same hash overwrites. Older binaries built before
+    //     `.vos_meta` lands as a section just skip this step;
+    //     the registry's `meta_for_*` queries will return empty
+    //     and consumers fall back to whatever heuristic they
+    //     have today.
+    if let Some(meta_blob) = vos::metadata::raw_section_from_elf(&elf_bytes) {
+        let status =
+            vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob))
+                .map_err(|e| anyhow::anyhow!("registry.register_meta('{program_name}'): {e}"))?;
+        if status != STATUS_OK {
+            // Don't fail the install — meta registration is a
+            // nice-to-have. Log so a future operator can spot
+            // schema drift.
+            tracing::warn!(
+                "register_meta('{program_name}') returned status {status}; \
+                 schema-aware coercion disabled for this agent",
+            );
+        } else {
+            tracing::debug!("registered meta for {program_name}:{program_version}");
+        }
+    } else {
+        tracing::debug!("{program_name}:{program_version} has no .vos_meta section; skipping",);
+    }
+
     // 3. Ensure installed.
     let already_installed = vos::block_on(reg.agent(&mut &*node, agent.name.clone()))
         .map_err(|e| anyhow::anyhow!("registry.agent('{}'): {e}", agent.name))?;

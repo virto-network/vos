@@ -471,6 +471,18 @@ mod decode {
         decode(section_data)
     }
 
+    /// Raw bytes of the `.vos_meta` ELF section, without decoding.
+    /// Used by `vosx` to forward the schema verbatim to the
+    /// space-registry's `register_meta` handler, which stores it
+    /// opaquely keyed by program hash. The registry then serves
+    /// the same bytes back to consumers (the gateway, CLIs) which
+    /// run `decode` to get a `ParsedMeta`. Skipping decode here
+    /// keeps the registry schema-agnostic across vos versions —
+    /// only the encoder and the consumer need to agree.
+    pub fn raw_section_from_elf(elf_data: &[u8]) -> Option<Vec<u8>> {
+        find_elf_section(elf_data, b".vos_meta").map(|s| s.to_vec())
+    }
+
     /// Find a named section in a 64-bit little-endian ELF.
     fn find_elf_section<'a>(elf: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         if elf.len() < 64 {
