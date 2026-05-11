@@ -118,6 +118,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
     constructor: &[],
     kind: 0,
     caps: &[],
+    cli_methods: &[],
 };
 
 /// Pre-encoded meta blob — same wire bytes the bundled registry's

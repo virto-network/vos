@@ -16,8 +16,24 @@
 //!     [name_len:u16 LE][name_bytes...]
 //!     [ty_len:u16 LE][ty_bytes...]
 //!   ...
-//! ...
+//! [ctor_count:u16 LE]
+//!   [name_len:u16 LE][name_bytes...]
+//!   [ty_len:u16 LE][ty_bytes...]
+//!   ...
+//! [kind:u8]
+//! [caps_count:u16 LE]
+//!   [name_len:u16 LE][name_bytes...]
+//!   ...
+//! [cli_methods_count:u16 LE]
+//!   [name_len:u16 LE][name_bytes...]
+//!   ...
 //! ```
+//!
+//! Each trailing section is append-only: older decoders that don't
+//! know about `kind` / `caps` / `cli_methods` stop reading at the
+//! previous section and the corresponding `ParsedMeta` field
+//! defaults to empty/false. This is how the format has evolved
+//! without breaking older actor binaries.
 
 /// Field descriptor — name and type as strings.
 pub struct FieldMeta {
@@ -26,6 +42,14 @@ pub struct FieldMeta {
 }
 
 /// Message descriptor — name, query flag, and fields.
+///
+/// `exposed_to_cli` is set out-of-band in the binary format
+/// (the encoder writes a trailing list of method names; the
+/// decoder cross-references). The compile-time `ActorMeta` const
+/// emitted by the `#[actor]` macro carries `false` here; the
+/// macro emits the names of CLI-exposed methods as
+/// `ActorMeta.cli_methods` and `encode` writes them. On decode,
+/// methods named in that list flip to `true`.
 pub struct MessageMeta {
     pub name: &'static str,
     pub is_query: bool,
@@ -51,6 +75,12 @@ pub struct ActorMeta {
     /// actors leave this empty — they live in the deterministic
     /// universe and have no OS access by construction.
     pub caps: &'static [&'static str],
+    /// Names of `#[msg]` handlers that should be reachable via
+    /// the `vosx <ext> <cmd>` CLI dispatcher. Subset of `messages`
+    /// by name. Declared on each handler with `#[msg(cli)]` and
+    /// emitted by the actor macro; the registry serves the same
+    /// blob so `vosx` can extend clap from cached schemas.
+    pub cli_methods: &'static [&'static str],
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -203,6 +233,33 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         k += 1;
     }
 
+    // CLI-exposed method names. Same trailing-append discipline:
+    // pre-CLI decoders stop after caps and parse all
+    // `ParsedMessage.exposed_to_cli=false`. The cross-reference
+    // by name (rather than a per-message flag inline with the
+    // existing record) keeps the existing per-message wire format
+    // untouched — adding a byte mid-record would break every
+    // older decoder.
+    let [lo, hi] = (meta.cli_methods.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut c = 0;
+    while c < meta.cli_methods.len() {
+        let cli_bytes = meta.cli_methods[c].as_bytes();
+        let [lo, hi] = (cli_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
+        let mut i = 0;
+        while i < cli_bytes.len() {
+            buf[pos + i] = cli_bytes[i];
+            i += 1;
+        }
+        pos += cli_bytes.len();
+        c += 1;
+    }
+
     (buf, pos)
 }
 
@@ -239,6 +296,7 @@ mod tests {
             }],
             kind: 0,
             caps: &[],
+            cli_methods: &[],
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -268,6 +326,7 @@ mod tests {
             constructor: &[],
             kind: 1, // Service
             caps: &[],
+            cli_methods: &[],
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -300,6 +359,7 @@ mod tests {
             constructor: &[],
             kind: 1,
             caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
+            cli_methods: &[],
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -331,6 +391,69 @@ mod tests {
         assert_eq!(parsed.kind, 1);
         assert!(parsed.caps.is_empty());
     }
+
+    #[test]
+    fn cli_methods_roundtrip_and_cross_reference() {
+        const META: ActorMeta = ActorMeta {
+            actor_name: "Gateway",
+            messages: &[
+                MessageMeta {
+                    name: "stop",
+                    is_query: false,
+                    fields: &[],
+                },
+                MessageMeta {
+                    name: "status",
+                    is_query: true,
+                    fields: &[],
+                },
+                MessageMeta {
+                    name: "internal_only",
+                    is_query: false,
+                    fields: &[],
+                },
+            ],
+            constructor: &[],
+            kind: 1,
+            caps: &[],
+            cli_methods: &["stop", "status"],
+        };
+        let (buf, len) = encode::<512>(&META);
+        let parsed = decode(&buf[..len]).expect("decode");
+        let by_name = |name: &str| {
+            parsed
+                .messages
+                .iter()
+                .find(|m| m.name == name)
+                .expect("message")
+        };
+        assert!(by_name("stop").exposed_to_cli);
+        assert!(by_name("status").exposed_to_cli);
+        assert!(!by_name("internal_only").exposed_to_cli);
+    }
+
+    #[test]
+    fn cli_methods_absent_in_pre_phase_blob_defaults_false() {
+        // Pre-CLI-section blob: walks through messages, ctor,
+        // kind, caps — stops cleanly without the cli_methods
+        // section. Decoder must default `exposed_to_cli=false`
+        // on every parsed message rather than panicking.
+        let blob: &[u8] = &[
+            1, 0,    // name_len = 1
+            b'Z', // name
+            1, 0, // msg_count = 1
+            3, 0, b'r', b'u', b'n', // msg name "run"
+            0,    // is_query = false
+            0, 0, // field_count = 0
+            0, 0, // ctor_count = 0
+            0, // kind = Actor
+            0, 0, // caps_count = 0
+               // no cli_methods section
+        ];
+        let parsed = decode(blob).expect("decode");
+        assert_eq!(parsed.messages.len(), 1);
+        assert!(!parsed.messages[0].exposed_to_cli);
+    }
 }
 
 /// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
@@ -356,6 +479,12 @@ mod decode {
         pub name: String,
         pub is_query: bool,
         pub fields: Vec<ParsedField>,
+        /// `true` if the binary's trailing `cli_methods` section
+        /// names this handler. Empty / absent section → `false`
+        /// across the board (binary predates the CLI dispatch
+        /// surface). Used by `vosx <ext> <cmd>` to filter the
+        /// handler list to those exposed to the CLI.
+        pub exposed_to_cli: bool,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -399,6 +528,10 @@ mod decode {
                 name,
                 is_query,
                 fields,
+                // Filled in from the trailing `cli_methods` section
+                // once that section parses successfully — see the
+                // post-caps block below.
+                exposed_to_cli: false,
             });
         }
 
@@ -435,6 +568,27 @@ mod decode {
                     caps.push(s);
                 } else {
                     break;
+                }
+            }
+        }
+
+        // CLI-exposed method names (added 2026-05-11 for the
+        // `vosx <ext> <cmd>` dispatcher). Trailing-append: blobs
+        // produced before this section was added simply stop at
+        // caps and every `ParsedMessage.exposed_to_cli` stays
+        // `false`. Cross-reference by name rather than by index
+        // so the per-message wire format stays unchanged —
+        // adding a flag inline would have broken every older
+        // decoder.
+        if pos < data.len()
+            && let Some(cli_count) = read_u16(data, &mut pos)
+        {
+            for _ in 0..cli_count as usize {
+                let Some(name) = read_str(data, &mut pos) else {
+                    break;
+                };
+                if let Some(msg) = messages.iter_mut().find(|m| m.name == name) {
+                    msg.exposed_to_cli = true;
                 }
             }
         }

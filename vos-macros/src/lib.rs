@@ -227,6 +227,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut is_query_arms = Vec::new();
     let mut from_msg_arms = Vec::new();
     let mut meta_messages: Vec<proc_macro2::TokenStream> = Vec::new();
+    // Method names declared with `#[msg(cli)]`. Emitted into the
+    // `ActorMeta.cli_methods` list and (via the trailing-append
+    // section in the binary meta blob) cross-referenced by the
+    // decoder to set `ParsedMessage.exposed_to_cli`.
+    let mut cli_method_names: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -243,7 +248,26 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
 
-        let is_msg = method.attrs.iter().any(|a| a.path().is_ident("msg"));
+        let msg_attr = method.attrs.iter().find(|a| a.path().is_ident("msg"));
+        let is_msg = msg_attr.is_some();
+        // Detect `#[msg(cli)]` — handler is exposed to the
+        // `vosx <ext> <cmd>` CLI dispatcher. Default false. The
+        // attribute's argument list is a sequence of bare idents
+        // (today only `cli` is recognised); use a permissive
+        // parse so future attributes (e.g. `#[msg(internal)]`)
+        // can land without breaking older actors.
+        let exposed_to_cli = msg_attr
+            .map(|a| {
+                let mut found = false;
+                let _ = a.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("cli") {
+                        found = true;
+                    }
+                    Ok(())
+                });
+                found
+            })
+            .unwrap_or(false);
 
         if !is_msg {
             // Detect constructor and extract its typed parameters
@@ -496,6 +520,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 fields: &[ #( #field_metas ),* ],
             }
         });
+        if exposed_to_cli {
+            cli_method_names.push(quote! { #msg_name_str });
+        }
 
         // Dynamic from_msg arm
         let from_msg_body = if field_names.is_empty() {
@@ -645,6 +672,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Phase 6 — declared capability tokens. Defaults to
                 // empty on the trait; overridden by #[actor(caps = [...])].
                 caps: <#actor_ty as vos::Actor>::CAPS,
+                // CLI dispatch surface — names of handlers marked
+                // `#[msg(cli)]`. Emitted into the trailing
+                // `cli_methods` section of the binary blob; the
+                // decoder uses it to set `ParsedMessage.exposed_to_cli`.
+                // The `vosx <ext> <cmd>` dispatcher filters by this
+                // when extending clap subcommands.
+                cli_methods: &[ #( #cli_method_names ),* ],
             };
         }
     };
