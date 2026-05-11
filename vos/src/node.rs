@@ -2429,16 +2429,20 @@ fn extension_thread(
 
     // Phase 3: dispatch on plugin kind. Service-mode extensions
     // own their thread + originate calls via ServiceCtx; the
-    // actor-mode dispatch loop below is unused for them. Drop
-    // invoke_rx — sync RPC into a service-mode extension isn't
-    // wired in Phase 3.
+    // actor-mode dispatch loop below is unused for them. Phase 5
+    // adds a dispatch sidecar: when the .so exports
+    // `vos_service_handle_invoke`, run_service_extension spawns a
+    // helper thread that consumes `invoke_rx` and routes each
+    // inbound invoke through it, so `vosx <ext> <method>` reaches
+    // a real handler instead of sitting in the channel until the
+    // caller times out.
     if plugin.kind() == crate::extension::ExtensionKind::Service {
-        let _ = invoke_rx;
         return run_service_extension(
             id,
             plugin,
             config,
             inbox,
+            invoke_rx,
             outbox,
             invoke_routes,
             shutdown,
@@ -2576,6 +2580,7 @@ fn run_service_extension(
     plugin: crate::extension::ExtensionPlugin,
     config: ExtensionConfig,
     inbox: mpsc::Receiver<Envelope>,
+    invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     invoke_routes: InvokeRoutes,
     shutdown: Arc<AtomicBool>,
@@ -2682,6 +2687,45 @@ fn run_service_extension(
         };
     }
 
+    // Phase 5: if the extension exports `vos_service_handle_invoke`,
+    // spawn a sidecar dispatch thread that consumes `invoke_rx` in
+    // parallel with `run()`. Each request is dispatched through
+    // the extension's fn and the reply wrapped in the standard
+    // invoke envelope (STATUS_DONE / STATUS_NOT_FOUND / STATUS_PANICKED).
+    // Extensions without the symbol get the legacy behaviour — the
+    // channel goes unread and callers time out. State pointer is
+    // shared across threads as `*mut ()`; the extension is
+    // responsible for thread-safe access between its run thread
+    // and the dispatch path (HttpGateway uses an OnceLock + Arc).
+    let sidecar = if plugin.service_has_invoke_dispatch() {
+        let state_ptr = SendState(state);
+        let shutdown_sidecar = shutdown.clone();
+        let plugin_path = config.path.clone();
+        Some(std::thread::spawn(move || {
+            // We re-load the .so on this thread to avoid sharing the
+            // ExtensionPlugin (and its Library handle) across threads.
+            // dlopen is refcounted so this is a no-op map; the
+            // existing handle in the parent thread keeps the library
+            // resident.
+            let sidecar_plugin = match unsafe {
+                crate::extension::ExtensionPlugin::load(&plugin_path)
+            } {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(%id, "service dispatch sidecar: re-load failed ({e}); inbound vosx <ext> <method> invokes will time out");
+                    return;
+                }
+            };
+            run_service_invoke_sidecar(id, sidecar_plugin, state_ptr, invoke_rx, shutdown_sidecar);
+        }))
+    } else {
+        // Drop the receiver explicitly so the channel's tx detects
+        // the disconnect promptly and senders fail-fast rather than
+        // blocking on a queue nobody reads.
+        drop(invoke_rx);
+        None
+    };
+
     // Capture panics inside run so we can clean up state + host_ptr
     // even if the extension blows up.
     let plugin_ref = &plugin;
@@ -2691,6 +2735,12 @@ fn run_service_extension(
         // handle_ptr lives on this stack frame and outlives the call.
         unsafe { plugin_ref.run_service(state, handle_ptr) }
     }));
+
+    if let Some(handle) = sidecar {
+        // Let the sidecar see shutdown; it polls every 50ms.
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
 
     // Drop state regardless of panic.
     // SAFETY: state was returned by this plugin's create_state and
@@ -2736,6 +2786,63 @@ fn run_service_extension(
 enum DispatchOutcome {
     Ok(Vec<u8>),
     Err,
+}
+
+/// `*mut ()` newtype that implements `Send` so the service-mode
+/// invoke dispatch sidecar can carry the extension's state across
+/// thread boundaries. The pointer aliases the same state the
+/// `run()` thread reads; coordination across the two threads is
+/// the extension's responsibility (HttpGateway uses interior
+/// `Arc`/`AtomicBool` for that).
+struct SendState(*mut ());
+// SAFETY: the underlying state lives in the extension's address
+// space and is accessed via the extension's own thread-safe
+// primitives — the host doesn't dereference it.
+unsafe impl Send for SendState {}
+
+/// Pull invokes off the channel and dispatch each through the
+/// extension's `vos_service_handle_invoke`. Wrap replies in the
+/// standard invoke envelope so the calling actor's
+/// `unwrap_invoke_envelope` decodes them the same way it does
+/// for PVM and actor-mode-extension replies. Exits when
+/// `shutdown` is set or the channel disconnects.
+fn run_service_invoke_sidecar(
+    id: ServiceId,
+    plugin: crate::extension::ExtensionPlugin,
+    state: SendState,
+    invoke_rx: mpsc::Receiver<InvokeRequest>,
+    shutdown: Arc<AtomicBool>,
+) {
+    use crate::actors::run::{STATUS_DONE, STATUS_NOT_FOUND, STATUS_PANICKED};
+    use crate::extension::{POLL_ERR_NO_FUTURE, POLL_READY};
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        match invoke_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(req) => {
+                // SAFETY: the extension's state ptr is alive for
+                // the duration of run_service_extension, which
+                // joins this sidecar before dropping state.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    plugin.dispatch_service_invoke(state.0, &req.msg)
+                }));
+                let envelope = match outcome {
+                    Ok((POLL_READY, Some(bytes))) => {
+                        encode_invoke_envelope(STATUS_DONE, &[], &bytes)
+                    }
+                    Ok((POLL_ERR_NO_FUTURE, _)) => {
+                        encode_invoke_envelope(STATUS_NOT_FOUND, &[], &[])
+                    }
+                    _ => encode_invoke_envelope(STATUS_PANICKED, &[], &[]),
+                };
+                send_reply_capped(req.reply_tx, envelope, id);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Dispatch a message to an actor-mode extension instance and poll

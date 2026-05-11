@@ -851,6 +851,20 @@ macro_rules! service_main {
                 }
             }
 
+            /// Free a `Vec<u8>` buffer the extension previously
+            /// handed to the host via `vos_service_handle_invoke`.
+            /// Required when the extension exports per-invoke
+            /// dispatch so the host can reclaim reply buffers
+            /// using the same allocator that produced them. Always
+            /// emitted (cost: a tiny fn) so future service-mode
+            /// dispatchers don't need to hand-roll it.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_free(ptr: *mut u8, len: usize, cap: usize) {
+                if !ptr.is_null() && cap > 0 {
+                    unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
+                }
+            }
+
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_extension_run(
                 state: *mut (),

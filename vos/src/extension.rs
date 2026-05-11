@@ -414,6 +414,22 @@ mod host {
     /// returns. Status: 0 = clean exit, < 0 = error.
     type RunFn = unsafe extern "C" fn(state: *mut (), handle: *const HostCtxHandle) -> i32;
 
+    /// Service-mode per-invoke dispatch (Phase 5): `vos_service_handle_invoke`.
+    /// Optional symbol — service-mode extensions opt in by exporting it.
+    /// The host's run_service_extension sidecar thread calls this for
+    /// each incoming invoke targeted at the extension's ServiceId,
+    /// independently of `run()` (so HTTP-serving loops keep running).
+    /// Reply bytes ride back in `ExtensionPollResult.ptr/len/cap`;
+    /// `POLL_ERR_NO_FUTURE` means "no matching handler"; the host
+    /// frees the buffer via `vos_extension_free` afterwards. The
+    /// extension *must* be thread-safe across the run-thread / this
+    /// sidecar thread when the symbol is exported.
+    type DispatchInvokeFn = unsafe extern "C" fn(
+        state: *mut (),
+        msg_ptr: *const u8,
+        msg_len: usize,
+    ) -> ExtensionPollResult;
+
     /// A loaded extension plugin. Holds either the actor-mode symbol
     /// set or the service-mode set, depending on what the .so
     /// declared via `kind` in its meta blob.
@@ -442,6 +458,18 @@ mod host {
 
     struct ServiceSymbols {
         run_fn: RunFn,
+        /// Optional: when present, the daemon spawns a sidecar
+        /// thread that consumes the extension's invoke queue and
+        /// dispatches each request through this fn. Service-mode
+        /// extensions that don't export it remain unreachable
+        /// via `vosx <ext> <method>` (Phase 5+ behaviour); their
+        /// inbound invokes still pile up in the channel and the
+        /// caller times out.
+        dispatch_invoke_fn: Option<DispatchInvokeFn>,
+        /// Required when `dispatch_invoke_fn` is present — the
+        /// host frees the reply buffer the extension produced.
+        /// Same shape as the actor-mode `vos_extension_free`.
+        free_fn: Option<FreeFn>,
     }
 
     impl ExtensionPlugin {
@@ -526,7 +554,33 @@ mod host {
                         let run_fn = *lib
                             .get::<RunFn>(b"vos_extension_run")
                             .map_err(|e| format!("missing vos_extension_run: {e}"))?;
-                        (None, Some(ServiceSymbols { run_fn }))
+                        // Phase 5 invoke dispatch is optional —
+                        // service extensions that don't declare
+                        // `#[msg(cli)]` handlers just don't export
+                        // these symbols and stay reachable only via
+                        // their `run()` loop's external channels
+                        // (HTTP, etc.). When `dispatch_invoke_fn`
+                        // is present we also require `free_fn` so
+                        // the host can reclaim reply buffers.
+                        let dispatch_invoke_fn = lib
+                            .get::<DispatchInvokeFn>(b"vos_service_handle_invoke")
+                            .ok()
+                            .map(|s| *s);
+                        let free_fn = lib.get::<FreeFn>(b"vos_extension_free").ok().map(|s| *s);
+                        if dispatch_invoke_fn.is_some() && free_fn.is_none() {
+                            return Err("service extension exports vos_service_handle_invoke but \
+                                 not vos_extension_free; both must be present for the host \
+                                 to reclaim reply buffers"
+                                .to_string());
+                        }
+                        (
+                            None,
+                            Some(ServiceSymbols {
+                                run_fn,
+                                dispatch_invoke_fn,
+                                free_fn,
+                            }),
+                        )
                     }
                 };
 
@@ -618,6 +672,71 @@ mod host {
         pub unsafe fn run_service(&self, state: *mut (), handle: *const HostCtxHandle) -> i32 {
             let run_fn = self.service_syms().run_fn;
             unsafe { run_fn(state, handle) }
+        }
+
+        /// `true` when this service-mode plugin exports
+        /// `vos_service_handle_invoke`. Used by the daemon to decide
+        /// whether to spawn the sidecar dispatch thread for the
+        /// extension's invoke queue.
+        pub fn service_has_invoke_dispatch(&self) -> bool {
+            self.service
+                .as_ref()
+                .and_then(|s| s.dispatch_invoke_fn)
+                .is_some()
+        }
+
+        /// Service-mode invoke dispatch (Phase 5). Calls the
+        /// extension's `vos_service_handle_invoke` with the wire
+        /// payload, copies the reply bytes into a Rust `Vec`, then
+        /// returns the buffer to the extension's allocator via
+        /// `vos_extension_free`. Returns the raw
+        /// [`ExtensionPollResult`] status + bytes:
+        ///
+        ///   - `POLL_READY` + `Some(bytes)` → handler succeeded.
+        ///   - `POLL_ERR_NO_FUTURE` → no matching handler for the
+        ///     wire-payload's method name.
+        ///   - other negative statuses → handler panic or decode error.
+        ///
+        /// The caller (daemon's sidecar thread) translates these
+        /// into the on-wire invoke envelope (`STATUS_DONE`,
+        /// `STATUS_NOT_FOUND`, `STATUS_PANICKED`).
+        ///
+        /// # Safety
+        /// `state` must be a live extension instance produced by
+        /// this plugin's `create_state`. The extension *must* be
+        /// thread-safe with respect to its run thread when this is
+        /// called from the sidecar.
+        pub unsafe fn dispatch_service_invoke(
+            &self,
+            state: *mut (),
+            msg: &[u8],
+        ) -> (i32, Option<Vec<u8>>) {
+            use super::{POLL_ERR_NO_FUTURE, POLL_READY};
+            let svc = self.service_syms();
+            let Some(dispatch_fn) = svc.dispatch_invoke_fn else {
+                return (POLL_ERR_NO_FUTURE, None);
+            };
+            let result = unsafe { dispatch_fn(state, msg.as_ptr(), msg.len()) };
+            if result.status == POLL_READY {
+                let bytes = if result.ptr.is_null() || result.len == 0 {
+                    Vec::new()
+                } else {
+                    let v = unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec();
+                    // SAFETY: the extension allocated the buffer in
+                    // its own Vec-shaped allocator; freeing via the
+                    // same .so's free_fn matches that allocator.
+                    if let Some(free_fn) = svc.free_fn
+                        && !result.ptr.is_null()
+                        && result.cap > 0
+                    {
+                        unsafe { free_fn(result.ptr, result.len, result.cap) };
+                    }
+                    v
+                };
+                (super::POLL_READY, Some(bytes))
+            } else {
+                (result.status, None)
+            }
         }
 
         /// Allocate a fresh state via the extension's `create` symbol

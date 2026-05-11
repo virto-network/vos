@@ -103,6 +103,14 @@ const DEFAULT_PORT: u16 = 8080;
 pub struct HttpGateway {
     cfg: config::GatewayConfig,
     port: u16,
+    /// Live runtime state, populated by `run()` once the config
+    /// passes validation. The dispatch sidecar
+    /// (`vos_service_handle_invoke`) reads this through a shared
+    /// reference, so `stop` / `status` invokes see the same
+    /// atomics the HTTP `/__admin/*` shortcut writes/reads. Empty
+    /// until `run()` runs — invokes before then come back
+    /// `STATUS_NOT_FOUND` (handler responds "not ready").
+    inner: std::sync::OnceLock<std::sync::Arc<state::Inner>>,
 }
 
 impl HttpGateway {
@@ -128,7 +136,19 @@ impl HttpGateway {
             .get_u32("port")
             .map(|p| p as u16)
             .unwrap_or(DEFAULT_PORT);
-        Self { cfg, port }
+        Self {
+            cfg,
+            port,
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Live runtime state, if `run()` has populated it. Used by
+    /// the `vos_service_handle_invoke` sidecar to expose `stop` /
+    /// `status` semantics consistent with the HTTP `/__admin/*`
+    /// shortcuts.
+    pub(crate) fn inner(&self) -> Option<&std::sync::Arc<state::Inner>> {
+        self.inner.get()
     }
 
     /// Service entry point. Builds a per-instance `Inner` carrying
@@ -157,6 +177,19 @@ impl HttpGateway {
                 return 2;
             }
         };
+        // Publish to the OnceLock so the invoke-dispatch sidecar
+        // (`vos_service_handle_invoke`) can read the same atomics
+        // the HTTP-side admin handlers do. set() can fail only if
+        // a previous run() already populated it; gateway lifecycle
+        // is one-shot so this should never fire, but the Err arm
+        // surfaces the bug rather than silently mismatched state.
+        if let Err(_existing) = self.inner.set(inner.clone()) {
+            log::error!(
+                "http-gateway: run() called twice on the same instance — \
+                 invoke sidecar would target stale state"
+            );
+            return 3;
+        }
         if !runtime::claim_port(&inner, port) {
             return 1;
         }
@@ -217,6 +250,89 @@ impl HttpGateway {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         log::info!("http-gateway: stopped ({stop_msg})");
         0
+    }
+}
+
+/// Service-mode invoke dispatch (Phase 5). Wires
+/// `vosx gateway stop` / `vosx gateway status` to the same atomics
+/// the HTTP `/__admin/*` namespace toggles. Hand-rolled (no macro)
+/// because service_main! doesn't generate per-message dispatch yet
+/// — the gateway is the lone consumer right now, so the manual
+/// shape is fine; the macro can subsume this in a follow-up that
+/// touches more than one service.
+///
+/// Wire shape: caller (vosx) encodes a `vos::value::Msg` prefixed
+/// with `TAG_DYNAMIC`; we decode, match on `msg.name`, dispatch,
+/// then return the reply as rkyv-encoded `vos::value::Value`
+/// (which `DaemonClient::invoke_dyn` already decodes). Unknown
+/// method → POLL_ERR_NO_FUTURE so the daemon's sidecar wraps it
+/// as STATUS_NOT_FOUND.
+///
+/// Thread-safety: the daemon's sidecar calls this on its own
+/// thread, in parallel with `run()`'s drain loop. We only touch
+/// `HttpGateway.inner` (a `OnceLock<Arc<Inner>>`) and `Inner`'s
+/// atomics — both are explicitly designed for cross-thread access.
+///
+/// # Safety
+///
+/// * `state` must be a live `HttpGateway` pointer produced by
+///   `vos_extension_create` and not yet freed via
+///   `vos_extension_drop`.
+/// * `msg_ptr` / `msg_len` must describe a valid byte slice or
+///   `(null, 0)`. Any other shape is a soundness violation.
+/// * Only the host's service-mode dispatch sidecar should call
+///   this — external callers can't satisfy either invariant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vos_service_handle_invoke(
+    state: *mut (),
+    msg_ptr: *const u8,
+    msg_len: usize,
+) -> vos::extension::ExtensionPollResult {
+    use vos::Encode;
+    use vos::extension::{ExtensionPollResult, POLL_ERR_HANDLER, POLL_ERR_NO_FUTURE};
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
+
+    let result = std::panic::catch_unwind(|| {
+        if state.is_null() || msg_ptr.is_null() || msg_len == 0 {
+            return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+        }
+        // SAFETY: state pointer is the live HttpGateway instance
+        // the host allocated via `vos_extension_create`; the
+        // sidecar holds the only other reference and never mutates.
+        let gateway = unsafe { &*(state as *const HttpGateway) };
+
+        let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
+        let body = if raw.first() == Some(&TAG_DYNAMIC) {
+            &raw[1..]
+        } else {
+            raw
+        };
+        let msg: Msg = vos::Decode::decode(body);
+
+        let reply: Value = match msg.name.as_str() {
+            "stop" => {
+                let Some(inner) = gateway.inner() else {
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                inner.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::info!("http-gateway: stop requested via vosx gateway stop");
+                Value::Unit
+            }
+            "status" => {
+                let Some(inner) = gateway.inner() else {
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                Value::Str(state::status_json(inner))
+            }
+            _ => return ExtensionPollResult::error(POLL_ERR_NO_FUTURE),
+        };
+
+        let bytes = reply.encode();
+        ExtensionPollResult::ready(bytes)
+    });
+    match result {
+        Ok(r) => r,
+        Err(_) => ExtensionPollResult::error(POLL_ERR_HANDLER),
     }
 }
 
