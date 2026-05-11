@@ -25,7 +25,21 @@ use crate::commands::space::endpoint;
 use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+
+/// Resolve the per-invoke timeout, honouring an env override.
+/// `VOSX_INVOKE_TIMEOUT_MS` lets the e2e suite shorten the wait
+/// when it intentionally talks to a handler that doesn't reply
+/// (extension dispatch before Phase 5 wires the `stop`/`status`
+/// handlers). Production callers never set it, so the default
+/// stays at 10s.
+fn invoke_timeout() -> Duration {
+    std::env::var("VOSX_INVOKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(INVOKE_TIMEOUT_DEFAULT)
+}
 
 pub struct DaemonClient {
     node: VosNode,
@@ -149,17 +163,25 @@ impl DaemonClient {
     }
 
     /// Resolve a user-supplied target string to a daemon-side
-    /// `ServiceId`. Three forms supported:
+    /// `ServiceId`. Four forms supported, in lookup order:
     ///
     /// - `"registry"` — the well-known per-space registry.
-    /// - `"<instance_name>"` — looks the agent up in the daemon's
-    ///   registry, then derives its per-node ServiceId via
-    ///   `instance_service_id` (the same function `space up`
-    ///   uses to register installed agents, so the derived id
-    ///   matches the actual registration).
     /// - `"0xHEX"` / 8-hex-chars — bare 32-bit ServiceId. The
     ///   prefix half is honored as-is, letting power users
     ///   target a specific node in a multi-node setup.
+    /// - `"<instance_name>"` of an installed PVM agent — looks
+    ///   the agent up in the daemon's registry, then derives
+    ///   its per-node ServiceId via `instance_service_id` (the
+    ///   same function `space up` uses to register installed
+    ///   agents, so the derived id matches the actual registration).
+    /// - `"<instance_name>"` of a manifest-installed extension —
+    ///   the reconciler now installs extensions at the same
+    ///   deterministic `instance_service_id(name, prefix)` shape,
+    ///   so the fallback path simply confirms the name exists in
+    ///   `extension_metas` (via `meta_for_instance`) and returns
+    ///   the same derivation. The two namespaces share an id
+    ///   formula but the registry guarantees their names are
+    ///   distinct (agent-first lookup in `meta_for_instance`).
     pub fn resolve_target(&self, target: &str) -> anyhow::Result<ServiceId> {
         if target == "registry" {
             return Ok(self.registry_id());
@@ -169,14 +191,21 @@ impl DaemonClient {
                 .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
             return Ok(ServiceId(raw));
         }
-        let agent = self.agent(target)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no agent named '{target}' is installed in this space \
-             (use `vosx space agents <space>` to list)",
-            )
-        })?;
-        debug_assert_eq!(agent.instance_name, target);
-        Ok(instance_service_id(target, self.daemon_prefix))
+        if let Some(agent) = self.agent(target)? {
+            debug_assert_eq!(agent.instance_name, target);
+            return Ok(instance_service_id(target, self.daemon_prefix));
+        }
+        // Not an installed agent — try the extension fallback.
+        // `meta_for_instance` returns non-empty bytes for any
+        // name with a registered schema, including extensions.
+        let meta_blob = self.meta_for_instance(target)?;
+        if !meta_blob.is_empty() {
+            return Ok(instance_service_id(target, self.daemon_prefix));
+        }
+        anyhow::bail!(
+            "no agent or extension named '{target}' is installed in this space \
+             (use `vosx space agents <space>` to list installed agents)",
+        )
     }
 
     /// Generic invoke — send `msg` to `target` on the daemon
@@ -194,12 +223,13 @@ impl DaemonClient {
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
+        let timeout = invoke_timeout();
         let reply = self
             .node
-            .invoke_with_timeout(target, payload, INVOKE_TIMEOUT)
+            .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "daemon at {target} didn't reply within {INVOKE_TIMEOUT:?} (target unreachable or timed out)",
+                    "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
             })?;
         if reply.is_empty() {

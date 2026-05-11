@@ -678,6 +678,46 @@ fn pvm_actors_via_gateway() {
         "unknown target must give a clear error: {stderr}",
     );
 
+    // 10a-ext-resolve. Phase 4c: `vosx <ext> <method>` must
+    //                  resolve the extension's ServiceId via
+    //                  the same `instance_service_id` formula
+    //                  agents use (and the reconciler now
+    //                  installs extensions at that deterministic
+    //                  id). Before this, dispatch bailed with
+    //                  "no agent named 'gateway'" because
+    //                  `resolve_target` only knew the agents
+    //                  table.
+    //
+    //                  Gateway doesn't have a real `stop` handler
+    //                  yet (Phase 5), so the invoke times out
+    //                  rather than returning a value. We shrink
+    //                  the per-invoke wait to 500 ms via env so
+    //                  the test stays snappy, and assert the
+    //                  error message is the timeout — NOT the
+    //                  pre-Phase-4c "no agent" message that the
+    //                  fix is meant to eliminate.
+    let out = Command::new(vosx_bin())
+        .args(["--space", "e2e", "gateway", "stop"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .env("VOSX_INVOKE_TIMEOUT_MS", "500")
+        .output()
+        .expect("spawn vosx gateway stop");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "gateway stop without a handler should fail; got stdout={:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    assert!(
+        !stderr.contains("no agent or extension"),
+        "resolve_target must fall through to extensions: {stderr}",
+    );
+    assert!(
+        stderr.contains("didn't reply"),
+        "expected timeout error after resolving extension id: {stderr}",
+    );
+
     // 10a-cache. The previous `vosx --space e2e math add` round
     //            wrote the math schema into the per-space CLI
     //            cache at `<XDG_CONFIG_HOME>/vosx/cli_cache.toml`.

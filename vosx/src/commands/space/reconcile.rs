@@ -136,6 +136,7 @@ fn register_extension(
     reg: &SpaceRegistryRef,
     ext: &ExtensionDef,
     manifest_dir: &Path,
+    daemon_prefix: u16,
 ) -> anyhow::Result<()> {
     let so_path = manifest_dir.join(&ext.path);
     if !so_path.exists() {
@@ -196,7 +197,15 @@ fn register_extension(
         ExtensionConfig::with_args(&so_path, &args)
     };
 
-    let id = node.register_extension(cfg);
+    // Install at a *deterministic* ServiceId derived from the
+    // extension's manifest name + daemon prefix, identical to the
+    // shape `instance_service_id` gives PVM agents. Without this,
+    // the host's `alloc_id` hands out an opaque incrementing id
+    // that vosx-side `resolve_target` has no way to rediscover
+    // — making `vosx <ext> <method>` unreachable. The blake2b-
+    // derived id is stable across daemon restarts so the cache
+    // and any external scripting stay valid.
+    let id = node.register_extension_at_id(cfg, instance_service_id(&ext.name, daemon_prefix));
     tracing::info!(
         "extension '{}' loaded from {} as {id}",
         ext.name,
@@ -266,7 +275,7 @@ pub fn reconcile(
             manifest.extensions.len(),
         );
         for ext in &manifest.extensions {
-            register_extension(node, &reg, ext, manifest_dir)?;
+            register_extension(node, &reg, ext, manifest_dir, daemon_prefix)?;
         }
     }
 
