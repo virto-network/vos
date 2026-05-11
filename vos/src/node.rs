@@ -2978,6 +2978,98 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // ── unwrap_invoke_envelope contract ─────────────────────────
+    //
+    // Locks in what b112aa6 doc-corrected: STATUS_DONE and
+    // STATUS_YIELDED both surface their reply bytes; everything
+    // else (PANICKED, NOT_FOUND, short envelopes, malformed
+    // state_len) collapses to None so gateway/host callers see
+    // "no reply" rather than partial garbage.
+
+    fn make_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
+        // Mirrors `encode_invoke_envelope` exactly so we're not
+        // testing the encoder against itself — keeps the test
+        // honest if `encode_invoke_envelope` regresses.
+        let mut v = Vec::with_capacity(5 + state.len() + reply.len());
+        v.push(status);
+        v.extend_from_slice(&(state.len() as u32).to_le_bytes());
+        v.extend_from_slice(state);
+        v.extend_from_slice(reply);
+        v
+    }
+
+    #[test]
+    fn unwrap_envelope_done_with_reply_yields_reply() {
+        use crate::actors::run::STATUS_DONE;
+        let env = make_envelope(STATUS_DONE, b"some-state", b"the-reply");
+        assert_eq!(
+            unwrap_invoke_envelope(&env).as_deref(),
+            Some(&b"the-reply"[..]),
+        );
+    }
+
+    #[test]
+    fn unwrap_envelope_done_with_empty_reply_yields_empty() {
+        use crate::actors::run::STATUS_DONE;
+        let env = make_envelope(STATUS_DONE, b"state-only", b"");
+        // Empty reply is meaningful: handler returned `()`.
+        // Caller distinguishes `Some(empty)` (returned unit) from
+        // `None` (envelope unusable).
+        let r = unwrap_invoke_envelope(&env).expect("done envelope decodes");
+        assert!(r.is_empty(), "empty-reply envelope must yield Some(empty)");
+    }
+
+    #[test]
+    fn unwrap_envelope_yielded_surfaces_reply() {
+        // YIELDED carries a post-dispatch state + the partial
+        // reply so far. Host callers (gateway) just want the
+        // bytes; the YIELDED-vs-DONE distinction is for
+        // `decode_invoke_envelope` on the runtime side.
+        use crate::actors::run::STATUS_YIELDED;
+        let env = make_envelope(STATUS_YIELDED, b"yielded-state", b"partial");
+        assert_eq!(
+            unwrap_invoke_envelope(&env).as_deref(),
+            Some(&b"partial"[..]),
+        );
+    }
+
+    #[test]
+    fn unwrap_envelope_panicked_yields_none() {
+        // The gateway path now distinguishes panic → 502 from
+        // "() return" → 200 null. That hinges on PANICKED
+        // collapsing to None here.
+        let env = make_envelope(crate::STATUS_PANICKED, b"", b"would-be-reply");
+        assert_eq!(unwrap_invoke_envelope(&env), None);
+    }
+
+    #[test]
+    fn unwrap_envelope_not_found_yields_none() {
+        let env = make_envelope(crate::STATUS_NOT_FOUND, b"", b"");
+        assert_eq!(unwrap_invoke_envelope(&env), None);
+    }
+
+    #[test]
+    fn unwrap_envelope_too_short_yields_none() {
+        // < 5 bytes can't carry status + state_len, regardless
+        // of what those bytes claim.
+        assert_eq!(unwrap_invoke_envelope(&[]), None);
+        assert_eq!(unwrap_invoke_envelope(&[0]), None);
+        assert_eq!(unwrap_invoke_envelope(&[0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn unwrap_envelope_oversized_state_len_yields_none() {
+        // state_len claims more bytes than the envelope holds —
+        // a hostile or corrupt wire payload. Must collapse to
+        // None rather than slicing out-of-bounds.
+        use crate::actors::run::STATUS_DONE;
+        let mut env = Vec::new();
+        env.push(STATUS_DONE);
+        env.extend_from_slice(&(999u32).to_le_bytes()); // claims 999B state
+        env.extend_from_slice(b"only-3"); // but only 6 bytes follow
+        assert_eq!(unwrap_invoke_envelope(&env), None);
+    }
+
     #[test]
     fn invoke_forward_check_detects_cycle() {
         // Self-invoke (target already in chain).
