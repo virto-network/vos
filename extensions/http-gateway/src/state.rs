@@ -12,25 +12,45 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use vos::metadata::ParsedMeta;
 
 use crate::config::GatewayConfig;
 
+/// How long a schema cache entry stays trusted before the next
+/// hit triggers a fresh registry fetch. `vosx space upgrade`
+/// re-registers meta on the registry side, so a stale entry
+/// will refresh within this window without operator action.
+/// 60 seconds keeps the hot path effectively free in steady
+/// state (a typical actor takes thousands of requests in that
+/// window) while bounding post-upgrade staleness.
+pub(crate) const META_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One entry in the per-agent schema cache. `meta` is `Some` when
+/// the schema is known, `None` when the registry confirmed "no
+/// schema for this name" — the distinction matters so a name
+/// without a schema doesn't pay a round trip every request.
+///
+/// `fetched_at` is checked against [`META_CACHE_TTL`] on each
+/// lookup; expired entries fall back to a fresh registry fetch.
+#[derive(Clone)]
+pub(crate) struct MetaEntry {
+    pub(crate) meta: Option<ParsedMeta>,
+    pub(crate) fetched_at: Instant,
+}
+
 /// Per-agent type schema cache. Keyed by raw ServiceId. Populated
 /// lazily on the first dispatch to an agent (registry round-trip)
-/// and never invalidated for the gateway's lifetime — a future
-/// `space upgrade` would need an explicit clear, but the
-/// re-registration on the registry side will at least give us
-/// fresh schema bytes on the next process restart.
+/// and refreshed when an entry is older than [`META_CACHE_TTL`].
 ///
-/// Values: `Some(meta)` once we successfully fetched + decoded
-/// the schema; `None` once we asked and got back "no meta" (so
-/// we don't retry on every subsequent request to the same
-/// agent). Distinguishes "not yet asked" (absent key) from
-/// "asked, found nothing" (key present with None).
-pub(crate) type MetaCache = Mutex<HashMap<u32, Option<ParsedMeta>>>;
+/// The cache distinguishes three states for a given ServiceId:
+/// - absent key: "not yet asked"
+/// - present, `meta = Some(_)`: schema known
+/// - present, `meta = None`: registry asked, no schema available
+///   (old binary, hash mismatch). Caching `None` avoids
+///   re-asking on every request for the same name.
+pub(crate) type MetaCache = Mutex<HashMap<u32, MetaEntry>>;
 
 pub(crate) struct Inner {
     /// Set to true to ask the running serve loop to exit.

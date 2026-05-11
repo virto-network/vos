@@ -761,20 +761,32 @@ fn ensure_meta_cached(
     target: ServiceId,
     name: &str,
 ) -> Option<vos::metadata::ParsedMeta> {
-    // Fast path: cache hit.
+    // Fast path: cache hit + entry is still fresh. TTL covers the
+    // `vosx space upgrade` case where the registry now has a
+    // different schema but the gateway has no event-driven signal
+    // to invalidate. Bounded staleness rather than per-request
+    // revalidation.
     {
         let cache = inner.meta_cache.lock().unwrap();
-        if let Some(entry) = cache.get(&target.0) {
-            return entry.clone();
+        if let Some(entry) = cache.get(&target.0)
+            && entry.fetched_at.elapsed() < crate::state::META_CACHE_TTL
+        {
+            return entry.meta.clone();
         }
     }
-    // Cache miss — ask the registry. We forward the name; the
-    // registry does the agent → program_hash → meta join. Empty
-    // reply means "no meta registered" → store `None` so we
-    // don't retry on every request.
+    // Cache miss / stale — ask the registry. We forward the name;
+    // the registry does the agent → program_hash → meta join.
+    // Empty reply means "no meta registered" → store `None` so we
+    // don't retry on every request inside this TTL window.
     let parsed = fetch_meta_from_registry(ctx, name);
     let mut cache = inner.meta_cache.lock().unwrap();
-    cache.insert(target.0, parsed.clone());
+    cache.insert(
+        target.0,
+        crate::state::MetaEntry {
+            meta: parsed.clone(),
+            fetched_at: std::time::Instant::now(),
+        },
+    );
     parsed
 }
 
@@ -866,6 +878,60 @@ mod tests {
                 ("name".into(), "hello world".into()),
                 ("q".into(), "&".into()),
             ],
+        );
+    }
+
+    #[test]
+    fn meta_cache_entry_past_ttl_is_considered_stale() {
+        // Hand-seed a cache entry with `fetched_at` set just past
+        // the TTL boundary, then confirm the staleness check the
+        // dispatcher uses on the fast path returns false. Catches
+        // accidental `<=` / `>=` flips or a TTL constant typo.
+        use crate::state::{META_CACHE_TTL, MetaEntry};
+        use std::time::Instant;
+
+        let inner = fresh_inner();
+        let target_id = 7u32;
+        let fresh = Instant::now();
+        let stale = fresh
+            .checked_sub(META_CACHE_TTL + std::time::Duration::from_millis(1))
+            .expect("subtract TTL");
+
+        // Fresh entry: well within TTL.
+        {
+            let mut cache = inner.meta_cache.lock().unwrap();
+            cache.insert(
+                target_id,
+                MetaEntry {
+                    meta: None,
+                    fetched_at: fresh,
+                },
+            );
+        }
+        let cache = inner.meta_cache.lock().unwrap();
+        let entry = cache.get(&target_id).expect("entry");
+        assert!(
+            entry.fetched_at.elapsed() < META_CACHE_TTL,
+            "freshly-inserted entry must read as in-TTL",
+        );
+        drop(cache);
+
+        // Stale entry: past TTL by 1ms.
+        {
+            let mut cache = inner.meta_cache.lock().unwrap();
+            cache.insert(
+                target_id,
+                MetaEntry {
+                    meta: None,
+                    fetched_at: stale,
+                },
+            );
+        }
+        let cache = inner.meta_cache.lock().unwrap();
+        let entry = cache.get(&target_id).expect("entry");
+        assert!(
+            entry.fetched_at.elapsed() >= META_CACHE_TTL,
+            "entry set 1ms past TTL must read as expired",
         );
     }
 
