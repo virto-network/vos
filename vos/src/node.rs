@@ -2152,11 +2152,22 @@ fn encode_invoke_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
 /// Strip the invoke envelope back to just the rkyv-encoded reply
 /// bytes for host-side callers (`VosNode::invoke`, peer invoke
 /// forwarding) who don't care about YIELDED/DONE — they only want
-/// the handler's return value. A short envelope (just a status byte
-/// from `STATUS_NOT_FOUND` / `STATUS_PANICKED`) decodes as `None`.
+/// the handler's return value. A short envelope or one carrying a
+/// failure status (`STATUS_NOT_FOUND` / `STATUS_PANICKED` /
+/// `STATUS_OOG`) decodes as `None` so the gateway and other
+/// ask-style callers can distinguish "actor returned nothing"
+/// from "actor failed".
 fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
+    use crate::actors::run::{STATUS_DONE, STATUS_YIELDED};
     if envelope.len() < 5 {
         return None;
+    }
+    match envelope[0] {
+        STATUS_DONE | STATUS_YIELDED => {}
+        // STATUS_NOT_FOUND / STATUS_PANICKED / STATUS_OOG and any
+        // future failure variant: the actor did not produce a
+        // valid reply. Surface as None.
+        _ => return None,
     }
     let state_len =
         u32::from_le_bytes([envelope[1], envelope[2], envelope[3], envelope[4]]) as usize;
@@ -2469,7 +2480,7 @@ fn extension_thread(
             match invoke_rx.try_recv() {
                 Ok(req) => {
                     bump();
-                    let reply = dispatch_and_poll(
+                    let outcome = dispatch_and_poll(
                         &mut instance,
                         &req.msg,
                         &inbox,
@@ -2480,8 +2491,19 @@ fn extension_thread(
                     // Workers don't yield — pack as DONE with no
                     // state so the caller's invoke_raw decodes
                     // `InvokeResult::Done { state: empty, reply }`.
-                    let envelope =
-                        encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
+                    // A `DispatchOutcome::Err` (handler panicked,
+                    // missing future, etc) becomes STATUS_PANICKED
+                    // so the gateway's `unwrap_invoke_envelope`
+                    // can distinguish it from a legitimate `()`
+                    // return — see vos::actors::run::STATUS_*.
+                    let envelope = match outcome {
+                        DispatchOutcome::Ok(reply) => {
+                            encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply)
+                        }
+                        DispatchOutcome::Err => {
+                            encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[])
+                        }
+                    };
                     send_reply_capped(req.reply_tx, envelope, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
@@ -2504,7 +2526,7 @@ fn extension_thread(
             }
         };
 
-        let reply = dispatch_and_poll(
+        let outcome = dispatch_and_poll(
             &mut instance,
             &envelope.payload,
             &inbox,
@@ -2512,16 +2534,23 @@ fn extension_thread(
             id,
             &mut deferred,
         );
-        // Always reply, even on empty/error returns — otherwise an
-        // ask-style caller (gateway via `ServiceCtx::ask_raw`) hangs
-        // for the full reply timeout when a handler dispatch errors
-        // (type mismatch, no such handler, panic). Empty payload is
-        // a valid reply for unit-returning handlers; callers
-        // already handle the empty-bytes case.
+        // Envelope-mode replies don't carry the `[status][state][reply]`
+        // wrapper — that's an invoke-channel detail. On the envelope
+        // path the receiver just gets the reply bytes addressed
+        // `from = target`. Treat a `DispatchOutcome::Err` as an empty
+        // reply here (we lose the panic vs () distinction in the
+        // envelope path, but no caller demands it today — the
+        // ask-style path that *does* distinguish them goes through
+        // invoke). Always reply even on empty so an ask-style caller
+        // doesn't hang for the full reply timeout.
+        let reply_bytes = match outcome {
+            DispatchOutcome::Ok(b) => b,
+            DispatchOutcome::Err => Vec::new(),
+        };
         let _ = outbox.send(Envelope {
             from: id,
             to: envelope.from,
-            payload: reply,
+            payload: reply_bytes,
         });
         persist(strategy.as_mut(), &instance, id);
     }
@@ -2597,14 +2626,18 @@ fn run_service_extension(
                         // PVM agent and actor-mode extension both
                         // reply with the wrapped invoke envelope
                         // `[status][state_len:u32][state][reply]`.
-                        // Strip back to just the rkyv reply bytes
-                        // — service extensions don't care about
-                        // YIELDED/DONE, they just want the typed
-                        // return value. A panicked / missing
-                        // handler decodes as None → ask_raw
-                        // surfaces None, gateway maps to 502 (or
-                        // 200 null after the empty-reply branch).
-                        return unwrap_invoke_envelope(&envelope).or(Some(Vec::new()));
+                        // `unwrap_invoke_envelope` returns Some(reply)
+                        // for DONE/YIELDED (legitimate completions —
+                        // empty bytes are fine for a `()` return) and
+                        // None for failure statuses (PANICKED /
+                        // NOT_FOUND / OOG). Passing the None through
+                        // lets `ServiceCtx::ask_raw` surface failures
+                        // as None at the caller — the gateway then
+                        // distinguishes "handler succeeded with no
+                        // value" (200 null) from "handler failed"
+                        // (502). Before this distinction, every
+                        // failure shape collapsed into 200 null.
+                        return unwrap_invoke_envelope(&envelope);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if Instant::now() >= deadline {
@@ -2692,8 +2725,23 @@ fn run_service_extension(
     }
 }
 
+/// Outcome of a single extension dispatch. `Ok(bytes)` means the
+/// handler completed with the given reply (`bytes` may be empty
+/// for a `()` return). `Err` covers the cases that can't be
+/// represented as bytes — handler panic, decode failure, missing
+/// future — and lets `extension_thread` pick the right `STATUS_*`
+/// byte for the invoke envelope. The exact `POLL_ERR_*` code
+/// behind the failure is logged inside `dispatch_and_poll` (the
+/// caller doesn't need it to pick a status byte).
+enum DispatchOutcome {
+    Ok(Vec<u8>),
+    Err,
+}
+
 /// Dispatch a message to an actor-mode extension instance and poll
-/// to completion. Returns the reply bytes (rkyv-encoded Value).
+/// to completion. Returns the reply bytes on success or a
+/// `POLL_ERR_*` status on a poisoned future (panic, missing future,
+/// etc).
 fn dispatch_and_poll(
     instance: &mut crate::extension::ExtensionInstance<'_>,
     msg: &[u8],
@@ -2701,7 +2749,7 @@ fn dispatch_and_poll(
     outbox: &mpsc::Sender<Envelope>,
     extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
-) -> Vec<u8> {
+) -> DispatchOutcome {
     use crate::extension::{POLL_PENDING, POLL_READY};
 
     instance.dispatch_start(msg);
@@ -2716,16 +2764,16 @@ fn dispatch_and_poll(
                     Vec::new()
                 };
                 instance.free_reply(&result);
-                return reply;
+                return DispatchOutcome::Ok(reply);
             }
             POLL_PENDING => {
                 let effect = instance.pending_effect();
                 let result = handle_effect(&effect, inbox, outbox, extension_id, deferred);
                 instance.provide_result(&result);
             }
-            _ => {
-                error!(%extension_id, status = result.status, "extension: poll returned error");
-                return Vec::new();
+            err => {
+                error!(%extension_id, status = err, "extension: poll returned error");
+                return DispatchOutcome::Err;
             }
         }
     }

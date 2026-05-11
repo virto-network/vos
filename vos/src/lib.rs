@@ -440,8 +440,16 @@ macro_rules! __vos_emit_worker_glue {
                         $crate::extension::ExtensionPollResult::pending()
                     }
                     Err(_panic) => {
+                        // Handler panicked — `catch_unwind` keeps the
+                        // host alive but the in-flight future is
+                        // poisoned. Surface as POLL_ERR_HANDLER so the
+                        // host can encode STATUS_PANICKED in the
+                        // invoke envelope (distinguishing "panic" from
+                        // a legitimate `() -> ()` return).
                         ws.in_flight = None;
-                        $crate::extension::ExtensionPollResult::ready_empty()
+                        $crate::extension::ExtensionPollResult::error(
+                            $crate::extension::POLL_ERR_HANDLER,
+                        )
                     }
                 }
             }

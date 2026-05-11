@@ -337,12 +337,16 @@ fn numeric_reply_is_a_bare_json_number() {
 // ── Error paths ──────────────────────────────────────────────────
 
 #[test]
-fn upstream_panic_renders_as_null_today() {
-    // Same shape as the type-mismatch test: handler runs, panics,
-    // host catches the panic and replies empty; gateway renders as
-    // null. Worth differentiating with a typed error reply in a
-    // follow-up so operators can tell "200 ok with no value" from
-    // "handler blew up".
+fn upstream_panic_yields_502() {
+    // Handler panic surfaces as 502 distinct from the legitimate
+    // `()` return that renders as 200 null. Previously both
+    // collapsed to 200 null because the host couldn't tell them
+    // apart on the wire; the invoke envelope now carries
+    // STATUS_PANICKED for caught panics (set by `extension_thread`
+    // when `dispatch_and_poll` returns `DispatchOutcome::Err`),
+    // and `unwrap_invoke_envelope` returns None for any
+    // non-success status, which `ServiceCtx::ask_raw` passes
+    // through to the gateway's None → 502 path.
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -352,8 +356,7 @@ fn upstream_panic_renders_as_null_today() {
     let http = node.http();
 
     let resp = http.get("/kitchen/boom");
-    resp.assert_status(200);
-    assert_eq!(resp.json(), json!(null));
+    resp.assert_status(502);
 }
 
 #[test]
@@ -400,13 +403,21 @@ fn malformed_json_body_yields_400() {
 }
 
 #[test]
-fn missing_required_arg_renders_as_null_today() {
-    // Same shape as the other dispatch-error cases: from_msg
-    // returns None, the worker drops the message without storing
-    // a future, the host always replies (post-Phase-6 fix), the
-    // gateway renders empty as null. Future: surface as 422 with
-    // a "missing arg" body once the host carries typed error
-    // replies.
+fn missing_required_arg_yields_502() {
+    // The gateway's schema-aware coercion catches per-arg type
+    // mismatches at 400, but doesn't yet enforce "all declared
+    // args present" — `{"a":2}` to `add(a, b)` reaches the actor
+    // with only `a` set. The actor's macro-generated `from_msg`
+    // returns None for the missing-`b` case, the worker poll
+    // returns POLL_ERR_NO_FUTURE, the host encodes STATUS_PANICKED
+    // in the invoke envelope, and the gateway maps the failure
+    // to 502. Pre-status-byte this collapsed to "200 null"
+    // alongside legitimate `()` returns.
+    //
+    // A schema-aware "missing required field" 400 would be a
+    // cleaner surface than 502 — the gateway has the field list
+    // already. Filed as a small follow-up; for now 502 is the
+    // right "something went wrong server-side" code.
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -416,8 +427,7 @@ fn missing_required_arg_renders_as_null_today() {
     let http = node.http();
 
     let resp = http.post_json("/kitchen/add", r#"{"a":2}"#); // missing b
-    resp.assert_status(200);
-    assert_eq!(resp.json(), json!(null));
+    resp.assert_status(502);
 }
 
 // ── State + lifecycle ────────────────────────────────────────────
