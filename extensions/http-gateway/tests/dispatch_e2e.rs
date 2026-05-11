@@ -154,20 +154,13 @@ fn get_handles_url_encoding() {
 }
 
 #[test]
-fn get_with_typed_arg_renders_as_null_today() {
-    // Documents current behaviour, not what we want long-term:
-    // GET /kitchen/add?a=2&b=3 — query args are Str, but `add`
-    // expects (u32, u32). The macro-generated `from_msg` returns
-    // None for type mismatch; the worker dispatcher silently
-    // returns without storing a future; the host always replies
-    // (post-Phase-6 fix in node.rs) with empty bytes; the gateway
-    // renders empty reply as JSON null.
-    //
-    // Future improvement: gateway could look up the actor's meta
-    // and coerce string→numeric for typed args, OR the host could
-    // send a typed error reply (no_handler / type_mismatch) so
-    // the gateway can map to a proper 4xx/5xx instead of hiding
-    // the failure under a 200 null.
+fn get_with_typed_arg_coerces_via_schema() {
+    // Schema-aware coercion: GET query args are `Value::Str(_)`,
+    // but the mock-registry serves kitchen-sink's schema so the
+    // gateway knows `add(a: u32, b: u32)` and parses "2"/"3" into
+    // `Value::U32(2)`/`Value::U32(3)`. Previously rendered as
+    // `200 null` because the macro's `from_msg` rejected the
+    // Str→u32 shape; now closes that gap when meta is registered.
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -178,7 +171,7 @@ fn get_with_typed_arg_renders_as_null_today() {
 
     let resp = http.get("/kitchen/add?a=2&b=3");
     resp.assert_status(200);
-    assert_eq!(resp.json(), json!(null));
+    assert_eq!(resp.json(), json!(5));
 }
 
 #[test]
@@ -364,13 +357,12 @@ fn upstream_panic_renders_as_null_today() {
 }
 
 #[test]
-fn unknown_method_on_known_agent_renders_as_null_today() {
-    // Resolve("kitchen") succeeds, but kitchen has no `nonsense`
-    // handler. The actor's from_msg returns None, the worker glue
-    // returns without storing a future, the host replies empty,
-    // gateway renders as null. Same caveat as the typed-arg case
-    // — should map to 404 / 422 once the host can carry typed
-    // error replies.
+fn unknown_method_on_known_agent_404s_with_schema() {
+    // Schema-aware error surface: resolve("kitchen") succeeds, but
+    // kitchen-sink's schema doesn't list `nonsense`. The gateway
+    // pre-checks `ParsedMessage` and 404s without dispatching.
+    // Pre-schema this used to render as `200 null` (handler
+    // missing was indistinguishable from `()`-returning).
     let paths = FixturePaths::discover();
     if !paths.all_present() {
         paths.print_skip_hint();
@@ -380,8 +372,12 @@ fn unknown_method_on_known_agent_renders_as_null_today() {
     let http = node.http();
 
     let resp = http.get("/kitchen/nonsense");
-    resp.assert_status(200);
-    assert_eq!(resp.json(), json!(null));
+    resp.assert_status(404);
+    assert!(
+        resp.body.contains("unknown method"),
+        "expected 'unknown method' in body, got {:?}",
+        resp.body
+    );
 }
 
 #[test]

@@ -1,20 +1,130 @@
 //! Stand-in for the bundled space-registry, used by the
-//! http-gateway dispatch tests. Only implements the one
-//! handler the gateway calls (`resolve(name) -> u32`); the actor
-//! itself is a hardcoded `(name → ServiceId)` map.
+//! http-gateway dispatch tests. Implements just the handlers
+//! the gateway calls during a request:
+//!   - `resolve(name) -> u32`             — name → ServiceId
+//!   - `meta_for_instance(name) -> Vec<u8>` — schema blob
 //!
-//! Built as a real `.so` so it loads through the same
-//! ExtensionPlugin path the production registry would (when the
-//! production registry exists as an extension at all).
+//! The actor is hardcoded against the fixture install order
+//! (`counter` at id 1, `kitchen` at id 2); the schema blob for
+//! `kitchen` is encoded at compile time from a verbatim
+//! restatement of `kitchen-sink`'s handler signatures. We can't
+//! `include_bytes!` the kitchen-sink `.so`'s ELF section because
+//! host-native cdylibs don't carry `.vos_meta` (it's a PVM-side
+//! convention), so we hand-keep the table here. If kitchen-sink's
+//! signatures change, the test fixtures get out of sync — the
+//! dispatch_e2e suite's coercion-aware tests will catch that.
 //!
-//! Mappings (matched in tests/common.rs to the fixture install
-//! order — REGISTRY = 0, then `counter` at id 1, then
-//! `kitchen` at id 2):
-//!   "counter" → 1
-//!   "kitchen" → 2
-//!   _         → 0  (gateway treats 0 as "unknown" → 404)
+//! Mappings:
+//!   "counter" → 1, no schema (legacy permissive path)
+//!   "kitchen" → 2, full schema below
+//!   _         → 0 / empty  (gateway: unknown → 404)
 
+use vos::metadata::{ActorMeta, FieldMeta, MessageMeta, encode};
 use vos::prelude::*;
+
+/// Mirror of `kitchen-sink`'s `#[messages]` block. Hand-kept;
+/// see comment above.
+const KITCHEN_META: ActorMeta = ActorMeta {
+    actor_name: "KitchenSink",
+    messages: &[
+        MessageMeta {
+            name: "echo",
+            is_query: false,
+            fields: &[FieldMeta {
+                name: "text",
+                ty: "String",
+            }],
+        },
+        MessageMeta {
+            name: "last_text",
+            is_query: true,
+            fields: &[],
+        },
+        MessageMeta {
+            name: "add",
+            is_query: false,
+            fields: &[
+                FieldMeta {
+                    name: "a",
+                    ty: "u32",
+                },
+                FieldMeta {
+                    name: "b",
+                    ty: "u32",
+                },
+            ],
+        },
+        MessageMeta {
+            name: "last_sum",
+            is_query: true,
+            fields: &[],
+        },
+        MessageMeta {
+            name: "flip",
+            is_query: false,
+            fields: &[FieldMeta {
+                name: "b",
+                ty: "bool",
+            }],
+        },
+        MessageMeta {
+            name: "flip_count",
+            is_query: true,
+            fields: &[],
+        },
+        MessageMeta {
+            name: "sum_list",
+            is_query: true,
+            fields: &[FieldMeta {
+                name: "xs",
+                ty: "Vec<u32>",
+            }],
+        },
+        MessageMeta {
+            name: "concat",
+            is_query: true,
+            fields: &[FieldMeta {
+                name: "parts",
+                ty: "Vec<String>",
+            }],
+        },
+        MessageMeta {
+            name: "range",
+            is_query: true,
+            fields: &[FieldMeta {
+                name: "n",
+                ty: "u32",
+            }],
+        },
+        MessageMeta {
+            name: "split",
+            is_query: true,
+            fields: &[FieldMeta {
+                name: "s",
+                ty: "String",
+            }],
+        },
+        MessageMeta {
+            name: "ping",
+            is_query: true,
+            fields: &[],
+        },
+        MessageMeta {
+            name: "boom",
+            is_query: true,
+            fields: &[],
+        },
+    ],
+    constructor: &[],
+    kind: 0,
+    caps: &[],
+};
+
+/// Pre-encoded meta blob — same wire bytes the bundled registry's
+/// `.vos_meta` section carries on PVM actors. Generated at const
+/// eval; `LEN` is the actual byte count, `BUF` holds it plus
+/// trailing zeros up to the fixed-size buffer.
+const KITCHEN_META_ENCODED: ([u8; 512], usize) = encode::<512>(&KITCHEN_META);
 
 #[actor]
 #[derive(Default)]
@@ -32,6 +142,23 @@ impl MockRegistry {
             "counter" => 1,
             "kitchen" => 2,
             _ => 0,
+        }
+    }
+
+    /// Schema-blob lookup. Returns the same wire format the
+    /// production registry serves: raw `.vos_meta` section bytes.
+    /// Only `kitchen` has a schema in this fixture — `counter`
+    /// is intentionally schema-less so dispatch_e2e can also
+    /// exercise the gateway's legacy pre-schema fallback path
+    /// when no meta is available.
+    #[msg]
+    async fn meta_for_instance(&self, name: String, _ctx: &mut Context<Self>) -> Vec<u8> {
+        match name.as_str() {
+            "kitchen" => {
+                let (buf, len) = KITCHEN_META_ENCODED;
+                buf[..len].to_vec()
+            }
+            _ => Vec::new(),
         }
     }
 }
