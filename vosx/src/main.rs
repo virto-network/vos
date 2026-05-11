@@ -223,8 +223,13 @@ fn is_top_level_help(argv: &[String]) -> bool {
             // Global no-value flags we tolerate alongside --help.
             "-v" | "--verbose" => {}
             // Global value-taking flags — skip the value too.
-            "--format" => i += 1,
-            s if s.starts_with("--format=") => {}
+            // `--space` rides here too: `vosx --space demo --help`
+            // is a legitimate "show me what `demo` knows about"
+            // request; we don't currently filter the cache
+            // listing to that space (Phase 4d), but we shouldn't
+            // bail out as if the user typed garbage.
+            "--format" | "--space" => i += 1,
+            s if s.starts_with("--format=") || s.starts_with("--space=") => {}
             // Anything else (built-in subcommand, dynamic verb,
             // unknown flag) → not a pure top-level help.
             _ => return false,
@@ -432,6 +437,18 @@ mod routing_tests {
         // handle that path, not our extended renderer.
         assert!(!is_top_level_help(&s(&["space", "--help"])));
         assert!(!is_top_level_help(&s(&["run", "--help"])));
+    }
+
+    #[test]
+    fn top_level_help_tolerates_space_flag() {
+        // `vosx --space demo --help` was previously rejected by
+        // the help-detection arm, falling through to the
+        // dynamic dispatcher which errored "no target". The
+        // user's intent is clearly help-with-context, not a
+        // missing verb.
+        assert!(is_top_level_help(&s(&["--space", "demo", "--help"])));
+        assert!(is_top_level_help(&s(&["--space=demo", "-h"])));
+        assert!(is_top_level_help(&s(&["help", "--space", "demo"])));
     }
 
     #[test]

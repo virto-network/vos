@@ -41,8 +41,12 @@
 //! ```
 //!
 //! Missing file → empty cache (`load()` returns
-//! `CliCache::default()`); malformed file → loud error so the
-//! user can either delete it or fix the toml.
+//! `CliCache::default()`). Malformed file → `load()` returns
+//! `Err`, but both call sites (`render_summary`, `update_target`)
+//! swallow it and `tracing::warn!` so the live wire path never
+//! gets blocked by a bad cache. Operator action on a corrupt
+//! cache: delete the file and re-run any `vosx <target>` to
+//! repopulate.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -151,7 +155,17 @@ pub fn save_to(cache: &CliCache, p: &Path) -> Result<(), CacheError> {
 /// parse error; the cache is a strict optimisation and must
 /// never block dispatch.
 pub fn update_target(space: &str, target: &str, meta: &ParsedMeta) {
-    let mut cache = load().unwrap_or_default();
+    let mut cache = match load() {
+        Ok(c) => c,
+        Err(e) => {
+            // Corrupt cache — start over rather than carry
+            // forward garbage. Warn so the operator notices.
+            tracing::warn!(
+                "vosx: cli_cache load failed during update (rebuilding from empty): {e}",
+            );
+            CliCache::default()
+        }
+    };
     if cache.version == 0 {
         cache.version = CACHE_VERSION;
     }
@@ -179,15 +193,35 @@ pub fn update_target(space: &str, target: &str, meta: &ParsedMeta) {
             .collect(),
     };
     space_entry.targets.insert(target.to_string(), target_meta);
-    let _ = save(&cache);
+    if let Err(e) = save(&cache) {
+        // Cache writes must never break dispatch — discovery
+        // can stay stale, the round trip already worked — but
+        // a silent failure leaves the operator wondering why
+        // `vosx --help` never picks up new targets. Log so the
+        // why is one `RUST_LOG=warn` away.
+        tracing::warn!("vosx: cli_cache save failed (discovery may be stale): {e}");
+    }
 }
 
 /// Render a human-readable "discoverable targets" section for
 /// inclusion in extended `--help` output. Returns `None` when
-/// the cache is empty so callers can skip the heading too.
+/// no space has any targets cached — both the empty-cache and
+/// "every space row is empty" paths collapse to the same
+/// "skip the section entirely" answer so the help output never
+/// shows an orphan heading with no bullets under it.
 pub fn render_summary() -> Option<String> {
-    let cache = load().ok()?;
-    if cache.spaces.is_empty() {
+    let cache = match load() {
+        Ok(c) => c,
+        Err(e) => {
+            // Cache is strict-optimisation; load failure must
+            // not break --help. Log at warn so the user can spot
+            // a corrupted/permissions-bad file.
+            tracing::warn!("vosx: cli_cache load failed: {e}");
+            return None;
+        }
+    };
+    let any_target = cache.spaces.values().any(|sp| !sp.targets.is_empty());
+    if !any_target {
         return None;
     }
     let mut out = String::new();
@@ -393,6 +427,54 @@ mod tests {
         assert!(stop.exposed_to_cli);
         assert!(!internal.exposed_to_cli);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn update_target_writes_through_via_xdg() {
+        // Exercises the actual `update_target` entry point —
+        // `load()` -> mutate -> `save()` — under an isolated
+        // XDG_CONFIG_HOME. Previous tests built CliCache by hand;
+        // a typo in update_target's field mapping would go
+        // unnoticed otherwise.
+        let tmp = tmp_path("update-via-xdg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let saved = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: see comment in render_summary_skips_when_empty.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+
+        let m = fake_meta();
+        update_target("demo", "gateway", &m);
+        // Re-read through the same XDG-keyed `load()` so the
+        // test covers `path()` too.
+        let cache = load().expect("load after update");
+
+        if let Some(prev) = saved {
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        }
+
+        let demo = cache.spaces.get("demo").expect("space written");
+        let gateway = demo.targets.get("gateway").expect("target written");
+        assert_eq!(gateway.actor_name, "HttpGateway");
+        assert_eq!(gateway.kind, 1);
+        assert_eq!(gateway.methods.len(), 3);
+        let stop = gateway.methods.iter().find(|m| m.name == "stop").unwrap();
+        let internal = gateway
+            .methods
+            .iter()
+            .find(|m| m.name == "internal")
+            .unwrap();
+        assert!(stop.exposed_to_cli);
+        assert!(!internal.exposed_to_cli);
+        // Field metadata for the non-CLI method survives so
+        // tooling consuming the cache (IDE schema, codegen)
+        // can render full signatures.
+        assert_eq!(internal.fields.len(), 1);
+        assert_eq!(internal.fields[0].name, "x");
+        assert_eq!(internal.fields[0].ty, "u32");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

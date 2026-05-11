@@ -95,7 +95,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
 
         let Some(method) = method else {
             // `vosx <target>` (or `--help`) → list surface.
-            return print_target_surface(target, meta.as_ref(), parsed.wants_help);
+            return print_target_surface(target, meta.as_ref());
         };
 
         if parsed.wants_help {
@@ -267,11 +267,7 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
     })
 }
 
-fn print_target_surface(
-    target: &str,
-    meta: Option<&ParsedMeta>,
-    _wants_help: bool,
-) -> anyhow::Result<()> {
+fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Result<()> {
     let Some(m) = meta else {
         bail!(
             "no schema registered for '{target}'. \
@@ -431,11 +427,31 @@ mod tests {
     }
 
     #[test]
-    fn build_msg_without_schema_falls_back_to_heuristic() {
+    fn build_msg_without_schema_uses_heuristic_typing() {
         // No method_meta → loose typing, same as `space call`.
+        // Round-trip through encode/decode so we actually
+        // observe how each `Value` arrived on the wire — a
+        // future refactor that flipped a numeric to a string
+        // would silently regress the `vosx <agent> <method>`
+        // shape for any actor that hasn't registered meta.
+        use vos::value::Value;
         let msg = build_msg("anything", None, &["x=42", "y=true", "z=hi"]).unwrap();
-        // Just confirm the call shape compiles + doesn't panic;
-        // wire-level type assertions live in `space::call::tests`.
-        let _ = msg;
+        assert_eq!(
+            msg.args.get("x").map(|v| matches!(v, Value::U64(42))),
+            Some(true),
+            "numeric heuristic should produce U64(42)",
+        );
+        assert_eq!(
+            msg.args.get("y").map(|v| matches!(v, Value::Bool(true))),
+            Some(true),
+            "true/false heuristic should produce Bool",
+        );
+        assert_eq!(
+            msg.args
+                .get("z")
+                .map(|v| matches!(v, Value::Str(s) if s == "hi")),
+            Some(true),
+            "non-numeric, non-bool heuristic should produce Str",
+        );
     }
 }
