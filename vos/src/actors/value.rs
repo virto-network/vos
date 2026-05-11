@@ -54,40 +54,82 @@ pub enum Value {
 }
 
 // ── Typed accessors ──────────────────────────────────────────────
+//
+// Numeric `as_*` follow `try_into()` semantics: they return `Some`
+// if the stored value is exactly representable as the target type,
+// regardless of which int variant happens to hold it. JSON has only
+// "number" — the gateway's `parse_flat_json` picks U32 for small
+// non-negative ints and U64 for larger ones — so a u64-typed actor
+// handler invoked via JSON would otherwise reject `{"a":2}` because
+// `as_u64(Value::U32(2))` is None. Widening here lets the same
+// payload satisfy any sufficiently-wide signature; values that
+// would lose precision (negative → unsigned, or out-of-range
+// narrowing) still fail. Mirrors what `i128`/`u128` `try_into()`
+// would do for the same pair.
 
 impl Value {
     pub fn as_u8(&self) -> Option<u8> {
         match self {
             Value::U8(v) => Some(*v),
+            Value::U16(v) => u8::try_from(*v).ok(),
+            Value::U32(v) => u8::try_from(*v).ok(),
+            Value::U64(v) => u8::try_from(*v).ok(),
+            Value::I32(v) => u8::try_from(*v).ok(),
+            Value::I64(v) => u8::try_from(*v).ok(),
             _ => None,
         }
     }
     pub fn as_u16(&self) -> Option<u16> {
         match self {
+            Value::U8(v) => Some(u16::from(*v)),
             Value::U16(v) => Some(*v),
+            Value::U32(v) => u16::try_from(*v).ok(),
+            Value::U64(v) => u16::try_from(*v).ok(),
+            Value::I32(v) => u16::try_from(*v).ok(),
+            Value::I64(v) => u16::try_from(*v).ok(),
             _ => None,
         }
     }
     pub fn as_u32(&self) -> Option<u32> {
         match self {
+            Value::U8(v) => Some(u32::from(*v)),
+            Value::U16(v) => Some(u32::from(*v)),
             Value::U32(v) => Some(*v),
+            Value::U64(v) => u32::try_from(*v).ok(),
+            Value::I32(v) => u32::try_from(*v).ok(),
+            Value::I64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
     pub fn as_u64(&self) -> Option<u64> {
         match self {
+            Value::U8(v) => Some(u64::from(*v)),
+            Value::U16(v) => Some(u64::from(*v)),
+            Value::U32(v) => Some(u64::from(*v)),
             Value::U64(v) => Some(*v),
+            Value::I32(v) => u64::try_from(*v).ok(),
+            Value::I64(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }
     pub fn as_i32(&self) -> Option<i32> {
         match self {
+            Value::U8(v) => Some(i32::from(*v)),
+            Value::U16(v) => Some(i32::from(*v)),
+            Value::U32(v) => i32::try_from(*v).ok(),
+            Value::U64(v) => i32::try_from(*v).ok(),
             Value::I32(v) => Some(*v),
+            Value::I64(v) => i32::try_from(*v).ok(),
             _ => None,
         }
     }
     pub fn as_i64(&self) -> Option<i64> {
         match self {
+            Value::U8(v) => Some(i64::from(*v)),
+            Value::U16(v) => Some(i64::from(*v)),
+            Value::U32(v) => Some(i64::from(*v)),
+            Value::U64(v) => i64::try_from(*v).ok(),
+            Value::I32(v) => Some(i64::from(*v)),
             Value::I64(v) => Some(*v),
             _ => None,
         }
@@ -543,6 +585,70 @@ pub mod desc {
             let msg = decode_msg(&buf).unwrap();
             assert_eq!(msg.name, "hello");
             assert_eq!(msg.args.get_u32("key"), Some(7));
+        }
+
+        // ── Accessor widening ─────────────────────────────────
+        //
+        // The gateway's JSON parser produces U32 for small ints
+        // and U64 for big ones; actor handlers with u64 args
+        // would otherwise reject the small case. These tests
+        // pin down the `try_into()`-shaped coercion contract.
+
+        #[test]
+        fn as_u64_widens_from_smaller_unsigned() {
+            assert_eq!(Value::U8(5).as_u64(), Some(5));
+            assert_eq!(Value::U16(5).as_u64(), Some(5));
+            assert_eq!(Value::U32(5).as_u64(), Some(5));
+            assert_eq!(Value::U64(5).as_u64(), Some(5));
+        }
+
+        #[test]
+        fn as_u64_accepts_non_negative_signed() {
+            assert_eq!(Value::I32(5).as_u64(), Some(5));
+            assert_eq!(Value::I64(5).as_u64(), Some(5));
+            // Negative signed → unsigned target fails.
+            assert_eq!(Value::I32(-1).as_u64(), None);
+            assert_eq!(Value::I64(-1).as_u64(), None);
+        }
+
+        #[test]
+        fn as_u32_narrows_only_when_value_fits() {
+            assert_eq!(Value::U64(5).as_u32(), Some(5));
+            assert_eq!(Value::U64(u64::from(u32::MAX)).as_u32(), Some(u32::MAX));
+            // u32::MAX + 1 — doesn't fit.
+            assert_eq!(Value::U64(1 << 32).as_u32(), None);
+        }
+
+        #[test]
+        fn as_i64_widens_from_smaller_signed_and_unsigned() {
+            assert_eq!(Value::I32(-5).as_i64(), Some(-5));
+            assert_eq!(Value::I64(-5).as_i64(), Some(-5));
+            assert_eq!(Value::U8(5).as_i64(), Some(5));
+            assert_eq!(Value::U32(5).as_i64(), Some(5));
+            // U64 within i64 range fits.
+            assert_eq!(Value::U64(5).as_i64(), Some(5));
+            // U64 above i64::MAX overflows.
+            assert_eq!(Value::U64(u64::MAX).as_i64(), None);
+        }
+
+        #[test]
+        fn as_i32_narrows_only_when_value_fits() {
+            assert_eq!(Value::I64(-5).as_i32(), Some(-5));
+            assert_eq!(Value::I64(i64::from(i32::MIN)).as_i32(), Some(i32::MIN),);
+            assert_eq!(Value::I64(i64::from(i32::MAX)).as_i32(), Some(i32::MAX),);
+            // Out-of-range narrowing fails.
+            assert_eq!(Value::I64(i64::from(i32::MAX) + 1).as_i32(), None);
+            assert_eq!(Value::I64(i64::from(i32::MIN) - 1).as_i32(), None);
+            // Negative unsigned-source can't fit.
+            assert_eq!(Value::U64(u64::MAX).as_i32(), None);
+        }
+
+        #[test]
+        fn non_numeric_variants_still_reject_numeric_accessors() {
+            // Sanity: widening doesn't accept non-numeric types.
+            assert_eq!(Value::Unit.as_u64(), None);
+            assert_eq!(Value::Str("5".into()).as_u64(), None);
+            assert_eq!(Value::Bool(true).as_i64(), None);
         }
     }
 }

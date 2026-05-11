@@ -76,6 +76,7 @@ fn ensure_built() {
         (gateway_so(), "cargo build -p http-gateway"),
         (actor_elf("greeter"), "cd examples && just build"),
         (actor_elf("counter"), "cd examples && just build"),
+        (actor_elf("math"), "cd examples && just build"),
     ] {
         if !path.exists() {
             panic!("test artifact missing: {}\nRun: {}", path.display(), hint,);
@@ -206,9 +207,9 @@ fn boot_daemon(manifest_path: &Path, port: u16) -> Daemon {
     );
 }
 
-/// Render a minimal manifest TOML installing greeter + counter PVM
-/// actors + the http-gateway. consistency = ephemeral keeps state
-/// in memory only, which suits the test's lifecycle.
+/// Render a minimal manifest TOML installing greeter + counter +
+/// math PVM actors + the http-gateway. consistency = ephemeral
+/// keeps state in memory only, which suits the test's lifecycle.
 fn write_manifest(dir: &Path, port: u16) -> PathBuf {
     let path = dir.join("manifest.toml");
     let body = format!(
@@ -226,6 +227,11 @@ name = "counter"
 path = "{counter}"
 consistency = "ephemeral"
 
+[[agent]]
+name = "math"
+path = "{math}"
+consistency = "ephemeral"
+
 [[extension]]
 name = "gateway"
 path = "{gateway}"
@@ -233,6 +239,7 @@ init = {{ bind_addr = "127.0.0.1", port = {port}, admin_token = "test-token" }}
 "#,
         greeter = actor_elf("greeter").display(),
         counter = actor_elf("counter").display(),
+        math = actor_elf("math").display(),
         gateway = gateway_so().display(),
     );
     std::fs::write(&path, body).expect("write manifest");
@@ -397,7 +404,61 @@ fn pvm_actors_via_gateway() {
         );
     }
 
-    // 5. Unknown agent — registry returns 0 → gateway 404.
+    // 5. Math actor with JSON-encoded args — exercises the full
+    //    typed-arg round trip. `parse_flat_json` encodes small
+    //    ints as `Value::U32`; `math::add(a:u64, b:u64) -> u64`
+    //    relies on `Value::as_u64` widening from U32. Returns
+    //    JSON-encoded sum.
+    let (status, body) = http_request(
+        daemon.port(),
+        "POST",
+        "/math/add",
+        None,
+        br#"{"a":2,"b":3}"#,
+    );
+    assert_eq!(
+        status,
+        200,
+        "POST /math/add expected 200, got {status} body={:?}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(
+        std::str::from_utf8(&body).expect("body utf-8").trim(),
+        "5",
+        "math/add(2,3): if this is 'null', Value::as_u64 isn't widening U32 → u64",
+    );
+
+    // Same actor, second method — proves dispatch picks the
+    // right handler by name and the type coercion is consistent.
+    let (status, body) = http_request(
+        daemon.port(),
+        "POST",
+        "/math/multiply",
+        None,
+        br#"{"a":6,"b":7}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "POST /math/multiply expected 200, got {status}"
+    );
+    assert_eq!(std::str::from_utf8(&body).expect("body utf-8").trim(), "42",);
+
+    // U64-shaped JSON (value > u32::MAX) also coerces — exercises
+    // the wide branch of the JSON parser's classifier.
+    let (status, body) = http_request(
+        daemon.port(),
+        "POST",
+        "/math/add",
+        None,
+        br#"{"a":5000000000,"b":1}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        std::str::from_utf8(&body).expect("body utf-8").trim(),
+        "5000000001",
+    );
+
+    // 6. Unknown agent — registry returns 0 → gateway 404.
     //    Asserts the negative path: registry isn't blanket-
     //    returning a non-zero id for everything.
     let (status, body) = http_request(daemon.port(), "POST", "/no-such-agent/whatever", None, &[]);
@@ -408,15 +469,16 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&body),
     );
 
-    // 6. Admin counter monotonically advances. Don't pin an exact
+    // 7. Admin counter monotonically advances. Don't pin an exact
     //    number — the readiness poll above can retry an unbounded
     //    number of times depending on install timing — just
     //    require the counter advanced by at least the number of
-    //    dispatch requests we issued in steps 3–5 (1 + 3 + 1 = 5).
+    //    dispatch requests we issued in steps 3–6 (greeter + 3
+    //    counter + 3 math + 404 = 8).
     let count1 = admin_request_count(&daemon, "test-token");
     assert!(
-        count1 >= count0 + 5,
-        "expected counter to advance by ≥5 (greeter + 3×counter + 404), got {count0} → {count1}",
+        count1 >= count0 + 8,
+        "expected counter to advance by ≥8, got {count0} → {count1}",
     );
 
     // Daemon teardown via Drop.
