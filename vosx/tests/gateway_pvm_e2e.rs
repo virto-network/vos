@@ -394,7 +394,7 @@ fn pvm_actors_via_gateway() {
         "greeter.start returns (); expected JSON null"
     );
 
-    // 4. Dispatch to counter. Same shape — different actor,
+    // 3. Dispatch to counter. Same shape — different actor,
     //    different registered ServiceId. If the registry is
     //    returning the same garbage id for every name (blake2b
     //    no-op'd), the gateway hits the same target as step 3
@@ -409,7 +409,7 @@ fn pvm_actors_via_gateway() {
         );
     }
 
-    // 5. Math actor with JSON-encoded args — exercises the full
+    // 4. Math actor with JSON-encoded args — exercises the full
     //    typed-arg round trip. `parse_flat_json` encodes small
     //    ints as `Value::U32`; `math::add(a:u64, b:u64) -> u64`
     //    relies on `Value::as_u64` widening from U32. Returns
@@ -483,7 +483,7 @@ fn pvm_actors_via_gateway() {
     );
     assert_eq!(std::str::from_utf8(&body).expect("body utf-8").trim(), "42",);
 
-    // 6. Unknown agent — registry returns 0 → gateway 404.
+    // 5. Unknown agent — registry returns 0 → gateway 404.
     //    Asserts the negative path: registry isn't blanket-
     //    returning a non-zero id for everything.
     let (status, body) = http_request(daemon.port(), "POST", "/no-such-agent/whatever", None, &[]);
@@ -494,7 +494,7 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&body),
     );
 
-    // 6b. Schema-aware error surface: an unknown method on a
+    // 5b. Schema-aware error surface: an unknown method on a
     //     known agent → 404 (not "200 null" like pre-schema).
     let (status, body) = http_request(
         daemon.port(),
@@ -515,7 +515,7 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&body),
     );
 
-    // 6c. Schema-aware error surface: type-mismatched arg → 400
+    // 5c. Schema-aware error surface: type-mismatched arg → 400
     //     (not "200 null"). math.add expects u64; sending a
     //     non-numeric string for `a` should fail at the gateway.
     let (status, body) = http_request(
@@ -537,7 +537,7 @@ fn pvm_actors_via_gateway() {
         "type-mismatch body should name the bad arg and its expected type, got {body_str:?}",
     );
 
-    // 7. /__schema → list of installed agents (JSON array of
+    // 6. /__schema → list of installed agents (JSON array of
     //    names). Public endpoint, no admin token. Sorted by
     //    instance_name on the registry side.
     let (status, body) = http_request(daemon.port(), "GET", "/__schema", None, &[]);
@@ -550,7 +550,7 @@ fn pvm_actors_via_gateway() {
         "expected math + greeter + counter in /__schema, got {names:?}",
     );
 
-    // 8. /__schema/math → full ActorMeta as JSON. Catches both
+    // 7. /__schema/math → full ActorMeta as JSON. Catches both
     //    the registry's `meta_for_instance` join and the gateway's
     //    `meta_to_json` rendering.
     let (status, body) = http_request(daemon.port(), "GET", "/__schema/math", None, &[]);
@@ -569,14 +569,14 @@ fn pvm_actors_via_gateway() {
     let a = fields.iter().find(|f| f["name"] == "a").expect("'a' arg");
     assert_eq!(a["type"], "u64", "math.add.a is declared u64");
 
-    // 9. /__schema/<unknown> → 404 (negative path).
+    // 8. /__schema/<unknown> → 404 (negative path).
     let (status, _body) = http_request(daemon.port(), "GET", "/__schema/nonexistent", None, &[]);
     assert_eq!(
         status, 404,
         "GET /__schema/nonexistent should 404, got {status}",
     );
 
-    // 10. `vosx space describe` CLI — operator-facing mirror of
+    // 9. `vosx space describe` CLI — operator-facing mirror of
     //     `/__schema/<agent>`. Uses the same daemon (via
     //     DaemonClient) so this exercises the registry's
     //     `meta_for_instance` handler over libp2p, plus the CLI's
@@ -607,7 +607,7 @@ fn pvm_actors_via_gateway() {
         "describe should list math.multiply: {cli_meta}",
     );
 
-    // 10a-pre. Phase 4 dynamic dispatch: `vosx --space e2e math add a=2 b=3`
+    // 9a-pre. Phase 4 dynamic dispatch: `vosx --space e2e math add a=2 b=3`
     //          replaces `vosx space call e2e math add a=2 b=3` with an
     //          ergonomic shape that's schema-aware (the registry's
     //          math.add(u64, u64) signature drives arg coercion).
@@ -667,7 +667,7 @@ fn pvm_actors_via_gateway() {
         "unknown target must give a clear error: {stderr}",
     );
 
-    // 10a-cache. The previous `vosx --space e2e math add` round
+    // 9a-cache. The previous `vosx --space e2e math add` round
     //            wrote the math schema into the per-space CLI
     //            cache at `<XDG_CONFIG_HOME>/vosx/cli_cache.toml`.
     //            `vosx --help` should now surface `math` as a
@@ -695,7 +695,7 @@ fn pvm_actors_via_gateway() {
         "vosx --help should list cached target `math` in space `e2e`, got:\n{help}",
     );
 
-    // 10a. Same CLI, but pointed at the gateway *extension* instead
+    // 9a. Same CLI, but pointed at the gateway *extension* instead
     //      of a PVM agent. Phase 3 wired vosx reconcile to forward
     //      `[[extension]]` meta to the registry's `register_extension_meta`;
     //      `meta_for_instance` falls through, so this round-trips
@@ -736,7 +736,7 @@ fn pvm_actors_via_gateway() {
     assert_eq!(stop["exposed_to_cli"], true);
     assert_eq!(status_msg["exposed_to_cli"], true);
 
-    // 10b. /openapi.json — auto-generated from registered schemas.
+    // 9b. /openapi.json — auto-generated from registered schemas.
     //      Asserts the doc shape: openapi version, math.add /
     //      math.multiply paths each with the right HTTP method,
     //      and that the u64 arg type maps to the proper OpenAPI
@@ -765,7 +765,7 @@ fn pvm_actors_via_gateway() {
     assert_eq!(a_param["schema"]["type"], "integer");
     assert_eq!(a_param["schema"]["format"], "uint64");
 
-    // 10c. /__metrics — Prometheus exposition format. Public,
+    // 9c. /__metrics — Prometheus exposition format. Public,
     //      no token. Asserts both the surface (HELP/TYPE lines)
     //      and a counter actually moved across all the requests
     //      we issued above. `responses_total{status_class="2xx"}`
@@ -802,7 +802,7 @@ fn pvm_actors_via_gateway() {
         "expected ≥1 4xx response counted, got {fourxx}"
     );
 
-    // 11. Dispatched-request counter monotonically advances. Don't
+    // 10. Dispatched-request counter monotonically advances. Don't
     //     pin an exact number — the readiness poll above can retry
     //     an unbounded number of times depending on install timing
     //     — just require it advanced by at least the dispatch
@@ -817,7 +817,7 @@ fn pvm_actors_via_gateway() {
         "expected counter to advance by ≥12, got {count0} → {count1}",
     );
 
-    // 12. Phase 5: `vosx gateway status` returns the same JSON
+    // 11. Phase 5: `vosx gateway status` returns the same JSON
     //     snapshot the removed `GET /__admin/status` did, and
     //     `vosx gateway stop` actually flips the gateway's stop
     //     flag — same wire path as Phase 4 dispatch, landing on

@@ -24,14 +24,10 @@ use serde_json::json;
 
 // ── Fixture sanity ──────────────────────────────────────────────
 //
-// `/__admin/stop` and `/__admin/status` (and the
-// `gateway_boots_and_serves_admin_endpoint` test that used to
-// exercise them) were removed in Phase 6. The gateway's
-// dispatch-side lifecycle now rides `vosx gateway stop` /
-// `vosx gateway status`; see the matching assertions in
-// `gateway_pvm_e2e`. Boot-time sanity is still covered by every
-// downstream test that calls `TestNode::start` — a failed boot
-// causes them to fail before their first request.
+// Pre-Phase-6 admin-namespace tests are gone; `vosx gateway *`
+// covers the lifecycle surface in `gateway_pvm_e2e`. Boot-time
+// sanity is implicitly covered by every test below — a failed
+// `TestNode::start` aborts the run.
 
 #[test]
 fn gateway_caps_are_declared_on_the_so() {
@@ -506,11 +502,6 @@ fn metrics_reflect_request_count() {
         "expected ≥5 requests counted, got {count}; metrics body:\n{body}",
     );
 }
-
-// `admin_stop_signals_gateway_to_exit` was removed in Phase 6.
-// The replacement assertion (`vosx gateway stop` actually flips
-// the stop flag and the gateway exits) lives in step 12 of
-// `gateway_pvm_e2e` where a real `vosx` daemon is up.
 
 // ── Concurrency ──────────────────────────────────────────────────
 

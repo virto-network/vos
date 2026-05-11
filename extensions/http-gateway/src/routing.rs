@@ -46,6 +46,10 @@
 //! HTTP namespace is gone; `admin_token` was removed from
 //! [`crate::config::GatewayConfig`]; operators upgrading from a
 //! pre-Phase-6 build should switch their tooling to `vosx`.
+//!
+//! TODO(post-stable): once VOS hits a release whose changelog
+//! readers won't have any pre-Phase-6 deployment, drop this
+//! section. The git history is enough beyond that point.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -155,23 +159,30 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
     ))
 }
 
+/// Public-namespace paths that skip the dispatch auth gate
+/// regardless of token config. Schema / metrics / openapi are
+/// intentionally readable by anyone reachable on the bound port
+/// — they describe what the gateway is, not anything sensitive.
+/// Centralized here so the `effective_auth_for` predicate doesn't
+/// rely on a fragile `agent_name.starts_with('_')` heuristic that
+/// silently auth-gated `/openapi.json` (which has no underscore).
+const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
+
 /// Pick the auth token to enforce for this request. Inspects
 /// `req.path` for the leading `/<agent>/`; if the agent name has
 /// an entry in `agent_tokens`, returns that token (per-agent
 /// override). Otherwise falls back to the global `auth_token`.
 ///
-/// Paths that don't start with `/<agent>/` (the admin / schema /
-/// metrics namespaces, plus the empty path) return `None` here so
-/// `check_auth` immediately allows them — those endpoints have
-/// their own gating (admin token) or are intentionally public.
+/// Paths that map to a public namespace ([`PUBLIC_NAMESPACES`])
+/// or to the empty path return `None` here so `check_auth`
+/// allows them through — those endpoints are intentionally
+/// readable without a token.
 fn effective_auth_for<'a>(req: &Request, policy: &Policy<'a>) -> Option<&'a str> {
     // Only `/<agent>/<method>` URLs receive auth checks. The
     // dispatch handler will 400 on missing method later anyway.
     let trimmed = req.path.trim_start_matches('/');
     let agent_name = trimmed.split_once('/').map(|(a, _)| a).unwrap_or(trimmed);
-    if agent_name.is_empty() || agent_name.starts_with('_') {
-        // `_admin`, `_schema`, `_metrics`, openapi: skip the
-        // dispatch-side auth entirely.
+    if agent_name.is_empty() || PUBLIC_NAMESPACES.contains(&agent_name) {
         return None;
     }
     if let Some(tokens) = policy.agent_tokens
@@ -225,10 +236,10 @@ pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &Serv
 
 fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
     // `/__schema*` and `/openapi.json` paths short-circuit the
-    // agent/method dispatcher. They still consume a job slot
-    // (actor-side) because the lookups need `ServiceCtx` to talk
-    // to the registry — handle_admin can't be used (it's
-    // connection-side, no ctx).
+    // agent/method dispatcher. They live actor-side (not in
+    // dispatch_inner's connection-side metrics shortcut) because
+    // their renderers need `ServiceCtx` to round-trip the
+    // registry for schema lookups.
     if let Some(resp) = handle_schema(req, inner, ctx) {
         return resp;
     }
@@ -1259,5 +1270,45 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn openapi_endpoint_bypasses_global_auth() {
+        // `/openapi.json` doesn't start with `_`, so the original
+        // `agent_name.starts_with('_')` predicate auth-gated it
+        // by mistake whenever `auth_token` was set — making the
+        // self-doc URL unreachable on any production-shaped
+        // deployment. Lock the explicit `PUBLIC_NAMESPACES`
+        // allowlist behaviour: a fresh request to /openapi.json
+        // with no bearer should reach the actor side (here a
+        // 400 because the test-side router has no openapi
+        // handler wired, but specifically NOT a 401 from the
+        // auth gate).
+        let inner = fresh_inner();
+        let (tx, rx) = channel();
+        // Drain side: the openapi handler lives actor-side, but
+        // the test harness's job rx isn't actually wired to a
+        // handler. So we just receive the job and reply 200 —
+        // proving the request passed the auth gate.
+        let actor = tokio::spawn(async move {
+            if let Ok(job) = rx.recv() {
+                let _ = job.resp_tx.send(Response::text(200, "ok"));
+            }
+        });
+        let resp = dispatch_request(
+            req("GET", "/openapi.json", &[], &[]),
+            &tx,
+            &inner,
+            Policy {
+                auth_token: Some("global-token"),
+                agent_tokens: None,
+            },
+        )
+        .await;
+        actor.await.expect("actor task");
+        assert_eq!(
+            resp.status, 200,
+            "openapi.json should pass auth even with global auth_token set",
+        );
     }
 }
