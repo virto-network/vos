@@ -257,6 +257,8 @@ pub fn reconcile(
     manifest_dir: &Path,
     daemon_prefix: u16,
 ) -> anyhow::Result<()> {
+    validate_manifest_names(manifest)?;
+
     let reg = SpaceRegistryRef::at(ServiceId::new(
         daemon_prefix,
         ServiceId::REGISTRY.local_id(),
@@ -588,6 +590,54 @@ fn flat_count(agents: &[AgentDef]) -> usize {
     flatten(agents).len()
 }
 
+/// Reject manifests where the same `instance_name` appears in
+/// more than one slot — agent + agent, agent + extension, or
+/// extension + extension.
+///
+/// Both `register_at_id` (PVM agents) and `register_extension_at_id`
+/// (native extensions) use `instance_service_id(name, prefix)` to
+/// pick the daemon-side ServiceId. Identical name → identical id →
+/// silent route shadow: the second registration overwrites the
+/// first's invoke channel, leaving the first's worker thread
+/// orphaned and its inbound traffic redirected to the wrong
+/// handler. The registry's `install` catches duplicate agent
+/// names (`STATUS_INSTANCE_EXISTS`) but it knows nothing about
+/// extensions and nothing about within-extension duplicates;
+/// catching the full set manifest-side gives the operator a
+/// single clear error before any side-effects land.
+fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    // Preserve first-seen order so duplicates list the original
+    // declaration kind first. BTreeMap keys sort lexically — fine
+    // for an error message; an IndexMap would preserve source
+    // order but isn't worth the dep for one-shot validation.
+    let mut seen: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    for agent in flatten(&manifest.agents) {
+        seen.entry(agent.name.clone()).or_default().push("agent");
+    }
+    for ext in &manifest.extensions {
+        seen.entry(ext.name.clone()).or_default().push("extension");
+    }
+
+    let conflicts: Vec<String> = seen
+        .iter()
+        .filter(|(_, kinds)| kinds.len() > 1)
+        .map(|(name, kinds)| format!("'{name}' appears {}× ({})", kinds.len(), kinds.join(", ")))
+        .collect();
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "manifest has duplicate instance_names — both agents and \
+         extensions install at a deterministic ServiceId derived \
+         from the name, so duplicates silently shadow each other's \
+         routes:\n  {}",
+        conflicts.join("\n  "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +673,106 @@ mod tests {
         assert_eq!(m.agents.len(), 1);
         assert_eq!(m.agents[0].actors.len(), 1);
         assert_eq!(m.agents[0].actors[0].name, "greeter");
+    }
+
+    #[test]
+    fn validate_names_accepts_distinct() {
+        let m: Manifest = toml::from_str(
+            r#"
+                [[agent]]
+                name = "counter"
+                path = "a.elf"
+                [[agent]]
+                name = "greeter"
+                path = "b.elf"
+                [[extension]]
+                name = "gateway"
+                path = "c.so"
+            "#,
+        )
+        .unwrap();
+        validate_manifest_names(&m).expect("distinct names pass");
+    }
+
+    #[test]
+    fn validate_names_rejects_agent_extension_clash() {
+        // The headline case — operator names both an agent and an
+        // extension `gateway`. They'd install at the same
+        // `instance_service_id(name, prefix)`, second silently
+        // shadows the first.
+        let m: Manifest = toml::from_str(
+            r#"
+                [[agent]]
+                name = "gateway"
+                path = "a.elf"
+                [[extension]]
+                name = "gateway"
+                path = "b.so"
+            "#,
+        )
+        .unwrap();
+        let err = validate_manifest_names(&m).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'gateway'"), "{msg}");
+        assert!(msg.contains("agent") && msg.contains("extension"), "{msg}");
+    }
+
+    #[test]
+    fn validate_names_rejects_duplicate_extensions() {
+        let m: Manifest = toml::from_str(
+            r#"
+                [[extension]]
+                name = "gateway"
+                path = "a.so"
+                [[extension]]
+                name = "gateway"
+                path = "b.so"
+            "#,
+        )
+        .unwrap();
+        let err = validate_manifest_names(&m).unwrap_err();
+        assert!(err.to_string().contains("'gateway' appears 2×"), "{}", err);
+    }
+
+    #[test]
+    fn validate_names_rejects_duplicate_agents() {
+        // The registry's `install` handler returns
+        // STATUS_INSTANCE_EXISTS for this case at runtime, but
+        // the manifest-side check fails earlier — before any
+        // .elf gets blob-cached or any partial registration
+        // lands.
+        let m: Manifest = toml::from_str(
+            r#"
+                [[agent]]
+                name = "counter"
+                path = "a.elf"
+                [[agent]]
+                name = "counter"
+                path = "b.elf"
+            "#,
+        )
+        .unwrap();
+        let err = validate_manifest_names(&m).unwrap_err();
+        assert!(err.to_string().contains("'counter' appears 2×"), "{}", err);
+    }
+
+    #[test]
+    fn validate_names_catches_nested_child_collision() {
+        // `flatten` walks parent + child agents; a child named
+        // the same as a top-level agent is a collision too.
+        let m: Manifest = toml::from_str(
+            r#"
+                [[agent]]
+                name = "scheduler"
+                path = "s.elf"
+                actors = [
+                    { name = "scheduler", path = "dup.elf" },
+                ]
+            "#,
+        )
+        .unwrap();
+        let err = validate_manifest_names(&m).unwrap_err();
+        assert!(err.to_string().contains("'scheduler'"), "{}", err);
     }
 
     #[test]
