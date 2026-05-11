@@ -458,6 +458,26 @@ fn pvm_actors_via_gateway() {
         "5000000001",
     );
 
+    // GET with numeric query args — exercises the schema-aware
+    // coercion path that landed alongside registry-owned meta.
+    // Query strings carry no JSON typing, so without the schema
+    // lookup `a` and `b` would arrive as `Value::Str` and the
+    // u64-typed handler would reject them. The registry's
+    // `meta_for_instance("math")` round trip (cached after the
+    // first request — math/add above already populated it) tells
+    // the gateway both fields are `u64`, and `coerce_to_type`
+    // parses "21" / "21" out of the URL.
+    let (status, body) = http_request(daemon.port(), "GET", "/math/add?a=21&b=21", None, &[]);
+    assert_eq!(
+        status,
+        200,
+        "GET /math/add?a=21&b=21 expected 200, got {status} body={:?}. \
+         If 'null', registry meta lookup or coerce_to_type isn't \
+         parsing query strings into Value::U64.",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(std::str::from_utf8(&body).expect("body utf-8").trim(), "42",);
+
     // 6. Unknown agent — registry returns 0 → gateway 404.
     //    Asserts the negative path: registry isn't blanket-
     //    returning a non-zero id for everything.
@@ -474,11 +494,11 @@ fn pvm_actors_via_gateway() {
     //    number of times depending on install timing — just
     //    require the counter advanced by at least the number of
     //    dispatch requests we issued in steps 3–6 (greeter + 3
-    //    counter + 3 math + 404 = 8).
+    //    counter + 3 math + 1 GET + 404 = 9).
     let count1 = admin_request_count(&daemon, "test-token");
     assert!(
-        count1 >= count0 + 8,
-        "expected counter to advance by ≥8, got {count0} → {count1}",
+        count1 >= count0 + 9,
+        "expected counter to advance by ≥9, got {count0} → {count1}",
     );
 
     // Daemon teardown via Drop.

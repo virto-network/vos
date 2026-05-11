@@ -9,11 +9,28 @@
 //! they exchange (a stop flag, a port, a few counters) never
 //! establish happens-before relationships with other data.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vos::metadata::ParsedMeta;
+
 use crate::config::GatewayConfig;
+
+/// Per-agent type schema cache. Keyed by raw ServiceId. Populated
+/// lazily on the first dispatch to an agent (registry round-trip)
+/// and never invalidated for the gateway's lifetime — a future
+/// `space upgrade` would need an explicit clear, but the
+/// re-registration on the registry side will at least give us
+/// fresh schema bytes on the next process restart.
+///
+/// Values: `Some(meta)` once we successfully fetched + decoded
+/// the schema; `None` once we asked and got back "no meta" (so
+/// we don't retry on every subsequent request to the same
+/// agent). Distinguishes "not yet asked" (absent key) from
+/// "asked, found nothing" (key present with None).
+pub(crate) type MetaCache = Mutex<HashMap<u32, Option<ParsedMeta>>>;
 
 pub(crate) struct Inner {
     /// Set to true to ask the running serve loop to exit.
@@ -34,6 +51,8 @@ pub(crate) struct Inner {
     /// Set once at construction; read by both the run thread and
     /// the per-connection tasks (immutable, no atomics needed).
     pub(crate) cfg: GatewayConfig,
+    /// Per-agent schema cache. See [`MetaCache`] for semantics.
+    pub(crate) meta_cache: MetaCache,
 }
 
 impl Inner {
@@ -45,6 +64,7 @@ impl Inner {
             started_unix: AtomicU64::new(0),
             in_flight: AtomicU16::new(0),
             cfg,
+            meta_cache: Mutex::new(HashMap::new()),
         })
     }
 

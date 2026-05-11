@@ -106,7 +106,7 @@ pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &Serv
         }
         match job_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(job) => {
-                let response = handle(&job.request, ctx);
+                let response = handle(&job.request, inner, ctx);
                 inner.requests.fetch_add(1, Ordering::Relaxed);
                 let _ = job.resp_tx.send(response);
             }
@@ -116,7 +116,7 @@ pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &Serv
     }
 }
 
-fn handle(req: &Request, ctx: &ServiceCtx) -> Response {
+fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
     let Some((agent, method)) = split_path(&req.path) else {
         return Response::text(400, "expected /<agent>/<method>");
     };
@@ -126,7 +126,17 @@ fn handle(req: &Request, ctx: &ServiceCtx) -> Response {
         None => return Response::text(404, format!("unknown agent '{agent}'")),
     };
 
-    let msg = match build_msg(method, req) {
+    // Look up (and lazily cache) the actor's schema. With it,
+    // `build_msg` can coerce query/JSON values to the handler's
+    // declared types; without it the request still flies, but
+    // numeric query args stay as strings and json U32/U64
+    // classification stays leaky.
+    let meta = ensure_meta_cached(ctx, inner, target, &agent);
+    let method_meta = meta
+        .as_ref()
+        .and_then(|m| m.messages.iter().find(|msg| msg.name == method).cloned());
+
+    let msg = match build_msg(method, method_meta.as_ref(), req) {
         Ok(m) => m,
         Err(r) => return r,
     };
@@ -236,12 +246,31 @@ fn resolve(ctx: &ServiceCtx, name: &str) -> Option<ServiceId> {
     (id != 0).then_some(ServiceId(id))
 }
 
-fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Response> {
+fn build_msg(
+    method: String,
+    method_meta: Option<&vos::metadata::ParsedMessage>,
+    req: &Request,
+) -> core::result::Result<Msg, Response> {
+    use vos::value::Value;
     let mut msg = Msg::new(method);
+    let coerce = |key: &str, v: Value| -> Value {
+        let Some(meta) = method_meta else {
+            return v;
+        };
+        match meta.fields.iter().find(|f| f.name == key) {
+            Some(field) => coerce_to_type(v, &field.ty),
+            None => v,
+        }
+    };
     match req.method.as_str() {
         "GET" => {
+            // Query args arrive as `Value::Str` (no JSON typing
+            // in a query string). With schema knowledge we can
+            // parse them into the declared type — `?n=5` becomes
+            // `Value::U64(5)` when the handler signature is u64.
             for (k, v) in parse_query(&req.query) {
-                msg = msg.with(k, v);
+                let typed = coerce(&k, Value::Str(v));
+                msg = msg.with(k, typed);
             }
         }
         "POST" | "PUT" | "PATCH" => {
@@ -254,13 +283,122 @@ fn build_msg(method: String, req: &Request) -> core::result::Result<Msg, Respons
                     Response::text(400, "invalid JSON body")
                 })?;
                 for (k, v) in pairs {
-                    msg = msg.with(k, v);
+                    let typed = coerce(&k, v);
+                    msg = msg.with(k, typed);
                 }
             }
         }
         other => return Err(Response::text(405, format!("method {other} not allowed"))),
     }
     Ok(msg)
+}
+
+/// Coerce a `Value` into the variant matching a Rust type string
+/// from `ParsedMeta::messages[i].fields[j].ty`. Used by the gateway
+/// to bridge the JSON / query-string world (`Value::Str(_)` and
+/// untyped numeric `Value::U32/U64`) to the actor's declared
+/// signature. On a failed parse the original value passes through
+/// — the actor will then reject the wrong type and the gateway
+/// renders an empty reply. Bool/string/bytes pass through
+/// unchanged.
+fn coerce_to_type(v: vos::value::Value, ty: &str) -> vos::value::Value {
+    use vos::value::Value;
+    // Pull a string out for parse-based coercion (the GET path).
+    let as_str = if let Value::Str(ref s) = v {
+        Some(s.as_str())
+    } else {
+        None
+    };
+    match ty {
+        "u8" => as_str
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(Value::U8)
+            .or_else(|| v.as_u8().map(Value::U8))
+            .unwrap_or(v),
+        "u16" => as_str
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(Value::U16)
+            .or_else(|| v.as_u16().map(Value::U16))
+            .unwrap_or(v),
+        "u32" => as_str
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(Value::U32)
+            .or_else(|| v.as_u32().map(Value::U32))
+            .unwrap_or(v),
+        "u64" => as_str
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Value::U64)
+            .or_else(|| v.as_u64().map(Value::U64))
+            .unwrap_or(v),
+        "i32" => as_str
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(Value::I32)
+            .or_else(|| v.as_i32().map(Value::I32))
+            .unwrap_or(v),
+        "i64" => as_str
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(Value::I64)
+            .or_else(|| v.as_i64().map(Value::I64))
+            .unwrap_or(v),
+        "bool" => as_str
+            .and_then(|s| s.parse::<bool>().ok())
+            .map(Value::Bool)
+            .unwrap_or(v),
+        // String and complex types (Vec, bytes) pass through.
+        // The actor's macro-generated `from_msg` runs the typed
+        // accessor and rejects the message if the shape doesn't
+        // match — no silent corruption.
+        _ => v,
+    }
+}
+
+/// Fetch the actor's schema from the registry on a cache miss; return
+/// the cached entry on a hit. The cache distinguishes "not yet asked"
+/// (absent) from "asked, no schema available" (`Some(None)`), so a
+/// permanent miss costs at most one round trip per gateway lifetime.
+fn ensure_meta_cached(
+    ctx: &ServiceCtx,
+    inner: &Inner,
+    target: ServiceId,
+    name: &str,
+) -> Option<vos::metadata::ParsedMeta> {
+    // Fast path: cache hit.
+    {
+        let cache = inner.meta_cache.lock().unwrap();
+        if let Some(entry) = cache.get(&target.0) {
+            return entry.clone();
+        }
+    }
+    // Cache miss — ask the registry. We forward the name; the
+    // registry does the agent → program_hash → meta join. Empty
+    // reply means "no meta registered" → store `None` so we
+    // don't retry on every request.
+    let parsed = fetch_meta_from_registry(ctx, name);
+    let mut cache = inner.meta_cache.lock().unwrap();
+    cache.insert(target.0, parsed.clone());
+    parsed
+}
+
+fn fetch_meta_from_registry(ctx: &ServiceCtx, name: &str) -> Option<vos::metadata::ParsedMeta> {
+    let msg = Msg::new("meta_for_instance").with("name", name.to_string());
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(vos::value::TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    let bytes = ctx.ask_raw(ServiceId::REGISTRY.0, &payload)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    // The reply is a `Value::Bytes(...)` carrying the raw
+    // `.vos_meta` section. Empty bytes means the registry didn't
+    // find a meta entry (old binary, hash mismatch). `decode`
+    // returns None on a malformed/empty section too.
+    let value: vos::value::Value = vos::value::Value::decode(&bytes);
+    let raw = value.as_bytes()?;
+    if raw.is_empty() {
+        return None;
+    }
+    vos::metadata::decode(raw)
 }
 
 /// Parse `a=1&b=hello+world` into key-value pairs, with proper percent
@@ -340,6 +478,7 @@ mod tests {
     // the actor's `ctx.ask` (covered by vos), focusing on the
     // policy/admin/auth/queue logic this crate owns.
 
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 
     fn fresh_inner() -> Inner {
@@ -350,6 +489,7 @@ mod tests {
             started_unix: AtomicU64::new(1_700_000_000),
             in_flight: AtomicU16::new(0),
             cfg: crate::config::GatewayConfig::default(),
+            meta_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 

@@ -206,9 +206,8 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     (buf, pos)
 }
 
-// --- Binary deserialization (std, used by vosx to read from ELF) ---
+// --- Binary deserialization (alloc-only, re-exported unconditionally) ---
 
-#[cfg(feature = "std")]
 pub use decode::*;
 
 #[cfg(all(test, feature = "std"))]
@@ -334,7 +333,11 @@ mod tests {
     }
 }
 
-#[cfg(feature = "std")]
+/// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
+/// entry points. Self-contained against `alloc` only — no std APIs.
+/// Re-exported from `vos::metadata` so it's reachable from both the
+/// host (where `vosx` registers schemas) and extensions like
+/// `http-gateway` whose cdylib build runs `default-features = false`.
 mod decode {
     extern crate alloc;
     use alloc::string::String;
