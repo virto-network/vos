@@ -117,6 +117,14 @@ pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &Serv
 }
 
 fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
+    // `/__schema*` paths short-circuit the agent/method dispatcher.
+    // They still consume a job slot (actor-side) because the
+    // lookups need `ServiceCtx` to talk to the registry — handle_admin
+    // can't be used (it's connection-side, no ctx).
+    if let Some(resp) = handle_schema(req, inner, ctx) {
+        return resp;
+    }
+
     let Some((agent, method)) = split_path(&req.path) else {
         return Response::text(400, "expected /<agent>/<method>");
     };
@@ -210,6 +218,103 @@ pub(crate) fn handle_admin(
             format!("unknown admin route {} {}", req.method, req.path),
         ),
     })
+}
+
+/// Self-documenting schema endpoints. Public — schema is no more
+/// sensitive than what the registry already serves over libp2p to
+/// any peer node. Returns `None` for unrelated paths so the
+/// caller falls through to the agent/method dispatcher.
+///
+/// - `GET /__schema`           → JSON `["name", ...]` of installed agents
+/// - `GET /__schema/<agent>`   → JSON `ActorMeta` of that agent
+///
+/// Non-GET methods 405; unknown agents 404; agents without
+/// registered meta (older binaries, hash mismatch) 404 with
+/// "no schema for".
+fn handle_schema(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Option<Response> {
+    if !req.path.starts_with("/__schema") {
+        return None;
+    }
+    if req.method != "GET" {
+        return Some(Response::text(405, "schema endpoints are GET-only"));
+    }
+    if req.path == "/__schema" || req.path == "/__schema/" {
+        return Some(list_schemas(ctx));
+    }
+    let name = req
+        .path
+        .trim_start_matches("/__schema/")
+        .trim_end_matches('/');
+    if name.is_empty() || name.contains('/') {
+        return Some(Response::text(400, "expected /__schema/<agent>"));
+    }
+    Some(schema_for_agent(name, inner, ctx))
+}
+
+fn list_schemas(ctx: &ServiceCtx) -> Response {
+    let msg = Msg::new("agent_names");
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(vos::value::TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    let bytes = match ctx.ask_raw(ServiceId::REGISTRY.0, &payload) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Response::text(502, "registry unreachable"),
+    };
+    let value: vos::value::Value = vos::value::Value::decode(&bytes);
+    let names = value.as_list_str().map(|s| s.to_vec()).unwrap_or_default();
+    Response::json(
+        200,
+        serde_json::to_vec(&names).unwrap_or_else(|_| b"[]".to_vec()),
+    )
+}
+
+fn schema_for_agent(name: &str, inner: &Inner, ctx: &ServiceCtx) -> Response {
+    let Some(target) = resolve(ctx, name) else {
+        return Response::text(404, format!("unknown agent '{name}'"));
+    };
+    match ensure_meta_cached(ctx, inner, target, name) {
+        Some(meta) => Response::json(200, meta_to_json(&meta).into_bytes()),
+        None => Response::text(404, format!("no schema for agent '{name}'")),
+    }
+}
+
+/// Render a `ParsedMeta` as JSON. Mirrors the field names of the
+/// in-tree `ActorMeta`/`MessageMeta`/`FieldMeta` structs so a
+/// client that's parsed a vos meta binary in a previous life sees
+/// the same names — `actor_name`, `messages[i].name`,
+/// `messages[i].is_query`, `messages[i].fields[j].name/type`,
+/// `constructor[i].name/type`, `kind`, `caps`.
+fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
+    let messages: Vec<_> = meta
+        .messages
+        .iter()
+        .map(|m| {
+            let fields: Vec<_> = m
+                .fields
+                .iter()
+                .map(|f| serde_json::json!({ "name": f.name, "type": f.ty }))
+                .collect();
+            serde_json::json!({
+                "name": m.name,
+                "is_query": m.is_query,
+                "fields": fields,
+            })
+        })
+        .collect();
+    let constructor: Vec<_> = meta
+        .constructor
+        .iter()
+        .map(|f| serde_json::json!({ "name": f.name, "type": f.ty }))
+        .collect();
+    serde_json::json!({
+        "actor_name": meta.actor_name,
+        "messages": messages,
+        "constructor": constructor,
+        "kind": meta.kind,
+        "caps": meta.caps,
+    })
+    .to_string()
 }
 
 fn split_path(path: &str) -> Option<(String, String)> {

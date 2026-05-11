@@ -479,6 +479,22 @@ impl SpaceRegistry {
         self.agents.clone()
     }
 
+    /// Lightweight enumeration of installed agent names.
+    /// Returns `Vec<String>` so cross-actor callers without
+    /// `AgentRow` schema knowledge (e.g. the gateway rendering
+    /// `/__schema`) can pull the list without an rkyv dance.
+    /// Same ordering as `agents()` — sorted by `instance_name`.
+    #[msg]
+    async fn agent_names(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.agents.len());
+        let mut idx = 0usize;
+        while idx < self.agents.len() {
+            out.push(self.agents[idx].instance_name.clone());
+            idx += 1;
+        }
+        out
+    }
+
     /// Resolve an installed agent's name to the `ServiceId` it
     /// occupies on the caller's node, packed as a u32.
     /// `caller_prefix` is the asking node's 16-bit identity

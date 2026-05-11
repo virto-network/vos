@@ -489,16 +489,56 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&body),
     );
 
-    // 7. Admin counter monotonically advances. Don't pin an exact
-    //    number — the readiness poll above can retry an unbounded
-    //    number of times depending on install timing — just
-    //    require the counter advanced by at least the number of
-    //    dispatch requests we issued in steps 3–6 (greeter + 3
-    //    counter + 3 math + 1 GET + 404 = 9).
+    // 7. /__schema → list of installed agents (JSON array of
+    //    names). Public endpoint, no admin token. Sorted by
+    //    instance_name on the registry side.
+    let (status, body) = http_request(daemon.port(), "GET", "/__schema", None, &[]);
+    assert_eq!(status, 200, "GET /__schema expected 200, got {status}");
+    let names: Vec<String> = serde_json::from_slice(&body).expect("/__schema returns a JSON array");
+    assert!(
+        names.contains(&"math".to_string())
+            && names.contains(&"greeter".to_string())
+            && names.contains(&"counter".to_string()),
+        "expected math + greeter + counter in /__schema, got {names:?}",
+    );
+
+    // 8. /__schema/math → full ActorMeta as JSON. Catches both
+    //    the registry's `meta_for_instance` join and the gateway's
+    //    `meta_to_json` rendering.
+    let (status, body) = http_request(daemon.port(), "GET", "/__schema/math", None, &[]);
+    assert_eq!(status, 200, "GET /__schema/math expected 200, got {status}");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&body).expect("/__schema/<agent> returns JSON");
+    assert_eq!(meta["actor_name"], "Math");
+    // Math has two messages: add(u64,u64) and multiply(u64,u64).
+    let messages = meta["messages"].as_array().expect("messages array");
+    let add = messages
+        .iter()
+        .find(|m| m["name"] == "add")
+        .expect("add method in schema");
+    let fields = add["fields"].as_array().expect("add.fields");
+    assert_eq!(fields.len(), 2, "add has 2 args");
+    let a = fields.iter().find(|f| f["name"] == "a").expect("'a' arg");
+    assert_eq!(a["type"], "u64", "math.add.a is declared u64");
+
+    // 9. /__schema/<unknown> → 404 (negative path).
+    let (status, _body) = http_request(daemon.port(), "GET", "/__schema/nonexistent", None, &[]);
+    assert_eq!(
+        status, 404,
+        "GET /__schema/nonexistent should 404, got {status}",
+    );
+
+    // 10. Admin counter monotonically advances. Don't pin an exact
+    //     number — the readiness poll above can retry an unbounded
+    //     number of times depending on install timing — just
+    //     require it advanced by at least the dispatch requests
+    //     in steps 3–9 (greeter + 3 counter + 3 math + 1 GET +
+    //     404 + /__schema + /__schema/math + /__schema/missing
+    //     = 12).
     let count1 = admin_request_count(&daemon, "test-token");
     assert!(
-        count1 >= count0 + 9,
-        "expected counter to advance by ≥9, got {count0} → {count1}",
+        count1 >= count0 + 12,
+        "expected counter to advance by ≥12, got {count0} → {count1}",
     );
 
     // Daemon teardown via Drop.
