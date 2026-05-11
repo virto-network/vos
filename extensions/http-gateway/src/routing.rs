@@ -15,6 +15,30 @@
 //!    the reply.
 //!
 //! [`drain_jobs`] is the loop on the actor side that pumps `handle`.
+//!
+//! ## Built-in routes (precedence + layer + auth)
+//!
+//! Five intercepts handle traffic before it reaches the fallback
+//! `/<agent>/<method>` dispatcher. Connection-side intercepts run
+//! ahead of the auth gate + job-queue admission so they never burn
+//! a job slot; actor-side intercepts need [`ServiceCtx`] for a
+//! registry round-trip, so they ride the job queue.
+//!
+//! | # | layer      | path                        | method   | auth          |
+//! |---|------------|-----------------------------|----------|---------------|
+//! | 1 | connection | `/__admin/stop`, `/status`  | POST/GET | `admin_token` |
+//! | 2 | connection | `/__metrics`                | GET      | public        |
+//! | 3 | actor      | `/__schema`, `/__schema/<a>`| GET      | public        |
+//! | 4 | actor      | `/openapi.json`             | GET      | public        |
+//! | 5 | actor      | `/<agent>/<method>`         | any      | varies†       |
+//!
+//! † `/<agent>/<method>` uses the global `auth_token` unless the
+//! manifest declared a per-agent override in `agent_tokens`. Admin
+//! / schema / metrics are unaffected by either token.
+//!
+//! Adding a built-in: append a row here AND insert the `handle_*`
+//! call in either [`dispatch_inner`] (connection-side) or [`handle`]
+//! (actor-side) in the matching precedence slot.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
