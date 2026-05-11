@@ -48,6 +48,22 @@ pub struct ProgramRow {
     pub hash: [u8; 32],
 }
 
+/// One row in the metadata table — opaque schema bytes attached to a
+/// program hash. The wire payload is the raw `.vos_meta` ELF section
+/// (binary format defined by `vos::actors::metadata`); the registry
+/// itself doesn't decode it, so no schema lock-in across versions.
+/// All agents installed from the same program share one entry; the
+/// `meta_for_instance` lookup composes the agent → program_hash join
+/// internally.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct MetaRow {
+    pub program_hash: [u8; 32],
+    pub blob: Vec<u8>,
+}
+
 // ── Agents ────────────────────────────────────────────────────────
 
 /// One row in the agent (instance) catalog.
@@ -144,6 +160,11 @@ pub struct SpaceRegistry {
     /// Members; nodes sorted by `prefix` first, then identities
     /// sorted by `key`.
     members: Vec<MemberRow>,
+    /// Opaque metadata blobs keyed by program hash. Stored as raw
+    /// `.vos_meta` section bytes so the registry stays agnostic
+    /// about the schema format (lives in `vos::metadata` on the
+    /// consumer side).
+    metas: Vec<MetaRow>,
 }
 
 #[messages]
@@ -153,6 +174,7 @@ impl SpaceRegistry {
             programs: Vec::new(),
             agents: Vec::new(),
             members: Vec::new(),
+            metas: Vec::new(),
         }
     }
 
@@ -234,6 +256,80 @@ impl SpaceRegistry {
     #[msg]
     async fn programs(&self) -> Vec<ProgramRow> {
         self.programs.clone()
+    }
+
+    // ── Metadata blobs ──────────────────────────────────────────
+
+    /// Record (or replace) the metadata blob for a program hash.
+    /// Idempotent: re-registering the same hash overwrites the
+    /// existing blob (lets a manifest re-deploy refresh schema).
+    /// Returns `STATUS_BAD_HASH` if the hash isn't 32 bytes;
+    /// otherwise `STATUS_OK`. The hash doesn't need to match an
+    /// existing `ProgramRow` — schema can be registered before
+    /// the program is published if the orchestrator prefers
+    /// that order.
+    #[msg]
+    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>) -> u8 {
+        let Some(program_hash) = bytes_to_32(&program_hash) else {
+            return STATUS_BAD_HASH;
+        };
+        let mut idx = 0usize;
+        while idx < self.metas.len() {
+            if self.metas[idx].program_hash == program_hash {
+                self.metas[idx].blob = blob;
+                return STATUS_OK;
+            }
+            idx += 1;
+        }
+        self.metas.push(MetaRow {
+            program_hash,
+            blob,
+        });
+        STATUS_OK
+    }
+
+    /// Look up the metadata blob for a program hash. Returns an
+    /// empty vector when no entry exists — callers treat that as
+    /// "schema unknown" and fall back to whatever heuristic they
+    /// were using before.
+    #[msg]
+    async fn meta_for_program(&self, program_hash: Vec<u8>) -> Vec<u8> {
+        let Some(program_hash) = bytes_to_32(&program_hash) else {
+            return Vec::new();
+        };
+        let mut idx = 0usize;
+        while idx < self.metas.len() {
+            if self.metas[idx].program_hash == program_hash {
+                return self.metas[idx].blob.clone();
+            }
+            idx += 1;
+        }
+        Vec::new()
+    }
+
+    /// Convenience join: find an installed agent by name, then
+    /// return its program's metadata blob. Saves the caller a
+    /// round trip in the common case (gateway resolving a
+    /// per-method schema). Empty vector when the agent is
+    /// unknown or has no meta registered.
+    #[msg]
+    async fn meta_for_instance(&self, name: String) -> Vec<u8> {
+        let mut ai = 0usize;
+        while ai < self.agents.len() {
+            if self.agents[ai].instance_name == name {
+                let hash = self.agents[ai].program_hash;
+                let mut mi = 0usize;
+                while mi < self.metas.len() {
+                    if self.metas[mi].program_hash == hash {
+                        return self.metas[mi].blob.clone();
+                    }
+                    mi += 1;
+                }
+                return Vec::new();
+            }
+            ai += 1;
+        }
+        Vec::new()
     }
 
     // ── Agents (instances) ──────────────────────────────────────
