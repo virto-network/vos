@@ -132,6 +132,33 @@ fn kread_hash(k: &InvocationKernel, addr: u32) -> [u8; 32] {
     h
 }
 
+/// Install the VOS-specific zkpvm-precompile slots as Protocol caps in
+/// the active VM's cap table. javm auto-installs slots 1..=28 (the
+/// spec-canonical protocol range) but leaves higher slots empty, and
+/// our precompiles squat at slot 100 (blake2b) and would-be 200..=204
+/// (ristretto, once those land via a javm imm > 127 fix). Without this
+/// install, `ecalli imm=100` falls into javm's `handle_call(100)` which
+/// finds no cap and returns RESULT_WHAT — the actor's inline asm
+/// doesn't check the return value, so `blake2b_hash` silently produces
+/// the IV-only hash (same bytes for every input), and any caller that
+/// uses it for keying (e.g. `space-registry`'s `instance_service_id`)
+/// gets a constant garbage ID instead of a per-input one.
+///
+/// Call this once per kernel construction, before the first `run()`,
+/// for every refine entry path (`new_cached`, `new_warm`, and child
+/// `handle_invoke`). The chosen slot collides with javm's
+/// program-cap range (29..=63 via CREATE, 64..255 via MOVE); until
+/// javm grows native zkpvm-precompile support, we squat.
+fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
+    use javm::cap::{Cap, ProtocolCap};
+    let slot = crate::crypto::ECALL_BLAKE2B_COMPRESS as u8;
+    kernel
+        .vm_arena
+        .vm_mut(kernel.active_vm)
+        .cap_table
+        .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+}
+
 fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -586,6 +613,7 @@ impl<D: DataLayer> VosRuntime<D> {
                         }
                     }
                 };
+                install_vos_precompile_caps(&mut kernel);
                 // φ[7] = 0 → refine phase.
                 kernel.set_active_reg(7, 0);
                 // Transition VM 0 from Ready → Running so kernel.run() executes.
@@ -1295,6 +1323,7 @@ fn handle_invoke(
             );
         }
     };
+    install_vos_precompile_caps(&mut child);
     child.set_active_reg(7, 0); // refine
     let _ = child
         .vm_arena
