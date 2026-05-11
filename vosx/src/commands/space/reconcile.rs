@@ -164,13 +164,17 @@ fn register_extension(
         };
     }
 
-    // Read the meta blob before handing off to `register_extension`.
-    // Loading here loads a second copy of the .so for ~the duration
-    // of this function; the plugin drops at the end of the scope so
-    // dlopen's refcount falls back to 1 by the time `register_extension`
-    // re-opens it inside the worker thread.
-    let meta_blob = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
-        Ok(plugin) => plugin.meta_bytes().to_vec(),
+    // Open the .so once to read meta + keep the handle alive past
+    // the `node.register_extension` call below. The worker thread
+    // does its own dlopen; by holding our handle until after the
+    // worker is spawned, we make the common interleaving (worker
+    // dlopens before our drop) keep dlopen's refcount ≥ 1, so the
+    // library never round-trips through an unmap. There's still a
+    // narrow race if the worker thread hasn't run yet at our drop;
+    // a stronger fix would have `node.register_extension` return
+    // the meta blob itself, which is the right Phase 5+ shape.
+    let plugin = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
+        Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(
                 "extension '{}': failed to read .vos_meta from {} ({e}); \
@@ -178,9 +182,13 @@ fn register_extension(
                 ext.name,
                 so_path.display(),
             );
-            Vec::new()
+            None
         }
     };
+    let meta_blob = plugin
+        .as_ref()
+        .map(|p| p.meta_bytes().to_vec())
+        .unwrap_or_default();
 
     let cfg = if ext.init.is_empty() {
         ExtensionConfig::new(&so_path)
@@ -211,6 +219,10 @@ fn register_extension(
             tracing::debug!("registered extension meta for '{}'", ext.name);
         }
     }
+
+    // Plugin handle drops here, *after* the worker thread has its
+    // own dlopen — the library stays mapped throughout.
+    drop(plugin);
 
     Ok(())
 }

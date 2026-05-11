@@ -556,8 +556,11 @@ mod host {
         /// `meta()` decodes. Forwarded verbatim by `vosx reconcile`
         /// to the registry's `register_extension_meta` so downstream
         /// consumers (`vosx <ext> <cmd>`) can decode against the same
-        /// `vos::metadata` definition the producer used. Empty when
-        /// the `.so` didn't export `vos_extension_meta`.
+        /// `vos::metadata` definition the producer used. `load()`
+        /// errors out when the `.so` lacks `vos_extension_meta`, so
+        /// reaching this accessor means the symbol was found; bytes
+        /// can still be empty if the function returned a null
+        /// pointer or zero length.
         pub fn meta_bytes(&self) -> &[u8] {
             &self.meta_bytes
         }

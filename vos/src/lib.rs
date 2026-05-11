@@ -640,6 +640,43 @@ macro_rules! service_main {
             const __VOS_SERVICE_NAME: &str = stringify!($actor_ty);
             const __VOS_SERVICE_CAPS: &[&str] = &[ $( $cap ),* ];
             const __VOS_SERVICE_CLI: &[&str] = &[ $( stringify!($cli) ),* ];
+
+            // Reject duplicates in `cli = [...]` at compile time —
+            // otherwise the decoder silently sees each name twice
+            // (once per duplicated MessageMeta, once per duplicated
+            // cli_methods entry) and the second pass through
+            // `iter_mut().find()` is a no-op on a no-op. Catching
+            // it here turns "your `vosx <ext> <cmd>` ambiguously
+            // dispatches the wrong handler" into a build error.
+            const fn __vos_check_unique_cli_names() {
+                let names = __VOS_SERVICE_CLI;
+                let mut i = 0;
+                while i < names.len() {
+                    let a = names[i].as_bytes();
+                    let mut j = i + 1;
+                    while j < names.len() {
+                        let b = names[j].as_bytes();
+                        if a.len() == b.len() {
+                            let mut k = 0;
+                            let mut eq = true;
+                            while k < a.len() {
+                                if a[k] != b[k] {
+                                    eq = false;
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if eq {
+                                panic!("service_main!: duplicate name in `cli = [...]`");
+                            }
+                        }
+                        j += 1;
+                    }
+                    i += 1;
+                }
+            }
+            const _: () = __vos_check_unique_cli_names();
+
             const fn __vos_build_service_meta<const N: usize>() -> ([u8; N], usize) {
                 let mut buf = [0u8; N];
                 let mut pos = 0;
@@ -732,8 +769,13 @@ macro_rules! service_main {
                 }
                 (buf, pos)
             }
-            const __VOS_SERVICE_META_ENCODED: ([u8; 1024], usize) =
-                __vos_build_service_meta::<1024>();
+            // 4096 matches the actor-mode buffer in `vos-macros` so
+            // an extension with many CLI methods or long capability
+            // strings doesn't hit a const-eval panic on `buf[pos]`.
+            // Actual usage today is ~150 bytes; the headroom is for
+            // future growth, not current need.
+            const __VOS_SERVICE_META_ENCODED: ([u8; 4096], usize) =
+                __vos_build_service_meta::<4096>();
             static __VOS_SERVICE_META: [u8; __VOS_SERVICE_META_ENCODED.1] = {
                 let (src, len) = __VOS_SERVICE_META_ENCODED;
                 let mut out = [0u8; __VOS_SERVICE_META_ENCODED.1];

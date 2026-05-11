@@ -23,6 +23,18 @@
 //! arg system handles a small fixed set of primitive types.
 //! The actor validates lengths internally and stores `[u8; 32]`
 //! in the rkyv-archived rows.
+//!
+//! ## Schema evolution
+//!
+//! Adding a field to `SpaceRegistry` (or any of its rkyv-archived
+//! rows) changes the on-disk layout. Persisted state from prior
+//! versions fails `try_decode` validation and the actor falls
+//! back to `create()` — i.e. every space hosting an older
+//! registry blob loses its full agents/programs/members tables
+//! on first restart. This is the operating model while the
+//! project is pre-release; once we ship a stable shape, additions
+//! will need an explicit migration step (versioned blob header,
+//! rkyv archive upgrade path, or similar).
 
 //! ── Wire types ─────────────────────────────────────────────────────
 
@@ -343,7 +355,10 @@ impl SpaceRegistry {
     /// matches — extensions share the same instance-name
     /// namespace from the manifest, and `vosx <ext> <cmd>` needs
     /// a single lookup that doesn't care whether the target is a
-    /// PVM agent or a native `.so`.
+    /// PVM agent or a native `.so`. Agents win on collision; an
+    /// extension with the same name as an installed agent is
+    /// shadowed. The manifest reconciler is the right place to
+    /// reject the collision up-front, but doesn't today.
     #[msg]
     async fn meta_for_instance(&self, name: String) -> Vec<u8> {
         let mut ai = 0usize;
@@ -373,23 +388,35 @@ impl SpaceRegistry {
 
     /// Record (or replace) the metadata blob for a native
     /// extension instance. Keyed by `instance_name` (not a
-    /// program hash — see `ExtensionMetaRow` comment). Empty
-    /// `blob` is allowed and clears the registered meta, so a
-    /// re-deploy can roll back a previously-published surface.
+    /// program hash — see `ExtensionMetaRow` comment).
+    ///
+    /// An empty `blob` removes the row outright rather than
+    /// storing an empty entry. That keeps "no schema registered"
+    /// distinguishable from "schema registered but trivially
+    /// empty" if the producer ever has reason to publish a
+    /// zero-method surface — and lets a re-deploy genuinely roll
+    /// back a previously-published surface rather than leaving
+    /// behind a stale row.
     #[msg]
     async fn register_extension_meta(&mut self, instance_name: String, blob: Vec<u8>) -> u8 {
         let mut idx = 0usize;
         while idx < self.extension_metas.len() {
             if self.extension_metas[idx].instance_name == instance_name {
-                self.extension_metas[idx].blob = blob;
+                if blob.is_empty() {
+                    self.extension_metas.remove(idx);
+                } else {
+                    self.extension_metas[idx].blob = blob;
+                }
                 return STATUS_OK;
             }
             idx += 1;
         }
-        self.extension_metas.push(ExtensionMetaRow {
-            instance_name,
-            blob,
-        });
+        if !blob.is_empty() {
+            self.extension_metas.push(ExtensionMetaRow {
+                instance_name,
+                blob,
+            });
+        }
         STATUS_OK
     }
 

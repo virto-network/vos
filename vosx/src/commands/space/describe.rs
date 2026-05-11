@@ -133,9 +133,17 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
         }
         println!("messages:");
         for msg in &meta.messages {
-            let q = if msg.is_query { " (query)" } else { "" };
+            // Tags are space-separated; `(query)` and `(cli)`
+            // compose so a CLI-exposed query handler shows both.
+            let mut tags = String::new();
+            if msg.is_query {
+                tags.push_str(" (query)");
+            }
+            if msg.exposed_to_cli {
+                tags.push_str(" (cli)");
+            }
             if msg.fields.is_empty() {
-                println!("  {}(){}", msg.name, q);
+                println!("  {}(){tags}", msg.name);
             } else {
                 let args = msg
                     .fields
@@ -143,7 +151,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                     .map(|f| format!("{}: {}", f.name, f.ty))
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("  {}({args}){q}", msg.name);
+                println!("  {}({args}){tags}", msg.name);
             }
         }
         Ok(())
