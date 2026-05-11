@@ -847,13 +847,15 @@ fn pvm_actors_via_gateway() {
         String::from_utf8_lossy(&out.stderr),
     );
     let body = String::from_utf8_lossy(&out.stdout);
-    // Reply is `Value::Str(json_blob)` → vosx prints it as a
-    // JSON-quoted string. Unwrap once to get the inner object.
-    let outer: serde_json::Value =
-        serde_json::from_str(body.trim()).expect("vosx gateway status returns JSON");
-    let inner_str = outer.as_str().expect("status reply is JSON string");
+    // Reply is `Value::Str(json_blob)`; vosx's `unwrap_json_string`
+    // heuristic strips the outer quoting so the operator sees a
+    // real JSON object instead of a string-containing-JSON.
     let status: serde_json::Value =
-        serde_json::from_str(inner_str).expect("status payload is JSON object");
+        serde_json::from_str(body.trim()).expect("vosx gateway status returns JSON object");
+    assert!(
+        status.is_object(),
+        "status should render as JSON object, got: {status}",
+    );
     assert_eq!(
         status["running"], true,
         "gateway should report running=true before stop",

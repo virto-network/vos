@@ -132,15 +132,54 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let reply = client.invoke_dyn(target_id, &msg)?;
 
         if output::is_json() {
-            output::print_json(&output::value_to_json(&reply));
+            output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
         } else {
             match reply {
                 Value::Unit => println!("()"),
+                Value::Str(s) if looks_like_json_object_or_array(&s) => {
+                    // `vosx gateway status` returns a JSON-shaped
+                    // string; in text mode the user is most
+                    // likely scanning for fields, so print the
+                    // payload verbatim rather than rust-Debug-
+                    // formatting the wrapping `Str(...)`.
+                    println!("{s}");
+                }
                 other => println!("{other:?}"),
             }
         }
         Ok(())
     })
+}
+
+/// `true` when `s` starts with `{` or `[` (after whitespace) —
+/// the cheap "looks like a JSON container" predicate the JSON-
+/// unwrap heuristic gates on. Conservative: doesn't fire on
+/// JSON numbers, booleans, or `null`, since those are
+/// ambiguous with a handler that genuinely returned the string
+/// literal.
+fn looks_like_json_object_or_array(s: &str) -> bool {
+    matches!(s.trim_start().chars().next(), Some('{' | '['))
+}
+
+/// Heuristic: when a handler returned `Value::Str(json_blob)`
+/// (e.g. `vosx gateway status`), the default JSON rendering
+/// produces a quoted string containing JSON — forcing the
+/// reader to parse it twice. Detect the case (Value::Str shape,
+/// starts with `{`/`[`, parses as JSON) and unwrap so the outer
+/// JSON layer renders the object/array directly.
+///
+/// Limited to JSON containers so a handler that legitimately
+/// returned, say, `"42"` or `"true"` doesn't get re-interpreted
+/// as a JSON number / boolean.
+fn unwrap_json_string(json: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &json
+        && looks_like_json_object_or_array(s)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+        && (parsed.is_object() || parsed.is_array())
+    {
+        return parsed;
+    }
+    json
 }
 
 fn parse_argv(argv: &[String]) -> anyhow::Result<ParsedArgv> {
@@ -424,6 +463,65 @@ mod tests {
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");
+    }
+
+    #[test]
+    fn unwrap_json_string_unwraps_object_payloads() {
+        // Status handler shape: handler returns Value::Str(json),
+        // outer layer wraps as JSON string → user sees a quoted
+        // string containing JSON. The heuristic should strip the
+        // outer quoting.
+        let outer = serde_json::Value::String(r#"{"port":8443,"running":true}"#.into());
+        let unwrapped = unwrap_json_string(outer);
+        assert!(
+            unwrapped.is_object(),
+            "expected JSON object, got {unwrapped}"
+        );
+        assert_eq!(unwrapped["port"], 8443);
+        assert_eq!(unwrapped["running"], true);
+    }
+
+    #[test]
+    fn unwrap_json_string_unwraps_array_payloads() {
+        let outer = serde_json::Value::String("[1, 2, 3]".into());
+        let unwrapped = unwrap_json_string(outer);
+        assert!(unwrapped.is_array(), "expected JSON array, got {unwrapped}");
+    }
+
+    #[test]
+    fn unwrap_json_string_leaves_bare_string_alone() {
+        // `"hello world"` is legitimately the handler's return —
+        // unwrapping would lose the type.
+        let outer = serde_json::Value::String("hello world".into());
+        let unwrapped = unwrap_json_string(outer.clone());
+        assert_eq!(unwrapped, outer);
+    }
+
+    #[test]
+    fn unwrap_json_string_leaves_quoted_number_alone() {
+        // `"42"` is valid JSON (a number) BUT also a valid string;
+        // the conservative heuristic gates on `{`/`[` start so
+        // numbers stay strings.
+        let outer = serde_json::Value::String("42".into());
+        let unwrapped = unwrap_json_string(outer.clone());
+        assert_eq!(unwrapped, outer);
+    }
+
+    #[test]
+    fn unwrap_json_string_passes_through_non_strings() {
+        let v = serde_json::json!({"already": "object"});
+        let unwrapped = unwrap_json_string(v.clone());
+        assert_eq!(unwrapped, v);
+    }
+
+    #[test]
+    fn unwrap_json_string_handles_malformed_payload() {
+        // `{`-prefixed but not valid JSON: keep the string as-is,
+        // don't crash. Handlers returning raw bytes that happen
+        // to start with `{` shouldn't break dispatch.
+        let outer = serde_json::Value::String("{not valid".into());
+        let unwrapped = unwrap_json_string(outer.clone());
+        assert_eq!(unwrapped, outer);
     }
 
     #[test]

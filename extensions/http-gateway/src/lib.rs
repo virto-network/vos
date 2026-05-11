@@ -307,11 +307,25 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
         } else {
             raw
         };
-        let msg: Msg = vos::Decode::decode(body);
+        // `try_decode` is the validating rkyv path — a malformed
+        // payload (truncated, schema-mismatched, hostile) returns
+        // None instead of panicking through the FFI boundary and
+        // looking like a handler bug in metrics/logs.
+        let Some(msg) = <Msg as vos::Decode>::try_decode(body) else {
+            log::warn!("http-gateway: vos_service_handle_invoke received malformed payload");
+            return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+        };
 
         let reply: Value = match msg.name.as_str() {
             "stop" => {
                 let Some(inner) = gateway.inner() else {
+                    // Pre-run() race: between `vos_extension_create`
+                    // returning and `run()` populating the OnceLock.
+                    // Caller sees STATUS_NOT_FOUND, indistinguishable
+                    // from "method doesn't exist" — but the window is
+                    // microseconds wide, and the next retry hits the
+                    // populated OnceLock cleanly. Better fix needs a
+                    // SERVICE_UNAVAILABLE status code in the envelope.
                     return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
                 };
                 inner.stop.store(true, std::sync::atomic::Ordering::Relaxed);

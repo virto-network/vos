@@ -2697,38 +2697,36 @@ fn run_service_extension(
     // shared across threads as `*mut ()`; the extension is
     // responsible for thread-safe access between its run thread
     // and the dispatch path (HttpGateway uses an OnceLock + Arc).
+    //
+    // Plugin handle is `Arc`-shared with the sidecar rather than
+    // re-loaded — `Library`'s fn-ptr fields are `Send+Sync`, and
+    // a single dlopen is cheaper than two. The Arc also keeps the
+    // library mapped for the sidecar's lifetime even if `run()`
+    // exits first.
+    let plugin = std::sync::Arc::new(plugin);
     let sidecar = if plugin.service_has_invoke_dispatch() {
         let state_ptr = SendState(state);
-        let shutdown_sidecar = shutdown.clone();
-        let plugin_path = config.path.clone();
+        let plugin_for_sidecar = plugin.clone();
+        let shutdown_for_sidecar = shutdown.clone();
         Some(std::thread::spawn(move || {
-            // We re-load the .so on this thread to avoid sharing the
-            // ExtensionPlugin (and its Library handle) across threads.
-            // dlopen is refcounted so this is a no-op map; the
-            // existing handle in the parent thread keeps the library
-            // resident.
-            let sidecar_plugin = match unsafe {
-                crate::extension::ExtensionPlugin::load(&plugin_path)
-            } {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(%id, "service dispatch sidecar: re-load failed ({e}); inbound vosx <ext> <method> invokes will time out");
-                    return;
-                }
-            };
-            run_service_invoke_sidecar(id, sidecar_plugin, state_ptr, invoke_rx, shutdown_sidecar);
+            run_service_invoke_sidecar(
+                id,
+                plugin_for_sidecar,
+                state_ptr,
+                invoke_rx,
+                shutdown_for_sidecar,
+            );
         }))
     } else {
-        // Drop the receiver explicitly so the channel's tx detects
-        // the disconnect promptly and senders fail-fast rather than
-        // blocking on a queue nobody reads.
+        // No dispatch handler — drop the receiver so any sender
+        // sees Disconnected on send and the channel doesn't leak.
         drop(invoke_rx);
         None
     };
 
     // Capture panics inside run so we can clean up state + host_ptr
     // even if the extension blows up.
-    let plugin_ref = &plugin;
+    let plugin_ref = &*plugin;
     let handle_ptr: *const HostCtxHandle = &handle;
     let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: state is a live instance from create_state above;
@@ -2736,9 +2734,19 @@ fn run_service_extension(
         unsafe { plugin_ref.run_service(state, handle_ptr) }
     }));
 
+    // After run() returns we need the sidecar to exit too. The
+    // process-wide `shutdown` flag would do it but is shared by
+    // every other agent/extension on this daemon — flipping it
+    // here would take them down too. Instead we drop the sender
+    // half of the invoke channel by removing the entry from
+    // `invoke_routes`; the sidecar's `recv_timeout` sees
+    // `Disconnected` and exits. Other clones of the Sender (e.g.
+    // a thread mid-send) keep the channel briefly alive, but
+    // they're short-lived and the sidecar exits within one
+    // timeout tick (50ms) after the last clone drops. Falls back
+    // to global shutdown anyway if a stray sender lingers.
     if let Some(handle) = sidecar {
-        // Let the sidecar see shutdown; it polls every 50ms.
-        shutdown.store(true, Ordering::Relaxed);
+        invoke_routes.lock().unwrap().remove(&id.0);
         let _ = handle.join();
     }
 
@@ -2805,10 +2813,13 @@ unsafe impl Send for SendState {}
 /// standard invoke envelope so the calling actor's
 /// `unwrap_invoke_envelope` decodes them the same way it does
 /// for PVM and actor-mode-extension replies. Exits when
-/// `shutdown` is set or the channel disconnects.
+/// `shutdown` is set or the channel disconnects (the latter is
+/// the per-extension wake signal — `run_service_extension`
+/// drops the Sender out of `invoke_routes` after `run()`
+/// returns).
 fn run_service_invoke_sidecar(
     id: ServiceId,
-    plugin: crate::extension::ExtensionPlugin,
+    plugin: std::sync::Arc<crate::extension::ExtensionPlugin>,
     state: SendState,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     shutdown: Arc<AtomicBool>,
