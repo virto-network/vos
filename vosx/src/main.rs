@@ -114,6 +114,40 @@ fn init_tracing(verbose: bool) {
 }
 
 fn main() {
+    // Pre-parser: peek argv and decide whether to enter the
+    // dynamic-dispatch path before handing off to clap. clap's
+    // Subcommand derive only knows the built-in verbs (`run`,
+    // `space`, `help-schema`); a `vosx gateway stop` invocation
+    // would otherwise slip through as the `file` positional and
+    // fail with a confusing "no such ELF" error.
+    //
+    // The verb is the first non-flag argv token. We route to the
+    // dynamic dispatcher when:
+    //
+    //   * the verb exists,
+    //   * it's not a built-in (`run`, `space`, `help-schema`,
+    //     `help`),
+    //   * and it's not a path-like token (one-shot ELF run still
+    //     takes precedence so `vosx ./foo.elf` keeps working).
+    //
+    // Anything else falls through to `Cli::parse()` so clap's
+    // own --help / --version / parse-error machinery stays intact.
+    let raw_argv: Vec<String> = std::env::args().skip(1).collect();
+    if should_dynamic_dispatch(&raw_argv) {
+        // Mirror the global-flag side-effects clap would have
+        // applied. Verbose + format are read off the same argv
+        // since the pre-parser hasn't consumed them.
+        let verbose = raw_argv.iter().any(|a| a == "-v" || a == "--verbose");
+        init_tracing(verbose);
+        if let Some(fmt) = extract_format_flag(&raw_argv) {
+            output::set(fmt);
+        }
+        if let Err(e) = commands::dynamic::dispatch(&raw_argv) {
+            report_error(e);
+        }
+        return;
+    }
+
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     output::set(cli.format);
@@ -155,6 +189,73 @@ fn main() {
     }
 }
 
+/// Decide whether argv should bypass clap into the dynamic
+/// dispatcher. The first non-flag token is the candidate verb;
+/// any of the built-in subcommand names — including clap's
+/// auto-generated `help` — falls back to clap. A path-like token
+/// (one with `/` or `\`, or starting with `.`) is preserved for
+/// the existing one-shot ELF run path.
+fn should_dynamic_dispatch(argv: &[String]) -> bool {
+    const BUILTIN_VERBS: &[&str] = &["run", "space", "help-schema", "help"];
+    // Skip global flags; only `--format` / `--space` take a
+    // value, the rest are boolean-shaped. We do NOT recognise
+    // `--space` here (it's a dynamic-only flag) — its presence
+    // is a strong "user wants dynamic dispatch" signal anyway.
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        match a.as_str() {
+            "--format" => {
+                i += 2;
+                continue;
+            }
+            s if s.starts_with("--format=") => {}
+            "--space" => return true,
+            s if s.starts_with("--space=") => return true,
+            "-v" | "--verbose" => {}
+            "--help" | "-h" | "--version" | "-V" => return false,
+            _ => {
+                if a.starts_with('-') {
+                    // Unknown flag — let clap surface the error.
+                    return false;
+                }
+                if BUILTIN_VERBS.contains(&a.as_str()) {
+                    return false;
+                }
+                if a.contains('/') || a.contains('\\') || a.starts_with('.') {
+                    return false;
+                }
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Pluck `--format <value>` / `--format=<value>` out of argv
+/// without disturbing the rest. clap would also handle these
+/// but only on the path through `Cli::parse`; the dynamic path
+/// re-implements just enough flag parsing to honor the same
+/// global flag.
+fn extract_format_flag(argv: &[String]) -> Option<Format> {
+    use clap::ValueEnum;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--format" => {
+                let v = argv.get(i + 1)?;
+                return Format::from_str(v, true).ok();
+            }
+            s if s.starts_with("--format=") => {
+                return Format::from_str(s.trim_start_matches("--format="), true).ok();
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Print an error and exit with the appropriate code. In JSON
 /// mode the error envelope goes to stderr too — tools parsing
 /// stdout get nothing on the failure path, and structured
@@ -183,4 +284,81 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
         return EXIT_NOT_FOUND;
     }
     EXIT_RUNTIME_ERROR
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::should_dynamic_dispatch;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_argv_uses_clap_path() {
+        // Lets clap's "no command" error surface as-is.
+        assert!(!should_dynamic_dispatch(&s(&[])));
+    }
+
+    #[test]
+    fn builtin_verbs_use_clap_path() {
+        for v in ["run", "space", "help-schema", "help"] {
+            assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
+        }
+    }
+
+    #[test]
+    fn path_like_first_positional_runs_one_shot() {
+        // The existing `vosx ./foo.elf` shape must keep working.
+        for v in ["./foo.elf", "/abs/path.elf", "rel\\path"] {
+            assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
+        }
+    }
+
+    #[test]
+    fn standalone_help_flag_uses_clap_path() {
+        // `vosx --help` and `vosx --version` are handled by clap.
+        assert!(!should_dynamic_dispatch(&s(&["--help"])));
+        assert!(!should_dynamic_dispatch(&s(&["-h"])));
+        assert!(!should_dynamic_dispatch(&s(&["--version"])));
+        assert!(!should_dynamic_dispatch(&s(&["-V"])));
+    }
+
+    #[test]
+    fn unknown_flag_falls_back_to_clap() {
+        // Clap surfaces the better error message for unknown flags.
+        assert!(!should_dynamic_dispatch(&s(&["--unknown"])));
+    }
+
+    #[test]
+    fn non_builtin_word_triggers_dynamic_dispatch() {
+        // The actual Phase-4 ergonomic surface.
+        assert!(should_dynamic_dispatch(&s(&["gateway"])));
+        assert!(should_dynamic_dispatch(&s(&["gateway", "stop"])));
+        assert!(should_dynamic_dispatch(&s(&["math", "add", "a=2", "b=3"])));
+    }
+
+    #[test]
+    fn global_flags_with_values_skip_correctly() {
+        // `--format json gateway stop` — the json value isn't a verb.
+        assert!(should_dynamic_dispatch(&s(&[
+            "--format", "json", "gateway"
+        ])));
+        assert!(should_dynamic_dispatch(&s(&["--format=json", "gateway"])));
+        assert!(should_dynamic_dispatch(&s(&["-v", "gateway"])));
+    }
+
+    #[test]
+    fn space_flag_alone_forces_dynamic() {
+        // `--space` only makes sense in the dynamic path; its
+        // presence is a strong signal even before the verb.
+        assert!(should_dynamic_dispatch(&s(&["--space", "demo"])));
+        assert!(should_dynamic_dispatch(&s(&["--space=demo", "gateway"])));
+    }
+
+    #[test]
+    fn format_before_builtin_verb_still_uses_clap() {
+        // `--format json space agents demo` — clap can handle it.
+        assert!(!should_dynamic_dispatch(&s(&["--format", "json", "space"])));
+    }
 }

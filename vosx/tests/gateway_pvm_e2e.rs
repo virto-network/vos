@@ -618,6 +618,66 @@ fn pvm_actors_via_gateway() {
         "describe should list math.multiply: {cli_meta}",
     );
 
+    // 10a-pre. Phase 4 dynamic dispatch: `vosx --space e2e math add a=2 b=3`
+    //          replaces `vosx space call e2e math add a=2 b=3` with an
+    //          ergonomic shape that's schema-aware (the registry's
+    //          math.add(u64, u64) signature drives arg coercion).
+    let out = Command::new(vosx_bin())
+        .args([
+            "--format", "json", "--space", "e2e", "math", "add", "a=2", "b=3",
+        ])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx math add");
+    assert!(
+        out.status.success(),
+        "vosx math add failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        body.trim(),
+        "5",
+        "math.add(2,3) via dynamic dispatch: {body}"
+    );
+
+    // Schema-aware rejection: math.add wants u64; sending a
+    // non-numeric arg must fail at the CLI level (before the
+    // daemon round trip) with a typed error.
+    let out = Command::new(vosx_bin())
+        .args(["--space", "e2e", "math", "add", "a=notanumber", "b=3"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx math add (bad arg)");
+    assert!(
+        !out.status.success(),
+        "type mismatch must error; got stdout={:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("u64") && stderr.contains("notanumber"),
+        "schema-aware error should name the type + value: {stderr}",
+    );
+
+    // `vosx <unknown>` from the index → "unknown" error from the
+    // registry meta lookup, not a daemon hang or a confusing
+    // "no such ELF" from the one-shot run path.
+    let out = Command::new(vosx_bin())
+        .args(["--space", "e2e", "no-such-target"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx unknown");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no schema") || stderr.contains("unknown"),
+        "unknown target must give a clear error: {stderr}",
+    );
+
     // 10a. Same CLI, but pointed at the gateway *extension* instead
     //      of a PVM agent. Phase 3 wired vosx reconcile to forward
     //      `[[extension]]` meta to the registry's `register_extension_meta`;
