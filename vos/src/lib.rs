@@ -579,19 +579,25 @@ macro_rules! __vos_emit_worker_glue {
 /// vos::service_main!(MyGateway);
 /// ```
 ///
-/// Emits the C ABI symbols (`vos_extension_meta`, `vos_extension_create`,
-/// `vos_extension_drop`, `vos_extension_run`) the host's
+/// Emits the C ABI symbols (`vos_extension_meta`,
+/// `vos_extension_create`, `vos_extension_drop`,
+/// `vos_extension_run`, `vos_extension_free`) the host's
 /// `ExtensionPlugin::load` looks up.
 ///
-/// V1 limitations:
-/// - Constructor is `fn new() -> Self` (no init args).
-/// - No `#[messages]` integration — control messages arrive via
-///   `ctx.recv_envelope`, the extension dispatches them itself.
-/// - No persistent state — fresh on each boot.
+/// Constructor takes `fn new(args: &[u8]) -> Self` — init args
+/// come from the `[[extension]] init = {...}` block in the
+/// manifest, rkyv-encoded as `vos::value::Args`. Constructors
+/// that don't need args declare `_args: &[u8]`.
 ///
-/// All three lift in later phases (Phase 4 wires init args for the
-/// gateway; Phase 5 adds the CLI dispatch surface; persistence stays
-/// opt-in per service).
+/// Per-invoke dispatch (`vosx <ext> <method>`) is opt-in by
+/// hand-writing a `vos_service_handle_invoke` extern fn — there's
+/// no `#[messages]`-style codegen for service mode yet. The
+/// extension is responsible for thread-safe state access between
+/// its run thread and the dispatch sidecar; see HttpGateway's
+/// `OnceLock<Arc<Inner>>` pattern in `extensions/http-gateway`.
+///
+/// Persistent state stays opt-in per service (each service owns
+/// its own redb / disk layout, if any).
 #[cfg(feature = "extension")]
 #[macro_export]
 macro_rules! service_main {

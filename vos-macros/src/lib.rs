@@ -988,9 +988,10 @@ struct ActorAttrs {
 /// - `error = Type` — custom Actor::Error type (default `()`)
 /// - `kind = "actor" | "service"` — extension kind discriminant
 ///   (default `"actor"`). `"service"` opts into the long-running
-///   shape introduced in Phase 3; in Phase 2 this byte is recorded
-///   in metadata but the loader still treats every extension as
-///   `Actor`.
+///   shape — the host's `run_service_extension` calls the
+///   extension's `run()` body once and (optionally) spawns a
+///   per-invoke dispatch sidecar against
+///   `vos_service_handle_invoke`.
 fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     let default_err = quote! { () };
     let mut out = ActorAttrs {

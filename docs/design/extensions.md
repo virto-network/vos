@@ -386,19 +386,32 @@ the side-thread channel with proper `ServiceCtx` calls.
 
 - `extensions/http-gateway/Cargo.toml` declares `kind = "service"`.
 - `serve(port)` no longer blocks the dispatch loop — it's the body of
-  `run(ctx_handle)`. Admin routes (`/__admin/stop`, `/__admin/status`)
-  flip a flag the run loop checks; control messages (e.g.
-  `gateway.status`) come in via `ctx.recv_envelope()`.
+  `run(ctx_handle)`.
 - The hyper accept loop spawns a task per connection; per-task asks
   go through `ServiceCtx::ask`.
 - HTTP/3 stays gated behind `feature = "http3"`.
 - Integration test: spin up a counter actor + http-gateway in a space,
   GET `/counter/inc`, verify the counter incremented.
 
+> The gateway's lifecycle ops (`stop`, `status`) initially rode a
+> short-lived `/__admin/*` HTTP namespace gated by `admin_token`.
+> Phase 6 of the CLI-dispatch follow-on (landed 2026-05-11)
+> dropped the HTTP namespace in favour of `vosx gateway stop` /
+> `vosx gateway status` through the registry-driven dispatch
+> sidecar. See `project_cli_dispatch_landed.md`.
+
 Validation: existing http-gateway tests pass; new e2e test (counter
 over HTTP) passes.
 
 ### Phase 5 — CLI dispatch from extension metadata
+
+> **Shipped 2026-05-11** as a separate plan over Phases 1–6 (see
+> `project_cli_dispatch_landed.md`). Original sketch left below
+> for historical context; what actually shipped differs in the
+> details (e.g. `~/.config/vosx/cli_cache.toml` not
+> `extensions.toml`, no separate `vosx extension list` /
+> `refresh` — `vosx --help` surfaces cached targets directly,
+> `vosx <target>` with no method lists CLI-exposed handlers).
 
 The `vosx <ext> <cmd>` surface.
 

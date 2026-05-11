@@ -130,9 +130,8 @@ Add an `[[extension]]` block to the space manifest:
 name = "gateway"
 path = "../target/debug/libhttp_gateway.so"
 init = {
-    bind_addr   = "127.0.0.1",
-    port        = 18080,
-    admin_token = "dev-only-token",
+    bind_addr = "127.0.0.1",
+    port      = 18080,
 }
 ```
 

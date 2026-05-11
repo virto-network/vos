@@ -343,18 +343,17 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
     }
 }
 
-// Phase 6 capability declarations — log-only today, but logged at
-// load time so an operator review can spot the OS access this
+// Capability declarations — log-only today, but logged at load
+// time so an operator review can spot the OS access this
 // extension wants. The HTTP gateway needs to bind a TCP port,
 // originate outbound TCP/TLS to peers (h3 + future webhooks), own
 // a tokio runtime + spawn protocol threads.
 //
-// `cli` lists handlers reachable via `vosx gateway <cmd>` once the
-// dispatcher lands. Today `/__admin/stop` and `/__admin/status`
-// front the same ops over HTTP; the CLI surface is declared now so
-// the registry-served meta carries a non-empty `cli_methods` list,
-// and a later phase swaps the HTTP admin namespace for daemon-side
-// dispatch through the declared names.
+// `cli = [stop, status]` exposes the gateway's lifecycle ops as
+// `vosx gateway stop` / `vosx gateway status` through the
+// registry-driven dispatch sidecar (vos_service_handle_invoke
+// above). These replaced the pre-Phase-6 `/__admin/*` HTTP
+// namespace.
 vos::service_main!(
     HttpGateway,
     caps = [

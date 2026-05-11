@@ -79,13 +79,14 @@ actors = [
 # Example: HTTP gateway exposed on loopback:18080. Init args become
 # rkyv-encoded `vos::value::Args` the extension's `fn new(args: &[u8])`
 # parses. Strings, integers, and bools all flow through as-is.
+# Lifecycle ops live on `vosx gateway stop` / `vosx gateway status`
+# through the dispatch path — no `admin_token` config needed.
 # [[extension]]
 # name = "gateway"
 # path = "../target/debug/libhttp_gateway.so"
 # init = {
-#     bind_addr   = "127.0.0.1",
-#     port        = 18080,
-#     admin_token = "dev-only-token",
+#     bind_addr = "127.0.0.1",
+#     port      = 18080,
 # }
 
 # ── Per-instance configuration ────────────────────────────────────

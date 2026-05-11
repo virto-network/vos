@@ -33,9 +33,10 @@ use alloc::vec::Vec;
 /// What kind of extension this is — `Actor` (request-driven, the
 /// default) or `Service` (long-running, owns its own thread).
 ///
-/// Phase 2 introduces this discriminant in the extension metadata
-/// blob. The host loader treats every extension as `Actor` until
-/// Phase 3 wires up the service ABI.
+/// Encoded as a trailing byte in the `.vos_meta` blob;
+/// pre-discriminant blobs default to `Actor`. The loader
+/// dispatches into the matching symbol set in
+/// `run_service_extension` / actor-mode `extension_thread`.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExtensionKind {

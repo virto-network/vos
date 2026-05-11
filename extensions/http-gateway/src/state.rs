@@ -150,8 +150,8 @@ pub(crate) fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Compact JSON snapshot — same shape served by `GET /__admin/status`
-/// and the `status()` actor message.
+/// Compact JSON snapshot — what `vos_service_handle_invoke`
+/// returns from `status`, reachable as `vosx gateway status`.
 pub(crate) fn status_json(inner: &Inner) -> String {
     let started = inner.started_unix.load(Ordering::Relaxed);
     let uptime = if started == 0 {
