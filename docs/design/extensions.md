@@ -173,6 +173,39 @@ Reply correlation re-uses the existing `request_id` field that
 the host just needs to expose it on the wire and on the demultiplexer
 side.
 
+### Routing model: ask vs tell, invoke vs outbox
+
+Two host-side channels carry traffic into and out of an extension:
+
+- **Outbox / inbox (envelope path).** Fire-and-forget. The host's
+  outbox dispatcher routes envelopes by `to`; replies arrive on the
+  inbox addressed `from = target`. Authors interact with it through
+  `ctx.recv_envelope()` (and a future `ctx.tell(target, payload)`
+  for sending). Used for: control RPC from `vosx <ext> *`, async
+  notifications, gossip from peer actors.
+- **Invoke channel (sync RPC path).** Each agent and actor-mode
+  extension registers a dedicated `Receiver<InvokeRequest>` in
+  `node::invoke_routes`. The wire envelope is
+  `[status][state_len:u32][state][reply]` so YIELDED/DONE
+  bookkeeping for the PVM continuation model rides alongside the
+  user payload. Authors interact with it through `ctx.ask_raw`.
+  PVM agents reply *only* through this channel — they have no
+  envelope outbox.
+
+`ServiceCtx::ask_raw` routes through invoke as of commit 05178e1.
+That's the only ask primitive exposed today. A future `ctx.tell`
+will route through outbox; the two stay distinct because their
+semantics differ (sync request/reply with continuation state vs
+async fire-and-forget envelope), not because the wire format is
+duplicated.
+
+The legacy `vh_send` / `vh_recv_reply` vtable callbacks stay live
+for the existing one-in-flight extension-to-extension tests and
+the eventual `tell` surface, but they aren't on the ask hot path
+anymore. The dispatch_e2e suite proves the envelope-mode path
+still works; the gateway → PVM path proves the invoke path works
+end-to-end (see `vosx/tests/gateway_pvm_e2e.rs`).
+
 ### Persistence
 
 Service-mode persistence is opt-in (default off). The lifecycle hook
