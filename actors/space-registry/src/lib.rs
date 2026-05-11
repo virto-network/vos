@@ -64,6 +64,24 @@ pub struct MetaRow {
     pub blob: Vec<u8>,
 }
 
+/// One row in the extension-metadata table — meta bytes for a native
+/// extension `.so`, keyed by its manifest `instance_name`. Service-
+/// mode extensions don't have a program-hash identity the way PVM
+/// blobs do (the host loads them straight from a path; the same
+/// .so can produce a different meta blob across rebuilds), so the
+/// natural key is the operator-chosen name. `meta_for_instance` falls
+/// through to this table when an extension instance shares a name
+/// with no installed agent — `vosx <ext> <cmd>` reads it to extend
+/// clap with the extension's CLI surface.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ExtensionMetaRow {
+    pub instance_name: String,
+    pub blob: Vec<u8>,
+}
+
 // ── Agents ────────────────────────────────────────────────────────
 
 /// One row in the agent (instance) catalog.
@@ -165,6 +183,13 @@ pub struct SpaceRegistry {
     /// about the schema format (lives in `vos::metadata` on the
     /// consumer side).
     metas: Vec<MetaRow>,
+    /// Opaque metadata blobs for native `.so` extensions, keyed by
+    /// the manifest `instance_name`. Service-mode extensions have
+    /// no program-hash identity in this catalog (the host loads
+    /// them off a filesystem path), so we key by the operator-
+    /// visible name. `meta_for_instance` falls through here when
+    /// the name doesn't match an installed PVM agent.
+    extension_metas: Vec<ExtensionMetaRow>,
 }
 
 #[messages]
@@ -175,6 +200,7 @@ impl SpaceRegistry {
             agents: Vec::new(),
             members: Vec::new(),
             metas: Vec::new(),
+            extension_metas: Vec::new(),
         }
     }
 
@@ -312,6 +338,12 @@ impl SpaceRegistry {
     /// round trip in the common case (gateway resolving a
     /// per-method schema). Empty vector when the agent is
     /// unknown or has no meta registered.
+    ///
+    /// Falls through to the extension-meta table when no agent
+    /// matches — extensions share the same instance-name
+    /// namespace from the manifest, and `vosx <ext> <cmd>` needs
+    /// a single lookup that doesn't care whether the target is a
+    /// PVM agent or a native `.so`.
     #[msg]
     async fn meta_for_instance(&self, name: String) -> Vec<u8> {
         let mut ai = 0usize;
@@ -329,7 +361,36 @@ impl SpaceRegistry {
             }
             ai += 1;
         }
+        let mut ei = 0usize;
+        while ei < self.extension_metas.len() {
+            if self.extension_metas[ei].instance_name == name {
+                return self.extension_metas[ei].blob.clone();
+            }
+            ei += 1;
+        }
         Vec::new()
+    }
+
+    /// Record (or replace) the metadata blob for a native
+    /// extension instance. Keyed by `instance_name` (not a
+    /// program hash — see `ExtensionMetaRow` comment). Empty
+    /// `blob` is allowed and clears the registered meta, so a
+    /// re-deploy can roll back a previously-published surface.
+    #[msg]
+    async fn register_extension_meta(&mut self, instance_name: String, blob: Vec<u8>) -> u8 {
+        let mut idx = 0usize;
+        while idx < self.extension_metas.len() {
+            if self.extension_metas[idx].instance_name == instance_name {
+                self.extension_metas[idx].blob = blob;
+                return STATUS_OK;
+            }
+            idx += 1;
+        }
+        self.extension_metas.push(ExtensionMetaRow {
+            instance_name,
+            blob,
+        });
+        STATUS_OK
     }
 
     // ── Agents (instances) ──────────────────────────────────────

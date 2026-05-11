@@ -552,6 +552,16 @@ mod host {
             crate::actors::metadata::decode(&self.meta_bytes)
         }
 
+        /// Raw bytes from `vos_extension_meta` — the same blob
+        /// `meta()` decodes. Forwarded verbatim by `vosx reconcile`
+        /// to the registry's `register_extension_meta` so downstream
+        /// consumers (`vosx <ext> <cmd>`) can decode against the same
+        /// `vos::metadata` definition the producer used. Empty when
+        /// the `.so` didn't export `vos_extension_meta`.
+        pub fn meta_bytes(&self) -> &[u8] {
+            &self.meta_bytes
+        }
+
         /// Create a new extension instance with no init args.
         pub fn create(&self) -> ExtensionInstance<'_> {
             let state = unsafe { (self.create_fn)(std::ptr::null(), 0) };

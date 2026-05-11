@@ -618,6 +618,47 @@ fn pvm_actors_via_gateway() {
         "describe should list math.multiply: {cli_meta}",
     );
 
+    // 10a. Same CLI, but pointed at the gateway *extension* instead
+    //      of a PVM agent. Phase 3 wired vosx reconcile to forward
+    //      `[[extension]]` meta to the registry's `register_extension_meta`;
+    //      `meta_for_instance` falls through, so this round-trips
+    //      through the same libp2p path as math/greeter/counter
+    //      and renders the gateway's service-mode meta. Assertion
+    //      doubles as the Phase 2 check (cli_methods crosses over
+    //      into `exposed_to_cli=true` for `stop`/`status`).
+    let out = Command::new(vosx_bin())
+        .args(["--format", "json", "space", "describe", "e2e", "gateway"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx space describe gateway");
+    assert!(
+        out.status.success(),
+        "vosx space describe gateway failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let ext_meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`describe gateway --format json` stdout not JSON ({e}): {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(ext_meta["actor_name"], "HttpGateway");
+    assert_eq!(ext_meta["kind"], 1, "gateway is a service-mode extension");
+    let ext_messages = ext_meta["messages"]
+        .as_array()
+        .expect("gateway messages array");
+    let stop = ext_messages
+        .iter()
+        .find(|m| m["name"] == "stop")
+        .expect("gateway should expose `stop`");
+    let status_msg = ext_messages
+        .iter()
+        .find(|m| m["name"] == "status")
+        .expect("gateway should expose `status`");
+    assert_eq!(stop["exposed_to_cli"], true);
+    assert_eq!(status_msg["exposed_to_cli"], true);
+
     // 10b. /openapi.json — auto-generated from registered schemas.
     //      Asserts the doc shape: openapi version, math.add /
     //      math.multiply paths each with the right HTTP method,

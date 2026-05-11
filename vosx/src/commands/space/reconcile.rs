@@ -123,8 +123,17 @@ fn default_consistency() -> String {
 /// build init args (rkyv `Args`), and hand off to
 /// `node.register_extension`. Logs the load + each init arg so
 /// operators can spot misconfigured manifests at boot.
+///
+/// Also pulls the `.so`'s `vos_extension_meta` blob out via a one-
+/// shot `ExtensionPlugin::load` and forwards it to the registry's
+/// `register_extension_meta` keyed by the manifest instance name.
+/// `vosx <ext> <cmd>` (Phase 4) reads back through the same name to
+/// drive its dynamic clap surface. Double-loading the .so here is
+/// trivial: cdylibs are small and meta extraction doesn't run any
+/// extension code.
 fn register_extension(
     node: &mut VosNode,
+    reg: &SpaceRegistryRef,
     ext: &ExtensionDef,
     manifest_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -155,6 +164,24 @@ fn register_extension(
         };
     }
 
+    // Read the meta blob before handing off to `register_extension`.
+    // Loading here loads a second copy of the .so for ~the duration
+    // of this function; the plugin drops at the end of the scope so
+    // dlopen's refcount falls back to 1 by the time `register_extension`
+    // re-opens it inside the worker thread.
+    let meta_blob = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
+        Ok(plugin) => plugin.meta_bytes().to_vec(),
+        Err(e) => {
+            tracing::warn!(
+                "extension '{}': failed to read .vos_meta from {} ({e}); \
+                 schema-aware CLI dispatch disabled",
+                ext.name,
+                so_path.display(),
+            );
+            Vec::new()
+        }
+    };
+
     let cfg = if ext.init.is_empty() {
         ExtensionConfig::new(&so_path)
     } else {
@@ -167,6 +194,24 @@ fn register_extension(
         ext.name,
         so_path.display(),
     );
+
+    if !meta_blob.is_empty() {
+        let status =
+            vos::block_on(reg.register_extension_meta(&mut &*node, ext.name.clone(), meta_blob))
+                .map_err(|e| {
+                    anyhow::anyhow!("registry.register_extension_meta('{}'): {e}", ext.name)
+                })?;
+        if status != STATUS_OK {
+            tracing::warn!(
+                "register_extension_meta('{}') returned status {status}; \
+                 CLI dispatch surface unavailable for this extension",
+                ext.name,
+            );
+        } else {
+            tracing::debug!("registered extension meta for '{}'", ext.name);
+        }
+    }
+
     Ok(())
 }
 
@@ -191,17 +236,25 @@ pub fn reconcile(
     manifest_dir: &Path,
     daemon_prefix: u16,
 ) -> anyhow::Result<()> {
-    // Extensions land first — they're host-local and don't need
-    // the registry. Doing them up-front lets a service-mode
-    // extension (gateway, etc.) be ready by the time PVM agents
-    // start sending traffic at it.
+    let reg = SpaceRegistryRef::at(ServiceId::new(
+        daemon_prefix,
+        ServiceId::REGISTRY.local_id(),
+    ));
+
+    // Extensions land first — they're host-local and don't need the
+    // registry to *boot*, but each one's meta blob does ride into
+    // the registry's `extension_metas` table so `meta_for_instance`
+    // (and Phase 4's `vosx <ext> <cmd>`) can find the CLI surface.
+    // Doing extensions up-front lets a service-mode extension
+    // (gateway, etc.) be ready by the time PVM agents start sending
+    // traffic at it.
     if !manifest.extensions.is_empty() {
         tracing::info!(
             "reconciling manifest ({} extension definition(s))",
             manifest.extensions.len(),
         );
         for ext in &manifest.extensions {
-            register_extension(node, ext, manifest_dir)?;
+            register_extension(node, &reg, ext, manifest_dir)?;
         }
     }
 
@@ -224,11 +277,6 @@ pub fn reconcile(
             instance_service_id(&a.name, daemon_prefix).0,
         );
     }
-
-    let reg = SpaceRegistryRef::at(ServiceId::new(
-        daemon_prefix,
-        ServiceId::REGISTRY.local_id(),
-    ));
 
     for agent in flatten(&manifest.agents) {
         reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids)?;

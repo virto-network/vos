@@ -28,6 +28,13 @@ struct MessageView<'a> {
     name: &'a str,
     is_query: bool,
     fields: Vec<FieldView<'a>>,
+    /// `true` when the producer declared this handler via
+    /// `#[msg(cli)]` (actor mode) or in `cli = [...]`
+    /// (service-mode `service_main!`). Mirrors the wire-side
+    /// `ParsedMessage.exposed_to_cli` so a JSON consumer
+    /// (`vosx <ext> <cmd>` schema cache, IDE tooling, etc.)
+    /// sees which surface is intended for the CLI.
+    exposed_to_cli: bool,
 }
 
 #[derive(Serialize)]
@@ -57,6 +64,7 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
                             ty: &f.ty,
                         })
                         .collect(),
+                    exposed_to_cli: msg.exposed_to_cli,
                 })
                 .collect(),
             constructor: m
@@ -75,18 +83,22 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
 
 pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
-        // First confirm the agent exists. A 404-shaped error
-        // is more useful than "schema unknown" when the user
-        // typo'd the name.
-        if client.agent(instance)?.is_none() {
-            return Err(anyhow!(
-                "no agent named '{instance}' in this space (use \
-                 `vosx space agents <space>` to list)"
-            ));
-        }
-
+        // Try the meta lookup first; the registry joins agents +
+        // extension instances internally, so a non-empty blob
+        // proves *some* installed thing owns the name (PVM agent
+        // or native extension). When the lookup comes back empty,
+        // fall back to the agent table to distinguish "name
+        // unknown" from "name installed but no schema" — the
+        // latter happens for older actor binaries that predate
+        // schema forwarding.
         let blob = client.meta_for_instance(instance)?;
         if blob.is_empty() {
+            if client.agent(instance)?.is_none() {
+                return Err(anyhow!(
+                    "no agent or extension named '{instance}' in this \
+                     space (use `vosx space agents <space>` to list)"
+                ));
+            }
             return Err(anyhow!(
                 "no schema registered for '{instance}'. The agent's \
                  program was likely installed before vosx started \
