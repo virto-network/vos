@@ -68,6 +68,7 @@ pub const STATUS_PARENT_NOT_FOUND: u8 = 3;
 pub const STATUS_BLOB_NOT_FOUND: u8 = 4;
 pub const STATUS_BRANCH_NOT_FAST_FORWARD: u8 = 5;
 pub const STATUS_INVALID_INPUT: u8 = 6;
+pub const STATUS_CHANGE_NOT_FOUND: u8 = 7;
 
 // ── Intent tag values ─────────────────────────────────────────────
 
@@ -578,6 +579,138 @@ pub mod store {
         HashResult::ok(hash)
     }
 
+    // ── Working changes (jj-style) ──────────────────────────────
+
+    /// Open a new working change off `base`. `base` is 32 bytes
+    /// pointing at an existing commit, or empty to open against
+    /// "no parent yet" (the change's eventual commit will become
+    /// the root commit of its branch).
+    ///
+    /// The minted `change_id` is derived deterministically from
+    /// the base + the current count of open changes so two
+    /// `open_change` calls on the same state don't collide and a
+    /// snapshot-then-restore round-trip reproduces the same id.
+    /// Stable across replays.
+    pub fn open_change(state: &mut ProjectState, base: &[u8]) -> HashResult {
+        let base_arr = if base.is_empty() {
+            [0u8; HASH_BYTES]
+        } else {
+            let Some(h) = bytes_to_32(base) else {
+                return HashResult::err(STATUS_BAD_HASH);
+            };
+            if find_commit(state, &h).is_none() {
+                return HashResult::err(STATUS_PARENT_NOT_FOUND);
+            }
+            h
+        };
+        let count = state.working.len() as u64;
+        let change_id: [u8; HASH_BYTES] = vos::crypto::blake2b_hash(
+            b"vos-dev-project/change-id/v1",
+            &[&base_arr, &count.to_le_bytes()],
+        );
+        let change = WorkingChange {
+            change_id,
+            base: base_arr,
+            edits: Vec::new(),
+        };
+        let pos = state
+            .working
+            .binary_search_by(|w| w.change_id.cmp(&change_id))
+            .unwrap_or_else(|p| p);
+        state.working.insert(pos, change);
+        HashResult::ok(change_id)
+    }
+
+    /// Drop `path` from the working change. The base commit's
+    /// entry for the same path will be masked when
+    /// `working_tree` materialises.
+    pub fn delete_file_working(state: &mut ProjectState, change_id: &[u8], path: &str) -> u8 {
+        if !is_valid_path(path) {
+            return STATUS_INVALID_INPUT;
+        }
+        let Some(cid) = bytes_to_32(change_id) else {
+            return STATUS_BAD_HASH;
+        };
+        let Some(idx) = find_working(state, &cid) else {
+            return STATUS_CHANGE_NOT_FOUND;
+        };
+        upsert_edit(&mut state.working[idx], path, EditOp::Delete);
+        STATUS_OK
+    }
+
+    /// Stage a file overlay on the working change: the file at
+    /// `path` now resolves to the blob at `blob_hash`. Blob must
+    /// already be in the project's blob store (call `put_blob`
+    /// first to get its hash). Replaces any prior edit for the
+    /// same path.
+    pub fn put_file_working(
+        state: &mut ProjectState,
+        change_id: &[u8],
+        path: &str,
+        blob_hash: &[u8],
+    ) -> u8 {
+        if !is_valid_path(path) {
+            return STATUS_INVALID_INPUT;
+        }
+        let Some(cid) = bytes_to_32(change_id) else {
+            return STATUS_BAD_HASH;
+        };
+        let Some(bh) = bytes_to_32(blob_hash) else {
+            return STATUS_BAD_HASH;
+        };
+        if find_blob(state, &bh).is_none() {
+            return STATUS_BLOB_NOT_FOUND;
+        }
+        let Some(idx) = find_working(state, &cid) else {
+            return STATUS_CHANGE_NOT_FOUND;
+        };
+        upsert_edit(&mut state.working[idx], path, EditOp::PutBlob(bh));
+        STATUS_OK
+    }
+
+    /// Materialise the working change's tree: take the base
+    /// commit's `files`, then apply each overlay (replace or
+    /// drop). The result is the file list the next snapshot
+    /// commit would carry.
+    pub fn working_tree(state: &ProjectState, change_id: &[u8]) -> Option<Vec<FileEntry>> {
+        let cid = bytes_to_32(change_id)?;
+        let idx = find_working(state, &cid)?;
+        let change = &state.working[idx];
+
+        // Start from the base commit's tree (empty if root).
+        let mut tree: Vec<FileEntry> = if change.base == [0u8; HASH_BYTES] {
+            Vec::new()
+        } else {
+            state
+                .commits
+                .iter()
+                .find(|c| commit_row_hash(c) == change.base)
+                .map(|c| c.files.clone())
+                .unwrap_or_default()
+        };
+
+        for edit in &change.edits {
+            match edit.op {
+                EditOp::PutBlob(blob) => match tree.binary_search_by(|f| f.path.cmp(&edit.path)) {
+                    Ok(i) => tree[i].blob = blob,
+                    Err(i) => tree.insert(
+                        i,
+                        FileEntry {
+                            path: edit.path.clone(),
+                            blob,
+                        },
+                    ),
+                },
+                EditOp::Delete => {
+                    if let Ok(i) = tree.binary_search_by(|f| f.path.cmp(&edit.path)) {
+                        tree.remove(i);
+                    }
+                }
+            }
+        }
+        Some(tree)
+    }
+
     // ── Lookups (linear or binary depending on table) ─────────
 
     fn find_blob(state: &ProjectState, hash: &[u8; HASH_BYTES]) -> Option<usize> {
@@ -598,6 +731,26 @@ pub mod store {
             .branches
             .binary_search_by(|b| b.name.as_str().cmp(name))
             .ok()
+    }
+
+    fn find_working(state: &ProjectState, change_id: &[u8; HASH_BYTES]) -> Option<usize> {
+        state
+            .working
+            .binary_search_by(|w| w.change_id.cmp(change_id))
+            .ok()
+    }
+
+    fn upsert_edit(change: &mut WorkingChange, path: &str, op: EditOp) {
+        match change.edits.binary_search_by(|e| e.path.as_str().cmp(path)) {
+            Ok(i) => change.edits[i].op = op,
+            Err(i) => change.edits.insert(
+                i,
+                WorkingEdit {
+                    path: path.to_string(),
+                    op,
+                },
+            ),
+        }
     }
 }
 
@@ -748,6 +901,42 @@ impl DevProject {
     #[msg]
     async fn put_blob_ast(&mut self, bytes: Vec<u8>) -> Vec<u8> {
         store::put_blob_with_kind(&mut self.state, bytes, BlobKind::RustAst).to_vec()
+    }
+
+    // ── Working changes (jj-style) ──────────────────────────────
+
+    /// Open a new working change off `base` (32 bytes pointing
+    /// at an existing commit, or empty for "no parent yet").
+    /// Returns the minted `change_id`, which the agent then
+    /// passes to subsequent `put_file_working` /
+    /// `delete_file_working` / `commit_change` / `amend` calls.
+    #[msg]
+    async fn open_change(&mut self, base: Vec<u8>) -> HashResult {
+        store::open_change(&mut self.state, &base)
+    }
+
+    /// Stage `path => blob_hash` on the working change.
+    #[msg]
+    async fn put_file_working(
+        &mut self,
+        change_id: Vec<u8>,
+        path: String,
+        blob_hash: Vec<u8>,
+    ) -> u8 {
+        store::put_file_working(&mut self.state, &change_id, &path, &blob_hash)
+    }
+
+    /// Mark `path` as deleted in the working change.
+    #[msg]
+    async fn delete_file_working(&mut self, change_id: Vec<u8>, path: String) -> u8 {
+        store::delete_file_working(&mut self.state, &change_id, &path)
+    }
+
+    /// Materialise the working change's current tree (base
+    /// commit's files overlaid with the change's edits).
+    #[msg]
+    async fn working_tree(&self, change_id: Vec<u8>) -> Option<Vec<FileEntry>> {
+        store::working_tree(&self.state, &change_id)
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
