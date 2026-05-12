@@ -288,6 +288,69 @@ pub struct ProjectState {
     pub commits: Vec<CommitNode>,
     /// Sorted by branch name.
     pub branches: Vec<BranchRef>,
+    /// Open working changes (jj-style) — `(change_id, edits)`
+    /// pairs the agent is iterating on between snapshot commits.
+    /// Sorted by `change_id`.
+    ///
+    /// **NOT REPLICATED — runtime support pending.** Working
+    /// state is per-replica scratchpad and shouldn't appear in
+    /// the CRDT export to peers; the runtime doesn't yet expose
+    /// a per-field consistency knob, so for now the field still
+    /// participates in archive/replication. Once that knob
+    /// lands, this field becomes the canonical example of
+    /// "local-only" state. Until then, the regression test in
+    /// `tests/host_smoke.rs::working_changes_arent_in_commit_log`
+    /// asserts the next-best invariant: working entries don't
+    /// leak into the commit log or branch refs (the parts of
+    /// state any consumer of the CRDT replication stream
+    /// observes).
+    pub working: Vec<WorkingChange>,
+}
+
+/// Per-file edit on top of a working change's `base` commit.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub enum EditOp {
+    /// Replace (or add) the file at `path` with the blob at
+    /// `hash`. Blob must already exist via `put_blob` /
+    /// `put_blob_ast` — the working change references blobs by
+    /// content hash, never by inline bytes.
+    PutBlob([u8; HASH_BYTES]),
+    /// Drop the file at `path` from the working tree. The base
+    /// commit's entry for the same path is masked.
+    Delete,
+}
+
+/// One open working change. The combination `(base, edits)` is
+/// the agent's current edit-in-progress; `commit_change` snapshots
+/// it as an immutable [`CommitNode`].
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct WorkingChange {
+    /// jj-style stable identifier. Survives `amend` so the
+    /// authoritative snapshot is "the latest commit sharing
+    /// this change_id"; `log` dedupes by it.
+    pub change_id: [u8; HASH_BYTES],
+    /// Commit the working tree builds on. `[0; 32]` for a fresh
+    /// change off a branch that doesn't exist yet.
+    pub base: [u8; HASH_BYTES],
+    /// Per-file overlays, sorted by path. An entry's presence at
+    /// a path always wins over the same path in `base`'s tree.
+    pub edits: Vec<WorkingEdit>,
+}
+
+/// One overlay entry in a working change.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct WorkingEdit {
+    pub path: String,
+    pub op: EditOp,
 }
 
 // ── store — pure functions over ProjectState ──────────────────
@@ -637,6 +700,7 @@ impl DevProject {
                 blobs: Vec::new(),
                 commits: Vec::new(),
                 branches: Vec::new(),
+                working: Vec::new(),
             },
         }
     }
