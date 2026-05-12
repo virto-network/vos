@@ -13,7 +13,7 @@ use std::time::Duration;
 use vos::extension::ServiceCtx;
 use vos::log;
 
-use crate::compile;
+use crate::{compile, publish};
 
 /// Shared runtime state — published into the `OnceLock` by
 /// `run()` so the invoke sidecar can wake the shutdown loop and
@@ -147,6 +147,31 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
                     return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
                 };
                 let result = compile::compile_and_record(&ctx, project_id, commit_hash);
+                Value::Bytes(<dev_project::HashResult as Encode>::encode(&result))
+            }
+            "publish" => {
+                let Some(ctx) = dev.live_ctx() else {
+                    log::warn!("dev: publish() invoked before run() populated the ctx");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(project_id) = msg.args.get_u32("project_id") else {
+                    log::warn!("dev: publish() missing project_id arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(build_commit) = msg.args.get_bytes("build_commit").map(|b| b.to_vec())
+                else {
+                    log::warn!("dev: publish() missing build_commit arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(name) = msg.args.get_str("name").map(|s| s.to_string()) else {
+                    log::warn!("dev: publish() missing name arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(version) = msg.args.get_str("version").map(|s| s.to_string()) else {
+                    log::warn!("dev: publish() missing version arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let result = publish::publish(&ctx, project_id, build_commit, name, version);
                 Value::Bytes(<dev_project::HashResult as Encode>::encode(&result))
             }
             _ => return ExtensionPollResult::error(POLL_ERR_NO_FUTURE),

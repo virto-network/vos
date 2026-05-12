@@ -207,7 +207,7 @@ pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<
     }
 }
 
-fn bytes_to_32_or_zero(b: &[u8]) -> [u8; HASH_BYTES] {
+pub(crate) fn bytes_to_32_or_zero(b: &[u8]) -> [u8; HASH_BYTES] {
     let mut out = [0u8; HASH_BYTES];
     if b.len() == HASH_BYTES {
         out.copy_from_slice(b);
@@ -308,7 +308,7 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
 
 // ── Wire helpers ─────────────────────────────────────────────────────
 
-fn dyn_payload(msg: &Msg) -> Vec<u8> {
+pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(TAG_DYNAMIC);
@@ -320,14 +320,14 @@ fn dyn_payload(msg: &Msg) -> Vec<u8> {
 /// bytes don't decode (transport/encoding bug) — distinct from a
 /// successful decode that just happens to be `Value::Unit` or
 /// `Value::Bytes(empty)`.
-fn decode_value(bytes: &[u8]) -> Option<Value> {
+pub(crate) fn decode_value(bytes: &[u8]) -> Option<Value> {
     <Value as vos::Decode>::try_decode(bytes)
 }
 
 /// Extract a `Vec<u8>` from a reply Value. Both typed-handler
 /// returns (`Value::Bytes`) and `Value::Unit` map here — the
 /// caller is expected to know which is "missing" vs "empty".
-fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
+pub(crate) fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
     match v {
         Value::Bytes(b) => Some(b),
         Value::Unit => Some(Vec::new()),
@@ -335,7 +335,11 @@ fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
     }
 }
 
-fn fetch_commit(ctx: &ServiceCtx, project_id: u32, hash: &[u8]) -> Result<Option<CommitNode>, u8> {
+pub(crate) fn fetch_commit(
+    ctx: &ServiceCtx,
+    project_id: u32,
+    hash: &[u8],
+) -> Result<Option<CommitNode>, u8> {
     let msg = Msg::new("get_commit").with("hash", hash.to_vec());
     let raw = ctx
         .ask_raw(project_id, &dyn_payload(&msg))
@@ -349,7 +353,11 @@ fn fetch_commit(ctx: &ServiceCtx, project_id: u32, hash: &[u8]) -> Result<Option
     Ok(Some(commit))
 }
 
-fn fetch_blob(ctx: &ServiceCtx, project_id: u32, hash: &[u8]) -> Result<Option<BlobObject>, u8> {
+pub(crate) fn fetch_blob(
+    ctx: &ServiceCtx,
+    project_id: u32,
+    hash: &[u8],
+) -> Result<Option<BlobObject>, u8> {
     let msg = Msg::new("get_blob").with("hash", hash.to_vec());
     let raw = ctx
         .ask_raw(project_id, &dyn_payload(&msg))
@@ -363,7 +371,7 @@ fn fetch_blob(ctx: &ServiceCtx, project_id: u32, hash: &[u8]) -> Result<Option<B
     Ok(Some(blob))
 }
 
-fn put_blob(ctx: &ServiceCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<u8>, u8> {
+pub(crate) fn put_blob(ctx: &ServiceCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<u8>, u8> {
     let msg = Msg::new("put_blob").with("bytes", bytes.to_vec());
     let raw = ctx
         .ask_raw(project_id, &dyn_payload(&msg))
@@ -372,7 +380,7 @@ fn put_blob(ctx: &ServiceCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<u8>, 
     value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
 }
 
-fn fetch_head(ctx: &ServiceCtx, project_id: u32, branch: &str) -> Result<Vec<u8>, u8> {
+pub(crate) fn fetch_head(ctx: &ServiceCtx, project_id: u32, branch: &str) -> Result<Vec<u8>, u8> {
     let msg = Msg::new("head").with("branch", branch.to_string());
     let raw = ctx
         .ask_raw(project_id, &dyn_payload(&msg))
@@ -382,7 +390,7 @@ fn fetch_head(ctx: &ServiceCtx, project_id: u32, branch: &str) -> Result<Vec<u8>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn remote_commit(
+pub(crate) fn remote_commit(
     ctx: &ServiceCtx,
     project_id: u32,
     parent: Vec<u8>,

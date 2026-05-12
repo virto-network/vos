@@ -94,6 +94,27 @@ pub struct ExtensionMetaRow {
     pub blob: Vec<u8>,
 }
 
+/// Raw PVM blob stored in the registry's per-space content-
+/// addressed object store. Hashed with the empty-domain blake2b
+/// that vosx's host-side `blob_store::BlobHash::of` uses, so a
+/// `ProgramRow.hash` looked up via `program(name, version)` is
+/// directly usable as a key into both the registry's blob table
+/// and the operator's `~/.cache/vosx/blobs/` cache.
+///
+/// Capacity caveat: blobs replicate via the registry's CRDT/Raft
+/// stream, so every peer in the space carries every blob's bytes.
+/// Fine for the program-distribution use case (small PVM ELFs at
+/// publish time) but unsuitable for bulk data — push that through
+/// a dedicated blob-distribution agent.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct BlobRow {
+    pub hash: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
 // ── Agents ────────────────────────────────────────────────────────
 
 /// One row in the agent (instance) catalog.
@@ -202,6 +223,13 @@ pub struct SpaceRegistry {
     /// visible name. `meta_for_instance` falls through here when
     /// the name doesn't match an installed PVM agent.
     extension_metas: Vec<ExtensionMetaRow>,
+    /// PVM blob bytes, keyed by their `BlobHash::of` hash. Sorted
+    /// by hash for binary search. Populated by
+    /// `upload_blob` — typically the dev extension's
+    /// `publish` flow uploads here before calling `publish` so
+    /// peers can resolve `ProgramRow.hash` without a separate
+    /// fetch dance.
+    blobs: Vec<BlobRow>,
 }
 
 #[messages]
@@ -213,6 +241,7 @@ impl SpaceRegistry {
             members: Vec::new(),
             metas: Vec::new(),
             extension_metas: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -715,6 +744,41 @@ impl SpaceRegistry {
     #[msg]
     async fn members(&self) -> Vec<MemberRow> {
         self.members.clone()
+    }
+
+    // ── Blob bytes ─────────────────────────────────────────────
+
+    /// Insert raw bytes into the registry's blob store, keyed by
+    /// the same empty-domain blake2b hash that vosx's
+    /// `BlobHash::of` (and therefore `ProgramRow.hash`) uses.
+    /// Returns the hash so callers can chain to `publish`
+    /// without a separate `BlobHash::of` step on the actor side.
+    /// Idempotent: re-uploading identical bytes is a no-op.
+    #[msg]
+    async fn upload_blob(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        let hash: [u8; 32] = vos::crypto::blake2b_hash(&[], &[&bytes]);
+        let pos = match self.blobs.binary_search_by(|b| b.hash.cmp(&hash)) {
+            Ok(_) => return hash.to_vec(),
+            Err(p) => p,
+        };
+        self.blobs.insert(pos, BlobRow { hash, bytes });
+        hash.to_vec()
+    }
+
+    /// Fetch raw bytes from the registry's blob store. Returns
+    /// an empty vector when the hash isn't present — callers
+    /// distinguish "blob absent" from "blob empty" by tracking
+    /// whether they uploaded zero-length data (almost certainly
+    /// a bug; the dev extension never does).
+    #[msg]
+    async fn fetch_blob(&self, hash: Vec<u8>) -> Vec<u8> {
+        let Some(h) = bytes_to_32(&hash) else {
+            return Vec::new();
+        };
+        match self.blobs.binary_search_by(|b| b.hash.cmp(&h)) {
+            Ok(i) => self.blobs[i].bytes.clone(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
