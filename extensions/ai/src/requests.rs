@@ -23,7 +23,6 @@
 //! leaks the entry; v1 accepts that, GC is a follow-up.
 
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 
 use vos::value::Args;
@@ -63,11 +62,10 @@ impl GenerationChunk {
 
 /// One outstanding streaming request. Owned by the request map;
 /// the worker thread holds the corresponding [`Sender<String>`]
-/// (in an `Option` so it can be dropped explicitly on
-/// completion) and is unaware of this struct directly.
+/// and signals completion by dropping it (the poll path observes
+/// `TryRecvError::Disconnected` and reports `done = true`).
 pub(crate) struct RequestState {
     pub(crate) receiver: Mutex<Option<Receiver<String>>>,
-    pub(crate) finished: AtomicBool,
     /// Populated by the worker on error before it drops the
     /// sender. Cleared on creation; the poll path reads it after
     /// observing the sender disconnected.
@@ -78,7 +76,6 @@ impl RequestState {
     pub(crate) fn new(receiver: Receiver<String>) -> Self {
         Self {
             receiver: Mutex::new(Some(receiver)),
-            finished: AtomicBool::new(false),
             error: Mutex::new(String::new()),
         }
     }

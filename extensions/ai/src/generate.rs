@@ -1,15 +1,15 @@
 //! Inference: load the GGUF model + tokenizer, run a token loop,
-//! return decoded text.
+//! emit decoded text chunks through a callback.
 //!
-//! v1 is the simplest correct loop:
+//! v1 design:
 //!
 //! - **Greedy-ish sampling** through candle's `LogitsProcessor`
 //!   with a temperature of 0.7 + top-p 0.9, fixed seed. Tunable
 //!   knobs land later when there's a use case asking for them.
-//! - **No streaming.** The caller waits for the full completion;
-//!   the reply carries the decoded text once the loop hits EOS or
-//!   `max_tokens`. Streaming would be a second handler that
-//!   returns a request id + a poll endpoint.
+//! - **Callback-driven streaming.** `generate_stream` invokes
+//!   `on_chunk` with each new text suffix as it's decoded. The
+//!   blocking `generate` wrapper collects every chunk into one
+//!   `String` for the legacy dispatch + tests.
 //! - **Single-threaded.** The owning extension wraps `ModelHandle`
 //!   in a mutex; concurrent `generate` invokes serialise.
 //!
@@ -18,7 +18,7 @@
 //! need their own template — keeping it inline rather than
 //! pulling in a templating crate so the dep surface stays small.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::{Device, Tensor};
@@ -159,11 +159,17 @@ impl ModelHandle {
                 .tokenizer
                 .decode(&generated, true)
                 .map_err(|e| anyhow!("decode generated tokens: {e}"))?;
-            if text.len() > emitted_bytes {
+            if text.len() > emitted_bytes && text.is_char_boundary(emitted_bytes) {
                 // Carve off the new suffix. `decode` is stable
                 // enough across appends that the prefix is
-                // byte-identical to the prior call's output, so a
-                // simple byte-slice gives us the new chunk.
+                // byte-identical to the prior call's output —
+                // but a BPE token can carry a partial UTF-8
+                // sequence whose completion arrives on the next
+                // iteration. The `is_char_boundary` guard skips
+                // emitting until the next iter brings the
+                // multi-byte char into a valid suffix. Without
+                // this, `&text[emitted_bytes..]` panics mid-
+                // codepoint on the first emoji / non-ASCII char.
                 let chunk = &text[emitted_bytes..];
                 if !on_chunk(chunk) {
                     return Ok(());
@@ -206,7 +212,7 @@ impl ModelHandle {
 /// loader. Pulled out so the file-handle lifetime is explicit —
 /// `Content::read` keeps borrowing the file across the subsequent
 /// `from_gguf` call.
-fn load_model_weights(path: &PathBuf, device: &Device) -> Result<ModelWeights> {
+fn load_model_weights(path: &Path, device: &Device) -> Result<ModelWeights> {
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let content = candle_core::quantized::gguf_file::Content::read(&mut file)
         .with_context(|| format!("read GGUF header from {}", path.display()))?;

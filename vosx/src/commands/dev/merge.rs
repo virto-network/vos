@@ -80,9 +80,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             )
         })?;
 
-        // Snapshot `into`'s head before we merge so we can tell
-        // FF / no-op from a true three-way merge after the fact.
-        let into_before = fetch_branch_head(client, project_id, &args.into)?;
+        // The actor's `merge` handler returns STATUS_NOT_FOUND
+        // when the target branch doesn't exist — translate to a
+        // clear CLI error rather than the opaque status code.
+        // Also snapshots `into`'s head before the merge for the
+        // FF detection below.
+        let into_before = fetch_branch_head(client, project_id, &args.into)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "target branch '{}' doesn't exist on project '{}' — \
+                 the actor's merge handler requires the target to already \
+                 have at least one commit. Pick a different --into.",
+                args.into,
+                args.project,
+            )
+        })?;
 
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -114,16 +125,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             anyhow::bail!("merge returned hash of wrong length: {}", result.hash.len());
         }
 
-        // Inspect the result commit to surface any first-class
-        // conflicts. FF / already-merged paths skip this — the
-        // result_hash will equal `theirs` (FF) or the prior
-        // `into` head (no-op).
-        let (fast_forward, conflicts) =
-            if matches!(&into_before, Some(h) if h == &result.hash) || result.hash == theirs {
-                (true, Vec::new())
-            } else {
-                (false, fetch_conflicts(client, project_id, &result.hash)?)
-            };
+        // FF detection via the *actual* signal the actor uses:
+        // a real merge commit has `extras = [theirs]`, while FF
+        // and already-merged short-circuit paths skip minting a
+        // new commit. We fetch the result commit's `extras` (and
+        // `conflicts` if it IS a merge) in one round-trip.
+        let result_commit = fetch_commit(client, project_id, &result.hash)?;
+        let fast_forward = result_commit.extras.is_empty();
+        let conflicts = if fast_forward {
+            // Sanity check: on FF/no-op the result hash should
+            // equal either theirs (FF advance) or into_before
+            // (no-op already-merged).
+            debug_assert!(
+                result.hash == theirs || result.hash == into_before,
+                "FF result hash didn't match theirs or into_before"
+            );
+            Vec::new()
+        } else {
+            result_commit.conflicts
+        };
 
         emit(&args, &from, &result.hash, fast_forward, conflicts)?;
         Ok(())
@@ -224,20 +244,20 @@ fn fetch_branch_head(
     }
 }
 
-fn fetch_conflicts(
+fn fetch_commit(
     client: &DaemonClient,
     project_id: ServiceId,
     commit_hash: &[u8],
-) -> anyhow::Result<Vec<dev_project::ConflictEntry>> {
+) -> anyhow::Result<dev_project::CommitNode> {
     let reply = client.invoke_dyn(
         project_id,
         &Msg::new("get_commit").with("hash", commit_hash.to_vec()),
     )?;
     let bytes = match reply {
         Value::Bytes(b) if !b.is_empty() => b,
-        _ => return Ok(Vec::new()),
+        Value::Unit => anyhow::bail!("get_commit returned Unit — merge commit missing?"),
+        other => anyhow::bail!("get_commit returned {other:?}, expected Bytes"),
     };
-    let commit = <dev_project::CommitNode as Decode>::try_decode(&bytes)
-        .ok_or_else(|| anyhow::anyhow!("get_commit reply isn't a valid CommitNode"))?;
-    Ok(commit.conflicts)
+    <dev_project::CommitNode as Decode>::try_decode(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("get_commit reply isn't a valid CommitNode"))
 }

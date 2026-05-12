@@ -49,6 +49,18 @@ fn vosx_bin() -> PathBuf {
 }
 
 fn ai_extension_so() -> PathBuf {
+    // Prefer the release .so when present — debug-build candle
+    // inference is several-fold slower and pushes the
+    // actor-context test past every reasonable wedge threshold.
+    // The release .so is ~12MB vs debug's 200MB+; building it
+    // costs more once but pays back on every test run.
+    let release = workspace()
+        .join("target")
+        .join("release")
+        .join("libai_extension.so");
+    if release.exists() {
+        return release;
+    }
     workspace()
         .join("target")
         .join("debug")
@@ -64,6 +76,29 @@ fn ensure_built() {
             panic!("test artifact missing: {}\nRun: {hint}", path.display());
         }
     }
+}
+
+/// Same as [`ensure_built`] plus the dev extension `.so`, which
+/// the actor-flow test needs.
+fn ensure_built_with_dev() {
+    ensure_built();
+    let dev_so = workspace()
+        .join("target")
+        .join("debug")
+        .join("libdev_extension.so");
+    if !dev_so.exists() {
+        panic!(
+            "test artifact missing: {}\nRun: cargo build -p dev-extension",
+            dev_so.display()
+        );
+    }
+}
+
+fn dev_extension_so() -> PathBuf {
+    workspace()
+        .join("target")
+        .join("debug")
+        .join("libdev_extension.so")
 }
 
 // ── Tiny temp-dir helper ─────────────────────────────────────────────
@@ -244,6 +279,29 @@ path = "{ai_so}"
     manifest_path
 }
 
+fn write_manifest_with_dev(dir: &Path, space_name: &str) -> PathBuf {
+    let manifest_path = dir.join(format!("{space_name}-manifest.toml"));
+    let body = format!(
+        r#"
+space = "{space_name}"
+version = "0.1.0"
+
+[[extension]]
+name = "dev"
+path = "{dev_so}"
+
+[[extension]]
+name = "ai"
+path = "{ai_so}"
+"#,
+        space_name = space_name,
+        dev_so = dev_extension_so().display(),
+        ai_so = ai_extension_so().display(),
+    );
+    fs::write(&manifest_path, body).expect("write manifest");
+    manifest_path
+}
+
 // ── The test ────────────────────────────────────────────────────────
 
 /// Drive `vosx ai generate` through the daemon. Asserts the
@@ -295,4 +353,331 @@ fn ai_generate_e2e() {
         !trimmed.starts_with("error:"),
         "vosx ai generate returned an error reply: {trimmed}"
     );
+}
+
+/// End-to-end for the full dev+ai pairing: provision a project,
+/// seed source on `main`, ask the AI to extend it with --apply
+/// on the default per-identity side branch, verify the head of
+/// that branch advanced.
+///
+/// Like `ai_generate_e2e`, marked #[ignore] because of the
+/// 470MB model fetch + several seconds of CPU. Re-use the cached
+/// model via `VOS_AI_E2E_CACHE_HOME`.
+#[test]
+#[ignore = "boots dev+ai; uses cached model via VOS_AI_E2E_CACHE_HOME"]
+fn ai_actor_apply_e2e() {
+    ensure_built_with_dev();
+
+    // Bring up a daemon with BOTH extensions loaded. We mirror
+    // boot_daemon() but with a different manifest + space name
+    // so the test can run alongside the ai-only one.
+    let data_home = TempDir::new("data");
+    let config_home = TempDir::new("config");
+    let cache_home = std::env::var("VOS_AI_E2E_CACHE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let cache_dir = TempDir::new("cache");
+            let p = cache_dir.path().to_path_buf();
+            std::mem::forget(cache_dir);
+            p
+        });
+    let space_name = "ai-actor-e2e";
+
+    let new = Command::new(vosx_bin())
+        .args(["space", "new", "--name", space_name])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("spawn vosx space new");
+    assert!(
+        new.status.success(),
+        "vosx space new failed: stderr={}",
+        String::from_utf8_lossy(&new.stderr),
+    );
+
+    let manifest = write_manifest_with_dev(config_home.path(), space_name);
+
+    let log_path = data_home.path().join("daemon.stderr");
+    let log_file = fs::File::create(&log_path).expect("create daemon stderr log");
+    let mut child = Command::new(vosx_bin())
+        .args(["space", "up", space_name, "--manifest"])
+        .arg(&manifest)
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("RUST_LOG", "warn")
+        .env("VOSX_DISABLE_MDNS", "1")
+        .stdout(Stdio::null())
+        .stderr(log_file)
+        .spawn()
+        .expect("spawn vosx space up");
+
+    // The reconciler doesn't watch the registry at runtime, so
+    // we need `space new` → daemon restart cycles to pick up
+    // each new agent. Pattern matches the dev extension's e2e.
+    let space_data_dir = resolve_space_data_dir(config_home.path(), space_name);
+    wait_endpoint(&space_data_dir, &log_path);
+
+    // 1. Provision a dev-project named `applytest`.
+    let new_proj = Command::new(vosx_bin())
+        .args(["dev", "new", "--space", space_name, "applytest"])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("spawn vosx dev new");
+    assert!(
+        new_proj.status.success(),
+        "vosx dev new failed: stderr={}",
+        String::from_utf8_lossy(&new_proj.stderr),
+    );
+
+    // Restart so the project's actor instance comes up. Same
+    // dance the dev extension's e2e does.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(space_data_dir.join(".endpoint"));
+    let log_file2 = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("reopen daemon log");
+    let mut child = Command::new(vosx_bin())
+        .args(["space", "up", space_name, "--manifest"])
+        .arg(&manifest)
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("RUST_LOG", "warn")
+        .env("VOSX_DISABLE_MDNS", "1")
+        .stdout(Stdio::null())
+        .stderr(log_file2)
+        .spawn()
+        .expect("spawn vosx space up restart");
+    wait_endpoint(&space_data_dir, &log_path);
+
+    // 2. Seed src/lib.rs on `main` via vosx space call (uses the
+    //    @file shorthand for blob bytes). A minimal counter that
+    //    the AI can extend.
+    let src_path = data_home.path().join("tiny.rs");
+    fs::write(
+        &src_path,
+        "use vos::prelude::*;\n#[actor]\npub struct C { n: u32 }\n#[messages]\nimpl C {\n    fn new() -> Self { Self { n: 0 } }\n    #[msg]\n    async fn inc(&mut self) -> u32 { self.n += 1; self.n }\n}\n",
+    )
+    .expect("write tiny.rs");
+
+    let blob_hex = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "--format",
+            "json",
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "put_blob",
+            &format!("bytes=@{}", src_path.display()),
+        ],
+    );
+    let blob_hex = blob_hex.trim().trim_matches('"').trim_start_matches("0x");
+    let blob_bin_path = data_home.path().join("tiny.hash");
+    write_hex(&blob_bin_path, blob_hex);
+
+    let open_raw = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "open_change",
+            "base=@/dev/null",
+        ],
+    );
+    let change_hex = open_raw
+        .trim()
+        .trim_start_matches("0x")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let change_bin_path = data_home.path().join("change.id");
+    write_hex(&change_bin_path, &change_hex);
+
+    let _ = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "put_file_working",
+            &format!("change_id=@{}", change_bin_path.display()),
+            "path=src/lib.rs",
+            &format!("blob_hash=@{}", blob_bin_path.display()),
+        ],
+    );
+    let _ = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "commit_change",
+            &format!("change_id=@{}", change_bin_path.display()),
+            "branch=main",
+            "intent_tag=1",
+            "intent_data=@/dev/null",
+            "author=@/dev/null",
+            "ts_ms=0",
+        ],
+    );
+
+    // 3. Capture pre-state for the side branch (should be empty).
+    let pre_main = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "head",
+            "branch=main",
+        ],
+    );
+    assert!(
+        pre_main.trim() != "0x",
+        "main should have a commit after seeding, got {pre_main:?}",
+    );
+
+    // 4. Run `vosx ai actor --apply` with the default branch
+    //    (per-identity ai/<prefix>/suggested). Use a small
+    //    max_tokens so the test wraps up quickly.
+    let actor_out = Command::new(vosx_bin())
+        .args([
+            "ai",
+            "actor",
+            "--space",
+            space_name,
+            "--project",
+            "applytest",
+            "--max-tokens",
+            "256",
+            "--apply",
+            "Add a reset() handler that sets n to 0.",
+        ])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("VOSX_INVOKE_TIMEOUT_MS", "600000")
+        .output()
+        .expect("spawn vosx ai actor");
+    let actor_stdout = String::from_utf8_lossy(&actor_out.stdout).to_string();
+    let actor_stderr = String::from_utf8_lossy(&actor_out.stderr).to_string();
+    assert!(
+        actor_out.status.success(),
+        "vosx ai actor --apply exited non-zero\nstdout: {actor_stdout}\nstderr: {actor_stderr}",
+    );
+
+    // 5. The stderr summary should report a per-identity branch
+    //    `ai/XXXX/suggested` (not the legacy `ai-suggested`),
+    //    and the new commit hash.
+    assert!(
+        actor_stderr.contains("on 'ai/"),
+        "--apply should target ai/<prefix>/suggested, got: {actor_stderr}",
+    );
+    assert!(
+        actor_stderr.contains("/suggested'"),
+        "--apply branch should end in /suggested, got: {actor_stderr}",
+    );
+
+    // 6. main stays put; the side branch has a new head.
+    let post_main = vosx_call_capture(
+        &data_home,
+        &config_home,
+        &cache_home,
+        &[
+            "space",
+            "call",
+            space_name,
+            "applytest",
+            "head",
+            "branch=main",
+        ],
+    );
+    assert_eq!(
+        pre_main.trim(),
+        post_main.trim(),
+        "main should NOT move on --apply with default side-branch behavior",
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_endpoint(space_data: &Path, log_path: &Path) {
+    let endpoint_path = space_data.join(".endpoint");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if endpoint_path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    let stderr_tail = fs::read_to_string(log_path).unwrap_or_default();
+    panic!(
+        "daemon didn't write endpoint within 30s\n--- stderr ---\n{stderr_tail}\n--- data ---\n{}",
+        space_data.display(),
+    );
+}
+
+/// Run a `vosx` subcommand and return its stdout. Panics on
+/// non-zero exit to surface the test failure clearly.
+fn vosx_call_capture(
+    data_home: &TempDir,
+    config_home: &TempDir,
+    cache_home: &Path,
+    args: &[&str],
+) -> String {
+    let out = Command::new(vosx_bin())
+        .args(args)
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", cache_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("VOSX_INVOKE_TIMEOUT_MS", "60000")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn vosx {args:?}: {e}"));
+    if !out.status.success() {
+        panic!(
+            "vosx {args:?} failed (status={:?})\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn write_hex(path: &Path, hex: &str) {
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect::<Vec<u8>>();
+    fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }

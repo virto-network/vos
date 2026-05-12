@@ -38,7 +38,12 @@ struct TreeView<'a> {
 struct FileEntryView {
     path: String,
     blob: String,
-    size: usize,
+    /// `Some(n)` for a successful fetch; `None` when the blob is
+    /// missing/malformed and we couldn't determine the byte
+    /// count. Text mode prints "?" in the size column; JSON
+    /// emits `null` so consumers can distinguish "0-byte file"
+    /// from "size unknown".
+    size: Option<usize>,
 }
 
 pub struct Args {
@@ -196,11 +201,10 @@ fn show_tree(
 ) -> anyhow::Result<()> {
     let mut rows: Vec<FileEntryView> = Vec::with_capacity(commit.files.len());
     for f in &commit.files {
-        let size = blob_size(client, project_id, &f.blob).unwrap_or(0);
         rows.push(FileEntryView {
             path: f.path.clone(),
             blob: hex::encode(f.blob),
-            size,
+            size: blob_size(client, project_id, &f.blob),
         });
     }
 
@@ -211,22 +215,40 @@ fn show_tree(
             commit: hex::encode(commit_bytes),
             files: rows,
         });
-    } else if rows.is_empty() {
+        return Ok(());
+    }
+
+    if rows.is_empty() {
         println!(
             "(no files in {} on '{}' @ {})",
             args.project,
             args.branch,
             &hex::encode(commit_bytes)[..16],
         );
-    } else {
+        return Ok(());
+    }
+
+    println!(
+        "tree @ {} (branch: {})",
+        &hex::encode(commit_bytes)[..16],
+        args.branch
+    );
+    // Auto-size the path column to the widest path so nested
+    // paths don't push the size/hash columns out of alignment.
+    // Minimum width of 20 keeps short trees from looking cramped.
+    let path_width = rows.iter().map(|r| r.path.len()).max().unwrap_or(0).max(20);
+    for r in &rows {
+        let size_str = match r.size {
+            Some(n) => format!("{n}"),
+            None => "?".to_string(),
+        };
         println!(
-            "tree @ {} (branch: {})",
-            &hex::encode(commit_bytes)[..16],
-            args.branch
+            "  {:<width$} {:>8}  {}",
+            r.path,
+            size_str,
+            &r.blob[..16],
+            width = path_width,
         );
-        for r in &rows {
-            println!("  {:<40} {:>8}  {}", r.path, r.size, &r.blob[..16]);
-        }
     }
     Ok(())
 }

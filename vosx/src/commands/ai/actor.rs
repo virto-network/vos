@@ -36,7 +36,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vos::Decode;
-use vos::Encode;
 use vos::abi::service::ServiceId;
 use vos::value::{Args as WireArgs, Msg, Value};
 
@@ -45,7 +44,13 @@ use crate::commands::space::client::DaemonClient;
 /// Tick interval for `poll_generation`. Same value as the plain
 /// `vosx ai generate` streaming path.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_EMPTY_TICKS: u32 = 600;
+/// Empty-poll counter before we declare the worker wedged. 3
+/// minutes is generous enough to cover debug-build prefill on a
+/// ~1KB actor-context prompt (~50s on a laptop CPU) without
+/// hanging indefinitely if the worker really has stuck. Release
+/// builds rarely come close to this; the constant trades a bit
+/// of wedge detection latency for not false-firing in dev.
+const MAX_EMPTY_TICKS: u32 = 1800;
 
 /// Per-file content cap when stuffing the prompt. A few-KB
 /// budget per file keeps the context window from blowing out
@@ -430,11 +435,7 @@ fn stream_generate(
             .with("prompt", prompt.to_string())
             .with("max_tokens", max_tokens),
     )?;
-    let request_id = match begin_reply {
-        Value::U64(id) => id,
-        Value::U32(id) => id as u64,
-        other => anyhow::bail!("ai begin_generate returned unexpected value: {other:?}"),
-    };
+    let request_id = decode_request_id(begin_reply)?;
 
     let mut empty_ticks: u32 = 0;
     let mut accumulated = String::new();
@@ -489,6 +490,15 @@ pub(crate) struct ParsedFile {
     pub content: String,
 }
 
+/// Aggregate result of parsing the model's response: the files
+/// to write + non-fatal warnings the CLI surfaces to the operator
+/// (duplicate paths, unclosed fences, etc.).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParseResult {
+    pub files: Vec<ParsedFile>,
+    pub warnings: Vec<String>,
+}
+
 /// Parse the AI extension's response into a list of (path,
 /// content) pairs. Tolerates several common Markdown patterns
 /// the model emits even when the prompt asks for a specific
@@ -503,13 +513,24 @@ pub(crate) struct ParsedFile {
 /// hint must appear within the few lines immediately preceding
 /// the fence opening.
 ///
-/// Paths are validated: no leading `/`, no `..` segments,
-/// no embedded null/backslash. Files that don't match a
-/// detected path are dropped silently — the response often
-/// contains explanatory code snippets the model wants to show
-/// but not save (e.g. the canonical example replayed back).
-pub(crate) fn parse_response(text: &str) -> Vec<ParsedFile> {
-    let mut out: Vec<ParsedFile> = Vec::new();
+/// Paths are validated: no leading `/`, no `..` segments, no
+/// embedded null/backslash. Files that don't match a detected
+/// path are dropped silently — the response often contains
+/// explanatory code snippets the model wants to show but not
+/// save (e.g. the canonical example replayed back).
+///
+/// Two failure modes surface as warnings (non-fatal):
+///
+/// - **Duplicate path**: the model emitted the same path twice.
+///   Last block wins; the first is dropped and a warning lists
+///   the path.
+/// - **Unclosed fence**: the response was truncated before the
+///   closing ``` (typical when `max_tokens` cut mid-block). The
+///   incomplete block is dropped — committing partial source is
+///   worse than committing nothing.
+pub(crate) fn parse_response(text: &str) -> ParseResult {
+    let mut files: Vec<ParsedFile> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     // Recent non-empty lines we'll scan as path candidates when
@@ -527,27 +548,48 @@ pub(crate) fn parse_response(text: &str) -> Vec<ParsedFile> {
                     break;
                 }
             }
-            // Walk forward to the closing fence.
+            // Walk forward to the closing fence; track whether
+            // we actually saw one so we can drop truncated blocks.
             let mut j = i + 1;
             let mut content = String::new();
-            while j < lines.len() && !is_fence(lines[j]) {
+            let mut saw_close = false;
+            while j < lines.len() {
+                if is_fence(lines[j]) {
+                    saw_close = true;
+                    break;
+                }
                 content.push_str(lines[j]);
                 content.push('\n');
                 j += 1;
             }
-            // Save if we found a usable path. Drop the block
-            // otherwise — the model likes to echo example code
-            // back without a path; only files with explicit
-            // hints get written.
+
             if let Some(p) = path {
-                out.push(ParsedFile { path: p, content });
+                if !saw_close {
+                    warnings.push(format!(
+                        "unclosed code block for '{p}' — likely a truncated \
+                         response (max_tokens cut mid-block); skipped",
+                    ));
+                } else if let Some(existing_pos) = files.iter().position(|f| f.path == p) {
+                    // Duplicate: the model emitted this path
+                    // twice (often echoing the example before
+                    // the real change). Last block wins; warn
+                    // so the operator notices.
+                    warnings.push(format!(
+                        "duplicate path '{p}' in response — keeping the later block",
+                    ));
+                    files[existing_pos] = ParsedFile { path: p, content };
+                } else {
+                    files.push(ParsedFile { path: p, content });
+                }
             }
+            // Advance past the closing fence (if any) so we don't
+            // re-enter the loop on it.
             i = j.saturating_add(1);
         } else {
             i += 1;
         }
     }
-    out
+    ParseResult { files, warnings }
 }
 
 /// Does this line look like ``` (with or without a language
@@ -629,7 +671,14 @@ fn apply_response(
     base_commit: &[u8],
     response: &str,
 ) -> anyhow::Result<()> {
-    let files = parse_response(response);
+    let parsed = parse_response(response);
+    // Always surface warnings, regardless of whether we got
+    // files out — they highlight model glitches the operator
+    // would otherwise miss.
+    for w in &parsed.warnings {
+        eprintln!("--apply: warning: {w}");
+    }
+    let files = parsed.files;
     if files.is_empty() {
         eprintln!(
             "\n--apply: no files detected in the response. The model's reply \
@@ -763,9 +812,10 @@ fn commit_change(
     intent_tag: u8,
     ts_ms: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    let intent_data: Vec<u8> = <() as Encode>::encode(&());
-    // Use empty intent_data — INTENT_EDIT doesn't carry typed
-    // payload today.
+    // INTENT_EDIT doesn't carry a typed payload — pass an
+    // actually-empty Vec rather than encoding a unit (which
+    // would add a few archive header bytes nobody reads).
+    let intent_data: Vec<u8> = Vec::new();
     let reply = client.invoke_dyn(
         project_id,
         &Msg::new("commit_change")
@@ -797,6 +847,22 @@ fn expect_bytes(value: Value, label: &str) -> anyhow::Result<Vec<u8>> {
         Value::Bytes(_) => anyhow::bail!("{label} returned empty bytes"),
         Value::Unit => anyhow::bail!("{label} returned Unit"),
         other => anyhow::bail!("{label} returned {other:?}, expected Bytes"),
+    }
+}
+
+/// Decode the AI extension's `begin_generate` reply into a u64
+/// request id. The typed dispatch produces `Value::U64`; some
+/// codegen paths emit primitives as `Value::Bytes` instead, so
+/// accept both shapes here and in `vosx ai generate` (kept in
+/// sync to avoid one path silently failing).
+pub(crate) fn decode_request_id(value: Value) -> anyhow::Result<u64> {
+    match value {
+        Value::U64(id) => Ok(id),
+        Value::U32(id) => Ok(id as u64),
+        Value::Bytes(b) if b.len() == 8 => Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ])),
+        other => anyhow::bail!("ai begin_generate returned unexpected value: {other:?}"),
     }
 }
 
@@ -868,10 +934,11 @@ src/lib.rs:
 pub fn hello() -> &'static str { \"hi\" }
 ```
 ";
-        let files = parse_response(text);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/lib.rs");
-        assert!(files[0].content.contains("pub fn hello"));
+        let r = parse_response(text);
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].path, "src/lib.rs");
+        assert!(r.files[0].content.contains("pub fn hello"));
+        assert!(r.warnings.is_empty());
     }
 
     #[test]
@@ -888,12 +955,13 @@ fn one() {}
 name = \"foo\"
 ```
 ";
-        let files = parse_response(text);
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].path, "src/lib.rs");
-        assert_eq!(files[1].path, "Cargo.toml");
-        assert!(files[0].content.contains("fn one"));
-        assert!(files[1].content.contains("[package]"));
+        let r = parse_response(text);
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(r.files[0].path, "src/lib.rs");
+        assert_eq!(r.files[1].path, "Cargo.toml");
+        assert!(r.files[0].content.contains("fn one"));
+        assert!(r.files[1].content.contains("[package]"));
+        assert!(r.warnings.is_empty());
     }
 
     #[test]
@@ -912,16 +980,90 @@ src/lib.rs:
 fn real() {}
 ```
 ";
-        let files = parse_response(text);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/lib.rs");
-        assert!(files[0].content.contains("fn real"));
+        let r = parse_response(text);
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].path, "src/lib.rs");
+        assert!(r.files[0].content.contains("fn real"));
     }
 
     #[test]
     fn parse_response_handles_empty_input() {
-        assert!(parse_response("").is_empty());
-        assert!(parse_response("just some prose with no code").is_empty());
+        assert!(parse_response("").files.is_empty());
+        assert!(
+            parse_response("just some prose with no code")
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_response_dedupes_duplicate_paths_last_wins() {
+        // The model echoes the example back before the real
+        // change. Both blocks claim `src/lib.rs`. Last wins, with
+        // a warning so the operator notices the duplication.
+        let text = "\
+src/lib.rs:
+```rust
+fn echo() {}
+```
+
+src/lib.rs:
+```rust
+fn real() {}
+```
+";
+        let r = parse_response(text);
+        assert_eq!(r.files.len(), 1, "duplicate paths should collapse to one");
+        assert_eq!(r.files[0].path, "src/lib.rs");
+        assert!(r.files[0].content.contains("fn real"));
+        assert!(!r.files[0].content.contains("fn echo"));
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains("duplicate path"),
+            "warning should call out the duplicate: {:?}",
+            r.warnings[0],
+        );
+    }
+
+    #[test]
+    fn parse_response_drops_unclosed_fence_with_warning() {
+        // Response cut off by `max_tokens` mid-block: opening
+        // fence + path hint + some content, then EOF. The block
+        // must NOT be committed — partial source is worse than
+        // none.
+        let text = "\
+src/lib.rs:
+```rust
+pub fn hello() -> &'static str {
+    \"hello, w";
+        let r = parse_response(text);
+        assert_eq!(
+            r.files.len(),
+            0,
+            "unclosed block should be dropped, not committed"
+        );
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains("unclosed"),
+            "warning should mention 'unclosed': {:?}",
+            r.warnings[0],
+        );
+    }
+
+    #[test]
+    fn parse_response_handles_fence_without_language_tag() {
+        // Plain ``` with no language hint. The parser shouldn't
+        // require ```rust or ```toml; any fence opener works.
+        let text = "\
+src/notes.md:
+```
+just a note
+```
+";
+        let r = parse_response(text);
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].path, "src/notes.md");
+        assert!(r.files[0].content.contains("just a note"));
     }
 
     #[test]
@@ -954,8 +1096,8 @@ use vos::prelude::*;
 struct A;
 ```
 ";
-        let files = parse_response(text);
+        let r = parse_response(text);
         let expected = "use vos::prelude::*;\n\n#[actor]\nstruct A;\n";
-        assert_eq!(files[0].content, expected);
+        assert_eq!(r.files[0].content, expected);
     }
 }

@@ -1101,3 +1101,246 @@ fn dev_compile_surfaces_cargo_failure() {
         "broken source should record a failed build, got intent: {intent:?}"
     );
 }
+
+// ── vosx dev show + vosx dev merge ──────────────────────────────────
+
+/// `vosx dev show --project P` (no path) lists the tree at head.
+/// `vosx dev show --project P PATH` dumps that file's bytes.
+/// Both paths should work against a project with a single
+/// committed file.
+#[test]
+fn dev_show_tree_and_file() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "showproj"],
+        "vosx dev new showproj",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("showproj");
+
+    // Seed src/lib.rs with the counter source on main.
+    let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    commit_source(&client, project_id, &src_hash);
+
+    // Tree listing — should mention the path + size > 0.
+    let tree_text = run_cli(
+        &daemon,
+        &[
+            "dev",
+            "show",
+            "--space",
+            &daemon.space_name,
+            "--project",
+            "showproj",
+        ],
+        "vosx dev show (tree)",
+    );
+    assert!(
+        tree_text.contains("src/lib.rs"),
+        "tree listing should mention src/lib.rs, got:\n{tree_text}"
+    );
+    assert!(
+        !tree_text.contains("? "),
+        "tree size column shouldn't fall back to '?', got:\n{tree_text}"
+    );
+
+    // File content — should match what we committed.
+    let file_text = run_cli(
+        &daemon,
+        &[
+            "dev",
+            "show",
+            "--space",
+            &daemon.space_name,
+            "--project",
+            "showproj",
+            "src/lib.rs",
+        ],
+        "vosx dev show (file)",
+    );
+    assert!(
+        file_text.contains("pub struct Counter"),
+        "file dump should contain the counter source, got:\n{file_text}"
+    );
+}
+
+/// `vosx dev show --project P does/not/exist` errors with a
+/// specific message naming the missing path (not a generic
+/// transport failure).
+#[test]
+fn dev_show_missing_path_errors() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "showproj2"],
+        "vosx dev new showproj2",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("showproj2");
+    let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    commit_source(&client, project_id, &src_hash);
+
+    let (code, _stdout, stderr) = run_cli_capture(
+        &daemon,
+        &[
+            "dev",
+            "show",
+            "--space",
+            &daemon.space_name,
+            "--project",
+            "showproj2",
+            "does/not/exist.rs",
+        ],
+        "vosx dev show missing path",
+    );
+    assert_ne!(code, 0, "show on missing path should exit non-zero");
+    assert!(
+        stderr.contains("does/not/exist.rs") && stderr.contains("not in commit"),
+        "error should name the missing path + reason, got:\n{stderr}"
+    );
+}
+
+/// `vosx dev merge` fast-forwards `main` to a descendant branch's
+/// head. Sets up a side branch by committing on top of main's
+/// current head and exercises the FF path explicitly.
+#[test]
+fn dev_merge_ff_advances_main() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "mergeproj"],
+        "vosx dev new mergeproj",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("mergeproj");
+
+    // Seed main with a base commit.
+    let base_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    commit_source(&client, project_id, &base_hash);
+    let main_before = current_head(&client, project_id, "main");
+
+    // Commit a follow-up on a side branch (`feature`) off main.
+    let updated = format!("{COUNTER_SOURCE}\n// trivial change\n");
+    let side_blob = put_source(&client, project_id, "put_blob", updated.as_bytes());
+    let side_commit_reply = client.invoke(
+        project_id,
+        &Msg::new("commit")
+            .with("parent", main_before.clone())
+            .with("paths", vec!["src/lib.rs".to_string()])
+            .with("blob_hashes", side_blob)
+            .with("branch", "feature".to_string())
+            .with("intent_tag", dev_project::INTENT_EDIT)
+            .with("intent_data", Vec::<u8>::new())
+            .with("author", Vec::<u8>::new())
+            .with("ts_ms", 1u64)
+            .with("change_id", Vec::<u8>::new()),
+    );
+    let side_head = decode_hash_result_assert_ok(side_commit_reply, "commit feature");
+
+    // `vosx dev merge --from feature --into main` should FF.
+    let out = run_cli(
+        &daemon,
+        &[
+            "dev",
+            "merge",
+            "--space",
+            &daemon.space_name,
+            "--project",
+            "mergeproj",
+            "--from",
+            "feature",
+            "--into",
+            "main",
+        ],
+        "vosx dev merge feature → main",
+    );
+    assert!(
+        out.contains("fast-forwarded"),
+        "merge should report fast-forward, got:\n{out}"
+    );
+
+    // main now points at the feature head.
+    let main_after = current_head(&client, project_id, "main");
+    assert_eq!(
+        main_after, side_head,
+        "main should equal feature's head after FF merge",
+    );
+}
+
+/// `vosx dev merge --into <missing>` returns a clear,
+/// specific error instead of the actor's opaque
+/// `STATUS_NOT_FOUND`.
+#[test]
+fn dev_merge_missing_into_errors_clearly() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "mergeproj2"],
+        "vosx dev new mergeproj2",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("mergeproj2");
+
+    // Seed a side branch but NOT main, so --into main is missing.
+    let blob = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    let reply = client.invoke(
+        project_id,
+        &Msg::new("commit")
+            .with("parent", Vec::<u8>::new())
+            .with("paths", vec!["src/lib.rs".to_string()])
+            .with("blob_hashes", blob)
+            .with("branch", "feature".to_string())
+            .with("intent_tag", dev_project::INTENT_EDIT)
+            .with("intent_data", Vec::<u8>::new())
+            .with("author", Vec::<u8>::new())
+            .with("ts_ms", 1u64)
+            .with("change_id", Vec::<u8>::new()),
+    );
+    let _ = decode_hash_result_assert_ok(reply, "commit feature");
+
+    let (code, _stdout, stderr) = run_cli_capture(
+        &daemon,
+        &[
+            "dev",
+            "merge",
+            "--space",
+            &daemon.space_name,
+            "--project",
+            "mergeproj2",
+            "--from",
+            "feature",
+            "--into",
+            "main",
+        ],
+        "vosx dev merge into missing main",
+    );
+    assert_ne!(code, 0, "merge into missing branch should fail");
+    assert!(
+        stderr.contains("'main'") && stderr.contains("doesn't exist"),
+        "error should specifically call out the missing target branch, got:\n{stderr}",
+    );
+}
+
+fn current_head(client: &TestClient, project_id: ServiceId, branch: &str) -> Vec<u8> {
+    let head = client.invoke(
+        project_id,
+        &Msg::new("head").with("branch", branch.to_string()),
+    );
+    match head {
+        Value::Bytes(b) => b,
+        other => panic!("head({branch}) returned {other:?}"),
+    }
+}

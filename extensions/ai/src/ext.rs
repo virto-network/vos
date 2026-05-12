@@ -33,11 +33,6 @@ use crate::requests::{GenerationChunk, RequestState};
 /// access is the v1 design.
 pub(crate) struct Inner {
     pub(crate) stop: AtomicBool,
-    /// ServiceCtx captured at `run()` entry. ServiceCtx is
-    /// `Copy + Send + Sync`; the host vtable serialises per-channel
-    /// state behind a mutex of its own.
-    #[allow(dead_code)]
-    ctx: ServiceCtx,
     /// Configuration baked in at construction. Used to drive the
     /// first-call model load.
     config: InitConfig,
@@ -91,7 +86,6 @@ impl AiExtension {
     pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
         let inner = Arc::new(Inner {
             stop: AtomicBool::new(false),
-            ctx,
             config: self.config.clone(),
             model: Mutex::new(None),
             requests: Mutex::new(BTreeMap::new()),
@@ -171,13 +165,26 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
                     return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
                 };
                 let max_tokens = msg.args.get_u32("max_tokens").unwrap_or(256);
-                match run_generate_blocking(inner, &prompt, max_tokens) {
-                    Ok(text) => Value::Str(text),
+                // Use the same wire shape as poll_generation
+                // (GenerationChunk encoded via Args) so callers
+                // get a structured `error` field instead of a
+                // stringly-typed "error: ..." prefix on success.
+                let chunk = match run_generate_blocking(inner, &prompt, max_tokens) {
+                    Ok(text) => GenerationChunk {
+                        text,
+                        done: true,
+                        error: String::new(),
+                    },
                     Err(e) => {
                         log::warn!("ai: generate failed: {e:#}");
-                        Value::Str(format!("error: {e}"))
+                        GenerationChunk {
+                            text: String::new(),
+                            done: true,
+                            error: format!("{e}"),
+                        }
                     }
-                }
+                };
+                Value::Bytes(chunk.to_args().encode())
             }
             "begin_generate" => {
                 let Some(inner) = ai.inner() else {
@@ -296,7 +303,6 @@ fn run_generate_worker(
             *error = msg;
         }
     }
-    state.finished.store(true, Ordering::Release);
     // tx drops here as the worker exits; the poll path sees
     // Disconnected on its next try_recv and reports done.
 }

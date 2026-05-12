@@ -68,8 +68,9 @@ pub enum AiCommand {
     /// Default mode is read-only — the model's reply lands on
     /// stdout for inspection. Pass `--apply` to parse the
     /// fenced code blocks out of the reply and commit them as
-    /// a new commit on `--branch` (default `ai-suggested` — a
-    /// side branch the operator can review before merging into
+    /// a new commit on `--branch` (default
+    /// `ai/<your-node-prefix>/suggested` — a per-identity side
+    /// branch the operator can review before merging into
     /// `main` with `vosx dev merge`).
     Actor {
         /// Space id (full hex) or name.

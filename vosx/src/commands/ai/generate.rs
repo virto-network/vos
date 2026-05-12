@@ -10,15 +10,17 @@
 //!   original `generate` invoke and print the full completion.
 //!   Used by JSON consumers that want a single well-formed reply.
 //!
+//! Both paths decode the AI extension's wire shape into the same
+//! `Args { text, done, error }` triple — the streaming path
+//! receives it incrementally, the blocking path in one go.
+//!
 //! Error surface:
 //!
 //! - Outer transport errors (daemon unreachable, timeout) bubble
 //!   up via the DaemonClient `?`.
-//! - In-flight inference errors land in the streaming `error`
+//! - In-flight inference errors land in the structured `error`
 //!   field once the worker terminates. Either path surfaces them
 //!   as a non-zero CLI exit so scripts catch them.
-//! - Legacy `generate` returns inference errors as a `Value::Str`
-//!   beginning with `"error: "` (unchanged from Phase 6.1).
 
 use std::thread;
 use std::time::Duration;
@@ -27,6 +29,7 @@ use serde::Serialize;
 use vos::abi::service::ServiceId;
 use vos::value::{Args as WireArgs, Msg, Value};
 
+use crate::commands::ai::actor::decode_request_id;
 use crate::commands::space::client::DaemonClient;
 use crate::output;
 
@@ -37,11 +40,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Bound on consecutive empty polls before we bail out. Protects
 /// against a wedged worker that never reports `done`; at 100ms
-/// ticks this is 60s of silence. Inference at <1 tok/s would
-/// false-trigger here but that's outside the model class we
-/// support — Q4 0.5B reliably emits a token within seconds even
-/// on a slow CPU.
-const MAX_EMPTY_TICKS: u32 = 600;
+/// ticks this is 3 minutes of silence — generous enough to cover
+/// debug-build prefill on the larger actor-context prompts
+/// (`vosx ai actor`) without false-firing.
+const MAX_EMPTY_TICKS: u32 = 1800;
 
 #[derive(Serialize)]
 struct CompletionView<'a> {
@@ -98,14 +100,7 @@ fn run_streaming(
             .with("prompt", args.prompt.clone())
             .with("max_tokens", args.max_tokens),
     )?;
-    let request_id = match begin_reply {
-        Value::U64(id) => id,
-        Value::U32(id) => id as u64,
-        Value::Bytes(b) if b.len() == 8 => {
-            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-        }
-        other => anyhow::bail!("ai begin_generate returned unexpected value: {other:?}"),
-    };
+    let request_id = decode_request_id(begin_reply)?;
 
     let mut accumulated = String::new();
     let mut empty_ticks: u32 = 0;
@@ -150,8 +145,10 @@ fn run_streaming(
     }
 }
 
-/// Blocking path: single `generate` invoke, print the full
-/// completion at once.
+/// Blocking path: single `generate` invoke. The extension's
+/// `generate` handler returns the same `Args { text, done,
+/// error }` shape `poll_generation` uses, so error surfaces are
+/// structured instead of relying on a stringly-typed prefix.
 fn run_blocking(client: &DaemonClient, extension_id: ServiceId, args: &Args) -> anyhow::Result<()> {
     let reply = client.invoke_dyn(
         extension_id,
@@ -160,14 +157,12 @@ fn run_blocking(client: &DaemonClient, extension_id: ServiceId, args: &Args) -> 
             .with("max_tokens", args.max_tokens),
     )?;
 
-    let completion = match reply {
-        Value::Str(s) => s,
-        Value::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
-        other => anyhow::bail!("ai generate returned unexpected value: {other:?}"),
-    };
+    let chunk_args = decode_chunk_args(reply)?;
+    let completion = chunk_args.get_str("text").unwrap_or_default();
+    let error = chunk_args.get_str("error").unwrap_or_default();
 
-    if let Some(rest) = completion.strip_prefix("error: ") {
-        anyhow::bail!("ai generate failed: {rest}");
+    if !error.is_empty() {
+        anyhow::bail!("ai generate failed: {error}");
     }
 
     if output::is_json() {
@@ -185,18 +180,19 @@ fn run_blocking(client: &DaemonClient, extension_id: ServiceId, args: &Args) -> 
     Ok(())
 }
 
-/// Decode the `Value::Bytes(rkyv-encoded Args)` payload that
-/// `poll_generation` returns. Matches the shape
-/// `GenerationChunk::to_args` produces in the ai extension.
+/// Decode the `Value::Bytes(rkyv-encoded Args)` payload that both
+/// `generate` (post-Phase-6.2 cleanup) and `poll_generation`
+/// return. Matches the shape `GenerationChunk::to_args` produces
+/// in the ai extension.
 fn decode_chunk_args(value: Value) -> anyhow::Result<WireArgs> {
     let bytes = match value {
         Value::Bytes(b) => b,
-        Value::Unit => anyhow::bail!("poll_generation returned Unit — request id unknown?"),
-        other => anyhow::bail!("poll_generation returned {other:?}, expected Bytes"),
+        Value::Unit => anyhow::bail!("ai handler returned Unit — request id unknown?"),
+        other => anyhow::bail!("ai handler returned {other:?}, expected Bytes"),
     };
     if bytes.is_empty() {
-        anyhow::bail!("poll_generation returned empty bytes");
+        anyhow::bail!("ai handler returned empty bytes");
     }
     <WireArgs as vos::Decode>::try_decode(&bytes)
-        .ok_or_else(|| anyhow::anyhow!("poll_generation reply isn't a valid Args"))
+        .ok_or_else(|| anyhow::anyhow!("ai handler reply isn't a valid Args"))
 }

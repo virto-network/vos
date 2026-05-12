@@ -72,11 +72,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
- "candle-nn",
  "candle-transformers",
  "hf-hub",
- "serde",
- "serde_json",
  "tokenizers 0.21.4",
  "toml",
  "vos",

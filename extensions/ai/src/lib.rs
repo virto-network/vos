@@ -6,7 +6,7 @@
 //!
 //! - **Fetch on first use.** The model and tokenizer files are
 //!   downloaded from HuggingFace (`hf-hub` crate) into
-//!   `$XDG_CACHE_HOME/vos-ai/models/<repo>/<file>` the first time
+//!   `$XDG_CACHE_HOME/vos-ai/hf/<repo>/<file>` the first time
 //!   `generate` is called. Subsequent invocations reuse the cache.
 //! - **Configurable.** Init args (`[[extension]] init = { model_repo
 //!   = "...", model_file = "...", ... }` in the space manifest)
@@ -36,7 +36,9 @@ mod generate;
 mod requests;
 
 pub use config::InitConfig;
-pub use requests::GenerationChunk;
+// `GenerationChunk` is the wire payload `poll_generation` emits.
+// External consumers decode the on-wire form via `vos::value::Args`
+// rather than this typed struct, so it stays crate-private.
 
 vos::service_main!(
     ext::AiExtension,

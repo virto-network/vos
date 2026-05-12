@@ -104,7 +104,7 @@ pub enum DevCommand {
     /// Promote a side branch into another branch by invoking
     /// the dev-project actor's `merge` handler. Defaults match
     /// the side-branch AI workflow: pull commits from
-    /// `ai-suggested` into `main`.
+    /// `ai/<your-node-prefix>/suggested` into `main`.
     ///
     /// Fast-forward is preferred when the source branch is a
     /// descendant of the target; otherwise the actor runs a
