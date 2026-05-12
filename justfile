@@ -59,6 +59,16 @@ build-crdt-counter:
 build-registry:
     cd actors/space-registry && cargo +nightly -Zjson-target-spec build --release
 
+# Refresh the shipped registry blob at `vosx/blobs/space_registry.elf`.
+# `cargo install vosx` from crates.io reads this file (the dev path
+# `actors/space-registry/target/.../space_registry.elf` is only
+# available in a working tree). Run after any change that affects
+# the produced space-registry ELF before publishing.
+refresh-bundled-registry: build-registry
+    cp actors/space-registry/target/riscv64em-javm/release/space_registry.elf \
+       vosx/blobs/space_registry.elf
+    @echo "✓ refreshed vosx/blobs/space_registry.elf"
+
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,

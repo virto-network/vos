@@ -1,18 +1,36 @@
 [package]
 name = "vosx"
-description = "vosx — host CLI for the VOS runtime"
+description = "Host CLI for VOS — peer-to-peer OS for collaborative, replicated apps. Run actors on a deterministic PVM, manage spaces, replicate state via CRDT or Raft."
+keywords = ["vos", "p2p", "actor", "crdt", "cli"]
+categories = ["command-line-utilities", "network-programming", "wasm"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+# Ship the prebuilt space-registry blob inside the crate so
+# `cargo install vosx` from crates.io has the actor available
+# out of the box. The blob is regenerated from the local actor
+# tree by `just refresh-bundled-registry`.
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "blobs/space_registry.elf",
+]
 
 [dependencies]
-vos = { path = "../vos", features = ["std", "http", "storage", "network"] }
+vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage", "network"] }
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6" }
+# `version` is what crates.io resolves at publish time.
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1" }
 # Per-space catalog of programs / agents / members. Source of
 # truth that the new `space *` subcommands operate on.
-space-registry = { path = "../actors/space-registry", default-features = false }
+space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }
 # Content-addressed cache + IPFS resolver dependency for the
 # blob store. Stays a thin dep — no daemon required for `Path`
 # and `Hash` sources, only `Cid` and `Url` resolution touch

@@ -1,9 +1,15 @@
 [package]
 name = "vos"
-description = "VOS runtime — JAR-aligned PVM executor for VOS actors"
+description = "VOS runtime: a deterministic actor host on a JAM-aligned PVM (RISC-V), with per-agent CRDT or Raft replication, libp2p transport, and content-addressed storage."
+keywords = ["vos", "p2p", "actor", "pvm", "crdt"]
+categories = ["network-programming", "embedded", "wasm"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
@@ -27,8 +33,8 @@ storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-c
 network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
-vos-macros = { path = "../vos-macros", optional = true }
-vos-raft = { path = "../vos-raft", default-features = false, features = ["std"], optional = true }
+vos-macros = { path = "../vos-macros", version = "0.1.0", optional = true }
+vos-raft = { path = "../vos-raft", version = "0.1.0", default-features = false, features = ["std"], optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 # Logging facade — re-exported as `vos::log` and pulled into
 # `vos::prelude::*`. `default-features = false` keeps it usable
@@ -36,9 +42,12 @@ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytech
 # the same facade and bridge to tracing if it wants.
 log = { version = "0.4", default-features = false }
 
-# std-only: PVM runtime and vosx binary dependencies
-javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", optional = true }
+# std-only: PVM runtime and vosx binary dependencies.
+# Both crates are pinned by git rev during local development; the
+# `version` is what crates.io uses when the published vos package
+# resolves them (the git URL is stripped at publish time).
+javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.4", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
@@ -49,7 +58,7 @@ libloading = { version = "0.8", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
-merkle-crdt = { path = "../merkle-crdt", features = ["redb"], optional = true }
+merkle-crdt = { path = "../merkle-crdt", version = "0.1.0", features = ["redb"], optional = true }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }

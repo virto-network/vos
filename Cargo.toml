@@ -46,6 +46,10 @@ exclude = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+homepage = "https://github.com/virto-network/vos"
+authors = ["Daniel Olano <daniel@olanod.com>"]
+readme = "README.md"
 
 # Phase 61: fat LTO + single codegen unit for maximum cross-crate
 # inlining of stwo's hot SIMD paths.  Measured at log14 MOBILE on
