@@ -354,6 +354,36 @@ pub struct WorkingEdit {
     pub op: EditOp,
 }
 
+/// One unresolved-merge entry recorded on a `CommitNode`. The
+/// merge commit carries a tentative pick in `files` (Phase 4.1
+/// defaults to "ours") *plus* this row for the operator / agent
+/// to act on. A subsequent plain commit that puts an explicit
+/// blob at `path` clears the conflict — no extra ceremony.
+///
+/// All three hashes are `[0; 32]` when the file was absent on
+/// that side (e.g. added on `ours` but not at `base` and not on
+/// `theirs`).
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ConflictEntry {
+    pub path: String,
+    pub base: [u8; HASH_BYTES],
+    pub ours: [u8; HASH_BYTES],
+    pub theirs: [u8; HASH_BYTES],
+}
+
+/// Result of a three-way merge — the resolved file tree plus any
+/// per-path conflicts the algorithm couldn't decide. `files` is
+/// always populated (a conflicting file gets `ours`'s blob as a
+/// tentative pick); `conflicts` is empty on a clean merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeResult {
+    pub files: Vec<FileEntry>,
+    pub conflicts: Vec<ConflictEntry>,
+}
+
 // ── store — pure functions over ProjectState ──────────────────
 
 pub mod store {
@@ -587,6 +617,105 @@ pub mod store {
         state.commits.insert(pos, row);
 
         HashResult::ok(hash)
+    }
+
+    // ── Three-way merge ─────────────────────────────────────────
+
+    /// Three-way merge over file trees. Per-path rules:
+    ///
+    /// - `base == ours == theirs` → take any (no change).
+    /// - `ours == theirs` (parallel identical edits or deletes) →
+    ///   take either side, no conflict.
+    /// - `base == ours`, `theirs` differs → take `theirs`
+    ///   (only the other side changed).
+    /// - `base == theirs`, `ours` differs → take `ours`
+    ///   (mirror of the above).
+    /// - Everything else (both sides changed differently, including
+    ///   add/add with different content or modify/delete) →
+    ///   conflict. `files` keeps `ours`'s blob as a tentative
+    ///   pick so the merged commit still has *something* there;
+    ///   the `ConflictEntry` row tells the caller to resolve.
+    pub fn merge_trees(
+        base: &[FileEntry],
+        ours: &[FileEntry],
+        theirs: &[FileEntry],
+    ) -> MergeResult {
+        let lookup = |tree: &[FileEntry], p: &str| -> Option<[u8; HASH_BYTES]> {
+            tree.iter().find(|f| f.path == p).map(|f| f.blob)
+        };
+
+        // Collect every path mentioned across the three trees,
+        // sorted, deduped.
+        let mut paths: Vec<String> = Vec::new();
+        for tree in [base, ours, theirs] {
+            for f in tree {
+                if !paths.iter().any(|p| p == &f.path) {
+                    paths.push(f.path.clone());
+                }
+            }
+        }
+        paths.sort();
+
+        let mut merged: Vec<FileEntry> = Vec::new();
+        let mut conflicts: Vec<ConflictEntry> = Vec::new();
+
+        for path in &paths {
+            let b = lookup(base, path);
+            let o = lookup(ours, path);
+            let t = lookup(theirs, path);
+
+            // Both sides agree (modulo deletes).
+            if o == t {
+                if let Some(blob) = o {
+                    merged.push(FileEntry {
+                        path: path.clone(),
+                        blob,
+                    });
+                }
+                continue;
+            }
+            // ours unchanged from base → take theirs.
+            if b == o {
+                if let Some(blob) = t {
+                    merged.push(FileEntry {
+                        path: path.clone(),
+                        blob,
+                    });
+                }
+                continue;
+            }
+            // theirs unchanged from base → take ours.
+            if b == t {
+                if let Some(blob) = o {
+                    merged.push(FileEntry {
+                        path: path.clone(),
+                        blob,
+                    });
+                }
+                continue;
+            }
+            // Both sides changed differently — record a conflict.
+            // Pick `ours` for the tentative merged file so the
+            // commit's tree still resolves to *some* content; the
+            // ConflictEntry below tells callers it's tentative.
+            if let Some(blob) = o {
+                merged.push(FileEntry {
+                    path: path.clone(),
+                    blob,
+                });
+            }
+            conflicts.push(ConflictEntry {
+                path: path.clone(),
+                base: b.unwrap_or([0u8; HASH_BYTES]),
+                ours: o.unwrap_or([0u8; HASH_BYTES]),
+                theirs: t.unwrap_or([0u8; HASH_BYTES]),
+            });
+        }
+
+        MergeResult {
+            files: merged,
+            conflicts,
+        }
     }
 
     // ── Working changes (jj-style) ──────────────────────────────
