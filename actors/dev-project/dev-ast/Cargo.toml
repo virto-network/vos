@@ -1,0 +1,21 @@
+[package]
+name = "dev-ast"
+description = "Host helper: parse Rust source into a normalised AST blob and back again, for the dev-project actor's BlobKind::RustAst payloads"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[lib]
+
+[dependencies]
+# `full` covers items, expressions, types — the whole `syn::File`
+# tree the compile path needs to decode + render.
+syn = { version = "2", features = ["full", "parsing"] }
+# Canonical reformatting on the round-trip. Comments and exact
+# whitespace get normalised; two semantically-identical sources
+# end up byte-identical, which is the property AST blob dedup
+# depends on.
+prettyplease = "0.2"
+thiserror = "1"
