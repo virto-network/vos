@@ -1062,6 +1062,16 @@ dependencies = [
 name = "dev-extension"
 version = "0.1.0"
 dependencies = [
+ "dev-project",
+ "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
+ "tempfile",
+ "vos",
+]
+
+[[package]]
+name = "dev-project"
+version = "0.1.0"
+dependencies = [
  "vos",
 ]
 
@@ -4083,6 +4093,19 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"

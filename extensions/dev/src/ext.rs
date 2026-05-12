@@ -1,10 +1,11 @@
 //! Dev extension service struct + entry points.
 //!
-//! Phase 1.1 lays down the scaffold: a service-mode extension
-//! with an idle `run()` loop and a hand-rolled invoke dispatch
-//! sidecar (matching the http-gateway pattern) that today only
-//! recognises `stop`. Later phases bolt `compile()` and
-//! `publish()` onto the same sidecar.
+//! Phase 1.1 lays down the scaffold; Phase 1.2 bolts `compile` onto
+//! the invoke dispatch sidecar. The sidecar shares the live
+//! `ServiceCtx` with `run()` via `Inner` so it can originate
+//! follow-up asks (e.g. fetch blobs from the dev-project actor,
+//! store the compiled PVM blob back) without queuing across
+//! threads.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -12,14 +13,22 @@ use std::time::Duration;
 use vos::extension::ServiceCtx;
 use vos::log;
 
+use crate::compile;
+
 /// Shared runtime state — published into the `OnceLock` by
-/// `run()` so the invoke sidecar can wake the shutdown loop.
+/// `run()` so the invoke sidecar can wake the shutdown loop and
+/// reach the host through the cached ctx.
 pub(crate) struct Inner {
     /// Set by the `stop` handler. `run()` polls this in addition
     /// to `ctx.is_shutdown()` so an operator can quiesce the
     /// extension via `vosx dev stop` without bringing the whole
     /// daemon down.
     pub(crate) stop: AtomicBool,
+    /// The `ServiceCtx` captured at `run()` entry. ServiceCtx is
+    /// `Copy + Send + Sync`, so handing the same value to the
+    /// sidecar is sound: the host's vtable callbacks already
+    /// serialise the per-channel state behind a mutex.
+    ctx: ServiceCtx,
 }
 
 pub struct DevExtension {
@@ -40,6 +49,14 @@ impl DevExtension {
         self.inner.get()
     }
 
+    /// The `ServiceCtx` `run()` was invoked with, or `None` if
+    /// the dispatch sidecar fired before `run()` populated the
+    /// OnceLock (microsecond-wide race after
+    /// `vos_extension_create`).
+    pub(crate) fn live_ctx(&self) -> Option<ServiceCtx> {
+        self.inner.get().map(|i| i.ctx)
+    }
+
     /// Service entry point. v1 is a passive idle loop — every
     /// real work item arrives through the invoke dispatch
     /// sidecar (`vos_service_handle_invoke`). Returns 0 on
@@ -47,6 +64,7 @@ impl DevExtension {
     pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
         let inner = Arc::new(Inner {
             stop: AtomicBool::new(false),
+            ctx,
         });
         if let Err(_existing) = self.inner.set(inner.clone()) {
             log::error!("dev: run() called twice — invoke sidecar would see stale state");
@@ -66,12 +84,9 @@ impl DevExtension {
     }
 }
 
-/// Service-mode invoke dispatch. Phase 1.1 only handles `stop`;
-/// `compile` / `publish` / etc. land in subsequent phases. Wire
-/// shape mirrors the http-gateway pattern — caller (vosx)
-/// encodes a `vos::value::Msg` prefixed with `TAG_DYNAMIC`; we
-/// decode, match `msg.name`, dispatch, and reply with rkyv-
-/// encoded `vos::value::Value`.
+/// Service-mode invoke dispatch. Phase 1.1 only handled `stop`;
+/// Phase 1.2 adds `compile` — the bridge from a project's commit
+/// to a PVM blob. Wire shape mirrors the http-gateway pattern.
 ///
 /// # Safety
 ///
@@ -117,6 +132,22 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
                 inner.stop.store(true, Ordering::Relaxed);
                 log::info!("dev: stop requested");
                 Value::Unit
+            }
+            "compile" => {
+                let Some(ctx) = dev.live_ctx() else {
+                    log::warn!("dev: compile() invoked before run() populated the ctx");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(project_id) = msg.args.get_u32("project_id") else {
+                    log::warn!("dev: compile() missing project_id arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let Some(commit_hash) = msg.args.get_bytes("commit").map(|b| b.to_vec()) else {
+                    log::warn!("dev: compile() missing commit arg");
+                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+                };
+                let outcome = compile::compile_project(&ctx, project_id, commit_hash);
+                Value::Bytes(compile::encode_outcome(&outcome))
             }
             _ => return ExtensionPollResult::error(POLL_ERR_NO_FUTURE),
         };

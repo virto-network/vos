@@ -26,7 +26,14 @@
 //! background task arrives (cache eviction, dep prefetch, …),
 //! it'll claim ownership of `run()` instead.
 
+mod compile;
 mod ext;
+
+pub use compile::{
+    COMPILE_STATUS_BAD_PATH, COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_BLOB_NOT_FOUND,
+    COMPILE_STATUS_CARGO_FAILED, COMPILE_STATUS_COMMIT_NOT_FOUND, COMPILE_STATUS_ELF_NOT_FOUND,
+    COMPILE_STATUS_IO, COMPILE_STATUS_TRANSPILE_FAILED, COMPILE_STATUS_TRANSPORT,
+};
 
 vos::service_main!(
     ext::DevExtension,

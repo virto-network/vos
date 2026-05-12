@@ -23,3 +23,12 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vos = { path = "../../vos", default-features = false, features = ["extension"] }
+# Wire types shared with the dev-project PVM actor (`CommitNode`,
+# `BlobObject`, `HashResult`, intent tags, status codes). The
+# `default-features = false` strips dev-project's `bin` feature so
+# the host-target rlib build doesn't drag in PVM entry-point glue.
+dev-project = { path = "../../actors/dev-project", default-features = false }
+# Drives the RISC-V ELF → PVM blob conversion after cargo
+# produces the riscv64em-javm target binary.
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1" }
+tempfile = "3"
