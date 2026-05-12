@@ -429,20 +429,30 @@ pub mod store {
 
     /// Walk back from a branch's head emitting up to `limit` commit
     /// hashes, newest first. Follows only `parent`, not `extras`.
-    /// Returned bytes are `limit * 32`-bounded (might be shorter
-    /// when history is finite).
+    ///
+    /// jj-style change_id deduplication: when `amend` produces a
+    /// chain of commits sharing the same change_id, only the most
+    /// recent (newest, encountered first while walking back) is
+    /// surfaced. The older commits are still in the DAG — they're
+    /// just hidden from this view so the agent sees one entry per
+    /// change.
     pub fn log(state: &ProjectState, branch: &str, limit: usize) -> Vec<u8> {
         let mut out = Vec::new();
+        let mut seen_changes: Vec<[u8; HASH_BYTES]> = Vec::new();
         let Some(idx) = find_branch(state, branch) else {
             return out;
         };
         let mut cur = state.branches[idx].commit;
         let zero = [0u8; HASH_BYTES];
         while out.len() / HASH_BYTES < limit && cur != zero {
-            out.extend_from_slice(&cur);
             let Some(ci) = find_commit(state, &cur) else {
                 break;
             };
+            let cid = state.commits[ci].change_id;
+            if !seen_changes.contains(&cid) {
+                out.extend_from_slice(&cur);
+                seen_changes.push(cid);
+            }
             cur = state.commits[ci].parent;
         }
         out
@@ -740,6 +750,50 @@ pub mod store {
         result
     }
 
+    /// Re-snapshot the working change under the same change_id
+    /// with a new ts_ms / intent, advancing whichever branch was
+    /// tracking the change's base. Functionally a thin wrapper
+    /// over `commit_change` — the named entry point signals
+    /// "you're fixing up the last commit, not landing a new
+    /// change". `log`'s change_id dedupe hides the superseded
+    /// commits so the operator only sees the latest.
+    pub fn amend(
+        state: &mut ProjectState,
+        change_id: &[u8],
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: &[u8],
+        ts_ms: u64,
+    ) -> HashResult {
+        let Some(cid) = bytes_to_32(change_id) else {
+            return HashResult::err(STATUS_BAD_HASH);
+        };
+        let Some(idx) = find_working(state, &cid) else {
+            return HashResult::err(STATUS_CHANGE_NOT_FOUND);
+        };
+        let base = state.working[idx].base;
+        // Find the branch whose head equals the change's base —
+        // i.e. the branch we last committed onto. amend advances
+        // that one.
+        let branch_name = state
+            .branches
+            .iter()
+            .find(|b| b.commit == base)
+            .map(|b| b.name.clone());
+        let Some(branch_name) = branch_name else {
+            return HashResult::err(STATUS_NOT_FOUND);
+        };
+        commit_change(
+            state,
+            change_id,
+            &branch_name,
+            intent_tag,
+            intent_data,
+            author,
+            ts_ms,
+        )
+    }
+
     /// Materialise the working change's tree: take the base
     /// commit's `files`, then apply each overlay (replace or
     /// drop). The result is the file list the next snapshot
@@ -1030,6 +1084,29 @@ impl DevProject {
             &mut self.state,
             &change_id,
             &branch,
+            intent_tag,
+            intent_data,
+            &author,
+            ts_ms,
+        )
+    }
+
+    /// Re-snapshot the working change under the same change_id
+    /// with new ts_ms / intent. Advances the branch whose head
+    /// equals the change's current base. `log` dedupes by
+    /// change_id so only the latest snapshot surfaces.
+    #[msg]
+    async fn amend(
+        &mut self,
+        change_id: Vec<u8>,
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::amend(
+            &mut self.state,
+            &change_id,
             intent_tag,
             intent_data,
             &author,
