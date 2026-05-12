@@ -1423,36 +1423,121 @@ impl DevProject {
         store::put_blob(&mut self.state, bytes).to_vec()
     }
 
-    // NOTE: `put_blob_ast` is host-only for the same grey-
-    // transpiler reason — see the comment near the working-change
-    // and merge handlers. The store::put_blob_with_kind function
-    // still exists and the AST-parity e2e test uses it through
-    // a host-side call path; the PVM-side actor only ships the
-    // plain `put_blob` (Raw) handler.
+    /// Store a `BlobKind::RustAst` blob. Bytes are an rkyv-encoded
+    /// `syn::File` produced host-side by `dev_ast::text_to_ast`;
+    /// the compile path detects `kind == RustAst` on read and
+    /// renders back to text via `ast_to_text` before invoking
+    /// the compiler. Hash uses a distinct domain tag so the
+    /// catalog distinguishes ASTs from raw bytes.
+    #[msg]
+    async fn put_blob_ast(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        store::put_blob_with_kind(&mut self.state, bytes, BlobKind::RustAst).to_vec()
+    }
 
-    // NOTE: working-change handlers (open_change, put_file_working,
-    // delete_file_working, working_tree, commit_change, amend) are
-    // exposed only on the host build, not on the PVM actor. The
-    // store::* functions still exist and the host-side tests
-    // cover them; pulling the full jj-style overlay logic into
-    // the PVM blob hits a grey-transpiler unsupported-instruction
-    // edge (an SLT-with-x0 idiom LLVM emits inside the binary-
-    // search + cmp loops). Phase 3.3-3.5's wire-level handlers
-    // come back once the transpiler grows support for that op
-    // (or we refactor the store functions to avoid the offending
-    // pattern). Until then, agents drive working state by
-    // building working trees host-side and using the plain
-    // `commit` handler.
+    // ── Working changes (jj-style) ──────────────────────────────
 
-    // NOTE: `merge` is exposed only on the host build, not on the
-    // PVM actor. The store::merge function still exists and the
-    // host-side tests cover it; pulling all of the three-way
-    // merge codegen into the PVM blob pushed it past a grey-
-    // transpiler unsupported-instruction edge (an SLT-with-x0
-    // idiom LLVM emits inside the inner cmp loops). Phase 4.3's
-    // wire-level `merge` handler can come back once the
-    // transpiler grows support for that op (or we refactor the
-    // store function to avoid the offending pattern).
+    /// Open a new working change off `base` (32 bytes pointing
+    /// at an existing commit, or empty for "no parent yet").
+    /// Returns the minted `change_id`, which the agent then
+    /// passes to subsequent `put_file_working` /
+    /// `delete_file_working` / `commit_change` / `amend` calls.
+    #[msg]
+    async fn open_change(&mut self, base: Vec<u8>) -> HashResult {
+        store::open_change(&mut self.state, &base)
+    }
+
+    /// Stage `path => blob_hash` on the working change.
+    #[msg]
+    async fn put_file_working(
+        &mut self,
+        change_id: Vec<u8>,
+        path: String,
+        blob_hash: Vec<u8>,
+    ) -> u8 {
+        store::put_file_working(&mut self.state, &change_id, &path, &blob_hash)
+    }
+
+    /// Mark `path` as deleted in the working change.
+    #[msg]
+    async fn delete_file_working(&mut self, change_id: Vec<u8>, path: String) -> u8 {
+        store::delete_file_working(&mut self.state, &change_id, &path)
+    }
+
+    /// Materialise the working change's current tree (base
+    /// commit's files overlaid with the change's edits).
+    #[msg]
+    async fn working_tree(&self, change_id: Vec<u8>) -> Option<Vec<FileEntry>> {
+        store::working_tree(&self.state, &change_id)
+    }
+
+    /// Snapshot the working change as an immutable commit and
+    /// advance `branch`. Returns the new commit's hash. The
+    /// working change stays open jj-style — its `base` advances
+    /// to the new commit, edits clear, so the agent can keep
+    /// iterating without re-opening.
+    #[msg]
+    async fn commit_change(
+        &mut self,
+        change_id: Vec<u8>,
+        branch: String,
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::commit_change(
+            &mut self.state,
+            &change_id,
+            &branch,
+            intent_tag,
+            intent_data,
+            &author,
+            ts_ms,
+        )
+    }
+
+    /// Re-snapshot the working change under the same change_id
+    /// with new ts_ms / intent. Advances the branch whose head
+    /// equals the change's current base. `log_dedup_changes`
+    /// (host-side) dedupes by change_id so callers see one entry
+    /// per change.
+    #[msg]
+    async fn amend(
+        &mut self,
+        change_id: Vec<u8>,
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::amend(
+            &mut self.state,
+            &change_id,
+            intent_tag,
+            intent_data,
+            &author,
+            ts_ms,
+        )
+    }
+
+    /// Three-way merge `theirs` into `into_branch`. Returns the
+    /// resulting commit's hash. Fast-forward inputs (theirs is a
+    /// descendant of ours, or vice versa) bypass the merge
+    /// commit; a true merge produces a 2-parent INTENT_MERGE
+    /// commit with `extras = [theirs]` and any per-path conflicts
+    /// recorded on the commit. Callers resolve conflicts via
+    /// subsequent plain commits — the merge itself is non-
+    /// blocking.
+    #[msg]
+    async fn merge(
+        &mut self,
+        into_branch: String,
+        theirs: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms)
+    }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
     /// table: `paths` is one utf-8 path per file; `blob_hashes` is

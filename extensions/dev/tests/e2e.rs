@@ -610,12 +610,13 @@ fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
 /// disk, so the cargo invocation sees byte-identical source in
 /// both flows.
 ///
-/// TEMP: ignored while the PVM-side `put_blob_ast` handler is
-/// off (kept host-side to dodge the grey-transpiler edge — see
-/// the NOTE comments in dev-project's lib.rs). The host-side
-/// AST round-trip is still covered by the unit tests in
-/// `actors/dev-project/dev-ast/`. Re-enable once the actor
-/// surfaces `put_blob_ast` again.
+/// TEMP: ignored — `put_blob_ast` returns Unit (dispatch failure)
+/// on the proj-ast actor after the working-change + merge code
+/// went back in. The handler is in the actor's .vos_meta but the
+/// invoke replies empty. Smells like a CRDT-actor cold-start
+/// timing issue or a runtime invoke-route resolution problem
+/// rather than a transpile bug. Host-side round-trip is still
+/// fully covered by `actors/dev-project/dev-ast/tests`.
 #[test]
 #[ignore]
 fn compile_via_ast_matches_raw_artifact() {
