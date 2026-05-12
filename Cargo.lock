@@ -1059,9 +1059,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-ast"
+version = "0.1.0"
+dependencies = [
+ "prettyplease",
+ "syn 2.0.117",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "dev-extension"
 version = "0.1.0"
 dependencies = [
+ "dev-ast",
  "dev-project",
  "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
  "libp2p",

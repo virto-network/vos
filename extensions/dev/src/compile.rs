@@ -22,7 +22,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dev_project::{
-    BlobObject, BuildIntent, CommitNode, HASH_BYTES, HashResult, INTENT_BUILD, STATUS_OK,
+    BlobKind, BlobObject, BuildIntent, CommitNode, HASH_BYTES, HashResult, INTENT_BUILD, STATUS_OK,
 };
 use vos::Encode;
 use vos::extension::ServiceCtx;
@@ -518,7 +518,36 @@ fn materialise_tree(
         {
             return Err(CompileOutcome::err(COMPILE_STATUS_IO, e.to_string()));
         }
-        if let Err(e) = fs::write(&dest, &blob.bytes) {
+
+        // Decode the blob according to its kind:
+        // - RustAst on a .rs path: render back to text via
+        //   dev_ast (canonical prettyplease output).
+        // - RustAst on a non-.rs path: a Cargo.toml or build
+        //   script tagged as Rust source by mistake. Reject —
+        //   silently treating it as raw would defeat the AST's
+        //   hash dedup invariant the next time it's stored.
+        // - Raw: write verbatim.
+        let bytes_to_write: Vec<u8> = match blob.kind {
+            BlobKind::RustAst => {
+                if !file.path.ends_with(".rs") {
+                    return Err(CompileOutcome::err(
+                        COMPILE_STATUS_BAD_PATH,
+                        format!("RustAst blob on non-.rs path: {}", file.path),
+                    ));
+                }
+                match dev_ast::ast_to_text(&blob.bytes) {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => {
+                        return Err(CompileOutcome::err(
+                            COMPILE_STATUS_BAD_REPLY,
+                            format!("ast_to_text for {}: {e}", file.path),
+                        ));
+                    }
+                }
+            }
+            BlobKind::Raw => blob.bytes,
+        };
+        if let Err(e) = fs::write(&dest, &bytes_to_write) {
             return Err(CompileOutcome::err(COMPILE_STATUS_IO, e.to_string()));
         }
     }
