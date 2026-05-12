@@ -1,0 +1,43 @@
+[package]
+name = "ai-extension"
+description = "Local-LLM extension — fetches a quantized GGUF model on first use and answers generate() invokes by running inference on the CPU via candle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# `bin` enables the cdylib's `vos_extension_*` extern-fn exports.
+# `extension` is matched by `service_main!` to emit the host ABI
+# glue. Both default-on so a plain `cargo build` produces a
+# loadable extension .so.
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../vos", default-features = false, features = ["extension"] }
+# Local-LLM stack. candle is Rust-native and lets us run quantized
+# GGUF models on CPU without a separate inference server. Pin to a
+# released minor (0.10) so the workspace's dep resolution stays
+# reproducible.
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+# Fetches model + tokenizer files from HuggingFace on first use.
+# `ureq` keeps the dep tree off tokio for the sync download path;
+# the extension's own dispatch is sync anyway.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+# Tokenizer loader. `onig` is the default regex engine the HF
+# tokenizers ship with — keeps `Qwen2.5-Coder-0.5B-Instruct`'s
+# tokenizer.json loading without per-model surgery.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
