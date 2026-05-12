@@ -668,6 +668,78 @@ pub mod store {
         STATUS_OK
     }
 
+    /// Snapshot the working change as an immutable commit and
+    /// advance `branch`. The working change stays open jj-style:
+    /// its `base` becomes the new commit hash, edits clear, and
+    /// the agent can keep iterating from here. Returns the new
+    /// commit's hash.
+    ///
+    /// Branch advance is the same fast-forward gate `commit`
+    /// enforces: the branch's current head must equal the
+    /// working change's base, or the branch must not exist yet.
+    pub fn commit_change(
+        state: &mut ProjectState,
+        change_id: &[u8],
+        branch: &str,
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: &[u8],
+        ts_ms: u64,
+    ) -> HashResult {
+        let Some(cid) = bytes_to_32(change_id) else {
+            return HashResult::err(STATUS_BAD_HASH);
+        };
+        let Some(idx) = find_working(state, &cid) else {
+            return HashResult::err(STATUS_CHANGE_NOT_FOUND);
+        };
+        let parent_arr = state.working[idx].base;
+
+        // Materialise the working tree the same way `working_tree`
+        // would, then hand it to the regular commit path.
+        let files = match working_tree(state, change_id) {
+            Some(f) => f,
+            None => return HashResult::err(STATUS_CHANGE_NOT_FOUND),
+        };
+        let mut paths: Vec<String> = Vec::with_capacity(files.len());
+        let mut blob_hashes: Vec<u8> = Vec::with_capacity(files.len() * HASH_BYTES);
+        for f in &files {
+            paths.push(f.path.clone());
+            blob_hashes.extend_from_slice(&f.blob);
+        }
+
+        let parent_bytes: Vec<u8> = if parent_arr == [0u8; HASH_BYTES] {
+            Vec::new()
+        } else {
+            parent_arr.to_vec()
+        };
+
+        let result = commit(
+            state,
+            CommitInputs {
+                parent: &parent_bytes,
+                paths: &paths,
+                blob_hashes: &blob_hashes,
+                branch,
+                intent_tag,
+                intent_data,
+                author,
+                ts_ms,
+                change_id: &cid,
+            },
+        );
+        if result.status != STATUS_OK {
+            return result;
+        }
+        // Carry the change forward: clear edits, advance its base
+        // to the new commit. Same change_id stays — that's what
+        // `amend` later looks up.
+        let new_base = bytes_to_32(&result.hash).unwrap_or([0u8; HASH_BYTES]);
+        let work = &mut state.working[idx];
+        work.base = new_base;
+        work.edits.clear();
+        result
+    }
+
     /// Materialise the working change's tree: take the base
     /// commit's `files`, then apply each overlay (replace or
     /// drop). The result is the file list the next snapshot
@@ -937,6 +1009,32 @@ impl DevProject {
     #[msg]
     async fn working_tree(&self, change_id: Vec<u8>) -> Option<Vec<FileEntry>> {
         store::working_tree(&self.state, &change_id)
+    }
+
+    /// Snapshot the working change as an immutable commit and
+    /// advance `branch`. Returns the new commit's hash. The
+    /// working change stays open jj-style — its `base` advances
+    /// to the new commit, edits clear, so the agent can keep
+    /// iterating without re-opening.
+    #[msg]
+    async fn commit_change(
+        &mut self,
+        change_id: Vec<u8>,
+        branch: String,
+        intent_tag: u8,
+        intent_data: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::commit_change(
+            &mut self.state,
+            &change_id,
+            &branch,
+            intent_tag,
+            intent_data,
+            &author,
+            ts_ms,
+        )
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
