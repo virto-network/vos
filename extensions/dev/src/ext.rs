@@ -146,8 +146,8 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
                     log::warn!("dev: compile() missing commit arg");
                     return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
                 };
-                let outcome = compile::compile_project(&ctx, project_id, commit_hash);
-                Value::Bytes(compile::encode_outcome(&outcome))
+                let result = compile::compile_and_record(&ctx, project_id, commit_hash);
+                Value::Bytes(<dev_project::HashResult as Encode>::encode(&result))
             }
             _ => return ExtensionPollResult::error(POLL_ERR_NO_FUTURE),
         };

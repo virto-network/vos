@@ -92,6 +92,31 @@ pub struct PublishIntent {
     pub program_hash: [u8; HASH_BYTES],
 }
 
+/// Decoded payload for `INTENT_BUILD` commits. The dev extension
+/// records one of these whenever it tries to compile a source
+/// commit, regardless of success — failure carries a blob hash
+/// pointing at the captured stderr so the operator can inspect
+/// the failure mode from the commit DAG alone.
+///
+/// `source_commit` links the build commit back to the tree that
+/// produced it; the commit's `parent` is the previous build on the
+/// `builds` branch (chained linearly so the FF-only commit handler
+/// works), and the source linkage lives here. `artifact` is the
+/// PVM blob hash on success, or the stderr blob hash on failure.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct BuildIntent {
+    /// `1` on successful compile, `0` on failure.
+    pub ok: u8,
+    /// The source-tree commit the extension was asked to build.
+    pub source_commit: [u8; HASH_BYTES],
+    /// PVM blob hash (when `ok = 1`) or stderr blob hash
+    /// (when `ok = 0`).
+    pub artifact: [u8; HASH_BYTES],
+}
+
 // ── Wire rows ─────────────────────────────────────────────────────
 
 /// One entry in a commit's flat file table.

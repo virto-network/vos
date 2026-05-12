@@ -19,8 +19,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use dev_project::{BlobObject, CommitNode, HASH_BYTES, HashResult};
+use dev_project::{
+    BlobObject, BuildIntent, CommitNode, HASH_BYTES, HashResult, INTENT_BUILD, STATUS_OK,
+};
 use vos::Encode;
 use vos::extension::ServiceCtx;
 use vos::log;
@@ -61,6 +64,7 @@ pub const COMPILE_STATUS_TRANSPORT: u8 = 15;
 pub const COMPILE_STATUS_BAD_REPLY: u8 = 16;
 pub const COMPILE_STATUS_BAD_PATH: u8 = 17;
 pub const COMPILE_STATUS_IO: u8 = 18;
+pub const COMPILE_STATUS_RECORD_FAILED: u8 = 19;
 
 /// Outcome of a compile attempt. Successful compile carries the
 /// PVM blob's hash; failure carries stderr (or another diagnostic
@@ -99,23 +103,116 @@ impl From<&CompileOutcome> for HashResult {
     }
 }
 
-/// rkyv-encode an outcome's `HashResult` projection for the wire.
-/// stderr stays host-side (logged + persisted to the build
-/// commit's intent_data in Phase 1.3); the caller only needs to
-/// see status + hash to decide what to do next.
-pub fn encode_outcome(o: &CompileOutcome) -> Vec<u8> {
-    if !o.stderr.is_empty() {
-        // Best-effort logging so the operator sees the failure
-        // even before Phase 1.3 records it on the commit DAG.
-        let stderr_str = String::from_utf8_lossy(&o.stderr);
-        log::warn!(
-            "dev: compile failed (status={}):\n{}",
-            o.status,
-            stderr_str.trim_end()
-        );
+/// Log a compile failure's stderr verbatim. Phase 1.3 also
+/// persists the stderr as a blob and links it from the build
+/// commit's `intent.artifact` field so it survives across daemon
+/// restarts; this trace just gets the operator's eyes on the
+/// failure mode without making them open a redb.
+fn log_outcome_stderr(o: &CompileOutcome) {
+    if o.stderr.is_empty() {
+        return;
     }
-    let result: HashResult = o.into();
-    <HashResult as vos::Encode>::encode(&result)
+    let stderr_str = String::from_utf8_lossy(&o.stderr);
+    log::warn!(
+        "dev: compile failed (status={}):\n{}",
+        o.status,
+        stderr_str.trim_end()
+    );
+}
+
+/// Top-level: compile a source commit and record the result on the
+/// `builds` branch. Returns the build commit's hash on success or
+/// failure (the commit itself encodes which); status only signals
+/// "recording itself broke" (transport / commit handler refused).
+///
+/// The wire shape callers see in `Value::Bytes(HashResult)` is:
+///   * `status == STATUS_OK` + 32-byte build commit hash → done;
+///     decode `intent.ok` from that commit's `intent_data` to
+///     check if cargo actually succeeded.
+///   * `status == COMPILE_STATUS_RECORD_FAILED` + empty hash →
+///     we couldn't even record the build attempt (most often a
+///     transport error or a malformed `source_commit` arg).
+pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<u8>) -> HashResult {
+    let outcome = compile_project(ctx, project_id, source_commit.clone());
+    log_outcome_stderr(&outcome);
+
+    // Resolve the artifact-hash slot for the build commit:
+    // - success: PVM blob hash from put_blob (already in
+    //   outcome.hash).
+    // - failure with stderr: persist stderr as its own blob so the
+    //   operator can fetch it from the commit DAG.
+    // - failure with no stderr: zeroes — the status field on the
+    //   commit's intent encoding already signals "no artifact".
+    let artifact_bytes = if outcome.status == STATUS_OK {
+        outcome.hash.clone()
+    } else if !outcome.stderr.is_empty() {
+        match put_blob(ctx, project_id, &outcome.stderr) {
+            Ok(h) => h,
+            Err(_) => {
+                return HashResult {
+                    status: COMPILE_STATUS_RECORD_FAILED,
+                    hash: Vec::new(),
+                };
+            }
+        }
+    } else {
+        vec![0u8; HASH_BYTES]
+    };
+
+    let source_arr = bytes_to_32_or_zero(&source_commit);
+    let artifact_arr = bytes_to_32_or_zero(&artifact_bytes);
+    let intent = BuildIntent {
+        ok: if outcome.status == STATUS_OK { 1 } else { 0 },
+        source_commit: source_arr,
+        artifact: artifact_arr,
+    };
+    let intent_data = <BuildIntent as Encode>::encode(&intent);
+
+    let builds_head = match fetch_head(ctx, project_id, "builds") {
+        Ok(b) => b,
+        Err(_) => {
+            return HashResult {
+                status: COMPILE_STATUS_RECORD_FAILED,
+                hash: Vec::new(),
+            };
+        }
+    };
+
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    match remote_commit(
+        ctx,
+        project_id,
+        builds_head,
+        Vec::new(),
+        Vec::new(),
+        "builds".to_string(),
+        INTENT_BUILD,
+        intent_data,
+        Vec::new(),
+        ts_ms,
+        Vec::new(),
+    ) {
+        Ok(commit_hash) => HashResult {
+            status: STATUS_OK,
+            hash: commit_hash,
+        },
+        Err(_) => HashResult {
+            status: COMPILE_STATUS_RECORD_FAILED,
+            hash: Vec::new(),
+        },
+    }
+}
+
+fn bytes_to_32_or_zero(b: &[u8]) -> [u8; HASH_BYTES] {
+    let mut out = [0u8; HASH_BYTES];
+    if b.len() == HASH_BYTES {
+        out.copy_from_slice(b);
+    }
+    out
 }
 
 /// Compile the tree at `commit_hash` from the dev-project actor at
@@ -273,6 +370,54 @@ fn put_blob(ctx: &ServiceCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<u8>, 
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
+}
+
+fn fetch_head(ctx: &ServiceCtx, project_id: u32, branch: &str) -> Result<Vec<u8>, u8> {
+    let msg = Msg::new("head").with("branch", branch.to_string());
+    let raw = ctx
+        .ask_raw(project_id, &dyn_payload(&msg))
+        .ok_or(COMPILE_STATUS_TRANSPORT)?;
+    let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
+    value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_commit(
+    ctx: &ServiceCtx,
+    project_id: u32,
+    parent: Vec<u8>,
+    paths: Vec<String>,
+    blob_hashes: Vec<u8>,
+    branch: String,
+    intent_tag: u8,
+    intent_data: Vec<u8>,
+    author: Vec<u8>,
+    ts_ms: u64,
+    change_id: Vec<u8>,
+) -> Result<Vec<u8>, u8> {
+    let msg = Msg::new("commit")
+        .with("parent", parent)
+        .with("paths", paths)
+        .with("blob_hashes", blob_hashes)
+        .with("branch", branch)
+        .with("intent_tag", intent_tag)
+        .with("intent_data", intent_data)
+        .with("author", author)
+        .with("ts_ms", ts_ms)
+        .with("change_id", change_id);
+    let raw = ctx
+        .ask_raw(project_id, &dyn_payload(&msg))
+        .ok_or(COMPILE_STATUS_TRANSPORT)?;
+    let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
+    let inner = value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)?;
+    let result = <HashResult as vos::Decode>::try_decode(&inner).ok_or(COMPILE_STATUS_BAD_REPLY)?;
+    if result.status != STATUS_OK {
+        // Surface the actor's status as a transport-level error so the
+        // caller distinguishes "recording itself failed" from
+        // "compile failed but recorded".
+        return Err(result.status);
+    }
+    Ok(result.hash)
 }
 
 // ── Filesystem layout ────────────────────────────────────────────────
