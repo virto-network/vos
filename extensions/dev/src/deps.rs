@@ -193,6 +193,13 @@ pub fn resolve(
 /// synthesise its Cargo.toml. Same materialise function the root
 /// project uses, plus a per-dep Cargo.toml with the right
 /// `[lib]` crate-type and dependency stanza.
+///
+/// Each dep's file tree gets shadowed into a persistent
+/// source cache at `$XDG_CACHE_HOME/vos-dev/source-cache/<hex
+/// commit>/`. Subsequent compiles that depend on the same commit
+/// skip the fetch path entirely and copy from the cache. v1
+/// never garbage-collects the cache — that's a TODO for whenever
+/// disk-pressure becomes a real concern.
 pub fn write_to_workspace(
     ctx: &ServiceCtx,
     root: &Path,
@@ -207,25 +214,158 @@ pub fn write_to_workspace(
         fs::create_dir_all(&dep_root)
             .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
 
-        // Resolve the dep's project_id again — we need it to
-        // fetch each file's blob bytes during materialise.
-        let dep_project_id = match registry_resolve(ctx, &r.project_name, local_prefix) {
-            Ok(id) if id != 0 => id,
-            _ => {
-                return Err((
-                    COMPILE_STATUS_DEP_NOT_FOUND,
-                    format!("project '{}' not registered (race?)", r.project_name),
-                ));
+        let cache_dir = source_cache_path(&r.commit);
+        if cache_dir.exists() {
+            // Cache hit: shadow the cached tree into the vendor
+            // dir. No actor invokes; just filesystem copy.
+            vos::log::info!(
+                "dev: source-cache hit for {} @ {}",
+                r.project_name,
+                hex_short(&r.commit)
+            );
+            copy_dir_contents(&cache_dir, &dep_root)
+                .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e))?;
+        } else {
+            // Cache miss: fetch + materialise into the vendor
+            // dir, then mirror to the cache so the next compile
+            // hits.
+            let dep_project_id = match registry_resolve(ctx, &r.project_name, local_prefix) {
+                Ok(id) if id != 0 => id,
+                _ => {
+                    return Err((
+                        COMPILE_STATUS_DEP_NOT_FOUND,
+                        format!("project '{}' not registered (race?)", r.project_name),
+                    ));
+                }
+            };
+            materialise_to_path(ctx, dep_project_id, &r.commit_node, &dep_root)
+                .map_err(|outcome| (outcome.status, "materialise dep failed".to_string()))?;
+            if let Err(e) = mirror_to_cache(&dep_root, &cache_dir) {
+                vos::log::warn!(
+                    "dev: failed to populate source cache for {} @ {}: {e}",
+                    r.project_name,
+                    hex_short(&r.commit),
+                );
             }
-        };
-        materialise_to_path(ctx, dep_project_id, &r.commit_node, &dep_root)
-            .map_err(|outcome| (outcome.status, "materialise dep failed".to_string()))?;
+        }
 
         let cargo_toml = synthesise_dep_cargo_toml(&r.vendor_name, &r.crate_type, &r.deps);
         fs::write(dep_root.join("Cargo.toml"), cargo_toml)
             .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
     }
     Ok(())
+}
+
+// ── Source cache ────────────────────────────────────────────────────
+
+/// Root for the dev extension's persistent source cache. Sits
+/// alongside vosx's blob cache so a single `XDG_CACHE_HOME`
+/// override scopes both stores. v1 never garbage-collects this
+/// directory; an operator can `rm -rf` it safely.
+fn source_cache_root() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".cache")
+        });
+    base.join("vos-dev").join("source-cache")
+}
+
+/// Cache directory for one project's commit. Keyed by the commit
+/// hash (content-addressed → no invalidation problem).
+fn source_cache_path(commit: &[u8; HASH_BYTES]) -> std::path::PathBuf {
+    source_cache_root().join(hex_full(commit))
+}
+
+/// Copy every file under `src` (recursively) into `dst`.
+/// Directories are created as needed. Files are copied verbatim.
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+    let mut stack: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        for entry in fs::read_dir(&s).map_err(|e| format!("read_dir {}: {e}", s.display()))? {
+            let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+            let name = entry.file_name();
+            let s_child = entry.path();
+            let d_child = d.join(&name);
+            let ty = entry
+                .file_type()
+                .map_err(|e| format!("file_type {}: {e}", s_child.display()))?;
+            if ty.is_dir() {
+                fs::create_dir_all(&d_child)
+                    .map_err(|e| format!("mkdir {}: {e}", d_child.display()))?;
+                stack.push((s_child, d_child));
+            } else if ty.is_file() {
+                fs::copy(&s_child, &d_child).map_err(|e| {
+                    format!("copy {} → {}: {e}", s_child.display(), d_child.display())
+                })?;
+            }
+            // Symlinks etc. ignored — the materialise step never
+            // produces them, and a cached tree mirrors that.
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot a freshly-materialised dep tree into the source
+/// cache. Atomic-write semantics: write into a sibling
+/// `.partial-<pid>` dir, then rename into place so a parallel
+/// reader doesn't see a half-populated entry. If the rename
+/// fails because someone else won the race, leave the existing
+/// cache entry alone.
+fn mirror_to_cache(src: &Path, cache_dir: &Path) -> Result<(), String> {
+    if let Some(parent) = cache_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging = cache_dir.with_extension(format!("partial-{pid}-{nanos}"));
+    copy_dir_contents(src, &staging)?;
+    match fs::rename(&staging, cache_dir) {
+        Ok(()) => Ok(()),
+        Err(_) if cache_dir.exists() => {
+            // Race: another compile populated the cache first.
+            // Drop the staging dir and accept their version.
+            let _ = fs::remove_dir_all(&staging);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(format!(
+                "rename {} → {}: {e}",
+                staging.display(),
+                cache_dir.display()
+            ))
+        }
+    }
+}
+
+fn hex_full(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(nibble(b >> 4));
+        s.push(nibble(b & 0xF));
+    }
+    s
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    hex_full(&bytes[..bytes.len().min(8)])
+}
+
+fn nibble(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        _ => (b'a' + (n - 10)) as char,
+    }
 }
 
 fn synthesise_dep_cargo_toml(name: &str, crate_type: &str, deps: &[DepEntry]) -> String {
