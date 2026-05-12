@@ -93,6 +93,13 @@ enum Command {
         #[command(subcommand)]
         command: commands::space::SpaceCommand,
     },
+    /// Author + publish PVM actors from source held in a dev-project.
+    /// Wraps the dev extension's compile/publish flow and surfaces
+    /// the per-project commit graph through `vosx dev log`.
+    Dev {
+        #[command(subcommand)]
+        command: commands::dev::DevCommand,
+    },
     /// Emit the full CLI schema as pretty-printed JSON. Walks
     /// every subcommand + argument from clap's introspection,
     /// so the dump always matches what the binary accepts.
@@ -189,6 +196,11 @@ fn main() {
                 report_error(e);
             }
         }
+        Some(Command::Dev { command }) => {
+            if let Err(e) = commands::dev::run(command) {
+                report_error(e);
+            }
+        }
         Some(Command::HelpSchema) => {
             let schema = help_schema::build(&Cli::command());
             match serde_json::to_string_pretty(&schema) {
@@ -250,7 +262,7 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// (one with `/` or `\`, or starting with `.`) is preserved for
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] = &["run", "space", "help-schema", "help"];
+    const BUILTIN_VERBS: &[&str] = &["run", "space", "dev", "help-schema", "help"];
     // Skip global flags; only `--format` / `--space` take a
     // value, the rest are boolean-shaped. We do NOT recognise
     // `--space` here (it's a dynamic-only flag) — its presence
@@ -356,7 +368,7 @@ mod routing_tests {
 
     #[test]
     fn builtin_verbs_use_clap_path() {
-        for v in ["run", "space", "help-schema", "help"] {
+        for v in ["run", "space", "dev", "help-schema", "help"] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
     }

@@ -20,6 +20,7 @@ include = [
     "build.rs",
     "Cargo.toml",
     "blobs/space_registry.elf",
+    "blobs/dev_project.elf",
 ]
 
 [dependencies]
@@ -31,6 +32,11 @@ grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c0
 # Per-space catalog of programs / agents / members. Source of
 # truth that the new `space *` subcommands operate on.
 space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }
+# Wire types for the `vosx dev *` subcommands. The dev extension
+# returns `HashResult` from `compile`/`publish`; the CLI decodes
+# back the same type to surface status/hash to operators.
+# `default-features = false` strips the PVM cdylib entry-points.
+dev-project = { path = "../actors/dev-project", default-features = false }
 # Content-addressed cache + IPFS resolver dependency for the
 # blob store. Stays a thin dep — no daemon required for `Path`
 # and `Hash` sources, only `Cid` and `Url` resolution touch

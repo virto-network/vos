@@ -263,6 +263,12 @@ pub mod store {
     //! marshals `Vec<u8>` arguments to/from these.
 
     use super::*;
+    // `to_string()` etc. live on `alloc::string::ToString`, which
+    // is in `std::prelude` on the host but not in the riscv64em-
+    // javm `no_std` build. Explicitly importing keeps the same
+    // source path compiling for both flavors.
+    #[allow(unused_imports)]
+    use alloc::string::ToString;
 
     /// Store a blob, returning its hash. Idempotent — calling with
     /// the same bytes twice is a no-op except for the return value.

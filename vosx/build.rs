@@ -25,50 +25,80 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    bundle_actor(
+        &manifest_dir,
+        &out_dir,
+        "space-registry",
+        "space_registry.elf",
+        "bundled_registry.elf",
+        "VOSX_BUNDLED_REGISTRY_ELF",
+        "`space new`/`space join` will require --registry",
+        "cd actors/space-registry && cargo actor",
+    );
+
+    bundle_actor(
+        &manifest_dir,
+        &out_dir,
+        "dev-project",
+        "dev_project.elf",
+        "bundled_dev_project.elf",
+        "VOSX_BUNDLED_DEV_PROJECT_ELF",
+        "`dev new` will require --program-source",
+        "cd actors/dev-project && cargo actor",
+    );
+}
+
+/// Wire up one bundled actor ELF. Tries the working-tree dev path
+/// first (live rebuilds win) and falls back to the shipped
+/// `blobs/<file>` (what `cargo package` ships from crates.io). If
+/// neither exists, writes an empty placeholder and prints a hint
+/// at how to populate the bundle.
+#[allow(clippy::too_many_arguments)]
+fn bundle_actor(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    actor_dir: &str,
+    elf_filename: &str,
+    bundled_dest: &str,
+    env_var: &str,
+    missing_hint: &str,
+    build_cmd: &str,
+) {
     let dev_path = manifest_dir
         .join("..")
         .join("actors")
-        .join("space-registry")
+        .join(actor_dir)
         .join("target")
         .join("riscv64em-javm")
         .join("release")
-        .join("space_registry.elf");
-
-    let shipped_path = manifest_dir.join("blobs").join("space_registry.elf");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let dest = out_dir.join("bundled_registry.elf");
+        .join(elf_filename);
+    let shipped_path = manifest_dir.join("blobs").join(elf_filename);
+    let dest = out_dir.join(bundled_dest);
 
     let bundled = read_first_present(&[dev_path.as_path(), shipped_path.as_path()]);
-
     match bundled {
         Some((source, bytes)) => {
-            fs::write(&dest, &bytes).expect("write bundled_registry.elf");
+            fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write {bundled_dest}: {e}"));
             println!(
-                "cargo:warning=vosx: bundled space-registry ({} bytes) from {}",
+                "cargo:warning=vosx: bundled {actor_dir} ({} bytes) from {}",
                 bytes.len(),
                 source.display(),
             );
         }
         None => {
-            // Empty placeholder — `include_bytes!` still resolves;
-            // runtime detects empty and falls back.
-            fs::write(&dest, []).expect("write empty bundled_registry.elf");
+            fs::write(&dest, []).unwrap_or_else(|e| panic!("write empty {bundled_dest}: {e}"));
             println!(
-                "cargo:warning=vosx: space-registry not built — `space new`/`space join` will require --registry. \
-                 To enable bundling: cd actors/space-registry && cargo actor"
+                "cargo:warning=vosx: {actor_dir} not built — {missing_hint}. \
+                 To enable bundling: {build_cmd}"
             );
         }
     }
 
-    // Force re-run when either source path appears or changes.
     println!("cargo:rerun-if-changed={}", dev_path.display());
     println!("cargo:rerun-if-changed={}", shipped_path.display());
-    println!(
-        "cargo:rustc-env=VOSX_BUNDLED_REGISTRY_ELF={}",
-        dest.display()
-    );
+    println!("cargo:rustc-env={env_var}={}", dest.display());
 }
 
 fn read_first_present(candidates: &[&Path]) -> Option<(PathBuf, Vec<u8>)> {

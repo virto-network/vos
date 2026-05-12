@@ -4603,6 +4603,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dev-project",
  "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
  "hex",
  "libc",
