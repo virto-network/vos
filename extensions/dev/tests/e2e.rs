@@ -752,3 +752,242 @@ fn extract_u32(v: Value) -> u32 {
         other => panic!("extract_u32: unexpected value {other:?}"),
     }
 }
+
+// ── Phase 5.5: cross-project deps ──────────────────────────────────
+
+/// Minimal lib source for a dep project — a single pub function
+/// so the cargo workspace has something to link against. `no_std`
+/// + `no_main` are injected by the synthesised `.cargo/config.toml`
+/// rustflags, same as the root project.
+const LIB_SOURCE: &str = r#"
+#![no_std]
+pub fn forty_two() -> u32 { 42 }
+"#;
+
+/// Set the project's `.vos-project.rkyv` metadata to the given
+/// deps + crate_type. Stores the rkyv-encoded `ProjectMetadata`
+/// as a blob and commits it alongside the source on the project's
+/// `main` branch. Returns the new commit hash.
+fn put_metadata(
+    client: &TestClient,
+    project_id: ServiceId,
+    parent: &[u8],
+    src_path: &str,
+    src_hash: &[u8],
+    name: &str,
+    crate_type: &str,
+    deps: Vec<dev_project::DepEntry>,
+    ts_ms: u64,
+) -> Vec<u8> {
+    let meta = dev_project::ProjectMetadata {
+        name: name.to_string(),
+        vos_version: String::new(),
+        crate_type: crate_type.to_string(),
+        deps,
+        caps: Vec::new(),
+    };
+    let meta_bytes = <dev_project::ProjectMetadata as Encode>::encode(&meta);
+    let meta_hash = put_source(client, project_id, "put_blob", &meta_bytes);
+
+    // Commit lists src + metadata, sorted by path (the actor
+    // rejects duplicate paths but accepts arbitrary order).
+    let mut paths = vec![src_path.to_string(), ".vos-project.rkyv".to_string()];
+    paths.sort();
+    let mut blob_hashes = Vec::with_capacity(64);
+    for p in &paths {
+        let h = if p == ".vos-project.rkyv" {
+            &meta_hash[..]
+        } else {
+            src_hash
+        };
+        blob_hashes.extend_from_slice(h);
+    }
+
+    let reply = client.invoke(
+        project_id,
+        &Msg::new("commit")
+            .with("parent", parent.to_vec())
+            .with("paths", paths)
+            .with("blob_hashes", blob_hashes)
+            .with("branch", "main".to_string())
+            .with("intent_tag", dev_project::INTENT_EDIT)
+            .with("intent_data", Vec::<u8>::new())
+            .with("author", Vec::<u8>::new())
+            .with("ts_ms", ts_ms)
+            .with("change_id", Vec::<u8>::new()),
+    );
+    decode_hash_result_assert_ok(reply, "commit src+metadata")
+}
+
+/// Walk the `builds` branch to its head and return the decoded
+/// `BuildIntent`. The test asserts on `intent.ok` to distinguish
+/// successful from failed builds.
+fn build_intent_for(client: &TestClient, project_id: ServiceId) -> dev_project::BuildIntent {
+    let head_reply = client.invoke(
+        project_id,
+        &Msg::new("head").with("branch", "builds".to_string()),
+    );
+    let head_bytes = match head_reply {
+        Value::Bytes(b) => b,
+        other => panic!("builds head returned {other:?}"),
+    };
+    assert_eq!(
+        head_bytes.len(),
+        32,
+        "expected builds branch head, got {} bytes",
+        head_bytes.len()
+    );
+    let commit_reply = client.invoke(project_id, &Msg::new("get_commit").with("hash", head_bytes));
+    let commit_outer = match commit_reply {
+        Value::Bytes(b) => b,
+        other => panic!("get_commit returned {other:?}"),
+    };
+    assert!(!commit_outer.is_empty(), "build commit should exist");
+    let commit =
+        <dev_project::CommitNode as Decode>::try_decode(&commit_outer).expect("decode CommitNode");
+    <dev_project::BuildIntent as Decode>::try_decode(&commit.intent_data)
+        .expect("decode BuildIntent")
+}
+
+/// A depends on B (lib). Compile A — should resolve B + materialise
+/// it under `vendor/proj-b/` + emit a workspace Cargo.toml + cargo
+/// compile the whole thing.
+#[test]
+fn cross_project_deps_compile_resolves_lib() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-b"],
+        "vosx dev new proj-b",
+    );
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-a"],
+        "vosx dev new proj-a",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+
+    let proj_b_id = client.resolve_instance("proj-b");
+    let proj_a_id = client.resolve_instance("proj-a");
+
+    // proj-b: a tiny pub fn lib, no deps.
+    let b_src_hash = put_source(&client, proj_b_id, "put_blob", LIB_SOURCE.as_bytes());
+    let b_commit = put_metadata(
+        &client,
+        proj_b_id,
+        &[],
+        "src/lib.rs",
+        &b_src_hash,
+        "proj-b",
+        "rlib",
+        Vec::new(),
+        1,
+    );
+
+    // proj-a: counter actor, depends on proj-b at the commit
+    // we just made. Note proj-a's source doesn't actually `use
+    // proj_b` — the dep is in the cargo workspace, which is what
+    // 5.2's resolver synthesis exercises.
+    let a_src_hash = put_source(&client, proj_a_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    let _a_commit = put_metadata(
+        &client,
+        proj_a_id,
+        &[],
+        "src/lib.rs",
+        &a_src_hash,
+        "proj-a",
+        "",
+        vec![dev_project::DepEntry {
+            name: "proj_b".to_string(),
+            dep: dev_project::DepRef::Space {
+                space_id: [0u8; 32],
+                project_name: "proj-b".to_string(),
+                commit: bytes_to_arr32(&b_commit),
+            },
+        }],
+        2,
+    );
+
+    // Compile A. The dev extension reads proj-a's metadata,
+    // resolves proj-b, materialises it under `vendor/proj-b/`,
+    // and runs cargo against the workspace.
+    run_cli(
+        &daemon,
+        &["dev", "compile", "--space", &daemon.space_name, "proj-a"],
+        "vosx dev compile proj-a",
+    );
+
+    let intent = build_intent_for(&client, proj_a_id);
+    assert_eq!(
+        intent.ok, 1,
+        "proj-a compile with proj-b dep should succeed; build commit intent_data: {intent:?}"
+    );
+}
+
+/// proj-a's metadata lists itself as a dep — resolver bails with
+/// COMPILE_STATUS_CYCLE before cargo runs.
+#[test]
+fn cross_project_deps_self_cycle_errors_loudly() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-cycle"],
+        "vosx dev new proj-cycle",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+
+    let proj_id = client.resolve_instance("proj-cycle");
+    let src_hash = put_source(&client, proj_id, "put_blob", COUNTER_SOURCE.as_bytes());
+
+    // Bogus commit hash for the self-dep — even if it pointed at
+    // a real commit, the cycle check fires first because
+    // project_name matches the root.
+    put_metadata(
+        &client,
+        proj_id,
+        &[],
+        "src/lib.rs",
+        &src_hash,
+        "proj-cycle",
+        "",
+        vec![dev_project::DepEntry {
+            name: "self".to_string(),
+            dep: dev_project::DepRef::Space {
+                space_id: [0u8; 32],
+                project_name: "proj-cycle".to_string(),
+                commit: [0xAAu8; 32],
+            },
+        }],
+        1,
+    );
+
+    run_cli(
+        &daemon,
+        &[
+            "dev",
+            "compile",
+            "--space",
+            &daemon.space_name,
+            "proj-cycle",
+        ],
+        "vosx dev compile proj-cycle",
+    );
+
+    let intent = build_intent_for(&client, proj_id);
+    assert_eq!(
+        intent.ok, 0,
+        "self-cycle should record a failed build, got intent: {intent:?}"
+    );
+}
+
+fn bytes_to_arr32(b: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+    out
+}

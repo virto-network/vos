@@ -261,8 +261,13 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         Err(status) => return CompileOutcome::err(status, "fetch_commit failed"),
     };
 
-    // ── 2. Fetch project metadata for deps resolution.
-    let metadata = match crate::deps::fetch_metadata(ctx, project_id) {
+    // ── 2. Fetch project metadata off the commit being built.
+    //    Metadata is a tree file at `.vos-project.rkyv`, not an
+    //    actor field — see `deps::METADATA_PATH`. Dep-less
+    //    projects (no metadata file in the tree) get a default
+    //    metadata back and the rest of the compile pipeline
+    //    short-circuits the dep-resolution path.
+    let metadata = match crate::deps::fetch_metadata_from_tree(ctx, project_id, &commit) {
         Ok(m) => m,
         Err(status) => return CompileOutcome::err(status, "fetch_metadata failed"),
     };

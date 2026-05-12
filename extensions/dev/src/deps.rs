@@ -25,8 +25,16 @@ use vos::value::{Msg, Value};
 
 use crate::compile::{
     COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_COMMIT_NOT_FOUND, COMPILE_STATUS_TRANSPORT,
-    decode_value, dyn_payload, fetch_commit, materialise_to_path, value_to_bytes,
+    decode_value, dyn_payload, fetch_blob, fetch_commit, materialise_to_path,
 };
+
+/// Well-known path under a dev-project's source tree carrying the
+/// project's rkyv-encoded `ProjectMetadata`. The dev extension's
+/// compile path reads this file off the commit being built —
+/// keeps metadata versioned with the source it describes and
+/// avoids any cross-actor field that would force a PVM-side
+/// `metadata` handler.
+pub const METADATA_PATH: &str = ".vos-project.rkyv";
 
 /// Extra status codes for the dep resolution path.
 pub const COMPILE_STATUS_DEP_NOT_FOUND: u8 = 20;
@@ -39,10 +47,13 @@ pub const COMPILE_STATUS_CROSS_SPACE_DEP: u8 = 22;
 
 /// One resolved dependency, ready to write into the workspace.
 pub struct ResolvedDep {
-    /// Vendor directory name — the local key from the parent
-    /// project's `DepEntry.name`. Two distinct deps must not
-    /// share the same vendor name even if they happen to point
-    /// at different project_names.
+    /// Local key from the parent project's `DepEntry.name`.
+    /// Currently informational only — the vendor directory is
+    /// keyed by `project_name` so multiple parents reaching the
+    /// same project under different local names converge on a
+    /// single vendor entry. Kept for debugging and the eventual
+    /// duplicate-local-name diagnostic.
+    #[allow(dead_code)]
     pub vendor_name: String,
     /// The project_name as registered in the space registry.
     pub project_name: String,
@@ -158,7 +169,7 @@ pub fn resolve(
             Err(status) => return Err((status, "fetch_commit for dep failed".to_string())),
         };
 
-        let metadata = match fetch_metadata(ctx, dep_project_id) {
+        let metadata = match fetch_metadata_from_tree(ctx, dep_project_id, &commit_node) {
             Ok(m) => m,
             Err(status) => return Err((status, "fetch_metadata for dep failed".to_string())),
         };
@@ -210,7 +221,18 @@ pub fn write_to_workspace(
     fs::create_dir_all(&vendor_dir)
         .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
     for r in resolved {
-        let dep_root = vendor_dir.join(&r.vendor_name);
+        // Vendor directory is keyed by `project_name`, not the
+        // local-dep `vendor_name`. Two reasons:
+        //
+        // - Different parents can reach the same project under
+        //   different local names; we want a single canonical
+        //   vendor entry per (project_name, commit).
+        // - The synthesised `[workspace] members = […]` list in
+        //   `synthesise_root_dependencies` and the inter-dep
+        //   `path = "../<project_name>"` references in
+        //   `synthesise_dep_cargo_toml` both use project_name,
+        //   so the directory layout has to match.
+        let dep_root = vendor_dir.join(&r.project_name);
         fs::create_dir_all(&dep_root)
             .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
 
@@ -249,7 +271,7 @@ pub fn write_to_workspace(
             }
         }
 
-        let cargo_toml = synthesise_dep_cargo_toml(&r.vendor_name, &r.crate_type, &r.deps);
+        let cargo_toml = synthesise_dep_cargo_toml(&r.project_name, &r.crate_type, &r.deps);
         fs::write(dep_root.join("Cargo.toml"), cargo_toml)
             .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
     }
@@ -385,9 +407,13 @@ crate-type = ["{crate_type}"]
         match &d.dep {
             DepRef::Space { project_name, .. } => {
                 // Sibling under vendor/, so `../<project_name>`.
+                // `package = "..."` keeps the local dep name in
+                // `[dependencies]` independent of the upstream
+                // crate's actual `name` (the parent might call
+                // proj-b as `b` or `proj_b`).
                 s.push_str(&format!(
-                    "{} = {{ path = \"../{}\" }}\n",
-                    d.name, project_name
+                    "{} = {{ path = \"../{}\", package = \"{}\" }}\n",
+                    d.name, project_name, project_name,
                 ));
             }
             DepRef::Builtin(crate_name) => {
@@ -413,9 +439,12 @@ pub fn synthesise_root_dependencies(deps: &[DepEntry]) -> String {
     for d in deps {
         match &d.dep {
             DepRef::Space { project_name, .. } => {
+                // `package = "..."` so the local dep name in
+                // `[dependencies]` can differ from the upstream
+                // crate's actual `name`.
                 s.push_str(&format!(
-                    "{} = {{ path = \"vendor/{}\" }}\n",
-                    d.name, project_name
+                    "{} = {{ path = \"vendor/{}\", package = \"{}\" }}\n",
+                    d.name, project_name, project_name,
                 ));
             }
             DepRef::Builtin(crate_name) => {
@@ -428,28 +457,45 @@ pub fn synthesise_root_dependencies(deps: &[DepEntry]) -> String {
 
 // ── Wire helpers ─────────────────────────────────────────────────────
 
-pub(crate) fn fetch_metadata(ctx: &ServiceCtx, project_id: u32) -> Result<ProjectMetadata, u8> {
-    // ProjectMetadata is the Phase 5.1 dep-graph payload. The
-    // current PVM-side actor doesn't expose a `metadata` handler
-    // (kept host-side to dodge the grey-transpiler edge — see
-    // dev-project's NOTE comments), so the dispatch may bounce
-    // back as STATUS_NOT_FOUND. Treat any of "transport bounced",
-    // "empty reply", or "non-decodable payload" as "no metadata
-    // declared yet" — the compile path falls through to a
-    // dep-less workspace synthesis in that case.
-    let Some(raw) = ctx.ask_raw(project_id, &dyn_payload(&Msg::new("metadata"))) else {
+/// Read the project's `ProjectMetadata` off the given commit by
+/// looking for a `.vos-project.rkyv` file in its `files` table.
+/// Metadata lives in the tree (not as an actor field) so it
+/// versions atomically with the source it describes and the
+/// PVM actor stays free of the metadata-specific codegen.
+///
+/// Returns `Default::default()` when no metadata file is
+/// committed (project is dep-less) or when its bytes fail to
+/// decode (treated as "ignore the malformed metadata, fall back
+/// to no deps"). Surface a status only on transport errors.
+pub(crate) fn fetch_metadata_from_tree(
+    ctx: &ServiceCtx,
+    project_id: u32,
+    commit: &CommitNode,
+) -> Result<ProjectMetadata, u8> {
+    let Some(entry) = commit.files.iter().find(|f| f.path == METADATA_PATH) else {
         return Ok(ProjectMetadata::default());
     };
-    let Some(value) = decode_value(&raw) else {
-        return Ok(ProjectMetadata::default());
+    let blob = match fetch_blob(ctx, project_id, &entry.blob) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(ProjectMetadata::default()),
+        Err(status) => return Err(status),
     };
-    let Some(inner) = value_to_bytes(value) else {
-        return Ok(ProjectMetadata::default());
-    };
-    if inner.is_empty() {
+    if blob.bytes.is_empty() {
         return Ok(ProjectMetadata::default());
     }
-    Ok(<ProjectMetadata as vos::Decode>::try_decode(&inner).unwrap_or_default())
+    Ok(<ProjectMetadata as vos::Decode>::try_decode(&blob.bytes).unwrap_or_default())
+}
+
+/// Back-compat alias for the old "fetch the project's metadata
+/// from the actor" API. Today's implementation reads from the
+/// commit tree instead — see `fetch_metadata_from_tree`. Kept
+/// because `compile.rs::compile_project` already has the
+/// project's commit in scope and can call the tree-aware form
+/// directly; the actor-targeted shape was never used past the
+/// inline NOTE comment.
+#[allow(dead_code)]
+pub(crate) fn fetch_metadata(_ctx: &ServiceCtx, _project_id: u32) -> Result<ProjectMetadata, u8> {
+    Ok(ProjectMetadata::default())
 }
 
 fn registry_resolve(ctx: &ServiceCtx, name: &str, caller_prefix: u16) -> Result<u32, u8> {
