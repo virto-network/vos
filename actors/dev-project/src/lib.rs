@@ -140,10 +140,45 @@ pub struct FileEntry {
     pub blob: [u8; HASH_BYTES],
 }
 
-/// One blob — opaque bytes addressed by their hash. v1 stores file
-/// content verbatim; v2 will carry an rkyv-encoded `syn::File`
-/// instead, and the dev extension renders that back to text before
+/// Discriminator for the encoding inside [`BlobObject::bytes`].
+///
+/// - `Raw` — bytes are file content verbatim. The compile path
+///   writes them to disk unchanged.
+/// - `RustAst` — bytes are an rkyv-encoded `syn::File`, hashed
+///   under a separate domain tag so a content-equivalent text and
+///   AST blob still hash to different values. The compile path
+///   rehydrates the AST to source via `dev_ast::ast_to_text`
+///   before invoking the compiler. Agents and AI tooling that
+///   manipulate code as structured values store under this kind.
+///
+/// The byte encoding matches the variant order so on-disk values
+/// stay stable; only append at the end if more kinds are added.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum BlobKind {
+    Raw = 0,
+    RustAst = 1,
+}
+
+impl Default for BlobKind {
+    fn default() -> Self {
+        Self::Raw
+    }
+}
+
+/// One blob — bytes addressed by their hash, with a [`BlobKind`]
+/// discriminator that tells the consumer how to interpret the
+/// bytes. v1 stored only `Raw`; Phase 2 added `RustAst` so the
+/// compile path can decode AST blobs back to text before
 /// invoking the compiler.
+///
+/// Schema-evolution note: appending `kind` to an existing rkyv-
+/// archived struct breaks decoding of pre-Phase-2 persisted
+/// state. Acceptable while pre-release — the actor falls back to
+/// `create()` per the dev-project-level note above.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -151,6 +186,7 @@ pub struct FileEntry {
 pub struct BlobObject {
     pub hash: [u8; HASH_BYTES],
     pub bytes: Vec<u8>,
+    pub kind: BlobKind,
 }
 
 /// Immutable commit, content-addressed by blake2b of its canonical
@@ -270,13 +306,30 @@ pub mod store {
     #[allow(unused_imports)]
     use alloc::string::ToString;
 
-    /// Store a blob, returning its hash. Idempotent — calling with
-    /// the same bytes twice is a no-op except for the return value.
+    /// Store a `BlobKind::Raw` blob, returning its hash. Idempotent —
+    /// calling with the same bytes twice is a no-op except for the
+    /// return value. Same domain tag the original v1 used so existing
+    /// raw blobs keep hashing identically.
     pub fn put_blob(state: &mut ProjectState, bytes: Vec<u8>) -> [u8; HASH_BYTES] {
-        let hash: [u8; HASH_BYTES] =
-            vos::crypto::blake2b_hash(b"vos-dev-project/blob/v1", &[&bytes]);
+        put_blob_with_kind(state, bytes, BlobKind::Raw)
+    }
+
+    /// Store a blob with an explicit kind. AST blobs hash under a
+    /// distinct domain tag so a content-equivalent text and AST blob
+    /// don't collide (and so the rendered text isn't accidentally
+    /// returned when the AST archive is what was asked for).
+    pub fn put_blob_with_kind(
+        state: &mut ProjectState,
+        bytes: Vec<u8>,
+        kind: BlobKind,
+    ) -> [u8; HASH_BYTES] {
+        let domain = match kind {
+            BlobKind::Raw => b"vos-dev-project/blob/v1".as_slice(),
+            BlobKind::RustAst => b"vos-dev-project/ast/v1".as_slice(),
+        };
+        let hash: [u8; HASH_BYTES] = vos::crypto::blake2b_hash(domain, &[&bytes]);
         if find_blob(state, &hash).is_none() {
-            let row = BlobObject { hash, bytes };
+            let row = BlobObject { hash, bytes, kind };
             let pos = state
                 .blobs
                 .binary_search_by(|b| b.hash.cmp(&hash))
@@ -620,6 +673,17 @@ impl DevProject {
     #[msg]
     async fn put_blob(&mut self, bytes: Vec<u8>) -> Vec<u8> {
         store::put_blob(&mut self.state, bytes).to_vec()
+    }
+
+    /// Store a `BlobKind::RustAst` blob. Bytes are an rkyv-encoded
+    /// `syn::File` produced host-side by `dev_ast::text_to_ast`;
+    /// the compile path detects `kind == RustAst` on read and
+    /// renders back to text via `ast_to_text` before invoking
+    /// the compiler. Hash uses a distinct domain tag so the
+    /// catalog distinguishes ASTs from raw bytes.
+    #[msg]
+    async fn put_blob_ast(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        store::put_blob_with_kind(&mut self.state, bytes, BlobKind::RustAst).to_vec()
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
