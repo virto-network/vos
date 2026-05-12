@@ -314,6 +314,11 @@ pub struct ProjectState {
     /// state any consumer of the CRDT replication stream
     /// observes).
     pub working: Vec<WorkingChange>,
+    /// Project-level metadata: dep graph, crate type, declared
+    /// capabilities. Read by the dev extension's compile path
+    /// to lay out cross-project deps and pick crate-type +
+    /// vos-version for the synthesised Cargo.toml.
+    pub metadata: ProjectMetadata,
 }
 
 /// Per-file edit on top of a working change's `base` commit.
@@ -390,6 +395,76 @@ pub struct ConflictEntry {
 pub struct MergeResult {
     pub files: Vec<FileEntry>,
     pub conflicts: Vec<ConflictEntry>,
+}
+
+/// One entry in a project's dependency graph. Sits inside
+/// [`Metadata::deps`] keyed by the local dep name (the string
+/// Cargo would see in `[dependencies]`).
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub enum DepRef {
+    /// Another dev-project. Pinned by `(space_id, project_name,
+    /// commit)` so a tag retag never silently swaps the bytes
+    /// out from under us. `commit` must point at a commit on the
+    /// dep project's `main` branch (or whichever the dep extension
+    /// configures); the resolver fetches its tree at that hash.
+    Space {
+        space_id: [u8; HASH_BYTES],
+        project_name: String,
+        commit: [u8; HASH_BYTES],
+    },
+    /// Reference to a host-provided crate (e.g. `vos`, `core`).
+    /// The dev extension's compile path leaves the dep alone —
+    /// the synthesised Cargo.toml resolves it via its existing
+    /// path/git declarations.
+    Builtin(String),
+}
+
+/// Per-project metadata. Captures what the project is + what it
+/// builds against; the dev extension's compile path reads `deps`
+/// to lay out a cargo workspace.
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ProjectMetadata {
+    /// Display name. Defaults to the project's `name` field.
+    pub name: String,
+    /// vos version the project compiles against. Empty = use
+    /// whatever the dev extension's synthesised Cargo.toml
+    /// defaults to (the bake-time workspace path).
+    pub vos_version: String,
+    /// `rlib` (default), `cdylib`, or `bin`. Mirrors what cargo's
+    /// `[lib] crate-type = [...]` would carry. The dev extension
+    /// synthesises Cargo.toml around the right value.
+    pub crate_type: String,
+    /// Sorted by key. Each `(name, DepRef)` is a single edge in
+    /// the project's dep graph.
+    pub deps: Vec<DepEntry>,
+    /// Capability declarations the actor wants at runtime. Plain
+    /// strings (e.g. `"net.tcp.bind"`), interpreted by the host.
+    pub caps: Vec<String>,
+}
+
+/// One `(name, DepRef)` entry in a project's metadata. Stored as
+/// a `Vec` rather than a `BTreeMap` so the rkyv archive stays
+/// flat — keep it sorted by `name` for deterministic order.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct DepEntry {
+    pub name: String,
+    pub dep: DepRef,
 }
 
 // ── store — pure functions over ProjectState ──────────────────
@@ -1272,6 +1347,7 @@ pub struct DevProject {
 #[messages]
 impl DevProject {
     fn new(name: String) -> Self {
+        let display = name.clone();
         Self {
             state: ProjectState {
                 name,
@@ -1279,6 +1355,13 @@ impl DevProject {
                 commits: Vec::new(),
                 branches: Vec::new(),
                 working: Vec::new(),
+                metadata: ProjectMetadata {
+                    name: display,
+                    vos_version: String::new(),
+                    crate_type: String::new(),
+                    deps: Vec::new(),
+                    caps: Vec::new(),
+                },
             },
         }
     }
@@ -1430,6 +1513,26 @@ impl DevProject {
         ts_ms: u64,
     ) -> HashResult {
         store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms)
+    }
+
+    /// Read the project's metadata (deps, crate type, caps, …).
+    #[msg]
+    async fn metadata(&self) -> ProjectMetadata {
+        self.state.metadata.clone()
+    }
+
+    /// Replace the project's metadata. `serialized` is an rkyv-
+    /// encoded `ProjectMetadata`. Returns `STATUS_OK` on success,
+    /// `STATUS_INVALID_INPUT` if the bytes don't decode.
+    #[msg]
+    async fn set_metadata(&mut self, serialized: Vec<u8>) -> u8 {
+        match <ProjectMetadata as vos::Decode>::try_decode(&serialized) {
+            Some(m) => {
+                self.state.metadata = m;
+                STATUS_OK
+            }
+            None => STATUS_INVALID_INPUT,
+        }
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
