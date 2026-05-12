@@ -1,5 +1,8 @@
-//! `vosx dev merge` — promote a side branch (default
-//! `ai-suggested`) into another branch (default `main`).
+//! `vosx dev merge` — promote a side branch into another
+//! branch (default `--into main`). The default `--from` matches
+//! the per-identity branch `vosx ai actor` mints,
+//! `ai/<your-node-prefix>/suggested`, so the common case
+//! "merge what I just suggested" is one command with no flags.
 //!
 //! Wraps the dev-project actor's `merge(into_branch, theirs,
 //! author, ts_ms)` handler. The actor does the merge logic —
