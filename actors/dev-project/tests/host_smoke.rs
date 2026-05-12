@@ -453,6 +453,193 @@ fn working_change_delete_masks_base_entry() {
     assert_eq!(tree[0].path, "src/b.rs");
 }
 
+/// Helper: land a fresh commit on `branch` with one file.
+fn commit_one_file(
+    s: &mut ProjectState,
+    branch: &str,
+    parent: &[u8],
+    path: &str,
+    content: &[u8],
+    ts_ms: u64,
+) -> Vec<u8> {
+    let blob = store::put_blob(s, content.to_vec());
+    let r = store::commit(
+        s,
+        store::CommitInputs {
+            parent,
+            paths: &[path.to_string()],
+            blob_hashes: &blob,
+            branch,
+            intent_tag: INTENT_EDIT,
+            intent_data: Vec::new(),
+            author: &[],
+            ts_ms,
+            change_id: &[],
+        },
+    );
+    assert_eq!(r.status, STATUS_OK, "commit failed: status={}", r.status);
+    r.hash
+}
+
+#[test]
+fn merge_fast_forwards_when_theirs_is_descendant() {
+    let mut s = ProjectState::default();
+
+    // main: A → B (linear)
+    let a = commit_one_file(&mut s, "main", &[], "src/lib.rs", b"// A\n", 1);
+    let b = commit_one_file(&mut s, "main", &a, "src/lib.rs", b"// B\n", 2);
+
+    // Reset branch to A so theirs (B) is a strict descendant.
+    let main_idx = s.branches.iter().position(|x| x.name == "main").unwrap();
+    s.branches[main_idx].commit = bytes_to_arr(&a);
+
+    let merge = store::merge(&mut s, "main", &b, &[], 3);
+    assert_eq!(merge.status, STATUS_OK);
+    assert_eq!(&merge.hash[..], &b[..], "FF: branch should advance to theirs");
+    // No new commit row, just branch pointer moved.
+    assert_eq!(s.commits.len(), 2);
+}
+
+#[test]
+fn merge_clean_independent_edits() {
+    let mut s = ProjectState::default();
+
+    // Common ancestor: holds lib.rs + a.rs.
+    let lib_blob = store::put_blob(&mut s, b"// lib\n".to_vec());
+    let a_blob = store::put_blob(&mut s, b"// a v1\n".to_vec());
+    let base = store::commit(
+        &mut s,
+        store::CommitInputs {
+            parent: &[],
+            paths: &["src/a.rs".to_string(), "src/lib.rs".to_string()],
+            blob_hashes: &[&a_blob[..], &lib_blob[..]].concat(),
+            branch: "main",
+            intent_tag: INTENT_EDIT,
+            intent_data: Vec::new(),
+            author: &[],
+            ts_ms: 1,
+            change_id: &[],
+        },
+    );
+    assert_eq!(base.status, STATUS_OK);
+
+    // ours: edits a.rs.
+    let ours = commit_one_file(&mut s, "main", &base.hash, "src/a.rs", b"// a v2\n", 2);
+
+    // theirs: a separate branch off base that adds b.rs while
+    // keeping the existing files (commits carry the full tree —
+    // dropping a path from `paths` means "this commit deletes
+    // it", which would conflict with ours's continued presence).
+    let b_blob = store::put_blob(&mut s, b"// b v1\n".to_vec());
+    let theirs_r = store::commit(
+        &mut s,
+        store::CommitInputs {
+            parent: &base.hash,
+            paths: &[
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/lib.rs".to_string(),
+            ],
+            blob_hashes: &[&a_blob[..], &b_blob[..], &lib_blob[..]].concat(),
+            branch: "feature",
+            intent_tag: INTENT_EDIT,
+            intent_data: Vec::new(),
+            author: &[],
+            ts_ms: 3,
+            change_id: &[],
+        },
+    );
+    assert_eq!(theirs_r.status, STATUS_OK);
+
+    let merge = store::merge(&mut s, "main", &theirs_r.hash, &[], 4);
+    assert_eq!(merge.status, STATUS_OK);
+
+    let merge_commit = store::get_commit(&s, &merge.hash).expect("merge commit exists");
+    assert!(
+        merge_commit.conflicts.is_empty(),
+        "clean merge should record no conflicts: {:?}",
+        merge_commit.conflicts
+    );
+    assert_eq!(merge_commit.parent, bytes_to_arr(&ours));
+    assert_eq!(merge_commit.extras.len(), 1);
+    assert_eq!(merge_commit.extras[0], bytes_to_arr(&theirs_r.hash));
+    assert_eq!(merge_commit.intent_tag, INTENT_MERGE);
+}
+
+#[test]
+fn merge_records_conflict_then_subsequent_commit_resolves() {
+    let mut s = ProjectState::default();
+
+    // base: lib.rs v0.
+    let v0 = store::put_blob(&mut s, b"// v0\n".to_vec());
+    let base = store::commit(
+        &mut s,
+        store::CommitInputs {
+            parent: &[],
+            paths: &["src/lib.rs".to_string()],
+            blob_hashes: &v0,
+            branch: "main",
+            intent_tag: INTENT_EDIT,
+            intent_data: Vec::new(),
+            author: &[],
+            ts_ms: 1,
+            change_id: &[],
+        },
+    );
+    assert_eq!(base.status, STATUS_OK);
+
+    // ours: lib.rs v1.
+    let ours = commit_one_file(&mut s, "main", &base.hash, "src/lib.rs", b"// ours v1\n", 2);
+
+    // theirs (off base): lib.rs v2 — same path, different content.
+    let theirs = commit_one_file(&mut s, "feature", &base.hash, "src/lib.rs", b"// theirs v1\n", 3);
+
+    let merge = store::merge(&mut s, "main", &theirs, &[], 4);
+    assert_eq!(merge.status, STATUS_OK);
+
+    let merge_commit = store::get_commit(&s, &merge.hash).expect("merge commit");
+    assert_eq!(
+        merge_commit.conflicts.len(),
+        1,
+        "lib.rs should conflict (both sides changed differently)"
+    );
+    let cf = &merge_commit.conflicts[0];
+    assert_eq!(cf.path, "src/lib.rs");
+    let v0_arr = bytes_to_arr(&v0.to_vec());
+    let ours_blob = merge_commit
+        .files
+        .iter()
+        .find(|f| f.path == "src/lib.rs")
+        .map(|f| f.blob)
+        .unwrap();
+    assert_eq!(cf.base, v0_arr);
+    assert_eq!(cf.ours, ours_blob, "merge keeps ours as tentative pick");
+
+    // Resolve by committing a fresh content on top of the merge.
+    let resolved = commit_one_file(
+        &mut s,
+        "main",
+        &merge.hash,
+        "src/lib.rs",
+        b"// resolved\n",
+        5,
+    );
+    let res_commit = store::get_commit(&s, &resolved).expect("resolved commit");
+    assert!(
+        res_commit.conflicts.is_empty(),
+        "resolution commit clears conflicts"
+    );
+
+    // Branch advanced through merge → resolved.
+    assert_eq!(store::head(&s, "main"), resolved);
+}
+
+fn bytes_to_arr(b: &[u8]) -> [u8; HASH_BYTES] {
+    let mut out = [0u8; HASH_BYTES];
+    out[..b.len().min(HASH_BYTES)].copy_from_slice(&b[..b.len().min(HASH_BYTES)]);
+    out
+}
+
 #[test]
 fn working_changes_arent_in_commit_log() {
     // Regression for Phase 3.2: working entries shouldn't leak
