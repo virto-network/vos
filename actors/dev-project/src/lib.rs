@@ -727,6 +727,155 @@ pub mod store {
         }
     }
 
+    /// Merge `theirs` into `into_branch`. Finds the common
+    /// ancestor (walking `parent` pointers — `extras` are
+    /// ignored in v1, fine for the linear histories we produce
+    /// today), runs `merge_trees`, persists a 2-parent commit
+    /// with `extras = [theirs]`, and advances `into_branch`.
+    /// Conflicts are recorded on the commit; the merge is still
+    /// considered successful — callers resolve via subsequent
+    /// plain commits.
+    pub fn merge(
+        state: &mut ProjectState,
+        into_branch: &str,
+        theirs_hash: &[u8],
+        author: &[u8],
+        ts_ms: u64,
+    ) -> HashResult {
+        let Some(branch_idx) = find_branch(state, into_branch) else {
+            return HashResult::err(STATUS_NOT_FOUND);
+        };
+        let ours_hash = state.branches[branch_idx].commit;
+
+        let Some(theirs_arr) = bytes_to_32(theirs_hash) else {
+            return HashResult::err(STATUS_BAD_HASH);
+        };
+        if find_commit(state, &theirs_arr).is_none() {
+            return HashResult::err(STATUS_PARENT_NOT_FOUND);
+        }
+
+        // Fast-forward: theirs is a descendant of ours (or equal).
+        // Just advance the branch — no merge commit needed.
+        if is_ancestor(state, &ours_hash, &theirs_arr) {
+            state.branches[branch_idx].commit = theirs_arr;
+            return HashResult::ok(theirs_arr);
+        }
+        // Already-merged: ours is a descendant of theirs. No-op.
+        if is_ancestor(state, &theirs_arr, &ours_hash) {
+            return HashResult::ok(ours_hash);
+        }
+
+        // True three-way merge.
+        let base_hash = common_ancestor(state, &ours_hash, &theirs_arr).unwrap_or([0u8; HASH_BYTES]);
+        let base_files = tree_at(state, &base_hash);
+        let ours_files = tree_at(state, &ours_hash);
+        let theirs_files = tree_at(state, &theirs_arr);
+        let merged = merge_trees(&base_files, &ours_files, &theirs_files);
+
+        let author_arr = if author.is_empty() {
+            [0u8; HASH_BYTES]
+        } else {
+            match bytes_to_32(author) {
+                Some(h) => h,
+                None => return HashResult::err(STATUS_BAD_HASH),
+            }
+        };
+        let mut row = CommitNode {
+            parent: ours_hash,
+            extras: vec![theirs_arr],
+            files: merged.files,
+            author: author_arr,
+            ts_ms,
+            intent_tag: INTENT_MERGE,
+            intent_data: Vec::new(),
+            change_id: [0u8; HASH_BYTES],
+            conflicts: merged.conflicts,
+        };
+        let hash = commit_hash(&row, [0u8; HASH_BYTES]);
+        row.change_id = hash;
+
+        let pos = state
+            .commits
+            .binary_search_by(|c| commit_row_hash(c).cmp(&hash))
+            .unwrap_or_else(|p| p);
+        state.commits.insert(pos, row);
+        state.branches[branch_idx].commit = hash;
+        HashResult::ok(hash)
+    }
+
+    fn tree_at(state: &ProjectState, hash: &[u8; HASH_BYTES]) -> Vec<FileEntry> {
+        if *hash == [0u8; HASH_BYTES] {
+            return Vec::new();
+        }
+        state
+            .commits
+            .iter()
+            .find(|c| commit_row_hash(c) == *hash)
+            .map(|c| c.files.clone())
+            .unwrap_or_default()
+    }
+
+    /// Is `ancestor` reachable from `descendant` by walking only
+    /// `parent` pointers (no `extras`)? Used by `merge` to detect
+    /// fast-forwardable / already-merged inputs before running
+    /// the full three-way machinery.
+    fn is_ancestor(
+        state: &ProjectState,
+        ancestor: &[u8; HASH_BYTES],
+        descendant: &[u8; HASH_BYTES],
+    ) -> bool {
+        if ancestor == descendant {
+            return true;
+        }
+        let mut cur = *descendant;
+        let zero = [0u8; HASH_BYTES];
+        while cur != zero {
+            if cur == *ancestor {
+                return true;
+            }
+            match state.commits.iter().find(|c| commit_row_hash(c) == cur) {
+                Some(c) => cur = c.parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Common-ancestor walk: collect every parent-reachable hash
+    /// from `a`, then walk back from `b` until one shows up.
+    /// Linear histories (which the v1 store mostly produces) get
+    /// the literal common ancestor; for richer DAGs this returns
+    /// *a* common ancestor, not necessarily the lowest one.
+    fn common_ancestor(
+        state: &ProjectState,
+        a: &[u8; HASH_BYTES],
+        b: &[u8; HASH_BYTES],
+    ) -> Option<[u8; HASH_BYTES]> {
+        let zero = [0u8; HASH_BYTES];
+
+        let mut a_set: Vec<[u8; HASH_BYTES]> = Vec::new();
+        let mut cur = *a;
+        while cur != zero {
+            a_set.push(cur);
+            match state.commits.iter().find(|c| commit_row_hash(c) == cur) {
+                Some(c) => cur = c.parent,
+                None => break,
+            }
+        }
+
+        cur = *b;
+        while cur != zero {
+            if a_set.contains(&cur) {
+                return Some(cur);
+            }
+            match state.commits.iter().find(|c| commit_row_hash(c) == cur) {
+                Some(c) => cur = c.parent,
+                None => return None,
+            }
+        }
+        None
+    }
+
     // ── Working changes (jj-style) ──────────────────────────────
 
     /// Open a new working change off `base`. `base` is 32 bytes
@@ -1262,6 +1411,25 @@ impl DevProject {
             &author,
             ts_ms,
         )
+    }
+
+    /// Three-way merge `theirs` into `into_branch`. Returns the
+    /// resulting commit's hash. Fast-forward inputs (theirs is a
+    /// descendant of ours, or vice versa) bypass the merge
+    /// commit; a true merge produces a 2-parent
+    /// `INTENT_MERGE` commit with `extras = [theirs]` and any
+    /// per-path conflicts recorded on the commit. Callers
+    /// resolve conflicts via subsequent plain commits — the
+    /// merge itself is non-blocking.
+    #[msg]
+    async fn merge(
+        &mut self,
+        into_branch: String,
+        theirs: Vec<u8>,
+        author: Vec<u8>,
+        ts_ms: u64,
+    ) -> HashResult {
+        store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms)
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
