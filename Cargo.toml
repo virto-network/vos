@@ -12,6 +12,7 @@ members = [
     "zkpvm/precompiles",
     "zkpvm/derive",
     "zkpvm/verifier",
+    "extensions/dev",
     "extensions/http-gateway",
     "examples/extensions/*",
 ]

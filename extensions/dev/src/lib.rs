@@ -1,0 +1,35 @@
+//! Dev extension — compiles + publishes PVM actors from a
+//! dev-project actor's tree.
+//!
+//! Bridges two parts of the VOS toolchain that today require an
+//! out-of-band scripting step:
+//!
+//! 1. **dev-project actor** (PVM, `actors/dev-project/`) — a
+//!    content-addressed object store + commit DAG that holds
+//!    each project's source as blobs.
+//! 2. **space-registry actor** (PVM, `actors/space-registry/`) —
+//!    the catalog of programs an agent can install and run.
+//!
+//! Agents put source code into a dev-project, hand the project's
+//! commit to `compile()`, and either pick up the resulting ELF
+//! blob hash or pass it directly through `publish()` to land in
+//! the space registry. Both calls record a commit on the project
+//! so the build / publish history is auditable from the same DAG
+//! as the source edits.
+//!
+//! ## Lifecycle
+//!
+//! Service-mode extension — `run()` idles in a shutdown poll,
+//! every actual work item is driven through
+//! `vos_service_handle_invoke` from the registry-driven CLI
+//! dispatch path. v1 of `run()` is a sleep loop; once an actual
+//! background task arrives (cache eviction, dep prefetch, …),
+//! it'll claim ownership of `run()` instead.
+
+mod ext;
+
+vos::service_main!(
+    ext::DevExtension,
+    caps = ["fs.tempdir", "process.spawn", "tokio-runtime",],
+    cli = [stop],
+);
