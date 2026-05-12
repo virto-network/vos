@@ -26,6 +26,7 @@ exclude = [
     # up as a workspace member.
     "actors",
     "actors/space-registry",
+    "actors/dev-project",
     # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.

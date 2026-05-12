@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "dev-project"
+description = "Built-in VOS actor: per-project content-addressed object store + commit DAG. The PVM side of the dev-extension toolchain — agents edit code as data here, the native dev extension compiles whatever the actor exposes."
+keywords = ["vos", "actor", "vcs", "p2p"]
+categories = ["data-structures"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+homepage = "https://github.com/virto-network/vos"
+authors = ["Daniel Olano <daniel@olanod.com>"]
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
