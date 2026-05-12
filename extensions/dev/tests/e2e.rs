@@ -602,6 +602,131 @@ fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
     result.hash
 }
 
+/// Verifies the property: storing source as `BlobKind::RustAst`
+/// and compiling produces the same artifact ELF (same hash) as
+/// storing the same source as `BlobKind::Raw` and compiling. The
+/// dev extension's materialise step renders RustAst back to
+/// canonical text via `dev_ast::ast_to_text` before writing to
+/// disk, so the cargo invocation sees byte-identical source in
+/// both flows.
+#[test]
+fn compile_via_ast_matches_raw_artifact() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    // Provision two independent projects.
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-raw"],
+        "vosx dev new proj-raw",
+    );
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-ast"],
+        "vosx dev new proj-ast",
+    );
+    daemon.restart();
+
+    let client = TestClient::connect(daemon.data_dir());
+    let raw_id = client.resolve_instance("proj-raw");
+    let ast_id = client.resolve_instance("proj-ast");
+
+    // Use a canonical-form source so the byte-identity property
+    // is unambiguous — prettyplease would strip a stray comment
+    // or normalise tabs even though the resulting ELF is the
+    // same, which would obscure the comparison we're after.
+    let canonical = dev_ast::ast_to_text(
+        &dev_ast::text_to_ast(COUNTER_SOURCE).expect("parse canonical counter"),
+    )
+    .expect("canonical counter back to text");
+
+    // proj-raw: put the canonical text as a Raw blob.
+    let raw_hash = put_source(&client, raw_id, "put_blob", canonical.as_bytes());
+    commit_source(&client, raw_id, &raw_hash);
+
+    // proj-ast: put the canonical text as a RustAst blob via
+    // `put_blob_ast`. The actor stores it as `BlobKind::RustAst`
+    // under a separate domain tag.
+    let ast_blob = dev_ast::text_to_ast(&canonical).expect("re-ast canonical");
+    let ast_hash = put_source(&client, ast_id, "put_blob_ast", &ast_blob);
+    commit_source(&client, ast_id, &ast_hash);
+
+    // Compile both.
+    run_cli(
+        &daemon,
+        &["dev", "compile", "--space", &daemon.space_name, "proj-raw"],
+        "vosx dev compile proj-raw",
+    );
+    run_cli(
+        &daemon,
+        &["dev", "compile", "--space", &daemon.space_name, "proj-ast"],
+        "vosx dev compile proj-ast",
+    );
+
+    let raw_artifact = artifact_hash_for(&client, raw_id);
+    let ast_artifact = artifact_hash_for(&client, ast_id);
+    assert_eq!(
+        raw_artifact, ast_artifact,
+        "AST and Raw paths should produce identical artifact ELFs"
+    );
+}
+
+fn put_source(client: &TestClient, project_id: ServiceId, method: &str, bytes: &[u8]) -> Vec<u8> {
+    let reply = client.invoke(project_id, &Msg::new(method).with("bytes", bytes.to_vec()));
+    match reply {
+        Value::Bytes(b) => {
+            assert_eq!(b.len(), 32, "{method} should return a 32-byte hash");
+            b
+        }
+        other => panic!("{method} returned {other:?}"),
+    }
+}
+
+fn commit_source(client: &TestClient, project_id: ServiceId, blob_hash: &[u8]) {
+    let reply = client.invoke(
+        project_id,
+        &Msg::new("commit")
+            .with("parent", Vec::<u8>::new())
+            .with("paths", vec!["src/lib.rs".to_string()])
+            .with("blob_hashes", blob_hash.to_vec())
+            .with("branch", "main".to_string())
+            .with("intent_tag", dev_project::INTENT_EDIT)
+            .with("intent_data", Vec::<u8>::new())
+            .with("author", Vec::<u8>::new())
+            .with("ts_ms", 0u64)
+            .with("change_id", Vec::<u8>::new()),
+    );
+    let _ = decode_hash_result_assert_ok(reply, "commit source");
+}
+
+/// Walk the `builds` branch to its head, fetch that commit, decode
+/// the `BuildIntent.artifact` field. Returns the empty-domain
+/// blake2b hash compile.rs wrote into the host blob cache.
+fn artifact_hash_for(client: &TestClient, project_id: ServiceId) -> [u8; 32] {
+    let head_reply = client.invoke(
+        project_id,
+        &Msg::new("head").with("branch", "builds".to_string()),
+    );
+    let head_bytes = match head_reply {
+        Value::Bytes(b) => b,
+        other => panic!("head returned {other:?}"),
+    };
+    assert_eq!(head_bytes.len(), 32, "builds head should be a 32-byte hash");
+
+    let commit_reply = client.invoke(project_id, &Msg::new("get_commit").with("hash", head_bytes));
+    let commit_outer = match commit_reply {
+        Value::Bytes(b) => b,
+        other => panic!("get_commit returned {other:?}"),
+    };
+    assert!(!commit_outer.is_empty(), "get_commit should return Some");
+    let commit =
+        <dev_project::CommitNode as Decode>::try_decode(&commit_outer).expect("decode CommitNode");
+    let intent = <dev_project::BuildIntent as Decode>::try_decode(&commit.intent_data)
+        .expect("decode BuildIntent");
+    assert_eq!(intent.ok, 1, "build should have succeeded");
+    intent.artifact
+}
+
 fn extract_u32(v: Value) -> u32 {
     // Typed-handler return: u32 → `reply.into()` → `Value::U32`.
     // Account for the `Value::Bytes(rkyv-u32)` shape too in case

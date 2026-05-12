@@ -47,3 +47,6 @@ vos = { path = "../../vos", default-features = false, features = ["extension", "
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Used by the AST-parity test to produce the canonical-text form
+# of the counter source and round it through `put_blob_ast`.
+dev-ast = { path = "../../actors/dev-project/dev-ast", version = "0.1.0" }
