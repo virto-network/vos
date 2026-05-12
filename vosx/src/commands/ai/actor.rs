@@ -12,10 +12,12 @@
 //!
 //! 1. Resolve the dev-project actor instance (`--project NAME`)
 //!    and the AI extension (`--extension`, default `ai`).
-//! 2. Fetch the head of the project's `main` branch and walk the
-//!    commit's `files` list. For each path that looks like
-//!    source (.rs, .toml, .md) under a small per-file cap,
-//!    decode the blob bytes as UTF-8.
+//! 2. Fetch the head of the project's `--branch` (default
+//!    `ai-suggested`, with fall-back to `main` when the side
+//!    branch doesn't exist yet) and walk the commit's `files`
+//!    list. For each path that looks like source (.rs, .toml,
+//!    .md) under a small per-file cap, decode the blob bytes
+//!    as UTF-8.
 //! 3. Build a prompt: a fixed preamble explaining VOS actor
 //!    conventions + one canonical example + the current source
 //!    files + the user's task description.
@@ -25,8 +27,9 @@
 //!
 //! Read-only by default — the model's reply lands on stdout for
 //! the operator to inspect. Pass `--apply` to write the parsed
-//! files back as a working change on the project's `main`
-//! branch (one new commit per `--apply` run).
+//! files back as a working change on `--branch` (default
+//! `ai-suggested`). Promote into `main` afterward with
+//! `vosx dev merge`.
 
 use std::io::Write as _;
 use std::thread;
