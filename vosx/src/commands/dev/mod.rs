@@ -24,6 +24,7 @@ pub mod compile;
 pub mod log;
 pub mod new;
 pub mod publish;
+pub mod show;
 
 #[derive(Subcommand, Debug)]
 pub enum DevCommand {
@@ -99,6 +100,32 @@ pub enum DevCommand {
         #[arg(long, default_value_t = 16)]
         limit: u32,
     },
+    /// Inspect a project's tree at a commit.
+    ///
+    /// Without `<PATH>` prints the file list (path, size, blob
+    /// hash prefix) on the chosen branch's head. With `<PATH>`
+    /// dumps that file's bytes to stdout so `vosx dev show
+    /// --project P src/lib.rs > local.rs` works for local edits.
+    ///
+    /// `--commit` overrides the branch lookup when you want to
+    /// inspect a specific historical commit.
+    Show {
+        /// Space id (full hex) or name.
+        #[arg(long)]
+        space: String,
+        /// Project instance name.
+        #[arg(long)]
+        project: String,
+        /// Optional path within the tree. Omit to list the whole
+        /// tree.
+        path: Option<String>,
+        /// Branch to read from. Default `main`.
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Specific commit hex to inspect. Overrides `--branch`.
+        #[arg(long, value_name = "HEX")]
+        commit: Option<String>,
+    },
 }
 
 pub fn run(cmd: DevCommand) -> anyhow::Result<()> {
@@ -144,6 +171,19 @@ pub fn run(cmd: DevCommand) -> anyhow::Result<()> {
             name,
             branch,
             limit,
+        }),
+        DevCommand::Show {
+            space,
+            project,
+            path,
+            branch,
+            commit,
+        } => show::run(show::Args {
+            space,
+            project,
+            path,
+            branch,
+            commit,
         }),
     }
 }
