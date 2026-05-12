@@ -445,6 +445,23 @@ fn vosx_cmd(daemon: &Daemon) -> Command {
     c
 }
 
+/// Run a CLI command and capture (exit_code, stdout, stderr)
+/// regardless of success. Used by tests that assert on failure
+/// modes (the regular `run_cli` panics on non-zero exit).
+fn run_cli_capture(daemon: &Daemon, args: &[&str], context: &str) -> (i32, String, String) {
+    let mut cmd = vosx_cmd(daemon);
+    cmd.args(args);
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("spawn vosx for {context}: {e}"));
+    let code = out.status.code().unwrap_or(-1);
+    (
+        code,
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 fn run_cli(daemon: &Daemon, args: &[&str], context: &str) -> String {
     let mut cmd = vosx_cmd(daemon);
     cmd.args(args);
@@ -967,7 +984,12 @@ fn cross_project_deps_self_cycle_errors_loudly() {
         1,
     );
 
-    run_cli(
+    // Capture exit + streams: the CLI now surfaces any
+    // intent.ok=0 outcome (cycle, cargo failure, etc.) as a
+    // non-zero exit. Cycle detection runs before cargo, so the
+    // build never gets that far — `compile_and_record` writes a
+    // build commit with ok=0 and the CLI bails.
+    let (code, stdout, stderr) = run_cli_capture(
         &daemon,
         &[
             "dev",
@@ -977,6 +999,10 @@ fn cross_project_deps_self_cycle_errors_loudly() {
             "proj-cycle",
         ],
         "vosx dev compile proj-cycle",
+    );
+    assert_ne!(
+        code, 0,
+        "self-cycle compile should exit non-zero\nstdout: {stdout}\nstderr: {stderr}"
     );
 
     let intent = build_intent_for(&client, proj_id);
@@ -990,4 +1016,88 @@ fn bytes_to_arr32(b: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
     out
+}
+
+/// Source with a syntax error — cargo build should fail. Used to
+/// drive the intent.ok=0 path so the CLI's "failed cargo" surface
+/// is regression-covered.
+const BROKEN_SOURCE: &str = r#"
+use vos::prelude::*;
+
+#[actor]
+pub struct Counter {
+    count: u32,
+}
+
+#[messages]
+impl Counter {
+    fn new() -> Self {
+        Self { count: 0 }
+    }
+
+    #[msg]
+    async fn inc(&mut self) -> u32 {
+        // Intentional syntax error: dangling token after expression.
+        self.count = self.count + ;
+        self.count
+    }
+}
+"#;
+
+/// Compiling a project whose source fails to build should exit
+/// the CLI non-zero with a useful "cargo build failed" message.
+/// Regression test for the intent.ok=0 path the CLI used to
+/// silently treat as success (printed "compiled <name>" even
+/// though the BuildIntent recorded the cargo failure).
+#[test]
+fn dev_compile_surfaces_cargo_failure() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "proj-broken"],
+        "vosx dev new proj-broken",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+
+    let project_id = client.resolve_instance("proj-broken");
+    let src_hash = put_source(&client, project_id, "put_blob", BROKEN_SOURCE.as_bytes());
+    commit_source(&client, project_id, &src_hash);
+
+    let (code, stdout, stderr) = run_cli_capture(
+        &daemon,
+        &[
+            "dev",
+            "compile",
+            "--space",
+            &daemon.space_name,
+            "proj-broken",
+        ],
+        "vosx dev compile proj-broken",
+    );
+
+    assert_ne!(
+        code, 0,
+        "vosx dev compile should exit non-zero on cargo failure\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("compiled "),
+        "stdout shouldn't claim 'compiled' on cargo failure\nstdout: {stdout}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("compile failed")
+            || stderr.to_lowercase().contains("build failed"),
+        "stderr should mention the failure\nstderr: {stderr}"
+    );
+
+    // Confirm the daemon-side record landed too — failure should
+    // still show up as a BuildIntent with ok=0 on the builds branch.
+    let intent = build_intent_for(&client, project_id);
+    assert_eq!(
+        intent.ok, 0,
+        "broken source should record a failed build, got intent: {intent:?}"
+    );
 }

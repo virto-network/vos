@@ -98,7 +98,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             println!("  publish_commit = {publish_commit_hex}");
             println!();
             println!(
-                "next: `vosx space install --space {} {}:{}`",
+                "next: `vosx space install {} {}:{}`",
                 args.space, args.program_name, args.version,
             );
         }

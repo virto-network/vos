@@ -1191,6 +1191,12 @@ pub mod store {
     /// commit's `files`, then apply each overlay (replace or
     /// drop). The result is the file list the next snapshot
     /// commit would carry.
+    ///
+    /// Returns `None` when:
+    /// - `change_id` is the wrong length / not a known change.
+    /// - The change's `base` is non-zero but no commit by that
+    ///   hash exists in the store (state corruption — different
+    ///   from an empty tree, which a fresh change off a root has).
     pub fn working_tree(state: &ProjectState, change_id: &[u8]) -> Option<Vec<FileEntry>> {
         let cid = bytes_to_32(change_id)?;
         let idx = find_working(state, &cid)?;
@@ -1200,12 +1206,17 @@ pub mod store {
         let mut tree: Vec<FileEntry> = if change.base == [0u8; HASH_BYTES] {
             Vec::new()
         } else {
+            // A non-zero base that doesn't resolve indicates
+            // corrupted state — silently treating it as empty
+            // would let `commit_change` snapshot a tree with
+            // none of the base's files. Surface as None so the
+            // actor returns a clean "change not found" rather
+            // than an empty-tree commit.
             state
                 .commits
                 .iter()
                 .find(|c| commit_row_hash(c) == change.base)
-                .map(|c| c.files.clone())
-                .unwrap_or_default()
+                .map(|c| c.files.clone())?
         };
 
         for edit in &change.edits {

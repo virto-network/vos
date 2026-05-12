@@ -103,15 +103,6 @@ impl CompileOutcome {
     }
 }
 
-impl From<&CompileOutcome> for HashResult {
-    fn from(o: &CompileOutcome) -> Self {
-        HashResult {
-            status: o.status,
-            hash: o.hash.clone(),
-        }
-    }
-}
-
 /// Log a compile failure's stderr verbatim. Phase 1.3 also
 /// persists the stderr as a blob and links it from the build
 /// commit's `intent.artifact` field so it survives across daemon
@@ -597,7 +588,7 @@ pub(crate) fn materialise_to_path(
 
 /// Resolve `path` (a project-relative path that already passed the
 /// actor's `is_valid_path` check) under `root` and refuse anything
-/// that escapes via symlinks or repeated `..`. The actor strips
+/// that escapes via symlinks or repeated `..`. The actor rejects
 /// `..` and leading `/` but symlinks come from the materialised
 /// tree itself, which v1 doesn't create — kept as a belt-and-
 /// braces check.

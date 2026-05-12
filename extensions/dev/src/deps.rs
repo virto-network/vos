@@ -15,7 +15,7 @@
 //! compile with `COMPILE_STATUS_CYCLE`. A self-cycle (A → A) is
 //! caught by the same mechanism.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -39,11 +39,7 @@ pub const METADATA_PATH: &str = ".vos-project.rkyv";
 /// Extra status codes for the dep resolution path.
 pub const COMPILE_STATUS_DEP_NOT_FOUND: u8 = 20;
 pub const COMPILE_STATUS_CYCLE: u8 = 21;
-/// Reserved for the federated fetch path (cross-space deps),
-/// not used yet — same-space deps are the only flavour the
-/// resolver handles in v1.
-#[allow(dead_code)]
-pub const COMPILE_STATUS_CROSS_SPACE_DEP: u8 = 22;
+pub const COMPILE_STATUS_PIN_CONFLICT: u8 = 22;
 
 /// One resolved dependency, ready to write into the workspace.
 pub struct ResolvedDep {
@@ -90,11 +86,19 @@ pub fn resolve(
             DepRef::Space { .. } => Some((e.name.clone(), e.dep.clone())),
         })
         .collect();
-    // Walking-set for cycle detection (project_name + commit).
-    let mut visited: BTreeSet<(String, [u8; HASH_BYTES])> = BTreeSet::new();
-    // The root project is visited even though we don't enqueue
-    // it — guards against `root → root` cycle declarations.
-    visited.insert((root_metadata.name.clone(), [0u8; HASH_BYTES]));
+    // Per-project pin map. The first time we see a project_name we
+    // record its pinned commit; the second time we either no-op
+    // (same commit → already resolved) or fail with PIN_CONFLICT
+    // (same name, different commit pinned by two different
+    // ancestors in the dep graph). Storing one commit per name —
+    // not a `(name, commit)` set — is what lets the conflict
+    // check actually fire: with a set, distinct commits look like
+    // distinct entries and the conflict never trips.
+    let mut pinned: BTreeMap<String, [u8; HASH_BYTES]> = BTreeMap::new();
+    // The root project is recorded even though we don't enqueue
+    // it — guards against `root → root` cycle declarations and
+    // catches deps that pin the root at a non-root commit.
+    pinned.insert(root_metadata.name.clone(), [0u8; HASH_BYTES]);
 
     while let Some((vendor_name, dep)) = queue.pop() {
         let DepRef::Space {
@@ -115,34 +119,33 @@ pub fn resolve(
         // exposes it. For now defer to the registry resolve which
         // is also same-space only.
 
-        // Cycle detection: don't enqueue a (project, commit) pair
-        // we've already seen.
-        let key = (project_name.clone(), commit);
-        if visited.contains(&key) {
-            // If the same project_name is reached via a different
-            // commit, surface as cycle (or pin conflict — same
-            // semantic from the resolver's view).
-            if resolved
-                .iter()
-                .any(|r| r.project_name == project_name && r.commit != commit)
-            {
-                return Err((
-                    COMPILE_STATUS_CYCLE,
-                    format!(
-                        "project '{project_name}' pinned at two different commits in the dep graph",
-                    ),
-                ));
-            }
-            continue;
-        }
-        // Self-cycle: project listing itself as a dep.
+        // Self-cycle: project listing itself as a dep. Catch
+        // this before the pin-map check so the error message is
+        // specific (the pin check would also catch it under the
+        // root's `[0u8; 32]` placeholder, but with a less useful
+        // diagnostic).
         if project_name == root_metadata.name {
             return Err((
                 COMPILE_STATUS_CYCLE,
                 format!("project '{project_name}' depends on itself"),
             ));
         }
-        visited.insert(key);
+        // Pin-and-cycle check: have we seen this project_name?
+        // - Same commit → already enqueued/resolved, skip.
+        // - Different commit → two parents pin the project at
+        //   different versions; refuse to silently pick one.
+        if let Some(existing) = pinned.get(&project_name) {
+            if *existing == commit {
+                continue;
+            }
+            return Err((
+                COMPILE_STATUS_PIN_CONFLICT,
+                format!(
+                    "project '{project_name}' pinned at two different commits in the dep graph",
+                ),
+            ));
+        }
+        pinned.insert(project_name.clone(), commit);
 
         // Resolve project_name → ServiceId via the space registry.
         let dep_project_id = match registry_resolve(ctx, &project_name, local_prefix) {
@@ -284,16 +287,17 @@ pub fn write_to_workspace(
 /// alongside vosx's blob cache so a single `XDG_CACHE_HOME`
 /// override scopes both stores. v1 never garbage-collects this
 /// directory; an operator can `rm -rf` it safely.
+///
+/// Matches vosx's `xdg_root` semantics so a test or operator
+/// setting `XDG_CACHE_HOME` once gets coherent paths across
+/// vosx's blob cache, the dev extension's blob mirror, and this
+/// source cache.
 fn source_cache_root() -> std::path::PathBuf {
+    let from_home = || std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"));
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".cache")
-        });
+        .or_else(from_home)
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"));
     base.join("vos-dev").join("source-cache")
 }
 
@@ -484,18 +488,6 @@ pub(crate) fn fetch_metadata_from_tree(
         return Ok(ProjectMetadata::default());
     }
     Ok(<ProjectMetadata as vos::Decode>::try_decode(&blob.bytes).unwrap_or_default())
-}
-
-/// Back-compat alias for the old "fetch the project's metadata
-/// from the actor" API. Today's implementation reads from the
-/// commit tree instead — see `fetch_metadata_from_tree`. Kept
-/// because `compile.rs::compile_project` already has the
-/// project's commit in scope and can call the tree-aware form
-/// directly; the actor-targeted shape was never used past the
-/// inline NOTE comment.
-#[allow(dead_code)]
-pub(crate) fn fetch_metadata(_ctx: &ServiceCtx, _project_id: u32) -> Result<ProjectMetadata, u8> {
-    Ok(ProjectMetadata::default())
 }
 
 fn registry_resolve(ctx: &ServiceCtx, name: &str, caller_prefix: u16) -> Result<u32, u8> {

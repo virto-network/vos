@@ -39,14 +39,44 @@ use crate::compile::{
 const REGISTRY_ID: u32 = 0;
 
 // Status codes start at 30 so they don't collide with PVM-side
-// status (0..=6) or compile-side status (10..=19).
+// status (0..=7), compile-side status (10..=19), or dep-resolve
+// status (20..=22).
 pub const PUBLISH_STATUS_BUILD_NOT_FOUND: u8 = 30;
 pub const PUBLISH_STATUS_BUILD_FAILED: u8 = 31;
 pub const PUBLISH_STATUS_BLOB_NOT_FOUND: u8 = 32;
+/// Registry rejected the (name, version, hash) row for some
+/// reason it didn't specialise. Distinct from the more specific
+/// codes below (tag conflict, bad hash) — see [`map_registry_status`].
 pub const PUBLISH_STATUS_REGISTRY_REJECTED: u8 = 33;
 pub const PUBLISH_STATUS_RECORD_FAILED: u8 = 34;
 pub const PUBLISH_STATUS_BAD_INTENT: u8 = 35;
 pub const PUBLISH_STATUS_BAD_BUILD_TAG: u8 = 36;
+/// Registry already has this (name, version) under a different
+/// hash. Surfaced separately so the CLI can hint at `--allow-retag`
+/// or version-bump workflows when that lands.
+pub const PUBLISH_STATUS_TAG_CONFLICT: u8 = 37;
+/// Registry rejected the hash as not 32 bytes — should never
+/// fire because publish already validates length, but routed
+/// through to keep the status pipeline honest.
+pub const PUBLISH_STATUS_BAD_HASH: u8 = 38;
+
+/// Translate a non-OK `space_registry` status into a
+/// publish-domain status. Each registry code maps to a specific
+/// publish variant so the CLI doesn't lose information; codes
+/// the registry adds later fall through to the generic
+/// REGISTRY_REJECTED bucket and the operator picks the detail
+/// out of the daemon log.
+fn map_registry_status(s: u8) -> u8 {
+    // Mapped against space_registry::STATUS_* circa Phase 5.
+    // Numeric values cross the FFI; mapping (not re-export)
+    // keeps the dev extension free of a build-time dep on
+    // space_registry's status constants.
+    match s {
+        1 => PUBLISH_STATUS_TAG_CONFLICT, // STATUS_TAG_CONFLICT
+        6 => PUBLISH_STATUS_BAD_HASH,     // STATUS_BAD_HASH
+        _ => PUBLISH_STATUS_REGISTRY_REJECTED,
+    }
+}
 
 /// Publish a build's PVM blob under `(name, version)` in the space
 /// registry. Returns the dev-project commit hash for the
@@ -129,12 +159,18 @@ pub fn publish(
     //    needs the (name, version, hash) row — the actual bytes
     //    are already in the local blob cache from the compile
     //    step, which is where `space install` reads them.
+    //
+    //    On non-OK registry status, map the registry's code into
+    //    the publish status namespace via `map_registry_status`.
+    //    The CLI surfaces specific codes (tag conflict, bad
+    //    hash) so the operator gets actionable diagnostics
+    //    rather than a flat "rejected".
     match registry_publish(ctx, &name, &version, &registry_hash) {
         Ok(s) if s == STATUS_OK => {}
         Ok(s) => {
             log::warn!("dev: registry.publish returned status {s}");
             return HashResult {
-                status: PUBLISH_STATUS_REGISTRY_REJECTED,
+                status: map_registry_status(s),
                 hash: Vec::new(),
             };
         }
@@ -249,24 +285,18 @@ pub(crate) fn blob_cache_path(hash: &[u8]) -> PathBuf {
 /// in lockstep — drift means same-node install can't find blobs
 /// the dev extension just published. Kept inline (rather than
 /// reusing vosx) so the extension stays free of a host-crate dep.
+///
+/// Matches vosx's `xdg_root` semantics exactly: accept whatever
+/// `XDG_CACHE_HOME` resolves to (no absolute-path filtering),
+/// fall back to `$HOME/.cache` and finally a relative `./.cache`
+/// when neither is set.
 fn blob_cache_dir() -> PathBuf {
-    let root = if let Some(xdg) = env::var_os("XDG_CACHE_HOME") {
-        let p = PathBuf::from(xdg);
-        if p.is_absolute() {
-            p
-        } else {
-            home_dir_or_dot().join(".cache")
-        }
-    } else {
-        home_dir_or_dot().join(".cache")
-    };
-    root.join("vosx").join("blobs")
-}
-
-fn home_dir_or_dot() -> PathBuf {
-    env::var_os("HOME")
+    let from_home = || env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"));
+    let root = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .or_else(from_home)
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    root.join("vosx").join("blobs")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
