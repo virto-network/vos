@@ -332,3 +332,150 @@ fn unknown_branch_head_is_empty() {
     assert!(store::head(&s, "ghost").is_empty());
     assert!(store::log(&s, "ghost", 10).is_empty());
 }
+
+#[test]
+fn working_change_open_put_commit_amend_dedups_log() {
+    let mut s = ProjectState::default();
+
+    // 1. Stash a few blobs so put_file_working has something
+    //    valid to point at.
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for i in 0..5 {
+        let h = store::put_blob(&mut s, format!("// file v1 ({i})\n").into_bytes());
+        blobs.push(h.to_vec());
+    }
+
+    // 2. open_change against an empty branch (no parent yet).
+    let opened = store::open_change(&mut s, &[]);
+    assert_eq!(opened.status, STATUS_OK);
+    let change_id = opened.hash.clone();
+    assert_eq!(change_id.len(), HASH_BYTES);
+
+    // 3. Five put_file_working calls.
+    for i in 0..5 {
+        let status = store::put_file_working(
+            &mut s,
+            &change_id,
+            &format!("src/file_{i}.rs"),
+            &blobs[i],
+        );
+        assert_eq!(status, STATUS_OK, "put_file_working[{i}]");
+    }
+
+    // 4. Materialised tree should carry all 5 files.
+    let tree = store::working_tree(&s, &change_id).expect("working tree");
+    assert_eq!(tree.len(), 5);
+
+    // 5. commit_change → first snapshot.
+    let snap1 = store::commit_change(
+        &mut s,
+        &change_id,
+        "main",
+        INTENT_EDIT,
+        Vec::new(),
+        &[],
+        100,
+    );
+    assert_eq!(snap1.status, STATUS_OK);
+    let snap1_hash = snap1.hash.clone();
+
+    // 6. Three amends — same change_id, new ts_ms each time.
+    let mut latest_hash = snap1_hash.clone();
+    for i in 0..3 {
+        let amend = store::amend(
+            &mut s,
+            &change_id,
+            INTENT_AMEND,
+            Vec::new(),
+            &[],
+            200 + i as u64,
+        );
+        assert_eq!(
+            amend.status, STATUS_OK,
+            "amend[{i}] failed: status={}",
+            amend.status
+        );
+        assert_ne!(amend.hash, latest_hash, "amend should mint a new hash");
+        latest_hash = amend.hash.clone();
+    }
+
+    // 7. log dedupes by change_id — should be exactly one entry,
+    //    and that entry is the latest amend.
+    let log = store::log(&s, "main", 10);
+    assert_eq!(
+        log.len(),
+        HASH_BYTES,
+        "log should surface exactly one commit per change_id, got {} bytes",
+        log.len()
+    );
+    assert_eq!(&log[..], &latest_hash[..], "log should surface the latest amend");
+
+    // 8. The DAG still has all 4 commits (1 snapshot + 3 amends);
+    //    they're just hidden from `log`'s view.
+    assert_eq!(s.commits.len(), 4);
+}
+
+#[test]
+fn working_change_delete_masks_base_entry() {
+    let mut s = ProjectState::default();
+
+    let blob_a = store::put_blob(&mut s, b"// a\n".to_vec());
+    let blob_b = store::put_blob(&mut s, b"// b\n".to_vec());
+
+    // Land an initial commit with two files.
+    let snap = store::commit(
+        &mut s,
+        store::CommitInputs {
+            parent: &[],
+            paths: &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            blob_hashes: &[&blob_a[..], &blob_b[..]].concat(),
+            branch: "main",
+            intent_tag: INTENT_INIT,
+            intent_data: Vec::new(),
+            author: &[],
+            ts_ms: 1,
+            change_id: &[],
+        },
+    );
+    assert_eq!(snap.status, STATUS_OK);
+
+    // Open a change off the snapshot, delete one file in the
+    // working overlay.
+    let opened = store::open_change(&mut s, &snap.hash);
+    assert_eq!(opened.status, STATUS_OK);
+    assert_eq!(
+        store::delete_file_working(&mut s, &opened.hash, "src/a.rs"),
+        STATUS_OK
+    );
+
+    let tree = store::working_tree(&s, &opened.hash).expect("tree");
+    assert_eq!(tree.len(), 1, "deleted file should be masked");
+    assert_eq!(tree[0].path, "src/b.rs");
+}
+
+#[test]
+fn working_changes_arent_in_commit_log() {
+    // Regression for Phase 3.2: working entries shouldn't leak
+    // into commits / branch refs even though they live on the
+    // same `ProjectState`. The actor uses
+    // commits/branches/blobs as the replication source-of-truth;
+    // confirming working stays out keeps the deferred per-field
+    // consistency story coherent.
+    let mut s = ProjectState::default();
+
+    let blob = store::put_blob(&mut s, b"// only in working\n".to_vec());
+    let opened = store::open_change(&mut s, &[]);
+    assert_eq!(opened.status, STATUS_OK);
+    assert_eq!(
+        store::put_file_working(&mut s, &opened.hash, "src/lib.rs", &blob),
+        STATUS_OK
+    );
+
+    // Working state has the edit...
+    assert_eq!(s.working.len(), 1);
+    assert_eq!(s.working[0].edits.len(), 1);
+    // ...but commits + branches are untouched.
+    assert!(s.commits.is_empty());
+    assert!(s.branches.is_empty());
+    assert!(store::log(&s, "main", 10).is_empty());
+}
