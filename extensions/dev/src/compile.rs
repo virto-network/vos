@@ -261,7 +261,13 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         Err(status) => return CompileOutcome::err(status, "fetch_commit failed"),
     };
 
-    // ── 2. Lay out the tree
+    // ── 2. Fetch project metadata for deps resolution.
+    let metadata = match crate::deps::fetch_metadata(ctx, project_id) {
+        Ok(m) => m,
+        Err(status) => return CompileOutcome::err(status, "fetch_metadata failed"),
+    };
+
+    // ── 3. Lay out the tree
     let tempdir = match tempfile::Builder::new().prefix("vos-dev-").tempdir() {
         Ok(d) => d,
         Err(e) => return CompileOutcome::err(COMPILE_STATUS_IO, e.to_string()),
@@ -271,8 +277,24 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         return e;
     }
 
-    // ── 3. Synthesise the build infra
-    if let Err(e) = write_build_infra(project_root) {
+    // ── 4. Resolve + materialise cross-project deps. No-op when
+    //    `metadata.deps` is empty (which the v1 happy-path test
+    //    relies on).
+    let resolved_deps = match crate::deps::resolve(ctx, project_id, &metadata) {
+        Ok(d) => d,
+        Err((status, msg)) => return CompileOutcome::err(status, msg),
+    };
+    if !resolved_deps.is_empty()
+        && let Err((status, msg)) =
+            crate::deps::write_to_workspace(ctx, project_root, &resolved_deps)
+    {
+        return CompileOutcome::err(status, msg);
+    }
+
+    // ── 5. Synthesise the build infra (now metadata-aware so
+    //    the root Cargo.toml carries `[workspace]` + the
+    //    `[dependencies]` section when there are deps).
+    if let Err(e) = write_build_infra(project_root, &metadata) {
         return CompileOutcome::err(COMPILE_STATUS_IO, e);
     }
 
@@ -491,6 +513,20 @@ fn materialise_tree(
     commit: &CommitNode,
     root: &Path,
 ) -> Result<(), CompileOutcome> {
+    materialise_to_path(ctx, project_id, commit, root)
+}
+
+/// Inner: materialise a commit's tree under an arbitrary
+/// destination path. Used by `materialise_tree` for the root
+/// project (writes into the tempdir's root) and by
+/// `deps::write_to_workspace` for each dep (writes into
+/// `vendor/<name>/`).
+pub(crate) fn materialise_to_path(
+    ctx: &ServiceCtx,
+    project_id: u32,
+    commit: &CommitNode,
+    root: &Path,
+) -> Result<(), CompileOutcome> {
     for file in &commit.files {
         let blob = match fetch_blob(ctx, project_id, &file.blob) {
             Ok(Some(b)) => b,
@@ -574,8 +610,8 @@ fn resolve_safe_path(root: &Path, path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn write_build_infra(root: &Path) -> Result<(), String> {
-    let cargo_toml = synthesised_cargo_toml();
+fn write_build_infra(root: &Path, metadata: &dev_project::ProjectMetadata) -> Result<(), String> {
+    let cargo_toml = synthesised_cargo_toml(metadata);
     fs::write(root.join("Cargo.toml"), cargo_toml).map_err(|e| e.to_string())?;
 
     let cargo_dir = root.join(".cargo");
@@ -587,19 +623,30 @@ fn write_build_infra(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn synthesised_cargo_toml() -> String {
+fn synthesised_cargo_toml(metadata: &dev_project::ProjectMetadata) -> String {
     // The agent-supplied tree owns `src/`; the dev extension owns
     // everything else around it. `name = "actor"` is fixed so the
     // output ELF path stays predictable across compiles.
     let vos_path = WORKSPACE_VOS_PATH;
+    let has_space_deps = metadata
+        .deps
+        .iter()
+        .any(|d| matches!(d.dep, dev_project::DepRef::Space { .. }));
+    // The default `[workspace]` empty section lets a synthesised
+    // project sit outside any parent workspace. When metadata
+    // declares Space deps, we replace it with an explicit
+    // members list + `[dependencies]` section.
+    let workspace_section = if has_space_deps {
+        crate::deps::synthesise_root_dependencies(&metadata.deps)
+    } else {
+        "\n[workspace]\n".to_string()
+    };
     format!(
         r#"[package]
 name = "actor"
 version = "0.1.0"
 edition = "2024"
-
-[workspace]
-
+{workspace_section}
 [features]
 default = ["bin"]
 bin = []

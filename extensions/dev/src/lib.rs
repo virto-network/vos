@@ -27,6 +27,7 @@
 //! it'll claim ownership of `run()` instead.
 
 mod compile;
+mod deps;
 mod ext;
 mod publish;
 

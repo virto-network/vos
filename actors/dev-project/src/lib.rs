@@ -314,11 +314,6 @@ pub struct ProjectState {
     /// state any consumer of the CRDT replication stream
     /// observes).
     pub working: Vec<WorkingChange>,
-    /// Project-level metadata: dep graph, crate type, declared
-    /// capabilities. Read by the dev extension's compile path
-    /// to lay out cross-project deps and pick crate-type +
-    /// vos-version for the synthesised Cargo.toml.
-    pub metadata: ProjectMetadata,
 }
 
 /// Per-file edit on top of a working change's `base` commit.
@@ -425,6 +420,16 @@ pub enum DepRef {
 /// Per-project metadata. Captures what the project is + what it
 /// builds against; the dev extension's compile path reads `deps`
 /// to lay out a cargo workspace.
+///
+/// Stored as a rkyv-encoded blob committed at the well-known
+/// path `.vos-project.rkyv` in the project's tree, not as a
+/// distinct actor field. Keeping it tree-resident means metadata
+/// versions atomically with the source it describes, and the
+/// actor's PVM-side codegen stays small enough for grey-
+/// transpiler — embedding the typed handlers + the Metadata
+/// struct pushed the actor across an LLVM idiom the transpiler
+/// doesn't yet handle (SLT with rs1=x0). Tree-resident metadata
+/// avoids both problems.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
@@ -542,16 +547,42 @@ pub mod store {
 
     /// Walk back from a branch's head emitting up to `limit` commit
     /// hashes, newest first. Follows only `parent`, not `extras`.
+    /// Returned bytes are `limit * 32`-bounded (might be shorter
+    /// when history is finite).
     ///
-    /// jj-style change_id deduplication: when `amend` produces a
-    /// chain of commits sharing the same change_id, only the most
-    /// recent (newest, encountered first while walking back) is
-    /// surfaced. The older commits are still in the DAG — they're
-    /// just hidden from this view so the agent sees one entry per
-    /// change.
+    /// Host-side `store::log_dedup_changes` runs the jj-style
+    /// change_id dedupe; pulling that loop into the PVM actor
+    /// triggers a grey-transpiler unsupported-instruction edge
+    /// (SLT-with-x0 from the inner `contains` call's byte-wise
+    /// array cmp), so the PVM build ships the raw walk and lets
+    /// the caller dedupe host-side.
     pub fn log(state: &ProjectState, branch: &str, limit: usize) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut seen_changes: Vec<[u8; HASH_BYTES]> = Vec::new();
+        let Some(idx) = find_branch(state, branch) else {
+            return out;
+        };
+        let mut cur = state.branches[idx].commit;
+        let zero = [0u8; HASH_BYTES];
+        while out.len() / HASH_BYTES < limit && cur != zero {
+            out.extend_from_slice(&cur);
+            let Some(ci) = find_commit(state, &cur) else {
+                break;
+            };
+            cur = state.commits[ci].parent;
+        }
+        out
+    }
+
+    /// jj-style change_id deduplication, host-side. Walks the
+    /// branch's commit chain newest-first and emits hashes that
+    /// don't share a `change_id` with one already emitted. Same
+    /// shape as `log` (concatenated 32-byte hashes, newest
+    /// first); intended for host callers that have already
+    /// fetched the commit chain via `log` and want the
+    /// dedup-by-change-id view.
+    pub fn log_dedup_changes(state: &ProjectState, branch: &str, limit: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut seen: Vec<[u8; HASH_BYTES]> = Vec::new();
         let Some(idx) = find_branch(state, branch) else {
             return out;
         };
@@ -562,9 +593,9 @@ pub mod store {
                 break;
             };
             let cid = state.commits[ci].change_id;
-            if !seen_changes.contains(&cid) {
+            if !seen.contains(&cid) {
                 out.extend_from_slice(&cur);
-                seen_changes.push(cid);
+                seen.push(cid);
             }
             cur = state.commits[ci].parent;
         }
@@ -1347,7 +1378,6 @@ pub struct DevProject {
 #[messages]
 impl DevProject {
     fn new(name: String) -> Self {
-        let display = name.clone();
         Self {
             state: ProjectState {
                 name,
@@ -1355,13 +1385,6 @@ impl DevProject {
                 commits: Vec::new(),
                 branches: Vec::new(),
                 working: Vec::new(),
-                metadata: ProjectMetadata {
-                    name: display,
-                    vos_version: String::new(),
-                    crate_type: String::new(),
-                    deps: Vec::new(),
-                    caps: Vec::new(),
-                },
             },
         }
     }
@@ -1400,140 +1423,36 @@ impl DevProject {
         store::put_blob(&mut self.state, bytes).to_vec()
     }
 
-    /// Store a `BlobKind::RustAst` blob. Bytes are an rkyv-encoded
-    /// `syn::File` produced host-side by `dev_ast::text_to_ast`;
-    /// the compile path detects `kind == RustAst` on read and
-    /// renders back to text via `ast_to_text` before invoking
-    /// the compiler. Hash uses a distinct domain tag so the
-    /// catalog distinguishes ASTs from raw bytes.
-    #[msg]
-    async fn put_blob_ast(&mut self, bytes: Vec<u8>) -> Vec<u8> {
-        store::put_blob_with_kind(&mut self.state, bytes, BlobKind::RustAst).to_vec()
-    }
+    // NOTE: `put_blob_ast` is host-only for the same grey-
+    // transpiler reason — see the comment near the working-change
+    // and merge handlers. The store::put_blob_with_kind function
+    // still exists and the AST-parity e2e test uses it through
+    // a host-side call path; the PVM-side actor only ships the
+    // plain `put_blob` (Raw) handler.
 
-    // ── Working changes (jj-style) ──────────────────────────────
+    // NOTE: working-change handlers (open_change, put_file_working,
+    // delete_file_working, working_tree, commit_change, amend) are
+    // exposed only on the host build, not on the PVM actor. The
+    // store::* functions still exist and the host-side tests
+    // cover them; pulling the full jj-style overlay logic into
+    // the PVM blob hits a grey-transpiler unsupported-instruction
+    // edge (an SLT-with-x0 idiom LLVM emits inside the binary-
+    // search + cmp loops). Phase 3.3-3.5's wire-level handlers
+    // come back once the transpiler grows support for that op
+    // (or we refactor the store functions to avoid the offending
+    // pattern). Until then, agents drive working state by
+    // building working trees host-side and using the plain
+    // `commit` handler.
 
-    /// Open a new working change off `base` (32 bytes pointing
-    /// at an existing commit, or empty for "no parent yet").
-    /// Returns the minted `change_id`, which the agent then
-    /// passes to subsequent `put_file_working` /
-    /// `delete_file_working` / `commit_change` / `amend` calls.
-    #[msg]
-    async fn open_change(&mut self, base: Vec<u8>) -> HashResult {
-        store::open_change(&mut self.state, &base)
-    }
-
-    /// Stage `path => blob_hash` on the working change.
-    #[msg]
-    async fn put_file_working(
-        &mut self,
-        change_id: Vec<u8>,
-        path: String,
-        blob_hash: Vec<u8>,
-    ) -> u8 {
-        store::put_file_working(&mut self.state, &change_id, &path, &blob_hash)
-    }
-
-    /// Mark `path` as deleted in the working change.
-    #[msg]
-    async fn delete_file_working(&mut self, change_id: Vec<u8>, path: String) -> u8 {
-        store::delete_file_working(&mut self.state, &change_id, &path)
-    }
-
-    /// Materialise the working change's current tree (base
-    /// commit's files overlaid with the change's edits).
-    #[msg]
-    async fn working_tree(&self, change_id: Vec<u8>) -> Option<Vec<FileEntry>> {
-        store::working_tree(&self.state, &change_id)
-    }
-
-    /// Snapshot the working change as an immutable commit and
-    /// advance `branch`. Returns the new commit's hash. The
-    /// working change stays open jj-style — its `base` advances
-    /// to the new commit, edits clear, so the agent can keep
-    /// iterating without re-opening.
-    #[msg]
-    async fn commit_change(
-        &mut self,
-        change_id: Vec<u8>,
-        branch: String,
-        intent_tag: u8,
-        intent_data: Vec<u8>,
-        author: Vec<u8>,
-        ts_ms: u64,
-    ) -> HashResult {
-        store::commit_change(
-            &mut self.state,
-            &change_id,
-            &branch,
-            intent_tag,
-            intent_data,
-            &author,
-            ts_ms,
-        )
-    }
-
-    /// Re-snapshot the working change under the same change_id
-    /// with new ts_ms / intent. Advances the branch whose head
-    /// equals the change's current base. `log` dedupes by
-    /// change_id so only the latest snapshot surfaces.
-    #[msg]
-    async fn amend(
-        &mut self,
-        change_id: Vec<u8>,
-        intent_tag: u8,
-        intent_data: Vec<u8>,
-        author: Vec<u8>,
-        ts_ms: u64,
-    ) -> HashResult {
-        store::amend(
-            &mut self.state,
-            &change_id,
-            intent_tag,
-            intent_data,
-            &author,
-            ts_ms,
-        )
-    }
-
-    /// Three-way merge `theirs` into `into_branch`. Returns the
-    /// resulting commit's hash. Fast-forward inputs (theirs is a
-    /// descendant of ours, or vice versa) bypass the merge
-    /// commit; a true merge produces a 2-parent
-    /// `INTENT_MERGE` commit with `extras = [theirs]` and any
-    /// per-path conflicts recorded on the commit. Callers
-    /// resolve conflicts via subsequent plain commits — the
-    /// merge itself is non-blocking.
-    #[msg]
-    async fn merge(
-        &mut self,
-        into_branch: String,
-        theirs: Vec<u8>,
-        author: Vec<u8>,
-        ts_ms: u64,
-    ) -> HashResult {
-        store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms)
-    }
-
-    /// Read the project's metadata (deps, crate type, caps, …).
-    #[msg]
-    async fn metadata(&self) -> ProjectMetadata {
-        self.state.metadata.clone()
-    }
-
-    /// Replace the project's metadata. `serialized` is an rkyv-
-    /// encoded `ProjectMetadata`. Returns `STATUS_OK` on success,
-    /// `STATUS_INVALID_INPUT` if the bytes don't decode.
-    #[msg]
-    async fn set_metadata(&mut self, serialized: Vec<u8>) -> u8 {
-        match <ProjectMetadata as vos::Decode>::try_decode(&serialized) {
-            Some(m) => {
-                self.state.metadata = m;
-                STATUS_OK
-            }
-            None => STATUS_INVALID_INPUT,
-        }
-    }
+    // NOTE: `merge` is exposed only on the host build, not on the
+    // PVM actor. The store::merge function still exists and the
+    // host-side tests cover it; pulling all of the three-way
+    // merge codegen into the PVM blob pushed it past a grey-
+    // transpiler unsupported-instruction edge (an SLT-with-x0
+    // idiom LLVM emits inside the inner cmp loops). Phase 4.3's
+    // wire-level `merge` handler can come back once the
+    // transpiler grows support for that op (or we refactor the
+    // store function to avoid the offending pattern).
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
     /// table: `paths` is one utf-8 path per file; `blob_hashes` is

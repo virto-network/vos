@@ -399,16 +399,23 @@ fn working_change_open_put_commit_amend_dedups_log() {
         latest_hash = amend.hash.clone();
     }
 
-    // 7. log dedupes by change_id — should be exactly one entry,
-    //    and that entry is the latest amend.
-    let log = store::log(&s, "main", 10);
+    // 7. log dedupes by change_id (via host-side
+    //    `log_dedup_changes` — the PVM-side `log` ships the raw
+    //    walk to keep the actor under grey-transpiler's
+    //    unsupported-instruction edge). Should be exactly one
+    //    entry, and that entry is the latest amend.
+    let log = store::log_dedup_changes(&s, "main", 10);
     assert_eq!(
         log.len(),
         HASH_BYTES,
-        "log should surface exactly one commit per change_id, got {} bytes",
+        "log_dedup_changes should surface exactly one commit per change_id, got {} bytes",
         log.len()
     );
-    assert_eq!(&log[..], &latest_hash[..], "log should surface the latest amend");
+    assert_eq!(
+        &log[..],
+        &latest_hash[..],
+        "log_dedup_changes should surface the latest amend"
+    );
 
     // 8. The DAG still has all 4 commits (1 snapshot + 3 amends);
     //    they're just hidden from `log`'s view.
