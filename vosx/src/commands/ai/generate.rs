@@ -1,10 +1,47 @@
-//! `vosx ai generate` — single-prompt completion.
+//! `vosx ai generate` — single-prompt completion, streaming by
+//! default.
+//!
+//! Two paths through the dispatcher:
+//!
+//! - **Streaming (default)**: send `begin_generate` → loop
+//!   `poll_generation` at ~100ms ticks, printing each non-empty
+//!   `text` chunk as it arrives. Exits when `done = true`.
+//! - **Blocking (`--no-stream` or `--format json`)**: send the
+//!   original `generate` invoke and print the full completion.
+//!   Used by JSON consumers that want a single well-formed reply.
+//!
+//! Error surface:
+//!
+//! - Outer transport errors (daemon unreachable, timeout) bubble
+//!   up via the DaemonClient `?`.
+//! - In-flight inference errors land in the streaming `error`
+//!   field once the worker terminates. Either path surfaces them
+//!   as a non-zero CLI exit so scripts catch them.
+//! - Legacy `generate` returns inference errors as a `Value::Str`
+//!   beginning with `"error: "` (unchanged from Phase 6.1).
+
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
-use vos::value::{Msg, Value};
+use vos::abi::service::ServiceId;
+use vos::value::{Args as WireArgs, Msg, Value};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
+
+/// Tick interval for the poll loop. Small enough to feel
+/// streaming on a typical 2-20 tok/s CPU run; large enough that
+/// the libp2p round-trip doesn't dominate.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bound on consecutive empty polls before we bail out. Protects
+/// against a wedged worker that never reports `done`; at 100ms
+/// ticks this is 60s of silence. Inference at <1 tok/s would
+/// false-trigger here but that's outside the model class we
+/// support — Q4 0.5B reliably emits a token within seconds even
+/// on a slow CPU.
+const MAX_EMPTY_TICKS: u32 = 600;
 
 #[derive(Serialize)]
 struct CompletionView<'a> {
@@ -13,11 +50,15 @@ struct CompletionView<'a> {
     max_tokens: u32,
 }
 
+/// CLI-level arguments for `vosx ai generate`. Named with the
+/// `Generate` prefix so it doesn't collide with `vos::value::Args`
+/// (the wire-arguments type the streaming code decodes).
 pub struct Args {
     pub space: String,
     pub prompt: String,
     pub max_tokens: u32,
     pub extension: String,
+    pub no_stream: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -32,39 +73,130 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             )
         })?;
 
-        let reply = client.invoke_dyn(
-            extension_id,
-            &Msg::new("generate")
-                .with("prompt", args.prompt.clone())
-                .with("max_tokens", args.max_tokens),
-        )?;
+        // JSON output needs the whole completion in one chunk so
+        // the consumer gets a single well-formed reply. Streaming
+        // would print incremental text chunks that aren't JSON.
+        let use_stream = !args.no_stream && !output::is_json();
 
-        let completion = match reply {
-            Value::Str(s) => s,
-            Value::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
-            other => anyhow::bail!("ai generate returned unexpected value: {other:?}"),
-        };
-
-        // The extension surfaces inference failures as a Str
-        // beginning with "error: ". Detect + bail so the CLI exit
-        // code reflects the failure rather than echoing the
-        // message into stdout as if it were a completion.
-        if let Some(rest) = completion.strip_prefix("error: ") {
-            anyhow::bail!("ai generate failed: {rest}");
-        }
-
-        if output::is_json() {
-            output::print_json(&CompletionView {
-                prompt: &args.prompt,
-                completion: &completion,
-                max_tokens: args.max_tokens,
-            });
+        if use_stream {
+            run_streaming(client, extension_id, &args)
         } else {
-            print!("{completion}");
-            if !completion.ends_with('\n') {
-                println!();
+            run_blocking(client, extension_id, &args)
+        }
+    })
+}
+
+/// Streaming path: begin_generate → poll until done.
+fn run_streaming(
+    client: &DaemonClient,
+    extension_id: ServiceId,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let begin_reply = client.invoke_dyn(
+        extension_id,
+        &Msg::new("begin_generate")
+            .with("prompt", args.prompt.clone())
+            .with("max_tokens", args.max_tokens),
+    )?;
+    let request_id = match begin_reply {
+        Value::U64(id) => id,
+        Value::U32(id) => id as u64,
+        Value::Bytes(b) if b.len() == 8 => {
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        }
+        other => anyhow::bail!("ai begin_generate returned unexpected value: {other:?}"),
+    };
+
+    let mut accumulated = String::new();
+    let mut empty_ticks: u32 = 0;
+    loop {
+        let poll_reply = client.invoke_dyn(
+            extension_id,
+            &Msg::new("poll_generation").with("request_id", request_id),
+        )?;
+        let chunk_args = decode_chunk_args(poll_reply)?;
+        let text = chunk_args.get_str("text").unwrap_or_default();
+        let done = chunk_args.get_bool("done").unwrap_or(false);
+        let error = chunk_args.get_str("error").unwrap_or_default();
+
+        if !text.is_empty() {
+            // Print + flush immediately so the user sees tokens
+            // as they arrive, not buffered until newline.
+            use std::io::Write as _;
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            accumulated.push_str(&text);
+            empty_ticks = 0;
+        } else if !done {
+            empty_ticks += 1;
+            if empty_ticks > MAX_EMPTY_TICKS {
+                anyhow::bail!(
+                    "ai poll_generation: no output for {}s — worker may be wedged",
+                    MAX_EMPTY_TICKS / 10,
+                );
             }
         }
-        Ok(())
-    })
+
+        if done {
+            if !accumulated.ends_with('\n') {
+                println!();
+            }
+            if !error.is_empty() {
+                anyhow::bail!("ai generate failed mid-stream: {error}");
+            }
+            return Ok(());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Blocking path: single `generate` invoke, print the full
+/// completion at once.
+fn run_blocking(client: &DaemonClient, extension_id: ServiceId, args: &Args) -> anyhow::Result<()> {
+    let reply = client.invoke_dyn(
+        extension_id,
+        &Msg::new("generate")
+            .with("prompt", args.prompt.clone())
+            .with("max_tokens", args.max_tokens),
+    )?;
+
+    let completion = match reply {
+        Value::Str(s) => s,
+        Value::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
+        other => anyhow::bail!("ai generate returned unexpected value: {other:?}"),
+    };
+
+    if let Some(rest) = completion.strip_prefix("error: ") {
+        anyhow::bail!("ai generate failed: {rest}");
+    }
+
+    if output::is_json() {
+        output::print_json(&CompletionView {
+            prompt: &args.prompt,
+            completion: &completion,
+            max_tokens: args.max_tokens,
+        });
+    } else {
+        print!("{completion}");
+        if !completion.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Decode the `Value::Bytes(rkyv-encoded Args)` payload that
+/// `poll_generation` returns. Matches the shape
+/// `GenerationChunk::to_args` produces in the ai extension.
+fn decode_chunk_args(value: Value) -> anyhow::Result<WireArgs> {
+    let bytes = match value {
+        Value::Bytes(b) => b,
+        Value::Unit => anyhow::bail!("poll_generation returned Unit — request id unknown?"),
+        other => anyhow::bail!("poll_generation returned {other:?}, expected Bytes"),
+    };
+    if bytes.is_empty() {
+        anyhow::bail!("poll_generation returned empty bytes");
+    }
+    <WireArgs as vos::Decode>::try_decode(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("poll_generation reply isn't a valid Args"))
 }

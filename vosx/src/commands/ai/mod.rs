@@ -24,6 +24,12 @@ pub enum AiCommand {
     /// Run a prompt through the AI extension's loaded model and
     /// print the completion to stdout. The model loads on first
     /// use; subsequent calls are warm.
+    ///
+    /// By default the CLI streams tokens as the model emits them
+    /// (visible incremental output, polling the extension at
+    /// ~100ms). Pass `--no-stream` for the one-shot blocking
+    /// shape — useful for `--format json` consumers that want a
+    /// single well-formed JSON object on stdout.
     Generate {
         /// Space id (full hex) or name.
         #[arg(long)]
@@ -40,6 +46,13 @@ pub enum AiCommand {
         /// different configs.
         #[arg(long, default_value = "ai")]
         extension: String,
+        /// Skip the streaming path: send one blocking `generate`
+        /// invoke and print the full completion at once. Default
+        /// streams via `begin_generate` + `poll_generation`.
+        /// `--format json` implies `--no-stream` because the
+        /// single-object reply is what JSON consumers expect.
+        #[arg(long)]
+        no_stream: bool,
     },
 }
 
@@ -50,11 +63,13 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             prompt,
             max_tokens,
             extension,
+            no_stream,
         } => generate::run(generate::Args {
             space,
             prompt,
             max_tokens,
             extension,
+            no_stream,
         }),
     }
 }

@@ -80,9 +80,28 @@ impl ModelHandle {
         })
     }
 
-    /// Generate up to `max_tokens` tokens for `prompt`. Returns the
-    /// decoded assistant turn, stripped of the template scaffolding.
-    pub fn generate(&mut self, prompt: &str, max_tokens: u32) -> Result<String> {
+    /// Generate up to `max_tokens` tokens for `prompt`, calling
+    /// `on_chunk` with each newly-decoded text chunk (the diff
+    /// between successive incremental decodes). The callback is
+    /// invoked at least once on success (possibly with an empty
+    /// string if the model emits EOS immediately) and returns
+    /// `false` to abort the loop early; `true` to keep going.
+    ///
+    /// We decode the *cumulative* token list each iteration and
+    /// emit only the suffix that's new since the last emit. This
+    /// is the standard pattern when token boundaries don't line
+    /// up with UTF-8 codepoints — naively decoding each token in
+    /// isolation produces replacement characters for multi-byte
+    /// sequences split across tokens.
+    pub fn generate_stream<F>(
+        &mut self,
+        prompt: &str,
+        max_tokens: u32,
+        mut on_chunk: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> bool,
+    {
         // Apply the Qwen2.5-Instruct chat template manually.
         // Single-user-turn shape; multi-turn history is a v2 concern.
         let templated = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
@@ -105,8 +124,10 @@ impl ModelHandle {
         let max_new = cap.saturating_sub(prompt_tokens.len());
         if max_new == 0 {
             // Prompt already fills the context — nothing left to
-            // generate. Empty string is the honest answer.
-            return Ok(String::new());
+            // generate. Emit one empty chunk so the caller sees a
+            // single "done" signal and exits cleanly.
+            on_chunk("");
+            return Ok(());
         }
 
         // ── Prompt-prefill pass: feed every prompt token at once
@@ -117,29 +138,67 @@ impl ModelHandle {
         let logits = self.model.forward(&input, 0)?;
         let mut next_token = sample_last(&mut logits_processor, &logits)?;
         let mut generated: Vec<u32> = Vec::with_capacity(max_new);
-        if next_token != self.eos_token_id {
-            generated.push(next_token);
-        }
+        let mut emitted_bytes: usize = 0;
         let mut idx_pos = prompt_tokens.len();
 
-        // ── Decode loop. Each iteration feeds one token, samples
-        //    one. Capped by `max_new` and short-circuited on EOS.
-        while generated.len() < max_new && next_token != self.eos_token_id {
-            let input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, idx_pos)?;
-            next_token = sample_last(&mut logits_processor, &logits)?;
-            idx_pos += 1;
+        // ── Decode loop. Each iteration appends the sampled
+        //    token, decodes the cumulative list, emits the suffix
+        //    that's new since last time. Breaks on EOS, the
+        //    max_tokens cap, or the callback returning false.
+        loop {
             if next_token == self.eos_token_id {
                 break;
             }
             generated.push(next_token);
+
+            // Re-decode the whole token list. Cheaper than it
+            // looks — the tokenizer's BPE is linear in the token
+            // count and 0.5B-Q4 inference is the bottleneck by
+            // orders of magnitude.
+            let text = self
+                .tokenizer
+                .decode(&generated, true)
+                .map_err(|e| anyhow!("decode generated tokens: {e}"))?;
+            if text.len() > emitted_bytes {
+                // Carve off the new suffix. `decode` is stable
+                // enough across appends that the prefix is
+                // byte-identical to the prior call's output, so a
+                // simple byte-slice gives us the new chunk.
+                let chunk = &text[emitted_bytes..];
+                if !on_chunk(chunk) {
+                    return Ok(());
+                }
+                emitted_bytes = text.len();
+            }
+
+            if generated.len() >= max_new {
+                break;
+            }
+            let input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
+            let logits = self.model.forward(&input, idx_pos)?;
+            next_token = sample_last(&mut logits_processor, &logits)?;
+            idx_pos += 1;
         }
 
-        let text = self
-            .tokenizer
-            .decode(&generated, true)
-            .map_err(|e| anyhow!("decode generated tokens: {e}"))?;
-        Ok(text)
+        // If we exited the loop without ever emitting (e.g. the
+        // very first sampled token was EOS), give the caller one
+        // empty chunk so its "done" signal fires cleanly.
+        if emitted_bytes == 0 {
+            on_chunk("");
+        }
+        Ok(())
+    }
+
+    /// Blocking wrapper around [`generate_stream`]: drains every
+    /// chunk into one `String` and returns. Used by the old
+    /// `generate` dispatch arm + the CLI's `--no-stream` mode.
+    pub fn generate(&mut self, prompt: &str, max_tokens: u32) -> Result<String> {
+        let mut buf = String::new();
+        self.generate_stream(prompt, max_tokens, |chunk| {
+            buf.push_str(chunk);
+            true
+        })?;
+        Ok(buf)
     }
 }
 

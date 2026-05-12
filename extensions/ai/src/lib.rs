@@ -13,24 +13,30 @@
 //!   override every defaultable knob. Defaults aim at a small
 //!   coding model that runs on a laptop CPU
 //!   (Qwen2.5-Coder-0.5B-Instruct Q4_K_M).
-//! - **Synchronous.** v1 returns the full completion in one reply;
-//!   streaming + cancellation are deferred until the generate
-//!   loop has a real backpressure story.
+//! - **Two dispatch shapes.** `generate(prompt, max_tokens) -> String`
+//!   is the blocking call; `begin_generate(prompt, max_tokens) -> u64`
+//!   spawns an inference worker and returns a `request_id`, then
+//!   `poll_generation(request_id) -> GenerationChunk` drains
+//!   newly-emitted text. Streaming is the CLI default; the
+//!   blocking call stays for the `--no-stream` / scripted-JSON
+//!   path.
 //!
 //! ## Lifecycle
 //!
 //! Service-mode extension. `run()` idles in a shutdown poll; all
 //! real work arrives through `vos_service_handle_invoke`. The
-//! model loads lazily inside the first `generate` call so daemon
-//! startup isn't penalised even when the manifest enables the
-//! extension but nothing invokes it.
+//! model loads lazily inside the first `generate` / `begin_generate`
+//! call so daemon startup isn't penalised even when the manifest
+//! enables the extension but nothing invokes it.
 
 mod config;
 mod ext;
 mod fetch;
 mod generate;
+mod requests;
 
 pub use config::InitConfig;
+pub use requests::GenerationChunk;
 
 vos::service_main!(
     ext::AiExtension,
