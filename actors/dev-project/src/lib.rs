@@ -223,6 +223,14 @@ pub struct CommitNode {
     pub intent_tag: u8,
     pub intent_data: Vec<u8>,
     pub change_id: [u8; HASH_BYTES],
+    /// Per-path conflicts the merge couldn't decide. Always empty
+    /// for non-merge commits and clean merges; populated by
+    /// `merge`'s `merge_trees` output when ours/theirs diverged
+    /// on a path. The commit is still valid — agents read it,
+    /// descend it, and resolve by put_blob + commit. Sorted by
+    /// path; the canonical commit hash includes this field so
+    /// resolving one conflict still mints a new commit.
+    pub conflicts: Vec<ConflictEntry>,
 }
 
 /// One branch pointer.
@@ -582,6 +590,7 @@ pub mod store {
             intent_tag: args.intent_tag,
             intent_data: args.intent_data,
             change_id: change_id_arr,
+            conflicts: Vec::new(),
         };
         let hash = commit_hash(&row, change_id_arr);
         if change_id_arr == [0u8; HASH_BYTES] {
@@ -1068,6 +1077,18 @@ fn commit_hash(row: &CommitNode, change_id_used: [u8; HASH_BYTES]) -> [u8; HASH_
     buf.extend_from_slice(&(row.intent_data.len() as u32).to_le_bytes());
     buf.extend_from_slice(&row.intent_data);
     buf.extend_from_slice(&change_id_used);
+    // Conflicts are part of the canonical encoding so resolving
+    // one (which mutates the conflicts list) still mints a new
+    // commit hash. Empty for non-merge commits.
+    buf.extend_from_slice(&(row.conflicts.len() as u32).to_le_bytes());
+    for c in &row.conflicts {
+        let pb = c.path.as_bytes();
+        buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pb);
+        buf.extend_from_slice(&c.base);
+        buf.extend_from_slice(&c.ours);
+        buf.extend_from_slice(&c.theirs);
+    }
     vos::crypto::blake2b_hash(b"vos-dev-project/commit/v1", &[&buf])
 }
 
