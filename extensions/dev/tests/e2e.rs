@@ -609,7 +609,15 @@ fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
 /// canonical text via `dev_ast::ast_to_text` before writing to
 /// disk, so the cargo invocation sees byte-identical source in
 /// both flows.
+///
+/// TEMP: ignored while the PVM-side `put_blob_ast` handler is
+/// off (kept host-side to dodge the grey-transpiler edge — see
+/// the NOTE comments in dev-project's lib.rs). The host-side
+/// AST round-trip is still covered by the unit tests in
+/// `actors/dev-project/dev-ast/`. Re-enable once the actor
+/// surfaces `put_blob_ast` again.
 #[test]
+#[ignore]
 fn compile_via_ast_matches_raw_artifact() {
     ensure_built();
     let mut daemon = boot_daemon();

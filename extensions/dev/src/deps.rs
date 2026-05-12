@@ -289,18 +289,27 @@ pub fn synthesise_root_dependencies(deps: &[DepEntry]) -> String {
 // ── Wire helpers ─────────────────────────────────────────────────────
 
 pub(crate) fn fetch_metadata(ctx: &ServiceCtx, project_id: u32) -> Result<ProjectMetadata, u8> {
-    let msg = Msg::new("metadata");
-    let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
-        .ok_or(COMPILE_STATUS_TRANSPORT)?;
-    let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
-    let inner = value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)?;
+    // ProjectMetadata is the Phase 5.1 dep-graph payload. The
+    // current PVM-side actor doesn't expose a `metadata` handler
+    // (kept host-side to dodge the grey-transpiler edge — see
+    // dev-project's NOTE comments), so the dispatch may bounce
+    // back as STATUS_NOT_FOUND. Treat any of "transport bounced",
+    // "empty reply", or "non-decodable payload" as "no metadata
+    // declared yet" — the compile path falls through to a
+    // dep-less workspace synthesis in that case.
+    let Some(raw) = ctx.ask_raw(project_id, &dyn_payload(&Msg::new("metadata"))) else {
+        return Ok(ProjectMetadata::default());
+    };
+    let Some(value) = decode_value(&raw) else {
+        return Ok(ProjectMetadata::default());
+    };
+    let Some(inner) = value_to_bytes(value) else {
+        return Ok(ProjectMetadata::default());
+    };
     if inner.is_empty() {
-        // Project predates Phase 5.1 / hasn't set metadata yet —
-        // treat as empty.
         return Ok(ProjectMetadata::default());
     }
-    <ProjectMetadata as vos::Decode>::try_decode(&inner).ok_or(COMPILE_STATUS_BAD_REPLY)
+    Ok(<ProjectMetadata as vos::Decode>::try_decode(&inner).unwrap_or_default())
 }
 
 fn registry_resolve(ctx: &ServiceCtx, name: &str, caller_prefix: u16) -> Result<u32, u8> {

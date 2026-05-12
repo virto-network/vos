@@ -30,7 +30,7 @@ vos = { path = "../../vos", default-features = false, features = ["extension"] }
 dev-project = { path = "../../actors/dev-project", default-features = false }
 # Drives the RISC-V ELF → PVM blob conversion after cargo
 # produces the riscv64em-javm target binary.
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1" }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec9989b5fe221051fb87be6664459a6148e", version = "0.1" }
 # Round-trips `BlobKind::RustAst` blobs back to text. Path dep
 # since dev-ast lives in its own workspace under the dev-project
 # tree — `version` mirrors what the crate self-declares.
