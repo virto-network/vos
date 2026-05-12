@@ -17,6 +17,7 @@
 
 use clap::Subcommand;
 
+pub mod actor;
 pub mod generate;
 
 #[derive(Subcommand, Debug)]
@@ -54,6 +55,43 @@ pub enum AiCommand {
         #[arg(long)]
         no_stream: bool,
     },
+    /// Ask the AI extension to write or modify a VOS actor's
+    /// source. Pulls the project's current files out of the
+    /// dev-project actor's commit DAG, stuffs them into the
+    /// prompt as context, then streams the completion to stdout.
+    ///
+    /// Requires both the AI extension and the dev extension
+    /// loaded in the space (the dev extension owns the
+    /// dev-project actor instances). Provision the project with
+    /// `vosx dev new` first.
+    ///
+    /// v1 is read-only — the model's reply lands on stdout, you
+    /// paste new files back through `vosx dev` or your editor.
+    /// An `--apply` flag that writes the result back as a
+    /// working change is a follow-up.
+    Actor {
+        /// Space id (full hex) or name.
+        #[arg(long)]
+        space: String,
+        /// Project instance name (the one passed to `vosx dev new`).
+        #[arg(long)]
+        project: String,
+        /// Description of what to add, change, or write. Quote
+        /// it so the shell hands the whole sentence as one argv.
+        prompt: String,
+        /// Cap on tokens generated. Higher than `generate`'s
+        /// default because a full actor file is often 100-300
+        /// tokens before the model gets to anything new.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+        /// Override the AI extension instance name.
+        #[arg(long, default_value = "ai")]
+        extension: String,
+        /// Source commit hash (64 hex). Defaults to the project's
+        /// current `main` branch head.
+        #[arg(long, value_name = "HEX")]
+        commit: Option<String>,
+    },
 }
 
 pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
@@ -70,6 +108,21 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             max_tokens,
             extension,
             no_stream,
+        }),
+        AiCommand::Actor {
+            space,
+            project,
+            prompt,
+            max_tokens,
+            extension,
+            commit,
+        } => actor::run(actor::Args {
+            space,
+            project,
+            prompt,
+            max_tokens,
+            extension,
+            commit,
         }),
     }
 }

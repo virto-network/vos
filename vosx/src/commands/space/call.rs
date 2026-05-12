@@ -85,16 +85,23 @@ fn is_raw_target(target: &str) -> bool {
 }
 
 /// Parse `key=value` strings into a typed `Msg`. Heuristics:
-/// numeric → u64, `true`/`false` → bool, otherwise string.
-/// Same shape `space install --init` and the manifest
-/// reconciler use.
+/// numeric → u64, `true`/`false` → bool, `@path` → bytes read
+/// from `path`, otherwise string. Same shape `space install
+/// --init` and the manifest reconciler use, extended with the
+/// `@path` shorthand so an operator can feed a file's bytes
+/// into a `Vec<u8>` handler arg without escaping every byte
+/// through the shell.
 fn build_msg(method: &str, args: &[String]) -> anyhow::Result<Msg> {
     let mut msg = Msg::new(method);
     for a in args {
         let (k, v) = a
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--arg '{a}' must be 'key=value'"))?;
-        if let Ok(n) = v.parse::<u64>() {
+        if let Some(path) = v.strip_prefix('@') {
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("read '{path}' for arg '{k}': {e}"))?;
+            msg = msg.with(k, bytes);
+        } else if let Ok(n) = v.parse::<u64>() {
             msg = msg.with(k, n);
         } else if let Ok(b) = v.parse::<bool>() {
             msg = msg.with(k, b);
