@@ -65,10 +65,10 @@ pub enum AiCommand {
     /// dev-project actor instances). Provision the project with
     /// `vosx dev new` first.
     ///
-    /// v1 is read-only — the model's reply lands on stdout, you
-    /// paste new files back through `vosx dev` or your editor.
-    /// An `--apply` flag that writes the result back as a
-    /// working change is a follow-up.
+    /// Default mode is read-only — the model's reply lands on
+    /// stdout for inspection. Pass `--apply` to parse the
+    /// fenced code blocks out of the reply and commit them back
+    /// to the project's `main` branch as a new commit.
     Actor {
         /// Space id (full hex) or name.
         #[arg(long)]
@@ -91,6 +91,13 @@ pub enum AiCommand {
         /// current `main` branch head.
         #[arg(long, value_name = "HEX")]
         commit: Option<String>,
+        /// Parse the model's response and write each detected
+        /// file back to the project's `main` branch as a new
+        /// commit. The parser looks for `path:` (or `## path`,
+        /// `**path:**`) followed by a fenced code block.
+        /// Without this flag the response is print-only.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -116,6 +123,7 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             max_tokens,
             extension,
             commit,
+            apply,
         } => actor::run(actor::Args {
             space,
             project,
@@ -123,6 +131,7 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             max_tokens,
             extension,
             commit,
+            apply,
         }),
     }
 }
