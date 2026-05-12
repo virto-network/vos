@@ -16,6 +16,7 @@
 
 use serde::Serialize;
 use space_registry::{STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT};
+use vos::init::{InitArgs, InitValue};
 
 use crate::blob_store::{self, BlobHash};
 use crate::bundled;
@@ -105,6 +106,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             None => auto_replication_id(&args.name, &program_hash.0),
         };
 
+        // dev-project's constructor is `new(name: String)` — the
+        // actor's bootstrap path expects the constructor args in
+        // storage under the macro-emitted INIT_KEY. Passing the
+        // operator-chosen instance name doubles as the project's
+        // display name in the actor's state.
+        let init_args = InitArgs::new().with("name", InitValue::Str(args.name.clone()));
+        let install_args = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args)
+            .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
+            .to_vec();
+
         let status = client.install(
             args.name.clone(),
             DEV_PROJECT_NAME.to_string(),
@@ -112,7 +123,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             program_hash.0.to_vec(),
             replication_id.to_vec(),
             CONSISTENCY_CRDT,
-            Vec::new(),
+            install_args,
             Vec::new(),
         )?;
 

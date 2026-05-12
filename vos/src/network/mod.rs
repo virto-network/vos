@@ -1255,10 +1255,18 @@ fn build_swarm(
             let ping = ping::Behaviour::default();
             let identify =
                 identify::Behaviour::new(identify::Config::new("/vos/0.1.0".into(), key.public()));
+            // request_response's default per-request timeout is
+            // 10s — fine for typical actor invokes but the dev
+            // extension's `compile` runs `cargo rustc` inline and
+            // routinely takes 5-30s on a cold cache. Lift the
+            // cap globally rather than threading a per-call
+            // override through every layer. Five minutes matches
+            // `DEFAULT_ASK_TIMEOUT` in service_host (the same
+            // budget extensions' own `ask_raw` calls bound on).
             let req_resp = request_response::Behaviour::with_codec(
                 VosCodec,
                 std::iter::once((PROTOCOL, ProtocolSupport::Full)),
-                request_response::Config::default(),
+                request_response::Config::default().with_request_timeout(Duration::from_secs(300)),
             );
             // Gossipsub: one mesh per replication group. We sign
             // messages with the local keypair so peers can attest

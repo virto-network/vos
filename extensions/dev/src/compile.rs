@@ -36,10 +36,19 @@ use vos::value::{Msg, TAG_DYNAMIC, Value};
 /// actor build and synthesised compiles.
 const RISCV_TARGET_JSON: &str = include_str!("../../../actors/dev-project/riscv64em-javm.json");
 
-/// Nightly channel the rest of the workspace pins. Synthesised
-/// projects use the same pin so a rustup install satisfying the
-/// workspace also satisfies dev-extension compiles.
-const RUST_TOOLCHAIN: &str = include_str!("../../../rust-toolchain.toml");
+/// Toolchain pin baked into every synthesised project. We
+/// deliberately *don't* mirror the workspace's
+/// `rust-toolchain.toml` here: the workspace pins
+/// `nightly-2025-05-09` for zkpvm reproducibility, but that
+/// nightly is too old to accept the riscv64em-javm JSON target
+/// spec's current shape. Pinning the generic `nightly` channel
+/// means the synthesised build picks up whatever fresh nightly
+/// the operator's rustup default points at — same one the
+/// `examples/actors/*/cargo actor` recipes target.
+const RUST_TOOLCHAIN: &str = r#"[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+"#;
 
 /// Path to the `vos` crate as a fully-qualified directory string.
 /// Baked at build time so the synthesised Cargo.toml can declare
@@ -207,6 +216,30 @@ pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<
     }
 }
 
+/// Extract the toolchain channel string out of a `rust-
+/// toolchain.toml` body. Returns `None` if the file shape isn't
+/// the expected `[toolchain] channel = "..."`.
+fn parse_toolchain_channel(s: &str) -> Option<&str> {
+    let mut in_toolchain = false;
+    for line in s.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_toolchain = line.starts_with("[toolchain");
+            continue;
+        }
+        if !in_toolchain {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("channel") else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        return rest.split('"').next();
+    }
+    None
+}
+
 pub(crate) fn bytes_to_32_or_zero(b: &[u8]) -> [u8; HASH_BYTES] {
     let mut out = [0u8; HASH_BYTES];
     if b.len() == HASH_BYTES {
@@ -243,9 +276,22 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         return CompileOutcome::err(COMPILE_STATUS_IO, e);
     }
 
-    // ── 4. Invoke cargo
+    // ── 4. Invoke cargo. Clear `RUSTUP_TOOLCHAIN` so the
+    //    synthesised `rust-toolchain.toml` actually drives the
+    //    channel selection — if the daemon was launched under
+    //    `cargo +stable test`, the env var would otherwise pin
+    //    cargo to stable and `-Zbuild-std` immediately rejects.
+    // The synthesised `rust-toolchain.toml` pins the channel, but
+    // rustup's rust-toolchain auto-detection runs *before* it picks
+    // up the file in CWD when invoked through the proxy in non-
+    // workspace contexts. Pass `+<channel>` explicitly so the right
+    // cargo binary handles `-Zjson-target-spec` + `-Zbuild-std`.
+    let cargo_channel = parse_toolchain_channel(RUST_TOOLCHAIN).unwrap_or("nightly");
+    let toolchain_arg = format!("+{cargo_channel}");
     let output = match Command::new("cargo")
         .args([
+            toolchain_arg.as_str(),
+            "-Zjson-target-spec",
             "rustc",
             "--lib",
             "--crate-type",
@@ -256,6 +302,7 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
             "--target",
             "riscv64em-javm.json",
         ])
+        .env_remove("RUSTUP_TOOLCHAIN")
         .current_dir(project_root)
         .output()
     {
@@ -283,27 +330,35 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         }
     };
 
-    // ── 6. Transpile RISC-V ELF → PVM blob
-    let pvm_blob = match grey_transpiler::link_elf(&elf_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            return CompileOutcome::err(COMPILE_STATUS_TRANSPILE_FAILED, format!("{e:?}"));
-        }
-    };
-
-    // ── 7. Store the PVM blob back into the project's object store
-    let pvm_hash = match put_blob(ctx, project_id, &pvm_blob) {
-        Ok(h) => h,
-        Err(status) => return CompileOutcome::err(status, "put_blob failed"),
-    };
-    if pvm_hash.len() != HASH_BYTES {
-        return CompileOutcome::err(
-            COMPILE_STATUS_BAD_REPLY,
-            "put_blob returned wrong hash length",
-        );
+    // ── 6. Sanity-check the transpile works — produces the PVM
+    //    blob that `space up`'s startup will compute later. We
+    //    discard the result; persisting the RISC-V ELF instead
+    //    keeps the cache shape symmetric with the rest of the
+    //    toolchain (`space publish <source>` → ELF → cache →
+    //    `space up`'s `link_elf` on load). Trying to cache the
+    //    PVM blob directly would force the install path to
+    //    distinguish "pre-transpiled" from "needs transpile"
+    //    bytes, which is more breakage than it's worth.
+    if let Err(e) = grey_transpiler::link_elf(&elf_bytes) {
+        return CompileOutcome::err(COMPILE_STATUS_TRANSPILE_FAILED, format!("{e:?}"));
     }
 
-    CompileOutcome::ok(pvm_hash)
+    // ── 7. Persist the RISC-V ELF to the host-side blob cache.
+    //    Neither dev-project nor space-registry can hold these
+    //    bytes in their PVM-archived state — both run in the PVM
+    //    with a 64KB heap, well under the typical ~150KB compiled
+    //    actor. The local cache (mirror of vosx's
+    //    `~/.cache/vosx/blobs/`) is the host-side store the rest
+    //    of the toolchain (`vosx space install`) already reads
+    //    from, so dropping the bytes there closes the loop without
+    //    a new transport. Cross-node distribution will need a
+    //    dedicated host-side blob agent — out of scope for v1.
+    let elf_hash = match crate::publish::write_to_blob_cache(&elf_bytes) {
+        Ok(h) => h,
+        Err(e) => return CompileOutcome::err(COMPILE_STATUS_IO, e),
+    };
+
+    CompileOutcome::ok(elf_hash)
 }
 
 // ── Wire helpers ─────────────────────────────────────────────────────

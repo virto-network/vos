@@ -32,3 +32,14 @@ dev-project = { path = "../../actors/dev-project", default-features = false }
 # produces the riscv64em-javm target binary.
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1" }
 tempfile = "3"
+
+[dev-dependencies]
+# The e2e test drives a real `vosx space up` daemon and dials it
+# as a libp2p client via vos's host APIs. Pulling vos back in with
+# std + network + storage gives us the same primitives DaemonClient
+# uses inside vosx — we can't import vosx's lib because it's a
+# binary crate.
+vos = { path = "../../vos", default-features = false, features = ["extension", "std", "network", "storage"] }
+libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

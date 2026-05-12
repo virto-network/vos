@@ -566,8 +566,13 @@ impl crate::network::NetworkService for NodeService {
         // libp2p protocol still ships only reply bytes, so unwrap
         // here. A future protocol bump can carry the envelope so
         // remote yielded children become drivable cross-node.
+        //
+        // Timeout budget mirrors the libp2p request_response side
+        // (5 min) so slow handlers like the dev extension's
+        // `compile` (cargo + rustc) don't get cut off here while
+        // the wire layer is still patient.
         reply_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(300))
             .ok()
             .and_then(|env| unwrap_invoke_envelope(&env))
             .unwrap_or_default()

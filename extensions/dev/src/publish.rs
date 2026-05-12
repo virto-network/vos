@@ -30,7 +30,7 @@ use vos::value::{Msg, Value};
 
 use crate::compile::{
     COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_TRANSPORT, bytes_to_32_or_zero, decode_value,
-    dyn_payload, fetch_blob, fetch_commit, fetch_head, remote_commit, value_to_bytes,
+    dyn_payload, fetch_commit, fetch_head, remote_commit,
 };
 
 /// `ServiceId::REGISTRY.0` — the space-registry is reachable as a
@@ -99,58 +99,36 @@ pub fn publish(
         };
     }
 
-    // ── 3. Pull the PVM blob's bytes out of the project's object
-    //    store. `intent.artifact` carries the dev-project blob hash
-    //    (i.e. blake2b("vos-dev-project/blob/v1", bytes)), distinct
-    //    from the empty-domain hash the registry uses.
-    let blob = match fetch_blob(ctx, project_id, &intent.artifact) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            return HashResult {
-                status: PUBLISH_STATUS_BLOB_NOT_FOUND,
-                hash: Vec::new(),
-            };
-        }
-        Err(status) => {
-            return HashResult {
-                status,
-                hash: Vec::new(),
-            };
-        }
-    };
-
-    // ── 4. Re-key under the registry's empty-domain hash by
-    //    uploading. The registry returns the canonical hash; we
-    //    use it as the catalog key and also as the local-cache
-    //    filename below.
-    let registry_hash = match registry_upload_blob(ctx, &blob.bytes) {
-        Ok(h) => h,
-        Err(status) => {
-            return HashResult {
-                status,
-                hash: Vec::new(),
-            };
-        }
-    };
+    // ── 3. The build commit's `intent.artifact` already carries
+    //    the empty-domain hash compile.rs computed when it wrote
+    //    the PVM blob into the host-side blob cache. Both
+    //    dev-project and space-registry would otherwise need to
+    //    materialise the bytes through the 64KB PVM heap, which
+    //    a typical ~150KB compiled actor doesn't fit; the local
+    //    cache sidesteps that entirely. The hash here is the same
+    //    one `space install` looks up via `cache_get`.
+    let registry_hash = intent.artifact.to_vec();
     if registry_hash.len() != HASH_BYTES {
         return HashResult {
             status: COMPILE_STATUS_BAD_REPLY,
             hash: Vec::new(),
         };
     }
-
-    // ── 5. Mirror to the local blob cache so same-node `vosx space
-    //    install` finds the bytes without falling back to a
-    //    registry fetch (which install / up don't do yet). Failure
-    //    is non-fatal — the registry still has the bytes.
-    if let Err(e) = write_to_local_cache(&registry_hash, &blob.bytes) {
-        log::warn!(
-            "dev: failed to mirror blob to local cache ({e}); \
-             registry upload still succeeded — install may need a manual blob cache hydrate"
-        );
+    // Sanity check: the blob the compile step wrote should still
+    // be in the local cache. If it's not, the operator has manually
+    // garbage-collected — surface a clean "not found" rather than
+    // a silent missing-bytes install.
+    if !blob_cache_path(&registry_hash).exists() {
+        return HashResult {
+            status: PUBLISH_STATUS_BLOB_NOT_FOUND,
+            hash: Vec::new(),
+        };
     }
 
-    // ── 6. Register the program in the catalog.
+    // ── 4. Register the program in the catalog. The catalog only
+    //    needs the (name, version, hash) row — the actual bytes
+    //    are already in the local blob cache from the compile
+    //    step, which is where `space install` reads them.
     match registry_publish(ctx, &name, &version, &registry_hash) {
         Ok(s) if s == STATUS_OK => {}
         Ok(s) => {
@@ -168,7 +146,7 @@ pub fn publish(
         }
     }
 
-    // ── 7. Record an INTENT_PUBLISH commit on the publishes
+    // ── 5. Record an INTENT_PUBLISH commit on the publishes
     //    branch.
     let publish_intent = PublishIntent {
         program_name: name,
@@ -216,17 +194,6 @@ pub fn publish(
     }
 }
 
-// ── Registry wire calls ─────────────────────────────────────────────
-
-fn registry_upload_blob(ctx: &ServiceCtx, bytes: &[u8]) -> Result<Vec<u8>, u8> {
-    let msg = Msg::new("upload_blob").with("bytes", bytes.to_vec());
-    let raw = ctx
-        .ask_raw(REGISTRY_ID, &dyn_payload(&msg))
-        .ok_or(COMPILE_STATUS_TRANSPORT)?;
-    let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
-    value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
-}
-
 fn registry_publish(ctx: &ServiceCtx, name: &str, version: &str, hash: &[u8]) -> Result<u8, u8> {
     let msg = Msg::new("publish")
         .with("name", name.to_string())
@@ -246,24 +213,36 @@ fn registry_publish(ctx: &ServiceCtx, name: &str, version: &str, hash: &[u8]) ->
     }
 }
 
-// ── Local blob cache mirror ─────────────────────────────────────────
+// ── Local blob cache (host-side storage) ────────────────────────────
 
-/// Replicate vosx's blob cache layout
-/// (`paths::blob_cache_dir() / hex_hash`) so `space install` /
-/// `space up` find the bytes without a registry-fallback lookup.
-fn write_to_local_cache(hash: &[u8], bytes: &[u8]) -> std::io::Result<()> {
+/// Persist bytes into vosx's blob cache layout
+/// (`paths::blob_cache_dir() / hex_hash`), keyed by the same
+/// empty-domain blake2b `BlobHash::of` uses. Returns the hash so
+/// the caller can record it in commits / catalog rows.
+///
+/// Called by the dev extension's compile step (storing the PVM
+/// artifact bytes the cargo run produced); `vosx space install`
+/// reads back from the same path via `cache_get`.
+pub(crate) fn write_to_blob_cache(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let hash: [u8; HASH_BYTES] = vos::crypto::blake2b_hash(&[], &[bytes]);
     let dir = blob_cache_dir();
-    fs::create_dir_all(&dir)?;
-    let hex_name = hex_encode(hash);
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let hex_name = hex_encode(&hash);
     let path = dir.join(&hex_name);
 
-    // Atomic write: rename a sibling temp into place. Eliminates a
-    // partial-write window where a parallel reader would see a
-    // truncated cache entry.
+    // Atomic write: rename a sibling temp into place so a parallel
+    // reader can't pick up a half-written file.
     let tmp = dir.join(format!("{hex_name}.partial-{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    Ok(hash.to_vec())
+}
+
+/// Resolve the on-disk path for a given blob hash. Used by
+/// `publish` as a defensive existence check before registering
+/// the program in the catalog.
+pub(crate) fn blob_cache_path(hash: &[u8]) -> PathBuf {
+    blob_cache_dir().join(hex_encode(hash))
 }
 
 /// Mirror of `vosx::paths::blob_cache_dir`. The two have to stay
