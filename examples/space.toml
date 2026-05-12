@@ -1,17 +1,18 @@
-# Kunekt.toml — example space manifest.
+# Example space manifest.
 #
-# One vosx instance runs one space. Other vosx instances pointed at
-# the same manifest will be able to join as peers when the libp2p
-# layer lands; today this still runs as a standalone node.
+# Reconcile into a space's registry on startup with:
 #
-# Run with:
-#   vosx up examples/Kunekt.toml
-#   vosx ls  examples/Kunekt.toml
+#   vosx space new --name demo
+#   vosx space up demo --manifest examples/space.toml
 #
-# Per-instance config (libp2p identity, listen addrs, data dir)
-# typically lives in a gitignored `Kunekt.local.toml` overlay so
-# different operators can run the same space with their own
-# `[node]` block.
+# The TOML is a devhelper — the registry is the runtime source of
+# truth. `vosx space export demo` re-derives an equivalent manifest
+# from the live registry; subsequent `space up --manifest` runs are
+# idempotent reconciliation.
+#
+# Per-node settings (libp2p listen, subscriptions) live in
+# `<data_dir>/local.toml`, not here. CLI flags `--listen` / `--connect`
+# on `space up` take precedence.
 
 # ── Space identity ────────────────────────────────────────────────
 #
@@ -20,12 +21,6 @@
 
 space = "demo"
 version = "0.1.0"
-
-# Optional. When set, this space announces itself to the named
-# hyperspace and inherits its registry transitively. A hyperspace
-# is just another space whose agent provides = ["registry"]
-# tracks the membership list. Standalone spaces leave this unset.
-# hyperspace = "main-hub"
 
 # ── Agents ────────────────────────────────────────────────────────
 #
@@ -37,14 +32,12 @@ version = "0.1.0"
 #   local      — redb-backed
 #   crdt       — merkle-CRDT (state + DAG + roots committed atomically;
 #                effect logs recorded for cross-replica replay)
+#   raft       — strict consensus; see space-raft.toml
 #
 # `provides`: opt-in role tags. Other actors / operators address
 # the agent by role rather than by local name. Future runtime will
 # expose `@role` lookup in init values; today these are surfaced in
-# the boot log and `vosx ls`.
-#
-# Either `path` (development) or `service` (registry lookup;
-# requires the networking layer) — not both.
+# the boot log and `vosx space agents`.
 
 [[agent]]
 name = "scheduler"
@@ -79,8 +72,9 @@ actors = [
 # Example: HTTP gateway exposed on loopback:18080. Init args become
 # rkyv-encoded `vos::value::Args` the extension's `fn new(args: &[u8])`
 # parses. Strings, integers, and bools all flow through as-is.
-# Lifecycle ops live on `vosx gateway stop` / `vosx gateway status`
-# through the dispatch path — no `admin_token` config needed.
+# Lifecycle ops live on `vosx --space demo gateway stop` /
+# `vosx --space demo gateway status` through the dispatch path —
+# no `admin_token` config needed.
 # [[extension]]
 # name = "gateway"
 # path = "../target/debug/libhttp_gateway.so"
@@ -88,15 +82,3 @@ actors = [
 #     bind_addr = "127.0.0.1",
 #     port      = 18080,
 # }
-
-# ── Per-instance configuration ────────────────────────────────────
-#
-# The [node] section holds settings that vary per running instance.
-# In practice, ship the manifest above without [node] and put
-# operator-specific config in a gitignored Kunekt.local.toml
-# overlay. CLI flags --data-dir / --no-persist take precedence.
-
-# [node]
-# identity = "auto"                       # libp2p keypair (reserved)
-# listen   = ["/ip4/0.0.0.0/tcp/4001"]    # libp2p listen addrs (reserved)
-# data_dir = "./data"                     # persistence dir

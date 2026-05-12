@@ -10,36 +10,31 @@
 #
 # ## Bootstrap
 #
-# One node bootstraps solo with `vosx up`; the others join with
-# `vosx join <bootnode>`. Membership is tracked dynamically via
-# joint consensus — no manual `node_prefix` harvesting.
+# One node creates the space; the others `space join` its
+# bootnode hint. Membership is tracked dynamically via joint
+# consensus — no manual `node_prefix` harvesting.
 #
-#   # Bootstrap node:
-#   vosx up examples/space-raft.toml \
-#       --data-dir /tmp/raft-a \
+#   # Bootstrap node A
+#   vosx space new --name a
+#   vosx space up a --manifest examples/space-raft.toml \
 #       --listen /ip4/127.0.0.1/tcp/4811 &
+#   vosx space info a  # copy the bootnode hint
 #
-#   # Note the printed bootnode multiaddr from the startup log
-#   # (looks like /ip4/127.0.0.1/tcp/4811/p2p/12D3...).
+#   # Joiner B
+#   vosx space join "<bootnode-hint>" --name b
+#   vosx space up b --manifest examples/space-raft.toml \
+#       --listen /ip4/127.0.0.1/tcp/4812 \
+#       --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id-a> &
 #
-#   # Joiner B:
-#   vosx join /ip4/127.0.0.1/tcp/4811/p2p/<bootnode-peer-id> \
-#       --data-dir /tmp/raft-b \
-#       --listen /ip4/127.0.0.1/tcp/4812 &
+#   # Joiner C
+#   vosx space join "<bootnode-hint>" --name c
+#   vosx space up c --manifest examples/space-raft.toml \
+#       --listen /ip4/127.0.0.1/tcp/4813 \
+#       --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id-a> &
 #
-#   # Joiner C:
-#   vosx join /ip4/127.0.0.1/tcp/4811/p2p/<bootnode-peer-id> \
-#       --data-dir /tmp/raft-c \
-#       --listen /ip4/127.0.0.1/tcp/4813 &
-#
-#   # Drive the actor from any replica's `vosx call` — only the
-#   # leader will accept writes; followers reply with
-#   # `Unreachable` until they're elected.
-#   vosx call ledger.inc 1
-#
-# Each node logs its discovered membership on startup; once
-# `vosx join` returns, the cluster is up to N voters and a
-# subsequent `vosx ps` shows everyone connected.
+#   # Drive the actor from any replica — only the leader will
+#   # accept writes; followers reply Unreachable until elected.
+#   vosx space call a ledger inc
 
 space = "raft-demo"
 version = "0.1.0"

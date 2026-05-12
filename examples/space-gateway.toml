@@ -50,10 +50,12 @@
 #   curl -X DELETE -sw '\n%{http_code}\n' http://localhost:18080/counter/start
 #   #   → 405
 #
-#   # graceful stop via the CLI dispatch path
+#   # graceful stop of the gateway extension. The host daemon
+#   # keeps running so other agents stay reachable; shut it down
+#   # explicitly with `vosx space down gw` (or Ctrl-C / SIGTERM
+#   # the `space up` process).
 #   ./target/debug/vosx --space gw gateway stop
-#
-#   # daemon will exit; reap it
+#   ./target/debug/vosx space down gw
 #   wait
 
 space = "gw"

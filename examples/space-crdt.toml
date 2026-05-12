@@ -1,20 +1,26 @@
 # Cross-node CRDT replication demo manifest.
 #
-# Run two vosx processes pointing at this same file (with
-# different --data-dir and --listen/--connect flags) and the
-# crdt-counter actor will auto-replicate between them: a state
-# change on one side propagates via the cycle-3 sync ticker
-# and a cycle-4 mid-flight soft restart on the other.
+# Run two vosx daemons over the same logical space and the
+# crdt-counter actor will auto-replicate between them.
+#
+# The cleanest two-process recipe is the just recipe at the
+# repo root:
+#
+#   just demo-crdt-procs
+#
+# (creates isolated XDG dirs for each node, dials A from B, and
+# reaps them.) For step-by-step:
 #
 #   # terminal A
-#   vosx up examples/space-crdt.toml \
-#     --data-dir /tmp/vosx-a \
-#     --listen /ip4/127.0.0.1/tcp/4811
+#   vosx space new --name a
+#   vosx space up a --manifest examples/space-crdt.toml \
+#     --listen /ip4/127.0.0.1/tcp/4811 &
+#   vosx space info a   # copy the bootnode hint <space-id>@<addr>
 #
-#   # terminal B
-#   vosx up examples/space-crdt.toml \
-#     --data-dir /tmp/vosx-b \
-#     --connect /ip4/127.0.0.1/tcp/4811
+#   # terminal B (paste the bootnode hint)
+#   vosx space join "<bootnode-hint>" --name b
+#   vosx space up b --manifest examples/space-crdt.toml \
+#     --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id> &
 #
 # `replication_id` defaults to `auto`, which derives it from
 # `blake2b(name || 0x00 || blob)`. Both processes load the same

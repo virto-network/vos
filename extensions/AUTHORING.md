@@ -6,9 +6,7 @@ shape) and **Service** (long-running, owns its own thread + runtime).
 
 This is the cookbook. The book chapter at
 [`docs/extensions.md`](../docs/extensions.md) is the reader-facing
-intro; the design notes at
-[`docs/design/extensions.md`](../docs/design/extensions.md) are the
-full architectural treatment.
+intro.
 
 ## When to pick which kind
 

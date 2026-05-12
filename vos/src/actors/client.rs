@@ -54,7 +54,7 @@ impl core::error::Error for ClientError {}
 ///   PVM path the `INVOKE` hostcall already returned the bytes by the
 ///   time we poll, so the future is `Ready` on first poll.
 /// - `&VosNode` (host, gated on `std`) — drives the same
-///   synchronous-invoke path `vosx call` uses. The returned future is
+///   synchronous-invoke path `vosx space call` uses. The returned future is
 ///   always `Ready` immediately; host callers wrap the call in
 ///   [`block_on`](crate::block_on) to recover a `Result<T, _>`.
 ///

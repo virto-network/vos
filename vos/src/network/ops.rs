@@ -12,8 +12,8 @@
 //! private command channel as the actor-runtime senders. Keeping
 //! them in a separate file makes the layering visible: anyone reading
 //! `mod.rs` sees the actor-runtime API; anyone reading `ops.rs` sees
-//! the tools `vosx join` / `vosx ps` use to drive a cluster from the
-//! outside.
+//! the senders an operator tool (`vosx space join`, future cluster-
+//! status reporters) uses to drive a cluster from the outside.
 
 use std::sync::mpsc as std_mpsc;
 
@@ -70,8 +70,8 @@ impl Network {
     /// group. The reply describes that peer's view of the
     /// group.
     ///
-    /// Operator-only: `vosx ps` fans this out across every
-    /// connected peer to assemble the cluster snapshot.
+    /// Operator-only: a cluster-status reporter fans this out
+    /// across every connected peer to assemble the snapshot.
     ///
     /// [`Frame::RaftStatusReq`]: super::Frame::RaftStatusReq
     pub fn send_raft_status_req(

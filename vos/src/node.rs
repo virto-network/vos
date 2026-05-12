@@ -514,7 +514,7 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 ///
 /// Constructed in [`VosNode::attach_network`] from the node's
 /// already-existing tables; the manifest slot is populated by the
-/// host (`vosx up`) before `attach_network` runs.
+/// host (`vosx space up`) before `attach_network` runs.
 #[cfg(feature = "network")]
 struct NodeService {
     invoke_routes: InvokeRoutes,
@@ -921,8 +921,8 @@ impl VosNode {
     /// programming error and is silently ignored. Call before
     /// [`attach_network`](Self::attach_network) — the
     /// `NetworkService` snapshot taken there reads from this slot.
-    /// `vosx up` calls this with the parsed `space.toml` bytes
-    /// plus every actor blob so `vosx join`ers can fetch the
+    /// `vosx space up` calls this with the parsed `space.toml` bytes
+    /// plus every actor blob so `vosx space join`ers can fetch the
     /// cluster's manifest without `--manifest`.
     #[cfg(feature = "network")]
     pub fn set_manifest(&self, reply: crate::network::ManifestReply) {
@@ -1520,7 +1520,7 @@ impl VosNode {
         // Remote delivery via the network (if attached). The
         // target's high 16 bits select the peer; if we haven't
         // seen that prefix yet (no Hello received), the envelope
-        // is dropped with a warn — kunekt has no store-and-forward
+        // is dropped with a warn — VOS has no store-and-forward
         // semantics today.
         #[cfg(feature = "network")]
         {

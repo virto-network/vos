@@ -254,8 +254,8 @@ mod crdt {
     /// blake2b-256 hasher for CRDT CIDs. Uses blake2b_simd (already a
     /// vos dep) with a configurable 32-byte output length.
     ///
-    /// blake2b is the hash of choice for kunekt-style actors: the
-    /// on-chain host exposes a precompile for it and the in-progress
+    /// blake2b is the hash of choice for VOS actors: the on-chain
+    /// host exposes a precompile for it and the in-progress
     /// zkVM has a dedicated circuit. Matching CRDT CIDs to those
     /// pieces keeps the moving parts aligned.
     pub struct Blake2b;

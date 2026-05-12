@@ -62,10 +62,10 @@ const TAG_RAFT_JOIN_REQ: u8 = 0x40;
 const TAG_RAFT_JOIN_RESP: u8 = 0x41;
 const TAG_MANIFEST_REQ: u8 = 0x42;
 const TAG_MANIFEST_RESP: u8 = 0x43;
-// `vosx ps` queries each peer for the per-group Raft state
-// (role, term, last_applied, commit_index, members, leader
-// hint) so the operator can see who's leader and whether
-// followers are caught up.
+// Operator cluster-status tooling queries each peer for the
+// per-group Raft state (role, term, last_applied, commit_index,
+// members, leader hint) so the operator can see who's leader
+// and whether followers are caught up.
 const TAG_RAFT_STATUS_REQ: u8 = 0x44;
 const TAG_RAFT_STATUS_RESP: u8 = 0x45;
 
@@ -251,9 +251,9 @@ pub enum Frame {
         toml_bytes: Vec<u8>,
         blobs: Vec<ManifestBlob>,
     },
-    /// Raft status query — `vosx ps` asks each peer "what's
-    /// your view of replication group X?". Receiver answers
-    /// from its [`vos_raft::WorkerSnapshot`].
+    /// Raft status query — a cluster-status reporter asks each
+    /// peer "what's your view of replication group X?". Receiver
+    /// answers from its [`vos_raft::WorkerSnapshot`].
     RaftStatusReq {
         replication_id: [u8; REPLICATION_ID_BYTES],
     },

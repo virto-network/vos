@@ -7,9 +7,16 @@
 # because the runtime stamps each event with a unique
 # (origin, seq) pair — see `vos::effect_log::CrdtEvent`).
 #
-# Run (with isolated XDG dirs so two nodes don't share state):
-#   vosx space new --name a --listen /ip4/127.0.0.1/tcp/4811
-#   vosx space up a --manifest examples/space-crdt-a.toml &
+# Easiest end-to-end recipe:
+#
+#   just demo-crdt-procs
+#
+# (creates two isolated XDG dirs, dials A from B, reaps them.)
+# Step-by-step:
+#
+#   vosx space new --name a
+#   vosx space up a --manifest examples/space-crdt-a.toml \
+#     --listen /ip4/127.0.0.1/tcp/4811 &
 #   # … then in another shell, run space-crdt-b.toml …
 #
 # `replication_id` defaults to "auto" =
