@@ -22,6 +22,7 @@ use clap::Subcommand;
 
 pub mod compile;
 pub mod log;
+pub mod merge;
 pub mod new;
 pub mod publish;
 pub mod show;
@@ -99,6 +100,32 @@ pub enum DevCommand {
         /// Maximum number of commits to surface.
         #[arg(long, default_value_t = 16)]
         limit: u32,
+    },
+    /// Promote a side branch into another branch by invoking
+    /// the dev-project actor's `merge` handler. Defaults match
+    /// the side-branch AI workflow: pull commits from
+    /// `ai-suggested` into `main`.
+    ///
+    /// Fast-forward is preferred when the source branch is a
+    /// descendant of the target; otherwise the actor runs a
+    /// true three-way merge and records per-path conflicts on
+    /// the resulting commit. Conflicts don't fail the merge —
+    /// `ours`'s blob is the tentative pick and the operator
+    /// resolves by committing the chosen content at the same
+    /// path.
+    Merge {
+        /// Space id (full hex) or name.
+        #[arg(long)]
+        space: String,
+        /// Project instance name.
+        #[arg(long)]
+        project: String,
+        /// Source branch to merge from.
+        #[arg(long, default_value = "ai-suggested")]
+        from: String,
+        /// Target branch to advance.
+        #[arg(long, default_value = "main")]
+        into: String,
     },
     /// Inspect a project's tree at a commit.
     ///
@@ -184,6 +211,17 @@ pub fn run(cmd: DevCommand) -> anyhow::Result<()> {
             path,
             branch,
             commit,
+        }),
+        DevCommand::Merge {
+            space,
+            project,
+            from,
+            into,
+        } => merge::run(merge::Args {
+            space,
+            project,
+            from,
+            into,
         }),
     }
 }

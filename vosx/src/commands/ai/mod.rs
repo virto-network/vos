@@ -67,8 +67,10 @@ pub enum AiCommand {
     ///
     /// Default mode is read-only — the model's reply lands on
     /// stdout for inspection. Pass `--apply` to parse the
-    /// fenced code blocks out of the reply and commit them back
-    /// to the project's `main` branch as a new commit.
+    /// fenced code blocks out of the reply and commit them as
+    /// a new commit on `--branch` (default `ai-suggested` — a
+    /// side branch the operator can review before merging into
+    /// `main` with `vosx dev merge`).
     Actor {
         /// Space id (full hex) or name.
         #[arg(long)]
@@ -87,17 +89,26 @@ pub enum AiCommand {
         /// Override the AI extension instance name.
         #[arg(long, default_value = "ai")]
         extension: String,
-        /// Source commit hash (64 hex). Defaults to the project's
-        /// current `main` branch head.
+        /// Source commit hash (64 hex). Defaults to the head of
+        /// the target `--branch` (or `main` if the side branch
+        /// doesn't exist yet).
         #[arg(long, value_name = "HEX")]
         commit: Option<String>,
         /// Parse the model's response and write each detected
-        /// file back to the project's `main` branch as a new
-        /// commit. The parser looks for `path:` (or `## path`,
-        /// `**path:**`) followed by a fenced code block.
-        /// Without this flag the response is print-only.
+        /// file back to the project's `--branch` as a new commit.
+        /// The parser looks for `path:` (or `## path`,
+        /// `**path:**`) followed by a fenced code block. Without
+        /// this flag the response is print-only.
         #[arg(long)]
         apply: bool,
+        /// Branch the `--apply` path commits on. Defaults to
+        /// `ai-suggested` so AI-driven commits land on a side
+        /// branch first; merge into `main` via `vosx dev merge`
+        /// after review. Pass `--branch main` to land directly
+        /// on the canonical history (not recommended for
+        /// unattended runs).
+        #[arg(long, default_value = "ai-suggested")]
+        branch: String,
     },
 }
 
@@ -124,6 +135,7 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             extension,
             commit,
             apply,
+            branch,
         } => actor::run(actor::Args {
             space,
             project,
@@ -132,6 +144,7 @@ pub fn run(cmd: AiCommand) -> anyhow::Result<()> {
             extension,
             commit,
             apply,
+            branch,
         }),
     }
 }

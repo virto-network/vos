@@ -63,6 +63,11 @@ pub struct Args {
     pub extension: String,
     pub commit: Option<String>,
     pub apply: bool,
+    /// Branch the `--apply` path commits on (and the branch we
+    /// pull the prompt context from when it exists). Defaults to
+    /// `ai-suggested` so AI-driven commits sit on a side branch
+    /// the operator can review before merging into `main`.
+    pub branch: String,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -78,10 +83,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             )
         })?;
 
-        // ── Resolve the source commit. Default: main branch head.
+        // ── Resolve the source commit. Precedence:
+        //    1. --commit HEX (explicit pin).
+        //    2. The target branch's head (when iterating on the
+        //       side branch — keeps the AI's context aligned with
+        //       what its own past suggestions look like).
+        //    3. `main`'s head, on first --apply where the side
+        //       branch doesn't exist yet.
         let commit_bytes = match args.commit.as_deref() {
             Some(hex) => parse_hex32(hex)?,
-            None => fetch_head_main(client, project_id, &args.project)?,
+            None => resolve_context_head(client, project_id, &args.project, &args.branch)?,
         };
 
         // ── Fetch the commit's file tree.
@@ -95,7 +106,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let response = stream_generate(client, extension_id, &full_prompt, args.max_tokens)?;
 
         if args.apply {
-            apply_response(client, project_id, &args.project, &commit_bytes, &response)?;
+            apply_response(
+                client,
+                project_id,
+                &args.project,
+                &args.branch,
+                &commit_bytes,
+                &response,
+            )?;
         }
 
         Ok(())
@@ -113,23 +131,53 @@ fn parse_hex32(hex_str: &str) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn fetch_head_main(
+/// Pick the commit we show the AI + base the working change on.
+/// Try the target branch first (so iterating on `ai-suggested`
+/// extends a coherent history); if that branch doesn't exist
+/// yet, fall back to `main`. If neither has a head, bail.
+fn resolve_context_head(
     client: &DaemonClient,
     project_id: ServiceId,
     project_name: &str,
+    branch: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let head = client.invoke_dyn(project_id, &Msg::new("head").with("branch", "main"))?;
-    let bytes = match head {
-        Value::Bytes(b) => b,
-        other => anyhow::bail!("project '{project_name}' head returned non-bytes: {other:?}"),
-    };
-    if bytes.is_empty() {
+    if let Some(head) = fetch_branch_head(client, project_id, branch)? {
+        return Ok(head);
+    }
+    if branch == "main" {
         anyhow::bail!(
-            "project '{project_name}' has no 'main' branch yet — commit source \
-             first or pass --commit"
+            "project '{project_name}' has no 'main' branch yet — commit \
+             source first or pass --commit"
         );
     }
-    Ok(bytes)
+    fetch_branch_head(client, project_id, "main")?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "project '{project_name}' has no '{branch}' or 'main' branch yet — \
+             commit source first or pass --commit"
+        )
+    })
+}
+
+/// Fetch a branch's head, or `None` when the branch doesn't
+/// exist (the actor returns an empty `Vec<u8>` in that case).
+fn fetch_branch_head(
+    client: &DaemonClient,
+    project_id: ServiceId,
+    branch: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let reply = client.invoke_dyn(
+        project_id,
+        &Msg::new("head").with("branch", branch.to_string()),
+    )?;
+    let bytes = match reply {
+        Value::Bytes(b) => b,
+        other => anyhow::bail!("head('{branch}') returned non-bytes: {other:?}"),
+    };
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
+    }
 }
 
 /// One source file lifted out of the project's commit tree.
@@ -541,12 +589,20 @@ fn extract_path(line: &str) -> Option<String> {
 
 /// Apply the parsed files to the project: open a working change
 /// off `base_commit`, put_blob + put_file_working for each, then
-/// commit_change on `main`. Prints a summary including the new
-/// commit hash so the operator can chain into `vosx dev compile`.
+/// commit_change on `branch`. Prints a summary including the new
+/// commit hash so the operator can chain into `vosx dev merge`
+/// (to fast-forward `main` once the AI's suggestion is reviewed)
+/// or `vosx dev compile`.
+///
+/// `base_commit` is whatever `resolve_context_head` picked — the
+/// target branch's head when it exists, or main's otherwise.
+/// Re-using that same hash here keeps the AI's view of the world
+/// aligned with what the working change is based on.
 fn apply_response(
     client: &DaemonClient,
     project_id: ServiceId,
     project_name: &str,
+    branch: &str,
     base_commit: &[u8],
     response: &str,
 ) -> anyhow::Result<()> {
@@ -560,7 +616,7 @@ fn apply_response(
         return Ok(());
     }
     eprintln!(
-        "\n--apply: writing {} file(s) to project '{project_name}':",
+        "\n--apply: writing {} file(s) to project '{project_name}' on branch '{branch}':",
         files.len()
     );
     for f in &files {
@@ -579,9 +635,9 @@ fn apply_response(
         put_file_working(client, project_id, &change_id, &f.path, &blob_hash)?;
     }
 
-    // Snapshot the change as a commit on `main`. Caller can
-    // walk the resulting commit via `vosx dev log --branch main
-    // <project>` once that command surfaces the commit graph.
+    // Snapshot the change as a commit on `branch`. The actor's
+    // FF gate accepts a fresh branch (created on first --apply)
+    // or one whose head matches our base.
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -590,14 +646,22 @@ fn apply_response(
         client,
         project_id,
         &change_id,
-        "main",
+        branch,
         dev_project::INTENT_EDIT,
         ts_ms,
     )?;
     eprintln!(
-        "--apply: committed {} on main\n         next: `vosx dev compile --space <space> {project_name}`",
+        "--apply: committed {} on '{branch}'",
         hex::encode(&commit_hash),
     );
+    if branch == "main" {
+        eprintln!("         next: `vosx dev compile --space <space> {project_name}`",);
+    } else {
+        eprintln!(
+            "         next: review with `vosx dev show --space <space> --project {project_name} --branch {branch}`\n\
+             then promote with `vosx dev merge --space <space> --project {project_name} --from {branch}`",
+        );
+    }
     Ok(())
 }
 
