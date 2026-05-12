@@ -130,8 +130,8 @@ pub enum RaftRole {
     Candidate,
     Leader,
     /// Future variant a newer peer used. Operators see this as
-    /// `?` in `vosx ps`; the bootnode and joiner code treat it
-    /// the same as Follower for routing purposes.
+    /// `?` in cluster-status output; the bootnode and joiner code
+    /// treat it the same as Follower for routing purposes.
     Unknown(u8),
 }
 
@@ -163,7 +163,7 @@ impl RaftRole {
         }
     }
 
-    /// Human-readable label for `vosx ps`-style output.
+    /// Human-readable label for cluster-status output.
     pub fn label(self) -> &'static str {
         match self {
             Self::Follower => "Follower",
@@ -245,10 +245,10 @@ pub trait NetworkService: Send + Sync {
         None
     }
 
-    /// Inbound `Frame::ManifestReq` from a fresh `vosx join`er.
+    /// Inbound `Frame::ManifestReq` from a fresh `vosx space join`er.
     /// Default returns `None` (no manifest exposed) — the joiner
     /// then bails with a clear error and falls back to
-    /// `--manifest <path>`. `vosx up` overrides this to serve the
+    /// `--manifest <path>`. `vosx space up` overrides this to serve the
     /// space.toml + actor blobs verbatim.
     fn manifest(&self) -> Option<ManifestReply> {
         None
@@ -395,6 +395,26 @@ pub struct NetworkConfig {
     /// Multiaddrs to dial at startup. Useful when not relying on
     /// mDNS / hyperspace discovery.
     pub bootstrap: Vec<Multiaddr>,
+    /// Auto-dial peers discovered via mDNS. Daemons want this
+    /// (so two VOS hosts on the same LAN find each other);
+    /// one-shot CLI client peers do **not** — they only need to
+    /// reach a single known bootstrap address, and auto-dialling
+    /// random LAN peers floods the log with `outgoing connection
+    /// failed` WARNs from unrelated libp2p apps. Defaults to
+    /// `true` for backwards compat.
+    pub auto_dial_mdns: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            keypair: identity::Keypair::generate_ed25519(),
+            local_prefix: 0,
+            listen: Vec::new(),
+            bootstrap: Vec::new(),
+            auto_dial_mdns: true,
+        }
+    }
 }
 
 pub(in crate::network) enum NetworkCmd {
@@ -621,8 +641,9 @@ impl Network {
 
     // Operator-tooling senders (manifest fetch, raft join, raft
     // status) live in the `ops` submodule — they're driven by
-    // `vosx join` / `vosx ps`, never by the PVM-actor runtime.
-    // See `crates/vos/src/network/ops.rs`.
+    // CLI tools (`vosx space join`, cluster-status reporters),
+    // never by the PVM-actor runtime.
+    // See `vos/src/network/ops.rs`.
 
     /// Send a Raft `AppendEntries` RPC to a specific peer. Receiver
     /// yields `RaftAppendResult`; on transport failure the Sender
@@ -926,6 +947,7 @@ async fn network_main(
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
     let local_prefix = config.local_prefix;
+    let auto_dial_mdns = config.auto_dial_mdns;
     info!(peer_id = %local_peer_id, prefix = format!("{local_prefix:#06x}"), "network: starting");
 
     let mut swarm = match build_swarm(config.keypair.clone()) {
@@ -984,6 +1006,7 @@ async fn network_main(
                     &raft_handlers,
                     &response_tx,
                     &hint_senders,
+                    auto_dial_mdns,
                 );
             }
             cmd = cmd_rx.recv() => {
@@ -1269,6 +1292,7 @@ fn build_swarm(
     Ok(swarm)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     swarm: &mut Swarm<VosBehaviour>,
     event: SwarmEvent<VosBehaviourEvent>,
@@ -1281,6 +1305,7 @@ fn handle_swarm_event(
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
+    auto_dial_mdns: bool,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -1313,12 +1338,24 @@ fn handle_swarm_event(
             info!(%peer_id, ?cause, "network: peer disconnected");
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            warn!(?peer_id, error = %error, "network: outgoing connection failed");
+            // INFO, not WARN — mDNS-discovered peers fail to dial
+            // routinely (unrelated libp2p apps on the LAN, NATs,
+            // etc.) and an operator can't act on it. Real outbound
+            // failures from the registered ops path log their own
+            // WARN at the call site (`send_tell`, `send_invoke`).
+            info!(?peer_id, error = %error, "network: outgoing connection failed");
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-            for (peer_id, addr) in peers {
-                info!(%peer_id, %addr, "network: mDNS discovered peer; dialing");
-                let _ = swarm.dial(addr);
+            // Client-style peers (`auto_dial_mdns = false`) still
+            // see the discovery event but skip the speculative
+            // dial — they only need the single known bootstrap
+            // peer, and dialling random LAN peers (other libp2p
+            // apps) just floods the log with `connection failed`.
+            if auto_dial_mdns {
+                for (peer_id, addr) in peers {
+                    info!(%peer_id, %addr, "network: mDNS discovered peer; dialing");
+                    let _ = swarm.dial(addr);
+                }
             }
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -1855,7 +1892,7 @@ fn record_prefix(map: &PrefixMap, prefix: u16, peer: PeerId) {
 ///
 /// Collisions are possible (1 in 65 536 per peer pair) — they don't
 /// happen in practice for small networks but will need real
-/// addressing once kunekt grows past hyperspace-sized clusters.
+/// addressing once a space grows past hyperspace-sized clusters.
 /// That's a Cycle 3+ concern; for now we log a warning when the
 /// prefix map sees a collision.
 pub fn derive_node_prefix(peer_id: &PeerId) -> u16 {
@@ -1924,6 +1961,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let inbox_a_rx = net_a.take_inbox().expect("first take");
 
@@ -1942,6 +1980,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
         let inbox_b_rx = net_b.take_inbox().expect("first take");
 
@@ -2022,6 +2061,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2035,6 +2075,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         let rep_id = [0xCDu8; 32];
@@ -2138,6 +2179,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2151,6 +2193,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         // Build node B with a pre-populated replica, attach net_b.
@@ -2245,6 +2288,7 @@ mod tests {
             local_prefix: 0xA0A0,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2258,6 +2302,7 @@ mod tests {
             local_prefix: 0xB0B0,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         let rep_id = [0x77u8; 32];
@@ -2324,6 +2369,7 @@ mod tests {
             local_prefix: 0x0A0A,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2337,6 +2383,7 @@ mod tests {
             local_prefix: 0x0B0B,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         let rep_id = [0x42u8; 32];
@@ -2427,6 +2474,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2440,6 +2488,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         // Install dispatcher on B before any invoke can race in.
@@ -2500,6 +2549,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2513,6 +2563,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         wait_for(
@@ -2589,6 +2640,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_listen = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2602,6 +2654,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         // Wait for the Hello round trip before attaching, so we can
@@ -2748,6 +2801,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         });
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2761,6 +2815,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
         });
 
         // Install the stub on B — A is the leader-side caller.
@@ -2874,6 +2929,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         }));
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -2887,6 +2943,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![a_dial.clone()],
+            auto_dial_mdns: true,
         }));
         // Wait for B's listen addr so C can bootstrap to both A
         // and B — without an explicit dial between B and C the
@@ -2903,6 +2960,7 @@ mod tests {
             local_prefix: prefix_c,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial, b_dial],
+            auto_dial_mdns: true,
         }));
 
         // Wait for the Hello triangle to close.
@@ -3096,6 +3154,7 @@ mod tests {
             local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
+            auto_dial_mdns: true,
         }));
         let a_addr = wait_for(
             || net_a.listen_addrs().into_iter().next(),
@@ -3109,6 +3168,7 @@ mod tests {
             local_prefix: prefix_b,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![a_dial.clone()],
+            auto_dial_mdns: true,
         }));
         let b_addr = wait_for(
             || net_b.listen_addrs().into_iter().next(),
@@ -3122,6 +3182,7 @@ mod tests {
             local_prefix: prefix_c,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial, b_dial],
+            auto_dial_mdns: true,
         }));
 
         wait_for(
