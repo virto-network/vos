@@ -238,11 +238,18 @@ fn build_network_for_daemon(
     let local_prefix = vos::network::derive_node_prefix(&peer_id);
     tracing::info!("node identity {peer_id} (prefix {local_prefix:#06x})");
 
+    // mDNS auto-dial is on by default — a long-running daemon
+    // benefits from same-LAN peer discovery. Set
+    // `VOSX_DISABLE_MDNS=1` to opt out; the integration suite uses
+    // it so test daemons don't latch onto unrelated libp2p apps
+    // (IPFS / Substrate / etc.) on the dev machine.
+    let auto_dial_mdns = std::env::var("VOSX_DISABLE_MDNS").is_err();
     Ok(vos::network::Network::start(vos::network::NetworkConfig {
         keypair,
         local_prefix,
         listen,
         bootstrap,
+        auto_dial_mdns,
     }))
 }
 

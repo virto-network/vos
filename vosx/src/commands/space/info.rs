@@ -140,8 +140,15 @@ fn print_text(
             print_rtt(query);
         }
         Some(ep) => {
+            // Stale endpoint: pid no longer alive. Clean up so the
+            // next `space *` invocation gets a clean "not running"
+            // signal instead of repeatedly seeing this warning.
+            endpoint::delete(data_dir);
             println!();
-            println!("daemon      STALE endpoint (pid {} not running)", ep.pid);
+            println!(
+                "daemon      not running (cleaned up stale endpoint from pid {})",
+                ep.pid,
+            );
         }
         None => {
             println!();

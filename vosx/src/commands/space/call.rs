@@ -17,7 +17,7 @@
 //! $ vosx space call demo counter add a=2 b=3
 //! ```
 
-use vos::value::{Msg, Value};
+use vos::value::Msg;
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -32,19 +32,56 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     DaemonClient::with_connect(&args.space, |client| {
         let target_id = client.resolve_target(&args.target)?;
+
+        // Validate the method against the schema when we have one.
+        // `registry` and `0xHEX` targets don't have an instance-name
+        // hook into `meta_for_instance`, so they fall through to the
+        // wire (best-effort). Named agents/extensions always do —
+        // and a typo gets rejected before it reaches the daemon
+        // instead of silently returning `()`.
+        if !is_raw_target(&args.target) {
+            let meta_bytes = client.meta_for_instance(&args.target)?;
+            if !meta_bytes.is_empty() {
+                if let Some(meta) = vos::metadata::decode(&meta_bytes) {
+                    if !meta.messages.iter().any(|m| m.name == args.method) {
+                        let names = meta
+                            .messages
+                            .iter()
+                            .map(|m| m.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let hint = if names.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (available: {names})")
+                        };
+                        anyhow::bail!(
+                            "unknown method '{}' on '{}'{hint}",
+                            args.method,
+                            args.target,
+                        );
+                    }
+                }
+            }
+        }
+
         let msg = build_msg(&args.method, &args.args)?;
         tracing::debug!("invoking {} on {target_id}", args.method);
         let reply = client.invoke_dyn(target_id, &msg)?;
         if output::is_json() {
             output::print_json(&output::value_to_json(&reply));
         } else {
-            match reply {
-                Value::Unit => println!("()"),
-                other => println!("{other:?}"),
-            }
+            println!("{}", output::value_to_text(&reply));
         }
         Ok(())
     })
+}
+
+/// `registry` (special name) or `0xHEX` (raw ServiceId) skip the
+/// `meta_for_instance` schema check because they don't go through
+/// the instance-name table. Everything else gets validated.
+fn is_raw_target(target: &str) -> bool {
+    target == "registry" || target.starts_with("0x")
 }
 
 /// Parse `key=value` strings into a typed `Msg`. Heuristics:

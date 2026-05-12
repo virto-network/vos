@@ -49,6 +49,50 @@ pub fn print_json<T: serde::Serialize>(value: &T) {
     }
 }
 
+/// Format a `vos::value::Value` for human-readable text output.
+/// Unwraps scalars to their plain form (`U64(2)` → `2`, `Str(s)`
+/// → `s` without quoting, `Bool(true)` → `true`); collections
+/// print as `[a, b, c]`. Use from commands that already know
+/// text mode is the active output.
+pub fn value_to_text(v: &vos::value::Value) -> String {
+    use std::fmt::Write;
+    use vos::value::Value as V;
+    match v {
+        V::Unit => "()".to_string(),
+        V::Bool(b) => b.to_string(),
+        V::U8(n) => n.to_string(),
+        V::U16(n) => n.to_string(),
+        V::U32(n) => n.to_string(),
+        V::U64(n) => n.to_string(),
+        V::I32(n) => n.to_string(),
+        V::I64(n) => n.to_string(),
+        V::Str(s) => s.clone(),
+        V::Bytes(b) => format!("0x{}", hex::encode(b)),
+        V::ListU32(xs) => {
+            let mut s = String::from("[");
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let _ = write!(&mut s, "{x}");
+            }
+            s.push(']');
+            s
+        }
+        V::ListStr(xs) => {
+            let mut s = String::from("[");
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let _ = write!(&mut s, "{x}");
+            }
+            s.push(']');
+            s
+        }
+    }
+}
+
 /// Convert a `vos::value::Value` (the dynamic reply type from
 /// `space call`) into a `serde_json::Value`. Bytes become
 /// hex-encoded strings for symmetry with the rest of the CLI;

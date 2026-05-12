@@ -24,6 +24,7 @@ pub mod call;
 pub mod client;
 pub mod common;
 pub mod describe;
+pub mod down;
 pub mod endpoint;
 pub mod export;
 pub mod forget;
@@ -123,6 +124,21 @@ pub enum SpaceCommand {
         /// spaces.toml entry for this run.
         #[arg(long, value_name = "MULTIADDR")]
         connect: Vec<String>,
+    },
+    /// Stop a running `space up` daemon by signalling its PID.
+    /// SIGTERM by default (daemon flushes state, removes the
+    /// endpoint file, exits); `--force` upgrades to SIGKILL if
+    /// the daemon doesn't exit within `--grace` seconds.
+    Down {
+        /// Space id (full hex) or name.
+        space: String,
+        /// Skip the SIGTERM grace window and SIGKILL immediately.
+        #[arg(long)]
+        force: bool,
+        /// Seconds to wait for graceful shutdown before
+        /// (optionally, with `--force`) escalating.
+        #[arg(long, default_value_t = 5)]
+        grace: u64,
     },
     /// Query a space's registry and emit a round-trippable
     /// TOML manifest to stdout.
@@ -280,6 +296,15 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             manifest,
             listen,
             connect,
+        }),
+        SpaceCommand::Down {
+            space,
+            force,
+            grace,
+        } => down::run(down::Args {
+            query: space,
+            force,
+            grace_secs: grace,
         }),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Publish {

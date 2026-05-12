@@ -44,7 +44,11 @@ const EXIT_USAGE_ERROR: i32 = 2;
 const EXIT_NOT_FOUND: i32 = 3;
 
 #[derive(Parser)]
-#[command(name = "vosx", about = "JAM-aligned PVM executor + space orchestrator")]
+#[command(
+    name = "vosx",
+    version,
+    about = "VOS host CLI — run actors, manage spaces, talk to peers"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

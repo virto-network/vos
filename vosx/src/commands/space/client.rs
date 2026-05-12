@@ -66,11 +66,20 @@ impl DaemonClient {
             )
         })?;
         if !endpoint::is_alive(&ep) {
+            // Daemon crashed without cleaning up. Remove the stale
+            // file so the next `space up` doesn't trip over it, and
+            // report no-daemon-running so the user just retries.
+            tracing::info!(
+                pid = ep.pid,
+                path = %endpoint::path(&data_dir).display(),
+                "removing stale endpoint file (pid not running)",
+            );
+            endpoint::delete(&data_dir);
             anyhow::bail!(
-                "stale endpoint file (pid {} not running). \
-                 Delete {} and start `vosx space up {}`.",
+                "no daemon running for space '{}' (cleaned up stale endpoint from pid {}). \
+                 Start it with `vosx space up {}`.",
+                entry.name,
                 ep.pid,
-                endpoint::path(&data_dir).display(),
                 entry.name,
             );
         }
@@ -91,6 +100,11 @@ impl DaemonClient {
             local_prefix,
             listen: vec![],
             bootstrap: vec![bootstrap],
+            // One-shot client peer: only the known daemon
+            // bootstrap address matters. Skipping mDNS auto-dial
+            // avoids spurious "outgoing connection failed" logs
+            // when unrelated libp2p apps are on the LAN.
+            auto_dial_mdns: false,
         });
 
         let mut node = VosNode::with_prefix(local_prefix);
