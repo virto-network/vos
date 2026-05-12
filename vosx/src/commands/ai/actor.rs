@@ -67,10 +67,11 @@ pub struct Args {
     pub commit: Option<String>,
     pub apply: bool,
     /// Branch the `--apply` path commits on (and the branch we
-    /// pull the prompt context from when it exists). Defaults to
-    /// `ai-suggested` so AI-driven commits sit on a side branch
-    /// the operator can review before merging into `main`.
-    pub branch: String,
+    /// pull the prompt context from when it exists). When
+    /// `None`, defaults to `ai/<your-node-prefix>/suggested` so
+    /// two nodes suggesting changes to the same project never
+    /// race on the same branch ref.
+    pub branch: Option<String>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -86,6 +87,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             )
         })?;
 
+        // Resolve the effective branch: per-identity default if
+        // the caller didn't pin one explicitly.
+        let branch = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| default_ai_branch(client.daemon_prefix()));
+
         // ── Resolve the source commit. Precedence:
         //    1. --commit HEX (explicit pin).
         //    2. The target branch's head (when iterating on the
@@ -95,7 +103,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         //       branch doesn't exist yet.
         let commit_bytes = match args.commit.as_deref() {
             Some(hex) => parse_hex32(hex)?,
-            None => resolve_context_head(client, project_id, &args.project, &args.branch)?,
+            None => resolve_context_head(client, project_id, &args.project, &branch)?,
         };
 
         // ── Fetch the commit's file tree.
@@ -113,7 +121,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 client,
                 project_id,
                 &args.project,
-                &args.branch,
+                &branch,
                 &commit_bytes,
                 &response,
             )?;
@@ -121,6 +129,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+/// Compute the default AI-suggestion branch for this node:
+/// `ai/<prefix4>/suggested`. The prefix is a stable per-node
+/// 16-bit value derived from the daemon's libp2p PeerId, so two
+/// daemons on different machines suggest into different branches
+/// even when they're talking to the same dev-project replica.
+///
+/// Kept pure (no client lookup inside) so it's unit-testable
+/// and shares its format with `vosx dev merge`.
+pub(crate) fn default_ai_branch(daemon_prefix: u16) -> String {
+    format!("ai/{daemon_prefix:04x}/suggested")
 }
 
 fn parse_hex32(hex_str: &str) -> anyhow::Result<Vec<u8>> {
@@ -902,6 +922,25 @@ fn real() {}
     fn parse_response_handles_empty_input() {
         assert!(parse_response("").is_empty());
         assert!(parse_response("just some prose with no code").is_empty());
+    }
+
+    #[test]
+    fn default_ai_branch_is_per_identity() {
+        // The branch name must include the node prefix so two
+        // nodes mint distinct defaults. Format is fixed because
+        // `vosx dev merge`'s default also derives it from the
+        // same function.
+        assert_eq!(default_ai_branch(0x06b7), "ai/06b7/suggested");
+        assert_eq!(default_ai_branch(0x0001), "ai/0001/suggested");
+        assert_eq!(default_ai_branch(0xffff), "ai/ffff/suggested");
+    }
+
+    #[test]
+    fn default_ai_branch_zero_pads_to_four_hex_chars() {
+        // Prefix < 0x1000 must still produce 4 hex chars to keep
+        // the format predictable for the merge path.
+        assert_eq!(default_ai_branch(0x0042), "ai/0042/suggested");
+        assert_eq!(default_ai_branch(0), "ai/0000/suggested");
     }
 
     #[test]

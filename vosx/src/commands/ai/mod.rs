@@ -101,14 +101,16 @@ pub enum AiCommand {
         /// this flag the response is print-only.
         #[arg(long)]
         apply: bool,
-        /// Branch the `--apply` path commits on. Defaults to
-        /// `ai-suggested` so AI-driven commits land on a side
-        /// branch first; merge into `main` via `vosx dev merge`
-        /// after review. Pass `--branch main` to land directly
-        /// on the canonical history (not recommended for
-        /// unattended runs).
-        #[arg(long, default_value = "ai-suggested")]
-        branch: String,
+        /// Branch the `--apply` path commits on. When unset,
+        /// defaults to `ai/<your-node-prefix>/suggested` —
+        /// per-identity namespacing so two nodes suggesting
+        /// changes to the same project never race on the same
+        /// branch ref. Pass `--branch main` to land directly on
+        /// canonical history (not recommended for unattended
+        /// runs), or `--branch any-other-name` for a one-off
+        /// experiment.
+        #[arg(long)]
+        branch: Option<String>,
     },
 }
 

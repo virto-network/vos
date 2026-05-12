@@ -120,9 +120,14 @@ pub enum DevCommand {
         /// Project instance name.
         #[arg(long)]
         project: String,
-        /// Source branch to merge from.
-        #[arg(long, default_value = "ai-suggested")]
-        from: String,
+        /// Source branch to merge from. When unset, defaults to
+        /// `ai/<your-node-prefix>/suggested` — the same
+        /// per-identity branch `vosx ai actor` mints by default.
+        /// Pass `--from <NAME>` to merge a different branch
+        /// (e.g. another node's `ai/06b7/suggested` in a
+        /// multi-peer setup).
+        #[arg(long)]
+        from: Option<String>,
         /// Target branch to advance.
         #[arg(long, default_value = "main")]
         into: String,

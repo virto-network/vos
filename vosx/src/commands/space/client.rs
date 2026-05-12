@@ -176,6 +176,16 @@ impl DaemonClient {
         ServiceId::new(self.daemon_prefix, ServiceId::REGISTRY.local_id())
     }
 
+    /// The connected daemon's 16-bit node prefix. Stable per
+    /// node (derived from its libp2p `PeerId`), useful as a
+    /// per-identity discriminator — e.g. when minting a default
+    /// branch name like `ai/<prefix>/suggested` so two nodes
+    /// suggesting changes to the same project never collide on
+    /// the branch ref.
+    pub fn daemon_prefix(&self) -> u16 {
+        self.daemon_prefix
+    }
+
     /// Resolve a user-supplied target string to a daemon-side
     /// `ServiceId`. Four forms supported, in lookup order:
     ///

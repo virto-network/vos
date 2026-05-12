@@ -48,7 +48,12 @@ struct ConflictView {
 pub struct Args {
     pub space: String,
     pub project: String,
-    pub from: String,
+    /// When `None`, defaults to `ai/<your-node-prefix>/suggested`
+    /// — matching the per-identity branch `vosx ai actor` mints
+    /// by default. Pass an explicit `--from NAME` to merge a
+    /// different branch (e.g. another node's `ai/06b7/suggested`
+    /// in a multi-peer setup).
+    pub from: Option<String>,
     pub into: String,
 }
 
@@ -56,11 +61,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     DaemonClient::with_connect(&args.space, |client| {
         let project_id = client.resolve_target(&args.project)?;
 
+        // Per-identity default mirrors the ai actor command so
+        // the common case "merge what I just suggested" is a
+        // one-liner.
+        let from = args.from.clone().unwrap_or_else(|| {
+            crate::commands::ai::actor::default_ai_branch(client.daemon_prefix())
+        });
+
         // Resolve the source branch's head — that's `theirs`.
-        let theirs = fetch_branch_head(client, project_id, &args.from)?.ok_or_else(|| {
+        let theirs = fetch_branch_head(client, project_id, &from)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "source branch '{}' has no commits yet on project '{}'",
-                args.from,
+                from,
                 args.project,
             )
         })?;
@@ -110,7 +122,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 (false, fetch_conflicts(client, project_id, &result.hash)?)
             };
 
-        emit(&args, &result.hash, fast_forward, conflicts)?;
+        emit(&args, &from, &result.hash, fast_forward, conflicts)?;
         Ok(())
     })
 }
@@ -118,6 +130,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// Print the merge result to stdout in either text or JSON mode.
 fn emit(
     args: &Args,
+    from: &str,
     result_hash: &[u8],
     fast_forward: bool,
     conflicts: Vec<dev_project::ConflictEntry>,
@@ -136,7 +149,7 @@ fn emit(
     if output::is_json() {
         output::print_json(&MergeView {
             project: &args.project,
-            from: &args.from,
+            from,
             into: &args.into,
             result_commit: result_hex.clone(),
             conflicts: conflict_views,
@@ -150,17 +163,17 @@ fn emit(
             "fast-forwarded '{}' to {} (from '{}')",
             args.into,
             &result_hex[..16],
-            args.from,
+            from,
         );
     } else if conflicts.is_empty() {
         println!(
             "merged '{}' into '{}'\n  result_commit = {}",
-            args.from, args.into, result_hex,
+            from, args.into, result_hex,
         );
     } else {
         println!(
             "merged '{}' into '{}' with {} conflict(s)\n  result_commit = {}",
-            args.from,
+            from,
             args.into,
             conflicts.len(),
             result_hex,
