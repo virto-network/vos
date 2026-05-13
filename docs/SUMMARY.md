@@ -36,6 +36,7 @@
 ## Part III — Implementation
 
 - [Roadmap](roadmap.md)
+- [Operations Runbook](operations.md)
 
 ## Appendices
 

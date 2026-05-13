@@ -21,6 +21,7 @@ the user's critical path.
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
 | [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space manifests |
+| [`containers/`](containers/) | Dockerfile + docker-compose for production deployments |
 | [`book/`](book/) | The VOS Book (architecture, protocols, applications). Source in [`docs/`](docs/) |
 
 ## Quick start
@@ -52,6 +53,21 @@ Two-process CRDT convergence demo (one shell):
 just demo-crdt-procs   # creates + dials two daemons, both reach count=2
 just demo-crdt-sync    # in-process variant, no separate processes
 ```
+
+## Running in production
+
+For container-based deployments use [`containers/`](containers/) —
+multi-stage Dockerfile, docker-compose exemplar, healthcheck,
+graceful SIGTERM, capability enforcement, and persistent
+identity all wired up:
+
+```bash
+docker compose -f containers/ai-daemon.yml up -d
+```
+
+The [Operations Runbook](docs/operations.md) covers identity
+setup, auth-role grants, capability policy, troubleshooting,
+and the rest of the day-2 operator surface.
 
 ## Consistency modes
 
