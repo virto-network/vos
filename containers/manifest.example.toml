@@ -1,0 +1,38 @@
+# Default manifest baked into the vosx:slim image.
+#
+# Loads the ai extension on top of the bundled space-registry.
+# Override by mounting your own manifest at /etc/vosx/manifest.toml.
+#
+# Secrets: any string value matching `$env:VAR` is resolved
+# against the daemon's environment at boot (Sprint 3). Use this
+# to keep HF tokens etc. out of the image:
+#
+#   [[extension]]
+#   name = "ai"
+#   init = { hf_token = "$env:HF_TOKEN" }
+#
+# Then `docker run -e HF_TOKEN=...`.
+
+space = "demo"
+version = "0.1.0"
+
+# ── Capability enforcement policy ──────────────────────────────
+# `block` is the Sprint 2 default — extensions that try to use
+# an undeclared cap get HOST_ERR_CAP_DENIED. Set to `"log"` to
+# observe-only during initial rollout.
+cap_policy = "block"
+
+# ── Extensions ─────────────────────────────────────────────────
+[[extension]]
+name = "ai"
+path = "/usr/local/lib/vosx/libai_extension.so"
+
+# Default model. Override at the container level via env vars
+# and the `$env:VAR` indirection (Sprint 3) — e.g.
+#   init.hf_token = "$env:HF_TOKEN"
+[extension.init]
+model_repo = "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
+model_file = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+tokenizer_repo = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+tokenizer_file = "tokenizer.json"
+max_seq_len = 4096

@@ -1,0 +1,104 @@
+# docker-compose exemplar — single vosx daemon hosting the AI
+# extension. Demonstrates the recommended container shape from
+# `project_container_packaging_plan`:
+#
+#   - vosx:slim image (built from containers/Dockerfile).
+#   - Three named volumes for $XDG_{DATA,CONFIG,CACHE}_HOME.
+#     CACHE optional but recommended (avoids re-downloading
+#     the ~400MB GGUF on every restart).
+#   - libp2p TCP + QUIC on 4001.
+#   - HF_TOKEN passed through as an env var; reference it
+#     from manifest.toml via `$env:HF_TOKEN` when accessing
+#     gated model repos.
+#   - restart: unless-stopped — daemon recovers from crashes
+#     but stops cleanly on `docker compose down` (Sprint 1
+#     SIGTERM handler).
+#
+# Usage:
+#   cd containers/
+#   docker compose -f ai-daemon.yml up -d
+#   docker compose -f ai-daemon.yml logs -f vosx
+#   docker compose -f ai-daemon.yml exec vosx vosx ai generate \
+#       --space demo --max-tokens 64 "What is 2+2?"
+
+services:
+  vosx:
+    # Build locally; in production swap for a tagged registry
+    # image once you've pushed one.
+    build:
+      context: ..
+      dockerfile: containers/Dockerfile
+    image: vosx:slim
+    container_name: vosx-ai-demo
+
+    environment:
+      # Space name the entrypoint creates / boots.
+      VOSX_SPACE: demo
+      # tracing-subscriber filter. `info` is quiet enough for
+      # production; bump to `debug` while troubleshooting.
+      RUST_LOG: info
+      # mDNS auto-dial floods logs with `outgoing connection
+      # failed` from unrelated libp2p apps on shared LANs.
+      # Most container deployments don't need LAN discovery.
+      VOSX_DISABLE_MDNS: "1"
+      # Pass-through. Used by manifest.example.toml's
+      # `init = { hf_token = "$env:HF_TOKEN" }` placeholder when
+      # uncommented.
+      HF_TOKEN: "${HF_TOKEN:-}"
+
+    ports:
+      # libp2p TCP + QUIC. The TCP port doubles as the
+      # endpoint clients dial via `vosx space join`.
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+
+    volumes:
+      # Per-space state: agent redbs, node.key, .endpoint.
+      # MUST persist — otherwise the operator's identity +
+      # auth grants reset on every container restart.
+      - vosx-data:/var/lib/vosx
+      # spaces.toml index + the operator's persistent
+      # client identity (identity.key). MUST persist.
+      - vosx-config:/etc/vosx
+      # HF model cache + blob cache. Optional but
+      # recommended — saves ~400MB per restart.
+      - vosx-cache:/var/cache/vosx
+      # Mount a custom manifest in via a host bind if you
+      # need to override the image default:
+      # - ./manifest.toml:/etc/vosx/manifest.toml:ro
+
+    restart: unless-stopped
+
+    # Filesystem-based healthcheck per
+    # `project_container_packaging_plan` option (c): the
+    # daemon writes `.endpoint` once libp2p has bound a
+    # listen address. Cheap; doesn't require a new HTTP
+    # surface or http-gateway dependency.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "find /var/lib/vosx -name .endpoint -mmin -1 | grep -q ."
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+    # Drop all caps the daemon doesn't need. vosx itself only
+    # needs `NET_BIND_SERVICE` (none needed for ports >1024,
+    # but listed for completeness); add CAPs back if your
+    # deployment binds privileged ports.
+    cap_drop:
+      - ALL
+
+    # Read-only root FS — the daemon only writes to the
+    # mounted volumes. Forces clean separation between
+    # image bits (immutable) and state (volume-resident).
+    read_only: true
+    # `/tmp` writable for cargo / scratch dirs.
+    tmpfs:
+      - /tmp:size=64m
+
+volumes:
+  vosx-data:
+  vosx-config:
+  vosx-cache:

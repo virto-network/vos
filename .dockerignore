@@ -1,0 +1,43 @@
+# Keep the docker build context small. The biggest contributors
+# to a naive `docker build .` are:
+#   - target/        — cargo build artifacts (multi-GB)
+#   - .git/          — full history (~hundreds of MB)
+#   - examples/actors/<*>/target/ — PVM build artifacts
+#   - zkpvm/target/  — zkVM build artifacts
+#
+# The image only needs source + the bundled PVM blobs at
+# vosx/blobs/, so this list is generous with what to exclude.
+
+# ── Build artifacts ────────────────────────────────────────────
+target/
+**/target/
+**/*.rlib
+**/*.rmeta
+
+# ── Git history + dev metadata ─────────────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── Editor + OS clutter ────────────────────────────────────────
+.vscode/
+.idea/
+**/.DS_Store
+**/*.swp
+
+# ── Test fixtures we don't need at build time ──────────────────
+examples/data/
+examples/wasm/*/target/
+zkpvm/STWO_MERKLE_LIFTED_OOB_ISSUE_DRAFT.md
+
+# ── Existing container outputs ─────────────────────────────────
+containers/tests/output/
+
+# ── Big checked-in PDFs the workspace happens to carry ─────────
+*.pdf
+
+# ── Bench + perf datasets ──────────────────────────────────────
+**/benches/data/
+
+# Note: we DO want `vosx/blobs/` in the build context so
+# build.rs's shipped-path fallback works.

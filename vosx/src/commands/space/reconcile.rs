@@ -159,7 +159,8 @@ fn register_extension(
 
     let mut args = Args::new();
     for (k, v) in &ext.init {
-        args = match v {
+        let resolved = resolve_env_indirection(&ext.name, k, v)?;
+        args = match &resolved {
             toml::Value::String(s) => args.with(k.clone(), s.clone()),
             toml::Value::Integer(i) => args.with(k.clone(), *i as u32),
             toml::Value::Boolean(b) => args.with(k.clone(), *b),
@@ -471,7 +472,7 @@ fn reconcile_one(
         }
     };
 
-    let install_args = encode_init_args(&elf_bytes, &agent.init, name_ids)?;
+    let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     let status = vos::block_on(reg.install(
@@ -504,6 +505,7 @@ fn reconcile_one(
 /// `name_ids` so manifest-style `children = ["greeter", …]`
 /// resolves to actual ServiceIds.
 fn encode_init_args(
+    agent_name: &str,
     elf_bytes: &[u8],
     init: &BTreeMap<String, toml::Value>,
     name_ids: &BTreeMap<String, u32>,
@@ -514,12 +516,13 @@ fn encode_init_args(
     let meta = vos::metadata::from_elf(elf_bytes);
     let mut args = InitArgs::new();
     for (key, val) in init {
+        let resolved = resolve_env_indirection(agent_name, key, val)?;
         let ty = meta
             .as_ref()
             .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
             .map(|f| f.ty.as_str())
             .unwrap_or("String");
-        args = args.with(key, toml_to_init_value(val, ty, name_ids));
+        args = args.with(key, toml_to_init_value(&resolved, ty, name_ids));
     }
     Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
         .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
@@ -541,7 +544,13 @@ fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> 
             // → u64, true/false → bool, else string. Manifest
             // authors who want explicit typing can upgrade to
             // typed init args once we have schemas.
-            match v {
+            //
+            // Sprint 3: `$env:VAR` strings get resolved here too
+            // so on_start payloads can pull secrets out of the
+            // container's env without baking them into the
+            // manifest.
+            let resolved = resolve_env_indirection(&entry.msg, k, v)?;
+            match &resolved {
                 toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
                 toml::Value::Boolean(b) => msg = msg.with(k, *b),
                 toml::Value::String(s) => msg = msg.with(k, s.clone()),
@@ -560,6 +569,51 @@ fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> 
         payloads.push(payload);
     }
     payload_codec::encode(&payloads)
+}
+
+/// Sprint 3 — resolve `$env:VAR` indirection in manifest init
+/// values. String values matching `$env:NAME` are looked up in
+/// the process environment; everything else passes through
+/// unchanged. Used by extension `[[extension]] init = {...}` and
+/// agent `[[agent]] init = {...}` paths so container deployments
+/// can keep secrets (HF tokens, API keys, …) out of the manifest
+/// file itself.
+///
+/// Error semantics:
+/// - `$env:NAME` where `NAME` is unset → `Err(anyhow)` so the
+///   daemon refuses to boot rather than passing an empty string
+///   to a handler expecting a secret.
+/// - `$env:` (no name) → treated as a literal string (operator
+///   typo; surface in logs but don't bail).
+///
+/// String values that *contain* but don't start with `$env:`
+/// (e.g. a default value with `$env:` embedded mid-string) pass
+/// through verbatim — only the prefix form is special-cased.
+fn resolve_env_indirection(
+    ext_name: &str,
+    key: &str,
+    val: &toml::Value,
+) -> anyhow::Result<toml::Value> {
+    let toml::Value::String(s) = val else {
+        return Ok(val.clone());
+    };
+    let Some(var_name) = s.strip_prefix("$env:") else {
+        return Ok(val.clone());
+    };
+    if var_name.is_empty() {
+        // Literal `$env:` with nothing after — treat as a typo,
+        // keep as-is.
+        return Ok(val.clone());
+    }
+    match std::env::var(var_name) {
+        Ok(resolved) => Ok(toml::Value::String(resolved)),
+        Err(_) => anyhow::bail!(
+            "extension '{ext_name}': init arg '{key}' references \
+             env var ${var_name} but it is not set in the daemon's \
+             environment. Set it before `vosx space up`, or remove \
+             the `$env:` indirection from the manifest.",
+        ),
+    }
 }
 
 fn toml_to_init_value(val: &toml::Value, ty: &str, name_ids: &BTreeMap<String, u32>) -> InitValue {
@@ -861,5 +915,112 @@ mod tests {
             InitValue::ListU32(ids) => assert!(ids.is_empty()),
             other => panic!("expected ListU32, got {other:?}"),
         }
+    }
+
+    // ── Sprint 3: $env:VAR indirection ──────────────────────
+
+    /// Use a per-test process-unique env-var name so concurrent
+    /// tests don't race on the same key. We unset on Drop so
+    /// stale state doesn't leak across tests.
+    struct EnvGuard {
+        key: String,
+    }
+    impl EnvGuard {
+        fn new(label: &str, value: &str) -> Self {
+            let key = format!(
+                "VOSX_RECONCILE_TEST_{}_{}_{}",
+                std::process::id(),
+                label,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            );
+            // SAFETY: tests in this crate run single-threaded
+            // per the suite layout; we restore by remove on drop.
+            unsafe {
+                std::env::set_var(&key, value);
+            }
+            Self { key }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: pair with the set above.
+            unsafe {
+                std::env::remove_var(&self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn env_indirection_resolves_set_var() {
+        let guard = EnvGuard::new("set_var", "s3cr3t");
+        let val = toml::Value::String(format!("$env:{}", guard.key));
+        let resolved = resolve_env_indirection("ai", "hf_token", &val).expect("set var resolves");
+        assert_eq!(resolved.as_str(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn env_indirection_errors_on_unset_var() {
+        // Use a fresh non-existent name (no EnvGuard set).
+        let nonexistent = format!(
+            "VOSX_RECONCILE_NEVER_SET_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let val = toml::Value::String(format!("$env:{nonexistent}"));
+        let err =
+            resolve_env_indirection("ai", "hf_token", &val).expect_err("unset var must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is not set"),
+            "error should explain the unset variable, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn env_indirection_passes_through_literal_string() {
+        let val = toml::Value::String("plain-literal".into());
+        let out = resolve_env_indirection("ai", "k", &val).expect("literal passthrough");
+        assert_eq!(out.as_str(), Some("plain-literal"));
+    }
+
+    #[test]
+    fn env_indirection_passes_through_non_strings() {
+        for val in [
+            toml::Value::Integer(42),
+            toml::Value::Boolean(true),
+            toml::Value::Array(vec![]),
+        ] {
+            let out = resolve_env_indirection("ai", "k", &val).expect("non-string passthrough");
+            assert_eq!(format!("{out:?}"), format!("{val:?}"));
+        }
+    }
+
+    #[test]
+    fn env_indirection_tolerates_bare_marker() {
+        // `$env:` with nothing after — operator typo; keep as
+        // literal so they see the bad value in the actor logs
+        // instead of a fatal error during reconcile.
+        let val = toml::Value::String("$env:".into());
+        let out = resolve_env_indirection("ai", "k", &val).expect("bare marker passthrough");
+        assert_eq!(out.as_str(), Some("$env:"));
+    }
+
+    #[test]
+    fn env_indirection_only_prefix_form_special() {
+        let guard = EnvGuard::new("mid", "ignored");
+        // Embedded $env: in the middle of the string is NOT
+        // special — only the prefix form is resolved.
+        let val = toml::Value::String(format!("prefix-$env:{}-suffix", guard.key));
+        let out = resolve_env_indirection("ai", "k", &val).expect("mid-string passthrough");
+        let s = out.as_str().unwrap();
+        assert!(
+            s.contains(&format!("$env:{}", guard.key)),
+            "mid-string $env: must NOT be expanded; got: {s}",
+        );
     }
 }
