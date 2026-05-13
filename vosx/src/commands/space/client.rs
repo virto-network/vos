@@ -91,7 +91,12 @@ impl DaemonClient {
         let bootstrap: libp2p::Multiaddr = libp2p::Multiaddr::from_str(bootstrap_str)
             .map_err(|e| anyhow::anyhow!("bad daemon multiaddr '{bootstrap_str}': {e}"))?;
 
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        // Sprint 2: load the operator's persistent libp2p
+        // identity from $XDG_CONFIG_HOME/vosx/identity.key
+        // (auto-create on first call). The daemon recognises
+        // the same PeerId across invocations and consults its
+        // members ACL table.
+        let keypair = crate::identity::load_or_create()?;
         let peer_id = libp2p::PeerId::from(keypair.public());
         let local_prefix = vos::network::derive_node_prefix(&peer_id);
 

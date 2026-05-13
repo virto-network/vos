@@ -108,6 +108,16 @@ pub fn spaces_index_path() -> PathBuf {
     config_root().join("spaces.toml")
 }
 
+/// Operator's persistent libp2p keypair, shared across every
+/// `vosx` client invocation from this shell user. Used by
+/// Sprint 2's daemon-auth path: the daemon recognises the same
+/// PeerId across calls and consults its `members` allow-list.
+/// Persistence is per-config-home; an operator with multiple
+/// machines / containers gets multiple identities.
+pub fn client_identity_path() -> PathBuf {
+    config_root().join("identity.key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

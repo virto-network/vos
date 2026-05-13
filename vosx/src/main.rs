@@ -22,6 +22,7 @@ mod bundled;
 mod cli_cache;
 mod commands;
 mod help_schema;
+mod identity;
 mod output;
 mod paths;
 mod shutdown;
@@ -115,6 +116,18 @@ enum Command {
     /// Designed for LLM and tooling consumption — pipe into
     /// `jq '.subcommands[] | .name'` to enumerate verbs.
     HelpSchema,
+    /// Print the operator's persistent libp2p PeerId — the
+    /// identity the daemon sees when this `vosx` invocation
+    /// dials it. Creates the keypair on first run at
+    /// `$XDG_CONFIG_HOME/vosx/identity.key`. Useful for
+    /// enrolling the operator into a space's `members`
+    /// ACL table (Sprint 2 daemon-auth work).
+    Whoami {
+        /// Emit JSON `{"peer_id": "...", "path": "..."}` instead
+        /// of plain text. Pipe into `jq` for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Initialize the global tracing subscriber. Default level is
@@ -225,6 +238,30 @@ fn main() {
                 }
             }
         }
+        Some(Command::Whoami { json }) => {
+            let path = paths::client_identity_path();
+            let kp = match identity::load_or_create() {
+                Ok(kp) => kp,
+                Err(e) => report_error(e),
+            };
+            let peer_id = libp2p::PeerId::from(kp.public()).to_string();
+            if json {
+                let view = serde_json::json!({
+                    "peer_id": peer_id,
+                    "path": path.display().to_string(),
+                });
+                match serde_json::to_string_pretty(&view) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(EXIT_RUNTIME_ERROR);
+                    }
+                }
+            } else {
+                println!("peer_id = {peer_id}");
+                println!("path    = {}", path.display());
+            }
+        }
         None => match cli.file {
             Some(p) => commands::run::run(&p, &[], &[], 100_000_000),
             None => {
@@ -276,7 +313,7 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// (one with `/` or `\`, or starting with `.`) is preserved for
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] = &["run", "space", "dev", "ai", "help-schema", "help"];
+    const BUILTIN_VERBS: &[&str] = &["run", "space", "dev", "ai", "help-schema", "help", "whoami"];
     // Skip global flags; only `--format` / `--space` take a
     // value, the rest are boolean-shaped. We do NOT recognise
     // `--space` here (it's a dynamic-only flag) — its presence
