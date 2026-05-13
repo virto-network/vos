@@ -237,6 +237,11 @@ pub struct ExtensionConfig {
     /// When set, the extension's redb file is created at
     /// `{data_dir}/extensions/{name}.redb`.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Sprint 2: cap-overage policy applied at the host ABI
+    /// boundary for this extension. Default `Block` — refuse
+    /// syscalls outside the declared caps. Override via the space
+    /// manifest's `cap_policy = "log"`/`"block"`/`"kill"`.
+    pub cap_policy: crate::extension::CapPolicy,
 }
 
 impl ExtensionConfig {
@@ -246,6 +251,7 @@ impl ExtensionConfig {
             path: path.into(),
             init_args: Vec::new(),
             data_dir: None,
+            cap_policy: crate::extension::CapPolicy::default(),
         }
     }
 
@@ -258,6 +264,7 @@ impl ExtensionConfig {
             path: path.into(),
             init_args: bytes,
             data_dir: None,
+            cap_policy: crate::extension::CapPolicy::default(),
         }
     }
 
@@ -266,6 +273,15 @@ impl ExtensionConfig {
     /// where `name` is derived from the `.so` filename.
     pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Override the cap-overage policy. Defaults to
+    /// [`CapPolicy::Block`](crate::extension::CapPolicy::Block) —
+    /// callers in tests that want the Sprint-1 warn-only
+    /// behaviour pass `CapPolicy::Log`.
+    pub fn with_cap_policy(mut self, policy: crate::extension::CapPolicy) -> Self {
+        self.cap_policy = policy;
         self
     }
 
@@ -2672,13 +2688,15 @@ fn run_service_extension(
     );
 
     // Read declared caps off the plugin's meta blob so the
-    // vtable shims can flag cap-overage at the syscall boundary
-    // (Sprint 1 / C10 observability — see
-    // HostCtx::check_cap_or_warn).
+    // vtable shims can gate / log at the syscall boundary
+    // (Sprint 2 — see HostCtx::check_cap_or_deny). cap_policy
+    // flows in from ExtensionConfig (operator-set via space
+    // manifest).
     let (declared_caps, actor_name) = match plugin.meta() {
         Some(m) => (m.caps.clone(), m.actor_name.clone()),
         None => (Vec::new(), format!("svc:{:#06x}", id.0)),
     };
+    let cap_policy = config.cap_policy;
     let host_ctx = Box::new(HostCtx {
         me: id.0,
         outbox: outbox.clone(),
@@ -2687,6 +2705,7 @@ fn run_service_extension(
         shutdown: shutdown.clone(),
         invoke: invoke_fn,
         declared_caps,
+        cap_policy,
         cap_warns_logged: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         actor_name,
     });

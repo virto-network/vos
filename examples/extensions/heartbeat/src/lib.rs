@@ -92,4 +92,4 @@ impl Heartbeat {
     }
 }
 
-vos::service_main!(Heartbeat);
+vos::service_main!(Heartbeat, caps = ["net.libp2p.dial"]);

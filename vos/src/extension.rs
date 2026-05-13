@@ -187,6 +187,13 @@ pub const HOST_OK: i32 = 0;
 pub const HOST_TIMEOUT: i32 = 1;
 pub const HOST_ERR_DISCONNECTED: i32 = -1;
 pub const HOST_ERR_INVALID: i32 = -2;
+/// The host refused the syscall because the extension's declared
+/// caps don't include the required capability. Surface to the
+/// extension so it can either bail or, for graceful degradation,
+/// log and skip. Sprint 2 `cap_policy = "block"` returns this;
+/// `"log"` lets the call through; `"kill"` returns this and also
+/// flips the shutdown flag so the extension's run loop exits.
+pub const HOST_ERR_CAP_DENIED: i32 = -3;
 
 /// Vtable exposed by the host to service-mode extensions. Each fn
 /// takes the opaque `*mut HostCtx` as its first arg so the host can
@@ -912,11 +919,14 @@ pub use host::{ExtensionInstance, ExtensionPlugin};
 // ── Service-mode host-side machinery (std only) ────────────────────────
 
 #[cfg(feature = "std")]
-pub use service_host::{HostCtx, InvokeFn, SERVICE_VTABLE};
+pub use service_host::{CapPolicy, HostCtx, InvokeFn, SERVICE_VTABLE};
 
 #[cfg(feature = "std")]
 mod service_host {
-    use super::{HOST_ERR_DISCONNECTED, HOST_OK, HOST_TIMEOUT, HostVTable, RecvBuf, RecvEnv};
+    use super::{
+        HOST_ERR_CAP_DENIED, HOST_ERR_DISCONNECTED, HOST_OK, HOST_TIMEOUT, HostVTable, RecvBuf,
+        RecvEnv,
+    };
     use crate::node::Envelope;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -934,6 +944,55 @@ mod service_host {
     /// actor-mode extensions use. Extensions don't need to know
     /// about `InvokeRequest` internals.
     pub type InvokeFn = dyn Fn(u32, &[u8], u64) -> Option<Vec<u8>> + Send + Sync;
+
+    /// Operator-configurable behaviour when an extension calls a
+    /// host syscall outside its declared `caps`. Set per-daemon
+    /// (or per-space via manifest); takes effect at extension
+    /// load time and stays fixed for the extension's lifetime.
+    ///
+    /// Order matters for serde round-trip — `Log` first so the
+    /// default-derived discriminant matches the legacy
+    /// Sprint-1 behaviour during the rollout.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum CapPolicy {
+        /// Log a `tracing::warn!` and let the call through. The
+        /// Sprint 1 behaviour. Use during initial rollout to
+        /// discover undeclared caps in production.
+        Log,
+        /// Refuse the call, return `HOST_ERR_CAP_DENIED` to the
+        /// extension. The extension can choose to recover or panic.
+        /// Sprint 2 default.
+        #[default]
+        Block,
+        /// Refuse + flip the extension's shutdown flag so its run
+        /// loop exits on the next `ctx.is_shutdown()` check. For
+        /// adversarial multi-tenant where a single cap violation
+        /// is grounds for termination.
+        Kill,
+    }
+
+    impl CapPolicy {
+        /// Parse from the operator-facing string form used in space
+        /// manifests + CLI flags. Unknown values fall back to the
+        /// default (`Block`) so a typo doesn't downgrade enforcement
+        /// to `Log`.
+        pub fn parse(s: &str) -> Self {
+            match s {
+                "log" => Self::Log,
+                "block" => Self::Block,
+                "kill" => Self::Kill,
+                _ => Self::default(),
+            }
+        }
+
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Log => "log",
+                Self::Block => "block",
+                Self::Kill => "kill",
+            }
+        }
+    }
 
     /// Internal host state backing a `ServiceCtx`. Exposed to
     /// service-mode extensions via the C ABI as `*mut c_void`.
@@ -960,14 +1019,16 @@ mod service_host {
         /// node internals.
         pub invoke: Arc<InvokeFn>,
         /// Capabilities the extension declared in its `service_main!`.
-        /// Used by Sprint 1's observability hooks
-        /// (`check_cap_or_warn`) — Sprint 2 will flip the warn into
-        /// a block/kill per the operator-configured policy.
+        /// Consulted by `check_cap_or_deny` at the host ABI boundary.
         pub declared_caps: Vec<String>,
+        /// Sprint 2 policy: what to do when an undeclared cap is
+        /// used. Cached at HostCtx construction from the daemon's
+        /// per-space config. See [`CapPolicy`].
+        pub cap_policy: CapPolicy,
         /// Per-(cap, extension) dedupe so a stream of N invokes
-        /// only logs the cap-overage warning once. Sprint 2's
-        /// policy gate will replace this with a per-call decision,
-        /// but for observability one log line is sufficient signal.
+        /// only logs once. Sprint 2 keeps the dedupe: even under
+        /// `Block`, a misbehaving extension that retries can flood
+        /// logs without it.
         pub cap_warns_logged: Mutex<std::collections::BTreeSet<&'static str>>,
         /// Extension's logging name (the `actor_name` field from
         /// `.vos_meta`). Threaded into the warning so the operator
@@ -976,41 +1037,68 @@ mod service_host {
     }
 
     impl HostCtx {
-        /// Sprint 1 cap-overage observability hook (C10).
+        /// Sprint 2 cap-policy gate. Returns `true` when the call
+        /// is allowed to proceed, `false` when the host should
+        /// refuse with `HOST_ERR_CAP_DENIED`.
         ///
-        /// Returns `true` if `cap` is declared in the extension's
-        /// `service_main!(caps = [...])`. Returns `false` AND
-        /// emits a `tracing::warn!` (deduped per cap per
-        /// extension) when the extension is using a host facility
-        /// outside its declaration. Behaviour is *observe-only* —
-        /// the call still proceeds.
+        /// Decision matrix:
+        /// - Cap declared           → allow (true), no log.
+        /// - Undeclared, `Log`      → allow (true), warn once.
+        /// - Undeclared, `Block`    → deny (false), warn once.
+        /// - Undeclared, `Kill`     → deny (false), warn once,
+        ///   flip shutdown so the extension's run loop exits.
         ///
-        /// Sprint 2 (`project_caps_enforcement_plan`) will replace
-        /// the warn-and-continue with an operator-configurable
-        /// policy gate: `log` (today), `block` (default), or
-        /// `kill`. See `project_caps_enforcement_plan.md` for the
-        /// design.
-        pub fn check_cap_or_warn(&self, cap: &'static str) -> bool {
+        /// The previous Sprint-1 name `check_cap_or_warn` is kept
+        /// as a thin alias so external callers (none today) don't
+        /// break across the rename.
+        pub fn check_cap_or_deny(&self, cap: &'static str) -> bool {
             if self.declared_caps.iter().any(|c| c == cap) {
                 return true;
             }
-            // Dedupe — one warning per cap per extension lifetime.
-            // The lock is uncontended on the happy path because
-            // declared_caps usually contains the cap.
-            if let Ok(mut logged) = self.cap_warns_logged.lock()
-                && logged.insert(cap)
-            {
+            let first_miss = match self.cap_warns_logged.lock() {
+                Ok(mut logged) => logged.insert(cap),
+                // Mutex poisoned — already in a bad state; log
+                // anyway and proceed with the policy decision.
+                Err(_) => true,
+            };
+            if first_miss {
                 tracing::warn!(
                     target: "vos::caps",
                     actor = %self.actor_name,
                     extension_id = self.me,
                     cap,
                     declared = ?self.declared_caps,
-                    "cap-overage: extension used host facility outside its declared caps \
-                     (Sprint 1 observability — will block in Sprint 2 per cap_policy)",
+                    policy = self.cap_policy.as_str(),
+                    "cap-overage: extension used host facility outside its declared caps",
                 );
             }
-            false
+            match self.cap_policy {
+                CapPolicy::Log => true,
+                CapPolicy::Block => false,
+                CapPolicy::Kill => {
+                    // Once per overage, surface that we're tearing
+                    // the extension down — operator-facing signal,
+                    // distinct from the per-call warn above.
+                    if first_miss {
+                        tracing::error!(
+                            target: "vos::caps",
+                            actor = %self.actor_name,
+                            extension_id = self.me,
+                            cap,
+                            "cap-overage under cap_policy=kill: flagging shutdown",
+                        );
+                    }
+                    self.shutdown.store(true, Ordering::Relaxed);
+                    false
+                }
+            }
+        }
+
+        /// Sprint-1 compatibility alias. Prefer `check_cap_or_deny`
+        /// in new code.
+        #[doc(hidden)]
+        pub fn check_cap_or_warn(&self, cap: &'static str) -> bool {
+            self.check_cap_or_deny(cap)
         }
     }
 
@@ -1062,11 +1150,15 @@ mod service_host {
         out: *mut RecvBuf,
     ) -> i32 {
         let ctx = unsafe { &*(host as *const HostCtx) };
-        // Sprint 1 / C10 observability: cross-actor invoke uses
-        // the libp2p dial path (when the target prefix isn't
-        // ours). Sprint 2 will flip this from warn-only into a
-        // blocking policy gate keyed on the same cap name.
-        let _ = ctx.check_cap_or_warn("net.libp2p.dial");
+        // Sprint 2: cap-policy gate on the cross-actor / cross-node
+        // invoke path. Under `Block`/`Kill` the extension sees
+        // `HOST_ERR_CAP_DENIED` and can recover or panic; under
+        // `Log` (Sprint-1 behaviour) the call proceeds with a
+        // single warn-once log line.
+        if !ctx.check_cap_or_deny("net.libp2p.dial") {
+            clear_recv_buf(out);
+            return HOST_ERR_CAP_DENIED;
+        }
         let bytes = if payload.is_null() || len == 0 {
             &[][..]
         } else {
@@ -1095,10 +1187,12 @@ mod service_host {
         len: usize,
     ) -> i32 {
         let ctx = unsafe { &*(host as *const HostCtx) };
-        // Sprint 1 / C10 observability: same cap as `vh_invoke` —
-        // fire-and-forget tells across actors traverse the same
-        // network path when the target is off-node.
-        let _ = ctx.check_cap_or_warn("net.libp2p.dial");
+        // Sprint 2: same cap as `vh_invoke` — fire-and-forget tells
+        // across actors traverse the same network path when the
+        // target is off-node.
+        if !ctx.check_cap_or_deny("net.libp2p.dial") {
+            return HOST_ERR_CAP_DENIED;
+        }
         let bytes = if payload.is_null() || len == 0 {
             Vec::new()
         } else {
@@ -1276,7 +1370,7 @@ mod service_host {
         use super::*;
         use crate::node::Envelope;
 
-        fn make_ctx(caps: &[&str]) -> HostCtx {
+        fn make_ctx(caps: &[&str], policy: CapPolicy) -> HostCtx {
             let (outbox, _outbox_rx) = mpsc::channel::<Envelope>();
             let (_inbox_tx, inbox_rx) = mpsc::channel::<Envelope>();
             HostCtx {
@@ -1287,38 +1381,103 @@ mod service_host {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 invoke: Arc::new(|_, _, _| None),
                 declared_caps: caps.iter().map(|s| s.to_string()).collect(),
+                cap_policy: policy,
                 cap_warns_logged: Mutex::new(std::collections::BTreeSet::new()),
                 actor_name: "test-ext".into(),
             }
         }
 
+        // ── Sprint 1 compat — Log policy preserves warn-only ────
+
         #[test]
-        fn declared_cap_passes_without_warning() {
-            let ctx = make_ctx(&["net.libp2p.dial", "fs.cache"]);
-            assert!(ctx.check_cap_or_warn("net.libp2p.dial"));
-            // dedupe set stays empty because no warning was emitted.
+        fn log_policy_declared_cap_passes_without_warning() {
+            let ctx = make_ctx(&["net.libp2p.dial", "fs.cache"], CapPolicy::Log);
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
             assert!(ctx.cap_warns_logged.lock().unwrap().is_empty());
         }
 
         #[test]
-        fn undeclared_cap_returns_false_and_dedupes() {
-            let ctx = make_ctx(&["fs.cache"]);
-            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
-            // First miss recorded.
+        fn log_policy_undeclared_cap_passes_with_warning() {
+            let ctx = make_ctx(&["fs.cache"], CapPolicy::Log);
+            // Under Log: the syscall is allowed (true) but the
+            // warning is logged (set has 1 entry).
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
             assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 1);
-            // Repeat: still returns false, dedupe keeps the set
-            // size at 1.
-            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
+            // Dedupe: second call still allows, set stays size 1.
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
             assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 1);
         }
 
         #[test]
-        fn distinct_undeclared_caps_log_distinctly() {
-            let ctx = make_ctx(&[]);
-            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
-            assert!(!ctx.check_cap_or_warn("fs.cache"));
-            // Two distinct caps, two dedupe entries.
+        fn log_policy_distinct_undeclared_caps_log_distinctly() {
+            let ctx = make_ctx(&[], CapPolicy::Log);
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
+            assert!(ctx.check_cap_or_deny("fs.cache"));
             assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 2);
+        }
+
+        // ── Sprint 2 — Block policy refuses the call ─────────────
+
+        #[test]
+        fn block_policy_declared_cap_passes() {
+            let ctx = make_ctx(&["net.libp2p.dial"], CapPolicy::Block);
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
+            assert!(!ctx.shutdown.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn block_policy_undeclared_cap_denies_without_kill() {
+            let ctx = make_ctx(&["fs.cache"], CapPolicy::Block);
+            assert!(!ctx.check_cap_or_deny("net.libp2p.dial"));
+            // Sanity: the extension's run loop is still alive —
+            // only Kill flips shutdown.
+            assert!(!ctx.shutdown.load(Ordering::Relaxed));
+            assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 1);
+        }
+
+        // ── Sprint 2 — Kill policy flips shutdown ────────────────
+
+        #[test]
+        fn kill_policy_declared_cap_passes_without_shutdown() {
+            let ctx = make_ctx(&["net.libp2p.dial"], CapPolicy::Kill);
+            assert!(ctx.check_cap_or_deny("net.libp2p.dial"));
+            assert!(!ctx.shutdown.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn kill_policy_undeclared_cap_denies_and_flips_shutdown() {
+            let ctx = make_ctx(&[], CapPolicy::Kill);
+            assert!(!ctx.check_cap_or_deny("net.libp2p.dial"));
+            assert!(
+                ctx.shutdown.load(Ordering::Relaxed),
+                "Kill policy must flip the extension's shutdown flag"
+            );
+        }
+
+        // ── Compat alias — keeps the Sprint-1 name pointing at
+        //    the same gate. ───────────────────────────────────────
+
+        #[test]
+        fn warn_alias_routes_to_deny() {
+            let ctx = make_ctx(&[], CapPolicy::Block);
+            #[allow(deprecated)]
+            let allowed = ctx.check_cap_or_warn("net.libp2p.dial");
+            assert!(!allowed, "Block policy must deny via the warn alias too");
+        }
+
+        // ── Parser ────────────────────────────────────────────────
+
+        #[test]
+        fn cap_policy_parse_round_trip() {
+            assert_eq!(CapPolicy::parse("log"), CapPolicy::Log);
+            assert_eq!(CapPolicy::parse("block"), CapPolicy::Block);
+            assert_eq!(CapPolicy::parse("kill"), CapPolicy::Kill);
+            // Unknown falls back to default (Block).
+            assert_eq!(CapPolicy::parse("nonsense"), CapPolicy::Block);
+            // Round-trip via as_str.
+            for p in [CapPolicy::Log, CapPolicy::Block, CapPolicy::Kill] {
+                assert_eq!(CapPolicy::parse(p.as_str()), p);
+            }
         }
     }
 }

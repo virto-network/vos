@@ -43,6 +43,11 @@ pub struct Manifest {
     /// `space_id`, looked up from the running entry.
     #[allow(dead_code)]
     pub space: Option<String>,
+    /// Sprint 2: default `cap_policy` for every extension in
+    /// this space — `"log"` / `"block"` / `"kill"`. Per-extension
+    /// `cap_policy` overrides. Omitted → host default
+    /// ([`vos::extension::CapPolicy::Block`]).
+    pub cap_policy: Option<String>,
     #[serde(rename = "agent", default)]
     pub agents: Vec<AgentDef>,
     /// Native `.so` extension plugins. Each `[[extension]]` entry
@@ -70,6 +75,10 @@ pub struct ExtensionDef {
     /// (Vec<u32> name-list, etc.) come later if needed.
     #[serde(default)]
     pub init: BTreeMap<String, toml::Value>,
+    /// Sprint 2: per-extension override of the space-level
+    /// [`Manifest::cap_policy`]. Useful for relaxing one
+    /// extension to `"log"` while keeping the rest at `"block"`.
+    pub cap_policy: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -137,6 +146,7 @@ fn register_extension(
     ext: &ExtensionDef,
     manifest_dir: &Path,
     daemon_prefix: u16,
+    space_cap_policy: vos::extension::CapPolicy,
 ) -> anyhow::Result<()> {
     let so_path = manifest_dir.join(&ext.path);
     if !so_path.exists() {
@@ -194,10 +204,23 @@ fn register_extension(
         .map(|p| p.meta_bytes().to_vec())
         .unwrap_or_default();
 
+    // Sprint 2: per-extension cap_policy override > space-level
+    // default. Falls back to the host-side CapPolicy::default()
+    // when neither is set.
+    let cap_policy = match ext.cap_policy.as_deref() {
+        Some(s) => vos::extension::CapPolicy::parse(s),
+        None => space_cap_policy,
+    };
+    tracing::info!(
+        "extension '{}' cap_policy = {}",
+        ext.name,
+        cap_policy.as_str(),
+    );
+
     let cfg = if ext.init.is_empty() {
-        ExtensionConfig::new(&so_path)
+        ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
     } else {
-        ExtensionConfig::with_args(&so_path, &args)
+        ExtensionConfig::with_args(&so_path, &args).with_cap_policy(cap_policy)
     };
 
     // Install at a *deterministic* ServiceId derived from the
@@ -279,8 +302,21 @@ pub fn reconcile(
             "reconciling manifest ({} extension definition(s))",
             manifest.extensions.len(),
         );
+        // Resolve the space-level default once; per-extension
+        // overrides are applied inside register_extension.
+        let space_cap_policy = match manifest.cap_policy.as_deref() {
+            Some(s) => vos::extension::CapPolicy::parse(s),
+            None => vos::extension::CapPolicy::default(),
+        };
         for ext in &manifest.extensions {
-            register_extension(node, &reg, ext, manifest_dir, daemon_prefix)?;
+            register_extension(
+                node,
+                &reg,
+                ext,
+                manifest_dir,
+                daemon_prefix,
+                space_cap_policy,
+            )?;
         }
     }
 
