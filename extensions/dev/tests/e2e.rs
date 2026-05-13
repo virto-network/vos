@@ -627,15 +627,15 @@ fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
 /// disk, so the cargo invocation sees byte-identical source in
 /// both flows.
 ///
-/// TEMP: ignored — `put_blob_ast` returns Unit (dispatch failure)
-/// on the proj-ast actor after the working-change + merge code
-/// went back in. The handler is in the actor's .vos_meta but the
-/// invoke replies empty. Smells like a CRDT-actor cold-start
-/// timing issue or a runtime invoke-route resolution problem
-/// rather than a transpile bug. Host-side round-trip is still
-/// fully covered by `actors/dev-project/dev-ast/tests`.
+/// This test was `#[ignore]`d 2026-05-12 (Phase 5 transpiler
+/// regression note) because `put_blob_ast` returned Unit on
+/// cold start. The companion regression test
+/// `dev_project_main_branch_survives_daemon_restart` exercises
+/// the same dispatch path and confirms the bug is gone — the
+/// fix landed in some intervening commit (likely one of the
+/// per-identity / side-branch / picky-review passes). Un-ignored
+/// 2026-05-13 as part of the Sprint 1 correctness sweep.
 #[test]
-#[ignore]
 fn compile_via_ast_matches_raw_artifact() {
     ensure_built();
     let mut daemon = boot_daemon();
@@ -1343,4 +1343,125 @@ fn current_head(client: &TestClient, project_id: ServiceId, branch: &str) -> Vec
         Value::Bytes(b) => b,
         other => panic!("head({branch}) returned {other:?}"),
     }
+}
+
+/// Regression for Sprint 1 / B5: a CRDT-replicated dev-project's
+/// `main` commits must survive a daemon restart. The 2026-05-12
+/// per-identity e2e session observed `main` reverting to empty
+/// after `space up` restarted — symptoms identical to the
+/// long-ignored `compile_via_ast_matches_raw_artifact` test in
+/// this file (handlers return `Value::Unit` on cold start). The
+/// regression test asserts the property directly: after a commit
+/// + restart, `head(main)` returns the same 32-byte hash.
+#[test]
+fn dev_project_main_branch_survives_daemon_restart() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "restartproj"],
+        "vosx dev new restartproj",
+    );
+    daemon.restart();
+
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("restartproj");
+
+    // Put a blob and commit on `main`.
+    let blob_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    let commit_reply = client.invoke(
+        project_id,
+        &Msg::new("commit")
+            .with("parent", Vec::<u8>::new())
+            .with("paths", vec!["src/lib.rs".to_string()])
+            .with("blob_hashes", blob_hash.clone())
+            .with("branch", "main".to_string())
+            .with("intent_tag", dev_project::INTENT_EDIT)
+            .with("intent_data", Vec::<u8>::new())
+            .with("author", Vec::<u8>::new())
+            .with("ts_ms", 0u64)
+            .with("change_id", Vec::<u8>::new()),
+    );
+    let commit_hash = decode_hash_result_assert_ok(commit_reply, "commit main");
+    assert_eq!(commit_hash.len(), 32, "commit hash size");
+
+    let head_before = current_head(&client, project_id, "main");
+    assert_eq!(
+        head_before, commit_hash,
+        "head(main) immediately after commit should equal the commit hash"
+    );
+
+    // Restart the daemon — the dev-project actor's state has to
+    // be restored from the CRDT replicated storage. Drop the
+    // client first so its libp2p outbound queues don't survive
+    // the daemon's PID change.
+    drop(client);
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+
+    let head_after = current_head(&client, project_id, "main");
+    assert_eq!(
+        head_after,
+        commit_hash,
+        "head(main) after daemon restart should still equal the commit hash; \
+         got {} bytes (commit was {} bytes)",
+        head_after.len(),
+        commit_hash.len(),
+    );
+
+    // get_blob should still resolve the source bytes too — covers
+    // the case where the branch ref persists but the blob table
+    // restoration lags. Without this, `dev compile` after restart
+    // would silently produce empty output.
+    let blob_reply = client.invoke(
+        project_id,
+        &Msg::new("get_blob").with("hash", blob_hash.clone()),
+    );
+    let restored_blob_bytes = match blob_reply {
+        Value::Bytes(b) => b,
+        other => panic!("get_blob after restart returned {other:?}"),
+    };
+    let restored_blob = <dev_project::BlobObject as Decode>::try_decode(&restored_blob_bytes)
+        .expect("decode BlobObject after restart");
+    assert_eq!(
+        restored_blob.bytes.as_slice(),
+        COUNTER_SOURCE.as_bytes(),
+        "blob bytes must round-trip across a daemon restart"
+    );
+
+    // Same coverage for the AST handler — the long-ignored
+    // `compile_via_ast_matches_raw_artifact` test in this file
+    // reports `put_blob_ast` returning Unit on cold start. Put
+    // an AST blob *after* the restart so we test both the
+    // post-restore write path and the immediate read-back.
+    let ast_blob = dev_ast::text_to_ast(COUNTER_SOURCE).expect("text→ast canonical");
+    let ast_reply = client.invoke(
+        project_id,
+        &Msg::new("put_blob_ast").with("bytes", ast_blob.clone()),
+    );
+    let ast_hash = match ast_reply {
+        Value::Bytes(b) => {
+            assert_eq!(b.len(), 32, "put_blob_ast hash should be 32 bytes");
+            b
+        }
+        Value::Unit => panic!(
+            "put_blob_ast returned Value::Unit on a warm-restart daemon — \
+             reproduces the bug from compile_via_ast_matches_raw_artifact"
+        ),
+        other => panic!("put_blob_ast returned {other:?}"),
+    };
+    let ast_get_reply = client.invoke(project_id, &Msg::new("get_blob").with("hash", ast_hash));
+    let ast_get_bytes = match ast_get_reply {
+        Value::Bytes(b) => b,
+        other => panic!("get_blob(AST) returned {other:?}"),
+    };
+    let ast_get = <dev_project::BlobObject as Decode>::try_decode(&ast_get_bytes)
+        .expect("decode BlobObject (AST)");
+    assert_eq!(
+        ast_get.kind,
+        dev_project::BlobKind::RustAst,
+        "AST blob must be tagged BlobKind::RustAst"
+    );
+    assert_eq!(ast_get.bytes, ast_blob, "AST blob bytes must round-trip");
 }

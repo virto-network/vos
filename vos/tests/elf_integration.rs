@@ -171,6 +171,94 @@ fn cooperative_loop_with_greeter() {
     assert_eq!(rt.panics, 0, "no service should have panicked in refine");
 }
 
+/// Regression for Sprint 1 / B6 — yielding sub-actors keep ticking
+/// when driven by the scheduler agent. See
+/// memory/project_runtime_tick_regression.md for the original
+/// failure (`lifecycle::invoke` was returning `Done` for yielded
+/// children, so the scheduler dropped them from the run queue
+/// after one iteration). RESOLVED on master 2026-05-04 via the
+/// per-service refine journal + invoke envelope packing commits;
+/// this test pins the property so a future refactor can't
+/// silently regress it.
+///
+/// Assertion: after N bounded `tick_blocking()` rounds the
+/// runtime still has work pending (scheduler hasn't stopped
+/// queuing self-`tick` messages) and nothing has panicked. The
+/// counter actor in `examples/actors/counter` is the canonical
+/// self-yielding fixture used by `examples/space.toml`.
+#[test]
+fn scheduler_keeps_driving_yielding_counter() {
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let agent_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let scheduler_data = match std::fs::read(&agent_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let counter_data = example_elf("counter");
+
+    let scheduler_blob = transpile_actor(&scheduler_data);
+    let counter_blob = transpile_actor(&counter_data);
+
+    let mut rt = VosRuntime::new();
+
+    let sched_blob_idx = rt.register_service_blob(scheduler_blob);
+    let sched_id = rt.register_service(sched_blob_idx);
+    let counter_blob_idx = rt.register_service_blob(counter_blob);
+    let counter_id = rt.register_service(counter_blob_idx);
+
+    let args = vos::init::InitArgs::new().with(
+        "children",
+        vos::init::InitValue::ListU32(vec![counter_id.0]),
+    );
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    rt.send_to(sched_id, Vec::new());
+
+    // Drain a bounded number of ticks. The scheduler self-sends
+    // `tick` after each round so `has_work()` should stay true as
+    // long as the counter remains yielded. If the regression
+    // returned (yield treated as Done), the scheduler would
+    // drop the counter from `run_queue`, stop scheduling ticks,
+    // and has_work() would go false within the first round.
+    const TICKS: usize = 8;
+    let mut productive = 0usize;
+    for _ in 0..TICKS {
+        if rt.tick_blocking() {
+            productive += 1;
+        }
+        if !rt.has_work() {
+            break;
+        }
+    }
+
+    assert_eq!(rt.panics, 0, "no service should have panicked");
+    assert!(
+        productive >= TICKS,
+        "expected the scheduler to drive at least {TICKS} productive ticks; \
+         got {productive} — yielded counter dropped early"
+    );
+    assert!(
+        rt.has_work(),
+        "scheduler should still have pending tick after {TICKS} rounds — \
+         a yielding counter must keep the run queue non-empty"
+    );
+    // The counter is invoked synchronously through the scheduler
+    // (lifecycle::invoke), not as a top-level suspended service —
+    // its yielded state lives in the scheduler's run_queue, not
+    // in the runtime's data layer. So we don't check
+    // `is_suspended(counter_id)`; the productive-tick + has_work
+    // assertions above are the real signal.
+    let _ = counter_id;
+}
+
 #[test]
 fn refine_completes_and_clears_continuation() {
     // Smoke test for the CoreVM-on-JAM model: a service that completes
