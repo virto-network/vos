@@ -959,6 +959,59 @@ mod service_host {
         /// this closure so the extension layer can stay free of
         /// node internals.
         pub invoke: Arc<InvokeFn>,
+        /// Capabilities the extension declared in its `service_main!`.
+        /// Used by Sprint 1's observability hooks
+        /// (`check_cap_or_warn`) — Sprint 2 will flip the warn into
+        /// a block/kill per the operator-configured policy.
+        pub declared_caps: Vec<String>,
+        /// Per-(cap, extension) dedupe so a stream of N invokes
+        /// only logs the cap-overage warning once. Sprint 2's
+        /// policy gate will replace this with a per-call decision,
+        /// but for observability one log line is sufficient signal.
+        pub cap_warns_logged: Mutex<std::collections::BTreeSet<&'static str>>,
+        /// Extension's logging name (the `actor_name` field from
+        /// `.vos_meta`). Threaded into the warning so the operator
+        /// can identify which extension to fix.
+        pub actor_name: String,
+    }
+
+    impl HostCtx {
+        /// Sprint 1 cap-overage observability hook (C10).
+        ///
+        /// Returns `true` if `cap` is declared in the extension's
+        /// `service_main!(caps = [...])`. Returns `false` AND
+        /// emits a `tracing::warn!` (deduped per cap per
+        /// extension) when the extension is using a host facility
+        /// outside its declaration. Behaviour is *observe-only* —
+        /// the call still proceeds.
+        ///
+        /// Sprint 2 (`project_caps_enforcement_plan`) will replace
+        /// the warn-and-continue with an operator-configurable
+        /// policy gate: `log` (today), `block` (default), or
+        /// `kill`. See `project_caps_enforcement_plan.md` for the
+        /// design.
+        pub fn check_cap_or_warn(&self, cap: &'static str) -> bool {
+            if self.declared_caps.iter().any(|c| c == cap) {
+                return true;
+            }
+            // Dedupe — one warning per cap per extension lifetime.
+            // The lock is uncontended on the happy path because
+            // declared_caps usually contains the cap.
+            if let Ok(mut logged) = self.cap_warns_logged.lock()
+                && logged.insert(cap)
+            {
+                tracing::warn!(
+                    target: "vos::caps",
+                    actor = %self.actor_name,
+                    extension_id = self.me,
+                    cap,
+                    declared = ?self.declared_caps,
+                    "cap-overage: extension used host facility outside its declared caps \
+                     (Sprint 1 observability — will block in Sprint 2 per cap_policy)",
+                );
+            }
+            false
+        }
     }
 
     /// Default per-call timeout for `ask` when the extension passes
@@ -1009,6 +1062,11 @@ mod service_host {
         out: *mut RecvBuf,
     ) -> i32 {
         let ctx = unsafe { &*(host as *const HostCtx) };
+        // Sprint 1 / C10 observability: cross-actor invoke uses
+        // the libp2p dial path (when the target prefix isn't
+        // ours). Sprint 2 will flip this from warn-only into a
+        // blocking policy gate keyed on the same cap name.
+        let _ = ctx.check_cap_or_warn("net.libp2p.dial");
         let bytes = if payload.is_null() || len == 0 {
             &[][..]
         } else {
@@ -1037,6 +1095,10 @@ mod service_host {
         len: usize,
     ) -> i32 {
         let ctx = unsafe { &*(host as *const HostCtx) };
+        // Sprint 1 / C10 observability: same cap as `vh_invoke` —
+        // fire-and-forget tells across actors traverse the same
+        // network path when the target is off-node.
+        let _ = ctx.check_cap_or_warn("net.libp2p.dial");
         let bytes = if payload.is_null() || len == 0 {
             Vec::new()
         } else {
@@ -1207,6 +1269,57 @@ mod service_host {
             (*out).from = 0;
         }
         clear_recv_buf(unsafe { &raw mut (*out).payload });
+    }
+
+    #[cfg(test)]
+    mod cap_tests {
+        use super::*;
+        use crate::node::Envelope;
+
+        fn make_ctx(caps: &[&str]) -> HostCtx {
+            let (outbox, _outbox_rx) = mpsc::channel::<Envelope>();
+            let (_inbox_tx, inbox_rx) = mpsc::channel::<Envelope>();
+            HostCtx {
+                me: 0,
+                outbox,
+                inbox: Mutex::new(inbox_rx),
+                deferred: Mutex::new(VecDeque::new()),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                invoke: Arc::new(|_, _, _| None),
+                declared_caps: caps.iter().map(|s| s.to_string()).collect(),
+                cap_warns_logged: Mutex::new(std::collections::BTreeSet::new()),
+                actor_name: "test-ext".into(),
+            }
+        }
+
+        #[test]
+        fn declared_cap_passes_without_warning() {
+            let ctx = make_ctx(&["net.libp2p.dial", "fs.cache"]);
+            assert!(ctx.check_cap_or_warn("net.libp2p.dial"));
+            // dedupe set stays empty because no warning was emitted.
+            assert!(ctx.cap_warns_logged.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn undeclared_cap_returns_false_and_dedupes() {
+            let ctx = make_ctx(&["fs.cache"]);
+            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
+            // First miss recorded.
+            assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 1);
+            // Repeat: still returns false, dedupe keeps the set
+            // size at 1.
+            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
+            assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn distinct_undeclared_caps_log_distinctly() {
+            let ctx = make_ctx(&[]);
+            assert!(!ctx.check_cap_or_warn("net.libp2p.dial"));
+            assert!(!ctx.check_cap_or_warn("fs.cache"));
+            // Two distinct caps, two dedupe entries.
+            assert_eq!(ctx.cap_warns_logged.lock().unwrap().len(), 2);
+        }
     }
 }
 

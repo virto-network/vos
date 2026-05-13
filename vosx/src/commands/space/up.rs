@@ -157,7 +157,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!("--once: exiting when registry goes idle");
         node.run();
     } else {
-        tracing::info!("running until shutdown (Ctrl-C)");
+        // Install SIGINT/SIGTERM handlers so the daemon exits
+        // cleanly on `docker stop` / `kill -TERM` / Ctrl-C
+        // without losing in-flight commits or leaking the
+        // endpoint file. The handler flips the same
+        // AtomicBool that `run_forever`'s poll loop watches.
+        crate::shutdown::install(node.shutdown_handle());
+        tracing::info!("running until shutdown (Ctrl-C / SIGTERM)");
         node.run_forever();
     }
 

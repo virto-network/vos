@@ -45,6 +45,12 @@ pub use publish::{
 
 vos::service_main!(
     ext::DevExtension,
-    caps = ["fs.tempdir", "process.spawn", "tokio-runtime",],
+    caps = [
+        "fs.cache",
+        "fs.tempdir",
+        "net.libp2p.dial",
+        "process.spawn",
+        "tokio-runtime",
+    ],
     cli = [stop],
 );

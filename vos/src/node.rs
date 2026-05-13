@@ -1076,10 +1076,10 @@ impl VosNode {
             // proposed entry commits).
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
             let rep_id = config.replication_id.unwrap_or([0u8; 32]);
-            match config
-                .db_path(id)
-                .map(|p| (p, redb::Database::create(config.db_path(id).unwrap())))
-            {
+            match config.db_path(id).map(|p| {
+                let db = redb::Database::create(&p);
+                (p, db)
+            }) {
                 Some((_path, Ok(db))) => {
                     let db = Arc::new(db);
                     config.pre_opened_db = Some(db.clone());
@@ -2231,10 +2231,13 @@ fn dispatch_once(
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
 ) -> Result<(), crate::commit::CommitError> {
-    let recorded = msg.is_some() && recording_enabled;
-    if recorded {
-        runtime.begin_recording(msg.as_ref().unwrap().clone());
-    }
+    let recorded = recording_enabled
+        && if let Some(payload) = msg.as_ref() {
+            runtime.begin_recording(payload.clone());
+            true
+        } else {
+            false
+        };
     if let Some(payload) = msg {
         runtime.send_to(svc_id, payload);
     }
@@ -2668,6 +2671,14 @@ fn run_service_extension(
         },
     );
 
+    // Read declared caps off the plugin's meta blob so the
+    // vtable shims can flag cap-overage at the syscall boundary
+    // (Sprint 1 / C10 observability — see
+    // HostCtx::check_cap_or_warn).
+    let (declared_caps, actor_name) = match plugin.meta() {
+        Some(m) => (m.caps.clone(), m.actor_name.clone()),
+        None => (Vec::new(), format!("svc:{:#06x}", id.0)),
+    };
     let host_ctx = Box::new(HostCtx {
         me: id.0,
         outbox: outbox.clone(),
@@ -2675,6 +2686,9 @@ fn run_service_extension(
         deferred: Mutex::new(VecDeque::new()),
         shutdown: shutdown.clone(),
         invoke: invoke_fn,
+        declared_caps,
+        cap_warns_logged: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        actor_name,
     });
     let host_ptr = Box::into_raw(host_ctx);
     let handle = HostCtxHandle {

@@ -24,6 +24,7 @@ mod commands;
 mod help_schema;
 mod output;
 mod paths;
+mod shutdown;
 mod spaces_index;
 
 use output::Format;

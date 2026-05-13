@@ -42,6 +42,11 @@ pub use config::InitConfig;
 
 vos::service_main!(
     ext::AiExtension,
-    caps = ["fs.cache", "net.http.outbound", "tokio-runtime"],
+    caps = [
+        "fs.cache",
+        "net.http.outbound",
+        "net.libp2p.dial",
+        "tokio-runtime",
+    ],
     cli = [stop],
 );

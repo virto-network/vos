@@ -359,10 +359,11 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
 vos::service_main!(
     HttpGateway,
     caps = [
+        "net.libp2p.dial",
         "net.tcp.bind",
         "net.tcp.connect",
-        "tokio-runtime",
         "thread.spawn",
+        "tokio-runtime",
     ],
     cli = [stop, status],
 );
