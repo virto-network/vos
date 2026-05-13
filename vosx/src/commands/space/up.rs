@@ -148,6 +148,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // path is stable across restarts.
     spawn_installed_agents(&mut node, &data_dir, local_prefix)?;
 
+    // Sprint 2 — first-boot admin bootstrap. `space new` records
+    // the creator's client PeerId in `admin_bootstrap.txt`. We
+    // grant them AUTH_ROLE_ADMIN via a local invoke (which
+    // bypasses the dispatch-layer auth gate — that only fires
+    // for libp2p-traversing calls), then delete the file so
+    // subsequent boots are no-ops.
+    consume_admin_bootstrap(&node, &data_dir, local_prefix)?;
+
     // Wait for the swarm to bind, then publish endpoint info
     // so client commands (`space publish`, `space install`, …)
     // can dial us. Removed in the cleanup block at the end.
@@ -261,6 +269,52 @@ fn build_network_for_daemon(
 
 /// Wait briefly for the swarm to bind, then write the endpoint
 /// descriptor so clients can find us.
+/// Sprint 2 — consume the `admin_bootstrap.txt` file that
+/// `space new` writes alongside `node.key`, granting the recorded
+/// PeerId `AUTH_ROLE_ADMIN` in the registry's `auth_grants`
+/// table. The grant goes through a local invoke so it bypasses
+/// the dispatch-layer auth gate (which only applies to libp2p-
+/// originated calls). Idempotent — if the file is missing, this
+/// is a no-op. Deletes the file after a successful grant so
+/// subsequent boots skip this work.
+fn consume_admin_bootstrap(
+    node: &VosNode,
+    data_dir: &std::path::Path,
+    daemon_prefix: u16,
+) -> anyhow::Result<()> {
+    use space_registry::{AUTH_ROLE_ADMIN, STATUS_OK, SpaceRegistryRef};
+    let bootstrap_path = data_dir.join("admin_bootstrap.txt");
+    let peer_id_str = match std::fs::read_to_string(&bootstrap_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("read {}: {e}", bootstrap_path.display()),
+    };
+    if peer_id_str.is_empty() {
+        let _ = std::fs::remove_file(&bootstrap_path);
+        return Ok(());
+    }
+    let peer_id: libp2p::PeerId = peer_id_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {peer_id_str} as PeerId: {e}"))?;
+
+    let reg = SpaceRegistryRef::at(ServiceId::new(
+        daemon_prefix,
+        ServiceId::REGISTRY.local_id(),
+    ));
+    let status = vos::block_on(reg.grant_role(&mut &*node, peer_id.to_bytes(), AUTH_ROLE_ADMIN))
+        .map_err(|e| anyhow::anyhow!("grant_role bootstrap: {e}"))?;
+    if status != STATUS_OK {
+        anyhow::bail!("grant_role returned status {status}");
+    }
+    tracing::info!(%peer_id, "auth: granted ADMIN to space creator (bootstrap)");
+
+    // One-shot — delete after successful grant. Subsequent boots
+    // see the file gone and skip; if the registry already has
+    // grants for this peer, the grant call above is idempotent.
+    let _ = std::fs::remove_file(&bootstrap_path);
+    Ok(())
+}
+
 fn publish_endpoint(node: &VosNode, data_dir: &std::path::Path, prefix: u16) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 

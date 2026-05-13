@@ -186,6 +186,40 @@ pub struct MemberRow {
     pub proof_data: Vec<u8>,
 }
 
+// ── Auth grants (Sprint 2) ────────────────────────────────────────
+//
+// Separate table from `MemberRow` because the existing `role`
+// field is a Raft-consensus concern (`NODE_ROLE_VOTER` /
+// `OBSERVER`), independent from auth roles. A PeerId can hold
+// any combination of (consensus role, auth role) — they're
+// orthogonal axes.
+//
+// Hierarchy: `ADMIN > DEVELOPER > READONLY > NONE`. Unenrolled
+// peers default to `NONE`. The dispatch-layer gate in
+// `vos::node::dispatch_invoke` compares the *required* role
+// for a handler against the caller's *granted* role.
+//
+// `READONLY` is the default for `members` lookups so a peer can
+// see who's enrolled without an explicit grant.
+
+pub const AUTH_ROLE_NONE: u8 = 0;
+pub const AUTH_ROLE_READONLY: u8 = 1;
+pub const AUTH_ROLE_DEVELOPER: u8 = 2;
+pub const AUTH_ROLE_ADMIN: u8 = 3;
+
+/// Per-PeerId auth grant. `peer_id` is the libp2p PeerId in
+/// multihash bytes (same encoding as `MemberRow.key` when
+/// `kind = Node`); `role` is one of the `AUTH_ROLE_*`
+/// constants above.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct AuthGrantRow {
+    pub peer_id: Vec<u8>,
+    pub role: u8,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 //
 // Mutation messages return a single u8 status. 0 always = ok.
@@ -197,6 +231,10 @@ pub const STATUS_IN_USE: u8 = 3;
 pub const STATUS_PROGRAM_NOT_FOUND: u8 = 4;
 pub const STATUS_INSTANCE_EXISTS: u8 = 5;
 pub const STATUS_BAD_HASH: u8 = 6;
+/// Sprint 2: the caller's PeerId doesn't carry the auth role
+/// required for this handler. Distinct from `STATUS_NOT_FOUND`
+/// so clients can surface "permission denied" specifically.
+pub const STATUS_FORBIDDEN: u8 = 7;
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -230,6 +268,13 @@ pub struct SpaceRegistry {
     /// peers can resolve `ProgramRow.hash` without a separate
     /// fetch dance.
     blobs: Vec<BlobRow>,
+    /// Sprint 2 — per-PeerId auth grants. Sorted by `peer_id`
+    /// (lexicographic bytes) for binary lookup. Pre-Sprint-2
+    /// state archives don't have this field; the actor's
+    /// fall-back-to-fresh behaviour on archive decode failure
+    /// (see "Schema evolution" in this file's module doc) lets
+    /// upgrades resync from the DAG.
+    auth_grants: Vec<AuthGrantRow>,
 }
 
 #[messages]
@@ -242,6 +287,7 @@ impl SpaceRegistry {
             metas: Vec::new(),
             extension_metas: Vec::new(),
             blobs: Vec::new(),
+            auth_grants: Vec::new(),
         }
     }
 
@@ -744,6 +790,69 @@ impl SpaceRegistry {
     #[msg]
     async fn members(&self) -> Vec<MemberRow> {
         self.members.clone()
+    }
+
+    // ── Auth grants (Sprint 2) ─────────────────────────────────
+
+    /// Grant `role` to `peer_id`. Idempotent — re-granting the
+    /// same role is a no-op; changing the role updates in place.
+    /// `peer_id` is libp2p multihash bytes (same encoding as
+    /// `add_node`'s `peer_id` arg).
+    #[msg]
+    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8) -> u8 {
+        if peer_id.is_empty() {
+            return STATUS_BAD_HASH;
+        }
+        match self
+            .auth_grants
+            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
+        {
+            Ok(idx) => {
+                self.auth_grants[idx].role = role;
+                STATUS_OK
+            }
+            Err(insert_at) => {
+                self.auth_grants
+                    .insert(insert_at, AuthGrantRow { peer_id, role });
+                STATUS_OK
+            }
+        }
+    }
+
+    /// Remove the grant for `peer_id`. Returns
+    /// `STATUS_NOT_FOUND` if the peer wasn't granted.
+    #[msg]
+    async fn revoke_role(&mut self, peer_id: Vec<u8>) -> u8 {
+        match self
+            .auth_grants
+            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
+        {
+            Ok(idx) => {
+                self.auth_grants.remove(idx);
+                STATUS_OK
+            }
+            Err(_) => STATUS_NOT_FOUND,
+        }
+    }
+
+    /// Look up the role granted to `peer_id`. Returns
+    /// `AUTH_ROLE_NONE` if no grant exists — the
+    /// dispatch-layer gate treats this as "deny".
+    #[msg]
+    async fn peer_role(&self, peer_id: Vec<u8>) -> u8 {
+        match self
+            .auth_grants
+            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
+        {
+            Ok(idx) => self.auth_grants[idx].role,
+            Err(_) => AUTH_ROLE_NONE,
+        }
+    }
+
+    /// Full grants list — for `vosx space role list`.
+    #[msg]
+    async fn auth_grants(&self) -> Vec<AuthGrantRow> {
+        self.auth_grants.clone()
     }
 
     // ── Blob bytes ─────────────────────────────────────────────

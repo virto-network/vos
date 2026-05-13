@@ -228,7 +228,23 @@ pub trait NetworkService: Send + Sync {
     /// vos::node impl dispatches against its invoke-route table
     /// and blocks on the agent's reply (called from
     /// `tokio::task::spawn_blocking`, so blocking is safe).
-    fn dispatch_invoke(&self, _from: u32, _to: u32, _chain: Vec<u32>, _msg: Vec<u8>) -> Vec<u8> {
+    ///
+    /// `caller_peer_id` is the libp2p-noise-verified PeerId of
+    /// the remote peer that opened the request_response stream.
+    /// Sprint 2's auth gate consults the registry's `auth_grants`
+    /// for this PeerId before forwarding gated handlers; non-
+    /// auth-gated handlers ignore it. `None` is reserved for
+    /// in-process calls that don't traverse libp2p (no current
+    /// callers — every InvokeRequest arrives over a noise
+    /// session).
+    fn dispatch_invoke(
+        &self,
+        _caller_peer_id: Option<libp2p::PeerId>,
+        _from: u32,
+        _to: u32,
+        _chain: Vec<u32>,
+        _msg: Vec<u8>,
+    ) -> Vec<u8> {
         Vec::new()
     }
 
@@ -1448,11 +1464,18 @@ fn handle_req_resp(
                         // park the runtime if awaited inline. The task
                         // calls back with (channel, InvokeReply) which the
                         // swarm select! arm forwards via send_response.
+                        //
+                        // Sprint 2: the libp2p `peer` is the
+                        // noise-verified PeerId of the remote that
+                        // opened this stream. Threaded into the
+                        // dispatch so vos::node's auth gate can
+                        // consult `auth_grants` for the caller.
                         let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
+                        let caller = peer;
                         tokio::task::spawn_blocking(move || {
                             let payload = match svc {
-                                Some(s) => s.dispatch_invoke(from, to, chain, msg),
+                                Some(s) => s.dispatch_invoke(Some(caller), from, to, chain, msg),
                                 None => {
                                     warn!(
                                         from,
@@ -2462,6 +2485,7 @@ mod tests {
         impl NetworkService for RecordingDispatcher {
             fn dispatch_invoke(
                 &self,
+                _caller_peer_id: Option<libp2p::PeerId>,
                 from: u32,
                 to: u32,
                 chain: Vec<u32>,

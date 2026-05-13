@@ -540,8 +540,94 @@ struct NodeService {
 }
 
 #[cfg(feature = "network")]
+impl NodeService {
+    /// Sprint 2 auth lookup. Send a synchronous `peer_role` invoke
+    /// to the local space-registry and surface the result as the
+    /// `AUTH_ROLE_*` byte the gate compares against. Returns
+    /// `AUTH_ROLE_NONE` (= "deny") for any of:
+    ///
+    /// - `caller_peer_id == None` — in-process calls don't have
+    ///   a libp2p identity (no current callers, but defensive).
+    /// - registry route missing — gate fires before the registry
+    ///   boots? bail safe.
+    /// - registry reply empty / undecodable.
+    ///
+    /// Cheap (~1 short round-trip on local mpsc) but a hot
+    /// frequent-call surface; the response is the registry's
+    /// already-cached in-memory `auth_grants` Vec lookup.
+    fn lookup_caller_role(&self, caller_peer_id: Option<&libp2p::PeerId>) -> u8 {
+        let Some(peer_id) = caller_peer_id else {
+            return AUTH_ROLE_NONE;
+        };
+        let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
+        let tx = match self.invoke_routes.lock() {
+            Ok(m) => m.get(&registry_id).cloned(),
+            Err(_) => return AUTH_ROLE_NONE,
+        };
+        let Some(tx) = tx else {
+            return AUTH_ROLE_NONE;
+        };
+        // Build a `peer_role` Msg with the caller's PeerId bytes.
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
+        let msg = Msg::new("peer_role").with("peer_id", peer_id.to_bytes());
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(InvokeRequest {
+                msg: payload,
+                reply_tx,
+                chain: vec![],
+            })
+            .is_err()
+        {
+            return AUTH_ROLE_NONE;
+        }
+        let envelope = match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(b) => b,
+            Err(_) => return AUTH_ROLE_NONE,
+        };
+        let Some(reply_bytes) = unwrap_invoke_envelope(&envelope) else {
+            return AUTH_ROLE_NONE;
+        };
+        // `peer_role` returns a `u8`. The actor framework wraps it
+        // via `Value::U8(...)` or `Value::Bytes(rkyv-encoded u8)`
+        // depending on emit shape; both decode to the same byte
+        // via the value->u8 conversion path.
+        decode_u8_reply(&reply_bytes).unwrap_or(AUTH_ROLE_NONE)
+    }
+}
+
+/// Pull a `u8` out of the actor-framework reply bytes. Handles
+/// both the `Value::U8` wire shape and the `Value::Bytes(rkyv(u8))`
+/// fallback. Sprint 2's auth lookup needs this; other host
+/// callers stay with the dynamic Value decoder.
+#[cfg(feature = "network")]
+fn decode_u8_reply(bytes: &[u8]) -> Option<u8> {
+    use crate::actors::codec::Decode;
+    let value = <crate::value::Value as Decode>::try_decode(bytes)?;
+    match value {
+        crate::value::Value::U8(n) => Some(n),
+        crate::value::Value::U32(n) => Some(n as u8),
+        crate::value::Value::U64(n) => Some(n as u8),
+        crate::value::Value::Bytes(b) => <u8 as Decode>::try_decode(&b),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "network")]
 impl crate::network::NetworkService for NodeService {
-    fn dispatch_invoke(&self, _from: u32, to: u32, chain: Vec<u32>, msg: Vec<u8>) -> Vec<u8> {
+    fn dispatch_invoke(
+        &self,
+        caller_peer_id: Option<libp2p::PeerId>,
+        _from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> Vec<u8> {
         // The chain arrived already including the original caller's
         // ID (the remote peer's agent). The receiver's own
         // external_invoke prepends *this* agent's ID when dispatching
@@ -555,6 +641,33 @@ impl crate::network::NetworkService for NodeService {
         // matches our own node — same routing decision the local
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
+
+        // Sprint 2 auth gate: when the target is the registry
+        // (well-known ServiceId 0) and the inner Msg names a
+        // gated handler, consult auth_grants for the caller. The
+        // gate runs BEFORE forwarding so a refused call never
+        // reaches the actor (and never lands in the DAG).
+        if to_unscoped == crate::abi::service::ServiceId::REGISTRY.local_id() as u32
+            && let Some(handler) = peek_dynamic_msg_name(&msg)
+            && handler_requires_admin(&handler)
+        {
+            let caller_role = self.lookup_caller_role(caller_peer_id.as_ref());
+            if caller_role < AUTH_ROLE_ADMIN {
+                let peer_label = caller_peer_id
+                    .as_ref()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "<local>".into());
+                warn!(
+                    handler = %handler,
+                    peer = %peer_label,
+                    granted_role = caller_role,
+                    "auth: refusing privileged registry handler — \
+                     caller lacks admin grant",
+                );
+                return forbidden_envelope();
+            }
+        }
+
         let tx = self.invoke_routes.lock().ok().and_then(|m| {
             m.get(&to).cloned().or_else(|| {
                 if to != to_unscoped {
@@ -2158,6 +2271,68 @@ fn handle_invoke_request(
 
 /// Encode the invoke wire envelope `[status][state_len:u32 LE][state][reply]`
 /// — the same format `runtime::handle_invoke` writes for a same-runtime
+/// Sprint 2 auth roles, kept in sync with
+/// `space_registry::AUTH_ROLE_*` so the host's dispatch-layer
+/// gate doesn't need a cross-crate dep on the actor.
+#[cfg(feature = "network")]
+pub(crate) const AUTH_ROLE_NONE: u8 = 0;
+#[cfg(feature = "network")]
+pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
+
+/// Set of registry handlers gated behind `AUTH_ROLE_ADMIN`.
+/// Mutating handlers go through here; read-only handlers
+/// (`programs`, `agents`, `members`, `auth_grants`, `peer_role`,
+/// `meta_for_instance`, …) stay open so a peer can introspect
+/// what's there before requesting enrollment.
+#[cfg(feature = "network")]
+pub(crate) fn handler_requires_admin(handler: &str) -> bool {
+    matches!(
+        handler,
+        "publish"
+            | "install"
+            | "upgrade"
+            | "uninstall"
+            | "add_node"
+            | "remove_node"
+            | "add_identity"
+            | "remove_identity"
+            | "grant_role"
+            | "revoke_role"
+            | "register_meta"
+            | "register_extension_meta"
+            | "upload_blob"
+    )
+}
+
+/// Peek the handler name out of an invoke payload without
+/// fully running it. Used by the auth gate to classify the
+/// call before forwarding. Returns `None` for payloads that
+/// don't carry a dynamic msg tag — the gate falls through to
+/// allow, since typed-dispatch payloads don't reach the
+/// publish/install handlers we care about anyway.
+#[cfg(feature = "network")]
+fn peek_dynamic_msg_name(payload: &[u8]) -> Option<String> {
+    use crate::value::TAG_DYNAMIC;
+    let body = payload.strip_prefix(&[TAG_DYNAMIC])?;
+    let msg = <crate::value::Msg as crate::actors::codec::Decode>::try_decode(body)?;
+    Some(msg.name)
+}
+
+/// Build a failure envelope the libp2p layer relays back to
+/// the caller. `STATUS_PANICKED` is the closest existing match
+/// — surfaces to `unwrap_invoke_envelope` as `None`, which
+/// libp2p-side reports as a transport failure. Sprint 2 picks
+/// it because adding a new STATUS_FORBIDDEN at the
+/// `actors::run` level is a separate cleanup; the warn at the
+/// dispatch boundary plus the registry's `STATUS_FORBIDDEN` on
+/// the eventual retry-via-grant flow give enough operator
+/// signal.
+#[cfg(feature = "network")]
+fn forbidden_envelope() -> Vec<u8> {
+    use crate::actors::run::STATUS_PANICKED;
+    encode_invoke_envelope(STATUS_PANICKED, &[], &[])
+}
+
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
 /// another agent thread surfaces as `STATUS_YIELDED` (with its post-
 /// dispatch state) to the calling actor's `lifecycle::invoke_raw`,

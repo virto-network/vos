@@ -144,6 +144,23 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(&key_path, key_bytes)?;
 
+    // 9.5. Sprint 2 — record the creator's client PeerId so the
+    // first `space up` of this space auto-enrols it as
+    // AUTH_ROLE_ADMIN in the registry's auth_grants. Without this
+    // file the space comes up with no admin and the gated
+    // registry handlers (`publish`, `install`, …) reject every
+    // client invoke.
+    let creator_kp = crate::identity::load_or_create()?;
+    let creator_peer_id = libp2p::PeerId::from(creator_kp.public());
+    let bootstrap_path = final_dir.join("admin_bootstrap.txt");
+    std::fs::write(&bootstrap_path, creator_peer_id.to_string()).map_err(|e| {
+        anyhow::anyhow!(
+            "write {}: {e} — admin_bootstrap file ensures first \
+             `space up` enrols you as ADMIN",
+            bootstrap_path.display(),
+        )
+    })?;
+
     // 10. Append to the spaces index.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
     let mut entry = spaces_index::entry_for(&space_id, &args.name);

@@ -420,4 +420,27 @@ impl DaemonClient {
         vos::block_on(self.registry().remove_identity(&mut &self.node, public_key))
             .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
+
+    // ── Sprint 2 auth grants ────────────────────────────────────
+
+    pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().grant_role(&mut &self.node, peer_id, role))
+            .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
+    }
+
+    pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().revoke_role(&mut &self.node, peer_id))
+            .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))
+    }
+
+    #[allow(dead_code)] // exposed for tooling; CLI consumers use `space role list`.
+    pub fn peer_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
+        vos::block_on(self.registry().peer_role(&mut &self.node, peer_id))
+            .map_err(|e| anyhow::anyhow!("registry.peer_role(): {e}"))
+    }
+
+    pub fn auth_grants(&self) -> anyhow::Result<Vec<space_registry::AuthGrantRow>> {
+        vos::block_on(self.registry().auth_grants(&mut &self.node))
+            .map_err(|e| anyhow::anyhow!("registry.auth_grants(): {e}"))
+    }
 }

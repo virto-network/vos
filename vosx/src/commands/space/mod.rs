@@ -38,6 +38,7 @@ pub mod payload_codec;
 pub mod programs;
 pub mod publish;
 pub mod reconcile;
+pub mod role;
 pub mod subscriptions;
 pub mod uninstall;
 pub mod unpublish;
@@ -220,6 +221,18 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<members::MembersCommand>,
     },
+    /// Manage auth-role grants (Sprint 2). Subcommands: list,
+    /// grant, revoke. Bare `space role <space>` lists. Sprint
+    /// 2 gates registry-mutation handlers behind
+    /// `AUTH_ROLE_ADMIN`; this is the table the dispatch-layer
+    /// gate consults. The space creator is auto-enrolled by
+    /// `space new` (first `space up` reads
+    /// `admin_bootstrap.txt`).
+    Role {
+        space: String,
+        #[command(subcommand)]
+        command: Option<role::RoleCommand>,
+    },
     /// Drop the local copy of a space — wipes the per-space
     /// data dir and the spaces.toml entry. The shared blob
     /// cache is kept and the space stays alive on its peers;
@@ -348,6 +361,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Agents { space } => agents::run(&space),
         SpaceCommand::Describe { space, instance } => describe::run(&space, &instance),
         SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
+        SpaceCommand::Role { space, command } => role::run(role::Args { space, command }),
         SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),
         SpaceCommand::Call {
             space,
