@@ -75,6 +75,7 @@ pub trait Invoker {
 // shape just collapses `InvokeError` into `ClientError::Unreachable`,
 // matching what the old `ActorClient` emission produced.
 impl<A: super::Actor> Invoker for super::Context<A> {
+    #[allow(clippy::manual_async_fn)]
     fn invoke(
         &mut self,
         target: ServiceId,

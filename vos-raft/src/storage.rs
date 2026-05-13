@@ -170,6 +170,7 @@ pub trait Storage<N: NodeId>: Send + 'static {
     /// recovery via log-tail scan, with the well-known caveat
     /// that compaction past the last `ConfigChange` reverts the
     /// view to `cfg.members`.
+    #[allow(clippy::type_complexity)]
     fn active_config(
         &self,
     ) -> impl core::future::Future<Output = Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error>> + Send

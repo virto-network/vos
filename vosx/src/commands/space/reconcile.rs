@@ -174,6 +174,9 @@ fn register_extension(
     // narrow race if the worker thread hasn't run yet at our drop;
     // a stronger fix would have `node.register_extension` return
     // the meta blob itself, which is the right Phase 5+ shape.
+    // SAFETY: dlopen on a vos-built extension .so; the manifest's
+    // path is operator-supplied. See node.rs:run_service_extension
+    // for the full FFI contract docstring.
     let plugin = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
         Ok(p) => Some(p),
         Err(e) => {

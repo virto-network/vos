@@ -48,6 +48,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // SIGTERM first. The daemon's signal handler is the same
     // path Ctrl-C takes — registry persists, sockets close,
     // `.endpoint` removed.
+    //
+    // SAFETY: libc::kill is async-signal-safe and takes only
+    // scalar args (pid_t + signum). No memory aliasing concerns.
     let sigterm = unsafe { libc::kill(ep.pid as libc::pid_t, libc::SIGTERM) };
     if sigterm != 0 {
         let err = std::io::Error::last_os_error();
@@ -77,6 +80,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
+    // SAFETY: same as SIGTERM above — libc::kill is a safe scalar
+    // call; the unsafe wrapper is just the FFI annotation.
     let sigkill = unsafe { libc::kill(ep.pid as libc::pid_t, libc::SIGKILL) };
     if sigkill != 0 {
         let err = std::io::Error::last_os_error();

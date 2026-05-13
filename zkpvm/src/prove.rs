@@ -485,6 +485,7 @@ fn prove_impl_with_components(
     // ~140 ms → ~50–70 ms with the default thread pool cap (10
     // threads); brings total prove time from 0.71 s to ~0.62 s.
     let t = Instant::now();
+    #[allow(clippy::type_complexity)]
     let interaction_results: Vec<(
         ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
         SecureField,

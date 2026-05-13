@@ -269,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::op_ref)]
     fn typed_scalar_arithmetic_matches_dalek() {
         // k + e * sk, the Schnorr signing operation.
         let k = Scalar::from(99u64);

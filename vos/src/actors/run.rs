@@ -288,6 +288,7 @@ static mut IN_REFINE: bool = false;
 
 #[cfg(feature = "service")]
 pub fn set_refine_mode(v: bool) {
+    // SAFETY: PVM is single-threaded; no concurrent access to IN_REFINE.
     unsafe {
         IN_REFINE = v;
     }
@@ -295,6 +296,7 @@ pub fn set_refine_mode(v: bool) {
 
 #[cfg(feature = "service")]
 pub fn is_refine_mode() -> bool {
+    // SAFETY: PVM is single-threaded; read of static mut bool is sound.
     unsafe { IN_REFINE }
 }
 
@@ -309,6 +311,7 @@ pub fn is_refine_mode() -> bool {
 /// Halt the PVM (no output). Used by accumulate (service mode).
 #[cfg(all(feature = "service", target_arch = "riscv64"))]
 fn halt() -> ! {
+    // SAFETY: terminal PVM hostcall. `noreturn` — no liveness after.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -321,6 +324,9 @@ fn halt() -> ! {
 /// Halt with output data in registers a0 (ptr) and a1 (len).
 #[cfg(target_arch = "riscv64")]
 fn halt_with_output(data: &[u8]) -> ! {
+    // SAFETY: terminal PVM hostcall. The host reads `len` bytes from
+    // `data.as_ptr()` before we lose control; the slice is owned by
+    // the caller until then. `noreturn` — no liveness after.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -405,6 +411,10 @@ pub fn run_refine_service<A: super::Actor>() {
     static mut ACTOR_HOLDER: usize = 0;
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
     let mut cold_start = false;
+    // SAFETY: PVM is single-threaded; the static-mut access goes via
+    // a raw pointer (no shared/exclusive ref conflict). The cast from
+    // `usize` back to `*mut A` is sound because we stamped the slot
+    // with a `Box::into_raw(Box::<A>::new(..))` value of the same A.
     let actor_ref: &mut A = unsafe {
         if *holder_ptr == 0 {
             cold_start = true;
@@ -465,6 +475,9 @@ pub fn run_refine_service<A: super::Actor>() {
     // never runs destructors).
     static mut OUTPUT_BUF: usize = 0;
     let out_ptr = addr_of_mut!(OUTPUT_BUF);
+    // SAFETY: same single-threaded PVM invariant as ACTOR_HOLDER —
+    // the slot holds a `Box::into_raw(Vec<u8>)` value we stamped on
+    // first use.
     let out_buf: &mut alloc::vec::Vec<u8> = unsafe {
         if *out_ptr == 0 {
             *out_ptr = Box::into_raw(Box::new(alloc::vec::Vec::<u8>::new())) as usize;

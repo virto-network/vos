@@ -5,8 +5,6 @@
 //! single `block_on` instead of pulling in `pollster` or `tokio` as
 //! a dev-dep.
 
-#![cfg(test)]
-
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};

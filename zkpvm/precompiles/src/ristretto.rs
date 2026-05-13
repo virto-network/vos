@@ -280,6 +280,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::op_ref)]
     fn point_add_matches_dalek() {
         let p_dalek = DalekScalar::from(7u64) * RISTRETTO_BASEPOINT_POINT;
         let q_dalek = DalekScalar::from(13u64) * RISTRETTO_BASEPOINT_POINT;

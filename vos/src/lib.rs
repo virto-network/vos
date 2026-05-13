@@ -280,6 +280,21 @@ macro_rules! __vos_emit_worker_glue {
         // worker's link. Top-of-graph builds keep `bin` on; cross-
         // actor lib deps disable default features so this block
         // expands to nothing.
+        //
+        // SAFETY contract with the host (see also vos/src/extension.rs):
+        // - The `state: *mut ()` opaque handle is whatever `vos_extension_create`
+        //   returned (a `Box::into_raw(WorkerState)`). The host stores
+        //   it and passes it back unchanged on every later call.
+        //   `vos_extension_destroy` consumes it. No mutable aliasing —
+        //   the host calls these in sequence on one thread per extension.
+        // - `(msg_ptr, msg_len)`, `(args_ptr, args_len)`, etc., are
+        //   borrowed slices owned by the caller for the duration of
+        //   the call. We read them, never store the pointer.
+        // - The `(state_ptr, state_len)` we return from snapshot fns
+        //   is a `Vec::into_raw_parts` triple the host must hand back
+        //   to `vos_extension_free_buf` so we can drop it.
+        // - The `_VOS_WORKER_META` byte slice is a `'static` array;
+        //   the host promises not to mutate through the pointer.
         #[cfg(feature = "bin")]
         mod __vos_worker {
             use super::*;
@@ -611,6 +626,19 @@ macro_rules! service_main {
         $crate::service_main!($actor_ty, caps = [], cli = [$($cli),*]);
     };
     ($actor_ty:ty, caps = [$($cap:literal),* $(,)?], cli = [$($cli:ident),* $(,)?] $(,)?) => {
+        // SAFETY contract with the host (same as the actor-mode glue):
+        // - `state: *mut ()` is a `Box::into_raw($actor_ty)` from
+        //   `vos_extension_create`; the host owns the raw pointer
+        //   and hands it back to every subsequent call, ending with
+        //   `vos_extension_destroy`. No concurrent access — one
+        //   thread per extension.
+        // - `handle: HostCtxHandle` is a borrowed pointer to a
+        //   `HostCtx` the host pins for the lifetime of `run`.
+        //   ServiceCtx::from_raw wraps it; we never store the raw
+        //   pointer past the call.
+        // - The cli-method shims read `(state, args_ptr, args_len)`
+        //   and return a `*mut u8 + len + cap` triple that the host
+        //   must return via `vos_extension_free_buf`.
         #[cfg(feature = "bin")]
         const _: () = {
             extern crate alloc;

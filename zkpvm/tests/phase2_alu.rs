@@ -915,7 +915,6 @@ fn prove_mul_upper_uu_small() {
     test_three_reg_op(Opcode::MulUpperUU, 7, 6, 0);
 }
 
-#[test]
 // ── Shift tests ──
 #[test]
 fn prove_shlo_l64() {

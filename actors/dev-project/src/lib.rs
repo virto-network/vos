@@ -1388,6 +1388,7 @@ pub struct DevProject {
 
 #[messages]
 impl DevProject {
+    #[allow(dead_code)]
     fn new(name: String) -> Self {
         Self {
             state: ProjectState {

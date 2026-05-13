@@ -459,6 +459,7 @@ impl<N: NodeId> Worker<N> {
     /// worker.wait_init().expect("raft init failed");
     /// // ...the worker is now serving...
     /// ```
+    #[allow(clippy::result_unit_err)]
     pub fn wait_init(&self) -> Result<(), ()> {
         let mut g = self.init.0.lock().unwrap();
         while g.is_none() {

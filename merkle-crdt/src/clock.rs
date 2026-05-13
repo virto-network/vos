@@ -142,6 +142,7 @@ impl<H: Hasher> MerkleClock<H> {
     {
         let mut visited = BTreeSet::new();
         // None = enter (fetch + push children), Some(node) = exit (visit)
+        #[allow(clippy::type_complexity)]
         let mut stack: Vec<(Cid<H>, Option<DagNode<H, P>>)> = vec![(root.clone(), None)];
 
         while let Some((cid, cached)) = stack.pop() {

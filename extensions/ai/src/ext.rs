@@ -135,6 +135,7 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
         // SAFETY: invariants documented on the function.
         let ai = unsafe { &*(state as *const AiExtension) };
 
+        // SAFETY: msg_ptr / msg_len are host-borrowed for this call.
         let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
         let body = if raw.first() == Some(&TAG_DYNAMIC) {
             &raw[1..]

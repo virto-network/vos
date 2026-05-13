@@ -1131,6 +1131,10 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
+                    // SAFETY: emitted by the macro for caller-supplied
+                    // Value::Bytes that the actor protocol promises is a
+                    // valid rkyv archive of `#inner`; AlignedVec<16> gives
+                    // the required alignment.
                     let archived = unsafe {
                         vos::rkyv::access_unchecked::<<#inner as vos::rkyv::Archive>::Archived>(&av)
                     };
@@ -1210,6 +1214,8 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
+                    // SAFETY: see the Option<T> arm above — same contract,
+                    // with `#ty` as the archive type.
                     let archived = unsafe {
                         vos::rkyv::access_unchecked::<<#ty as vos::rkyv::Archive>::Archived>(&av)
                     };

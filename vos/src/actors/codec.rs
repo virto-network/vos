@@ -59,11 +59,17 @@ where
             if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T::Archived>()) {
                 let mut av = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
                 av.extend_from_slice(bytes);
+                // SAFETY: `av` is freshly aligned via AlignedVec<16>, and
+                // the caller is responsible for `bytes` being a valid
+                // archive of `T::Archived` (paired with `T`'s Encode).
                 let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&av) };
                 return rkyv::deserialize::<T, rkyv::rancor::Error>(archived).unwrap();
             } else {
                 bytes
             };
+        // SAFETY: `aligned` is verified above to satisfy
+        // `align_of::<T::Archived>()`, and the caller-supplied bytes
+        // are a valid archive of `T::Archived` by Encode/Decode pairing.
         let archived = unsafe { rkyv::access_unchecked::<T::Archived>(aligned) };
         rkyv::deserialize::<T, rkyv::rancor::Error>(archived).unwrap()
     }

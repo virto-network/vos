@@ -60,6 +60,7 @@ impl<L: std::error::Error + 'static, R: std::error::Error + 'static> std::error:
 /// applying their payloads in order preserves causality.
 ///
 /// Each fetched node is verified by recomputing its CID from the payload and children.
+#[allow(clippy::type_complexity)]
 pub fn fetch_missing<H, P, L, R>(
     root: &Cid<H>,
     local: &L,

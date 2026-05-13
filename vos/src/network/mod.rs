@@ -267,6 +267,7 @@ pub trait RaftRpcHandler: Send + Sync {
     /// for log consistency checks, term updates, applying entries,
     /// and any local persistence — the network layer just delivers
     /// the call and ferries the answer back.
+    #[allow(clippy::too_many_arguments)]
     fn append_entries(
         &self,
         replication_id: &[u8; 32],
@@ -1398,6 +1399,7 @@ fn handle_swarm_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_req_resp(
     swarm: &mut Swarm<VosBehaviour>,
     event: request_response::Event<Frame, Frame>,

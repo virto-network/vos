@@ -128,6 +128,10 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let m_ptr = m.as_ptr() as u64;
     let t_low = t as u64;
     let f_flag: u64 = if f { 1 } else { 0 };
+    // SAFETY: hostcall trap into BLAKE2B_COMPRESS. The host reads
+    // 128 bytes from `m_ptr` and writes 64 bytes back through
+    // `h_ptr`, sizes that match the borrowed `[u8; 64]` / `[u8; 128]`
+    // we just took the pointers of. `nostack` — we don't touch SP.
     unsafe {
         core::arch::asm!(
             "ecall",

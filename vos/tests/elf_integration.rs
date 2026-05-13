@@ -1741,6 +1741,7 @@ fn crdt_counter_converges_across_nodes_live() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -1755,6 +1756,7 @@ fn crdt_counter_converges_across_nodes_live() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // ── Nodes + actors ─────────────────────────────────────────
@@ -1950,6 +1952,7 @@ fn crdt_scheduler_install_propagates_across_nodes() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -1962,6 +1965,7 @@ fn crdt_scheduler_install_propagates_across_nodes() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // Empty initial children so install(N) is the only state
@@ -2139,6 +2143,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -2153,6 +2158,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     let mut node_a = VosNode::with_prefix(prefix_a);
@@ -3011,6 +3017,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -3023,6 +3030,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
         local_prefix: prefix_b,
         listen: vec![listen.clone()],
         bootstrap: vec![a_dial.clone()],
+        auto_dial_mdns: true,
     });
     // Snapshot B's bound address now so A's restart can dial
     // it directly — without that, A2 would only discover B
@@ -3126,6 +3134,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
         local_prefix: prefix_a,
         listen: vec![listen],
         bootstrap: vec![b_dial],
+        auto_dial_mdns: true,
     });
 
     let mut node_a2 = VosNode::with_prefix(prefix_a);
@@ -3684,6 +3693,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -3697,6 +3707,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         local_prefix: prefix_b,
         listen: vec![listen.clone()],
         bootstrap: vec![a_dial.clone()],
+        auto_dial_mdns: true,
     });
     let b_listen = wait_for(
         || net_b.listen_addrs().into_iter().next(),
@@ -3710,6 +3721,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
         local_prefix: prefix_c,
         listen: vec![listen],
         bootstrap: vec![a_dial, b_dial],
+        auto_dial_mdns: true,
     });
 
     // ── Three VosNodes. ──────────────────────────────────────
@@ -3960,6 +3972,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -3973,6 +3986,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         local_prefix: prefix_b,
         listen: vec![listen.clone()],
         bootstrap: vec![a_dial.clone()],
+        auto_dial_mdns: true,
     });
     let b_listen = wait_for(
         || net_b.listen_addrs().into_iter().next(),
@@ -3986,6 +4000,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
         local_prefix: prefix_c,
         listen: vec![listen],
         bootstrap: vec![a_dial, b_dial],
+        auto_dial_mdns: true,
     });
 
     let mut node_a = VosNode::with_prefix(prefix_a);
@@ -4372,6 +4387,7 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -4407,6 +4423,7 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
         local_prefix: prefix_b,
         listen: vec![listen.clone()],
         bootstrap: vec![a_dial.clone()],
+        auto_dial_mdns: true,
     }));
     let b_addr = wait_for(
         || net_b.listen_addrs().into_iter().next(),
@@ -4473,6 +4490,7 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
         local_prefix: prefix_c,
         listen: vec![listen],
         bootstrap: vec![a_dial, b_dial],
+        auto_dial_mdns: true,
     }));
     wait_for(
         || {
@@ -4606,6 +4624,7 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -4640,6 +4659,7 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     }));
     wait_for(
         || {
@@ -4760,6 +4780,7 @@ fn raft_status_req_returns_absent_for_unknown_group() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -4790,6 +4811,7 @@ fn raft_status_req_returns_absent_for_unknown_group() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     }));
     wait_for(
         || net_b.peer_for_prefix(prefix_a).is_some().then_some(()),
@@ -4872,6 +4894,7 @@ fn manifest_req_returns_installed_provider_payload() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     }));
     let a_addr = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -4906,6 +4929,7 @@ version = "0.1.0"
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     }));
     wait_for(
         || net_b.peer_for_prefix(prefix_a).is_some().then_some(()),

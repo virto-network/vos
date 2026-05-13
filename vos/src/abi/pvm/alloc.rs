@@ -31,6 +31,22 @@ struct FreeNode {
 /// - First-fit allocation with block splitting.
 /// - Deallocation with immediate coalescing of adjacent free blocks.
 /// - Single-threaded (PVM guarantee).
+///
+/// # Safety invariants
+///
+/// All `unsafe` blocks below rely on:
+/// - **Single-threaded execution.** The PVM is strictly single-threaded,
+///   so the `UnsafeCell` fields are never accessed concurrently.
+/// - **Sorted-by-address free list.** `dealloc` keeps the free list
+///   ordered by `block_start`, which makes coalesce-with-neighbour
+///   correct: the only candidates are `prev` and `cur`.
+/// - **Header invariant.** Every `alloc` writes an `AllocHeader`
+///   immediately before the returned payload; `dealloc` reads it back
+///   from `ptr - HEADER_SIZE`. Callers must not pass a pointer that
+///   wasn't returned by `alloc` from this allocator.
+/// - **Block ownership.** A block is either on the free list (reachable
+///   via `head → ...`) or out with the caller, never both. Splits
+///   transfer ownership of the leftover bytes back to the free list.
 #[repr(C, align(16))]
 struct FreeListHeap {
     arena: UnsafeCell<[u8; HEAP_SIZE]>,
@@ -38,6 +54,8 @@ struct FreeListHeap {
     initialised: UnsafeCell<bool>,
 }
 
+// SAFETY: single-threaded PVM execution — the UnsafeCell fields are
+// never raced.
 unsafe impl Sync for FreeListHeap {}
 
 impl FreeListHeap {

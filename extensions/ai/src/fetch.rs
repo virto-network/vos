@@ -86,6 +86,9 @@ fn stderr_is_tty() -> bool {
     }
     #[cfg(unix)]
     {
+        // SAFETY: libc isatty is a const-fd query — no side effects,
+        // no aliasing concerns; fd 2 (stderr) is always valid in a
+        // hosted process.
         unsafe { isatty(2) == 1 }
     }
     #[cfg(not(unix))]

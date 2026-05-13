@@ -982,6 +982,19 @@ mod service_host {
         invoke: vh_invoke,
     };
 
+    // SAFETY contract for every vh_* shim below:
+    // - `host: *mut c_void` is a pointer to a `HostCtx` we
+    //   `Box::leak`-ed before calling `run`; it stays valid for the
+    //   entire `vos_extension_run` invocation. The shim dereferences
+    //   it as `&HostCtx` (shared borrow — fields are interior-mutable
+    //   via the contained channels / AtomicBool).
+    // - `(payload, len)` / `(state, state_len)` are borrowed slices
+    //   owned by the calling extension. We only read or copy out of
+    //   them inside the shim.
+    // - `out: *mut RecvBuf` is a borrowed sink the caller pins for
+    //   the call; `write_recv_buf` / `clear_recv_buf` write through
+    //   `&raw mut` projections, never reading prior contents.
+
     unsafe extern "C" fn vh_me(host: *mut core::ffi::c_void) -> u32 {
         let ctx = unsafe { &*(host as *const HostCtx) };
         ctx.me

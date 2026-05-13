@@ -294,6 +294,8 @@ pub unsafe extern "C" fn vos_service_handle_invoke(
         // sidecar holds the only other reference and never mutates.
         let gateway = unsafe { &*(state as *const HttpGateway) };
 
+        // SAFETY: msg_ptr / msg_len describe a host-borrowed slice
+        // valid for the duration of this call (FFI contract).
         let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
         let body = if raw.first() == Some(&TAG_DYNAMIC) {
             &raw[1..]

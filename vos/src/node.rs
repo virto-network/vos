@@ -1601,6 +1601,7 @@ impl Default for VosNode {
 
 // ── Agent thread ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn agent_thread(
     id: ServiceId,
     mut config: AgentConfig,
@@ -2393,6 +2394,7 @@ const MAX_DEFERRED: usize = 256;
 
 // ── Worker thread ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn extension_thread(
     id: ServiceId,
     config: ExtensionConfig,
@@ -2406,6 +2408,11 @@ fn extension_thread(
     use crate::extension::ExtensionPlugin;
     use std::collections::VecDeque;
 
+    // SAFETY: ExtensionPlugin::load wraps libloading::Library; it's
+    // only unsafe because dlopen runs the .so's static initialisers
+    // and binds C symbols whose type signatures we can't verify at
+    // compile time. We trust the operator's manifest path to point
+    // at a vos-built extension.
     let plugin = match unsafe { ExtensionPlugin::load(&config.path) } {
         Ok(p) => p,
         Err(e) => {
@@ -2580,6 +2587,7 @@ fn extension_thread(
 /// Control flow back here only happens when the extension's run
 /// loop exits — either because `shutdown` was flipped or because
 /// the extension hit an unrecoverable error.
+#[allow(clippy::too_many_arguments)]
 fn run_service_extension(
     id: ServiceId,
     plugin: crate::extension::ExtensionPlugin,
@@ -2881,6 +2889,9 @@ fn dispatch_and_poll(
         let result = instance.poll_once();
         match result.status {
             POLL_READY => {
+                // SAFETY: `result.ptr` was just returned by the
+                // extension's poll-once shim with the matching len;
+                // it's a Vec we own until `free_reply` releases it.
                 let reply = if !result.ptr.is_null() && result.len > 0 {
                     unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec()
                 } else {
