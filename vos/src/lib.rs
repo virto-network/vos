@@ -134,7 +134,8 @@ pub use actors::{
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
-    STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED, service_code_hash,
+    STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED,
+    service_code_hash,
 };
 #[cfg(feature = "pvm")]
 pub use actors::{run_accumulate_entry, run_refine_entry};
@@ -209,11 +210,86 @@ mod host_invoker {
             let outcome = VosNode::invoke(self, target, payload);
             async move {
                 match outcome {
+                    Some(b) if is_forbidden_envelope(&b) => Err(ClientError::Forbidden),
                     Some(b) if b.is_empty() => Ok(Value::Unit),
                     Some(b) => Ok(<Value as Decode>::decode(&b)),
                     None => Err(ClientError::Unreachable),
                 }
             }
+        }
+    }
+
+    /// True iff `bytes` is the 5-byte `STATUS_FORBIDDEN` envelope
+    /// the daemon's auth gate returns when refusing a remote call.
+    /// Cross-node invokes preserve this shape verbatim — the
+    /// daemon does NOT run `unwrap_invoke_envelope` on the
+    /// refusal path, so the wire payload arrives here unchanged.
+    /// Length and zero state-len are both load-bearing so a
+    /// legitimately empty `STATUS_FORBIDDEN` shape can't be
+    /// confused with an arbitrary 5-byte rkyv reply.
+    fn is_forbidden_envelope(bytes: &[u8]) -> bool {
+        bytes.len() == 5 && bytes[0] == crate::STATUS_FORBIDDEN && bytes[1..5] == [0, 0, 0, 0]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_forbidden_envelope;
+
+        #[test]
+        fn matches_canonical_5_byte_envelope() {
+            let env = [crate::STATUS_FORBIDDEN, 0, 0, 0, 0];
+            assert!(is_forbidden_envelope(&env));
+        }
+
+        #[test]
+        fn rejects_other_status_bytes() {
+            // Same shape, different status byte — must not be
+            // misclassified as Forbidden. Future status bytes
+            // surface to their own paths (Unreachable / decode).
+            for s in [
+                crate::STATUS_DONE,
+                crate::STATUS_YIELDED,
+                crate::STATUS_PANICKED,
+                crate::STATUS_NOT_FOUND,
+                crate::STATUS_OOG,
+            ] {
+                assert!(
+                    !is_forbidden_envelope(&[s, 0, 0, 0, 0]),
+                    "status {s:#x} must not match Forbidden",
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_wrong_length() {
+            // 4 bytes (too short) and 6+ bytes (envelope with
+            // state) are not the canonical refusal shape. The
+            // longer case in particular protects against a
+            // hypothetical legitimate reply that happens to lead
+            // with `STATUS_FORBIDDEN`.
+            assert!(!is_forbidden_envelope(&[crate::STATUS_FORBIDDEN, 0, 0, 0]));
+            assert!(!is_forbidden_envelope(&[
+                crate::STATUS_FORBIDDEN,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]));
+        }
+
+        #[test]
+        fn rejects_nonzero_state_len() {
+            // state_len != 0 means the envelope claims to carry
+            // state bytes — not a refusal shape. Refusal pads
+            // are always all zero.
+            assert!(!is_forbidden_envelope(&[
+                crate::STATUS_FORBIDDEN,
+                1,
+                0,
+                0,
+                0
+            ]));
         }
     }
 }

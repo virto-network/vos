@@ -358,6 +358,11 @@ pub const STATUS_PANICKED: u8 = 0x02;
 pub const STATUS_NOT_FOUND: u8 = 0x03;
 /// Exit status: child actor ran out of gas during invoke.
 pub const STATUS_OOG: u8 = 0x04;
+/// Refusal status: the dispatch-layer auth gate denied the call
+/// before the target actor ran. Distinct from `STATUS_PANICKED`
+/// so a refused remote caller surfaces "permission denied" rather
+/// than colliding with a real actor panic.
+pub const STATUS_FORBIDDEN: u8 = 0x05;
 
 // ── Service refine phase (PC=0, JAM-pure) ─────────────────────────────
 

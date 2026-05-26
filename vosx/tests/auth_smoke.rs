@@ -222,6 +222,18 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
         "outsider's `role grant` must be refused by the auth gate. stderr:\n{stderr_b}",
     );
 
+    // Client-side surface: the refusal must now reach vosx as a
+    // distinct "permission denied" message (ClientError::Forbidden
+    // through STATUS_FORBIDDEN), not collapse into a generic
+    // transport error. Operators in the field rely on this — the
+    // daemon-log assertion below confirms the gate fired, but only
+    // this assertion proves the user-facing surface is operable.
+    assert!(
+        stderr_b.contains("permission denied"),
+        "outsider's `role grant` stderr must surface 'permission denied' \
+         (STATUS_FORBIDDEN end-to-end). stderr:\n{stderr_b}",
+    );
+
     // Evidence: the failure must be the auth gate's refusal, not
     // a CLI parse error, transport timeout, or anything else.
     // `tracing::warn!` from node.rs::dispatch_invoke writes the

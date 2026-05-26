@@ -28,8 +28,8 @@ pub use context::{Context, Extension, ExtensionCtx};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 pub use run::{
-    Ask, HostIo, RunResult, STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
-    STATUS_YIELDED, Yield, noop_waker, run_blocking, service_code_hash, try_poll,
+    Ask, HostIo, RunResult, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG,
+    STATUS_PANICKED, STATUS_YIELDED, Yield, noop_waker, run_blocking, service_code_hash, try_poll,
 };
 #[cfg(feature = "service")]
 pub use run::{run_accumulate_service, run_refine_service};

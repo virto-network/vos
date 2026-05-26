@@ -31,6 +31,10 @@ pub enum ClientError {
     /// be rkyv-decoded into the user-defined return type. Most
     /// often a version skew between the actor and the consumer.
     Decode,
+    /// The remote daemon's dispatch-layer auth gate refused the
+    /// call (`STATUS_FORBIDDEN` envelope). The local peer lacks
+    /// the role required for the targeted handler.
+    Forbidden,
 }
 
 impl core::fmt::Display for ClientError {
@@ -39,6 +43,7 @@ impl core::fmt::Display for ClientError {
             Self::Unreachable => write!(f, "client: target unreachable"),
             Self::UnexpectedReply(s) => write!(f, "client: unexpected reply: {s}"),
             Self::Decode => write!(f, "client: failed to decode reply"),
+            Self::Forbidden => write!(f, "permission denied: caller lacks the required role"),
         }
     }
 }

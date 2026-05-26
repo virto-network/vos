@@ -2319,18 +2319,19 @@ fn peek_dynamic_msg_name(payload: &[u8]) -> Option<String> {
 }
 
 /// Build a failure envelope the libp2p layer relays back to
-/// the caller. `STATUS_PANICKED` is the closest existing match
-/// — surfaces to `unwrap_invoke_envelope` as `None`, which
-/// libp2p-side reports as a transport failure. Sprint 2 picks
-/// it because adding a new STATUS_FORBIDDEN at the
-/// `actors::run` level is a separate cleanup; the warn at the
-/// dispatch boundary plus the registry's `STATUS_FORBIDDEN` on
-/// the eventual retry-via-grant flow give enough operator
-/// signal.
+/// the caller when the dispatch-layer auth gate refuses a call.
+/// `STATUS_FORBIDDEN` is the distinct status the client-side
+/// `Invoker for &VosNode` peeks at (see `vos/src/lib.rs`) so
+/// vosx surfaces "permission denied" rather than colliding with
+/// a generic actor panic.
+///
+/// Shape: exactly 5 bytes — `[STATUS_FORBIDDEN, 0, 0, 0, 0]`
+/// (status + zero-length state). Both the length and the leading
+/// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
 fn forbidden_envelope() -> Vec<u8> {
-    use crate::actors::run::STATUS_PANICKED;
-    encode_invoke_envelope(STATUS_PANICKED, &[], &[])
+    use crate::actors::run::STATUS_FORBIDDEN;
+    encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
 }
 
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
@@ -2351,9 +2352,9 @@ fn encode_invoke_envelope(status: u8, state: &[u8], reply: &[u8]) -> Vec<u8> {
 /// forwarding) who don't care about YIELDED/DONE — they only want
 /// the handler's return value. A short envelope or one carrying a
 /// failure status (`STATUS_NOT_FOUND` / `STATUS_PANICKED` /
-/// `STATUS_OOG`) decodes as `None` so the gateway and other
-/// ask-style callers can distinguish "actor returned nothing"
-/// from "actor failed".
+/// `STATUS_OOG` / `STATUS_FORBIDDEN`) decodes as `None` so the
+/// gateway and other ask-style callers can distinguish "actor
+/// returned nothing" from "actor failed".
 fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
     use crate::actors::run::{STATUS_DONE, STATUS_YIELDED};
     if envelope.len() < 5 {
@@ -2361,9 +2362,9 @@ fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
     }
     match envelope[0] {
         STATUS_DONE | STATUS_YIELDED => {}
-        // STATUS_NOT_FOUND / STATUS_PANICKED / STATUS_OOG and any
-        // future failure variant: the actor did not produce a
-        // valid reply. Surface as None.
+        // STATUS_NOT_FOUND / STATUS_PANICKED / STATUS_OOG /
+        // STATUS_FORBIDDEN and any future failure variant: the
+        // actor did not produce a valid reply. Surface as None.
         _ => return None,
     }
     let state_len =
@@ -3397,6 +3398,32 @@ mod tests {
         assert_eq!(unwrap_invoke_envelope(&[]), None);
         assert_eq!(unwrap_invoke_envelope(&[0]), None);
         assert_eq!(unwrap_invoke_envelope(&[0, 0, 0, 0]), None);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn forbidden_envelope_is_5_bytes_starting_with_status_forbidden() {
+        // Wire-shape contract: vosx's `is_forbidden_envelope` peeks
+        // for exactly this 5-byte pattern to surface
+        // `ClientError::Forbidden`. If either the length or the
+        // status byte drifts, the client-side detection silently
+        // breaks and refusals collapse back to "transport failure"
+        // again. Pin both.
+        let env = forbidden_envelope();
+        assert_eq!(env.len(), 5, "forbidden envelope must be exactly 5 bytes");
+        assert_eq!(env[0], crate::STATUS_FORBIDDEN, "status byte mismatch");
+        assert_eq!(&env[1..5], &[0, 0, 0, 0], "state_len must be zero");
+    }
+
+    #[test]
+    fn unwrap_envelope_forbidden_yields_none() {
+        // STATUS_FORBIDDEN belongs to the same failure family as
+        // PANICKED/NOT_FOUND/OOG for `unwrap_invoke_envelope` —
+        // there's no actor-produced reply to surface. Client-side
+        // detection happens at a different layer (Invoker for
+        // &VosNode), not here.
+        let env = make_envelope(crate::STATUS_FORBIDDEN, b"", b"");
+        assert_eq!(unwrap_invoke_envelope(&env), None);
     }
 
     #[test]
