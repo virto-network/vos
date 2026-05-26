@@ -129,6 +129,9 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
         .env("XDG_CONFIG_HOME", config_a.path())
         .env("RUST_LOG", "info")
         .env("VOSX_DISABLE_MDNS", "1")
+        // Disable ANSI styling so log assertions below can match
+        // `handler=grant_role` etc. as literal substrings.
+        .env("NO_COLOR", "1")
         .stdout(Stdio::null())
         .stderr(log_file)
         .spawn()
@@ -217,6 +220,43 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
     assert!(
         !grant_b.status.success(),
         "outsider's `role grant` must be refused by the auth gate. stderr:\n{stderr_b}",
+    );
+
+    // Evidence: the failure must be the auth gate's refusal, not
+    // a CLI parse error, transport timeout, or anything else.
+    // `tracing::warn!` from node.rs::dispatch_invoke writes the
+    // line below to the daemon's stderr (captured in `log_path`).
+    // Both fields (`handler=grant_role`, `peer=<B's peer_id>`)
+    // must be present so we know *which* call and *which* peer
+    // got rejected.
+    let gate_deadline = Instant::now() + Duration::from_secs(2);
+    let mut log_snapshot = String::new();
+    let mut saw_refusal = false;
+    let mut saw_handler = false;
+    let mut saw_peer = false;
+    while Instant::now() < gate_deadline {
+        log_snapshot = fs::read_to_string(&log_path).unwrap_or_default();
+        saw_refusal = log_snapshot.contains("auth: refusing privileged registry handler");
+        saw_handler = log_snapshot.contains("handler=\"grant_role\"")
+            || log_snapshot.contains("handler=grant_role");
+        saw_peer = log_snapshot.contains(&b_peer);
+        if saw_refusal && saw_handler && saw_peer {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_refusal,
+        "daemon log must record the gate's refusal — \
+         the failure could have happened anywhere otherwise. log:\n{log_snapshot}"
+    );
+    assert!(
+        saw_handler,
+        "log must name the refused handler (grant_role); log:\n{log_snapshot}"
+    );
+    assert!(
+        saw_peer,
+        "log must name the refused peer ({b_peer}); log:\n{log_snapshot}"
     );
 
     // ── A: grant B admin — must SUCCEED (A is the bootstrap

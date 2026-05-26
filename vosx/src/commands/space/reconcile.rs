@@ -975,10 +975,72 @@ mod tests {
         let err =
             resolve_env_indirection("ai", "hf_token", &val).expect_err("unset var must error");
         let msg = format!("{err}");
+        // Sprint 5: error contract — the operator needs (a) the
+        // unset *var name*, (b) the extension + key context so
+        // they can find it in the manifest, and (c) a clear cause
+        // and remediation hint. Any one of these going missing
+        // means a refactor silently degraded the error.
+        assert!(
+            msg.contains(&nonexistent),
+            "error must name the unset var ({nonexistent}); got: {msg}",
+        );
+        assert!(
+            msg.contains("ai"),
+            "error must name the extension (ai); got: {msg}",
+        );
+        assert!(
+            msg.contains("hf_token"),
+            "error must name the init key (hf_token); got: {msg}",
+        );
         assert!(
             msg.contains("is not set"),
-            "error should explain the unset variable, got: {msg}",
+            "error must state the cause (not set); got: {msg}",
         );
+        assert!(
+            msg.contains("vosx space up") || msg.contains("Set it"),
+            "error should include a remediation hint; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn env_indirection_unset_var_error_propagates_through_init_loop() {
+        // The unit error above is the local contract. This guards
+        // the *call site* — `resolve_env_indirection` is invoked
+        // from a `for (k, v) in &ext.init { ?; }` loop, and the
+        // anyhow result must bubble up unchanged so the caller can
+        // surface it as a refuse-to-boot. Simulates the loop body.
+        let nonexistent = format!(
+            "VOSX_RECONCILE_BUBBLES_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let init: Vec<(String, toml::Value)> = vec![
+            ("region".into(), toml::Value::String("us-east-1".into())),
+            (
+                "hf_token".into(),
+                toml::Value::String(format!("$env:{nonexistent}")),
+            ),
+        ];
+        let mut resolved_first = false;
+        let result: anyhow::Result<()> = (|| {
+            for (k, v) in &init {
+                let r = resolve_env_indirection("ai", k, v)?;
+                if k == "region" {
+                    assert_eq!(r.as_str(), Some("us-east-1"));
+                    resolved_first = true;
+                }
+            }
+            Ok(())
+        })();
+        assert!(
+            resolved_first,
+            "literal init args before $env:UNSET must still resolve"
+        );
+        let err = result.expect_err("unset var must abort the loop");
+        let msg = format!("{err}");
+        assert!(msg.contains(&nonexistent) && msg.contains("hf_token"));
     }
 
     #[test]

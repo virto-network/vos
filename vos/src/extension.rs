@@ -1369,6 +1369,7 @@ mod service_host {
     mod cap_tests {
         use super::*;
         use crate::node::Envelope;
+        use std::sync::atomic::AtomicUsize;
 
         fn make_ctx(caps: &[&str], policy: CapPolicy) -> HostCtx {
             let (outbox, _outbox_rx) = mpsc::channel::<Envelope>();
@@ -1384,6 +1385,45 @@ mod service_host {
                 cap_policy: policy,
                 cap_warns_logged: Mutex::new(std::collections::BTreeSet::new()),
                 actor_name: "test-ext".into(),
+            }
+        }
+
+        /// Harness for the ABI-shim tests below — keeps the outbox
+        /// receiver alive (so `send` doesn't see a disconnected
+        /// channel and return HOST_ERR_DISCONNECTED, which would mask
+        /// HOST_ERR_CAP_DENIED) and counts invoke-closure entries so
+        /// we can assert the side effect actually fired or didn't.
+        struct AbiHarness {
+            ctx: HostCtx,
+            invoke_calls: Arc<AtomicUsize>,
+            outbox_rx: mpsc::Receiver<Envelope>,
+        }
+
+        fn abi_harness(caps: &[&str], policy: CapPolicy) -> AbiHarness {
+            let (outbox, outbox_rx) = mpsc::channel::<Envelope>();
+            let (_inbox_tx, inbox_rx) = mpsc::channel::<Envelope>();
+            let invoke_calls = Arc::new(AtomicUsize::new(0));
+            let counter = invoke_calls.clone();
+            let invoke: Arc<InvokeFn> = Arc::new(move |_target, _payload, _timeout| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Some(b"REPLY".to_vec())
+            });
+            let ctx = HostCtx {
+                me: 0,
+                outbox,
+                inbox: Mutex::new(inbox_rx),
+                deferred: Mutex::new(VecDeque::new()),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                invoke,
+                declared_caps: caps.iter().map(|s| s.to_string()).collect(),
+                cap_policy: policy,
+                cap_warns_logged: Mutex::new(std::collections::BTreeSet::new()),
+                actor_name: "test-ext".into(),
+            };
+            AbiHarness {
+                ctx,
+                invoke_calls,
+                outbox_rx,
             }
         }
 
@@ -1463,6 +1503,148 @@ mod service_host {
             #[allow(deprecated)]
             let allowed = ctx.check_cap_or_warn("net.libp2p.dial");
             assert!(!allowed, "Block policy must deny via the warn alias too");
+        }
+
+        // ── Sprint 5 — ABI-shim enforcement (real side effects) ──
+        //
+        // The tests above check `check_cap_or_deny` in isolation.
+        // Those below drive the real `vh_invoke` / `vh_send` extern
+        // shims through `SERVICE_VTABLE` and assert that the side
+        // effect (invoke closure run, envelope on outbox) actually
+        // does or doesn't fire — so a future change that bypasses
+        // the gate would be caught even if `check_cap_or_deny`
+        // still reports correctly.
+
+        #[test]
+        fn vh_invoke_block_undeclared_short_circuits() {
+            let h = abi_harness(&[], CapPolicy::Block);
+            let payload = b"hello";
+            let mut out = RecvBuf::empty();
+            let rc = unsafe {
+                (SERVICE_VTABLE.invoke)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    payload.as_ptr(),
+                    payload.len(),
+                    0,
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, HOST_ERR_CAP_DENIED, "Block must refuse the invoke");
+            assert_eq!(
+                h.invoke_calls.load(Ordering::Relaxed),
+                0,
+                "invoke closure must not run when caps deny"
+            );
+            assert!(out.ptr.is_null(), "out buffer must stay cleared on denial");
+        }
+
+        #[test]
+        fn vh_invoke_log_undeclared_reaches_closure() {
+            let h = abi_harness(&[], CapPolicy::Log);
+            let mut out = RecvBuf::empty();
+            let rc = unsafe {
+                (SERVICE_VTABLE.invoke)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    b"x".as_ptr(),
+                    1,
+                    0,
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, HOST_OK);
+            assert_eq!(
+                h.invoke_calls.load(Ordering::Relaxed),
+                1,
+                "Log must let the call reach the closure"
+            );
+            unsafe { (SERVICE_VTABLE.free_buf)(out.ptr, out.len, out.cap) };
+        }
+
+        #[test]
+        fn vh_invoke_block_declared_reaches_closure() {
+            let h = abi_harness(&["net.libp2p.dial"], CapPolicy::Block);
+            let mut out = RecvBuf::empty();
+            let rc = unsafe {
+                (SERVICE_VTABLE.invoke)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    b"x".as_ptr(),
+                    1,
+                    0,
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, HOST_OK);
+            assert_eq!(h.invoke_calls.load(Ordering::Relaxed), 1);
+            unsafe { (SERVICE_VTABLE.free_buf)(out.ptr, out.len, out.cap) };
+        }
+
+        #[test]
+        fn vh_invoke_kill_undeclared_denies_and_flips_shutdown() {
+            let h = abi_harness(&[], CapPolicy::Kill);
+            let mut out = RecvBuf::empty();
+            let rc = unsafe {
+                (SERVICE_VTABLE.invoke)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    b"x".as_ptr(),
+                    1,
+                    0,
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, HOST_ERR_CAP_DENIED);
+            assert_eq!(
+                h.invoke_calls.load(Ordering::Relaxed),
+                0,
+                "Kill must short-circuit before the closure"
+            );
+            assert!(
+                h.ctx.shutdown.load(Ordering::Relaxed),
+                "Kill must flip the shutdown flag at the ABI boundary too"
+            );
+        }
+
+        #[test]
+        fn vh_send_block_undeclared_does_not_enqueue() {
+            let h = abi_harness(&[], CapPolicy::Block);
+            let payload = b"hi";
+            let rc = unsafe {
+                (SERVICE_VTABLE.send)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            };
+            assert_eq!(rc, HOST_ERR_CAP_DENIED, "Block must refuse send");
+            assert!(
+                h.outbox_rx.try_recv().is_err(),
+                "Block must not push onto outbox"
+            );
+        }
+
+        #[test]
+        fn vh_send_block_declared_enqueues() {
+            let h = abi_harness(&["net.libp2p.dial"], CapPolicy::Block);
+            let payload = b"hi";
+            let rc = unsafe {
+                (SERVICE_VTABLE.send)(
+                    &h.ctx as *const _ as *mut core::ffi::c_void,
+                    7,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            };
+            assert_eq!(rc, HOST_OK);
+            let env = h
+                .outbox_rx
+                .try_recv()
+                .expect("declared send must push an envelope");
+            assert_eq!(env.payload, b"hi");
+            assert_eq!(env.to.0, 7);
         }
 
         // ── Parser ────────────────────────────────────────────────

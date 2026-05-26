@@ -861,6 +861,73 @@ fn pvm_actors_via_gateway() {
         "expected counter to advance by ≥12, got {count0} → {count1}",
     );
 
+    // 10b. Sprint 5: concurrent /math/add stress. The sequential
+    //      checks above prove dispatch *works*; this one proves
+    //      it works *concurrently* — no response cross-talk, no
+    //      lost dispatches, no actor-mutex deadlock. `math::add`
+    //      is pure on its inputs, so each (a,b) pair has exactly
+    //      one correct sum and we can detect any reply mixup.
+    {
+        const N: u32 = 16;
+        let port = daemon.port();
+        let pre = dispatch_request_count(&daemon);
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let a = (i as u64) * 100 + 1;
+                    let b = (i as u64) * 100 + 2;
+                    let body_json = format!(r#"{{"a":{a},"b":{b}}}"#);
+                    let (status, body) =
+                        http_request(port, "POST", "/math/add", None, body_json.as_bytes());
+                    (i, a, b, status, body)
+                })
+            })
+            .collect();
+        let mut results: Vec<(u32, u64, u64, u16, Vec<u8>)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread panicked"))
+            .collect();
+        // Sort by `i` so the assertion failure messages are stable.
+        results.sort_by_key(|r| r.0);
+
+        for (i, a, b, status, body) in &results {
+            assert_eq!(
+                *status,
+                200,
+                "concurrent /math/add[{i}] (a={a}, b={b}) expected 200; got {status} body={:?}",
+                String::from_utf8_lossy(body),
+            );
+            let txt = std::str::from_utf8(body).expect("body utf-8").trim();
+            let got: u64 = txt
+                .parse()
+                .unwrap_or_else(|_| panic!("non-numeric reply for ({a},{b}): {txt}"));
+            assert_eq!(
+                got,
+                a + b,
+                "concurrent /math/add[{i}] reply mismatch — \
+                 cross-talk between in-flight requests? \
+                 want {} + {} = {}, got {}",
+                a,
+                b,
+                a + b,
+                got,
+            );
+        }
+
+        // Every dispatched /math/add ticks the gateway request
+        // counter; /__metrics is a system endpoint and does NOT
+        // self-count. So the gap is exactly `N`. A weaker `>= N`
+        // would let a lost-dispatch regression slip through, so
+        // pin the exact number.
+        let post = dispatch_request_count(&daemon);
+        assert_eq!(
+            post - pre,
+            N as u64,
+            "concurrent burst dispatch counter mismatch: pre={pre} post={post} \
+             expected delta {N} (one tick per /math/add request)",
+        );
+    }
+
     // 11. Phase 5: `vosx gateway status` returns the same JSON
     //     snapshot the removed `GET /__admin/status` did, and
     //     `vosx gateway stop` actually flips the gateway's stop
