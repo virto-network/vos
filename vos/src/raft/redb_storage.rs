@@ -558,6 +558,250 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // ── Sprint 5 — crash-recovery tests ──────────────────────
+    //
+    // The existing tests above drop the `RedbStorage` and re-open
+    // a new one from the *same* `Arc<Database>` handle. That misses
+    // the real production restart path: the redb file is closed,
+    // every handle is gone, and a fresh `Database::create` reopens
+    // it from disk. Tests below exercise that path and the
+    // failed-commit cache-restore branch (`do_txn().is_err()`
+    // around line 335).
+
+    /// Open a redb database at `path`, returning the Arc handle.
+    /// Distinct from `temp_db()` (which generates a fresh dir);
+    /// this one reopens the same physical file across calls.
+    fn open_at(path: &std::path::Path) -> Arc<Database> {
+        Arc::new(Database::create(path).unwrap())
+    }
+
+    /// Allocate a fresh temp dir + path WITHOUT opening the
+    /// database yet. Callers open + close handles inside their
+    /// own scopes so the OS-level file release is deterministic.
+    fn temp_db_path() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(alloc::format!(
+            "vos_redb_restart_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+        (path, dir)
+    }
+
+    #[test]
+    fn durability_across_full_process_restart() {
+        // Write log + state + meta, drop *every* handle so the
+        // redb file is fully closed, then re-open from path and
+        // assert all three categories survived. This is the real
+        // "daemon restart" durability contract; if a regression
+        // batched a write into RAM-only and only flushed on Drop,
+        // this test would catch it.
+        let (path, dir) = temp_db_path();
+        let m = Meta::<u16> {
+            current_term: 7,
+            voted_for: Some(11),
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        };
+
+        {
+            let db = open_at(&path);
+            let mut s = RedbStorage::open(db).unwrap();
+            block_on(s.commit_batch(WriteBatch {
+                appends: alloc::vec![
+                    entry(1, 7, b"alpha"),
+                    entry(2, 7, b"beta"),
+                    entry(3, 7, b"gamma"),
+                ],
+                state: Some(b"state-after-3".to_vec()),
+                meta: Some(m.clone()),
+                ..Default::default()
+            }))
+            .unwrap();
+            // `s` and `db` go out of scope here — Drop closes redb.
+        }
+
+        {
+            let db = open_at(&path);
+            let s = RedbStorage::open(db).unwrap();
+            assert_eq!(s.last_index(), 3, "log tail must survive restart");
+            assert_eq!(s.last_term(), 7);
+            assert_eq!(
+                block_on(s.read_state()).unwrap(),
+                b"state-after-3".to_vec(),
+                "state row must survive restart",
+            );
+            assert_eq!(
+                block_on(s.load_meta()).unwrap(),
+                m,
+                "meta scalars must survive restart",
+            );
+            let raw = block_on(s.entries(1, 3)).unwrap();
+            assert_eq!(raw.len(), 3);
+            assert_eq!(raw[2].payload(), Some(b"gamma".as_ref()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_commit_reverts_in_memory_cache_and_disk_unchanged() {
+        // Induce a commit failure mid-batch (truncate below the
+        // snap pointer is a hard error per `truncate_after_in_txn`)
+        // and verify:
+        //   1. `commit_batch` returns Err.
+        //   2. The in-memory cache (`last_index`, `snap_last_*`)
+        //      is restored to its pre-batch state.
+        //   3. On a full restart from disk, the storage shows the
+        //      same pre-batch state — i.e. the failed batch's
+        //      partial work didn't leak through.
+        // A regression that lost the `cache_restore(cache_snap)`
+        // call would fail (2); a regression that committed the
+        // txn before the validation would fail (3).
+        let (path, dir) = temp_db_path();
+        {
+            let db = open_at(&path);
+            let mut s = RedbStorage::open(db).unwrap();
+            // First, set up a snap pointer at index 5. Compact
+            // runs BEFORE append within a single batch (per the
+            // WriteBatch contract), and `compact_to` bumps the
+            // cached last_index — so the appends + compact must
+            // be split into two batches.
+            block_on(s.commit_batch(WriteBatch {
+                appends: alloc::vec![
+                    entry(1, 1, b"a"),
+                    entry(2, 1, b"b"),
+                    entry(3, 1, b"c"),
+                    entry(4, 1, b"d"),
+                    entry(5, 1, b"e"),
+                ],
+                ..Default::default()
+            }))
+            .unwrap();
+            block_on(s.commit_batch(WriteBatch {
+                compact_to: Some((5, 1)),
+                ..Default::default()
+            }))
+            .unwrap();
+            // Sanity: state matches expectation.
+            assert_eq!(s.last_index(), 5);
+            assert_eq!(s.snap_last_index(), 5);
+            assert_eq!(s.snap_last_term(), 1);
+
+            // Now attempt a batch that MUST fail: truncate_after(2)
+            // is below the snap pointer at 5.
+            let err = block_on(s.commit_batch(WriteBatch {
+                truncate_after: Some(2),
+                appends: alloc::vec![entry(6, 2, b"f")],
+                ..Default::default()
+            }));
+            assert!(err.is_err(), "truncate below snap_last_index must fail",);
+
+            // Cache must be restored to pre-batch state.
+            assert_eq!(
+                s.last_index(),
+                5,
+                "failed batch must not advance last_index"
+            );
+            assert_eq!(s.last_term(), 1);
+            assert_eq!(s.snap_last_index(), 5);
+        }
+
+        // Restart from disk — the failed batch's partial work
+        // (truncate, append, whatever) must not be visible.
+        {
+            let db = open_at(&path);
+            let s = RedbStorage::open(db).unwrap();
+            assert_eq!(
+                s.last_index(),
+                5,
+                "post-restart last_index must match pre-failure",
+            );
+            assert_eq!(s.snap_last_index(), 5);
+            // Index 6 must not be on disk.
+            let entries_above = block_on(s.entries(6, 6)).unwrap();
+            assert!(
+                entries_above.is_empty(),
+                "failed batch's append must not be persisted; got {entries_above:?}",
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_then_restart_then_append_continues_log_correctly() {
+        // The compact-then-restart path is the snapshot install
+        // recovery flow: leader installs a snapshot at (idx=N,
+        // term=T), the follower restarts, and subsequent appends
+        // must continue from N+1 with the right term anchor.
+        // A regression where snap_last_index doesn't survive
+        // restart would cause `term_at(N)` to return `None`
+        // after reopen.
+        let (path, dir) = temp_db_path();
+        {
+            let db = open_at(&path);
+            let mut s = RedbStorage::open(db).unwrap();
+            // Two batches — compact must follow appends in its
+            // own batch (in-batch ordering is truncate→compact→
+            // append, and compact bumps the cached last_index).
+            block_on(s.commit_batch(WriteBatch {
+                appends: alloc::vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 2, b"c"),],
+                ..Default::default()
+            }))
+            .unwrap();
+            block_on(s.commit_batch(WriteBatch {
+                compact_to: Some((2, 1)),
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(s.snap_last_index(), 2);
+            assert_eq!(s.last_index(), 3);
+        }
+        // Restart.
+        {
+            let db = open_at(&path);
+            let mut s = RedbStorage::open(db).unwrap();
+            assert_eq!(
+                s.snap_last_index(),
+                2,
+                "snap_last_index must survive restart",
+            );
+            assert_eq!(s.snap_last_term(), 1);
+            assert_eq!(s.last_index(), 3);
+            // term_at(2) must come from the snap pointer (the
+            // entry itself was compacted away).
+            assert_eq!(block_on(s.term_at(2)).unwrap(), Some(1));
+            assert_eq!(block_on(s.term_at(3)).unwrap(), Some(2));
+
+            // Continue appending past the restart.
+            block_on(s.commit_batch(WriteBatch {
+                appends: alloc::vec![entry(4, 2, b"d"), entry(5, 3, b"e"),],
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(s.last_index(), 5);
+            assert_eq!(s.last_term(), 3);
+        }
+        // Restart again — full history (snap + post-restart
+        // appends) must all be visible.
+        {
+            let db = open_at(&path);
+            let s = RedbStorage::open(db).unwrap();
+            assert_eq!(s.last_index(), 5);
+            assert_eq!(s.last_term(), 3);
+            assert_eq!(s.snap_last_index(), 2);
+            let raw = block_on(s.entries(3, 5)).unwrap();
+            assert_eq!(raw.len(), 3, "got entries: {raw:?}");
+            assert_eq!(raw[0].payload(), Some(b"c".as_ref()));
+            assert_eq!(raw[2].payload(), Some(b"e".as_ref()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn compact_drops_head_and_anchors_term() {
         let (db, dir) = temp_db();
