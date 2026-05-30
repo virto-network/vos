@@ -316,11 +316,22 @@ struct InvokeRequest {
     /// the noise-verified PeerId); `Caller::Actor` for intra-system
     /// invokes (the calling actor's ServiceId); `Caller::Unauthenticated`
     /// for host-initiated calls and future HTTP gateway routes.
-    ///
-    /// M2 lands the field + the 6 construction sites; M3 plumbs it
-    /// into `Context<A>` so handlers can call `ctx.caller()`.
-    #[allow(dead_code)] // Consumer wired in M3 — same shape as `chain` above.
+    #[allow(dead_code)] // Consumer wired via macro emission in M6.
     caller: crate::actors::Caller,
+    /// Space-wide role byte for `caller`, decoded as a
+    /// [`SpaceRole`](crate::actors::SpaceRole) discriminant.
+    /// `None` for callers without a space-level grant (Unauthenticated
+    /// or unknown peers). Populated by [`NodeService::dispatch_invoke`]
+    /// in M5; until then, all sites leave it at `None`.
+    #[allow(dead_code)] // Consumer wired in M3/M5.
+    space_role: Option<u8>,
+    /// Actor-local role byte for `caller`, decoded against the
+    /// target actor's [`Role`](crate::Actor::Role) discriminant.
+    /// `None` when no actor-local grant exists; falls back to the
+    /// space-level grant mapped via `SPACE_ROLE_MAP`. Populated
+    /// in M5; until then, all sites leave it at `None`.
+    #[allow(dead_code)] // Consumer wired in M3/M5.
+    actor_local_role: Option<u8>,
     msg: Vec<u8>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -506,6 +517,8 @@ impl InvokeHandle {
             // Host-side API entry: the caller is the embedder
             // (vosx, a test harness) — no transport identity.
             caller: crate::actors::Caller::Unauthenticated,
+            space_role: None,
+            actor_local_role: None,
             msg,
             reply_tx,
             chain: Vec::new(),
@@ -595,6 +608,8 @@ impl NodeService {
                 // no real caller. The registry's read handlers
                 // accept Unauthenticated.
                 caller: crate::actors::Caller::Unauthenticated,
+                space_role: None,
+                actor_local_role: None,
                 msg: payload,
                 reply_tx,
                 chain: vec![],
@@ -709,6 +724,12 @@ impl crate::network::NetworkService for NodeService {
         if tx
             .send(InvokeRequest {
                 caller,
+                // Role bytes are populated in M5 via the
+                // dispatch-time registry probe (lookup_caller_role
+                // for the space tier; lookup_caller_actor_role for
+                // the actor-local override).
+                space_role: None,
+                actor_local_role: None,
                 msg,
                 reply_tx,
                 chain,
@@ -1629,6 +1650,8 @@ impl VosNode {
                 // transport identity. Tests + the bootstrap
                 // admin-grant path reach the actor through here.
                 caller: crate::actors::Caller::Unauthenticated,
+                space_role: None,
+                actor_local_role: None,
                 msg,
                 reply_tx,
                 chain: Vec::new(),
@@ -1838,6 +1861,8 @@ fn agent_thread(
                 // calls bypass role checks by virtue of being
                 // inside the trust boundary.
                 caller: crate::actors::Caller::Actor(id),
+                space_role: None,
+                actor_local_role: None,
                 msg: msg.to_vec(),
                 reply_tx,
                 chain: chain_snapshot,
@@ -2857,6 +2882,8 @@ fn run_service_extension(
                 // its ServiceId — `Caller::Actor` mirrors the
                 // agent-thread path above.
                 caller: crate::actors::Caller::Actor(ServiceId(me)),
+                space_role: None,
+                actor_local_role: None,
                 msg: payload.to_vec(),
                 reply_tx,
                 chain: vec![me],

@@ -1,5 +1,5 @@
 use super::Actor;
-use super::auth::Caller;
+use super::auth::{Caller, Forbidden, RoleByte, SpaceRole};
 use alloc::vec::Vec;
 
 /// Execution context passed to message handlers.
@@ -17,11 +17,23 @@ pub struct Context<A: Actor> {
     stop_requested: bool,
 
     /// Identity of whoever invoked the handler currently running.
-    /// `Unauthenticated` by default until the per-invoke plumbing
-    /// (M3) overwrites it from the [`InvokeRequest`]. M2 ships the
-    /// shape; M3 wires the propagation so `ctx.caller()` returns
-    /// the real caller end-to-end.
+    /// `Unauthenticated` by default until per-invoke plumbing
+    /// overwrites it from the [`InvokeRequest`].
     caller: Caller,
+
+    /// Caller's space-wide role byte — a
+    /// [`SpaceRole`](super::auth::SpaceRole) discriminant. `None`
+    /// when the registry holds no space-level grant for this
+    /// caller. M3 ships the field; M5 populates it from
+    /// `lookup_caller_role` and `set_caller_roles` plumbs it in.
+    space_role: Option<u8>,
+
+    /// Caller's actor-local role byte — a discriminant of this
+    /// actor's [`Role`](super::Actor::Role) enum, set when the
+    /// registry holds an actor-local grant overriding the
+    /// space-level tier. Takes precedence over `space_role` in
+    /// [`Self::caller_role`].
+    actor_local_role: Option<u8>,
 
     // Effect queues (flushed in accumulate)
     pending_tells: Vec<PendingTell>,
@@ -59,6 +71,8 @@ impl<A: Actor> Context<A> {
             id,
             stop_requested: false,
             caller: Caller::Unauthenticated,
+            space_role: None,
+            actor_local_role: None,
             pending_tells: Vec::new(),
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
@@ -97,6 +111,92 @@ impl<A: Actor> Context<A> {
     /// individual invocations, so this is a per-call slot.
     pub fn set_caller(&mut self, caller: Caller) {
         self.caller = caller;
+    }
+
+    /// Overwrite the per-invocation role bytes. Mirrors
+    /// [`Self::set_caller`] — called by host glue before each
+    /// dispatch so the caller's grants are visible to handler
+    /// code. `space_role` is a [`SpaceRole`] discriminant;
+    /// `actor_local_role` is an [`A::Role`](Actor::Role)
+    /// discriminant (takes precedence when both are present).
+    pub fn set_caller_roles(&mut self, space_role: Option<u8>, actor_local_role: Option<u8>) {
+        self.space_role = space_role;
+        self.actor_local_role = actor_local_role;
+    }
+
+    /// Resolve the caller's effective role for *this* actor.
+    ///
+    /// Lookup precedence (matches the host dispatch path):
+    /// 1. If an actor-local grant exists, decode the byte against
+    ///    `A::Role` and use that — overrides any space-level
+    ///    grant.
+    /// 2. Else fall back to the space-level role and map it via
+    ///    [`A::SPACE_ROLE_MAP`](Actor::SPACE_ROLE_MAP).
+    /// 3. Else `None`. Calls
+    ///    [`Self::ensure_role`](Self::ensure_role) at any tier
+    ///    higher than `A::DEFAULT_ROLE` will fail.
+    ///
+    /// `Caller::Actor` (intra-system) bypasses the lookup and
+    /// surfaces no role — the dispatch boundary trusts in-system
+    /// calls by virtue of having passed through the libp2p auth
+    /// gate already. Handlers that want stricter policy can
+    /// inspect `ctx.caller()` directly.
+    pub fn caller_role(&self) -> Option<A::Role> {
+        if let Some(b) = self.actor_local_role {
+            return A::Role::from_byte(b);
+        }
+        self.space_role
+            .and_then(SpaceRole::from_u8)
+            .and_then(|sr| A::SPACE_ROLE_MAP.lookup(sr))
+    }
+
+    /// True iff the caller's effective role satisfies `required`
+    /// — i.e. `>=` in the actor's role hierarchy. `Caller::Actor`
+    /// intra-system calls return `true` regardless (see
+    /// [`Self::caller_role`] for the trust-model rationale).
+    pub fn has_role(&self, required: A::Role) -> bool {
+        if matches!(self.caller, Caller::Actor(_)) {
+            return true;
+        }
+        self.caller_role().is_some_and(|r| r >= required)
+    }
+
+    /// `?`-friendly role check. Returns [`Forbidden`] when the
+    /// caller's effective role is insufficient. Handler authors
+    /// who want `?` propagation impl `From<Forbidden>` for their
+    /// actor's error type:
+    ///
+    /// ```ignore
+    /// impl From<Forbidden> for MyError { ... }
+    ///
+    /// async fn merge(&mut self, ctx: &mut Context<Self>) -> Result<(), MyError> {
+    ///     ctx.ensure_role(MyRole::Maintainer)?;
+    ///     // ...
+    /// }
+    /// ```
+    ///
+    /// The M6 macro-emitted check at the dispatch boundary
+    /// halts the actor with `STATUS_FORBIDDEN` *before* the
+    /// handler runs, so this method is for the *manual*
+    /// composability case (e.g.
+    /// `ensure_role(Maintainer).or_else(|_| ensure_owner(...))`).
+    pub fn ensure_role(&self, required: A::Role) -> Result<(), Forbidden> {
+        if self.has_role(required) {
+            Ok(())
+        } else {
+            Err(Forbidden)
+        }
+    }
+
+    /// Byte-form of [`Self::has_role`] used by the M6 macro-emitted
+    /// pre-dispatch check, which only has the raw discriminant
+    /// from the message enum's `required_role()` and doesn't want
+    /// to round-trip through `A::Role::from_byte`.
+    pub fn has_role_byte(&self, required: u8) -> bool {
+        match A::Role::from_byte(required) {
+            Some(req) => self.has_role(req),
+            None => false,
+        }
     }
 
     // --- Storage ---
@@ -655,5 +755,194 @@ mod tests {
 
         ctx.set_caller(Caller::Actor(ServiceId(42)));
         assert_eq!(ctx.caller(), &Caller::Actor(ServiceId(42)));
+    }
+
+    // Richer fixture actor with a 3-tier Role enum — exercises
+    // the precedence matrix in `caller_role` / `has_role` /
+    // `ensure_role` that the M6 macro will emit checks against.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    #[repr(u8)]
+    enum FixtureRole {
+        Viewer = 0,
+        Contributor = 1,
+        Maintainer = 2,
+    }
+
+    impl RoleByte for FixtureRole {
+        fn from_byte(b: u8) -> Option<Self> {
+            match b {
+                0 => Some(Self::Viewer),
+                1 => Some(Self::Contributor),
+                2 => Some(Self::Maintainer),
+                _ => None,
+            }
+        }
+        fn as_byte(self) -> u8 {
+            self as u8
+        }
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct FixtureActor;
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct FixtureMsg;
+
+    impl crate::actors::value::FromDynamic for FixtureMsg {
+        fn from_dynamic(_d: &crate::actors::value::Msg) -> Option<Self> {
+            None
+        }
+    }
+
+    impl Actor for FixtureActor {
+        type Error = ();
+        type Message = FixtureMsg;
+        type Role = FixtureRole;
+        const DEFAULT_ROLE: FixtureRole = FixtureRole::Viewer;
+        const SPACE_ROLE_MAP: crate::actors::auth::SpaceRoleMap<FixtureRole> =
+            crate::actors::auth::SpaceRoleMap {
+                admin: Some(FixtureRole::Maintainer),
+                developer: Some(FixtureRole::Contributor),
+                member: Some(FixtureRole::Viewer),
+                guest: None,
+            };
+
+        fn create() -> Self {
+            FixtureActor
+        }
+
+        fn dispatch(
+            &mut self,
+            _msg: FixtureMsg,
+            _ctx: &mut Context<Self>,
+        ) -> crate::actors::run::RunResult<bool> {
+            crate::actors::run::RunResult::Complete(true)
+        }
+    }
+
+    fn fixture_ctx_with(
+        caller: Caller,
+        space_role: Option<u8>,
+        actor_local_role: Option<u8>,
+    ) -> Context<FixtureActor> {
+        let mut ctx: Context<FixtureActor> = Context::new(ServiceId(1));
+        ctx.set_caller(caller);
+        ctx.set_caller_roles(space_role, actor_local_role);
+        ctx
+    }
+
+    #[test]
+    fn caller_role_actor_local_overrides_space() {
+        // Actor-local grant must win even when the space role
+        // would map to something different — the whole point of
+        // letting operators override per-actor.
+        let ctx = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Admin.as_u8()),
+            Some(FixtureRole::Viewer.as_byte()),
+        );
+        assert_eq!(ctx.caller_role(), Some(FixtureRole::Viewer));
+    }
+
+    #[test]
+    fn caller_role_falls_back_to_space_via_map() {
+        // No actor-local grant: walk the SPACE_ROLE_MAP.
+        // Developer → Contributor in the fixture's map.
+        let ctx = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Developer.as_u8()),
+            None,
+        );
+        assert_eq!(ctx.caller_role(), Some(FixtureRole::Contributor));
+    }
+
+    #[test]
+    fn caller_role_guest_yields_none() {
+        // Guest maps to None in this fixture — caller_role
+        // returns None and any ensure_role(Viewer) call will
+        // fail. Locks in deny-by-default semantics for the
+        // lowest tier.
+        let ctx = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Guest.as_u8()),
+            None,
+        );
+        assert_eq!(ctx.caller_role(), None);
+        assert!(!ctx.has_role(FixtureRole::Viewer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Viewer), Err(Forbidden));
+    }
+
+    #[test]
+    fn caller_role_no_grant_at_all_is_none() {
+        // No space-level, no actor-local: deny everything.
+        let ctx = fixture_ctx_with(Caller::Unauthenticated, None, None);
+        assert_eq!(ctx.caller_role(), None);
+        assert!(!ctx.has_role(FixtureRole::Viewer));
+    }
+
+    #[test]
+    fn has_role_respects_ord() {
+        // Space-Admin maps to Maintainer — admits every tier
+        // including Viewer. Space-Developer maps to Contributor
+        // — admits Viewer + Contributor, not Maintainer.
+        let ctx_admin = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Admin.as_u8()),
+            None,
+        );
+        assert!(ctx_admin.has_role(FixtureRole::Viewer));
+        assert!(ctx_admin.has_role(FixtureRole::Contributor));
+        assert!(ctx_admin.has_role(FixtureRole::Maintainer));
+
+        let ctx_dev = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Developer.as_u8()),
+            None,
+        );
+        assert!(ctx_dev.has_role(FixtureRole::Viewer));
+        assert!(ctx_dev.has_role(FixtureRole::Contributor));
+        assert!(!ctx_dev.has_role(FixtureRole::Maintainer));
+    }
+
+    #[test]
+    fn intra_system_actor_caller_bypasses_role_checks() {
+        // Trust-model invariant: anything past the libp2p auth
+        // gate that's now calling intra-system is trusted. No
+        // role bytes, but `has_role` still returns true so
+        // intra-actor compositions don't accidentally lock
+        // themselves out.
+        let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Actor(ServiceId(99)), None, None);
+        assert!(ctx.has_role(FixtureRole::Maintainer));
+        assert!(ctx.ensure_role(FixtureRole::Maintainer).is_ok());
+    }
+
+    #[test]
+    fn ensure_role_returns_forbidden_marker() {
+        // Display text on the returned Err is what bubbles to
+        // user errors via `From<Forbidden>` impls. Confirm the
+        // marker is structurally distinct from Ok.
+        let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Unauthenticated, None, None);
+        assert_eq!(ctx.ensure_role(FixtureRole::Viewer), Err(Forbidden));
+    }
+
+    #[test]
+    fn has_role_byte_round_trips_known_discriminants() {
+        // The macro-emitted dispatch check (M6) only has the raw
+        // byte from `required_role()`. has_role_byte must handle
+        // the round-trip — valid discriminants succeed when the
+        // caller has the role; unknown discriminants always fail
+        // (forward-incompatible).
+        let ctx = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Developer.as_u8()),
+            None,
+        );
+        // Caller maps to Contributor. Viewer/Contributor OK,
+        // Maintainer denied.
+        assert!(ctx.has_role_byte(FixtureRole::Viewer.as_byte()));
+        assert!(ctx.has_role_byte(FixtureRole::Contributor.as_byte()));
+        assert!(!ctx.has_role_byte(FixtureRole::Maintainer.as_byte()));
+        // Unknown discriminant → deny.
+        assert!(!ctx.has_role_byte(99));
     }
 }
