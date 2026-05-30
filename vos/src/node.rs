@@ -2474,6 +2474,25 @@ fn encode_replay_payload(msg: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Wrap an inbox-sourced payload with the safe default caller
+/// prefix (Caller::Unauthenticated, no role bytes). Closes the
+/// forged-caller-prefix attack on Tells — see the SECURITY
+/// comment in `dispatch_once`. Inbox payloads have no
+/// trustworthy origin (external libp2p Tells set
+/// attacker-controlled `from` fields), so the wrap *always*
+/// uses Unauthenticated regardless of `env.from`.
+fn wrap_with_unauthenticated_prefix(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + msg.len());
+    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    out.push(0); // trust_flag = external (Unauthenticated)
+    out.push(0); // has_space_role
+    out.push(0); // space byte (unused)
+    out.push(0); // has_actor_local_role
+    out.push(0); // actor_local byte (unused)
+    out.extend_from_slice(msg);
+    out
+}
+
 /// Wrap the request's message bytes with the M7 caller-info
 /// header so the PVM agent can populate `Context::caller` and
 /// the role bytes before the M6 macro-emitted role check runs.
@@ -2605,6 +2624,40 @@ fn dispatch_once(
             false
         };
     if let Some(payload) = msg {
+        // SECURITY: wrap with Caller::Unauthenticated *before*
+        // dispatching so the actor's M7 dispatch_one always sees
+        // a host-controlled caller prefix. Without this wrap, an
+        // attacker could send a libp2p Tell whose payload begins
+        // with TAG_CALLER_PREFIX (0xFE) and have dispatch_one
+        // strip + parse the attacker's bytes as a "host-issued"
+        // caller assertion — forging trust=System bypasses every
+        // role check. With the wrap, the attacker's prefix bytes
+        // become inner-message bytes the Msg decoder mis-parses
+        // and rejects.
+        //
+        // Internal Tells (ctx.tell from one actor to another)
+        // could legitimately want Caller::Actor trust, but the
+        // inbox mixes them with external Tells and `env.from` is
+        // attacker-controlled in the external case — so the safe
+        // default is Unauthenticated for everything that arrives
+        // through this path. Intra-system callers that need
+        // trusted dispatch use ctx.ask (invoke path), which goes
+        // through handle_invoke_request and gets the right
+        // Caller::Actor wrap.
+        //
+        // Empty payloads are the runtime's wake-up tick (used to
+        // re-schedule yielded services); the runtime filters them
+        // out before dispatch and they never reach dispatch_one
+        // (see `runtime.rs::run_blocking`'s round_items retain).
+        // Wrapping would turn them into non-empty bytes that
+        // *aren't* filtered, then trip the empty-Msg decoder.
+        // Skip the wrap; empty in / empty out preserves the
+        // wake-up semantics.
+        let payload = if payload.is_empty() {
+            payload
+        } else {
+            wrap_with_unauthenticated_prefix(&payload)
+        };
         runtime.send_to(svc_id, payload);
     }
     runtime.run_blocking();
@@ -3612,6 +3665,97 @@ mod tests {
         // &VosNode), not here.
         let env = make_envelope(crate::STATUS_FORBIDDEN, b"", b"");
         assert_eq!(unwrap_invoke_envelope(&env), None);
+    }
+
+    // ── Tell-path forgery defense (C1 regression test) ───────
+    //
+    // The M7 caller-prefix protocol is the host's mechanism for
+    // asserting "this dispatch is from <Caller>"; the PVM strips
+    // the leading 6-byte header and trusts it. If any path
+    // sends inbox-sourced bytes to the runtime *without* the
+    // host's wrap, an attacker can prepend their own forged
+    // header — flipping trust_flag=1 turns Caller::System on
+    // and bypasses every role check.
+    //
+    // These tests pin the two host-side wrap shapes (replay +
+    // inbox) so a refactor that drops the wrap (or flips a
+    // trust flag) fails fast instead of silently re-opening the
+    // attack surface.
+
+    #[test]
+    fn wrap_with_unauthenticated_prefix_layout() {
+        // Inbox / Tell dispatch path must use the safe-default
+        // wrap: trust_flag=0 (Unauthenticated), no role bytes.
+        // Bytes 0..6 are the fixed-shape header; the original
+        // payload trails verbatim.
+        let inner = b"some-msg-bytes";
+        let wrapped = wrap_with_unauthenticated_prefix(inner);
+        assert_eq!(
+            wrapped[0],
+            crate::actors::lifecycle::TAG_CALLER_PREFIX,
+            "header must start with TAG_CALLER_PREFIX",
+        );
+        assert_eq!(
+            wrapped[1], 0,
+            "trust_flag MUST be 0 (Unauthenticated) for inbox-sourced \
+             payloads — an attacker controls the inner bytes, so \
+             trust=1 would forge Caller::System",
+        );
+        assert_eq!(
+            &wrapped[2..6],
+            &[0u8; 4],
+            "role flags / bytes are all zero in the safe-default wrap",
+        );
+        assert_eq!(
+            &wrapped[6..],
+            &inner[..],
+            "inner payload trails the header verbatim",
+        );
+    }
+
+    #[test]
+    fn replay_payload_uses_system_trust() {
+        // Replay re-runs already-committed log entries; the
+        // original authorisation is implicit in the commit.
+        // System trust here is intentional — but only when the
+        // bytes come from the replay log, never from an inbox.
+        let inner = b"logged-msg";
+        let wrapped = encode_replay_payload(inner);
+        assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_CALLER_PREFIX);
+        assert_eq!(wrapped[1], 1, "replay must use trust_flag=System");
+        assert_eq!(&wrapped[6..], &inner[..]);
+    }
+
+    #[test]
+    fn inbox_wrap_neutralises_forged_caller_prefix() {
+        // Attacker crafts a Tell payload that *itself* starts
+        // with TAG_CALLER_PREFIX and a forged trust_flag=1
+        // (System). After the host wraps it with the safe
+        // default, the attacker's bytes start at offset 6 — the
+        // PVM's dispatch_one only strips one prefix, so the
+        // attacker's bytes go to the Msg decoder, NOT to a
+        // second caller-set. dispatch_one is single-pass, so
+        // confirming the wrap puts the attacker's prefix at
+        // offset 6 is sufficient to prove the forgery is
+        // neutralised.
+        let forged: Vec<u8> = std::iter::once(crate::actors::lifecycle::TAG_CALLER_PREFIX)
+            .chain([1, 0, 0, 0, 0])
+            .chain(b"would-be-admin-call".iter().copied())
+            .collect();
+        let wrapped = wrap_with_unauthenticated_prefix(&forged);
+        // Host's prefix at 0..6, attacker's bytes start at 6.
+        assert_eq!(wrapped[1], 0, "outer trust_flag must be 0");
+        assert_eq!(
+            wrapped[6],
+            crate::actors::lifecycle::TAG_CALLER_PREFIX,
+            "attacker's prefix byte is preserved inside as msg \
+             content — dispatch_one is single-pass so this byte \
+             gets treated as the first byte of the inner Msg, not \
+             as another caller-prefix to strip",
+        );
+        // The forged trust_flag=1 byte sits at offset 7, where
+        // it can only be decoded as part of a malformed Msg.
+        assert_eq!(wrapped[7], 1);
     }
 
     #[test]
