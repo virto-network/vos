@@ -220,6 +220,27 @@ pub struct AuthGrantRow {
     pub role: u8,
 }
 
+/// Per-(PeerId, agent_name) ACL row — the M4 actor-local override
+/// table. Lookup precedence in the dispatch path is:
+///
+/// 1. `actor_acls` keyed on `(peer_id, agent_name)`.
+/// 2. Fall back to `auth_grants` keyed on `peer_id` (space-level).
+///
+/// `role` discriminants are interpreted in the *target actor's*
+/// `Role` enum, not [`SpaceRole`](vos::SpaceRole). The registry
+/// stores them opaquely; the host plumbs them through and the
+/// actor decodes via `RoleByte::from_byte`. Sorting key is the
+/// pair `(peer_id_bytes, agent_name_bytes)` for binary lookup.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ActorAclRow {
+    pub peer_id: Vec<u8>,
+    pub agent_name: String,
+    pub role: u8,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 //
 // Mutation messages return a single u8 status. 0 always = ok.
@@ -275,6 +296,12 @@ pub struct SpaceRegistry {
     /// (see "Schema evolution" in this file's module doc) lets
     /// upgrades resync from the DAG.
     auth_grants: Vec<AuthGrantRow>,
+    /// M4 — per-(peer, agent) actor-local ACL overrides. Sorted
+    /// by `(peer_id, agent_name)` for binary lookup. Empty until
+    /// an operator calls `grant_actor_role`. Falls through to
+    /// `auth_grants` (space-level) when no actor-local grant
+    /// exists for `(peer, target_agent)`.
+    actor_acls: Vec<ActorAclRow>,
 }
 
 #[messages]
@@ -288,6 +315,7 @@ impl SpaceRegistry {
             extension_metas: Vec::new(),
             blobs: Vec::new(),
             auth_grants: Vec::new(),
+            actor_acls: Vec::new(),
         }
     }
 
@@ -855,6 +883,90 @@ impl SpaceRegistry {
         self.auth_grants.clone()
     }
 
+    // ── Actor-local ACLs (M4) ──────────────────────────────────
+    //
+    // Sibling of the space-level `auth_grants` quartet above —
+    // same shape, scoped by `agent_name`. The dispatch path in
+    // vos/src/node.rs (M5) consults this table first; misses
+    // fall through to `auth_grants` mapped via the actor's
+    // `SPACE_ROLE_MAP`. CLI surface (`vosx space role
+    // --in <actor>`) lands in M8.
+
+    /// Grant `role` to `peer_id` *scoped to* `agent_name`.
+    /// Idempotent — re-granting the same role is a no-op;
+    /// changing the role updates in place. `role` is interpreted
+    /// in the target actor's `Role` enum (not `SpaceRole`).
+    #[msg]
+    async fn grant_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String, role: u8) -> u8 {
+        if peer_id.is_empty() || agent_name.is_empty() {
+            return STATUS_BAD_HASH;
+        }
+        match self
+            .actor_acls
+            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
+        {
+            Ok(idx) => {
+                self.actor_acls[idx].role = role;
+                STATUS_OK
+            }
+            Err(insert_at) => {
+                self.actor_acls.insert(
+                    insert_at,
+                    ActorAclRow {
+                        peer_id,
+                        agent_name,
+                        role,
+                    },
+                );
+                STATUS_OK
+            }
+        }
+    }
+
+    /// Remove the actor-local grant for `(peer_id, agent_name)`.
+    /// `STATUS_NOT_FOUND` if no such row exists. Does not affect
+    /// the space-level grant in `auth_grants`.
+    #[msg]
+    async fn revoke_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String) -> u8 {
+        match self
+            .actor_acls
+            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
+        {
+            Ok(idx) => {
+                self.actor_acls.remove(idx);
+                STATUS_OK
+            }
+            Err(_) => STATUS_NOT_FOUND,
+        }
+    }
+
+    /// Look up the actor-local role byte granted to `peer_id`
+    /// for `agent_name`. Returns `AUTH_ROLE_NONE` when no such
+    /// row exists — the dispatch path then falls back to the
+    /// space-level grant. (The byte 0 is overloaded with
+    /// `AUTH_ROLE_NONE` for the space-level path; actor `Role`
+    /// enums may legitimately assign 0 to their lowest tier.
+    /// `actor_acl` would shadow that with "no grant", so the
+    /// dispatch path uses the `Option<u8>` variant in M5 to
+    /// distinguish "no row" from "row with role 0".)
+    #[msg]
+    async fn actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> u8 {
+        match self
+            .actor_acls
+            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
+        {
+            Ok(idx) => self.actor_acls[idx].role,
+            Err(_) => AUTH_ROLE_NONE,
+        }
+    }
+
+    /// Full actor-local ACL list — for `vosx space role list --in
+    /// <actor>` and operator audit. Returned in sorted order.
+    #[msg]
+    async fn actor_acls(&self) -> Vec<ActorAclRow> {
+        self.actor_acls.clone()
+    }
+
     // ── Blob bytes ─────────────────────────────────────────────
 
     /// Insert raw bytes into the registry's blob store, keyed by
@@ -918,6 +1030,23 @@ fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str)
     0
 }
 
+/// Total order on `(peer_id, agent_name)` rows in the
+/// `actor_acls` table. Primary key is `peer_id` bytes
+/// (lexicographic); secondary key is `agent_name`. Returns
+/// `Ordering` directly so it can be plugged into
+/// `binary_search_by`.
+fn actor_acl_key(
+    a_peer: &[u8],
+    a_name: &str,
+    b_peer: &[u8],
+    b_name: &str,
+) -> core::cmp::Ordering {
+    match compare_bytes(a_peer, b_peer).cmp(&0) {
+        core::cmp::Ordering::Equal => a_name.cmp(b_name),
+        other => other,
+    }
+}
+
 fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
     let mut i = 0usize;
     while i < a.len() && i < b.len() {
@@ -963,4 +1092,367 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
     let raw = u16::from_le_bytes(raw_bytes);
     let local = (raw & 0x7FFF).max(0x100);
     ((prefix as u32) << 16) | (local as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos::Message;
+    use vos::actors::context::ServiceId;
+
+    fn registry() -> SpaceRegistry {
+        SpaceRegistry::new()
+    }
+
+    fn run<F: core::future::Future>(fut: F) -> F::Output {
+        vos::block_on(fut)
+    }
+
+    // The `#[messages]` macro lifts each `#[msg]` handler into an
+    // `impl Message<X> for SpaceRegistry` and removes the inherent
+    // method. To exercise a handler from a test, we construct a
+    // throwaway Context and dispatch via the trait. Helper keeps
+    // each call site to one line.
+    fn dispatch<M>(r: &mut SpaceRegistry, msg: M) -> <SpaceRegistry as Message<M>>::Output
+    where
+        SpaceRegistry: Message<M>,
+    {
+        let mut ctx: vos::Context<SpaceRegistry> = vos::Context::new(ServiceId(0));
+        run(<SpaceRegistry as Message<M>>::handle(r, msg, &mut ctx))
+    }
+
+    // ── actor_acl_key — total order ─────────────────────────────
+
+    #[test]
+    fn actor_acl_key_orders_by_peer_then_name() {
+        // peer_id is the primary key; agent_name disambiguates
+        // rows for the same peer. The dispatch path's binary
+        // search depends on this total order.
+        use core::cmp::Ordering;
+        assert_eq!(actor_acl_key(b"aaa", "x", b"aaa", "x"), Ordering::Equal);
+        assert_eq!(actor_acl_key(b"aaa", "x", b"aab", "x"), Ordering::Less);
+        assert_eq!(actor_acl_key(b"aab", "x", b"aaa", "x"), Ordering::Greater);
+        // Same peer, agent_name disambiguates.
+        assert_eq!(actor_acl_key(b"aaa", "x", b"aaa", "y"), Ordering::Less);
+        assert_eq!(actor_acl_key(b"aaa", "y", b"aaa", "x"), Ordering::Greater);
+    }
+
+    // ── grant_actor_role / actor_role round-trip ────────────────
+
+    #[test]
+    fn grant_actor_role_then_lookup_returns_role() {
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        let agent = String::from("dev-project");
+        let status = dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+                role: 2,
+            },
+        );
+        assert_eq!(status, STATUS_OK);
+
+        let role = dispatch(
+            &mut r,
+            ActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+            },
+        );
+        assert_eq!(role, 2, "ActorRole must return the granted byte");
+    }
+
+    #[test]
+    fn actor_role_unknown_peer_returns_none_byte() {
+        // AUTH_ROLE_NONE is the "no row" sentinel — the dispatch
+        // path turns this into `Option<u8>::None` before passing
+        // to Context::set_caller_roles (M5).
+        let mut r = registry();
+        let role = dispatch(
+            &mut r,
+            ActorRole {
+                peer_id: alloc::vec![9, 9, 9],
+                agent_name: String::from("any"),
+            },
+        );
+        assert_eq!(role, AUTH_ROLE_NONE);
+    }
+
+    #[test]
+    fn grant_actor_role_is_idempotent_for_same_role() {
+        // Re-granting the same row must not duplicate or error.
+        // Operators frequently call grant on bootstrap; the
+        // second run must be a clean no-op.
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        let agent = String::from("dev-project");
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: agent.clone(),
+                    role: 2,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: agent.clone(),
+                    role: 2,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: agent.clone(),
+                },
+            ),
+            2,
+        );
+        let all = dispatch(&mut r, ActorAcls);
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn grant_actor_role_changes_role_in_place() {
+        // Re-granting with a different role updates rather than
+        // inserts. Operators changing a peer's actor-local role
+        // expect the old grant to be replaced.
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        let agent = String::from("dev-project");
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+                role: 1,
+            },
+        );
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+                role: 3,
+            },
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: agent.clone(),
+                },
+            ),
+            3,
+        );
+        assert_eq!(dispatch(&mut r, ActorAcls).len(), 1);
+    }
+
+    #[test]
+    fn grant_actor_role_rejects_empty_peer_or_name() {
+        // Empty peer/name would alias to an unintended row and
+        // collide with future identity bytes. STATUS_BAD_HASH
+        // matches the existing convention from grant_role.
+        let mut r = registry();
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantActorRole {
+                    peer_id: Vec::new(),
+                    agent_name: String::from("x"),
+                    role: 1,
+                },
+            ),
+            STATUS_BAD_HASH,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantActorRole {
+                    peer_id: alloc::vec![1],
+                    agent_name: String::new(),
+                    role: 1,
+                },
+            ),
+            STATUS_BAD_HASH,
+        );
+    }
+
+    // ── revoke_actor_role ───────────────────────────────────────
+
+    #[test]
+    fn revoke_actor_role_removes_grant() {
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        let agent = String::from("dev-project");
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+                role: 2,
+            },
+        );
+        let status = dispatch(
+            &mut r,
+            RevokeActorRole {
+                peer_id: peer.clone(),
+                agent_name: agent.clone(),
+            },
+        );
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: agent.clone(),
+                },
+            ),
+            AUTH_ROLE_NONE,
+        );
+        assert!(dispatch(&mut r, ActorAcls).is_empty());
+    }
+
+    #[test]
+    fn revoke_actor_role_missing_returns_not_found() {
+        let mut r = registry();
+        let status = dispatch(
+            &mut r,
+            RevokeActorRole {
+                peer_id: alloc::vec![1],
+                agent_name: String::from("x"),
+            },
+        );
+        assert_eq!(status, STATUS_NOT_FOUND);
+    }
+
+    // ── multi-peer / multi-agent ─────────────────────────────────
+
+    #[test]
+    fn one_peer_can_have_distinct_roles_per_agent() {
+        // The whole point of actor-local grants: Bob can be
+        // Maintainer on dev-project AND Viewer on dev-payments
+        // without one role bleeding into the other.
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: String::from("a"),
+                role: 1,
+            },
+        );
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: String::from("b"),
+                role: 3,
+            },
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: String::from("a"),
+                },
+            ),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: String::from("b"),
+                },
+            ),
+            3,
+        );
+        assert_eq!(dispatch(&mut r, ActorAcls).len(), 2);
+    }
+
+    #[test]
+    fn rows_stay_sorted_under_arbitrary_insertion_order() {
+        // binary_search_by depends on a total order. Insert in
+        // reverse and confirm actor_acls() returns sorted order.
+        let mut r = registry();
+        for peer_byte in (1u8..=4).rev() {
+            dispatch(
+                &mut r,
+                GrantActorRole {
+                    peer_id: alloc::vec![peer_byte],
+                    agent_name: String::from("z"),
+                    role: 1,
+                },
+            );
+        }
+        let rows = dispatch(&mut r, ActorAcls);
+        for w in rows.windows(2) {
+            assert!(
+                actor_acl_key(&w[0].peer_id, &w[0].agent_name, &w[1].peer_id, &w[1].agent_name)
+                    == core::cmp::Ordering::Less,
+                "actor_acls rows must be in sorted order",
+            );
+        }
+    }
+
+    #[test]
+    fn space_level_grant_table_unaffected_by_actor_local_grants() {
+        // The two tables are independent: granting an actor-
+        // local role must not touch the space-level grant
+        // and vice versa.
+        let mut r = registry();
+        let peer = alloc::vec![1, 2, 3];
+        dispatch(
+            &mut r,
+            GrantRole {
+                peer_id: peer.clone(),
+                role: AUTH_ROLE_DEVELOPER,
+            },
+        );
+        dispatch(
+            &mut r,
+            GrantActorRole {
+                peer_id: peer.clone(),
+                agent_name: String::from("x"),
+                role: 3,
+            },
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer.clone(),
+                },
+            ),
+            AUTH_ROLE_DEVELOPER,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorRole {
+                    peer_id: peer.clone(),
+                    agent_name: String::from("x"),
+                },
+            ),
+            3,
+        );
+    }
 }
