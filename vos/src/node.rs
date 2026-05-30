@@ -2367,7 +2367,14 @@ fn handle_invoke_request(
             return Ok(());
         }
     };
-    let status = if runtime.is_suspended(svc_id) {
+    // M6 — when the macro-emitted role check refused the call,
+    // the runtime stashes STATUS_FORBIDDEN in last_status. That
+    // wins over the default DONE/YIELDED inference so the wire
+    // envelope carries the actor-level refusal end-to-end.
+    let actor_status = runtime.take_last_status(svc_id);
+    let status = if let Some(s) = actor_status {
+        s
+    } else if runtime.is_suspended(svc_id) {
         crate::actors::run::STATUS_YIELDED
     } else {
         crate::actors::run::STATUS_DONE

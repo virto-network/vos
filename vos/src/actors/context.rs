@@ -35,6 +35,15 @@ pub struct Context<A: Actor> {
     /// [`Self::caller_role`].
     actor_local_role: Option<u8>,
 
+    /// Set by the M6 macro-emitted pre-dispatch check when the
+    /// caller's role doesn't satisfy the handler's
+    /// `#[msg(role = X)]`. Surfaces upstream via
+    /// [`lifecycle::exit_status`](super::lifecycle::exit_status)
+    /// as `STATUS_FORBIDDEN` so the wire envelope carries the
+    /// refusal and vosx prints "permission denied" — same
+    /// surface the Sprint-2 dispatch-layer gate produced.
+    forbidden: bool,
+
     // Effect queues (flushed in accumulate)
     pending_tells: Vec<PendingTell>,
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -73,6 +82,7 @@ impl<A: Actor> Context<A> {
             caller: Caller::Unauthenticated,
             space_role: None,
             actor_local_role: None,
+            forbidden: false,
             pending_tells: Vec::new(),
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
@@ -197,6 +207,33 @@ impl<A: Actor> Context<A> {
             Some(req) => self.has_role(req),
             None => false,
         }
+    }
+
+    /// Flag the current dispatch as refused. Called by the M6
+    /// macro-emitted pre-handler check when
+    /// [`Self::has_role_byte`] returns false — surfaces upstream
+    /// via [`lifecycle::exit_status`](super::lifecycle::exit_status)
+    /// as `STATUS_FORBIDDEN`. Hidden — actor authors who want
+    /// custom policy use [`Self::ensure_role`] instead.
+    #[doc(hidden)]
+    pub fn __mark_forbidden(&mut self) {
+        self.forbidden = true;
+    }
+
+    /// Whether the current dispatch was flagged as refused.
+    /// Read by [`exit_status`](super::lifecycle::exit_status)
+    /// when packing the wire envelope.
+    pub fn was_forbidden(&self) -> bool {
+        self.forbidden
+    }
+
+    /// Reset the forbidden flag between dispatches. The actor
+    /// framework calls this on every new invocation so a refused
+    /// call doesn't poison subsequent dispatches sharing the same
+    /// Context.
+    #[doc(hidden)]
+    pub fn __reset_forbidden(&mut self) {
+        self.forbidden = false;
     }
 
     // --- Storage ---
@@ -537,6 +574,7 @@ impl<A: Actor> Context<A> {
             reply,
             effects,
             continue_next: self.self_schedule,
+            forbidden: self.forbidden,
         }
     }
 }

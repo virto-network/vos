@@ -144,7 +144,14 @@ pub fn fetch_raw(buf: &mut [u8]) -> usize {
 /// Build exit status bytes from context state.
 #[cfg(feature = "pvm")]
 pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
-    use super::run::{STATUS_DONE, STATUS_YIELDED};
+    use super::run::{STATUS_DONE, STATUS_FORBIDDEN, STATUS_YIELDED};
+    // M6 — the macro-emitted role check flagged this dispatch
+    // as refused. `STATUS_FORBIDDEN` propagates through the wire
+    // envelope so vosx surfaces "permission denied" without any
+    // handler-body side effects.
+    if ctx.was_forbidden() {
+        return alloc::vec![STATUS_FORBIDDEN];
+    }
     if ctx.self_scheduled() {
         let ticks = ctx.sleep_ticks();
         if ticks > 0 {

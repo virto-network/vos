@@ -347,6 +347,13 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     ///
     /// [`take_last_reply`]: VosRuntime::take_last_reply
     last_reply: HashMap<u32, Vec<u8>>,
+    /// Per-service exit status byte from the most recent
+    /// dispatch's invoke envelope. Today only `STATUS_FORBIDDEN`
+    /// (from the M6 macro-emitted role check) flows through here
+    /// — `STATUS_DONE` / `STATUS_YIELDED` are still inferred by
+    /// the host from `is_suspended`. Cleared by
+    /// [`take_last_status`](VosRuntime::take_last_status).
+    last_status: HashMap<u32, u8>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -380,6 +387,7 @@ impl<D: DataLayer> VosRuntime<D> {
             external_invoke: None,
             effect_mode: crate::effect_log::EffectMode::Inactive,
             last_reply: HashMap::new(),
+            last_status: HashMap::new(),
         }
     }
 
@@ -388,6 +396,16 @@ impl<D: DataLayer> VosRuntime<D> {
     /// answer synchronous invoke requests routed to this agent.
     pub fn take_last_reply(&mut self, svc_id: ServiceId) -> Option<Vec<u8>> {
         self.last_reply.remove(&svc_id.0)
+    }
+
+    /// Take and return the most recent dispatch's exit status
+    /// byte for `svc_id`, if any. Today only `STATUS_FORBIDDEN`
+    /// shows up here (from the M6 role check); other statuses
+    /// stay implicit. Used by the host (`handle_invoke_request`)
+    /// to override the default `STATUS_DONE` when the actor
+    /// refused the call at the dispatch boundary.
+    pub fn take_last_status(&mut self, svc_id: ServiceId) -> Option<u8> {
+        self.last_status.remove(&svc_id.0)
     }
 
     pub fn gas_config(&self) -> &GasConfig {
@@ -688,6 +706,16 @@ impl<D: DataLayer> VosRuntime<D> {
                             // panics surface to the host as silent
                             // success.
                             self.last_reply.insert(svc_id, payload.reply.clone());
+                            // M6 — propagate the M6 forbidden flag from
+                            // the refine payload so the host can
+                            // surface the actor-emitted refusal as a
+                            // STATUS_FORBIDDEN envelope. Other
+                            // statuses stay implicit (DONE / YIELDED
+                            // are inferred from is_suspended).
+                            if payload.forbidden {
+                                self.last_status
+                                    .insert(svc_id, crate::actors::run::STATUS_FORBIDDEN);
+                            }
                             journal.absorb_effects(payload.effects, svc_id);
                             (cn, state)
                         } else {

@@ -45,6 +45,14 @@ pub const REFINE_PAYLOAD_VERSION: u8 = 0x02;
 /// Flag bit: guest yielded; host should re-queue this service next tick.
 pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
 
+/// Flag bit: the M6 macro-emitted role check refused the call.
+/// Host produces a `STATUS_FORBIDDEN` invoke envelope so vosx
+/// surfaces "permission denied" instead of treating the empty
+/// reply as `Value::Unit`. Wire-additive — older hosts that
+/// don't know this bit see `FORBIDDEN` payloads as empty-reply
+/// `STATUS_DONE` calls (same as today).
+pub const FLAG_FORBIDDEN: u8 = 0x02;
+
 pub const EFFECT_WRITE: u8 = 0x01;
 pub const EFFECT_TRANSFER: u8 = 0x02;
 pub const EFFECT_PROVIDE: u8 = 0x03;
@@ -67,6 +75,11 @@ pub struct RefinePayload {
     pub effects: Vec<Effect>,
     /// Guest requested to be re-scheduled next tick (yield_now / sleep).
     pub continue_next: bool,
+    /// M6 — the macro-emitted pre-dispatch role check refused
+    /// the call. Encoded via [`FLAG_FORBIDDEN`] in the flags
+    /// byte; the host turns this into a `STATUS_FORBIDDEN`
+    /// invoke envelope.
+    pub forbidden: bool,
 }
 
 impl RefinePayload {
@@ -118,6 +131,9 @@ impl RefinePayload {
         if self.continue_next {
             flags |= FLAG_CONTINUE_NEXT;
         }
+        if self.forbidden {
+            flags |= FLAG_FORBIDDEN;
+        }
         out.push(flags);
         push_u32(&mut out, self.state.len() as u32);
         out.extend_from_slice(&self.state);
@@ -139,6 +155,7 @@ impl RefinePayload {
         }
         let flags = c.read_u8()?;
         let continue_next = flags & FLAG_CONTINUE_NEXT != 0;
+        let forbidden = flags & FLAG_FORBIDDEN != 0;
         let state_len = c.read_u32()? as usize;
         let state = c.read_bytes(state_len)?.to_vec();
         let reply_len = c.read_u32()? as usize;
@@ -153,6 +170,7 @@ impl RefinePayload {
             reply,
             effects,
             continue_next,
+            forbidden,
         })
     }
 }
@@ -291,6 +309,7 @@ mod tests {
             reply: vec![0xAA, 0xBB],
             effects: vec![],
             continue_next: true,
+            forbidden: false,
         };
         let bytes = p.encode();
         let decoded = RefinePayload::decode(&bytes).unwrap();
@@ -318,6 +337,7 @@ mod tests {
                 Effect::New { code_hash: [7; 32] },
             ],
             continue_next: false,
+            forbidden: false,
         };
         let bytes = p.encode();
         let decoded = RefinePayload::decode(&bytes).unwrap();
@@ -338,9 +358,30 @@ mod tests {
             reply: vec![],
             effects: vec![],
             continue_next: false,
+            forbidden: false,
         }
         .encode();
         // Lop off the last state byte
         assert!(RefinePayload::decode(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn roundtrip_forbidden_flag() {
+        // M6: the FLAG_FORBIDDEN bit must round-trip cleanly so
+        // the host can surface STATUS_FORBIDDEN envelopes from
+        // role-refused dispatches. Independent of continue_next
+        // so a future "forbidden but please re-tick" combination
+        // stays expressible.
+        let p = RefinePayload {
+            state: vec![],
+            reply: vec![],
+            effects: vec![],
+            continue_next: false,
+            forbidden: true,
+        };
+        let bytes = p.encode();
+        let decoded = RefinePayload::decode(&bytes).unwrap();
+        assert_eq!(p, decoded);
+        assert!(decoded.forbidden);
     }
 }

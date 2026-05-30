@@ -242,6 +242,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // section in the binary meta blob) cross-referenced by the
     // decoder to set `ParsedMessage.exposed_to_cli`.
     let mut cli_method_names: Vec<proc_macro2::TokenStream> = Vec::new();
+    // M6 — one arm per `#[msg(role = X)]` variant for the
+    // emitted `required_role(&self) -> Option<u8>` method. Other
+    // variants emit a `None` arm so the dispatch boundary skips
+    // the role check.
+    let mut required_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -260,24 +265,35 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let msg_attr = method.attrs.iter().find(|a| a.path().is_ident("msg"));
         let is_msg = msg_attr.is_some();
-        // Detect `#[msg(cli)]` — handler is exposed to the
-        // `vosx <ext> <cmd>` CLI dispatcher. Default false. The
-        // attribute's argument list is a sequence of bare idents
-        // (today only `cli` is recognised); use a permissive
-        // parse so future attributes (e.g. `#[msg(internal)]`)
-        // can land without breaking older actors.
-        let exposed_to_cli = msg_attr
-            .map(|a| {
-                let mut found = false;
-                let _ = a.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("cli") {
-                        found = true;
-                    }
-                    Ok(())
-                });
-                found
-            })
-            .unwrap_or(false);
+        // Parse `#[msg(...)]` arguments. Two shapes recognised:
+        //
+        //   #[msg(cli)]          — bare ident; exposes handler to
+        //                          the vosx CLI dispatcher.
+        //   #[msg(role = EXPR)]  — M6; requires caller's effective
+        //                          role to be `>=` EXPR before the
+        //                          handler runs. EXPR is parsed as
+        //                          a syn::Expr so paths like
+        //                          `MyRole::Maintainer` work.
+        //
+        // Permissive iteration so future bare idents / keys land
+        // without breaking older actors.
+        let mut exposed_to_cli = false;
+        let mut role_expr: Option<syn::Expr> = None;
+        if let Some(attr) = msg_attr {
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("cli") {
+                    exposed_to_cli = true;
+                    return Ok(());
+                }
+                if meta.path.is_ident("role") {
+                    let value = meta.value()?;
+                    let expr: syn::Expr = value.parse()?;
+                    role_expr = Some(expr);
+                    return Ok(());
+                }
+                Ok(())
+            });
+        }
 
         if !is_msg {
             // Detect constructor and extract its typed parameters
@@ -477,10 +493,48 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        // M6 — pre-dispatch role check. Emitted at the very top
+        // of the arm so it runs *before* the user's handler can
+        // observe `msg`. On refusal the actor flags the dispatch
+        // as forbidden via Context::__mark_forbidden; lifecycle's
+        // exit_status then emits STATUS_FORBIDDEN end-to-end
+        // (PVM -> runtime.last_status -> host envelope).
+        // `__mark_forbidden + return false` is short and
+        // side-effect-free so a refused call leaves no trace
+        // behind beyond the wire status.
+        let role_check = if let Some(role) = &role_expr {
+            quote! {
+                if !ctx.has_role_byte(
+                    <<#actor_name as vos::Actor>::Role as vos::RoleByte>::as_byte(#role)
+                ) {
+                    ctx.__mark_forbidden();
+                    return false;
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        // Stash a `required_role()` arm for this variant. The
+        // emitted enum gets a single `match` that returns
+        // `Some(byte)` for role-gated handlers and `None`
+        // otherwise, mirroring the existing `is_query` shape.
+        let required_role_arm = if let Some(role) = &role_expr {
+            quote! {
+                #enum_name::#struct_name(_) => Some(
+                    <<#actor_name as vos::Actor>::Role as vos::RoleByte>::as_byte(#role)
+                )
+            }
+        } else {
+            quote! { #enum_name::#struct_name(_) => None }
+        };
+        required_role_arms.push(required_role_arm);
+
         // Deliver arm — different code for infallible vs fallible handlers
         let deliver_arm = if returns_result {
             quote! {
                 #enum_name::#struct_name(msg) => {
+                    #role_check
                     match <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await {
                         Ok(reply) => {
                             ctx.__set_reply(#reply_to_value);
@@ -493,6 +547,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {
                 #enum_name::#struct_name(msg) => {
+                    #role_check
                     let reply = <#actor_name as vos::Message<#struct_name>>::handle(actor, msg, ctx).await;
                     ctx.__set_reply(#reply_to_value);
                     false
@@ -651,6 +706,20 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn is_query(&self) -> bool {
                 match self {
                     #( #is_query_arms ),*
+                }
+            }
+
+            /// M6 — role byte required to invoke this variant.
+            /// `Some(b)` for handlers annotated with
+            /// `#[msg(role = X)]` (the byte decodes against
+            /// the actor's `Role` enum); `None` for handlers
+            /// without an explicit annotation (open by default).
+            /// The macro-emitted `deliver` already enforces this
+            /// check before dispatching; the method is exposed
+            /// for introspection (e.g. CLI help, audit tooling).
+            pub fn required_role(&self) -> Option<u8> {
+                match self {
+                    #( #required_role_arms ),*
                 }
             }
 
