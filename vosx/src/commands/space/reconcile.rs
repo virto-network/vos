@@ -79,6 +79,16 @@ pub struct ExtensionDef {
     /// [`Manifest::cap_policy`]. Useful for relaxing one
     /// extension to `"log"` while keeping the rest at `"block"`.
     pub cap_policy: Option<String>,
+    /// M9 — this extension is a relay for *external* traffic
+    /// (HTTP gateway, future REST adapters). When `true`, the
+    /// extension's outbound calls tag every InvokeRequest as
+    /// [`Caller::Unauthenticated`] so the targeted actor's
+    /// role-gated handlers refuse anonymous traffic.
+    ///
+    /// Defaults to `false` — most extensions compose with
+    /// other actors as trusted in-process peers.
+    #[serde(default)]
+    pub relay_unauthenticated: bool,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -222,6 +232,11 @@ fn register_extension(
         ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
     } else {
         ExtensionConfig::with_args(&so_path, &args).with_cap_policy(cap_policy)
+    };
+    let cfg = if ext.relay_unauthenticated {
+        cfg.relay_unauthenticated()
+    } else {
+        cfg
     };
 
     // Install at a *deterministic* ServiceId derived from the

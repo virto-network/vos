@@ -242,6 +242,14 @@ pub struct ExtensionConfig {
     /// syscalls outside the declared caps. Override via the space
     /// manifest's `cap_policy = "log"`/`"block"`/`"kill"`.
     pub cap_policy: crate::extension::CapPolicy,
+    /// M9 — relay-only mode for extensions that proxy external
+    /// traffic (the HTTP gateway). When `true`, the host's
+    /// invoke closure tags every outbound call from this
+    /// extension as [`Caller::Unauthenticated`] instead of the
+    /// default [`Caller::Actor`] intra-system bypass. Default
+    /// `false` for traditional extensions that compose with
+    /// other actors as trusted in-process peers.
+    pub relay_unauthenticated: bool,
 }
 
 impl ExtensionConfig {
@@ -252,6 +260,7 @@ impl ExtensionConfig {
             init_args: Vec::new(),
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
+            relay_unauthenticated: false,
         }
     }
 
@@ -265,7 +274,20 @@ impl ExtensionConfig {
             init_args: bytes,
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
+            relay_unauthenticated: false,
         }
+    }
+
+    /// Mark the extension as a relay for external traffic — its
+    /// outbound calls tag every InvokeRequest as
+    /// [`Caller::Unauthenticated`] so the targeted actor's
+    /// role-gated handlers can refuse anonymous HTTP / REST /
+    /// future-gateway-protocol traffic. The HTTP gateway sets
+    /// this; most other extensions leave it at the default
+    /// `false` so they retain intra-system trust.
+    pub fn relay_unauthenticated(mut self) -> Self {
+        self.relay_unauthenticated = true;
+        self
     }
 
     /// Enable state persistence under the given data directory.
@@ -2961,6 +2983,12 @@ fn run_service_extension(
     let invoke_routes_for_ctx = invoke_routes.clone();
     let me = id.0;
     let invoke_shutdown = shutdown.clone();
+    // M9 — relay-mode extensions (HTTP gateway, future REST
+    // adapters) tag outbound calls as Unauthenticated so the
+    // targeted actor's role-gated handlers reject anonymous
+    // external traffic. Default (false) keeps the Actor
+    // intra-system trust for traditional extensions.
+    let relay_unauthenticated = config.relay_unauthenticated;
     let invoke_fn: std::sync::Arc<crate::extension::InvokeFn> = std::sync::Arc::new(
         move |target: u32, payload: &[u8], timeout_ms: u64| -> Option<Vec<u8>> {
             let tx = invoke_routes_for_ctx
@@ -2968,11 +2996,13 @@ fn run_service_extension(
                 .ok()
                 .and_then(|m| m.get(&target).cloned())?;
             let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
+            let caller = if relay_unauthenticated {
+                crate::actors::Caller::Unauthenticated
+            } else {
+                crate::actors::Caller::Actor(ServiceId(me))
+            };
             tx.send(InvokeRequest {
-                // Intra-system call from this extension. `me` is
-                // its ServiceId — `Caller::Actor` mirrors the
-                // agent-thread path above.
-                caller: crate::actors::Caller::Actor(ServiceId(me)),
+                caller,
                 space_role: None,
                 actor_local_role: None,
                 msg: payload.to_vec(),
