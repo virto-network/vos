@@ -13,6 +13,7 @@
 //! - `ctx.sleep(n)` — commit state, sleep N ticks, halt
 
 mod actor;
+pub mod auth;
 pub mod client;
 pub mod codec;
 pub mod init;
@@ -22,6 +23,7 @@ pub mod run;
 pub mod value;
 
 pub use actor::{Actor, Message};
+pub use auth::{Caller, SpaceRole, SpaceRoleMap};
 pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, Extension, ExtensionCtx};
