@@ -234,37 +234,32 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
          (STATUS_FORBIDDEN end-to-end). stderr:\n{stderr_b}",
     );
 
-    // Evidence: the failure must be the auth gate's refusal, not
-    // a CLI parse error, transport timeout, or anything else.
-    // `tracing::warn!` from node.rs::dispatch_invoke writes the
-    // line below to the daemon's stderr (captured in `log_path`).
-    // Both fields (`handler=grant_role`, `peer=<B's peer_id>`)
-    // must be present so we know *which* call and *which* peer
-    // got rejected.
+    // Evidence: the failure must be a real auth refusal, not a
+    // CLI parse error, transport timeout, or anything else. The
+    // host-side warn() in node.rs::dispatch_invoke fires when
+    // an actor returns STATUS_FORBIDDEN — confirms both that
+    // the wire status round-tripped and that the offending peer
+    // is named. Pre-M7 the warn came from the dispatch gate
+    // (`handler=grant_role` etc.); post-M7 it comes from the
+    // actor's own M6 macro-emitted role check via
+    // STATUS_FORBIDDEN.
     let gate_deadline = Instant::now() + Duration::from_secs(2);
     let mut log_snapshot = String::new();
     let mut saw_refusal = false;
-    let mut saw_handler = false;
     let mut saw_peer = false;
     while Instant::now() < gate_deadline {
         log_snapshot = fs::read_to_string(&log_path).unwrap_or_default();
-        saw_refusal = log_snapshot.contains("auth: refusing privileged registry handler");
-        saw_handler = log_snapshot.contains("handler=\"grant_role\"")
-            || log_snapshot.contains("handler=grant_role");
+        saw_refusal = log_snapshot.contains("auth: actor refused call");
         saw_peer = log_snapshot.contains(&b_peer);
-        if saw_refusal && saw_handler && saw_peer {
+        if saw_refusal && saw_peer {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
         saw_refusal,
-        "daemon log must record the gate's refusal — \
+        "daemon log must record the actor's refusal — \
          the failure could have happened anywhere otherwise. log:\n{log_snapshot}"
-    );
-    assert!(
-        saw_handler,
-        "log must name the refused handler (grant_role); log:\n{log_snapshot}"
     );
     assert!(
         saw_peer,

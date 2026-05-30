@@ -4,7 +4,7 @@
 //! - `#[messages]` — message types, dispatch enum, entry points
 
 use proc_macro::TokenStream;
-use quote::{ToTokens, format_ident, quote};
+use quote::{format_ident, quote};
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
 /// Makes a struct a VOS actor.
@@ -55,6 +55,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let error_ty = parsed.error_ty;
     let kind_byte = parsed.kind_byte;
     let caps_lits = parsed.caps;
+    let role_ty = parsed.role_ty;
+    let default_role = parsed.default_role;
+    let space_role_map = parsed.space_role_map;
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -145,15 +148,15 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             type Error = #error_ty;
             type Message = #msg_enum;
 
-            // Per-agent ACL framework (M1) — sentinel defaults so
+            // Per-agent ACL framework — sentinel defaults so
             // actors that haven't declared their own `Role` enum
             // keep compiling. `NoRoles::Any` admits every check;
-            // override the three items together when the actor
-            // opts into RBAC. M6 will plumb `#[actor(role = X)]`
-            // through here.
-            type Role = vos::NoRoles;
-            const DEFAULT_ROLE: vos::NoRoles = vos::NoRoles::Any;
-            const SPACE_ROLE_MAP: vos::SpaceRoleMap<vos::NoRoles> = vos::NO_ROLES_MAP;
+            // M7-and-later actors opt in via
+            // `#[actor(role = MyRole, default_role = ...,
+            // space_role_map = ...)]`.
+            type Role = #role_ty;
+            const DEFAULT_ROLE: <Self as vos::Actor>::Role = #default_role;
+            const SPACE_ROLE_MAP: vos::SpaceRoleMap<<Self as vos::Actor>::Role> = #space_role_map;
 
             // Phase 2 — extension kind discriminant; defaulted on the
             // trait, overridden here from `#[actor(kind = "...")]`.
@@ -1059,6 +1062,17 @@ struct ActorAttrs {
     /// Declared capability tokens (Phase 6). Each element is a
     /// string literal that goes into the `Actor::CAPS` slice.
     caps: Vec<String>,
+    /// M7 — token stream for the actor's `Role` associated type
+    /// (e.g. `MyRole`). `vos::NoRoles` when not specified, which
+    /// makes the actor opt out of RBAC.
+    role_ty: proc_macro2::TokenStream,
+    /// M7 — token stream for `Actor::DEFAULT_ROLE` (the value
+    /// applied when no grant resolves). `vos::NoRoles::Any` when
+    /// not specified.
+    default_role: proc_macro2::TokenStream,
+    /// M7 — token stream for `Actor::SPACE_ROLE_MAP` (a const
+    /// SpaceRoleMap<Self::Role>). Defaults to vos::NO_ROLES_MAP.
+    space_role_map: proc_macro2::TokenStream,
 }
 
 /// Parse `#[actor(...)]` attributes.
@@ -1072,45 +1086,51 @@ struct ActorAttrs {
 ///   per-invoke dispatch sidecar against
 ///   `vos_service_handle_invoke`.
 fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
+    use syn::Token;
+    use syn::parse::Parser;
+    use syn::punctuated::Punctuated;
+
     let default_err = quote! { () };
     let mut out = ActorAttrs {
         error_ty: default_err.clone(),
         kind_byte: 0,
         caps: Vec::new(),
+        role_ty: quote! { vos::NoRoles },
+        default_role: quote! { vos::NoRoles::Any },
+        space_role_map: quote! { vos::NO_ROLES_MAP },
     };
     if attr.is_empty() {
         return out;
     }
-    let Ok(meta) = syn::parse::<syn::Meta>(attr) else {
-        return out;
-    };
-    match meta {
-        syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
-            let val = &nv.value;
-            out.error_ty = quote! { #val };
-        }
-        syn::Meta::NameValue(nv) if nv.path.is_ident("kind") => {
-            if let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) = &nv.value
-            {
-                out.kind_byte = parse_kind_str(&s.value());
+
+    // Proc-macro attribute body is the tokens inside the parens,
+    // possibly comma-separated. Parse as a Punctuated<Meta, ,>
+    // so multi-arg forms like
+    // `#[actor(role = X, default_role = Y, ...)]` work — a bare
+    // `syn::parse::<syn::Meta>` only handles a single arg.
+    let metas: Punctuated<syn::Meta, Token![,]> =
+        match Punctuated::<syn::Meta, Token![,]>::parse_terminated.parse(attr) {
+            Ok(p) => p,
+            Err(_) => return out,
+        };
+
+    for meta in metas {
+        match meta {
+            syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
+                let val = &nv.value;
+                out.error_ty = quote! { #val };
             }
-        }
-        syn::Meta::List(list) => {
-            let _ = list.parse_nested_meta(|meta| {
-                if meta.path.is_ident("error") {
-                    let value = meta.value()?;
-                    out.error_ty = value.parse::<syn::Type>()?.to_token_stream();
-                } else if meta.path.is_ident("kind") {
-                    let value = meta.value()?;
-                    let lit: syn::LitStr = value.parse()?;
-                    out.kind_byte = parse_kind_str(&lit.value());
-                } else if meta.path.is_ident("caps") {
-                    // `caps = ["net.tcp.bind", ...]`
-                    let value = meta.value()?;
-                    let arr: syn::ExprArray = value.parse()?;
+            syn::Meta::NameValue(nv) if nv.path.is_ident("kind") => {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = &nv.value
+                {
+                    out.kind_byte = parse_kind_str(&s.value());
+                }
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("caps") => {
+                if let syn::Expr::Array(arr) = &nv.value {
                     for elem in &arr.elems {
                         if let syn::Expr::Lit(syn::ExprLit {
                             lit: syn::Lit::Str(s),
@@ -1121,10 +1141,22 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                         }
                     }
                 }
-                Ok(())
-            });
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("role") => {
+                // M7 — `role = MyRole` overrides `type Role`.
+                let val = &nv.value;
+                out.role_ty = quote! { #val };
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("default_role") => {
+                let val = &nv.value;
+                out.default_role = quote! { #val };
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("space_role_map") => {
+                let val = &nv.value;
+                out.space_role_map = quote! { #val };
+            }
+            _ => {}
         }
-        _ => {}
     }
     out
 }

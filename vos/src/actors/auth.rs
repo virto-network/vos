@@ -180,6 +180,15 @@ pub enum Caller {
     /// peer). Default policy: read handlers may accept; mutating
     /// handlers reject.
     Unauthenticated,
+    /// Host-initiated call from within the daemon process — not
+    /// routed through any transport. The `vosx space up`
+    /// bootstrap (which grants the operator their initial admin
+    /// role *before* any libp2p connection exists), internal
+    /// host probes, and other embedder-controlled entry points
+    /// land here. Treated as trusted by `has_role` since it
+    /// originates inside the daemon's process boundary; external
+    /// peers can't synthesise this variant.
+    System,
     /// libp2p peer, identity verified by noise at connect time.
     /// The carried bytes are the peer's multihash encoding (the
     /// stable wire form of a libp2p PeerId) — opaque to actor
@@ -206,14 +215,24 @@ impl Caller {
         !matches!(self, Self::Unauthenticated)
     }
 
+    /// True iff the caller is trusted by virtue of originating
+    /// inside the daemon process — [`Self::System`] (host-
+    /// initiated) or [`Self::Actor`] (intra-system invoke).
+    /// `Context::has_role` short-circuits these variants to
+    /// `true` so they can call admin-gated handlers without an
+    /// explicit grant.
+    pub const fn is_trusted(&self) -> bool {
+        matches!(self, Self::System | Self::Actor(_))
+    }
+
     /// Bytes the registry's grant table keys on. `None` for
-    /// callers that don't have a binding (Unauthenticated, or
-    /// intra-system Actor calls — those are policy-checked by
-    /// kind, not by lookup).
+    /// callers that don't have a binding (Unauthenticated /
+    /// System / intra-system Actor calls — those are
+    /// policy-checked by kind, not by lookup).
     pub fn grant_key(&self) -> Option<&[u8]> {
         match self {
             Self::Peer(bytes) => Some(bytes.as_slice()),
-            Self::Unauthenticated | Self::Actor(_) => None,
+            Self::Unauthenticated | Self::System | Self::Actor(_) => None,
         }
     }
 }
@@ -394,8 +413,22 @@ mod tests {
     #[test]
     fn caller_is_authenticated() {
         assert!(!Caller::Unauthenticated.is_authenticated());
+        assert!(Caller::System.is_authenticated());
         assert!(Caller::Peer(alloc::vec![1, 2, 3]).is_authenticated());
         assert!(Caller::Actor(crate::actors::context::ServiceId(42)).is_authenticated());
+    }
+
+    #[test]
+    fn caller_is_trusted() {
+        // Trust shortcut: anything originating inside the
+        // daemon process (System, Actor) bypasses role checks.
+        // External-identity variants (Unauthenticated, Peer)
+        // must NOT bypass — they have to go through the
+        // registry's grant lookup.
+        assert!(!Caller::Unauthenticated.is_trusted());
+        assert!(!Caller::Peer(alloc::vec![1]).is_trusted());
+        assert!(Caller::System.is_trusted());
+        assert!(Caller::Actor(crate::actors::context::ServiceId(0)).is_trusted());
     }
 
     #[test]
@@ -442,6 +475,7 @@ mod tests {
         // not by per-caller grants — `grant_key` must return
         // None for both so a lookup is structurally impossible.
         assert_eq!(Caller::Unauthenticated.grant_key(), None);
+        assert_eq!(Caller::System.grant_key(), None);
         assert_eq!(
             Caller::Actor(crate::actors::context::ServiceId(7)).grant_key(),
             None

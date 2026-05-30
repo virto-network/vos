@@ -207,6 +207,53 @@ pub const AUTH_ROLE_READONLY: u8 = 1;
 pub const AUTH_ROLE_DEVELOPER: u8 = 2;
 pub const AUTH_ROLE_ADMIN: u8 = 3;
 
+/// The space-registry actor's own role hierarchy. Discriminants
+/// match the AUTH_ROLE_* constants above so a space-level grant
+/// (stored as a SpaceRole byte) can be reinterpreted in this
+/// enum's vocabulary via [`SPACE_ROLE_MAP`](SpaceRegistry::SPACE_ROLE_MAP).
+///
+/// Each #[msg(role = SpaceRegistryRole::Admin)] handler runs the
+/// M6 macro-emitted check against the caller's effective role
+/// before the handler body executes; the M5 host dispatch
+/// populates the caller's bytes from `peer_role` and
+/// `actor_role`.
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum SpaceRegistryRole {
+    None = 0,
+    Reader = 1,
+    Developer = 2,
+    Admin = 3,
+}
+
+impl vos::RoleByte for SpaceRegistryRole {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::None),
+            1 => Some(Self::Reader),
+            2 => Some(Self::Developer),
+            3 => Some(Self::Admin),
+            _ => None,
+        }
+    }
+    fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Per-PeerId auth grant. `peer_id` is the libp2p PeerId in
 /// multihash bytes (same encoding as `MemberRow.key` when
 /// `kind = Node`); `role` is one of the `AUTH_ROLE_*`
@@ -261,7 +308,34 @@ pub const STATUS_FORBIDDEN: u8 = 7;
 
 use vos::prelude::*;
 
-#[actor]
+/// Per-actor SpaceRole map (M7) — declared as a `pub const` so
+/// it survives the `#[actor(space_role_map = ...)]` expansion.
+/// Maps the four space-level tiers onto this registry's local
+/// roles:
+///
+///   space Admin     → registry Admin     (full control)
+///   space Developer → registry Developer (reserved — no
+///                                         handlers gate on
+///                                         Developer today, but
+///                                         the tier is wired so
+///                                         M8/M9 operators can
+///                                         delegate via local
+///                                         grants)
+///   space Member    → registry Reader    (read-only handlers)
+///   space Guest     → None               (deny mutations)
+pub const SPACE_REGISTRY_SPACE_ROLE_MAP: vos::SpaceRoleMap<SpaceRegistryRole> =
+    vos::SpaceRoleMap {
+        admin: Some(SpaceRegistryRole::Admin),
+        developer: Some(SpaceRegistryRole::Developer),
+        member: Some(SpaceRegistryRole::Reader),
+        guest: None,
+    };
+
+#[actor(
+    role = SpaceRegistryRole,
+    default_role = SpaceRegistryRole::Reader,
+    space_role_map = SPACE_REGISTRY_SPACE_ROLE_MAP
+)]
 pub struct SpaceRegistry {
     /// Sorted by `(name, version)` for fast lookup.
     programs: Vec<ProgramRow>,
@@ -325,7 +399,7 @@ impl SpaceRegistry {
     /// `(name, version)` already exists, returns
     /// `STATUS_TAG_CONFLICT` unless the existing hash matches
     /// (idempotent re-publish).
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn publish(&mut self, name: String, version: String, hash: Vec<u8>) -> u8 {
         let Some(hash) = bytes_to_32(&hash) else {
             return STATUS_BAD_HASH;
@@ -358,7 +432,7 @@ impl SpaceRegistry {
 
     /// Remove a program from the catalog. Errors with
     /// `STATUS_IN_USE` if any agent still references the version.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn unpublish(&mut self, name: String, version: String) -> u8 {
         let mut idx = 0usize;
         while idx < self.programs.len() {
@@ -409,7 +483,7 @@ impl SpaceRegistry {
     /// existing `ProgramRow` — schema can be registered before
     /// the program is published if the orchestrator prefers
     /// that order.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>) -> u8 {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return STATUS_BAD_HASH;
@@ -500,7 +574,7 @@ impl SpaceRegistry {
     /// zero-method surface — and lets a re-deploy genuinely roll
     /// back a previously-published surface rather than leaving
     /// behind a stale row.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn register_extension_meta(&mut self, instance_name: String, blob: Vec<u8>) -> u8 {
         let mut idx = 0usize;
         while idx < self.extension_metas.len() {
@@ -531,7 +605,7 @@ impl SpaceRegistry {
     /// Init args are NOT stored here — they're applied host-side
     /// when the agent is spawned and recorded in the registry's
     /// DAG node for this `install` call.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn install(
         &mut self,
         instance_name: String,
@@ -594,7 +668,7 @@ impl SpaceRegistry {
 
     /// Tombstone an agent. Local data on each replica moves to
     /// trash on the host side; the registry just removes the row.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn uninstall(&mut self, instance_name: String) -> u8 {
         let mut idx = 0usize;
         while idx < self.agents.len() {
@@ -610,7 +684,7 @@ impl SpaceRegistry {
     /// Repoint an agent at a different program version. State
     /// is preserved (same `replication_id`, same redb); replicas
     /// restart their agent thread on the next sync.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn upgrade(
         &mut self,
         instance_name: String,
@@ -711,7 +785,7 @@ impl SpaceRegistry {
     /// Add a Node member. Idempotent in `prefix` — re-adding
     /// updates `peer_id` and `role`. `role` is
     /// `NODE_ROLE_VOTER` or `NODE_ROLE_OBSERVER`.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8) -> u8 {
         let prefix = prefix as u16;
         let mut idx = 0usize;
@@ -745,7 +819,7 @@ impl SpaceRegistry {
         STATUS_OK
     }
 
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn remove_node(&mut self, prefix: u32) -> u8 {
         let prefix = prefix as u16;
         let mut idx = 0usize;
@@ -765,7 +839,7 @@ impl SpaceRegistry {
     /// when an identity-authored message arrives at an agent.
     /// `proof_kind` is `PROOF_KIND_MERKLE_INCLUSION` (v1) or
     /// `PROOF_KIND_ZK` (future).
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn add_identity(
         &mut self,
         public_key: Vec<u8>,
@@ -801,7 +875,7 @@ impl SpaceRegistry {
         STATUS_OK
     }
 
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn remove_identity(&mut self, public_key: Vec<u8>) -> u8 {
         let mut idx = 0usize;
         while idx < self.members.len() {
@@ -826,7 +900,7 @@ impl SpaceRegistry {
     /// same role is a no-op; changing the role updates in place.
     /// `peer_id` is libp2p multihash bytes (same encoding as
     /// `add_node`'s `peer_id` arg).
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8) -> u8 {
         if peer_id.is_empty() {
             return STATUS_BAD_HASH;
@@ -849,7 +923,7 @@ impl SpaceRegistry {
 
     /// Remove the grant for `peer_id`. Returns
     /// `STATUS_NOT_FOUND` if the peer wasn't granted.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn revoke_role(&mut self, peer_id: Vec<u8>) -> u8 {
         match self
             .auth_grants
@@ -896,7 +970,7 @@ impl SpaceRegistry {
     /// Idempotent — re-granting the same role is a no-op;
     /// changing the role updates in place. `role` is interpreted
     /// in the target actor's `Role` enum (not `SpaceRole`).
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn grant_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String, role: u8) -> u8 {
         if peer_id.is_empty() || agent_name.is_empty() {
             return STATUS_BAD_HASH;
@@ -926,7 +1000,7 @@ impl SpaceRegistry {
     /// Remove the actor-local grant for `(peer_id, agent_name)`.
     /// `STATUS_NOT_FOUND` if no such row exists. Does not affect
     /// the space-level grant in `auth_grants`.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn revoke_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String) -> u8 {
         match self
             .actor_acls
@@ -975,7 +1049,7 @@ impl SpaceRegistry {
     /// Returns the hash so callers can chain to `publish`
     /// without a separate `BlobHash::of` step on the actor side.
     /// Idempotent: re-uploading identical bytes is a no-op.
-    #[msg]
+    #[msg(role = SpaceRegistryRole::Admin)]
     async fn upload_blob(&mut self, bytes: Vec<u8>) -> Vec<u8> {
         let hash: [u8; 32] = vos::crypto::blake2b_hash(&[], &[&bytes]);
         let pos = match self.blobs.binary_search_by(|b| b.hash.cmp(&hash)) {

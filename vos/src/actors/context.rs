@@ -161,11 +161,14 @@ impl<A: Actor> Context<A> {
     }
 
     /// True iff the caller's effective role satisfies `required`
-    /// — i.e. `>=` in the actor's role hierarchy. `Caller::Actor`
-    /// intra-system calls return `true` regardless (see
-    /// [`Self::caller_role`] for the trust-model rationale).
+    /// — i.e. `>=` in the actor's role hierarchy.
+    /// [`Caller::is_trusted`] callers ([`Caller::System`] +
+    /// [`Caller::Actor`]) return `true` regardless: they
+    /// originate inside the daemon process, past the network
+    /// trust boundary. See [`Self::caller_role`] for the
+    /// rationale.
     pub fn has_role(&self, required: A::Role) -> bool {
-        if matches!(self.caller, Caller::Actor(_)) {
+        if self.caller.is_trusted() {
             return true;
         }
         self.caller_role().is_some_and(|r| r >= required)
@@ -950,6 +953,19 @@ mod tests {
         // intra-actor compositions don't accidentally lock
         // themselves out.
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Actor(ServiceId(99)), None, None);
+        assert!(ctx.has_role(FixtureRole::Maintainer));
+        assert!(ctx.ensure_role(FixtureRole::Maintainer).is_ok());
+    }
+
+    #[test]
+    fn system_caller_bypasses_role_checks() {
+        // Trust-model invariant: host-initiated calls
+        // (`Caller::System`) originate inside the daemon
+        // process — past the network trust boundary.
+        // `vosx space up` uses this to grant the operator
+        // their initial admin role *before* any peer exists,
+        // and tests use it as the embedder-side entry point.
+        let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::System, None, None);
         assert!(ctx.has_role(FixtureRole::Maintainer));
         assert!(ctx.ensure_role(FixtureRole::Maintainer).is_ok());
     }

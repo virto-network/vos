@@ -297,6 +297,24 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
 
 // ── Message dispatch ──────────────────────────────────────────────
 
+/// Wire-marker the host prepends to dispatch messages so the
+/// PVM agent can populate `Context::caller` + the role bytes
+/// before each handler runs. Layout:
+///
+///   raw[0] = TAG_CALLER_PREFIX (0xFE)
+///   raw[1] = trust_flag (0 = external, 1 = trusted-bypass)
+///   raw[2] = has_space_role (0 / 1)
+///   raw[3] = space_role byte (only meaningful if has_space_role)
+///   raw[4] = has_actor_local_role (0 / 1)
+///   raw[5] = actor_local_role byte
+///   raw[6..] = the original message (TAG_DYNAMIC / typed bytes)
+///
+/// Hosts that don't know about this prefix (and the legacy
+/// dispatch path that doesn't need role info) send `raw` without
+/// the header — `dispatch_one` then leaves Context::caller at
+/// its previous value.
+pub const TAG_CALLER_PREFIX: u8 = 0xFE;
+
 /// Dispatch a single message to the actor.
 ///
 /// Decodes raw bytes to `A::Message` and calls `actor.dispatch()` once.
@@ -306,6 +324,39 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
 /// `yield_now` / `sleep` commit, not an in-flight query.
 #[cfg(feature = "pvm")]
 pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -> DispatchResult {
+    // Reset the per-invocation forbidden flag so a prior refused
+    // call doesn't poison this dispatch. Context lives across
+    // invocations on the warm-restart path.
+    ctx.__reset_forbidden();
+
+    // Strip the M7 caller-info prefix if present. The host
+    // packs the caller's role bytes here so the macro-emitted
+    // role check can run without an extra hostcall.
+    let raw = if raw.len() >= 6 && raw[0] == TAG_CALLER_PREFIX {
+        use super::auth::Caller;
+        let trust_flag = raw[1];
+        let has_space = raw[2] != 0;
+        let space_byte = raw[3];
+        let has_actor_local = raw[4] != 0;
+        let actor_local_byte = raw[5];
+        ctx.set_caller(if trust_flag == 1 {
+            Caller::System
+        } else {
+            Caller::Unauthenticated
+        });
+        ctx.set_caller_roles(
+            if has_space { Some(space_byte) } else { None },
+            if has_actor_local {
+                Some(actor_local_byte)
+            } else {
+                None
+            },
+        );
+        &raw[6..]
+    } else {
+        raw
+    };
+
     // Decode message: if first byte is TAG_DYNAMIC, decode as dynamic Msg → FromDynamic;
     // otherwise decode as typed A::Message directly.
     let msg = if !raw.is_empty() && raw[0] == TAG_DYNAMIC {

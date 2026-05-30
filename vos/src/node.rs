@@ -514,9 +514,13 @@ impl InvokeHandle {
         let tx = tx?;
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(InvokeRequest {
-            // Host-side API entry: the caller is the embedder
-            // (vosx, a test harness) — no transport identity.
-            caller: crate::actors::Caller::Unauthenticated,
+            // Host-side API entry: the embedder calling into the
+            // daemon from inside the process. `Caller::System`
+            // bypasses role checks via the trust shortcut so
+            // host-side bootstrap (admin grant before any peer
+            // is enrolled) and test harness calls don't hit the
+            // M6 macro-emitted gate.
+            caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
             msg,
@@ -640,9 +644,10 @@ impl NodeService {
         if tx
             .send(InvokeRequest {
                 // Internal host probe of a registry read handler
-                // — no real caller. Registry reads accept
-                // Unauthenticated.
-                caller: crate::actors::Caller::Unauthenticated,
+                // — `Caller::System` lets the probe bypass any
+                // future role-gated read handlers without
+                // requiring an actor-level deny exception.
+                caller: crate::actors::Caller::System,
                 space_role: None,
                 actor_local_role: None,
                 msg: payload,
@@ -700,31 +705,14 @@ impl crate::network::NetworkService for NodeService {
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
 
-        // Sprint 2 auth gate: when the target is the registry
-        // (well-known ServiceId 0) and the inner Msg names a
-        // gated handler, consult auth_grants for the caller. The
-        // gate runs BEFORE forwarding so a refused call never
-        // reaches the actor (and never lands in the DAG).
-        if to_unscoped == crate::abi::service::ServiceId::REGISTRY.local_id() as u32
-            && let Some(handler) = peek_dynamic_msg_name(&msg)
-            && handler_requires_admin(&handler)
-        {
-            let caller_role = self.lookup_caller_role(caller_peer_id.as_ref());
-            if caller_role < AUTH_ROLE_ADMIN {
-                let peer_label = caller_peer_id
-                    .as_ref()
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "<local>".into());
-                warn!(
-                    handler = %handler,
-                    peer = %peer_label,
-                    granted_role = caller_role,
-                    "auth: refusing privileged registry handler — \
-                     caller lacks admin grant",
-                );
-                return forbidden_envelope();
-            }
-        }
+        // M7 — Sprint-2's dispatch-layer auth gate retires here.
+        // The actor's own macro-emitted #[msg(role = X)] check
+        // runs at the dispatch boundary inside the agent and
+        // surfaces STATUS_FORBIDDEN through the wire envelope
+        // (see vos/src/actors/lifecycle.rs::exit_status + the
+        // runtime's last_status plumbing). The host stays
+        // generic: it ferries the caller bytes; the actor
+        // decides.
 
         let tx = self.invoke_routes.lock().ok().and_then(|m| {
             m.get(&to).cloned().or_else(|| {
@@ -790,15 +778,35 @@ impl crate::network::NetworkService for NodeService {
         // here. A future protocol bump can carry the envelope so
         // remote yielded children become drivable cross-node.
         //
+        // M7 — STATUS_FORBIDDEN envelopes are preserved verbatim
+        // so the client-side `is_forbidden_envelope` peek
+        // surfaces ClientError::Forbidden ("permission denied").
+        // Without this passthrough, the unwrap collapses the
+        // refusal to an empty reply that vosx mis-decodes as
+        // Value::Unit.
+        //
         // Timeout budget mirrors the libp2p request_response side
         // (5 min) so slow handlers like the dev extension's
         // `compile` (cargo + rustc) don't get cut off here while
         // the wire layer is still patient.
-        reply_rx
-            .recv_timeout(Duration::from_secs(300))
-            .ok()
-            .and_then(|env| unwrap_invoke_envelope(&env))
-            .unwrap_or_default()
+        match reply_rx.recv_timeout(Duration::from_secs(300)).ok() {
+            Some(env) => {
+                if env.first().copied() == Some(crate::actors::run::STATUS_FORBIDDEN) {
+                    let peer_label = caller_peer_id
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "<local>".into());
+                    warn!(
+                        target = to,
+                        peer = %peer_label,
+                        "auth: actor refused call — caller lacks the required role",
+                    );
+                    return forbidden_envelope();
+                }
+                unwrap_invoke_envelope(&env).unwrap_or_default()
+            }
+            None => Vec::new(),
+        }
     }
 
     #[cfg(feature = "storage")]
@@ -838,7 +846,13 @@ fn replay_dag_into_runtime(
     for (i, log) in logs.into_iter().enumerate() {
         let msg = log.msg.clone();
         runtime.begin_replay(log);
-        runtime.send_to(svc_id, msg);
+        // M7 — recorded effects were authorised by *some* caller
+        // at record time. For replay determinism, wrap with the
+        // trusted-System prefix so the M6 role check passes the
+        // same way it did originally. If/when we record the
+        // original caller's role bytes in the log, we can replay
+        // with that exact identity instead.
+        runtime.send_to(svc_id, encode_replay_payload(&msg));
         runtime.run_blocking();
         // External transfers emitted during replay had their
         // original effects at record time; we don't re-issue them.
@@ -1693,10 +1707,14 @@ impl VosNode {
         if let Some(tx) = local_tx {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
-                // Host-side `VosNode::invoke` entry point — no
-                // transport identity. Tests + the bootstrap
-                // admin-grant path reach the actor through here.
-                caller: crate::actors::Caller::Unauthenticated,
+                // Host-side `VosNode::invoke` entry point.
+                // `Caller::System` is the right variant for
+                // embedder-originated calls (test harnesses, the
+                // `vosx space up` bootstrap admin grant, etc.).
+                // External peers can't synthesise this variant
+                // — libp2p inbounds always arrive as
+                // `Caller::Peer` via `dispatch_invoke`.
+                caller: crate::actors::Caller::System,
                 space_role: None,
                 actor_local_role: None,
                 msg,
@@ -2300,7 +2318,12 @@ fn handle_invoke_request(
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
-    runtime.send_to(svc_id, req.msg);
+    // M7 — wrap the dispatch payload with a caller-info header
+    // so the PVM agent can populate Context::caller / role
+    // bytes before running the M6 macro-emitted role check.
+    // Format: see lifecycle::TAG_CALLER_PREFIX.
+    let payload = encode_caller_prefix(&req);
+    runtime.send_to(svc_id, payload);
     runtime.run_blocking();
 
     // Route any external transfers the dispatch produced.
@@ -2384,54 +2407,13 @@ fn handle_invoke_request(
     Ok(())
 }
 
-/// Encode the invoke wire envelope `[status][state_len:u32 LE][state][reply]`
-/// — the same format `runtime::handle_invoke` writes for a same-runtime
-/// Sprint 2 auth roles, kept in sync with
-/// `space_registry::AUTH_ROLE_*` so the host's dispatch-layer
-/// gate doesn't need a cross-crate dep on the actor.
+/// Wire-byte for "no grant exists" in the registry's
+/// `peer_role` / `actor_role` probe replies. Mirrors
+/// `space_registry::AUTH_ROLE_NONE`; kept here so the host
+/// doesn't need a cross-crate dep on the actor just to read a
+/// single byte.
 #[cfg(feature = "network")]
 pub(crate) const AUTH_ROLE_NONE: u8 = 0;
-#[cfg(feature = "network")]
-pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
-
-/// Set of registry handlers gated behind `AUTH_ROLE_ADMIN`.
-/// Mutating handlers go through here; read-only handlers
-/// (`programs`, `agents`, `members`, `auth_grants`, `peer_role`,
-/// `meta_for_instance`, …) stay open so a peer can introspect
-/// what's there before requesting enrollment.
-#[cfg(feature = "network")]
-pub(crate) fn handler_requires_admin(handler: &str) -> bool {
-    matches!(
-        handler,
-        "publish"
-            | "install"
-            | "upgrade"
-            | "uninstall"
-            | "add_node"
-            | "remove_node"
-            | "add_identity"
-            | "remove_identity"
-            | "grant_role"
-            | "revoke_role"
-            | "register_meta"
-            | "register_extension_meta"
-            | "upload_blob"
-    )
-}
-
-/// Peek the handler name out of an invoke payload without
-/// fully running it. Used by the auth gate to classify the
-/// call before forwarding. Returns `None` for payloads that
-/// don't carry a dynamic msg tag — the gate falls through to
-/// allow, since typed-dispatch payloads don't reach the
-/// publish/install handlers we care about anyway.
-#[cfg(feature = "network")]
-fn peek_dynamic_msg_name(payload: &[u8]) -> Option<String> {
-    use crate::value::TAG_DYNAMIC;
-    let body = payload.strip_prefix(&[TAG_DYNAMIC])?;
-    let msg = <crate::value::Msg as crate::actors::codec::Decode>::try_decode(body)?;
-    Some(msg.name)
-}
 
 /// Build a failure envelope the libp2p layer relays back to
 /// the caller when the dispatch-layer auth gate refuses a call.
@@ -2440,13 +2422,68 @@ fn peek_dynamic_msg_name(payload: &[u8]) -> Option<String> {
 /// vosx surfaces "permission denied" rather than colliding with
 /// a generic actor panic.
 ///
+/// Retained post-M7 as a host-side fallback (e.g. for a future
+/// quota / rate-limit gate); the actor-level role check now
+/// produces STATUS_FORBIDDEN through the agent's own dispatch.
+///
 /// Shape: exactly 5 bytes — `[STATUS_FORBIDDEN, 0, 0, 0, 0]`
 /// (status + zero-length state). Both the length and the leading
 /// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
+#[allow(dead_code)] // Retained as host-side fallback; see doc comment above.
 fn forbidden_envelope() -> Vec<u8> {
     use crate::actors::run::STATUS_FORBIDDEN;
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
+}
+
+/// Replay-side wrapper for already-logged messages. Always
+/// emits a trusted-System prefix so the M6 macro-emitted role
+/// check passes during replay — original authorisation is
+/// implicit in the fact the log was committed.
+fn encode_replay_payload(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + msg.len());
+    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    out.push(1); // trust_flag = System
+    out.push(0); // has_space_role
+    out.push(0); // space byte (unused)
+    out.push(0); // has_actor_local_role
+    out.push(0); // actor_local byte (unused)
+    out.extend_from_slice(msg);
+    out
+}
+
+/// Wrap the request's message bytes with the M7 caller-info
+/// header so the PVM agent can populate `Context::caller` and
+/// the role bytes before the M6 macro-emitted role check runs.
+///
+/// Layout (6 bytes header + original message):
+///
+///   [0] TAG_CALLER_PREFIX (0xFE)
+///   [1] trust_flag: 1 iff caller is System/Actor (intra-process)
+///   [2] has_space_role: 0 / 1
+///   [3] space_role byte
+///   [4] has_actor_local_role: 0 / 1
+///   [5] actor_local_role byte
+///   [6..] original message bytes
+fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
+    let trust_flag: u8 = if req.caller.is_trusted() { 1 } else { 0 };
+    let (has_space, space_byte) = match req.space_role {
+        Some(b) => (1u8, b),
+        None => (0u8, 0u8),
+    };
+    let (has_actor_local, actor_local_byte) = match req.actor_local_role {
+        Some(b) => (1u8, b),
+        None => (0u8, 0u8),
+    };
+    let mut out = Vec::with_capacity(6 + req.msg.len());
+    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    out.push(trust_flag);
+    out.push(has_space);
+    out.push(space_byte);
+    out.push(has_actor_local);
+    out.push(actor_local_byte);
+    out.extend_from_slice(&req.msg);
+    out
 }
 
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
