@@ -585,14 +585,6 @@ impl NodeService {
         let Some(peer_id) = caller_peer_id else {
             return AUTH_ROLE_NONE;
         };
-        let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
-        let tx = match self.invoke_routes.lock() {
-            Ok(m) => m.get(&registry_id).cloned(),
-            Err(_) => return AUTH_ROLE_NONE,
-        };
-        let Some(tx) = tx else {
-            return AUTH_ROLE_NONE;
-        };
         // Build a `peer_role` Msg with the caller's PeerId bytes.
         use crate::actors::codec::Encode;
         use crate::value::{Msg, TAG_DYNAMIC};
@@ -600,13 +592,56 @@ impl NodeService {
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&msg.encode());
+        self.probe_registry_for_u8(payload)
+            .unwrap_or(AUTH_ROLE_NONE)
+    }
 
+    /// M5 — actor-local role probe. Sibling of
+    /// [`Self::lookup_caller_role`] for the actor-local override
+    /// table. Looks up the byte the registry's `actor_role`
+    /// handler returns; `AUTH_ROLE_NONE` for "no row" so the
+    /// caller can map back to `Option::None` cleanly.
+    ///
+    /// `agent_name` is the *target* actor's instance name —
+    /// `"space-registry"` for the well-known registry target,
+    /// the manifest-installed name for others. For v1, only the
+    /// registry target gets this probe; non-registry targets
+    /// require a service-id → name reverse lookup that a later
+    /// commit will add.
+    fn lookup_caller_actor_role(
+        &self,
+        caller_peer_id: Option<&libp2p::PeerId>,
+        agent_name: &str,
+    ) -> u8 {
+        let Some(peer_id) = caller_peer_id else {
+            return AUTH_ROLE_NONE;
+        };
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
+        let msg = Msg::new("actor_role")
+            .with("peer_id", peer_id.to_bytes())
+            .with("agent_name", agent_name);
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        self.probe_registry_for_u8(payload)
+            .unwrap_or(AUTH_ROLE_NONE)
+    }
+
+    /// Shared probe helper for both auth lookups — sends an
+    /// already-encoded dynamic Msg to the registry, decodes the
+    /// reply as a single `u8`. Returns `None` if the registry is
+    /// unreachable (gate fires before registry boots), the reply
+    /// times out, or the reply payload doesn't decode.
+    fn probe_registry_for_u8(&self, payload: Vec<u8>) -> Option<u8> {
+        let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
+        let tx = self.invoke_routes.lock().ok()?.get(&registry_id).cloned()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         if tx
             .send(InvokeRequest {
-                // Internal host probe of `registry::peer_role` —
-                // no real caller. The registry's read handlers
-                // accept Unauthenticated.
+                // Internal host probe of a registry read handler
+                // — no real caller. Registry reads accept
+                // Unauthenticated.
                 caller: crate::actors::Caller::Unauthenticated,
                 space_role: None,
                 actor_local_role: None,
@@ -616,20 +651,11 @@ impl NodeService {
             })
             .is_err()
         {
-            return AUTH_ROLE_NONE;
+            return None;
         }
-        let envelope = match reply_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(b) => b,
-            Err(_) => return AUTH_ROLE_NONE,
-        };
-        let Some(reply_bytes) = unwrap_invoke_envelope(&envelope) else {
-            return AUTH_ROLE_NONE;
-        };
-        // `peer_role` returns a `u8`. The actor framework wraps it
-        // via `Value::U8(...)` or `Value::Bytes(rkyv-encoded u8)`
-        // depending on emit shape; both decode to the same byte
-        // via the value->u8 conversion path.
-        decode_u8_reply(&reply_bytes).unwrap_or(AUTH_ROLE_NONE)
+        let envelope = reply_rx.recv_timeout(Duration::from_secs(5)).ok()?;
+        let reply_bytes = unwrap_invoke_envelope(&envelope)?;
+        decode_u8_reply(&reply_bytes)
     }
 }
 
@@ -721,15 +747,36 @@ impl crate::network::NetworkService for NodeService {
             Some(p) => crate::actors::Caller::Peer(p.to_bytes()),
             None => crate::actors::Caller::Unauthenticated,
         };
+        // M5 — populate the role bytes for Peer callers so the
+        // actor's M6 macro-emitted check has the inputs it needs.
+        // Space-level grant always probed; actor-local grant
+        // probed for the registry target (the only target with a
+        // host-known agent name in v1; other targets stay None
+        // until the service-id → name reverse lookup lands).
+        let (space_role, actor_local_role) = match &caller {
+            crate::actors::Caller::Peer(_) => {
+                let space = self.lookup_caller_role(caller_peer_id.as_ref());
+                let actor_local =
+                    if to_unscoped == crate::abi::service::ServiceId::REGISTRY.local_id() as u32 {
+                        self.lookup_caller_actor_role(caller_peer_id.as_ref(), "space-registry")
+                    } else {
+                        AUTH_ROLE_NONE
+                    };
+                (
+                    (space != AUTH_ROLE_NONE).then_some(space),
+                    (actor_local != AUTH_ROLE_NONE).then_some(actor_local),
+                )
+            }
+            // Unauthenticated has no grant lookups; intra-system
+            // Actor callers bypass via the Context::has_role
+            // short-circuit.
+            _ => (None, None),
+        };
         if tx
             .send(InvokeRequest {
                 caller,
-                // Role bytes are populated in M5 via the
-                // dispatch-time registry probe (lookup_caller_role
-                // for the space tier; lookup_caller_actor_role for
-                // the actor-local override).
-                space_role: None,
-                actor_local_role: None,
+                space_role,
+                actor_local_role,
                 msg,
                 reply_tx,
                 chain,
