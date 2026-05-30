@@ -1,6 +1,6 @@
 //! Authorization primitives shared by host, registry, and actors.
 //!
-//! Three types form the foundation of per-actor ACLs:
+//! Five types form the foundation of per-agent ACLs:
 //!
 //! - [`SpaceRole`] — the coarse, space-wide role tier (Admin /
 //!   Developer / Member / Guest). One enum the whole space agrees
@@ -13,6 +13,13 @@
 //!   actor's own [`Role`](crate::Actor::Role). Declared once on the
 //!   [`Actor`] trait as a `const`, giving each actor a stable,
 //!   verifiably-static "what does space-Admin mean here?" answer.
+//! - [`RoleByte`] — trait the actor's own `Role` enum implements
+//!   so the host can plumb opaque role bytes through dispatch.
+//!   Auto-derived by the `#[actor]` macro.
+//! - [`NoRoles`] / [`NO_ROLES_MAP`] / [`Forbidden`] — sentinels:
+//!   the zero-roles type for actors that opted out of RBAC, the
+//!   trivially-permissive map paired with it, and the error
+//!   marker for the `ensure_role` family of checks.
 //!
 //! Role discriminants are bytes. Each actor's [`Role`] enum is
 //! independent — the wire / storage carries the byte; the actor
@@ -211,6 +218,75 @@ impl Caller {
     }
 }
 
+/// Convert an actor's [`Role`](crate::Actor::Role) variant to / from
+/// the raw byte the registry's grant table stores. The host plumbs
+/// role bytes through the dispatch path without understanding what
+/// they mean; the actor's own `Role` enum interprets them via this
+/// trait.
+///
+/// Manually implementing the trait is straightforward — the
+/// `#[actor]` macro emits one automatically for the user's
+/// `Role` enum (M6).
+pub trait RoleByte: Sized + Copy {
+    /// Decode the byte form. Returns `None` on an unrecognised byte
+    /// — the caller treats that as "no effective role" rather than
+    /// panicking on a forward-incompatible discriminant.
+    fn from_byte(b: u8) -> Option<Self>;
+    /// Encode to byte form for storage / wire.
+    fn as_byte(self) -> u8;
+}
+
+/// Sentinel role enum for actors that don't yet declare a real
+/// `Role`. Acts as a single-variant Top — `NoRoles::Any` satisfies
+/// every check. The `#[actor]` macro emits this as the default
+/// `type Role` so existing actors keep compiling without source
+/// edits when the trait is extended in M1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum NoRoles {
+    /// The sole variant. `Any` is named to signal that any check
+    /// against this role is trivially satisfied — the actor opted
+    /// out of role-based access control.
+    Any = 0,
+}
+
+impl RoleByte for NoRoles {
+    fn from_byte(b: u8) -> Option<Self> {
+        if b == 0 { Some(Self::Any) } else { None }
+    }
+    fn as_byte(self) -> u8 {
+        0
+    }
+}
+
+/// The standard [`SpaceRoleMap`] for actors that use [`NoRoles`] —
+/// every space-level tier maps to `Any`, so `SPACE_ROLE_MAP.lookup`
+/// always succeeds and `allows` returns `true` for every input. The
+/// `#[actor]` macro emits this as the default `const SPACE_ROLE_MAP`.
+pub const NO_ROLES_MAP: SpaceRoleMap<NoRoles> = SpaceRoleMap {
+    admin: Some(NoRoles::Any),
+    developer: Some(NoRoles::Any),
+    member: Some(NoRoles::Any),
+    guest: Some(NoRoles::Any),
+};
+
+/// Marker returned by [`Context::ensure_role`](crate::Context) when
+/// the caller's effective role is insufficient. Authors who want
+/// `?`-propagation in their handlers `impl From<Forbidden> for
+/// MyError`. The macro-emitted check at the dispatch boundary
+/// halts the actor directly with `STATUS_FORBIDDEN` and never
+/// surfaces `Forbidden` to the handler body, so the `From` impl is
+/// only needed for *manual* `ensure_role` calls inside handlers
+/// that want fine-grained policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forbidden;
+
+impl core::fmt::Display for Forbidden {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("permission denied: caller lacks the required role")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +396,42 @@ mod tests {
         assert!(!Caller::Unauthenticated.is_authenticated());
         assert!(Caller::Peer(alloc::vec![1, 2, 3]).is_authenticated());
         assert!(Caller::Actor(crate::actors::context::ServiceId(42)).is_authenticated());
+    }
+
+    #[test]
+    fn no_roles_byte_roundtrip() {
+        assert_eq!(NoRoles::from_byte(0), Some(NoRoles::Any));
+        assert_eq!(NoRoles::from_byte(1), None);
+        assert_eq!(NoRoles::Any.as_byte(), 0);
+    }
+
+    #[test]
+    fn no_roles_map_admits_every_tier() {
+        // Sentinel map used by actors that opted out of RBAC:
+        // every space tier resolves to `Any`, and `allows` is
+        // trivially `true` for any required role. Confirms
+        // existing actors don't accidentally deny calls after
+        // the trait extension lands.
+        for sr in [
+            SpaceRole::Guest,
+            SpaceRole::Member,
+            SpaceRole::Developer,
+            SpaceRole::Admin,
+        ] {
+            assert_eq!(NO_ROLES_MAP.lookup(sr), Some(NoRoles::Any));
+            assert!(NO_ROLES_MAP.allows(sr, NoRoles::Any));
+        }
+    }
+
+    #[test]
+    fn forbidden_displays_user_facing_text() {
+        // Display text is what bubbles up through anyhow chains
+        // and into vosx stderr. Lock the wording.
+        let s = alloc::format!("{}", Forbidden);
+        assert!(
+            s.contains("permission denied"),
+            "Forbidden display must contain 'permission denied'; got: {s}",
+        );
     }
 
     #[test]

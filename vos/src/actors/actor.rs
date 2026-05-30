@@ -50,6 +50,34 @@ pub trait Actor: Sized + Encode + Decode {
     /// The message enum dispatched to this actor.
     type Message: Decode + super::value::FromDynamic;
 
+    /// The actor's own role hierarchy — the domain-specific tiers
+    /// `#[msg(role = X)]` references and `ctx.ensure_role` checks
+    /// against. Auto-derived to [`NoRoles`](super::auth::NoRoles)
+    /// by the `#[actor]` macro for actors that opted out of RBAC;
+    /// override by declaring your own enum with `#[derive(...)]`
+    /// (or, in M6+, `#[actor(role = MyRole)]`).
+    ///
+    /// The bounds are minimal: `Copy + Ord` for the `>=` comparison
+    /// inside `ensure_role`, plus `RoleByte` so the host can plumb
+    /// the discriminant through dispatch as an opaque byte.
+    type Role: Copy + Ord + super::auth::RoleByte;
+
+    /// The role applied when no grant resolves — neither an
+    /// actor-local grant for this caller nor a space-level role
+    /// mapped via [`SPACE_ROLE_MAP`](Self::SPACE_ROLE_MAP). For
+    /// most actors this is the lowest tier (deny-by-default for
+    /// gated handlers). [`NoRoles::Any`](super::auth::NoRoles::Any)
+    /// for the sentinel case.
+    const DEFAULT_ROLE: Self::Role;
+
+    /// Mapping from the space-wide
+    /// [`SpaceRole`](super::auth::SpaceRole) hierarchy onto this
+    /// actor's own [`Role`](Self::Role). Looked up by the
+    /// dispatch-time role check when no actor-local grant exists
+    /// for the caller. Authors declare this as a const struct
+    /// literal — see [`SpaceRoleMap`](super::auth::SpaceRoleMap).
+    const SPACE_ROLE_MAP: super::auth::SpaceRoleMap<Self::Role>;
+
     /// Extension kind discriminant — `0 = Actor` (request-driven,
     /// the default) or `1 = Service` (long-running). Overridden by
     /// `#[actor(kind = "service")]`. Mirrors

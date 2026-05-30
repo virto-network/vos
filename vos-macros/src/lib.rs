@@ -145,6 +145,16 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             type Error = #error_ty;
             type Message = #msg_enum;
 
+            // Per-agent ACL framework (M1) — sentinel defaults so
+            // actors that haven't declared their own `Role` enum
+            // keep compiling. `NoRoles::Any` admits every check;
+            // override the three items together when the actor
+            // opts into RBAC. M6 will plumb `#[actor(role = X)]`
+            // through here.
+            type Role = vos::NoRoles;
+            const DEFAULT_ROLE: vos::NoRoles = vos::NoRoles::Any;
+            const SPACE_ROLE_MAP: vos::SpaceRoleMap<vos::NoRoles> = vos::NO_ROLES_MAP;
+
             // Phase 2 — extension kind discriminant; defaulted on the
             // trait, overridden here from `#[actor(kind = "...")]`.
             const KIND_BYTE: u8 = #kind_byte;
