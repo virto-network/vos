@@ -311,6 +311,16 @@ impl ExtensionConfig {
 /// chain doubles as a depth counter — capped at
 /// [`MAX_CROSS_AGENT_DEPTH`] hops.
 struct InvokeRequest {
+    /// Who's calling — host-side identity as seen by the dispatch
+    /// gate. `Caller::Peer` for libp2p inbound (multihash bytes of
+    /// the noise-verified PeerId); `Caller::Actor` for intra-system
+    /// invokes (the calling actor's ServiceId); `Caller::Unauthenticated`
+    /// for host-initiated calls and future HTTP gateway routes.
+    ///
+    /// M2 lands the field + the 6 construction sites; M3 plumbs it
+    /// into `Context<A>` so handlers can call `ctx.caller()`.
+    #[allow(dead_code)] // Consumer wired in M3 — same shape as `chain` above.
+    caller: crate::actors::Caller,
     msg: Vec<u8>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -493,6 +503,9 @@ impl InvokeHandle {
         let tx = tx?;
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(InvokeRequest {
+            // Host-side API entry: the caller is the embedder
+            // (vosx, a test harness) — no transport identity.
+            caller: crate::actors::Caller::Unauthenticated,
             msg,
             reply_tx,
             chain: Vec::new(),
@@ -578,6 +591,10 @@ impl NodeService {
         let (reply_tx, reply_rx) = mpsc::channel();
         if tx
             .send(InvokeRequest {
+                // Internal host probe of `registry::peer_role` —
+                // no real caller. The registry's read handlers
+                // accept Unauthenticated.
+                caller: crate::actors::Caller::Unauthenticated,
                 msg: payload,
                 reply_tx,
                 chain: vec![],
@@ -681,8 +698,17 @@ impl crate::network::NetworkService for NodeService {
             return Vec::new();
         };
         let (reply_tx, reply_rx) = mpsc::channel();
+        // libp2p noise verified the PeerId at connect time; the
+        // multihash bytes are what the registry's grant table
+        // keys on. `None` (in-process libp2p frame with no peer)
+        // collapses to Unauthenticated.
+        let caller = match caller_peer_id.as_ref() {
+            Some(p) => crate::actors::Caller::Peer(p.to_bytes()),
+            None => crate::actors::Caller::Unauthenticated,
+        };
         if tx
             .send(InvokeRequest {
+                caller,
                 msg,
                 reply_tx,
                 chain,
@@ -1599,6 +1625,10 @@ impl VosNode {
         if let Some(tx) = local_tx {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
+                // Host-side `VosNode::invoke` entry point — no
+                // transport identity. Tests + the bootstrap
+                // admin-grant path reach the actor through here.
+                caller: crate::actors::Caller::Unauthenticated,
                 msg,
                 reply_tx,
                 chain: Vec::new(),
@@ -1802,6 +1832,12 @@ fn agent_thread(
         if let Some(tx) = local_tx {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
+                // Intra-system call from this agent. `id` is the
+                // calling agent's ServiceId — perfect for the
+                // `Caller::Actor` variant. Past-the-libp2p-gate
+                // calls bypass role checks by virtue of being
+                // inside the trust boundary.
+                caller: crate::actors::Caller::Actor(id),
                 msg: msg.to_vec(),
                 reply_tx,
                 chain: chain_snapshot,
@@ -2817,6 +2853,10 @@ fn run_service_extension(
                 .and_then(|m| m.get(&target).cloned())?;
             let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
             tx.send(InvokeRequest {
+                // Intra-system call from this extension. `me` is
+                // its ServiceId — `Caller::Actor` mirrors the
+                // agent-thread path above.
+                caller: crate::actors::Caller::Actor(ServiceId(me)),
                 msg: payload.to_vec(),
                 reply_tx,
                 chain: vec![me],

@@ -1,4 +1,5 @@
 use super::Actor;
+use super::auth::Caller;
 use alloc::vec::Vec;
 
 /// Execution context passed to message handlers.
@@ -14,6 +15,13 @@ use alloc::vec::Vec;
 pub struct Context<A: Actor> {
     id: ServiceId,
     stop_requested: bool,
+
+    /// Identity of whoever invoked the handler currently running.
+    /// `Unauthenticated` by default until the per-invoke plumbing
+    /// (M3) overwrites it from the [`InvokeRequest`]. M2 ships the
+    /// shape; M3 wires the propagation so `ctx.caller()` returns
+    /// the real caller end-to-end.
+    caller: Caller,
 
     // Effect queues (flushed in accumulate)
     pending_tells: Vec<PendingTell>,
@@ -50,6 +58,7 @@ impl<A: Actor> Context<A> {
         Self {
             id,
             stop_requested: false,
+            caller: Caller::Unauthenticated,
             pending_tells: Vec::new(),
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
@@ -66,6 +75,28 @@ impl<A: Actor> Context<A> {
     /// Get this actor's service ID.
     pub fn id(&self) -> ServiceId {
         self.id
+    }
+
+    /// Who invoked the currently-running handler. The host writes
+    /// this from the [`InvokeRequest`] before each dispatch; PVM
+    /// guests receive it via a hostcall (wired in M3).
+    ///
+    /// Variants:
+    /// - [`Caller::Unauthenticated`]: no credentials presented
+    ///   (HTTP gateway public routes; host-initiated calls).
+    /// - [`Caller::Peer`]: a libp2p peer, noise-verified.
+    /// - [`Caller::Actor`]: an intra-system invoke from another
+    ///   actor on the same node.
+    pub fn caller(&self) -> &Caller {
+        &self.caller
+    }
+
+    /// Overwrite the caller for the next handler dispatch. Called
+    /// by the host dispatch layer (and the macro-emitted glue) so
+    /// each invocation sees the right caller — Context outlives
+    /// individual invocations, so this is a per-call slot.
+    pub fn set_caller(&mut self, caller: Caller) {
+        self.caller = caller;
     }
 
     // --- Storage ---
@@ -551,5 +582,78 @@ impl<'ctx, A: Actor> core::future::IntoFuture for FetchBuilder<'ctx, A> {
                 crate::effects::FetchResponse::host_error("malformed host response")
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actors::auth::{NO_ROLES_MAP, NoRoles};
+
+    // Minimal fixture Actor — just enough to satisfy the trait
+    // bounds for Context<A> construction. Roles default to
+    // NoRoles via the M1 sentinels.
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct TestActor;
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct TestMsg;
+
+    impl crate::actors::value::FromDynamic for TestMsg {
+        fn from_dynamic(_d: &crate::actors::value::Msg) -> Option<Self> {
+            None
+        }
+    }
+
+    impl Actor for TestActor {
+        type Error = ();
+        type Message = TestMsg;
+        type Role = NoRoles;
+        const DEFAULT_ROLE: NoRoles = NoRoles::Any;
+        const SPACE_ROLE_MAP: crate::actors::auth::SpaceRoleMap<NoRoles> = NO_ROLES_MAP;
+
+        fn create() -> Self {
+            TestActor
+        }
+
+        fn dispatch(
+            &mut self,
+            _msg: TestMsg,
+            _ctx: &mut Context<Self>,
+        ) -> crate::actors::run::RunResult<bool> {
+            crate::actors::run::RunResult::Complete(true)
+        }
+    }
+
+    #[test]
+    fn context_new_defaults_caller_to_unauthenticated() {
+        // Fresh Context starts with no caller — the host writes
+        // the real one via `set_caller` before each dispatch.
+        // Defaulting to Unauthenticated (rather than panicking on
+        // missing caller) keeps construction sites that don't yet
+        // populate the slot safe.
+        let ctx: Context<TestActor> = Context::new(ServiceId(7));
+        assert_eq!(ctx.caller(), &Caller::Unauthenticated);
+    }
+
+    #[test]
+    fn context_set_caller_round_trips_every_variant() {
+        // The setter is the single host-side hook; every variant
+        // must round-trip exactly. If set_caller silently
+        // normalised any variant, role checks would break in
+        // surprising ways downstream.
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+
+        ctx.set_caller(Caller::Unauthenticated);
+        assert_eq!(ctx.caller(), &Caller::Unauthenticated);
+
+        ctx.set_caller(Caller::Peer(alloc::vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(
+            ctx.caller(),
+            &Caller::Peer(alloc::vec![0xde, 0xad, 0xbe, 0xef])
+        );
+
+        ctx.set_caller(Caller::Actor(ServiceId(42)));
+        assert_eq!(ctx.caller(), &Caller::Actor(ServiceId(42)));
     }
 }
