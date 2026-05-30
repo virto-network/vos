@@ -124,65 +124,124 @@ Either back it up or re-run `space new` to rebootstrap.
 
 ## Identity, members, and auth
 
-Sprint 2 added a dispatch-layer auth gate on registry-mutating
-handlers (`publish`, `install`, `grant_role`, etc.). The flow:
+Per-agent ACLs (M0-M10, 2026-05-30) put role checks at the
+*actor* layer instead of the host. Each actor declares its
+own role hierarchy via `type Role` + `const SPACE_ROLE_MAP`;
+the macro emits a check at the dispatch boundary that runs
+before the handler body. Refusals surface as
+`STATUS_FORBIDDEN` on the wire and "permission denied" at the
+vosx surface.
 
-1. The operator has a persistent libp2p PeerId
-   (`vosx whoami`).
-2. The space's registry has an `auth_grants` table keyed by
-   PeerId, with role bits `none | read | developer | admin`.
-3. Every libp2p-arriving call to the registry is checked: if
-   the handler is on the admin-only list and the caller's
-   role < admin, the call is refused.
-4. `space new` auto-enrols the creator as admin on first boot
-   via the `admin_bootstrap.txt` mechanism.
+There are two scopes:
+
+- **Space-level**: a coarse role (`guest | member | developer
+  | admin`) that applies across every actor in the space via
+  the actor's `SPACE_ROLE_MAP`. The common case.
+- **Actor-local**: a per-`(peer, agent)` override stored in
+  the registry's `actor_acls` table. Useful for "Bob is a
+  regular Member but I need him to maintain dev-project."
+
+The flow:
+
+1. The operator has a persistent libp2p PeerId (`vosx whoami`).
+2. `space new` auto-enrols the creator as space-level Admin on
+   first boot via the `admin_bootstrap.txt` mechanism.
+3. Every libp2p-arriving call carries the caller's PeerId
+   bytes. The host probes the registry for both grants and
+   passes them through to the actor.
+4. The actor's macro-emitted check picks the higher-precedence
+   grant (actor-local first, then space-level via the actor's
+   map) and refuses if the result is below the handler's
+   declared `#[msg(role = X)]` threshold.
 
 ### Inspect the current grants
 
 ```sh
-vosx space role demo list
+vosx space role demo list                   # space-level
+vosx space role demo list --in dev-project  # actor-local for dev-project
 ```
 
 ### Add an admin
 
 ```sh
-# Get their PeerId
 TEAMMATE_PEER="12D3KooW..."
 
 vosx space role demo grant "${TEAMMATE_PEER}" admin
 ```
 
 Each new admin can then `space role grant <other> <role>`
-recursively. Role hierarchy: admin > developer > read > none.
-Sprint 2 enforces the admin gate only; developer/read remain
-informational for now.
+recursively. Space-level role hierarchy:
+`admin > developer > member > guest`.
+
+### Add an actor-local override
+
+When a peer needs elevated access in just one actor:
+
+```sh
+# Grant raw role byte 2 on dev-project — discriminant of the
+# dev-project actor's Role enum (Maintainer = 2 in its source).
+vosx space role demo grant "${TEAMMATE_PEER}" 2 --in dev-project
+```
+
+Actor-local roles are bytes the CLI doesn't try to name — look
+up the discriminant in the target actor's `Role` enum. The
+override takes precedence over the space-level grant for that
+actor only; all other actors still see the space-level role.
 
 ### Revoke a grant
 
 ```sh
-vosx space role demo revoke "${TEAMMATE_PEER}"
+vosx space role demo revoke "${TEAMMATE_PEER}"                  # space-level
+vosx space role demo revoke "${TEAMMATE_PEER}" --in dev-project # actor-local only
 ```
+
+The actor-local revoke leaves the space-level grant intact.
 
 ### Anyone vs nobody
 
-A peer with no grant defaults to `AUTH_ROLE_NONE`. They can:
+A peer with no grant defaults to `guest`. They can:
 
 - Read public handlers (`programs`, `agents`, `members`,
   `auth_grants`, `peer_role`, `meta_for_instance`).
-- Run `vosx whoami`, `vosx space role demo list`.
+- Run `vosx whoami`, `vosx space role <space> list`.
 
 They cannot:
 
 - Publish programs, install agents, change membership, grant
-  roles, upload blobs.
+  roles, upload blobs — any handler annotated
+  `#[msg(role = ...)]` in its actor.
 
-If a non-admin tries a gated operation the daemon refuses
-with a generic call failure and a `tracing::warn!` in the
-daemon log:
+If a non-admin tries a gated operation the daemon emits:
 
 ```
-WARN vos::node: auth: refusing privileged registry handler — caller lacks admin grant handler=publish peer=12D3KooW... granted_role=0
+WARN vos::node: auth: actor refused call — caller lacks the required role target=<svc_id> peer=12D3KooW...
 ```
+
+and the vosx client prints:
+
+```
+error: registry.grant_role(): permission denied: caller lacks the required role
+```
+
+### HTTP gateway and anonymous traffic
+
+The http-gateway extension proxies external HTTP requests into
+the daemon. By default the gateway's outbound calls are tagged
+as intra-system trusted — a security gap if it ever routes
+admin handlers. Opt the gateway into anonymous mode in the
+manifest so its requests are rejected by role-gated handlers:
+
+```toml
+[[ext]]
+name = "http-gateway"
+path = "extensions/http-gateway.so"
+relay_unauthenticated = true
+```
+
+Every call originating from the gateway then carries
+`Caller::Unauthenticated`. The actor's role check refuses
+anonymous traffic on mutations; read-only handlers stay
+open.
 
 ## Capability policy
 
