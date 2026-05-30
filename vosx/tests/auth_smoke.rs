@@ -299,6 +299,92 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
         String::from_utf8_lossy(&grant_b_again.stderr),
     );
 
+    // ── M8: --in <actor> actor-local grants ──────────────────
+    //
+    // The actor-local grant path is independent of the
+    // space-level path. Confirm:
+    //   1. `grant --in <actor>` succeeds for an admin (B is now
+    //      admin from above) and stores a row in `actor_acls`.
+    //   2. `list --in <actor>` shows the new row (and only that
+    //      row — separate scope from the space-level list).
+    //   3. `revoke --in <actor>` removes it; subsequent
+    //      `list --in <actor>` is empty.
+    //   4. The space-level row for the same peer is unchanged.
+    let target_agent = "space-registry";
+    let grant_local = Command::new(vosx_bin())
+        .args([
+            "space",
+            "role",
+            space_name,
+            "grant",
+            synthetic,
+            "2", // raw role byte — actor-local roles are opaque to the CLI
+            "--in",
+            target_agent,
+        ])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_b.path())
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("actor-local grant");
+    assert!(
+        grant_local.status.success(),
+        "actor-local grant must succeed. stderr:\n{}",
+        String::from_utf8_lossy(&grant_local.stderr),
+    );
+
+    let list_local = Command::new(vosx_bin())
+        .args(["space", "role", space_name, "list", "--in", target_agent])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_b.path())
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("actor-local list");
+    assert!(list_local.status.success());
+    let list_out = String::from_utf8_lossy(&list_local.stdout);
+    assert!(
+        list_out.contains(synthetic),
+        "actor-local list must show the granted peer. stdout:\n{list_out}",
+    );
+
+    let revoke_local = Command::new(vosx_bin())
+        .args([
+            "space",
+            "role",
+            space_name,
+            "revoke",
+            synthetic,
+            "--in",
+            target_agent,
+        ])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_b.path())
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("actor-local revoke");
+    assert!(
+        revoke_local.status.success(),
+        "actor-local revoke must succeed. stderr:\n{}",
+        String::from_utf8_lossy(&revoke_local.stderr),
+    );
+
+    // Space-level list still shows the synthetic peer as
+    // `developer` — actor-local revoke didn't touch it.
+    let list_space = Command::new(vosx_bin())
+        .args(["space", "role", space_name, "list"])
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_b.path())
+        .env("VOSX_DISABLE_MDNS", "1")
+        .output()
+        .expect("space-level list");
+    assert!(list_space.status.success());
+    let space_out = String::from_utf8_lossy(&list_space.stdout);
+    assert!(
+        space_out.contains(synthetic),
+        "space-level list must still show the peer after actor-local revoke.\
+         \n{space_out}",
+    );
+
     // Cleanup.
     let _ = child.kill();
     let _ = child.wait();

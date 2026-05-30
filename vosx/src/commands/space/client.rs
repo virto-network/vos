@@ -443,4 +443,32 @@ impl DaemonClient {
         vos::block_on(self.registry().auth_grants(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.auth_grants(): {e}"))
     }
+
+    // ── M4/M8 actor-local grants ────────────────────────────────
+
+    pub fn grant_actor_role(
+        &self,
+        peer_id: Vec<u8>,
+        agent_name: String,
+        role: u8,
+    ) -> anyhow::Result<u8> {
+        vos::block_on(
+            self.registry()
+                .grant_actor_role(&mut &self.node, peer_id, agent_name, role),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
+    }
+
+    pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u8> {
+        vos::block_on(
+            self.registry()
+                .revoke_actor_role(&mut &self.node, peer_id, agent_name),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
+    }
+
+    pub fn actor_acls(&self) -> anyhow::Result<Vec<space_registry::ActorAclRow>> {
+        vos::block_on(self.registry().actor_acls(&mut &self.node))
+            .map_err(|e| anyhow::anyhow!("registry.actor_acls(): {e}"))
+    }
 }
