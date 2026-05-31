@@ -3035,6 +3035,73 @@ fn extension_thread(
 
 // ── Service-mode extension runner (Phase 3) ──────────────────────────
 
+/// Caller context an extension relays on an outbound call: the
+/// identity that invoked the extension's handler plus its space-wide
+/// role byte. Propagated so the extension acts as a transparent
+/// relay — the downstream actor sees who really called, not the
+/// extension's own id.
+///
+/// `actor_local_role` is intentionally dropped: the incoming byte was
+/// computed for the *extension* as target and is meaningless for a
+/// downstream actor; v1 doesn't re-look-up per-target actor-local
+/// grants on the extension path — the same limitation the libp2p
+/// dispatch path has (it only probes actor-local for the registry).
+#[derive(Clone, Debug)]
+struct PropagatedCaller {
+    caller: crate::actors::Caller,
+    space_role: Option<u8>,
+}
+
+thread_local! {
+    /// The caller of the invoke the service-mode dispatch sidecar is
+    /// *currently* handling on this thread. The sidecar stamps it
+    /// before handing the payload to the extension (which calls back
+    /// synchronously on the same thread via `ctx.ask_raw` →
+    /// `invoke_fn`) and clears it after. `invoke_fn` reads its own
+    /// thread's slot: `Some` for sidecar-driven relays, `None` for
+    /// calls originating on the extension's `run()` thread (HTTP
+    /// serving, ping loops) — those have no external caller and relay
+    /// as `Unauthenticated`. Keyed implicitly by thread, so the
+    /// sidecar and `run()` threads never clobber each other's caller.
+    ///
+    /// Limitation: a handler that hands its `ask_raw` off to a
+    /// *different* thread (its own tokio pool) won't carry the slot —
+    /// `invoke_fn` there reads `None` and relays as `Unauthenticated`.
+    /// That is fail-*safe* (deny), never fail-open. Today's
+    /// sidecar-dispatched handlers (dev `compile`/`publish`) call
+    /// `ask_raw` synchronously on the sidecar thread, so the slot is
+    /// always present where it matters.
+    static RELAY_CALLER: core::cell::RefCell<Option<PropagatedCaller>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// RAII guard: stamp the current relay caller for the duration of a
+/// service-mode dispatch, clearing it on drop. Drop runs even if the
+/// dispatched handler panics (the sidecar wraps dispatch in
+/// `catch_unwind`, which absorbs the panic before this guard's scope
+/// ends), so a refused/exploding call never leaves a stale caller to
+/// poison the next dispatch on this thread.
+struct RelayCallerGuard;
+
+impl RelayCallerGuard {
+    fn stamp(pc: PropagatedCaller) -> Self {
+        RELAY_CALLER.with(|c| *c.borrow_mut() = Some(pc));
+        RelayCallerGuard
+    }
+}
+
+impl Drop for RelayCallerGuard {
+    fn drop(&mut self) {
+        RELAY_CALLER.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Read this thread's current relay caller, if a service-mode
+/// dispatch is in flight on it.
+fn current_relay_caller() -> Option<PropagatedCaller> {
+    RELAY_CALLER.with(|c| c.borrow().clone())
+}
+
 /// Drive a service-mode extension: build a HostCtx, hand it to the
 /// extension's `vos_extension_run` entry, block until it returns.
 ///
@@ -3082,14 +3149,24 @@ fn run_service_extension(
                 .ok()
                 .and_then(|m| m.get(&target).cloned())?;
             let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
-            let caller = if relay_unauthenticated {
-                crate::actors::Caller::Unauthenticated
+            // M2 — transparent relay: forward the caller of the
+            // invoke this extension is currently handling, instead of
+            // the extension's own `Caller::Actor(me)` (which would
+            // bypass every downstream role check — the C2 bug). A
+            // relay-mode extension (or one with no in-flight caller on
+            // this thread) forwards `Unauthenticated`. The cap
+            // intersection that bounds this is layered on in M3.
+            let (caller, space_role) = if relay_unauthenticated {
+                (crate::actors::Caller::Unauthenticated, None)
             } else {
-                crate::actors::Caller::Actor(ServiceId(me))
+                match current_relay_caller() {
+                    Some(pc) => (pc.caller, pc.space_role),
+                    None => (crate::actors::Caller::Unauthenticated, None),
+                }
             };
             tx.send(InvokeRequest {
                 caller,
-                space_role: None,
+                space_role,
                 actor_local_role: None,
                 msg: payload.to_vec(),
                 reply_tx,
@@ -3329,12 +3406,23 @@ fn run_service_invoke_sidecar(
         }
         match invoke_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(req) => {
+                // M2 — stamp this thread's relay caller so any
+                // synchronous `ctx.ask_raw` the handler makes (on this
+                // same thread, via `invoke_fn`) forwards the real
+                // caller rather than the extension's own id. Cleared
+                // on drop, panic-safe (catch_unwind absorbs panics
+                // before the guard's scope ends).
+                let relay_guard = RelayCallerGuard::stamp(PropagatedCaller {
+                    caller: req.caller.clone(),
+                    space_role: req.space_role,
+                });
                 // SAFETY: the extension's state ptr is alive for
                 // the duration of run_service_extension, which
                 // joins this sidecar before dropping state.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     plugin.dispatch_service_invoke(state.0, &req.msg)
                 }));
+                drop(relay_guard);
                 let envelope = match outcome {
                     Ok((POLL_READY, Some(bytes))) => {
                         encode_invoke_envelope(STATUS_DONE, &[], &bytes)
@@ -3593,6 +3681,37 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn relay_caller_guard_is_thread_scoped_and_clears() {
+        use crate::actors::{Caller, SpaceRole};
+        // No dispatch in flight on this thread → no relay caller.
+        assert!(current_relay_caller().is_none());
+
+        let pc = PropagatedCaller {
+            caller: Caller::Peer(vec![0xaa, 0xbb]),
+            space_role: Some(SpaceRole::Developer.as_u8()),
+        };
+        {
+            let _g = RelayCallerGuard::stamp(pc.clone());
+            // invoke_fn reads the slot on the SAME thread the sidecar
+            // stamped it on — exactly the sidecar → handler →
+            // ask_raw → invoke_fn chain.
+            let seen = current_relay_caller().expect("stamped caller visible same-thread");
+            assert_eq!(seen.caller, pc.caller);
+            assert_eq!(seen.space_role, pc.space_role);
+
+            // A DIFFERENT thread must not see this thread's caller —
+            // the run()/tokio threads stay isolated, so a concurrent
+            // self-originated call relays as None (→ Unauthenticated),
+            // never another caller's identity.
+            let other = std::thread::spawn(current_relay_caller);
+            assert!(other.join().unwrap().is_none());
+        }
+        // Guard dropped → slot cleared; the next dispatch on this
+        // thread can't inherit a stale caller.
+        assert!(current_relay_caller().is_none());
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────
