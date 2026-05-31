@@ -256,6 +256,26 @@ fn register_extension(
         );
     }
 
+    // M4 — operator visibility. The boot log is the authoritative
+    // surface for what an extension may relay: intra_caps are
+    // host-side daemon config (not registry state), so `vosx space
+    // describe` — which renders the registry's `.vos_meta` — can't
+    // show them. Render the *effective* caps (relay mode collapses to
+    // none) and warn loudly on footgun wildcards.
+    let effective_caps: &[vos::IntraCap] = if ext.relay_unauthenticated {
+        &[]
+    } else {
+        &intra_caps
+    };
+    tracing::info!(
+        "extension '{}' intra_caps: {}",
+        ext.name,
+        render_intra_caps(effective_caps),
+    );
+    if let Some(warning) = intra_caps_wildcard_warning(&ext.name, effective_caps) {
+        tracing::warn!("{warning}");
+    }
+
     let cfg = if ext.init.is_empty() {
         ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
     } else {
@@ -304,6 +324,40 @@ fn register_extension(
     drop(plugin);
 
     Ok(())
+}
+
+/// Render an extension's declared intra_caps for the operator-facing
+/// boot log. Empty renders an explicit "(none …)" so the operator
+/// sees the deny-by-default posture rather than silence.
+fn render_intra_caps(caps: &[vos::IntraCap]) -> String {
+    if caps.is_empty() {
+        return "(none — outbound calls relay as Unauthenticated)".to_string();
+    }
+    caps.iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A loud warning when an extension's caps include an any-actor
+/// wildcard — it can then relay to *every* actor, which defeats the
+/// per-extension scoping the cap model exists for. Returns the
+/// warning text (naming the extension), or `None` for named-only caps.
+fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<String> {
+    let full = caps.iter().any(|c| c.is_full_wildcard());
+    let actor_wild = caps.iter().any(|c| c.is_actor_wildcard());
+    if !actor_wild {
+        return None;
+    }
+    let detail = if full {
+        "'*' / '*:*' grants ANY role on ANY actor — the extension becomes a fully-trusted relay"
+    } else {
+        "a '*:<role>' cap grants that role on EVERY actor in the space"
+    };
+    Some(format!(
+        "extension '{name}': intra_caps wildcard is a footgun — {detail}. \
+         Name each target actor explicitly instead.",
+    ))
 }
 
 pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
@@ -826,6 +880,46 @@ mod tests {
         "#;
         let m: Manifest = toml::from_str(s).unwrap();
         assert!(m.extensions[0].intra_caps.is_empty());
+    }
+
+    #[test]
+    fn render_intra_caps_empty_is_explicit() {
+        // Deny-by-default must be visible, not silent.
+        let s = render_intra_caps(&[]);
+        assert!(s.contains("none"), "{s}");
+        assert!(s.contains("Unauthenticated"), "{s}");
+    }
+
+    #[test]
+    fn render_intra_caps_lists_canonical_tokens() {
+        let caps = vec![
+            vos::IntraCap::parse("space-registry:admin").unwrap(),
+            vos::IntraCap::parse("*:guest").unwrap(),
+        ];
+        assert_eq!(render_intra_caps(&caps), "space-registry:admin, *:guest");
+    }
+
+    #[test]
+    fn wildcard_warning_fires_on_actor_wildcards() {
+        // Full wildcard → loud warning naming the extension.
+        let caps = vec![vos::IntraCap::parse("*").unwrap()];
+        let w = intra_caps_wildcard_warning("dev", &caps).expect("full wildcard warns");
+        assert!(w.contains("dev"), "{w}");
+        assert!(w.contains("fully-trusted relay"), "{w}");
+
+        // Actor wildcard with a concrete role → still fires (broad
+        // authority on every actor).
+        let caps = vec![vos::IntraCap::parse("*:developer").unwrap()];
+        let w = intra_caps_wildcard_warning("dev", &caps).expect("actor wildcard warns");
+        assert!(w.contains("EVERY actor"), "{w}");
+    }
+
+    #[test]
+    fn no_wildcard_warning_for_named_caps_or_empty() {
+        let caps = vec![vos::IntraCap::parse("space-registry:admin").unwrap()];
+        assert!(intra_caps_wildcard_warning("dev", &caps).is_none());
+        // Empty = deny-by-default, not a footgun.
+        assert!(intra_caps_wildcard_warning("dev", &[]).is_none());
     }
 
     #[test]

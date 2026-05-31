@@ -445,6 +445,19 @@ impl IntraCap {
     }
 }
 
+impl core::fmt::Display for IntraCap {
+    /// Canonical `"actor:role"` form, with `*` for either wildcard.
+    /// `parse(self.to_string())` round-trips (a bare `"*"` canonicalises
+    /// to `"*:*"`). Used by the operator-facing boot log.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let actor = self.actor_name.as_deref().unwrap_or("*");
+        match self.role {
+            Some(r) => write!(f, "{actor}:{}", r.name()),
+            None => write!(f, "{actor}:*"),
+        }
+    }
+}
+
 /// Resolve the cap ceiling an extension's `intra_caps` grant for a
 /// call to `target_name`. Returns the **highest** ceiling among all
 /// matching caps (caps are grants of authority — their union
@@ -733,6 +746,27 @@ mod tests {
         assert_eq!(cap_for(&caps, Some("anything")), Some(SpaceRole::Member));
         // Unresolved target still matches a `*` actor cap.
         assert_eq!(cap_for(&caps, None), Some(SpaceRole::Member));
+    }
+
+    #[test]
+    fn intra_cap_display_round_trips() {
+        // Canonical form is snapshot-stable (operator boot log) and
+        // re-parses to the same cap. Bare "*" canonicalises to "*:*".
+        let cases = [
+            ("space-registry:admin", "space-registry:admin"),
+            ("space-registry:*", "space-registry:*"),
+            ("*:guest", "*:guest"),
+            ("*", "*:*"),
+            ("*:*", "*:*"),
+            ("Dev-Project:dev", "dev-project:developer"),
+        ];
+        for (input, canonical) in cases {
+            let c = IntraCap::parse(input).unwrap();
+            let rendered = alloc::format!("{c}");
+            assert_eq!(rendered, canonical, "display of {input}");
+            // Round-trip: rendering re-parses to an equal cap.
+            assert_eq!(IntraCap::parse(&rendered).unwrap(), c, "round-trip {input}");
+        }
     }
 
     #[test]
