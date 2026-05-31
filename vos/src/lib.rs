@@ -129,8 +129,9 @@ pub use actors::lifecycle;
 pub use actors::run_refine;
 pub use actors::value;
 pub use actors::{
-    Actor, Ask, Caller, Context, Extension, ExtensionCtx, Forbidden, Message, NO_ROLES_MAP,
-    NoRoles, RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata, run_blocking, try_poll,
+    Actor, Ask, Caller, Context, Extension, ExtensionCtx, Forbidden, IntraCap, IntraCapParseError,
+    Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata,
+    run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{

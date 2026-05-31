@@ -249,7 +249,22 @@ pub struct ExtensionConfig {
     /// default [`Caller::Actor`] intra-system bypass. Default
     /// `false` for traditional extensions that compose with
     /// other actors as trusted in-process peers.
+    ///
+    /// Deprecated synonym for `intra_caps = []`: now that the
+    /// default *denies* (an extension with no declared caps relays
+    /// every outbound call as [`Caller::Unauthenticated`]), this
+    /// flag is redundant. Kept for back-compat with existing
+    /// gateway manifests. When `true`, [`Self::relay_unauthenticated`]
+    /// also clears `intra_caps` so the "relay has no authority"
+    /// guarantee can't be accidentally combined with a declared cap.
     pub relay_unauthenticated: bool,
+    /// Declared intra-system capabilities — the ceiling [`SpaceRole`]
+    /// this extension may relay to each named target actor. Empty
+    /// (the default) means the extension has *no* authority to relay:
+    /// every outbound call arrives [`Caller::Unauthenticated`], so
+    /// role-gated handlers refuse it. See [`IntraCap`] for the
+    /// intersection model and wildcard semantics.
+    pub intra_caps: Vec<crate::actors::IntraCap>,
 }
 
 impl ExtensionConfig {
@@ -261,6 +276,7 @@ impl ExtensionConfig {
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
             relay_unauthenticated: false,
+            intra_caps: Vec::new(),
         }
     }
 
@@ -275,6 +291,7 @@ impl ExtensionConfig {
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
             relay_unauthenticated: false,
+            intra_caps: Vec::new(),
         }
     }
 
@@ -287,6 +304,22 @@ impl ExtensionConfig {
     /// `false` so they retain intra-system trust.
     pub fn relay_unauthenticated(mut self) -> Self {
         self.relay_unauthenticated = true;
+        // Mutually exclusive with declared caps: a relay has no
+        // authority of its own. Clearing here keeps the invariant
+        // even if a manifest sets both shapes.
+        self.intra_caps.clear();
+        self
+    }
+
+    /// Declare the extension's intra-system capabilities — the
+    /// ceiling [`SpaceRole`] it may relay to each named target.
+    /// Ignored (cleared) when [`Self::relay_unauthenticated`] is
+    /// also set, since a relay has no authority. See [`IntraCap`].
+    pub fn with_intra_caps(mut self, caps: Vec<crate::actors::IntraCap>) -> Self {
+        if self.relay_unauthenticated {
+            return self;
+        }
+        self.intra_caps = caps;
         self
     }
 

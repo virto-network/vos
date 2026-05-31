@@ -23,7 +23,10 @@ pub mod run;
 pub mod value;
 
 pub use actor::{Actor, Message};
-pub use auth::{Caller, Forbidden, NO_ROLES_MAP, NoRoles, RoleByte, SpaceRole, SpaceRoleMap};
+pub use auth::{
+    Caller, Forbidden, IntraCap, IntraCapParseError, NO_ROLES_MAP, NoRoles, RoleByte, SpaceRole,
+    SpaceRoleMap, cap_for,
+};
 pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, Extension, ExtensionCtx};

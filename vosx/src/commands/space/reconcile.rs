@@ -89,6 +89,15 @@ pub struct ExtensionDef {
     /// other actors as trusted in-process peers.
     #[serde(default)]
     pub relay_unauthenticated: bool,
+    /// Declared intra-system capabilities — `"actor:role"` strings
+    /// bounding what this extension may relay to other actors. Empty
+    /// (the default) denies all role-gated relays: outbound calls
+    /// reach their target as `Caller::Unauthenticated`. See
+    /// [`vos::IntraCap`] for wildcard semantics. Malformed entries
+    /// fail the boot (parsed eagerly in `register_extension`) rather
+    /// than silently dropping authority bounds.
+    #[serde(default)]
+    pub intra_caps: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -228,6 +237,25 @@ fn register_extension(
         cap_policy.as_str(),
     );
 
+    // Parse declared intra-system caps eagerly: a malformed entry is
+    // a boot failure naming the offending token, not a silent loss of
+    // an authority bound.
+    let mut intra_caps = Vec::with_capacity(ext.intra_caps.len());
+    for tok in &ext.intra_caps {
+        let cap = vos::IntraCap::parse(tok)
+            .map_err(|e| anyhow::anyhow!("extension '{}': {e}", ext.name))?;
+        intra_caps.push(cap);
+    }
+    if ext.relay_unauthenticated && !intra_caps.is_empty() {
+        tracing::warn!(
+            "extension '{}': relay_unauthenticated=true overrides intra_caps \
+             ({} declared) — a relay has no authority of its own, so the caps \
+             are ignored",
+            ext.name,
+            intra_caps.len(),
+        );
+    }
+
     let cfg = if ext.init.is_empty() {
         ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
     } else {
@@ -236,7 +264,7 @@ fn register_extension(
     let cfg = if ext.relay_unauthenticated {
         cfg.relay_unauthenticated()
     } else {
-        cfg
+        cfg.with_intra_caps(intra_caps)
     };
 
     // Install at a *deterministic* ServiceId derived from the
@@ -764,6 +792,55 @@ mod tests {
         assert_eq!(m.agents.len(), 1);
         assert_eq!(m.agents[0].name, "counter");
         assert_eq!(m.agents[0].consistency, "crdt");
+    }
+
+    #[test]
+    fn parses_extension_intra_caps() {
+        let s = r#"
+            [[extension]]
+            name = "dev"
+            path = "libdev_extension.so"
+            intra_caps = ["space-registry:admin", "*:guest"]
+        "#;
+        let m: Manifest = toml::from_str(s).unwrap();
+        assert_eq!(m.extensions.len(), 1);
+        assert_eq!(
+            m.extensions[0].intra_caps,
+            vec!["space-registry:admin".to_string(), "*:guest".to_string()],
+        );
+        // Each token round-trips through the typed parser the
+        // reconciler uses at boot.
+        for tok in &m.extensions[0].intra_caps {
+            vos::IntraCap::parse(tok).expect("declared caps parse");
+        }
+    }
+
+    #[test]
+    fn extension_intra_caps_default_empty() {
+        // An extension with no intra_caps key parses to an empty Vec
+        // (deny-by-default: every relayed call is Unauthenticated).
+        let s = r#"
+            [[extension]]
+            name = "math"
+            path = "libmath.so"
+        "#;
+        let m: Manifest = toml::from_str(s).unwrap();
+        assert!(m.extensions[0].intra_caps.is_empty());
+    }
+
+    #[test]
+    fn malformed_intra_cap_token_is_rejected_by_parser() {
+        // The reconciler parses each token eagerly; a malformed entry
+        // becomes a boot failure rather than a silently-dropped bound.
+        let s = r#"
+            [[extension]]
+            name = "bad"
+            path = "libbad.so"
+            intra_caps = ["space-registry"]
+        "#;
+        let m: Manifest = toml::from_str(s).unwrap();
+        let err = vos::IntraCap::parse(&m.extensions[0].intra_caps[0]).unwrap_err();
+        assert!(err.reason.contains("actor:role"), "{}", err.reason);
     }
 
     #[test]

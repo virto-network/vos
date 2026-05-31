@@ -27,6 +27,7 @@
 //! break on-disk grants) so the host's `lookup_caller_role` can
 //! emit the right byte regardless of the actor.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Space-wide role tier. Stored centrally in the space registry;
@@ -37,7 +38,17 @@ use alloc::vec::Vec;
 /// Discriminants are pinned: changing them invalidates persisted
 /// grants and any in-flight wire payloads.
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
 )]
 #[repr(u8)]
 pub enum SpaceRole {
@@ -306,6 +317,150 @@ impl core::fmt::Display for Forbidden {
     }
 }
 
+/// A single declared *intra-system capability* for a native
+/// extension: the maximum [`SpaceRole`] the extension may relay to
+/// a named target actor when forwarding an outbound call.
+///
+/// Extensions are relays, not principals. Without a declared cap
+/// for a target, an extension's outbound calls reach that target as
+/// [`Caller::Unauthenticated`], so role-gated handlers refuse them.
+/// With a cap, the effective authority of a relayed call is
+/// `min(caller's space role, this ceiling)`: the extension can never
+/// *amplify* the caller, and the caller can never reach actors the
+/// extension didn't declare.
+///
+/// Declared in the space manifest as `"actor:role"` strings:
+///
+/// ```toml
+/// [[extension]]
+/// name = "dev"
+/// intra_caps = ["space-registry:admin"]
+/// ```
+///
+/// Wildcards:
+/// - `"space-registry:*"` — any role on that actor (uncapped).
+/// - `"*:developer"` — developer ceiling on *any* actor.
+/// - `"*"` (or `"*:*"`) — any role on any actor. A footgun: the
+///   extension becomes a fully-trusted relay. Install-time code
+///   emits a loud warning (see [`Self::is_full_wildcard`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntraCap {
+    /// Target actor instance name (lower-cased — agent names are
+    /// case-insensitive), or `None` for the `*` wildcard matching
+    /// every actor.
+    pub actor_name: Option<String>,
+    /// Ceiling role, or `None` for the `*` wildcard meaning "any
+    /// role" (uncapped — equivalent to the maximum tier).
+    pub role: Option<SpaceRole>,
+}
+
+/// Error parsing an [`IntraCap`] from its `"actor:role"` string
+/// form. Carries the offending token so the operator can find it in
+/// the manifest. Surfaced (never silently dropped) at install time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntraCapParseError {
+    /// The raw token that failed to parse.
+    pub token: String,
+    /// Human-readable reason, suitable for an operator-facing error.
+    pub reason: &'static str,
+}
+
+impl core::fmt::Display for IntraCapParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid intra_cap '{}': {}", self.token, self.reason)
+    }
+}
+
+impl IntraCap {
+    /// Parse an `"actor:role"` token. `"*"` alone is shorthand for
+    /// `"*:*"`. Either side may be `"*"`. Actor names are
+    /// case-folded. Errors (visible to the operator, never silent):
+    /// missing colon on a non-`*` token, empty actor/role, or an
+    /// unrecognised role name.
+    pub fn parse(token: &str) -> Result<Self, IntraCapParseError> {
+        let err = |reason| IntraCapParseError {
+            token: token.into(),
+            reason,
+        };
+        let trimmed = token.trim();
+        if trimmed == "*" {
+            return Ok(Self {
+                actor_name: None,
+                role: None,
+            });
+        }
+        let (actor, role) = trimmed
+            .split_once(':')
+            .ok_or_else(|| err("expected 'actor:role' (e.g. \"space-registry:admin\")"))?;
+        let actor = actor.trim();
+        let role = role.trim();
+        if actor.is_empty() {
+            return Err(err("empty actor name"));
+        }
+        if role.is_empty() {
+            return Err(err("empty role"));
+        }
+        let actor_name = if actor == "*" {
+            None
+        } else {
+            Some(actor.to_ascii_lowercase())
+        };
+        let role =
+            if role == "*" {
+                None
+            } else {
+                Some(SpaceRole::parse(role).ok_or_else(|| {
+                    err("unknown role (expected guest|member|developer|admin or *)")
+                })?)
+            };
+        Ok(Self { actor_name, role })
+    }
+
+    /// `true` when this cap's actor side is a `*` wildcard.
+    pub fn is_actor_wildcard(&self) -> bool {
+        self.actor_name.is_none()
+    }
+
+    /// `true` when this is the `*:*` footgun (matches every actor at
+    /// every role) — install-time code warns on these.
+    pub fn is_full_wildcard(&self) -> bool {
+        self.actor_name.is_none() && self.role.is_none()
+    }
+
+    /// The ceiling role this cap grants: the declared role, or
+    /// [`SpaceRole::Admin`] for a `*` (any-role) cap — uncapped is
+    /// equivalent to capping at the maximum tier.
+    fn ceiling(&self) -> SpaceRole {
+        self.role.unwrap_or(SpaceRole::Admin)
+    }
+
+    /// Does this cap match `target_name`? Wildcard-actor caps match
+    /// every target (including unresolved ones, where `target_name`
+    /// is `None`); named caps match only their (case-folded) name.
+    fn matches(&self, target_name: Option<&str>) -> bool {
+        match &self.actor_name {
+            None => true,
+            Some(name) => target_name.is_some_and(|t| t.eq_ignore_ascii_case(name)),
+        }
+    }
+}
+
+/// Resolve the cap ceiling an extension's `intra_caps` grant for a
+/// call to `target_name`. Returns the **highest** ceiling among all
+/// matching caps (caps are grants of authority — their union
+/// applies), or `None` when no cap matches (the relay has no
+/// authority for this target, so its call must arrive
+/// [`Caller::Unauthenticated`]).
+///
+/// `target_name == None` models a target whose instance name the
+/// host couldn't resolve; only `*` (any-actor) caps match it.
+pub fn cap_for(caps: &[IntraCap], target_name: Option<&str>) -> Option<SpaceRole> {
+    caps.iter()
+        .filter(|c| c.matches(target_name))
+        .map(|c| c.ceiling())
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +637,124 @@ mod tests {
         );
         let bytes = alloc::vec![9, 9, 9];
         assert_eq!(Caller::Peer(bytes.clone()).grant_key(), Some(&bytes[..]));
+    }
+
+    // ── IntraCap parsing + lookup ───────────────────────────────
+
+    #[test]
+    fn intra_cap_parse_exact() {
+        let c = IntraCap::parse("space-registry:admin").unwrap();
+        assert_eq!(c.actor_name.as_deref(), Some("space-registry"));
+        assert_eq!(c.role, Some(SpaceRole::Admin));
+        assert!(!c.is_actor_wildcard());
+        assert!(!c.is_full_wildcard());
+
+        // Synonyms + case-folding of the actor name.
+        let c = IntraCap::parse("Dev-Project:dev").unwrap();
+        assert_eq!(c.actor_name.as_deref(), Some("dev-project"));
+        assert_eq!(c.role, Some(SpaceRole::Developer));
+    }
+
+    #[test]
+    fn intra_cap_parse_wildcards() {
+        // Any role on a named actor.
+        let c = IntraCap::parse("space-registry:*").unwrap();
+        assert_eq!(c.actor_name.as_deref(), Some("space-registry"));
+        assert_eq!(c.role, None);
+        assert_eq!(c.ceiling(), SpaceRole::Admin); // any-role == max tier
+
+        // A role on any actor.
+        let c = IntraCap::parse("*:guest").unwrap();
+        assert!(c.is_actor_wildcard());
+        assert_eq!(c.role, Some(SpaceRole::Guest));
+        assert!(!c.is_full_wildcard());
+
+        // Bare `*` and explicit `*:*` are the full-wildcard footgun.
+        for tok in ["*", "*:*"] {
+            let c = IntraCap::parse(tok).unwrap();
+            assert!(c.is_full_wildcard(), "{tok} should be full wildcard");
+            assert!(c.is_actor_wildcard());
+            assert_eq!(c.role, None);
+        }
+    }
+
+    #[test]
+    fn intra_cap_parse_malformed_is_visible_error() {
+        // No colon (and not the bare `*`) — operator typo.
+        let e = IntraCap::parse("space-registry").unwrap_err();
+        assert_eq!(e.token, "space-registry");
+        assert!(e.reason.contains("actor:role"));
+
+        // Empty sides.
+        assert!(IntraCap::parse(":admin").is_err());
+        assert!(IntraCap::parse("space-registry:").is_err());
+
+        // Unknown role name.
+        let e = IntraCap::parse("space-registry:wizard").unwrap_err();
+        assert!(e.reason.contains("unknown role"), "{}", e.reason);
+
+        // Display surfaces the offending token + reason for the operator.
+        let s = alloc::format!("{e}");
+        assert!(s.contains("space-registry:wizard"), "{s}");
+    }
+
+    #[test]
+    fn cap_for_no_match_is_none() {
+        let caps = [IntraCap::parse("space-registry:admin").unwrap()];
+        // Unrelated target, and an unresolved target: neither matches
+        // a name-pinned cap.
+        assert_eq!(cap_for(&caps, Some("dev-project")), None);
+        assert_eq!(cap_for(&caps, None), None);
+        // Empty caps deny everything.
+        assert_eq!(cap_for(&[], Some("space-registry")), None);
+    }
+
+    #[test]
+    fn cap_for_exact_and_case_insensitive() {
+        let caps = [IntraCap::parse("space-registry:developer").unwrap()];
+        assert_eq!(
+            cap_for(&caps, Some("space-registry")),
+            Some(SpaceRole::Developer)
+        );
+        // Target name matching is case-insensitive (mirrors I4).
+        assert_eq!(
+            cap_for(&caps, Some("SPACE-REGISTRY")),
+            Some(SpaceRole::Developer)
+        );
+    }
+
+    #[test]
+    fn cap_for_wildcard_actor_matches_any_including_unresolved() {
+        let caps = [IntraCap::parse("*:member").unwrap()];
+        assert_eq!(
+            cap_for(&caps, Some("space-registry")),
+            Some(SpaceRole::Member)
+        );
+        assert_eq!(cap_for(&caps, Some("anything")), Some(SpaceRole::Member));
+        // Unresolved target still matches a `*` actor cap.
+        assert_eq!(cap_for(&caps, None), Some(SpaceRole::Member));
+    }
+
+    #[test]
+    fn cap_for_takes_max_ceiling_among_matches() {
+        // Caps are grants — their union applies, so the highest
+        // ceiling among matching entries wins.
+        let caps = [
+            IntraCap::parse("space-registry:member").unwrap(),
+            IntraCap::parse("*:developer").unwrap(),
+        ];
+        assert_eq!(
+            cap_for(&caps, Some("space-registry")),
+            Some(SpaceRole::Developer),
+        );
+        // Wildcard-role cap raises the ceiling to the max tier.
+        let caps = [
+            IntraCap::parse("space-registry:member").unwrap(),
+            IntraCap::parse("space-registry:*").unwrap(),
+        ];
+        assert_eq!(
+            cap_for(&caps, Some("space-registry")),
+            Some(SpaceRole::Admin)
+        );
     }
 }
