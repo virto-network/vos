@@ -223,25 +223,66 @@ and the vosx client prints:
 error: registry.grant_role(): permission denied: caller lacks the required role
 ```
 
-### HTTP gateway and anonymous traffic
+### Extension relay caps (`intra_caps`)
 
-The http-gateway extension proxies external HTTP requests into
-the daemon. By default the gateway's outbound calls are tagged
-as intra-system trusted — a security gap if it ever routes
-admin handlers. Opt the gateway into anonymous mode in the
-manifest so its requests are rejected by role-gated handlers:
+Native extensions are **relays, not principals**. When an extension
+makes an outbound call to another actor (e.g. the dev extension
+calling `space-registry.publish`), the daemon forwards the *caller
+that invoked the extension* — not the extension's own identity — and
+bounds it by the extension's declared `intra_caps`. The effective
+authority of a relayed call is:
 
-```toml
-[[ext]]
-name = "http-gateway"
-path = "extensions/http-gateway.so"
-relay_unauthenticated = true
+```
+min(caller's space role, the extension's declared ceiling for the target)
 ```
 
-Every call originating from the gateway then carries
-`Caller::Unauthenticated`. The actor's role check refuses
-anonymous traffic on mutations; read-only handlers stay
-open.
+So an extension can never amplify the caller, and the caller can
+never reach actors the extension didn't declare.
+
+Declare caps in the manifest as `"actor:role"` strings:
+
+```toml
+[[extension]]
+name = "dev"
+path = "/usr/local/lib/vosx/libdev_extension.so"
+# The dev extension's `publish` lands programs in the registry's
+# Admin-gated catalog, so it must relay up to Admin there.
+intra_caps = ["space-registry:admin"]
+```
+
+- **No `intra_caps`** (the default) → every outbound call relays as
+  `Caller::Unauthenticated`, so role-gated handlers refuse it. An
+  extension that only reads ungated handlers needs no caps.
+- **Wildcards**: `"space-registry:*"` (any role on that actor),
+  `"*:developer"` (developer on every actor), `"*"` / `"*:*"` (any
+  role on any actor — a fully-trusted relay). The daemon logs a loud
+  warning at `space up` for any-actor wildcards; prefer naming each
+  target explicitly.
+
+At boot the daemon logs each extension's effective caps, so `vosx
+space up` output is the source of truth for what an extension may
+relay:
+
+```
+INFO vosx: extension 'dev' intra_caps: space-registry:admin
+INFO vosx: extension 'gateway' intra_caps: (none — outbound calls relay as Unauthenticated)
+```
+
+The bound applies regardless of who called the extension: a `member`
+operator who triggers the dev extension's `publish` is still refused
+at the registry, because their `member` role (not the extension's
+trust) is what gets relayed, capped by the declared ceiling.
+
+### HTTP gateway and anonymous traffic
+
+The http-gateway proxies external HTTP into the daemon. Because the
+relay default is now deny (no `intra_caps` → `Caller::Unauthenticated`),
+the gateway is safe out of the box: its outbound calls carry
+`Caller::Unauthenticated`, so role-gated handlers reject anonymous
+HTTP traffic while read-only handlers (`resolve`, `agent_names`,
+`meta_for_instance`) stay open. The legacy `relay_unauthenticated =
+true` flag is now a deprecated synonym for "declare no caps" — keep
+it for back-compat, but it has no effect beyond clearing any caps.
 
 ## Capability policy
 

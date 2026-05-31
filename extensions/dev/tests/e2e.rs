@@ -295,6 +295,11 @@ fn resolve_space_data_dir(config_home: &Path, space_name: &str) -> PathBuf {
 
 fn write_manifest(dir: &Path) -> PathBuf {
     let manifest_path = dir.join("dev-e2e-manifest.toml");
+    // `intra_caps = ["space-registry:admin"]` is required post
+    // caller-propagation: the dev extension's `publish` handler relays
+    // the operator's caller to `space-registry.publish` (Admin-gated).
+    // Without a declared cap the relay arrives Unauthenticated and the
+    // registry refuses it — see dev_publish_admin_succeeds_member_refused.
     let body = format!(
         r#"
 space = "dev-e2e"
@@ -303,6 +308,7 @@ version = "0.1.0"
 [[extension]]
 name = "dev"
 path = "{dev_so}"
+intra_caps = ["space-registry:admin"]
 "#,
         dev_so = dev_extension_so().display(),
     );
@@ -479,6 +485,46 @@ fn run_cli(daemon: &Daemon, args: &[&str], context: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Run a CLI command as a *different* operator identity (its own
+/// XDG_CONFIG_HOME) against the same daemon. Used to prove the dev
+/// extension relays the *real* caller's role rather than its own
+/// intra-system trust. Returns (exit_code, stdout, stderr).
+fn run_cli_capture_as(
+    daemon: &Daemon,
+    config_home: &Path,
+    args: &[&str],
+    context: &str,
+) -> (i32, String, String) {
+    let out = Command::new(vosx_bin())
+        .args(args)
+        .env("XDG_DATA_HOME", daemon.data_home.path())
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("VOSX_INVOKE_TIMEOUT_MS", "180000")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn vosx for {context}: {e}"));
+    let code = out.status.code().unwrap_or(-1);
+    (
+        code,
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Provision a fresh, non-admin operator identity that can still reach
+/// the same daemon: a new config home with the admin's `spaces.toml`
+/// copied in so it resolves the space's endpoint. Its libp2p identity
+/// stays independent (a fresh keypair, no role granted → Guest), which
+/// is exactly the "outsider" shape `auth_smoke` uses.
+fn member_config(daemon: &Daemon) -> TempDir {
+    let cfg = TempDir::new("config-member");
+    let admin_spaces = daemon.config_home.path().join("vosx").join("spaces.toml");
+    let member_vosx = cfg.path().join("vosx");
+    fs::create_dir_all(&member_vosx).expect("create member vosx dir");
+    fs::copy(&admin_spaces, member_vosx.join("spaces.toml")).expect("copy spaces.toml to member");
+    cfg
+}
+
 // ── The test ────────────────────────────────────────────────────────
 
 #[test]
@@ -601,6 +647,100 @@ fn dev_compile_publish_install_invoke() {
     let second_n = extract_u32(second);
     assert_eq!(first_n, 1, "first inc should yield 1");
     assert_eq!(second_n, 2, "second inc should yield 2");
+}
+
+/// Caller-propagation + cap intersection, end-to-end (the C2 fix).
+///
+/// `vosx dev publish` invokes the dev extension's `publish` handler,
+/// which relays the operator's caller to `space-registry.publish`
+/// (Admin-gated). Before the fix the relay carried `Caller::Actor(dev)`
+/// — trusted intra-system — so *any* operator could publish through the
+/// extension. Now:
+///   - a non-admin (Guest) operator's publish is REFUSED at the registry
+///     step (the extension can't amplify the caller past its Guest role),
+///   - the admin operator's publish SUCCEEDS — same daemon, same project,
+///     same build, same `(name, version)`, same command; only the
+///     identity differs.
+///
+/// That contrast is the security property: the refusal is role-driven,
+/// not a setup or transport artifact. (The compile step hits the ungated
+/// dev-project actor, so it's identity-agnostic — only the publish relay
+/// is gated.)
+#[test]
+fn dev_publish_admin_succeeds_member_refused() {
+    ensure_built();
+    let mut daemon = boot_daemon();
+
+    // Admin provisions + compiles a project.
+    run_cli(
+        &daemon,
+        &["dev", "new", "--space", &daemon.space_name, "authproj"],
+        "vosx dev new authproj",
+    );
+    daemon.restart();
+    let client = TestClient::connect(daemon.data_dir());
+    let project_id = client.resolve_instance("authproj");
+    let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
+    commit_source(&client, project_id, &src_hash);
+    drop(client);
+
+    run_cli(
+        &daemon,
+        &["dev", "compile", "--space", &daemon.space_name, "authproj"],
+        "vosx dev compile authproj",
+    );
+
+    // A non-admin operator (fresh identity, no grant → Guest) attempts
+    // the same publish. The dev extension relays the member's Guest
+    // authority — not its own trust — so the Admin-gated registry.publish
+    // refuses it, and the CLI exits non-zero. Nothing is recorded (the
+    // refusal precedes the publishes-branch commit), so the admin's
+    // publish of the same (name, version) below is fresh.
+    let member = member_config(&daemon);
+    let (code, _out, err) = run_cli_capture_as(
+        &daemon,
+        member.path(),
+        &[
+            "dev",
+            "publish",
+            "--space",
+            &daemon.space_name,
+            "authproj",
+            "counter",
+            "0.1.0",
+        ],
+        "member dev publish",
+    );
+    assert_ne!(
+        code, 0,
+        "a non-admin operator's `dev publish` must be refused at the registry relay\nstderr: {err}",
+    );
+    // Pin the failure to the publish step (registry relay refusal), not
+    // an incidental connect/resolve error — otherwise the assertion
+    // above could pass without exercising the security property. The
+    // member reaches the dev extension (resolve + builds-head are
+    // ungated) and only the relayed registry.publish is refused.
+    assert!(
+        err.contains("publish failed"),
+        "member's failure must be the publish-step refusal, not a transport/setup error\nstderr: {err}",
+    );
+
+    // The admin operator (the space creator → Admin) publishes the SAME
+    // build under the SAME (name, version) and SUCCEEDS. Same everything
+    // but the identity → the member's refusal above was role-driven.
+    run_cli(
+        &daemon,
+        &[
+            "dev",
+            "publish",
+            "--space",
+            &daemon.space_name,
+            "authproj",
+            "counter",
+            "0.1.0",
+        ],
+        "admin dev publish",
+    );
 }
 
 fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
