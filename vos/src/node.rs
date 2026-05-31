@@ -801,7 +801,7 @@ impl crate::network::NetworkService for NodeService {
                 let space = self.lookup_caller_role(caller_peer_id.as_ref());
                 let actor_local =
                     if to_unscoped == crate::abi::service::ServiceId::REGISTRY.local_id() as u32 {
-                        self.lookup_caller_actor_role(caller_peer_id.as_ref(), "space-registry")
+                        self.lookup_caller_actor_role(caller_peer_id.as_ref(), REGISTRY_AGENT_NAME)
                     } else {
                         AUTH_ROLE_NONE
                     };
@@ -3102,6 +3102,86 @@ fn current_relay_caller() -> Option<PropagatedCaller> {
     RELAY_CALLER.with(|c| c.borrow().clone())
 }
 
+/// Well-known instance name of the space registry — the one target
+/// whose ServiceId (the fixed [`ServiceId::REGISTRY`]) the host can
+/// map back to a name without a reverse lookup. Other gated actors
+/// would need a service-id → name probe (a documented v1 limitation,
+/// mirroring the libp2p dispatch path's registry-only actor-local
+/// lookup); the registry is the only role-gated actor today.
+const REGISTRY_AGENT_NAME: &str = "space-registry";
+
+/// Map an outbound target id to the agent name the cap table keys on.
+/// v1 resolves only the registry (well-known [`ServiceId::REGISTRY`]);
+/// other targets return `None` and so match only `*` (any-actor)
+/// caps. Sufficient because the registry is the only actor with
+/// role-gated handlers today — ungated targets accept the
+/// `Unauthenticated` relay regardless.
+fn relay_target_name(target: u32) -> Option<&'static str> {
+    if target & 0xFFFF == ServiceId::REGISTRY.local_id() as u32 {
+        Some(REGISTRY_AGENT_NAME)
+    } else {
+        None
+    }
+}
+
+/// Compute the `(caller, space_role byte)` a service-mode extension
+/// relays for an outbound call to `target_name`, applying the
+/// intersection model: the effective authority is
+/// `min(caller's space role, the extension's declared cap ceiling for
+/// the target)`. The extension can never *amplify* the caller, and
+/// the caller can never reach actors the extension didn't declare.
+///
+/// The returned caller is always NON-trusted (Peer or
+/// Unauthenticated) so the downstream actor's role check actually
+/// consults the (capped) `space_role` rather than short-circuiting
+/// through the [`Caller::is_trusted`] bypass.
+///
+/// - No matching cap → `(Unauthenticated, None)`: the extension has
+///   no authority for this target; role-gated handlers refuse.
+/// - `propagated == None` (a `run()`-thread / self-originated call
+///   with no external caller) → `(Unauthenticated, None)`.
+/// - Peer caller → relays the peer's identity + `min(space_role,
+///   ceiling)`.
+/// - System / Actor caller (trusted incoming) → relays anonymously
+///   (`Unauthenticated`) carrying `min(Admin, ceiling)`: trusted
+///   callers have full authority, but the cap still bounds it, and
+///   dropping the trusted variant keeps the cap effective.
+fn resolve_relay_caller(
+    propagated: Option<&PropagatedCaller>,
+    caps: &[crate::actors::IntraCap],
+    target_name: Option<&str>,
+) -> (crate::actors::Caller, Option<u8>) {
+    use crate::actors::{Caller, SpaceRole, cap_for};
+
+    let Some(ceiling) = cap_for(caps, target_name) else {
+        return (Caller::Unauthenticated, None);
+    };
+    let Some(pc) = propagated else {
+        return (Caller::Unauthenticated, None);
+    };
+    // The caller's effective space-wide authority entering the relay.
+    let carried: Option<SpaceRole> = match &pc.caller {
+        Caller::Peer(_) => pc.space_role.and_then(SpaceRole::from_u8),
+        // Trusted incoming (host-initiated or intra-system) carries
+        // full authority — but is still bounded by the cap below.
+        Caller::System | Caller::Actor(_) => Some(SpaceRole::Admin),
+        Caller::Unauthenticated => None,
+    };
+    let Some(carried) = carried else {
+        return (Caller::Unauthenticated, None);
+    };
+    let effective = carried.min(ceiling);
+    // The carrier must be non-trusted so the downstream role check
+    // uses the capped space_role instead of short-circuiting.
+    // Preserve the peer's identity (audit / future per-target
+    // actor-local lookups); relay trusted callers anonymously.
+    let carrier = match &pc.caller {
+        Caller::Peer(bytes) => Caller::Peer(bytes.clone()),
+        _ => Caller::Unauthenticated,
+    };
+    (carrier, Some(effective.as_u8()))
+}
+
 /// Drive a service-mode extension: build a HostCtx, hand it to the
 /// extension's `vos_extension_run` entry, block until it returns.
 ///
@@ -3136,12 +3216,10 @@ fn run_service_extension(
     let invoke_routes_for_ctx = invoke_routes.clone();
     let me = id.0;
     let invoke_shutdown = shutdown.clone();
-    // M9 — relay-mode extensions (HTTP gateway, future REST
-    // adapters) tag outbound calls as Unauthenticated so the
-    // targeted actor's role-gated handlers reject anonymous
-    // external traffic. Default (false) keeps the Actor
-    // intra-system trust for traditional extensions.
-    let relay_unauthenticated = config.relay_unauthenticated;
+    // M3 — the extension's declared intra-system caps. Empty (the
+    // default, and what `relay_unauthenticated` collapses to) means
+    // every outbound call relays as `Caller::Unauthenticated`.
+    let intra_caps = config.intra_caps.clone();
     let invoke_fn: std::sync::Arc<crate::extension::InvokeFn> = std::sync::Arc::new(
         move |target: u32, payload: &[u8], timeout_ms: u64| -> Option<Vec<u8>> {
             let tx = invoke_routes_for_ctx
@@ -3149,21 +3227,18 @@ fn run_service_extension(
                 .ok()
                 .and_then(|m| m.get(&target).cloned())?;
             let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
-            // M2 — transparent relay: forward the caller of the
-            // invoke this extension is currently handling, instead of
-            // the extension's own `Caller::Actor(me)` (which would
-            // bypass every downstream role check — the C2 bug). A
-            // relay-mode extension (or one with no in-flight caller on
-            // this thread) forwards `Unauthenticated`. The cap
-            // intersection that bounds this is layered on in M3.
-            let (caller, space_role) = if relay_unauthenticated {
-                (crate::actors::Caller::Unauthenticated, None)
-            } else {
-                match current_relay_caller() {
-                    Some(pc) => (pc.caller, pc.space_role),
-                    None => (crate::actors::Caller::Unauthenticated, None),
-                }
-            };
+            // M2 + M3 — transparent, *bounded* relay. Forward the
+            // caller of the invoke this extension is currently
+            // handling (not the extension's own id — the C2 bypass),
+            // intersected with the extension's declared cap ceiling
+            // for the target. One path: a relay-mode / no-caps
+            // extension and a run()-thread call both resolve to
+            // `Unauthenticated` here, so role-gated handlers refuse.
+            let (caller, space_role) = resolve_relay_caller(
+                current_relay_caller().as_ref(),
+                &intra_caps,
+                relay_target_name(target),
+            );
             tx.send(InvokeRequest {
                 caller,
                 space_role,
@@ -3712,6 +3787,115 @@ mod tests {
         // Guard dropped → slot cleared; the next dispatch on this
         // thread can't inherit a stale caller.
         assert!(current_relay_caller().is_none());
+    }
+
+    #[test]
+    fn relay_target_name_resolves_only_registry() {
+        assert_eq!(
+            relay_target_name(ServiceId::REGISTRY.0),
+            Some(REGISTRY_AGENT_NAME),
+        );
+        // Registry under a node prefix still resolves (low 16 bits 0).
+        assert_eq!(
+            relay_target_name(ServiceId::new(0xBEEF, 0).0),
+            Some(REGISTRY_AGENT_NAME),
+        );
+        // Any other local id is unresolved → matches only `*` caps.
+        assert_eq!(relay_target_name(ServiceId::new(0, 7).0), None);
+    }
+
+    #[test]
+    fn resolve_relay_caller_intersection_matrix() {
+        use crate::actors::{Caller, IntraCap, SpaceRole};
+
+        let admin_cap = [IntraCap::parse("space-registry:admin").unwrap()];
+        let dev_cap = [IntraCap::parse("space-registry:developer").unwrap()];
+
+        let peer = |b: &[u8]| Caller::Peer(b.to_vec());
+        let pc = |c: Caller, sr: Option<SpaceRole>| PropagatedCaller {
+            caller: c,
+            space_role: sr.map(|r| r.as_u8()),
+        };
+
+        // 1. SECURITY CORE: no cap declared for the target → the relay
+        //    has no authority → Unauthenticated (role-gated handlers
+        //    refuse). Holds even for an admin caller.
+        let p_admin = pc(peer(&[1]), Some(SpaceRole::Admin));
+        assert_eq!(
+            resolve_relay_caller(Some(&p_admin), &[], Some("space-registry")),
+            (Caller::Unauthenticated, None),
+            "empty caps deny every role-gated relay",
+        );
+        // A cap for a *different* actor doesn't apply to this target.
+        assert_eq!(
+            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("dev-project")),
+            (Caller::Unauthenticated, None),
+        );
+
+        // 2. Peer admin + admin cap → full admin relayed (transparent,
+        //    identity preserved).
+        let (c, sr) = resolve_relay_caller(Some(&p_admin), &admin_cap, Some("space-registry"));
+        assert_eq!(c, peer(&[1]));
+        assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
+
+        // 3. Peer member + admin cap → bounded by the *caller's* own
+        //    role (min(Member, Admin) = Member): no amplification.
+        let p_member = pc(peer(&[2]), Some(SpaceRole::Member));
+        let (c, sr) = resolve_relay_caller(Some(&p_member), &admin_cap, Some("space-registry"));
+        assert_eq!(c, peer(&[2]));
+        assert_eq!(sr, Some(SpaceRole::Member.as_u8()));
+
+        // 4. Peer admin but a lower cap ceiling → bounded DOWN by the
+        //    cap (min(Admin, Developer) = Developer).
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &dev_cap, Some("space-registry"));
+        assert_eq!(
+            sr,
+            Some(SpaceRole::Developer.as_u8()),
+            "ceiling bounds an over-privileged caller",
+        );
+
+        // 5. No propagated caller (run()-thread / boot) → Unauthenticated
+        //    even with a cap.
+        assert_eq!(
+            resolve_relay_caller(None, &admin_cap, Some("space-registry")),
+            (Caller::Unauthenticated, None),
+        );
+
+        // 6. Unauthenticated incoming → nothing to relay.
+        let p_unauth = pc(Caller::Unauthenticated, None);
+        assert_eq!(
+            resolve_relay_caller(Some(&p_unauth), &admin_cap, Some("space-registry")),
+            (Caller::Unauthenticated, None),
+        );
+
+        // 7. Trusted incoming (System / Actor) → relayed ANONYMOUSLY
+        //    (non-trusted carrier) but still capped, so the cap binds.
+        for trusted in [Caller::System, Caller::Actor(ServiceId(9))] {
+            let p_trusted = pc(trusted, None);
+            let (c, sr) = resolve_relay_caller(Some(&p_trusted), &dev_cap, Some("space-registry"));
+            assert!(
+                !c.is_trusted(),
+                "carrier must be non-trusted so the cap is not bypassed: {c:?}",
+            );
+            assert_eq!(c, Caller::Unauthenticated);
+            assert_eq!(
+                sr,
+                Some(SpaceRole::Developer.as_u8()),
+                "Admin capped to ceiling"
+            );
+        }
+
+        // 8. Wildcard-role cap ("space-registry:*") → uncapped: a peer
+        //    admin keeps admin.
+        let any_role = [IntraCap::parse("space-registry:*").unwrap()];
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_role, Some("space-registry"));
+        assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
+
+        // 9. Wildcard-actor cap ("*:member") applies to an unresolved
+        //    target and caps the admin caller to member.
+        let any_actor = [IntraCap::parse("*:member").unwrap()];
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_actor, None);
+        assert_eq!(sr, Some(SpaceRole::Member.as_u8()));
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────
