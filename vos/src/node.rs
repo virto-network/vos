@@ -3124,6 +3124,18 @@ fn relay_target_name(target: u32) -> Option<&'static str> {
     }
 }
 
+/// Whether a *named* intra_cap target can be matched at dispatch time.
+/// The companion to [`relay_target_name`]: a named cap is only ever
+/// applied when some target id maps back to that name, which v1 does
+/// solely for the registry. So a named cap for any other actor is a
+/// silent no-op (the relay falls back to `Unauthenticated`) — install
+/// tooling warns operators rather than letting the cap vanish. `*`
+/// (wildcard-actor) caps are always matchable, so they don't go
+/// through this check.
+pub fn cap_target_resolvable(actor_name: &str) -> bool {
+    actor_name.eq_ignore_ascii_case(REGISTRY_AGENT_NAME)
+}
+
 /// Compute the `(caller, space_role byte)` a service-mode extension
 /// relays for an outbound call to `target_name`, applying the
 /// intersection model: the effective authority is
@@ -3896,6 +3908,66 @@ mod tests {
         let any_actor = [IntraCap::parse("*:member").unwrap()];
         let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_actor, None);
         assert_eq!(sr, Some(SpaceRole::Member.as_u8()));
+
+        // 10. Full wildcard ("*:*") — any role on any actor — uncaps a
+        //     peer admin on both a named and an unresolved target.
+        let full = [IntraCap::parse("*:*").unwrap()];
+        let (c, sr) = resolve_relay_caller(Some(&p_admin), &full, Some("space-registry"));
+        assert_eq!(c, peer(&[1]));
+        assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &full, None);
+        assert_eq!(
+            sr,
+            Some(SpaceRole::Admin.as_u8()),
+            "full wildcard matches unresolved targets too"
+        );
+    }
+
+    #[test]
+    fn cap_target_resolvable_only_registry() {
+        // A named cap is enforceable only when its actor maps back to a
+        // target id — v1 resolves just the registry (case-insensitive).
+        assert!(cap_target_resolvable("space-registry"));
+        assert!(cap_target_resolvable("SPACE-REGISTRY"));
+        // Any other named actor is a silent no-op today; install tooling
+        // warns on these so the operator isn't surprised.
+        assert!(!cap_target_resolvable("dev-project"));
+        assert!(!cap_target_resolvable("auth-service"));
+    }
+
+    #[test]
+    fn extension_config_relay_and_caps_mutually_exclusive() {
+        use crate::actors::IntraCap;
+        let caps = || vec![IntraCap::parse("space-registry:admin").unwrap()];
+
+        // relay_unauthenticated() clears any caps set before it — a
+        // relay has no authority of its own.
+        let cfg = ExtensionConfig::new("x.so")
+            .with_intra_caps(caps())
+            .relay_unauthenticated();
+        assert!(cfg.relay_unauthenticated);
+        assert!(
+            cfg.intra_caps.is_empty(),
+            "relay_unauthenticated must clear declared caps",
+        );
+
+        // …and with_intra_caps() after relay_unauthenticated() is a
+        // no-op, so neither builder order can produce a relay that also
+        // carries authority. Locks the documented invariant against a
+        // future refactor dropping the guard.
+        let cfg = ExtensionConfig::new("x.so")
+            .relay_unauthenticated()
+            .with_intra_caps(caps());
+        assert!(cfg.relay_unauthenticated);
+        assert!(
+            cfg.intra_caps.is_empty(),
+            "with_intra_caps after relay_unauthenticated must not re-add caps",
+        );
+
+        // Without the relay flag, caps are carried as declared.
+        let cfg = ExtensionConfig::new("x.so").with_intra_caps(caps());
+        assert!(!cfg.relay_unauthenticated);
+        assert_eq!(cfg.intra_caps.len(), 1);
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────

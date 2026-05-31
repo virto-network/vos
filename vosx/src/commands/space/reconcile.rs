@@ -275,6 +275,9 @@ fn register_extension(
     if let Some(warning) = intra_caps_wildcard_warning(&ext.name, effective_caps) {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = unresolvable_cap_warning(&ext.name, effective_caps) {
+        tracing::warn!("{warning}");
+    }
 
     let cfg = if ext.init.is_empty() {
         ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
@@ -357,6 +360,34 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
     Some(format!(
         "extension '{name}': intra_caps wildcard is a footgun — {detail}. \
          Name each target actor explicitly instead.",
+    ))
+}
+
+/// Warn when an extension declares a cap for a *named* actor the host
+/// can't resolve at dispatch time. v1 maps only the well-known
+/// `space-registry` target id back to a name, so a named cap for any
+/// other actor is silently never matched (the relay falls back to
+/// `Unauthenticated`). Surfacing it at boot keeps a typo'd or
+/// premature cap from vanishing without the operator noticing. `*`
+/// (wildcard-actor) caps always match, so they're exempt.
+fn unresolvable_cap_warning(name: &str, caps: &[vos::IntraCap]) -> Option<String> {
+    let mut unresolved: Vec<&str> = caps
+        .iter()
+        .filter(|c| !c.is_actor_wildcard())
+        .filter_map(|c| c.actor_name.as_deref())
+        .filter(|n| !vos::node::cap_target_resolvable(n))
+        .collect();
+    if unresolved.is_empty() {
+        return None;
+    }
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    Some(format!(
+        "extension '{name}': intra_caps name actor(s) the host can't resolve for cap \
+         enforcement in v1 ({}) — only 'space-registry' is resolvable today, so these caps \
+         are NOT applied and calls to those actors relay as Unauthenticated. Use a wildcard \
+         (\"*:<role>\") if you intend to grant authority on other actors.",
+        unresolved.join(", "),
     ))
 }
 
@@ -920,6 +951,33 @@ mod tests {
         assert!(intra_caps_wildcard_warning("dev", &caps).is_none());
         // Empty = deny-by-default, not a footgun.
         assert!(intra_caps_wildcard_warning("dev", &[]).is_none());
+    }
+
+    #[test]
+    fn unresolvable_named_cap_warns() {
+        // A named cap for a non-registry actor is a silent no-op in v1
+        // (only the registry is resolvable) — warn so it doesn't vanish.
+        let caps = vec![
+            vos::IntraCap::parse("space-registry:admin").unwrap(),
+            vos::IntraCap::parse("auth-service:member").unwrap(),
+        ];
+        let w = unresolvable_cap_warning("dev", &caps).expect("unresolvable cap warns");
+        assert!(w.contains("auth-service"), "{w}");
+        assert!(w.contains("NOT applied"), "{w}");
+        // The registry cap is resolvable, so it must NOT be listed.
+        assert!(!w.contains("space-registry:"), "{w}");
+    }
+
+    #[test]
+    fn no_unresolvable_warning_for_registry_or_wildcards() {
+        // Registry-only caps + wildcard-actor caps are all matchable.
+        let caps = vec![
+            vos::IntraCap::parse("space-registry:admin").unwrap(),
+            vos::IntraCap::parse("*:developer").unwrap(),
+            vos::IntraCap::parse("*").unwrap(),
+        ];
+        assert!(unresolvable_cap_warning("dev", &caps).is_none());
+        assert!(unresolvable_cap_warning("dev", &[]).is_none());
     }
 
     #[test]

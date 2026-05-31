@@ -273,6 +273,14 @@ operator who triggers the dev extension's `publish` is still refused
 at the registry, because their `member` role (not the extension's
 trust) is what gets relayed, capped by the declared ceiling.
 
+**v1 limitation**: only the `space-registry` target is resolved by
+name for cap enforcement today (it's the only role-gated actor). A
+named cap for any *other* actor (e.g. `"some-actor:developer"`) is
+currently a no-op — the daemon logs a warning at `space up` and the
+relay falls back to `Caller::Unauthenticated`. To grant authority on
+a non-registry actor, use a wildcard cap (`"*:<role>"`); a tighter
+per-actor binding lands with the service-id → name reverse lookup.
+
 ### HTTP gateway and anonymous traffic
 
 The http-gateway proxies external HTTP into the daemon. Because the
