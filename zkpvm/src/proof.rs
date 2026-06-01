@@ -85,6 +85,36 @@ fn proof_format_version_default() -> u32 {
     0
 }
 
+impl Proof {
+    /// Phase ZK-ABI: reconstruct the 32-byte actor-IO binding hash from
+    /// the final-state register window φ[9..13].
+    ///
+    /// A migrated actor writes `H = compute_io_hash(public, return)` into
+    /// φ[9..13] via the `ecall_zk_bind` hostcall (see `vos::zk` and
+    /// `zkpvm::core::tracing::handle_zk_bind_ecall`).  Phase Z0's closing
+    /// chip STARK-binds `final_state.registers`, so once an actor emits
+    /// the binding ECALL this hash is a publicly-committed, tamper-evident
+    /// output of the proof: `vos::zk::verify_actor_io` checks it against a
+    /// locally-recomputed `compute_io_hash`.
+    ///
+    /// Decoding is the exact inverse of the host-side encoding: word
+    /// φ[9] → bytes 0..8, φ[10] → 8..16, φ[11] → 16..24, φ[12] → 24..32,
+    /// each little-endian.  `registers[9..13]` is statically in bounds
+    /// (registers is `[u64; 13]`).
+    ///
+    /// Proofs that never emitted the binding ECALL leave φ[9..13] at
+    /// their cold-start zero, so this returns `[0u8; 32]` — which fails
+    /// any real `compute_io_hash` equality check, the intended
+    /// "unbound proof" rejection.
+    pub fn public_io_hash(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, word) in self.final_state.registers[9..13].iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+}
+
 /// Minimum FRI proof-of-work bits the production verifier requires.
 ///
 /// `production_pcs_config()` sets `pow_bits = 20`; this constant is

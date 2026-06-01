@@ -9,6 +9,7 @@ use crate::core::step::{MemAccess, PvmStep};
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+    ECALL_ZK_BIND,
 };
 
 /// A recorded blake2b call for the precompile chip.
@@ -335,6 +336,9 @@ impl TracingPvm {
                     ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
                         self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
                     }
+                    ExitReason::HostCall(id) if id == ECALL_ZK_BIND => {
+                        self.handle_zk_bind_ecall();
+                    }
                     other => return other,
                 }
             }
@@ -369,6 +373,9 @@ impl TracingPvm {
                     }
                     ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
                         self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                    }
+                    ExitReason::HostCall(id) if id == ECALL_ZK_BIND => {
+                        self.handle_zk_bind_ecall();
                     }
                     ExitReason::HostCall(id) => match id {
                         // imm=0 is the IPC/REPLY slot — `halt_with_output`
@@ -464,6 +471,44 @@ impl TracingPvm {
             m_bytes,
             out_bytes,
         });
+    }
+
+    /// Phase ZK-ABI: bind a 32-byte actor-IO hash into the final-state
+    /// register window φ[9..13].
+    ///
+    /// The guest computes `H = compute_io_hash(public, return)` (see
+    /// `vos::zk`), writes it into guest memory, and issues
+    /// `ecall_zk_bind(ptr, len)`.  Per the `vos::abi::pvm::ecall` shim →
+    /// grey-transpiler mapping, `ecall2(id, ptr, len)` lands `ptr` in
+    /// φ[7] (A0) and `len` in φ[8] (A1).  This handler reads 32 bytes
+    /// from `flat_mem[ptr..ptr+32]` and writes them as four
+    /// little-endian u64 words into φ[9..13] (A2-A5) — the exact window
+    /// `Proof::public_io_hash` reconstructs.
+    ///
+    /// Out-of-bounds or short (`len < 32`) requests are no-ops, leaving
+    /// φ[9..13] untouched.
+    ///
+    /// NOTE (register-ledger): writing φ[9..13] here is outside
+    /// `step()`'s per-instruction reg-diff, so the Phase-Z0
+    /// RegisterMemoryChip closing-ledger does not yet account for it.
+    /// No actor emits this ECALL today, so the path is inert.  Wiring an
+    /// actor to emit it requires keeping the closing-chip ledger
+    /// balanced for φ[9..13] (a Z0-style augmentation), tracked as the
+    /// actor-migration follow-up — do not assume this write alone makes
+    /// the hash STARK-bound until that lands.
+    fn handle_zk_bind_ecall(&mut self) {
+        let src_ptr = self.pvm.registers[7] as usize;
+        let len = self.pvm.registers[8] as usize;
+        let mem_len = self.pvm.flat_mem.len();
+        if len < 32 || src_ptr.saturating_add(32) > mem_len {
+            return;
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&self.pvm.flat_mem[src_ptr..src_ptr + 32]);
+        for i in 0..4 {
+            self.pvm.registers[9 + i] =
+                u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        }
     }
 
     /// Read 32 scalar bytes + 32 compressed-point bytes from flat_mem,
