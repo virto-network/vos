@@ -4835,10 +4835,18 @@ mod tests {
 
     #[test]
     fn instance_name_collision_is_last_writer_wins() {
-        // Two distinct prefixes collide on the same local id (a
-        // ~15-bit-space collision). The map keys on the local half, so
-        // the later write wins — documented, matching the registry's
-        // own id derivation. (Also fires the WARN in record_agent_name.)
+        // The map keys on the local half only, so two records that share
+        // a local id resolve last-writer-wins. This single rule covers
+        // both real cases: (a) two different node prefixes carrying the
+        // same instance's local id — the cross-node replica path, where
+        // both names are identical so the outcome is moot; and (b) two
+        // *different* names that hash-collide into the same ~15-bit
+        // local on one node — where the survivor also owns the (single)
+        // route, so the map never points at a name whose route a
+        // different live actor holds. The losing name's actor-local
+        // grant is simply dropped (availability), never applied to
+        // another actor. Distinct prefixes are used here so the assert
+        // is unambiguous; record_agent_name also WARNs on the overwrite.
         let node = VosNode::new();
         node.record_agent_name(ServiceId::new(0x0001, 0x0300), Some("alpha".into()));
         node.record_agent_name(ServiceId::new(0x0002, 0x0300), Some("beta".into()));
