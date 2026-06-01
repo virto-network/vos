@@ -324,6 +324,93 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// ZK actor-IO ABI input-sensitivity: the io-hash bound into φ[9..12]
+/// must actually depend on the `Public` the actor ran on — i.e. the
+/// `vos::zk::bind_io::<VoucherCheck, (), Public, u8>` call in `start`
+/// binds the real witness, not a constant.
+///
+/// Cheap trace-level check (no prove): after `run_with_vos_stubs`, the
+/// guest's halt sequence has placed the io-hash in φ[9..12], so the
+/// final `tracing.pvm.registers[9..13]` reconstruct `public_io_hash`
+/// (same LE decode).  Two distinct witnesses must bind two distinct
+/// hashes; the same witness must rebind identically.  C3's
+/// `actor_io_hash_is_bound_and_nonzero` separately proves this same
+/// window is STARK-bound, so input-dependence here means the *proof*'s
+/// public output is tied to the public input.
+#[test]
+fn actor_io_hash_reflects_public_input() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+    ))
+    .expect("read voucher-check ELF for symbol lookup");
+    let witness_addr =
+        find_witness_buffer_addr(&elf).expect("WITNESS_BUFFER symbol in voucher-check ELF");
+
+    let io_hash_for = |amount: u64, blinding_byte: u8| -> [u8; 32] {
+        let amount_blinding =
+            Blinding::from_bytes([blinding_byte; 32]).expect("canonical Ristretto scalar");
+        let amount_commit = Amount::commit(amount, &amount_blinding);
+        let public = Public {
+            issuer: AuthKey([0x11u8; 32]),
+            amount_commit,
+            state_root_before: [0xAAu8; 32],
+            state_root_after: [0xBBu8; 32],
+        };
+        let secret = Secret {
+            amount,
+            amount_blinding,
+            sender_balance_before: amount + 1,
+        };
+        let public_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&public)
+            .expect("rkyv encode Public")
+            .to_vec();
+        let secret_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&secret)
+            .expect("rkyv encode Secret")
+            .to_vec();
+        let witness = encode_witness(&public_bytes, &secret_bytes);
+
+        let (interp, mut flat_mem) =
+            zkpvm::actor::interpreter_from_blob(&blob, 100_000_000).expect("interpreter from blob");
+        let end = (witness_addr as usize) + witness.len();
+        flat_mem[witness_addr as usize..end].copy_from_slice(&witness);
+        let mut interp = interp;
+        interp.flat_mem = flat_mem;
+        let mut tracing = TracingPvm::new(interp);
+        let _ = tracing.run_with_vos_stubs();
+
+        // Reconstruct the io-hash from final φ[9..12] — the same LE
+        // decode `Proof::public_io_hash` performs on final_state.registers.
+        let mut h = [0u8; 32];
+        for (i, w) in tracing.pvm.registers[9..13].iter().enumerate() {
+            h[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        h
+    };
+
+    let hash_a = io_hash_for(100, 2);
+    let hash_b = io_hash_for(50, 5);
+    eprintln!("io-hash A={}, B={}", hex(&hash_a), hex(&hash_b));
+    assert_ne!(
+        hash_a,
+        [0u8; 32],
+        "bind_io must place a non-zero io-hash in φ[9..12]"
+    );
+    assert_ne!(
+        hash_a, hash_b,
+        "different Public must bind a different io-hash — the binding is \
+         not actually a function of the public input"
+    );
+    assert_eq!(
+        hash_a,
+        io_hash_for(100, 2),
+        "identical Public must bind an identical io-hash (determinism)"
+    );
+}
+
 /// Phase Z0 load-bearing test: a proof's `final_state.registers` is
 /// genuinely STARK-bound (not just decorative metadata the prover
 /// fills in). Tampering with any byte of any register post-prove

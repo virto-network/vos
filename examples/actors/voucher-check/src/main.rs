@@ -84,6 +84,15 @@ impl VoucherCheck {
             None => hardcoded_witness(),
         };
         proof::check(&public, &secret);
+        // ZK actor-IO ABI: bind this proof to the asserted `Public`
+        // input and the `1` success return.  The hash lands in the
+        // Phase-Z0-bound final-state registers φ[9..12] at halt; a
+        // verifier checks it with
+        // `vos::zk::verify_actor_io::<VoucherCheck, (), Public, u8>`.
+        // (M = () for now — the prove path drives `start`, which carries
+        // no message struct; the `#[zk_public]` macro path will supply a
+        // real message identity once it lands.)
+        vos::zk::bind_io::<VoucherCheck, (), Public, u8>(&public, &1u8);
         1
     }
 

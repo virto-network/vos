@@ -130,6 +130,66 @@ where
     proof.public_io_hash() == compute_io_hash::<A, M, P, R>(public, expected_return)
 }
 
+// ── Guest-side binding (halt-asm path) ───────────────────────────────
+//
+// A service actor binds its `(public, return)` by computing the io-hash
+// during execution and stashing it here; `actors::run::run_refine_service`
+// reads the stash just before halt and places it in φ[9..12] via
+// `halt_with_output_bound` (see `crate::zk` module docs).  When no actor
+// binds explicitly, `run_refine_service` falls back to the empty-public/
+// empty-return default — every service actor still binds its actor
+// identity.
+
+/// Single-slot stash for the pending io-hash, set by [`bind_io`] during
+/// handler execution and drained by `run_refine_service` at halt.
+///
+/// SAFETY: the PVM guest is strictly single-threaded, so the `static mut`
+/// is never concurrently accessed — same invariant the runtime relies on
+/// for `ACTOR_HOLDER` / `OUTPUT_BUF` in `actors::run`.
+#[cfg(feature = "pvm")]
+static mut PENDING_IO_HASH: Option<[u8; 32]> = None;
+
+/// Stash a precomputed io-hash for the halt binding.  Internal — actors
+/// call [`bind_io`].
+#[cfg(feature = "pvm")]
+#[doc(hidden)]
+pub fn __set_pending_io_hash(hash: [u8; 32]) {
+    let slot = core::ptr::addr_of_mut!(PENDING_IO_HASH);
+    // SAFETY: single-threaded PVM; exclusive access via raw pointer.
+    unsafe { *slot = Some(hash) };
+}
+
+/// Drain the pending io-hash.  Internal — `run_refine_service` calls this
+/// once at halt.
+#[cfg(feature = "pvm")]
+#[doc(hidden)]
+pub fn __take_pending_io_hash() -> Option<[u8; 32]> {
+    let slot = core::ptr::addr_of_mut!(PENDING_IO_HASH);
+    // SAFETY: single-threaded PVM; exclusive access via raw pointer.
+    unsafe { (*slot).take() }
+}
+
+/// Guest-side: bind this execution to the asserted `(public, return)`
+/// tuple under actor `A` / message `M`.
+///
+/// Computes [`compute_io_hash`] and stashes it; `run_refine_service`
+/// places it into the Phase-Z0-bound final-state register window φ[9..12]
+/// at halt, making it the proof's [`zkpvm::Proof::public_io_hash`].  The
+/// verifier checks it with [`verify_actor_io`] using the SAME `A, M, P, R`.
+///
+/// Call this from a handler after the work it proves, e.g.
+/// `vos::zk::bind_io::<MyActor, (), Public, u8>(&public, &1u8)`.  The last
+/// binding in a refine wins (one handler per proof is the model).  Actors
+/// that never call it bind the empty-public/empty-return default.
+#[cfg(feature = "pvm")]
+pub fn bind_io<A, M, P, R>(public: &P, return_value: &R)
+where
+    P: crate::Encode,
+    R: crate::Encode,
+{
+    __set_pending_io_hash(compute_io_hash::<A, M, P, R>(public, return_value));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

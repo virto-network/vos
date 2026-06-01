@@ -519,12 +519,13 @@ pub fn run_refine_service<A: super::Actor>() {
     }
     // ZK actor-IO ABI: bind this execution's (public, return) identity
     // into the final-state register window φ[9..12] as part of the halt
-    // (see `crate::zk` and `halt_with_output_bound`).  The default binds
-    // the actor identity with empty public/return — decision: every
-    // service actor always binds, so a proof is uniformly tied to its
-    // actor type; the per-handler `#[zk_public]` macro path refines the
-    // public-input and return components.
-    let io_hash = crate::zk::compute_io_hash::<A, (), (), ()>(&(), &());
+    // (see `crate::zk` and `halt_with_output_bound`).  A handler that
+    // called `vos::zk::bind_io` stashed the real `(public, return)` hash;
+    // drain it.  Otherwise fall back to binding the actor identity with
+    // empty public/return — every service actor always binds, so a proof
+    // is uniformly tied to at least its actor type.
+    let io_hash = crate::zk::__take_pending_io_hash()
+        .unwrap_or_else(|| crate::zk::compute_io_hash::<A, (), (), ()>(&(), &()));
     halt_with_output_bound(out_buf, &io_hash);
 }
 
