@@ -3926,7 +3926,6 @@ fn run_service_invoke_sidecar(
     }
 }
 
-
 /// Dispatch a message to an actor-mode extension instance and poll
 /// to completion. Returns the reply bytes on success or a
 /// `POLL_ERR_*` status on a poisoned future (panic, missing future,
