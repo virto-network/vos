@@ -7554,6 +7554,400 @@ fn clerk_ledger_two_bank_federation() {
         "inflow with != 2 entries must be rejected at the bridge shape check"
     );
 
+    // ── 5g) Mode::External voucher wire round-trip ──────────────
+    //
+    // Demonstrates the Mode::External proof envelope flowing through
+    // the existing voucher wire format. cipher-clerk's voucher
+    // protocol already accommodates two proof modes (Signature +
+    // External); previous sections used Mode::Signature
+    // (`CcProof::default()` → 0-byte placeholder under the
+    // Signature mode tag). This section builds a voucher whose
+    // proof field carries `Mode::External` opaque bytes, signs +
+    // round-trips it through Voucher::from_bytes, and verifies the
+    // proof bytes host-side against the issuer's canonical
+    // public_bytes.
+    //
+    // The proof bytes here are the SAME v0 placeholder that
+    // clerk-prover-extension emits: blake2b-256("clerk-prover/
+    // voucher-proof/v0-placeholder" || public_bytes). Cryptographic
+    // zk verification is gated on the prove path being unblocked
+    // (zkpvm task #7); once it is, the placeholder swap to
+    // `zkpvm_verifier::verify_standalone` is a single-function
+    // change. The WIRE shape this section pins is invariant.
+    //
+    // In-bridge verification (clerk-bridge.submit_voucher dispatching
+    // to the prover extension before acceptance) is deferred to a
+    // follow-on slice — task #8.
+    use cipher_clerk::proof::Mode as CcProofMode;
+    use cipher_clerk::voucher::proof::{Public as VoucherPublic, public_bytes};
+
+    // clerk-prover-extension's v0 placeholder proof body:
+    // blake2b-256("clerk-prover/voucher-proof/v0-placeholder" ||
+    // public_bytes). Same logic the extension's
+    // `verify_voucher_proof` handler runs.
+    let placeholder_proof = |pub_bytes: &[u8]| -> Vec<u8> {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"clerk-prover/voucher-proof/v0-placeholder");
+        h.update(pub_bytes);
+        h.finalize().as_bytes().to_vec()
+    };
+
+    let public_for_proof = VoucherPublic {
+        issuer: registrar_a.public,
+        amount_commit: amt,
+        state_root_before: root_before,
+        state_root_after: root_after,
+    };
+    let pub_bytes = public_bytes(&public_for_proof);
+    let external_proof_bytes = placeholder_proof(&pub_bytes);
+
+    // Re-seal an envelope to match the existing transfer; the
+    // sender side packages a fresh voucher with the external proof.
+    let envelope_external =
+        EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk).expect("seal envelope external");
+    let voucher_external = Voucher::sign(
+        amt,
+        envelope_external,
+        root_before,
+        root_after,
+        CcProof {
+            mode: CcProofMode::External,
+            bytes: external_proof_bytes.clone(),
+        },
+        &registrar_a.secret,
+    );
+    assert_eq!(
+        voucher_external.proof.mode,
+        CcProofMode::External,
+        "voucher.proof.mode must round-trip as External"
+    );
+    assert_eq!(
+        voucher_external.proof.bytes.len(),
+        32,
+        "placeholder proof bytes are blake2b-256 (32 bytes)"
+    );
+
+    // Wire round-trip — Voucher::to_bytes / from_bytes must preserve
+    // Mode::External and the proof bytes verbatim.
+    let voucher_external_bytes = voucher_external.to_bytes();
+    let parsed_external = Voucher::from_bytes(&voucher_external_bytes)
+        .expect("Voucher::from_bytes must accept Mode::External payloads");
+    assert_eq!(parsed_external.proof.mode, CcProofMode::External);
+    assert_eq!(parsed_external.proof.bytes, external_proof_bytes);
+    assert_eq!(
+        parsed_external.verify_signature(&registrar_a.public),
+        Ok(()),
+        "issuer signature still authenticates the voucher when proof.mode = External"
+    );
+
+    // Verifier-side check: independently reconstruct `public_bytes`
+    // from the voucher's public fields, recompute the placeholder,
+    // assert byte-equality with the carried proof.bytes.  This is
+    // what a real `verify_standalone` call site will do — modulo the
+    // placeholder being a STARK proof check instead of byte equality.
+    let pub_bytes_verifier = public_bytes(&VoucherPublic {
+        issuer: registrar_a.public,
+        amount_commit: parsed_external.amount_commit,
+        state_root_before: parsed_external.state_root_before,
+        state_root_after: parsed_external.state_root_after,
+    });
+    assert_eq!(
+        pub_bytes_verifier, pub_bytes,
+        "verifier-reconstructed public_bytes must match issuer's"
+    );
+    assert_eq!(
+        placeholder_proof(&pub_bytes_verifier),
+        parsed_external.proof.bytes,
+        "placeholder proof bytes must reproduce on the verifier side — \
+         once zkpvm task #7 is fixed, this is the call site that swaps \
+         to verify_standalone(proof, program_commitment)"
+    );
+
+    // Adversarial: flipping a byte of the proof field makes the
+    // wire signature fail (signature payload covers proof.bytes).
+    let mut tampered_external = voucher_external_bytes.clone();
+    // The proof bytes live after the mode-tag byte; mutate one to
+    // exercise the issuer-signature-covers-proof property.
+    let proof_byte_offset = tampered_external.len() - 64 - 8;
+    tampered_external[proof_byte_offset] ^= 0x01;
+    let parsed_tampered_external = Voucher::from_bytes(&tampered_external)
+        .expect("structural parse survives a single-byte flip in the proof body");
+    assert_eq!(
+        parsed_tampered_external.verify_signature(&registrar_a.public),
+        Err(VoucherError::BadSignature),
+        "wire signature must reject a proof-bytes tamper"
+    );
+
+    // ── 5h) In-bridge Mode::External verify via clerk-prover ────
+    //
+    // Loads the `clerk-prover-extension` .so on bank B's node,
+    // points clerk-bridge at it via `set_prover`, and submits a
+    // fresh Mode::External voucher. The bridge dispatches
+    // verify_voucher_proof to the prover before accepting; on a
+    // tampered (or placeholder) proof it returns
+    // Status::ProofInvalid.
+    //
+    // Why a host extension rather than in-actor verification:
+    // zkpvm-verifier can't build for riscv64em-javm today (task
+    // #1 spike). The prover runs natively as a `.so` and the
+    // bridge dispatches via `ctx.ask`; same trust boundary in
+    // effect — the actor still decides whether to accept.
+    //
+    // v0 limitation (2026-05-13): the extension now runs the real
+    // `zkpvm_verifier::verify_standalone` path (no more blake2b
+    // placeholder), so the 32-byte placeholder bytes this test
+    // embeds in `voucher.proof.bytes` are rejected (decode fails on
+    // a malformed proof).  All 5h paths therefore exercise the
+    // ProofInvalid branch.  Shipping a REAL ~1.4 MiB STARK proof
+    // through the bridge → extension dispatch would need an object-
+    // store / DA-style hand-off (the proof exceeds the PVM ↔ host
+    // message envelope); cryptographic happy-path coverage lives
+    // in `zkpvm/tests/voucher_check_smoke.rs::prove_verify_voucher
+    // _check_hardcoded` instead.
+
+    // Load clerk-prover-extension's .so. Skip if not built;
+    // matches the SKIP pattern used by other actor ELFs above.
+    let prover_so = {
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        std::path::PathBuf::from(format!(
+            "{}/../target/{profile}/libclerk_prover_extension.so",
+            env!("CARGO_MANIFEST_DIR"),
+        ))
+    };
+    if !prover_so.exists() {
+        eprintln!(
+            "SKIP 5h: clerk-prover-extension not built. Run: cargo build -p clerk-prover-extension"
+        );
+    } else {
+        use vos::node::ExtensionConfig;
+
+        // Mutable handle on node_b so we can register an extension.
+        // node_b has already been mutated through `&mut &node_b`
+        // for actor handlers above; the typed pattern allows mixing
+        // immutable invocations with mutable registrations.
+        let prover_id = node_b.register_extension(ExtensionConfig::new(prover_so));
+
+        // Wire bank B's bridge to the prover. `set_prover` is
+        // legal post-bootstrap (idempotent in identical args).
+        assert_eq!(
+            vos::block_on(bridge_actor.set_prover(&mut &node_b, prover_id.0))
+                .expect("invoke set_prover"),
+            BridgeStatus::Ok,
+            "set_prover after bootstrap must succeed"
+        );
+        assert_eq!(
+            vos::block_on(bridge_actor.prover(&mut &node_b)).expect("invoke prover"),
+            prover_id.0,
+            "diagnostic getter must return the configured id"
+        );
+
+        // Build a fresh Mode::External voucher from transfer T3
+        // (which is on bank A's ledger but has NEVER been
+        // successfully redeemed on bank B — section 5f's
+        // adversarial cases all rejected without dedup-marking it).
+        // T3 has its own (amount_commit, root_before, root_after)
+        // triple so its dedup key is distinct from voucher / voucher_2.
+        let public_v3 = VoucherPublic {
+            issuer: registrar_a.public,
+            amount_commit: voucher_3.amount_commit,
+            state_root_before: voucher_3.state_root_before,
+            state_root_after: voucher_3.state_root_after,
+        };
+        let proof_v3_bytes = placeholder_proof(&public_bytes(&public_v3));
+        // Re-seal a fresh envelope and re-sign the voucher with
+        // Mode::External so the wire signature covers the proof
+        // bytes (signature mode would carry a stub here).
+        let envelope_v3 = EncryptedEnvelope::seal(value3, &blinding3, &bank_b_ivk_pk)
+            .expect("seal envelope v3 external");
+        let voucher_v3_external = Voucher::sign(
+            amt3,
+            envelope_v3,
+            voucher_3.state_root_before,
+            voucher_3.state_root_after,
+            CcProof {
+                mode: CcProofMode::External,
+                bytes: proof_v3_bytes.clone(),
+            },
+            &registrar_a.secret,
+        );
+        let voucher_v3_external_bytes = voucher_v3_external.to_bytes();
+
+        // Placeholder-payload path — bridge dispatches
+        // verify_voucher_proof; the real STARK extension rejects
+        // the 32-byte blake2b placeholder (bincode-deserialize
+        // fails on a non-Proof byte string), so the bridge surfaces
+        // Status::ProofInvalid.  Once an object-store / DA layer
+        // ships proof bytes through a side channel, this path
+        // becomes the happy-path (= bridge admits + dedup advances).
+        let dedup_before_5h = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+            .expect("redeemed_count pre-5h");
+        let reply_external = vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            voucher_v3_external_bytes.clone(),
+            b"bank-a".to_vec(),
+        ))
+        .expect("invoke submit_voucher (Mode::External, placeholder proof)");
+        assert_eq!(
+            reply_external.status,
+            BridgeStatus::ProofInvalid,
+            "real STARK extension must reject 32-byte placeholder proof"
+        );
+        let dedup_after_5h = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+            .expect("redeemed_count post-5h");
+        assert_eq!(
+            dedup_after_5h, dedup_before_5h,
+            "rejected proof must not advance dedup"
+        );
+
+        // Adversarial — tamper proof bytes on a FRESH voucher
+        // (otherwise the dedup catches before the prover dispatch).
+        // We use yet-another fresh transfer to avoid both dedup and
+        // signature-coverage interference: re-sign with the wrong
+        // placeholder, then ALSO re-issue a fresh wire signature so
+        // the bridge reaches the prover dispatch step.
+        let blinding4 = cipher_clerk::crypto::Blinding([6u8; 32]);
+        let value4: u64 = 25;
+        let amt4 = Amount::commit(value4, &blinding4);
+        let signed_transfer_4: Transfer = Transfer::builder(journal_a)
+            .debit(&alice, Layer::Settled, amt4)
+            .credit(&vault_a, Layer::Settled, amt4)
+            .signed_with(&[(&alice, &alice_kp.secret)]);
+        let transfer_id_4 = signed_transfer_4.id.0;
+        let transfer_bytes_4 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer_4)
+            .expect("rkyv encode transfer 4")
+            .to_vec();
+        let openings_4 = vec![clerk_ledger::Opening {
+            amount: amt4,
+            value: value4,
+            blinding: blinding4,
+        }];
+        let openings_bytes_4 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings_4)
+            .expect("rkyv encode openings 4")
+            .to_vec();
+        assert_eq!(
+            vos::block_on(ledger_a.apply_transfer(
+                &mut &node_a,
+                transfer_bytes_4,
+                openings_bytes_4,
+                ts + 1200,
+            ))
+            .expect("apply_transfer T4 on A"),
+            Status::Ok,
+        );
+        let (root_before_4_vec, root_after_4_vec) =
+            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_4.to_vec()))
+                .expect("transfer_state_roots T4")
+                .expect("anchor for T4");
+        let root_before_4: [u8; 32] = root_before_4_vec.try_into().expect("32-byte");
+        let root_after_4: [u8; 32] = root_after_4_vec.try_into().expect("32-byte");
+        let envelope_v4 =
+            EncryptedEnvelope::seal(value4, &blinding4, &bank_b_ivk_pk).expect("seal envelope v4");
+        // Forged proof: bytes for a DIFFERENT public — i.e. the
+        // attacker swapped the proof bytes from a different transfer.
+        // Issuer re-signs the (now-internally-inconsistent) voucher.
+        let forged_proof_bytes = placeholder_proof(b"some-other-transfer");
+        let voucher_v4_forged = Voucher::sign(
+            amt4,
+            envelope_v4,
+            root_before_4,
+            root_after_4,
+            CcProof {
+                mode: CcProofMode::External,
+                bytes: forged_proof_bytes,
+            },
+            &registrar_a.secret,
+        );
+        let voucher_v4_forged_bytes = voucher_v4_forged.to_bytes();
+        let reply_forged = vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            voucher_v4_forged_bytes,
+            b"bank-a".to_vec(),
+        ))
+        .expect("invoke submit_voucher (Mode::External, forged proof)");
+        assert_eq!(
+            reply_forged.status,
+            BridgeStatus::ProofInvalid,
+            "bridge must reject Mode::External voucher with proof bytes that don't match public_bytes"
+        );
+        // Dedup count unchanged — a rejected proof must not poison
+        // the dedup set (same posture as UnknownPeer / VoucherInvalid).
+        let dedup_after_forged = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+            .expect("redeemed_count post-forged");
+        assert_eq!(
+            dedup_after_forged, dedup_after_5h,
+            "rejected Mode::External proof must not advance dedup"
+        );
+
+        // Cross-node adversarial: same forged-proof voucher submitted
+        // from bank A's node. Routes through libp2p to bank B's bridge,
+        // which dispatches to bank B's prover. Pins that the
+        // bridge → prover dispatch works irrespective of which node
+        // initiated the submit. (We use a FRESH forged voucher on a
+        // new transfer T5 — the previous voucher's dedup_key would
+        // hit VoucherReplayed otherwise, masking the proof path.)
+        let blinding5 = cipher_clerk::crypto::Blinding([7u8; 32]);
+        let value5: u64 = 10;
+        let amt5 = Amount::commit(value5, &blinding5);
+        let signed_transfer_5: Transfer = Transfer::builder(journal_a)
+            .debit(&alice, Layer::Settled, amt5)
+            .credit(&vault_a, Layer::Settled, amt5)
+            .signed_with(&[(&alice, &alice_kp.secret)]);
+        let transfer_id_5 = signed_transfer_5.id.0;
+        let transfer_bytes_5 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer_5)
+            .expect("rkyv encode transfer 5")
+            .to_vec();
+        let openings_5 = vec![clerk_ledger::Opening {
+            amount: amt5,
+            value: value5,
+            blinding: blinding5,
+        }];
+        let openings_bytes_5 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings_5)
+            .expect("rkyv encode openings 5")
+            .to_vec();
+        assert_eq!(
+            vos::block_on(ledger_a.apply_transfer(
+                &mut &node_a,
+                transfer_bytes_5,
+                openings_bytes_5,
+                ts + 1300,
+            ))
+            .expect("apply_transfer T5 on A"),
+            Status::Ok,
+        );
+        let (root_before_5_vec, root_after_5_vec) =
+            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_5.to_vec()))
+                .expect("transfer_state_roots T5")
+                .expect("anchor for T5");
+        let envelope_v5 =
+            EncryptedEnvelope::seal(value5, &blinding5, &bank_b_ivk_pk).expect("seal envelope v5");
+        let voucher_v5_forged = Voucher::sign(
+            amt5,
+            envelope_v5,
+            root_before_5_vec.try_into().unwrap(),
+            root_after_5_vec.try_into().unwrap(),
+            CcProof {
+                mode: CcProofMode::External,
+                bytes: placeholder_proof(b"another-different-public"),
+            },
+            &registrar_a.secret,
+        );
+        let cross_node_forged = vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_a, // caller = bank A's node, target = bank B's bridge
+            voucher_v5_forged.to_bytes(),
+            b"bank-a".to_vec(),
+        ))
+        .expect("cross-node submit_voucher (Mode::External, forged)");
+        assert_eq!(
+            cross_node_forged.status,
+            BridgeStatus::ProofInvalid,
+            "cross-node bridge must dispatch to its local prover and reject forged proofs same as local submit"
+        );
+    }
+
     // ── 6) Bridge addressing parity ─────────────────────────────
     //
     // The bridge is the path a future cross-bank settlement would

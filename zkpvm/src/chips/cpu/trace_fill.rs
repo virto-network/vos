@@ -685,6 +685,25 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                         };
                         ((qs as u64).to_le_bytes(), (rs as u64).to_le_bytes())
                     }
+                } else if flags.is_shift && flags.shift_op == 2 {
+                    // Arithmetic right shift (SharR): divisor = 2^shift_k
+                    // and the PVM result is `(val_b as iN) >> shift_k`,
+                    // which sign-fills the top bits.  Unsigned division
+                    // (the else branch) zero-fills, so for negative
+                    // val_b the result and quotient diverge — breaking
+                    // the `result[i] = div_quotient[i]` binding.  Override
+                    // q here so div_quotient matches the PVM result;
+                    // schoolbook still holds because q·d + r = b mod 2^64
+                    // for r = b − q·d (and 0 ≤ r < d since d divides the
+                    // low bits exactly the same way).
+                    let shift_k = saved_shift_amount as u32;
+                    let q_arith: u64 = if flags.is_32bit {
+                        (dividend as u32 as i32).wrapping_shr(shift_k) as i64 as u64
+                    } else {
+                        (dividend as i64).wrapping_shr(shift_k) as u64
+                    };
+                    let r_arith = dividend.wrapping_sub(q_arith.wrapping_mul(divisor));
+                    (q_arith.to_le_bytes(), r_arith.to_le_bytes())
                 } else {
                     // DivU / RemU: unsigned division.
                     (
@@ -797,6 +816,27 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                         div_corr_hi[i] = s_mod as u8;
                         carry = (s - s_mod) / 256;
                         div_corr_carry[i] = carry as u8;
+                    }
+                } else if flags.is_shift && flags.shift_op == 2 {
+                    // SharR: arith-right-shift override (above) put a
+                    // sign-extended quotient into `div_quotient`.  For
+                    // negative inputs that means q ≥ 2^63 (64-bit) or
+                    // q ≥ 2^31 (32-bit), so the schoolbook `q·d + r`
+                    // overflows into the high 8 bytes (64-bit) or high
+                    // 4 bytes (32-bit).  DivRemChip's schoolbook chain
+                    // pins those overflow bytes to `div_corr_hi[i]`,
+                    // so we have to witness them — DivS's sign-
+                    // correction formula doesn't apply here (is_div_s
+                    // is 0 for SharR), so we extract the bytes
+                    // directly from the carry-propagated schoolbook
+                    // accumulator above.  `div_corr_carry` stays at
+                    // its default 0 — DivRemChip's DivS sign-
+                    // correction chain (which is the only consumer of
+                    // `div_corr_carry`) is gated on is_div_s and
+                    // doesn't fire on SharR rows.
+                    let n = if flags.is_32bit { 4 } else { WORD_SIZE };
+                    for i in 0..n {
+                        div_corr_hi[i] = (accum[i + n] & 0xFF) as u8;
                     }
                 }
             }

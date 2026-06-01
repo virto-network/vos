@@ -39,6 +39,11 @@ grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168"
 bincode = "1"
 zkpvm-verifier = { workspace = true }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
+# Dynamic-witness smoke test (voucher_check_smoke.rs) builds
+# cipher-clerk Public/Secret rkyv archives to feed voucher-check's
+# WITNESS_BUFFER region — exercises the per-voucher proof path.
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
 
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }

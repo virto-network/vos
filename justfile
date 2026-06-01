@@ -96,6 +96,17 @@ build-clerk-bridge:
     cd actors/clerk-bridge && cargo +nightly actor
 
 
+# Build the voucher-check PVM guest — the binary whose traced
+# execution IS the witness for a Mode::External voucher proof.
+# `start` runs cipher_clerk::voucher::proof::check; zkpvm proves
+# the trace, a verifier checks the proof against the program
+# commitment. Lives under examples/actors/ (not actors/) because
+# it's a guest workload, not a service actor — no Local/Crdt
+# replication, no Ref API consumers.
+build-voucher-check:
+    cd examples/actors/voucher-check && cargo +nightly build --release
+
+
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,

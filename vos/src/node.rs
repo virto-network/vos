@@ -453,7 +453,12 @@ const MAX_CROSS_AGENT_DEPTH: usize = 32;
 /// produces a multi-megabyte reply, not a consensus-history
 /// concern. Replies exceeding this are dropped at the producer
 /// side and surface as `InvokeError::NotFound` at the caller.
-const MAX_PRODUCER_REPLY: usize = 1024 * 1024;
+///
+/// 8 MiB accommodates STARK proof bodies (clerk-prover-extension's
+/// `prove_voucher` returns ~1.4 MiB; future production-config
+/// proofs may exceed 2 MiB) without admitting unboundedly large
+/// replies.
+const MAX_PRODUCER_REPLY: usize = 8 * 1024 * 1024;
 
 /// Send `reply` through `reply_tx` if it's within the producer
 /// cap; otherwise log and drop the channel so the caller gets a

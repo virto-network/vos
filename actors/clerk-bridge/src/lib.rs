@@ -116,6 +116,16 @@ pub enum Status {
     /// voucher is NOT marked redeemed — caller can rebuild the
     /// inflow correctly and retry.
     LedgerRejected = 9,
+    /// Voucher carries `proof.mode == Mode::External` and the
+    /// configured prover extension rejected the proof bytes against
+    /// the voucher's canonical `public_bytes`. Distinguishes a
+    /// cryptographically-invalid External proof from a malformed
+    /// voucher or a bad signature (those still map to
+    /// `VoucherInvalid`). Only reachable when `set_prover` has
+    /// been called with a non-zero id; without a configured prover,
+    /// External-mode vouchers fall through the signature check
+    /// (same trust model as Signature-mode vouchers).
+    ProofInvalid = 10,
 }
 
 // ── Wire types ──────────────────────────────────────────────────
@@ -242,6 +252,14 @@ pub struct ClerkBridge {
     /// vos/tests/elf_integration.rs's voucher-replay coverage
     /// for the rationale.
     received: Vec<[u8; 32]>,
+    /// ServiceId of the `clerk-prover` extension this bridge
+    /// dispatches `Mode::External` voucher-proof verification
+    /// against. `0` means "no prover wired" — External-mode
+    /// vouchers then fall through the wire-signature check
+    /// (same trust model as Signature-mode). Set via
+    /// `set_prover`; persisted across actor restarts as part of
+    /// the rkyv archive.
+    prover_id: u32,
 }
 
 #[messages]
@@ -252,6 +270,7 @@ impl ClerkBridge {
             ivk_secret_bytes: [0u8; 32],
             peers: Vec::new(),
             received: Vec::new(),
+            prover_id: 0,
         }
     }
 
@@ -295,6 +314,30 @@ impl ClerkBridge {
         } else {
             Status::AlreadyBootstrapped
         }
+    }
+
+    /// Configure the `clerk-prover` extension to dispatch
+    /// Mode::External voucher proofs to. Setting `prover_id = 0`
+    /// disables prover dispatch (External-mode vouchers then fall
+    /// through the wire-signature check, same as Signature-mode).
+    ///
+    /// Idempotent in identical arguments. Separate from
+    /// `bootstrap` so the wire ABI stays additive: existing
+    /// callers that don't know about prover dispatch keep working
+    /// with `prover_id` defaulted to 0.
+    #[msg]
+    async fn set_prover(&mut self, prover_id: u32) -> Status {
+        if self.local_ledger_id == 0 {
+            return Status::NotBootstrapped;
+        }
+        self.prover_id = prover_id;
+        Status::Ok
+    }
+
+    /// Diagnostic — current prover ServiceId, or `0` if none.
+    #[msg]
+    async fn prover(&self) -> u32 {
+        self.prover_id
     }
 
     /// Register a peer bank's clerk pubkey under a federation-
@@ -356,13 +399,18 @@ impl ClerkBridge {
     /// so a malformed-but-not-replayed voucher can be re-submitted
     /// after being fixed.
     #[msg]
-    async fn submit_voucher(&mut self, voucher_bytes: Vec<u8>, peer_name: Vec<u8>) -> SubmitVoucherReply {
+    async fn submit_voucher(
+        &mut self,
+        ctx: &mut Context<Self>,
+        voucher_bytes: Vec<u8>,
+        peer_name: Vec<u8>,
+    ) -> SubmitVoucherReply {
         if self.local_ledger_id == 0 {
             return reply(Status::NotBootstrapped);
         }
 
-        let peer = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-            Ok(i) => &self.peers[i],
+        let peer_clerk_pubkey = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => self.peers[i].clerk_pubkey,
             Err(_) => return reply(Status::UnknownPeer),
         };
 
@@ -371,8 +419,19 @@ impl ClerkBridge {
             None => return reply(Status::VoucherInvalid),
         };
 
-        if voucher.verify_signature(&peer.clerk_pubkey).is_err() {
+        if voucher.verify_signature(&peer_clerk_pubkey).is_err() {
             return reply(Status::VoucherInvalid);
+        }
+
+        // Dispatch Mode::External proofs to the configured prover
+        // BEFORE dedup so a rejected proof doesn't poison the dedup
+        // set; same posture as the UnknownPeer rejection above. The
+        // dispatch is a no-op when prover_id == 0 or the voucher's
+        // proof is Signature-mode.
+        if dispatch_external_proof(ctx, self.prover_id, &voucher, &peer_clerk_pubkey).await
+            == Status::ProofInvalid
+        {
+            return reply(Status::ProofInvalid);
         }
 
         // Dedup BEFORE opening the envelope. A replayed voucher
@@ -467,15 +526,20 @@ impl ClerkBridge {
         if self.local_ledger_id == 0 {
             return early_redeem(Status::NotBootstrapped);
         }
-        let peer = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-            Ok(i) => &self.peers[i],
+        let peer_clerk_pubkey = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => self.peers[i].clerk_pubkey,
             Err(_) => return early_redeem(Status::UnknownPeer),
         };
         let Some(voucher) = Voucher::from_bytes(&voucher_bytes) else {
             return early_redeem(Status::VoucherInvalid);
         };
-        if voucher.verify_signature(&peer.clerk_pubkey).is_err() {
+        if voucher.verify_signature(&peer_clerk_pubkey).is_err() {
             return early_redeem(Status::VoucherInvalid);
+        }
+        if dispatch_external_proof(ctx, self.prover_id, &voucher, &peer_clerk_pubkey).await
+            == Status::ProofInvalid
+        {
+            return early_redeem(Status::ProofInvalid);
         }
         let dedup_key = blake2b_256(
             b"clerk-bridge/voucher-redemption/v1",
@@ -589,6 +653,57 @@ fn reply(status: Status) -> SubmitVoucherReply {
         status,
         value: 0,
         blinding: Vec::new(),
+    }
+}
+
+/// Dispatch a Mode::External voucher's proof bytes to the configured
+/// `clerk-prover` extension for verification. Returns:
+///   - `Status::Ok` if the voucher is Signature-mode, OR if
+///     `prover_id == 0`, OR if the prover accepted the proof.
+///   - `Status::ProofInvalid` on any rejection path (prover replied
+///     0, prover panicked, prover not found, prover reply was
+///     non-u8). The bridge collapses every prover-side failure into
+///     a single bucket so the caller can't distinguish "prover
+///     unreachable" from "proof rejected" — same state-hiding
+///     posture as `VoucherInvalid`.
+///
+/// `peer_clerk_pubkey` is folded into the canonical `public_bytes`
+/// since `Voucher.signature` is over the bytes (including proof
+/// bytes) AND the issuer's identity is the clerk pubkey; the
+/// verifier must use the SAME `issuer` field that the prover used.
+/// This is why the bridge passes the peer's pubkey here rather than
+/// letting the extension reconstruct it from somewhere else.
+async fn dispatch_external_proof(
+    ctx: &mut vos::Context<ClerkBridge>,
+    prover_id: u32,
+    voucher: &Voucher,
+    peer_clerk_pubkey: &AuthKey,
+) -> Status {
+    if prover_id == 0 {
+        return Status::Ok;
+    }
+    if voucher.proof.mode != cipher_clerk::proof::Mode::External {
+        return Status::Ok;
+    }
+    let public = cipher_clerk::voucher::proof::Public {
+        issuer: *peer_clerk_pubkey,
+        amount_commit: voucher.amount_commit,
+        state_root_before: voucher.state_root_before,
+        state_root_after: voucher.state_root_after,
+    };
+    let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
+    let msg = vos::value::Msg::new("verify_voucher_proof")
+        .with("public_bytes", public_bytes)
+        .with("proof_bytes", voucher.proof.bytes.clone());
+    match ctx.ask(ServiceId(prover_id), &msg).await {
+        Ok(value) => {
+            if value.as_u8() == Some(1) {
+                Status::Ok
+            } else {
+                Status::ProofInvalid
+            }
+        }
+        Err(_) => Status::ProofInvalid,
     }
 }
 

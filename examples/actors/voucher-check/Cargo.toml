@@ -1,0 +1,69 @@
+[workspace]
+
+[package]
+name = "voucher-check"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` gates the PVM entry-point block (`_start` + `accumulate`)
+# emitted by `#[actor]`. Default-on so a plain `cargo build` for
+# the riscv64em-javm target produces a non-empty ELF; turn off via
+# `default-features = false` when depending on this crate purely
+# as a typed Ref source (no symbols).
+default = ["bin"]
+bin = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+# Mode::External voucher proof — the PVM guest binary whose execution
+# IS the zkpvm-proved witness for cipher_clerk::voucher::proof::check.
+#
+# Two ways the prover invokes this binary:
+#
+#   1. v0 smoke test — `start` builds a hardcoded (Public, Secret)
+#      and runs `check`. Validates the prove/verify pipeline against
+#      cipher-clerk semantics. Hardcoded inputs ⇒ same proof every
+#      call.
+#
+#   2. v1 production — `verify_check(public_bytes, secret_bytes)`
+#      decodes rkyv archives from message args. The prover writes
+#      the args into the actor's input buffer before TracingPvm
+#      runs, so each (Public, Secret) tuple produces a distinct
+#      trace and proof. The proof's `initial_state.memory_commitment`
+#      binds the witness bytes — a verifier reconstructs the same
+#      memory layout from `public_bytes(&public)` and checks the
+#      hash matches.
+#
+# Built via `cargo +nightly actor` (the alias in
+# `.cargo/config.toml`).
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "viewing-keys",
+    "voucher",
+    "pvm-precompile",
+] }
+# cipher-clerk's voucher feature pulls chacha20poly1305 → aead;
+# none of them need getrandom directly. But `signing` (which we DON'T
+# enable here) would — keep it off so the actor's PVM build doesn't
+# drag OsRng/getrandom plumbing.
+#
+# pvm-precompile DELIBERATELY OFF: cipher-clerk's Ristretto path
+# routes through zkpvm's RistrettoCombCompressChip when the
+# precompile is on, which currently emits a `ConstraintsNotSatisfied`
+# failure during prove on this branch (tracked as task #7). Falling
+# back to dalek native lets `Amount::commit` resolve in PVM software
+# arithmetic — slower but proves cleanly against the ALU + Memory
+# chips we know work (fizzbuzz pins this).
+#
+# When task #7 lands, re-enable `pvm-precompile` for a much smaller
+# trace. zkpvm-precompiles is no longer pulled directly — cipher-
+# clerk owns its own path-dep on it via the `pvm-precompile` feature.
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

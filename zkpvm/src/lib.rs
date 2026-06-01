@@ -133,6 +133,15 @@ mod verify;
 // generated impls (which target `::zkpvm::AirColumn`) resolve correctly.
 pub use air_column::{AirColumn, PreprocessedAirColumn};
 
+/// Diagnostics: the full BASE_COMPONENTS slice (no activity filter).
+/// Returns ALL chips, in declaration order. Test harnesses use this
+/// to bisect ConstraintsNotSatisfied failures — force a chip to be
+/// active even when its activity flag would normally drop it.
+#[cfg(feature = "prover")]
+pub fn all_components() -> &'static [&'static dyn framework::MachineProverComponent] {
+    BASE_COMPONENTS
+}
+
 // Ordering rule: all consumers of a lookup table must be listed BEFORE the table
 // chip itself.  Table chips populate their multiplicity column by reading counts
 // that consumers accumulate into SideNote during trace generation.
@@ -217,7 +226,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
 /// the current implementation.  When more chips become conditional
 /// (Phase 60+ followups), each gains a corresponding index check.
 #[cfg(feature = "prover")]
-pub(crate) fn active_components(
+pub fn active_components(
     side_note: &side_note::SideNote,
 ) -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent> {
     let a = activity_from_steps(side_note);
@@ -252,14 +261,18 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         {
             a.blake2b = true;
         }
-        // Phase R1b/R1e-quat — Ristretto chip activity is true if
-        // either an ECALL_RISTRETTO_SCALAR_MULT step is present, OR
-        // the SideNote already carries pre-built field rows (chip-
-        // level tests that skip the ECALL path).
+        // Ristretto scalar-mult ECALL gates RistrettoEcallChip. Whether
+        // RistrettoChip itself is active depends on the *kind* of the
+        // recorded call: Variable scalar mults populate
+        // `ristretto_field_rows` and are handled below; FixedBasepoint
+        // calls route to the comb-method chips (21..=26) and bypass
+        // RistrettoChip. We can't tell the kind from `step.imm` alone,
+        // so activate RistrettoChip only via the `ristretto_field_rows`
+        // post-ingest check; this avoids activating an empty chip when
+        // every scalar mult in the trace was FixedBase.
         if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
             && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64
         {
-            a.ristretto = true;
             a.ristretto_ecall = true;
         }
         // Step 13 ECALL gates: point-add and scalar-reduce-wide

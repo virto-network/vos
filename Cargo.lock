@@ -909,6 +909,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clerk-prover-extension"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake2",
+ "cipher-clerk",
+ "grey-transpiler 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
+ "javm 0.4.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
+ "vos",
+ "zkpvm",
+ "zkpvm-verifier",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
