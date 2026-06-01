@@ -273,13 +273,15 @@ operator who triggers the dev extension's `publish` is still refused
 at the registry, because their `member` role (not the extension's
 trust) is what gets relayed, capped by the declared ceiling.
 
-**v1 limitation**: only the `space-registry` target is resolved by
-name for cap enforcement today (it's the only role-gated actor). A
-named cap for any *other* actor (e.g. `"some-actor:developer"`) is
-currently a no-op — the daemon logs a warning at `space up` and the
-relay falls back to `Caller::Unauthenticated`. To grant authority on
-a non-registry actor, use a wildcard cap (`"*:<role>"`); a tighter
-per-actor binding lands with the service-id → name reverse lookup.
+**Naming any installed actor**: a named cap binds for *any* agent or
+extension this space installs — the daemon resolves the target's
+`ServiceId` back to its instance name through a host-side reverse map
+built at registration. A cap that names an actor the space *doesn't*
+install (a typo) won't bind — the call relays as
+`Caller::Unauthenticated` — and the daemon logs a warning at `space
+up` listing the offending names, so the mistake surfaces immediately.
+Use a wildcard (`"*:<role>"`) to grant authority broadly rather than
+per actor.
 
 ### HTTP gateway and anonymous traffic
 

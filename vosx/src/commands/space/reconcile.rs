@@ -166,6 +166,7 @@ fn register_extension(
     manifest_dir: &Path,
     daemon_prefix: u16,
     space_cap_policy: vos::extension::CapPolicy,
+    known_names: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let so_path = manifest_dir.join(&ext.path);
     if !so_path.exists() {
@@ -275,7 +276,7 @@ fn register_extension(
     if let Some(warning) = intra_caps_wildcard_warning(&ext.name, effective_caps) {
         tracing::warn!("{warning}");
     }
-    if let Some(warning) = unresolvable_cap_warning(&ext.name, effective_caps) {
+    if let Some(warning) = unresolvable_cap_warning(&ext.name, effective_caps, known_names) {
         tracing::warn!("{warning}");
     }
 
@@ -284,6 +285,10 @@ fn register_extension(
     } else {
         ExtensionConfig::with_args(&so_path, &args).with_cap_policy(cap_policy)
     };
+    // Record the instance name so the host's reverse map can resolve
+    // this extension's ServiceId — letting it be the *target* of a
+    // named intra_cap or an actor-local grant.
+    let cfg = cfg.with_name(ext.name.clone());
     let cfg = if ext.relay_unauthenticated {
         cfg.relay_unauthenticated()
     } else {
@@ -370,12 +375,28 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
 /// `Unauthenticated`). Surfacing it at boot keeps a typo'd or
 /// premature cap from vanishing without the operator noticing. `*`
 /// (wildcard-actor) caps always match, so they're exempt.
-fn unresolvable_cap_warning(name: &str, caps: &[vos::IntraCap]) -> Option<String> {
+/// Warn about named `intra_cap` targets that don't correspond to any
+/// actor this space installs. R3 made the host resolve *any* installed
+/// agent or extension by name (via its reverse map), so the host can no
+/// longer say in isolation whether a name is resolvable — the authority
+/// is the manifest's own roster. `known_names` is that roster (every
+/// agent + extension instance name, plus the built-in `space-registry`,
+/// compared case-insensitively to match [`vos::IntraCap`]'s matching).
+/// A named cap outside it is almost certainly a typo: it will silently
+/// relay as `Unauthenticated`, so we flag it at boot. Wildcard-actor
+/// caps (`*:<role>`) match anything and are never flagged.
+fn unresolvable_cap_warning(
+    name: &str,
+    caps: &[vos::IntraCap],
+    known_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let known_lc: std::collections::HashSet<String> =
+        known_names.iter().map(|n| n.to_ascii_lowercase()).collect();
     let mut unresolved: Vec<&str> = caps
         .iter()
         .filter(|c| !c.is_actor_wildcard())
         .filter_map(|c| c.actor_name.as_deref())
-        .filter(|n| !vos::node::cap_target_resolvable(n))
+        .filter(|n| !known_lc.contains(&n.to_ascii_lowercase()))
         .collect();
     if unresolved.is_empty() {
         return None;
@@ -383,10 +404,9 @@ fn unresolvable_cap_warning(name: &str, caps: &[vos::IntraCap]) -> Option<String
     unresolved.sort_unstable();
     unresolved.dedup();
     Some(format!(
-        "extension '{name}': intra_caps name actor(s) the host can't resolve for cap \
-         enforcement in v1 ({}) — only 'space-registry' is resolvable today, so these caps \
-         are NOT applied and calls to those actors relay as Unauthenticated. Use a wildcard \
-         (\"*:<role>\") if you intend to grant authority on other actors.",
+        "extension '{name}': intra_caps name actor(s) this space doesn't install ({}) — likely \
+         a typo. These caps won't bind: calls to those actors relay as Unauthenticated. Name an \
+         installed agent/extension, or use a wildcard (\"*:<role>\") to grant authority broadly.",
         unresolved.join(", "),
     ))
 }
@@ -419,6 +439,17 @@ pub fn reconcile(
         ServiceId::REGISTRY.local_id(),
     ));
 
+    // Every instance name this space installs — the roster a named
+    // intra_cap target is validated against (R3). Includes the built-in
+    // registry, which isn't a manifest entry but is always resolvable.
+    let known_names: std::collections::HashSet<String> = manifest
+        .agents
+        .iter()
+        .map(|a| a.name.clone())
+        .chain(manifest.extensions.iter().map(|e| e.name.clone()))
+        .chain(std::iter::once("space-registry".to_string()))
+        .collect();
+
     // Extensions land first — they're host-local and don't need the
     // registry to *boot*, but each one's meta blob does ride into
     // the registry's `extension_metas` table so `meta_for_instance`
@@ -445,6 +476,7 @@ pub fn reconcile(
                 manifest_dir,
                 daemon_prefix,
                 space_cap_policy,
+                &known_names,
             )?;
         }
     }
@@ -955,29 +987,52 @@ mod tests {
 
     #[test]
     fn unresolvable_named_cap_warns() {
-        // A named cap for a non-registry actor is a silent no-op in v1
-        // (only the registry is resolvable) — warn so it doesn't vanish.
+        // A named cap for an actor the space doesn't install is almost
+        // certainly a typo — warn so it doesn't silently fail to bind.
+        // `dev-project` and the registry are installed; `auth-service`
+        // is not.
+        let known: std::collections::HashSet<String> = ["space-registry", "dev-project"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let caps = vec![
             vos::IntraCap::parse("space-registry:admin").unwrap(),
+            vos::IntraCap::parse("dev-project:developer").unwrap(),
             vos::IntraCap::parse("auth-service:member").unwrap(),
         ];
-        let w = unresolvable_cap_warning("dev", &caps).expect("unresolvable cap warns");
+        let w = unresolvable_cap_warning("dev", &caps, &known).expect("unresolvable cap warns");
         assert!(w.contains("auth-service"), "{w}");
-        assert!(w.contains("NOT applied"), "{w}");
-        // The registry cap is resolvable, so it must NOT be listed.
+        assert!(w.contains("won't bind"), "{w}");
+        // Installed actors must NOT be listed.
         assert!(!w.contains("space-registry:"), "{w}");
+        assert!(!w.contains("dev-project"), "{w}");
     }
 
     #[test]
-    fn no_unresolvable_warning_for_registry_or_wildcards() {
-        // Registry-only caps + wildcard-actor caps are all matchable.
+    fn named_cap_match_against_known_is_case_insensitive() {
+        // IntraCap matching is case-insensitive, so the typo check must
+        // be too — a correctly-named-but-differently-cased cap is fine.
+        let known: std::collections::HashSet<String> =
+            std::iter::once("Dev-Project".to_string()).collect();
+        let caps = vec![vos::IntraCap::parse("dev-project:admin").unwrap()];
+        assert!(unresolvable_cap_warning("dev", &caps, &known).is_none());
+    }
+
+    #[test]
+    fn no_unresolvable_warning_for_known_or_wildcards() {
+        // Installed-actor caps + wildcard-actor caps are all matchable.
+        let known: std::collections::HashSet<String> = ["space-registry", "dev-project"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let caps = vec![
             vos::IntraCap::parse("space-registry:admin").unwrap(),
+            vos::IntraCap::parse("dev-project:admin").unwrap(),
             vos::IntraCap::parse("*:developer").unwrap(),
             vos::IntraCap::parse("*").unwrap(),
         ];
-        assert!(unresolvable_cap_warning("dev", &caps).is_none());
-        assert!(unresolvable_cap_warning("dev", &[]).is_none());
+        assert!(unresolvable_cap_warning("dev", &caps, &known).is_none());
+        assert!(unresolvable_cap_warning("dev", &[], &known).is_none());
     }
 
     #[test]

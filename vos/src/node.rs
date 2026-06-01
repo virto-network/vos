@@ -1625,6 +1625,7 @@ impl VosNode {
         let shutdown = self.shutdown.clone();
         let activity = self.last_activity.clone();
         let invoke_routes = self.invoke_routes.clone();
+        let agent_names = self.agent_names.clone();
 
         let join = thread::spawn(move || {
             extension_thread(
@@ -1634,6 +1635,7 @@ impl VosNode {
                 invoke_rx,
                 outbox,
                 invoke_routes,
+                agent_names,
                 shutdown,
                 activity,
             )
@@ -2992,6 +2994,7 @@ const MAX_DEFERRED: usize = 256;
 // ── Worker thread ────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn extension_thread(
     id: ServiceId,
     config: ExtensionConfig,
@@ -2999,6 +3002,7 @@ fn extension_thread(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     invoke_routes: InvokeRoutes,
+    agent_names: AgentNames,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult {
@@ -3054,6 +3058,7 @@ fn extension_thread(
             invoke_rx,
             outbox,
             invoke_routes,
+            agent_names,
             shutdown,
             activity,
         );
@@ -3244,39 +3249,13 @@ fn current_relay_caller() -> Option<PropagatedCaller> {
     RELAY_CALLER.with(|c| c.borrow().clone())
 }
 
-/// Well-known instance name of the space registry — the one target
-/// whose ServiceId (the fixed [`ServiceId::REGISTRY`]) the host can
-/// map back to a name without a reverse lookup. Other gated actors
-/// would need a service-id → name probe (a documented v1 limitation,
-/// mirroring the libp2p dispatch path's registry-only actor-local
-/// lookup); the registry is the only role-gated actor today.
+/// Well-known instance name of the space registry. Used by
+/// [`VosNode::record_agent_name`] to seed the [`AgentNames`] reverse
+/// map for the registry's fixed [`ServiceId::REGISTRY`] even when it's
+/// registered from a bare `AgentConfig`, so the registry resolves
+/// name-from-id through the same map as every other installed agent
+/// rather than via a special case.
 const REGISTRY_AGENT_NAME: &str = "space-registry";
-
-/// Map an outbound target id to the agent name the cap table keys on.
-/// v1 resolves only the registry (well-known [`ServiceId::REGISTRY`]);
-/// other targets return `None` and so match only `*` (any-actor)
-/// caps. Sufficient because the registry is the only actor with
-/// role-gated handlers today — ungated targets accept the
-/// `Unauthenticated` relay regardless.
-fn relay_target_name(target: u32) -> Option<&'static str> {
-    if target & 0xFFFF == ServiceId::REGISTRY.local_id() as u32 {
-        Some(REGISTRY_AGENT_NAME)
-    } else {
-        None
-    }
-}
-
-/// Whether a *named* intra_cap target can be matched at dispatch time.
-/// The companion to [`relay_target_name`]: a named cap is only ever
-/// applied when some target id maps back to that name, which v1 does
-/// solely for the registry. So a named cap for any other actor is a
-/// silent no-op (the relay falls back to `Unauthenticated`) — install
-/// tooling warns operators rather than letting the cap vanish. `*`
-/// (wildcard-actor) caps are always matchable, so they don't go
-/// through this check.
-pub fn cap_target_resolvable(actor_name: &str) -> bool {
-    actor_name.eq_ignore_ascii_case(REGISTRY_AGENT_NAME)
-}
 
 /// Compute the `(caller, space_role byte)` a service-mode extension
 /// relays for an outbound call to `target_name`, applying the
@@ -3352,6 +3331,7 @@ fn run_service_extension(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     invoke_routes: InvokeRoutes,
+    agent_names: AgentNames,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult {
@@ -3374,6 +3354,9 @@ fn run_service_extension(
     // default, and what `relay_unauthenticated` collapses to) means
     // every outbound call relays as `Caller::Unauthenticated`.
     let intra_caps = config.intra_caps.clone();
+    // R3 — the node's reverse map, read live so an `intra_cap` naming
+    // *any* installed actor (not just the registry) resolves and binds.
+    let relay_agent_names = agent_names.clone();
     let invoke_fn: std::sync::Arc<crate::extension::InvokeFn> = std::sync::Arc::new(
         move |target: u32, payload: &[u8], timeout_ms: u64| -> Option<Vec<u8>> {
             let tx = invoke_routes_for_ctx
@@ -3381,17 +3364,24 @@ fn run_service_extension(
                 .ok()
                 .and_then(|m| m.get(&target).cloned())?;
             let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
-            // M2 + M3 — transparent, *bounded* relay. Forward the
-            // caller of the invoke this extension is currently
-            // handling (not the extension's own id — the C2 bypass),
-            // intersected with the extension's declared cap ceiling
-            // for the target. One path: a relay-mode / no-caps
-            // extension and a run()-thread call both resolve to
-            // `Unauthenticated` here, so role-gated handlers refuse.
+            // M2 + M3 + R3 — transparent, *bounded* relay. Forward the
+            // caller of the invoke this extension is currently handling
+            // (not the extension's own id — the C2 bypass), intersected
+            // with the extension's declared cap ceiling for the target.
+            // The target's name comes from the host's reverse map, so a
+            // declared cap binds for any installed actor; an unresolved
+            // target (anonymous / not yet registered) matches only `*`
+            // caps. One path: a relay-mode / no-caps extension and a
+            // run()-thread call both resolve to `Unauthenticated` here,
+            // so role-gated handlers refuse.
+            let target_name = relay_agent_names
+                .read()
+                .ok()
+                .and_then(|m| m.get(&local_id_of(target)).cloned());
             let (caller, space_role) = resolve_relay_caller(
                 current_relay_caller().as_ref(),
                 &intra_caps,
-                relay_target_name(target),
+                target_name.as_deref(),
             );
             tx.send(InvokeRequest {
                 caller,
@@ -3944,18 +3934,30 @@ mod tests {
     }
 
     #[test]
-    fn relay_target_name_resolves_only_registry() {
+    fn relay_resolves_target_names_through_the_reverse_map() {
+        // R3 — the relay path resolves *any* installed actor's name
+        // from the same reverse map the libp2p gate uses, superseding
+        // the old registry-only `relay_target_name`. The registry seeds
+        // itself…
+        let node = VosNode::new();
+        node.record_agent_name(ServiceId::REGISTRY, None);
+        node.record_agent_name(ServiceId::new(0, 0x0444), Some("dev-project".into()));
+
+        // Registry resolves (and still does under a node prefix — low
+        // 16 bits zero).
         assert_eq!(
-            relay_target_name(ServiceId::REGISTRY.0),
-            Some(REGISTRY_AGENT_NAME),
+            node.agent_name_for(ServiceId::REGISTRY.0).as_deref(),
+            Some(REGISTRY_AGENT_NAME)
         );
-        // Registry under a node prefix still resolves (low 16 bits 0).
         assert_eq!(
-            relay_target_name(ServiceId::new(0xBEEF, 0).0),
-            Some(REGISTRY_AGENT_NAME),
+            node.agent_name_for(ServiceId::new(0xBEEF, 0).0).as_deref(),
+            Some(REGISTRY_AGENT_NAME)
         );
-        // Any other local id is unresolved → matches only `*` caps.
-        assert_eq!(relay_target_name(ServiceId::new(0, 7).0), None);
+        // …and so does a non-registry installed agent — the cap for it
+        // now binds instead of silently vanishing.
+        assert_eq!(node.agent_name_for(0x0444).as_deref(), Some("dev-project"));
+        // An unregistered id stays unresolved → matches only `*` caps.
+        assert_eq!(node.agent_name_for(0x0007), None);
     }
 
     #[test]
@@ -4063,18 +4065,6 @@ mod tests {
             Some(SpaceRole::Admin.as_u8()),
             "full wildcard matches unresolved targets too"
         );
-    }
-
-    #[test]
-    fn cap_target_resolvable_only_registry() {
-        // A named cap is enforceable only when its actor maps back to a
-        // target id — v1 resolves just the registry (case-insensitive).
-        assert!(cap_target_resolvable("space-registry"));
-        assert!(cap_target_resolvable("SPACE-REGISTRY"));
-        // Any other named actor is a silent no-op today; install tooling
-        // warns on these so the operator isn't surprised.
-        assert!(!cap_target_resolvable("dev-project"));
-        assert!(!cap_target_resolvable("auth-service"));
     }
 
     #[test]
