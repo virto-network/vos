@@ -81,6 +81,13 @@ pub enum Consistency {
 pub struct AgentConfig {
     /// PVM blob (already transpiled).
     pub blob: Vec<u8>,
+    /// Installed instance name, recorded in the node's [`AgentNames`]
+    /// reverse map at register time so the auth path can resolve this
+    /// agent's `ServiceId` back to a name (actor-local grant probes,
+    /// `intra_caps` targets). `None` for anonymous/test agents — the
+    /// reverse map simply gets no row, and name-keyed auth lookups fall
+    /// back to deny (the prior behaviour for every non-registry target).
+    pub name: Option<String>,
     /// Initial payloads to deliver on startup.
     pub init_payloads: Vec<Vec<u8>>,
     /// Pre-populated storage entries (key, value).
@@ -143,6 +150,7 @@ impl AgentConfig {
     pub fn new(blob: Vec<u8>) -> Self {
         Self {
             blob,
+            name: None,
             init_payloads: Vec::new(),
             storage: Vec::new(),
             data_dir: None,
@@ -170,6 +178,15 @@ impl AgentConfig {
     /// Attach initial payloads dispatched on cold start.
     pub fn with_init_payloads(mut self, payloads: Vec<Vec<u8>>) -> Self {
         self.init_payloads = payloads;
+        self
+    }
+
+    /// Record the agent's installed instance name so the node's
+    /// [`AgentNames`] reverse map can resolve its `ServiceId` back to a
+    /// name for the auth path. Set by `vosx` from the manifest/registry
+    /// at install time; left unset for anonymous test agents.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -230,6 +247,12 @@ impl AgentConfig {
 pub struct ExtensionConfig {
     /// Path to the extension `.so` file.
     pub path: std::path::PathBuf,
+    /// Installed instance name, recorded in the node's [`AgentNames`]
+    /// reverse map at register time. Mirrors [`AgentConfig::name`] for
+    /// the extension side — lets an extension be the *target* of a
+    /// named `intra_cap` and of actor-local grants. `None` for
+    /// anonymous/test extensions.
+    pub name: Option<String>,
     /// rkyv-encoded `vos::value::Args` for the extension's constructor.
     /// Empty if the constructor takes no parameters.
     pub init_args: Vec<u8>,
@@ -272,6 +295,7 @@ impl ExtensionConfig {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             path: path.into(),
+            name: None,
             init_args: Vec::new(),
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
@@ -287,12 +311,22 @@ impl ExtensionConfig {
             .to_vec();
         Self {
             path: path.into(),
+            name: None,
             init_args: bytes,
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
             relay_unauthenticated: false,
             intra_caps: Vec::new(),
         }
+    }
+
+    /// Record the extension's installed instance name so the node's
+    /// [`AgentNames`] reverse map can resolve its `ServiceId` back to a
+    /// name. Set by `vosx` from the manifest; left unset for test
+    /// extensions.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     /// Mark the extension as a relay for external traffic — its
@@ -476,6 +510,12 @@ pub struct VosNode {
     /// at thread spawn time) freezes A's view of the world before
     /// B exists, breaking cross-agent invoke order-independent.
     invoke_routes: InvokeRoutes,
+    /// Reverse map `local_id → instance name`, populated at register
+    /// time and read live by the auth path (the libp2p gate's
+    /// actor-local probe and extension relays). Shared (cheap clone)
+    /// into [`NodeService`] and into each service-extension thread.
+    /// See [`AgentNames`].
+    agent_names: AgentNames,
     /// Set by [`VosNode::run_until_idle`] (or `collect`) when the
     /// node decides it's done. Threads poll this at the top of
     /// their main loop and exit cleanly. Replaces the per-agent
@@ -539,6 +579,33 @@ pub(crate) struct ReplicaSlot {
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
+
+/// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
+/// installed instance name. The companion to `InvokeRoutes` for the
+/// auth path: where `InvokeRoutes` answers "which channel reaches this
+/// ServiceId?", this answers "what instance name *is* this ServiceId?"
+/// so the libp2p gate ([`NodeService::dispatch_invoke`]) and extension
+/// relays ([`run_service_extension`]'s `invoke_fn`) can resolve a
+/// target's name for actor-local grant probes and `intra_caps`
+/// enforcement.
+///
+/// Keyed on the **low 16 bits** because `instance_service_id` hashes the
+/// name into the local half and ORs the node prefix into the high half
+/// (see `space_registry::instance_service_id`); the name↔local_id
+/// relation is therefore prefix-independent — a replica of the same
+/// instance on another node shares the entry. Distinct names *can*
+/// collide in the ~15-bit local space; the map is last-writer-wins on
+/// collision (the registry's id derivation has the same exposure) and
+/// `register_*_inner` logs a WARN when an insert overwrites a different
+/// name. `RwLock` because reads are hot (every dispatch / relay) and
+/// writes happen once per `register`.
+type AgentNames = Arc<std::sync::RwLock<HashMap<u16, String>>>;
+
+/// Mask a (possibly prefix-scoped) `ServiceId` value down to its
+/// prefix-independent local id — the key space of [`AgentNames`].
+fn local_id_of(svc_id: u32) -> u16 {
+    (svc_id & 0xFFFF) as u16
+}
 
 /// Thread-safe handle for invoking local services. Returned by
 /// [`VosNode::invoke_handle`] so background tasks can keep
@@ -619,6 +686,12 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 #[cfg(feature = "network")]
 struct NodeService {
     invoke_routes: InvokeRoutes,
+    /// Clone of the node's [`AgentNames`] reverse map, read by
+    /// [`Self::dispatch_invoke`] to resolve the target's instance name
+    /// for the actor-local grant probe — so an operator-written
+    /// actor-local grant enforces for *any* installed agent, not just
+    /// the registry.
+    agent_names: AgentNames,
     #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
@@ -717,6 +790,19 @@ impl NodeService {
         let reply_bytes = unwrap_invoke_envelope(&envelope)?;
         decode_u8_reply(&reply_bytes)
     }
+
+    /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
+    /// to the installed instance name registered for it. Reads the
+    /// node's shared [`AgentNames`] reverse map; `None` for ids this
+    /// node never registered. Mirror of [`VosNode::agent_name_for`]
+    /// over the cloned handle the network service holds.
+    fn agent_name_for(&self, svc_id: u32) -> Option<String> {
+        self.agent_names
+            .read()
+            .ok()?
+            .get(&local_id_of(svc_id))
+            .cloned()
+    }
 }
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
@@ -792,19 +878,21 @@ impl crate::network::NetworkService for NodeService {
         };
         // M5 — populate the role bytes for Peer callers so the
         // actor's M6 macro-emitted check has the inputs it needs.
-        // Space-level grant always probed; actor-local grant
-        // probed for the registry target (the only target with a
-        // host-known agent name in v1; other targets stay None
-        // until the service-id → name reverse lookup lands).
+        // Space-level grant always probed; actor-local grant probed
+        // against whichever installed agent the target resolves to via
+        // the host's reverse map. R2 generalised this beyond the
+        // registry: an operator's `space role <agent> --in <agent>`
+        // grant now enforces for *any* installed agent, not just
+        // space-registry. Targets the host never registered (anonymous,
+        // cross-node) resolve to `None` → no actor-local grant, which
+        // is the correct deny-by-omission.
         let (space_role, actor_local_role) = match &caller {
             crate::actors::Caller::Peer(_) => {
                 let space = self.lookup_caller_role(caller_peer_id.as_ref());
-                let actor_local =
-                    if to_unscoped == crate::abi::service::ServiceId::REGISTRY.local_id() as u32 {
-                        self.lookup_caller_actor_role(caller_peer_id.as_ref(), REGISTRY_AGENT_NAME)
-                    } else {
-                        AUTH_ROLE_NONE
-                    };
+                let actor_local = match self.agent_name_for(to_unscoped) {
+                    Some(name) => self.lookup_caller_actor_role(caller_peer_id.as_ref(), &name),
+                    None => AUTH_ROLE_NONE,
+                };
                 (
                     (space != AUTH_ROLE_NONE).then_some(space),
                     (actor_local != AUTH_ROLE_NONE).then_some(actor_local),
@@ -1200,6 +1288,7 @@ impl VosNode {
             outbox_tx,
             outbox_rx,
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
+            agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "network")]
@@ -1250,6 +1339,7 @@ impl VosNode {
         // trait's empty-reply defaults.
         let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
+            agent_names: self.agent_names.clone(),
             #[cfg(feature = "storage")]
             replicas: self.crdt_replicas.clone(),
             manifest: self.manifest.clone(),
@@ -1294,6 +1384,56 @@ impl VosNode {
         ServiceId::new(self.node_prefix, local)
     }
 
+    /// Record an installed instance name in the [`AgentNames`] reverse
+    /// map under its local id. Called by both `register_inner` and
+    /// `register_extension_inner` so every registered service is
+    /// resolvable name-from-id by the auth path.
+    ///
+    /// The well-known `space-registry` name is filled in for the
+    /// registry's fixed id even when the caller passed no name (vosx
+    /// registers the registry from a bare `AgentConfig`), so the gate
+    /// resolves the registry through the map uniformly instead of via a
+    /// hardcoded special case. A WARN fires when an insert would
+    /// overwrite a *different* existing name — a `local_id` collision in
+    /// the ~15-bit instance space (`instance_service_id` masks to
+    /// `0x100..=0x7FFF`); last-writer-wins, matching the registry's own
+    /// id derivation.
+    fn record_agent_name(&self, id: ServiceId, name: Option<String>) {
+        let local = local_id_of(id.0);
+        let name = name.or_else(|| {
+            (local == ServiceId::REGISTRY.local_id()).then(|| REGISTRY_AGENT_NAME.to_string())
+        });
+        let Some(name) = name else { return };
+        let Ok(mut map) = self.agent_names.write() else {
+            return;
+        };
+        if let Some(prev) = map.get(&local) {
+            if prev != &name {
+                warn!(
+                    local_id = local,
+                    previous = %prev,
+                    new = %name,
+                    "register: instance-name collision on local id; \
+                     auth reverse-lookup will use the latest name"
+                );
+            }
+        }
+        map.insert(local, name);
+    }
+
+    /// Resolve a (possibly prefix-scoped) `ServiceId` value back to the
+    /// installed instance name registered for it, if any. The public
+    /// reverse lookup backing actor-local grant probes and `intra_caps`
+    /// targeting. Returns `None` for ids this node never registered
+    /// (anonymous agents, cross-node targets the gate doesn't run for).
+    pub fn agent_name_for(&self, svc_id: u32) -> Option<String> {
+        self.agent_names
+            .read()
+            .ok()?
+            .get(&local_id_of(svc_id))
+            .cloned()
+    }
+
     /// Register an agent at an explicit `ServiceId` instead of
     /// auto-allocating one. Used for well-known slots like the
     /// hyperspace registry which always lives at
@@ -1319,6 +1459,7 @@ impl VosNode {
 
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
+        self.record_agent_name(id, config.name.clone());
 
         // Pre-open the redb database for CRDT actors that declare
         // a replication group, so the same `Arc<Database>` powers
@@ -1479,6 +1620,7 @@ impl VosNode {
 
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
+        self.record_agent_name(id, config.name.clone());
 
         let shutdown = self.shutdown.clone();
         let activity = self.last_activity.clone();
@@ -4542,5 +4684,185 @@ mod tests {
         for r in &results {
             assert_eq!(r.panics, 0, "extension {} panicked: {:?}", r.id, r.error);
         }
+    }
+
+    // ── R1: host-side local_id → name reverse map ──────────────────
+
+    #[test]
+    fn local_id_of_masks_to_low_16_bits() {
+        assert_eq!(local_id_of(0x00A3_0123), 0x0123);
+        assert_eq!(local_id_of(0xFFFF_BEEF), 0xBEEF);
+        assert_eq!(local_id_of(ServiceId::REGISTRY.0), 0);
+    }
+
+    #[test]
+    fn with_name_sets_config_name() {
+        assert_eq!(
+            AgentConfig::new(Vec::new())
+                .with_name("counter")
+                .name
+                .as_deref(),
+            Some("counter")
+        );
+        assert_eq!(
+            ExtensionConfig::new("plugin.so")
+                .with_name("gateway")
+                .name
+                .as_deref(),
+            Some("gateway")
+        );
+        // Default: anonymous, so the reverse map simply gets no row.
+        assert_eq!(AgentConfig::new(Vec::new()).name, None);
+        assert_eq!(ExtensionConfig::new("plugin.so").name, None);
+    }
+
+    #[test]
+    fn record_agent_name_populates_and_resolves_prefix_independently() {
+        let node = VosNode::with_prefix(0x0042);
+        node.record_agent_name(ServiceId::new(0x0042, 0x0321), Some("dev-project".into()));
+        // Resolvable by the full prefix-scoped id…
+        assert_eq!(
+            node.agent_name_for(ServiceId::new(0x0042, 0x0321).0)
+                .as_deref(),
+            Some("dev-project")
+        );
+        // …and by any value sharing the low 16 bits (a replica of the
+        // same instance on another node reuses the entry).
+        assert_eq!(node.agent_name_for(0x0321).as_deref(), Some("dev-project"));
+        assert_eq!(
+            node.agent_name_for(0xBEEF_0321).as_deref(),
+            Some("dev-project")
+        );
+        // An id this node never registered → None (deny-by-omission).
+        assert_eq!(node.agent_name_for(0x0999), None);
+    }
+
+    #[test]
+    fn record_agent_name_seeds_registry_name_without_explicit_name() {
+        // vosx registers the registry from a bare AgentConfig (name =
+        // None); the well-known registry id still resolves so the gate
+        // can treat it uniformly through the map.
+        let node = VosNode::new();
+        node.record_agent_name(ServiceId::REGISTRY, None);
+        assert_eq!(
+            node.agent_name_for(ServiceId::REGISTRY.0).as_deref(),
+            Some(REGISTRY_AGENT_NAME)
+        );
+    }
+
+    #[test]
+    fn record_agent_name_non_registry_without_name_is_noop() {
+        let node = VosNode::new();
+        node.record_agent_name(ServiceId::new(0, 0x0500), None);
+        assert_eq!(node.agent_name_for(0x0500), None);
+    }
+
+    #[test]
+    fn instance_name_collision_is_last_writer_wins() {
+        // Two distinct prefixes collide on the same local id (a
+        // ~15-bit-space collision). The map keys on the local half, so
+        // the later write wins — documented, matching the registry's
+        // own id derivation. (Also fires the WARN in record_agent_name.)
+        let node = VosNode::new();
+        node.record_agent_name(ServiceId::new(0x0001, 0x0300), Some("alpha".into()));
+        node.record_agent_name(ServiceId::new(0x0002, 0x0300), Some("beta".into()));
+        assert_eq!(node.agent_name_for(0x0300).as_deref(), Some("beta"));
+    }
+
+    // ── R2: libp2p actor-local probe generalised beyond the registry ──
+
+    /// The host now resolves *any* installed agent's name from the
+    /// reverse map and probes its actor-local grant — closing I1, where
+    /// an operator's `--in <agent>` grant for a non-registry target was
+    /// silently dropped. Drives the real `dispatch_invoke` against a
+    /// mock registry (records the probed name) and a target sink
+    /// (captures the delivered `actor_local_role`).
+    #[cfg(feature = "network")]
+    #[test]
+    fn dispatch_probes_actor_local_grant_for_any_installed_agent() {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::run::STATUS_DONE;
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let target = ServiceId::new(0, 0x0444);
+        const TARGET_NAME: &str = "dev-project";
+        const ACTOR_LOCAL_ROLE: u8 = 3; // Admin grant on that actor.
+
+        // Mock registry on route 0: answers the peer_role + actor_role
+        // probes, recording which agent_name the actor-local probe asked
+        // about.
+        let (reg_tx, reg_rx) = mpsc::channel::<InvokeRequest>();
+        let probed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let probed_w = probed.clone();
+        let reg = thread::spawn(move || {
+            while let Ok(req) = reg_rx.recv() {
+                // payload = [TAG_DYNAMIC] ++ rkyv(Msg)
+                let msg = <Msg as Decode>::try_decode(&req.msg[1..]).expect("decode probe");
+                let role = match msg.name.as_str() {
+                    "actor_role" => {
+                        probed_w
+                            .lock()
+                            .unwrap()
+                            .push(msg.args.get_str("agent_name").unwrap_or_default());
+                        ACTOR_LOCAL_ROLE
+                    }
+                    _ => AUTH_ROLE_NONE, // peer_role and anything else
+                };
+                let reply = encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(role).encode());
+                let _ = req.reply_tx.send(reply);
+            }
+        });
+
+        // Target sink: capture the actor_local_role the host delivered,
+        // then reply so dispatch_invoke returns.
+        let (tgt_tx, tgt_rx) = mpsc::channel::<InvokeRequest>();
+        let delivered: Arc<Mutex<Option<Option<u8>>>> = Arc::new(Mutex::new(None));
+        let delivered_w = delivered.clone();
+        let sink = thread::spawn(move || {
+            if let Ok(req) = tgt_rx.recv() {
+                *delivered_w.lock().unwrap() = Some(req.actor_local_role);
+                let _ = req
+                    .reply_tx
+                    .send(encode_invoke_envelope(STATUS_DONE, &[], &[]));
+            }
+        });
+
+        let mut routes = HashMap::new();
+        routes.insert(ServiceId::REGISTRY.0, reg_tx);
+        routes.insert(target.0, tgt_tx);
+        let mut names = HashMap::new();
+        names.insert(local_id_of(target.0), TARGET_NAME.to_string());
+
+        let service = NodeService {
+            invoke_routes: Arc::new(Mutex::new(routes)),
+            agent_names: Arc::new(std::sync::RwLock::new(names)),
+            #[cfg(feature = "storage")]
+            replicas: Arc::new(Mutex::new(HashMap::new())),
+            manifest: Arc::new(OnceLock::new()),
+        };
+
+        let peer = libp2p::PeerId::random();
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&Msg::new("do_admin_thing").encode());
+        let _ = service.dispatch_invoke(Some(peer), 0, target.0, vec![], payload);
+
+        // The actor-local probe was issued for the TARGET's name — not
+        // the hardcoded registry name — and only once.
+        assert_eq!(
+            probed.lock().unwrap().as_slice(),
+            &[TARGET_NAME.to_string()],
+            "actor-local grant must be probed for the resolved target name"
+        );
+        // …and the resolved grant byte reached the target actor.
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            Some(Some(ACTOR_LOCAL_ROLE)),
+            "host must deliver the actor-local override to the target"
+        );
+
+        drop(service); // close the senders so the mock threads exit.
+        reg.join().unwrap();
+        sink.join().unwrap();
     }
 }

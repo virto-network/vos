@@ -414,7 +414,9 @@ fn spawn_installed_agents(
             continue;
         };
 
-        let mut cfg = AgentConfig::new(blob).with_consistency(consistency);
+        let mut cfg = AgentConfig::new(blob)
+            .with_name(a.instance_name.clone())
+            .with_consistency(consistency);
         if matches!(
             consistency,
             Consistency::Local | Consistency::Crdt | Consistency::Raft
