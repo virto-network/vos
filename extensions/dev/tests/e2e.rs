@@ -1605,3 +1605,61 @@ fn dev_project_main_branch_survives_daemon_restart() {
     );
     assert_eq!(ast_get.bytes, ast_blob, "AST blob bytes must round-trip");
 }
+
+/// Approach-C cap surfacing: the daemon records each service
+/// extension's effective `intra_caps` in its endpoint descriptor at
+/// boot, and `space caps` / `space describe` render them. The dev
+/// manifest declares `intra_caps = ["space-registry:admin"]`, so both
+/// surfaces must show that for the `dev` extension — no boot-log
+/// scraping required.
+#[test]
+fn dev_relay_caps_surfaced_via_caps_and_describe() {
+    ensure_built();
+    let daemon = boot_daemon();
+
+    // `space caps <space>` lists every extension's relay caps.
+    let all = run_cli(
+        &daemon,
+        &["space", "caps", &daemon.space_name],
+        "vosx space caps",
+    );
+    assert!(
+        all.contains("dev") && all.contains("space-registry:admin"),
+        "space caps should list dev's relay cap, got:\n{all}"
+    );
+
+    // Filtered to the one instance.
+    let one = run_cli(
+        &daemon,
+        &["space", "caps", &daemon.space_name, "dev"],
+        "vosx space caps dev",
+    );
+    assert!(
+        one.contains("space-registry:admin"),
+        "space caps dev should show the declared cap, got:\n{one}"
+    );
+
+    // A non-extension name is rejected with guidance.
+    let (code, _out, err) = run_cli_capture(
+        &daemon,
+        &["space", "caps", &daemon.space_name, "space-registry"],
+        "vosx space caps space-registry",
+    );
+    assert_ne!(code, 0, "caps for a non-extension should fail");
+    assert!(
+        err.contains("not a service extension"),
+        "expected a helpful error, got:\n{err}"
+    );
+
+    // `space describe <space> dev` adds a `relay caps:` line distinct
+    // from the host-ABI `caps:` line.
+    let desc = run_cli(
+        &daemon,
+        &["space", "describe", &daemon.space_name, "dev"],
+        "vosx space describe dev",
+    );
+    assert!(
+        desc.contains("relay caps:") && desc.contains("space-registry:admin"),
+        "describe should show a relay caps line, got:\n{desc}"
+    );
+}

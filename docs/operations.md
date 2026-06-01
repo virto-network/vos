@@ -259,14 +259,26 @@ intra_caps = ["space-registry:admin"]
   warning at `space up` for any-actor wildcards; prefer naming each
   target explicitly.
 
-At boot the daemon logs each extension's effective caps, so `vosx
-space up` output is the source of truth for what an extension may
-relay:
+At boot the daemon logs each extension's effective caps:
 
 ```
 INFO vosx: extension 'dev' intra_caps: space-registry:admin
 INFO vosx: extension 'gateway' intra_caps: (none — outbound calls relay as Unauthenticated)
 ```
+
+You don't have to scrape the log, though — query the running daemon:
+
+```sh
+vosx space caps <space>              # all extensions' relay caps
+vosx space caps <space> dev          # just one
+vosx space describe <space> dev      # schema + a `relay caps:` line
+```
+
+These read the caps the *running* daemon actually loaded (recorded in
+its local endpoint descriptor at boot), so they reflect enforced policy
+rather than whatever the manifest on disk currently says. The caps are
+per-daemon host config, not replicated registry state, so `space caps`
+describes the daemon you're pointed at.
 
 The bound applies regardless of who called the extension: a `member`
 operator who triggers the dev extension's `publish` is still refused

@@ -46,6 +46,11 @@ pub struct DaemonClient {
     /// Cached so command handlers can access the entry the
     /// query resolved to (e.g. for printing the space name).
     pub entry: SpaceEntry,
+    /// The endpoint descriptor read at connect time. Retained so
+    /// handlers can read daemon-published diagnostics (e.g. each
+    /// extension's effective `intra_caps`) without re-reading the
+    /// file.
+    pub endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
 }
 
@@ -139,6 +144,7 @@ impl DaemonClient {
             node,
             entry,
             daemon_prefix: ep.prefix,
+            endpoint: ep,
         })
     }
 

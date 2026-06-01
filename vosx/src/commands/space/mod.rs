@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 pub mod agents;
 pub mod call;
+pub mod caps;
 pub mod client;
 pub mod common;
 pub mod describe;
@@ -213,6 +214,17 @@ pub enum SpaceCommand {
         /// Instance name as it appears in `vosx space agents`.
         instance: String,
     },
+    /// Show the effective relay `intra_caps` the running daemon
+    /// loaded for each service extension — the per-target role
+    /// ceilings an extension may relay (deny-all when empty).
+    /// Daemon-local host policy, read from the endpoint descriptor.
+    /// Pass an instance to filter; `--format json` for machine
+    /// consumption.
+    Caps {
+        space: String,
+        /// Optional extension instance name to filter to.
+        instance: Option<String>,
+    },
     /// Manage Node + Identity members. Subcommands: list,
     /// add-node, remove-node, add-identity, remove-identity.
     /// Bare `space members <space>` lists.
@@ -360,6 +372,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         }),
         SpaceCommand::Agents { space } => agents::run(&space),
         SpaceCommand::Describe { space, instance } => describe::run(&space, &instance),
+        SpaceCommand::Caps { space, instance } => caps::run(&space, instance.as_deref()),
         SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
         SpaceCommand::Role { space, command } => role::run(role::Args { space, command }),
         SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),

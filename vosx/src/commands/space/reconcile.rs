@@ -175,7 +175,7 @@ fn register_extension(
     daemon_prefix: u16,
     space_cap_policy: vos::extension::CapPolicy,
     known_names: &std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let so_path = manifest_dir.join(&ext.path);
     if !so_path.exists() {
         anyhow::bail!(
@@ -265,17 +265,19 @@ fn register_extension(
         );
     }
 
-    // M4 — operator visibility. The boot log is the authoritative
-    // surface for what an extension may relay: intra_caps are
-    // host-side daemon config (not registry state), so `vosx space
-    // describe` — which renders the registry's `.vos_meta` — can't
-    // show them. Render the *effective* caps (relay mode collapses to
-    // none) and warn loudly on footgun wildcards.
+    // M4 — operator visibility. `intra_caps` are host-side daemon
+    // config (not replicated registry state). Render the *effective*
+    // caps (relay mode collapses to none) for the boot log, warn
+    // loudly on footgun wildcards, and capture the canonical tokens to
+    // return — the caller stamps them into the local endpoint
+    // descriptor so `space describe` / `space caps` can surface them
+    // without scraping the log.
     let effective_caps: &[vos::IntraCap] = if ext.relay_unauthenticated {
         &[]
     } else {
         &intra_caps
     };
+    let effective_tokens: Vec<String> = effective_caps.iter().map(|c| c.to_string()).collect();
     tracing::info!(
         "extension '{}' intra_caps: {}",
         ext.name,
@@ -339,7 +341,7 @@ fn register_extension(
     // own dlopen — the library stays mapped throughout.
     drop(plugin);
 
-    Ok(())
+    Ok(effective_tokens)
 }
 
 /// Render an extension's declared intra_caps for the operator-facing
@@ -439,8 +441,14 @@ pub fn reconcile(
     manifest: &Manifest,
     manifest_dir: &Path,
     daemon_prefix: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<crate::commands::space::endpoint::ExtensionCaps>> {
+    use crate::commands::space::endpoint::ExtensionCaps;
     validate_manifest_names(manifest)?;
+
+    // Effective relay caps per extension, returned to the caller for
+    // the local endpoint descriptor (the `space describe` / `space
+    // caps` surface).
+    let mut ext_caps: Vec<ExtensionCaps> = Vec::new();
 
     let reg = SpaceRegistryRef::at(ServiceId::new(
         daemon_prefix,
@@ -477,7 +485,7 @@ pub fn reconcile(
             None => vos::extension::CapPolicy::default(),
         };
         for ext in &manifest.extensions {
-            register_extension(
+            let caps = register_extension(
                 node,
                 &reg,
                 ext,
@@ -486,11 +494,15 @@ pub fn reconcile(
                 space_cap_policy,
                 &known_names,
             )?;
+            ext_caps.push(ExtensionCaps {
+                name: ext.name.clone(),
+                caps,
+            });
         }
     }
 
     if manifest.agents.is_empty() {
-        return Ok(());
+        return Ok(ext_caps);
     }
     tracing::info!(
         "reconciling manifest ({} agent definition(s))",
@@ -513,7 +525,7 @@ pub fn reconcile(
         reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids)?;
     }
 
-    Ok(())
+    Ok(ext_caps)
 }
 
 fn reconcile_one(

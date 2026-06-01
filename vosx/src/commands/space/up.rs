@@ -166,9 +166,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // Reconcile the optional --manifest BEFORE we spawn the
     // currently-installed agents, so manifest-introduced
-    // agents land in the same boot.
+    // agents land in the same boot. Reconcile returns each
+    // extension's effective relay caps, which we stamp into the
+    // local endpoint descriptor below so `space describe` /
+    // `space caps` can surface them.
+    let mut extension_caps = Vec::new();
     if let Some((manifest, manifest_dir)) = parsed_manifest {
-        crate::commands::space::reconcile::reconcile(
+        extension_caps = crate::commands::space::reconcile::reconcile(
             &mut node,
             &manifest,
             &manifest_dir,
@@ -192,7 +196,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Wait for the swarm to bind, then publish endpoint info
     // so client commands (`space publish`, `space install`, …)
     // can dial us. Removed in the cleanup block at the end.
-    publish_endpoint(&node, &data_dir, local_prefix)?;
+    publish_endpoint(&node, &data_dir, local_prefix, extension_caps)?;
 
     if args.once {
         tracing::info!("--once: exiting when registry goes idle");
@@ -348,7 +352,12 @@ fn consume_admin_bootstrap(
     Ok(())
 }
 
-fn publish_endpoint(node: &VosNode, data_dir: &std::path::Path, prefix: u16) -> anyhow::Result<()> {
+fn publish_endpoint(
+    node: &VosNode,
+    data_dir: &std::path::Path,
+    prefix: u16,
+    extensions: Vec<crate::commands::space::endpoint::ExtensionCaps>,
+) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     let net = node
@@ -372,6 +381,7 @@ fn publish_endpoint(node: &VosNode, data_dir: &std::path::Path, prefix: u16) -> 
         multiaddrs: multiaddrs.clone(),
         prefix,
         pid: std::process::id(),
+        extensions,
     };
     crate::commands::space::endpoint::write(data_dir, &ep)?;
     tracing::info!("endpoint published on {} address(es)", multiaddrs.len());

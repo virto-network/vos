@@ -43,7 +43,16 @@ struct MetaView<'a> {
     messages: Vec<MessageView<'a>>,
     constructor: Vec<FieldView<'a>>,
     kind: u8,
+    /// Host-ABI capabilities the producer declared in `.vos_meta`
+    /// (`net.*`, `fs.*`, …) — what syscalls the extension may make.
     caps: Vec<&'a str>,
+    /// Effective relay `intra_caps` (`"actor:role"` tokens) the
+    /// *running daemon* loaded for this instance — distinct from
+    /// `caps`. `None` when the instance isn't a service extension this
+    /// daemon configured; `Some([])` means it relays everything as
+    /// Unauthenticated (no relay authority).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_caps: Option<Vec<String>>,
 }
 
 impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
@@ -77,6 +86,9 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
                 .collect(),
             kind: m.kind,
             caps: m.caps.iter().map(String::as_str).collect(),
+            // Filled in by `run` from the daemon's endpoint descriptor;
+            // ParsedMeta (registry schema) doesn't carry relay caps.
+            relay_caps: None,
         }
     }
 }
@@ -110,8 +122,22 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
             anyhow!("schema blob for '{instance}' failed to decode (corrupt or schema-drifted)")
         })?;
 
+        // Effective relay caps the running daemon loaded for this
+        // instance (None if it's not a service extension this daemon
+        // configured). Read from the endpoint descriptor the client
+        // already fetched on connect — daemon-local host policy, not
+        // replicated registry state.
+        let relay_caps = client
+            .endpoint
+            .extensions
+            .iter()
+            .find(|e| e.name == instance)
+            .map(|e| e.caps.clone());
+
         if output::is_json() {
-            output::print_json(&MetaView::from(&meta));
+            let mut view = MetaView::from(&meta);
+            view.relay_caps = relay_caps;
+            output::print_json(&view);
             return Ok(());
         }
 
@@ -120,6 +146,14 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
         println!("kind:   {}", kind_label(meta.kind));
         if !meta.caps.is_empty() {
             println!("caps:   {}", meta.caps.join(", "));
+        }
+        if let Some(caps) = &relay_caps {
+            let rendered = if caps.is_empty() {
+                "(none — relays as Unauthenticated)".to_string()
+            } else {
+                caps.join(", ")
+            };
+            println!("relay caps: {rendered}");
         }
         if !meta.constructor.is_empty() {
             println!("constructor:");
