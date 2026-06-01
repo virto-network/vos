@@ -269,6 +269,15 @@ pub trait NetworkService: Send + Sync {
     fn manifest(&self) -> Option<ManifestReply> {
         None
     }
+
+    /// Inbound `Frame::FetchProofBlob` from a peer that needs a
+    /// content-addressed proof blob this node has produced (or
+    /// cached). Default returns `None` (no such blob locally) so
+    /// the peer can try another producer. The concrete vos::node
+    /// impl delegates to `VosNode::get_proof_blob`.
+    fn get_proof_blob(&self, _hash: &[u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
@@ -461,6 +470,15 @@ pub(in crate::network) enum NetworkCmd {
         cid: [u8; 32],
         reply: std_mpsc::Sender<Option<Vec<u8>>>,
     },
+    /// Send a [`Frame::FetchProofBlob`] to a peer that may hold
+    /// the content-addressed proof bytes. Reply yields
+    /// `Some(bytes)` on hit, `None` if the peer doesn't have it
+    /// (typical when the consumer hasn't yet found the producer).
+    SendFetchProofBlob {
+        target_peer: PeerId,
+        hash: [u8; 32],
+        reply: std_mpsc::Sender<Option<Vec<u8>>>,
+    },
     /// Subscribe the local node to the gossipsub topic for a
     /// replication group. Idempotent — re-subscribing is a no-op.
     SubscribeRep {
@@ -553,6 +571,7 @@ enum OutboundReply {
     RaftJoin(std_mpsc::Sender<RaftJoinResult>),
     Manifest(std_mpsc::Sender<ManifestReply>),
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
+    ProofBlob(std_mpsc::Sender<Option<Vec<u8>>>),
 }
 
 impl Network {
@@ -773,6 +792,27 @@ impl Network {
             target_peer,
             replication_id,
             cid,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Point-fetch a content-addressed proof blob from a peer.
+    /// The receiver yields `Some(bytes)` if the peer holds the
+    /// blob, `None` if it doesn't (which is *not* an error — the
+    /// caller might be asking the wrong peer first and then
+    /// fanning out). Reply timing is bounded by the
+    /// `request_response` behaviour's own per-request timeout;
+    /// callers can layer their own with `recv_timeout`.
+    pub fn send_fetch_proof_blob(
+        &self,
+        target_peer: PeerId,
+        hash: [u8; 32],
+    ) -> std_mpsc::Receiver<Option<Vec<u8>>> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendFetchProofBlob {
+            target_peer,
+            hash,
             reply: tx,
         });
         rx
@@ -1074,6 +1114,17 @@ async fn network_main(
                             .send_request(&target_peer, frame);
                         outbound_replies.insert(req_id, OutboundReply::Node(reply));
                         debug!(%target_peer, "network: sent FetchNode");
+                    }
+                    Some(NetworkCmd::SendFetchProofBlob {
+                        target_peer, hash, reply,
+                    }) => {
+                        let frame = Frame::FetchProofBlob { hash };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::ProofBlob(reply));
+                        debug!(%target_peer, "network: sent FetchProofBlob");
                     }
                     Some(NetworkCmd::SubscribeRep { replication_id }) => {
                         let topic = gossip_topic(&replication_id);
@@ -1516,6 +1567,15 @@ fn handle_req_resp(
                             .req_resp
                             .send_response(channel, Frame::NodeReply { node });
                     }
+                    Frame::FetchProofBlob { hash } => {
+                        // Proof-blob lookup is a HashMap read behind an
+                        // RwLock — quick enough to serve inline.
+                        let blob = service.get().and_then(|s| s.get_proof_blob(&hash));
+                        let _ = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_response(channel, Frame::ProofBlobReply { blob });
+                    }
                     Frame::RaftAppendReq {
                         replication_id,
                         term,
@@ -1767,6 +1827,9 @@ fn handle_req_resp(
                     }
                     (Frame::NodeReply { node }, Some(OutboundReply::Node(tx))) => {
                         let _ = tx.send(node);
+                    }
+                    (Frame::ProofBlobReply { blob }, Some(OutboundReply::ProofBlob(tx))) => {
+                        let _ = tx.send(blob);
                     }
                     (
                         Frame::RaftAppendResp {

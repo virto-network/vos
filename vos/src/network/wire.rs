@@ -68,6 +68,14 @@ const TAG_MANIFEST_RESP: u8 = 0x43;
 // and whether followers are caught up.
 const TAG_RAFT_STATUS_REQ: u8 = 0x44;
 const TAG_RAFT_STATUS_RESP: u8 = 0x45;
+// Content-addressed proof-blob fetch. Consumers ship the 32-byte
+// hash carried by a Mode::External voucher; producers (or any
+// node that has the bytes cached) serve them back. Large STARK
+// payloads (~1.4 MiB today) ride a single frame thanks to the
+// `MAX_FRAME_BYTES` cap below — chunked transport lands in a
+// later cycle once production proofs start to push past it.
+const TAG_FETCH_PROOF_BLOB: u8 = 0x50;
+const TAG_PROOF_BLOB_REPLY: u8 = 0x51;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -113,7 +121,15 @@ const MANIFEST_MAX_BLOBS: usize = 256;
 /// Hard cap on a single encoded frame. Matches the producer-side
 /// reply cap in `node.rs` so an oversized payload is rejected at
 /// the same boundary regardless of whether it's local or networked.
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+///
+/// 8 MiB accommodates STARK proof bodies riding a single
+/// [`Frame::ProofBlobReply`] (clerk-prover-extension's prove path
+/// produces ~1.4 MiB; future production-config proofs may exceed
+/// 2 MiB) without admitting unboundedly large frames. Other frame
+/// types stay tiny in practice; an attacker who tries to push 8 MiB
+/// of, say, an `InvokeRequest` still pays the libp2p handshake cost
+/// and downstream code paths cap their own payloads independently.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum number of hops carried in an `InvokeRequest` chain.
 /// Mirrors `MAX_CROSS_AGENT_DEPTH` in `node.rs`. Encoded as a u32
@@ -269,6 +285,24 @@ pub enum Frame {
         last_log_index: u64,
         members: Vec<u16>,
         leader_hint: Option<u16>,
+    },
+    /// Point-fetch a content-addressed proof blob by its 32-byte
+    /// hash. Sent as a request; reply rides back as
+    /// [`Frame::ProofBlobReply`]. The hash is domain-tagged
+    /// blake2b-256 of the blob bytes (see
+    /// `node::proof_blob_hash`); receivers either hold the blob
+    /// in their local proof-blob store or don't.
+    FetchProofBlob {
+        hash: [u8; 32],
+    },
+    /// Reply to [`Frame::FetchProofBlob`]. `None` means the peer
+    /// doesn't have the blob (typical when the consumer is asking
+    /// the wrong producer first; the consumer can try another
+    /// peer). Real STARK bytes ride here; bounded by
+    /// `MAX_FRAME_BYTES` (8 MiB) — production proofs exceeding
+    /// that need the chunked transport reserved for a later cycle.
+    ProofBlobReply {
+        blob: Option<Vec<u8>>,
     },
 }
 
@@ -600,6 +634,23 @@ impl Frame {
                     None => out.push(0),
                 }
             }
+            Frame::FetchProofBlob { hash } => {
+                out.push(TAG_FETCH_PROOF_BLOB);
+                out.extend_from_slice(hash);
+            }
+            Frame::ProofBlobReply { blob } => {
+                out.push(TAG_PROOF_BLOB_REPLY);
+                match blob {
+                    Some(bytes) => {
+                        out.push(1);
+                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                    None => {
+                        out.push(0);
+                    }
+                }
+            }
         }
         out
     }
@@ -858,6 +909,18 @@ impl Frame {
                     leader_hint,
                 }
             }
+            TAG_FETCH_PROOF_BLOB => Frame::FetchProofBlob {
+                hash: r.fixed::<32>()?,
+            },
+            TAG_PROOF_BLOB_REPLY => {
+                let present = r.u8()?;
+                let blob = match present {
+                    0 => None,
+                    1 => Some(r.bytes_with_len_prefix()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::ProofBlobReply { blob }
+            }
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -1103,6 +1166,30 @@ mod tests {
         let mut bad = Vec::new();
         bad.push(TAG_NODE_REPLY);
         bad.push(2); // not 0 or 1
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
+    }
+
+    #[test]
+    fn fetch_proof_blob_roundtrip() {
+        roundtrip(Frame::FetchProofBlob { hash: [0xAB; 32] });
+    }
+
+    #[test]
+    fn proof_blob_reply_roundtrip() {
+        roundtrip(Frame::ProofBlobReply { blob: None });
+        roundtrip(Frame::ProofBlobReply {
+            blob: Some(b"stark proof body".to_vec()),
+        });
+        // Large blob — exercises the MAX_FRAME_BYTES lift.
+        let big = vec![0x55u8; 2 * 1024 * 1024];
+        roundtrip(Frame::ProofBlobReply { blob: Some(big) });
+    }
+
+    #[test]
+    fn proof_blob_reply_bad_option_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_PROOF_BLOB_REPLY);
+        bad.push(2);
         assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
     }
 

@@ -22,7 +22,7 @@ use std::collections::HashSet;
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -576,6 +576,46 @@ pub struct VosNode {
     /// with `Database already open. Cannot acquire lock`.
     #[cfg(all(feature = "network", feature = "storage"))]
     sync_threads: Vec<thread::JoinHandle<()>>,
+    /// Content-addressed store for large opaque blobs (today: STARK
+    /// proof bodies; future: any payload too big to ride inline
+    /// through the PVM dispatch envelope). Keyed by domain-tagged
+    /// blake2b-256 of the bytes — see [`Self::put_proof_blob`].
+    ///
+    /// Always-on in-memory hot cache. When
+    /// [`proof_blobs_dir`](Self::proof_blobs_dir) is set, every
+    /// `put` writes through to disk and every on-miss `get` lazy-
+    /// loads from disk, so restarts don't lose cached proofs.
+    pub(crate) proof_blobs: ProofBlobStore,
+    /// Optional persistent backing for the proof-blob CAS. When
+    /// `Some`, blobs land at `{dir}/{hex_hash}` on `put`, and a
+    /// hot-cache miss falls back to a read from that path before
+    /// returning `None`. `None` keeps the store pure in-memory —
+    /// matches the legacy behaviour and is what tests use unless
+    /// they explicitly opt in.
+    pub(crate) proof_blobs_dir: Option<std::path::PathBuf>,
+}
+
+/// Shared content-addressed proof-blob store. Cheap to clone; both
+/// the node's `Self` and any extension threads that need to look up
+/// blobs receive an `Arc` to the same `RwLock<HashMap<...>>`.
+pub(crate) type ProofBlobStore = Arc<RwLock<HashMap<[u8; 32], Vec<u8>>>>;
+
+/// Content address for a proof blob. Domain-tagged blake2b-256 so
+/// the namespace can't collide with other hash uses on the node
+/// (replication IDs, CRDT CIDs, etc.).
+pub fn proof_blob_hash(bytes: &[u8]) -> [u8; 32] {
+    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/proof-blob/v1", &[bytes])
+}
+
+/// Lower-case hex encoding of a proof-blob hash. Used as the
+/// filename under [`VosNode::proof_blobs_dir`].
+fn proof_blob_filename(hash: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in hash {
+        use core::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 /// Shared handle for one CRDT replication group. The same
@@ -708,6 +748,8 @@ struct NodeService {
     #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
+    proof_blobs: ProofBlobStore,
+    proof_blobs_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "network")]
@@ -988,6 +1030,21 @@ impl crate::network::NetworkService for NodeService {
 
     fn manifest(&self) -> Option<crate::network::ManifestReply> {
         self.manifest.get().cloned()
+    }
+
+    fn get_proof_blob(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        // Hot cache first; disk fallback lazy-hydrates so a peer
+        // that put the blob in a previous process incarnation can
+        // still serve it. Mirrors `VosNode::get_proof_blob`.
+        if let Some(bytes) = self.proof_blobs.read().ok()?.get(hash).cloned() {
+            return Some(bytes);
+        }
+        let dir = self.proof_blobs_dir.as_ref()?;
+        let bytes = std::fs::read(dir.join(proof_blob_filename(hash))).ok()?;
+        if let Ok(mut store) = self.proof_blobs.write() {
+            store.insert(*hash, bytes.clone());
+        }
+        Some(bytes)
     }
 }
 
@@ -1326,7 +1383,73 @@ impl VosNode {
             manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
             sync_threads: Vec::new(),
+            proof_blobs: Arc::new(RwLock::new(HashMap::new())),
+            proof_blobs_dir: None,
         }
+    }
+
+    /// Enable on-disk persistence for the proof-blob CAS at the
+    /// given directory. Blobs `put` after this call write through
+    /// to `{dir}/{hex_hash}`; on a hot-cache miss, `get` lazy-loads
+    /// from disk before returning `None`. The directory is created
+    /// if missing.
+    ///
+    /// Call this before driving any proof traffic so the disk shape
+    /// is consistent across put / get. Re-calling overrides the
+    /// previous directory; the in-memory hot cache is unaffected.
+    pub fn with_proof_blobs_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        self.proof_blobs_dir = Some(dir);
+        self
+    }
+
+    /// Insert `bytes` into the proof-blob store. Returns the
+    /// content address (32-byte blake2b-256 of the bytes under the
+    /// `"vos/proof-blob/v1"` domain tag).
+    ///
+    /// Idempotent on equal bytes; the hash is collision-resistant.
+    /// Used by producers to stash a STARK proof before sending a
+    /// voucher whose `proof.bytes` carries the returned hash.
+    ///
+    /// When [`proof_blobs_dir`](Self::with_proof_blobs_dir) is set,
+    /// also writes the bytes to `{dir}/{hex_hash}`. Disk errors are
+    /// logged at `warn!` and ignored — the hot cache still has the
+    /// blob, so the local node stays functional; only persistence
+    /// across restarts is lost on a disk failure.
+    pub fn put_proof_blob(&self, bytes: Vec<u8>) -> [u8; 32] {
+        let hash = proof_blob_hash(&bytes);
+        if let Some(dir) = &self.proof_blobs_dir {
+            let path = dir.join(proof_blob_filename(&hash));
+            if !path.exists()
+                && let Err(e) = std::fs::write(&path, &bytes)
+            {
+                warn!(error = %e, path = %path.display(), "proof_blobs: disk write failed");
+            }
+        }
+        if let Ok(mut store) = self.proof_blobs.write() {
+            store.insert(hash, bytes);
+        }
+        hash
+    }
+
+    /// Look up a proof blob by hash. Returns `None` when neither
+    /// the hot cache nor disk (if configured) holds the blob.
+    /// Cross-node fetch (cycle A1+A2) layers on top of this; a
+    /// successful network fan-out caches into both tiers.
+    pub fn get_proof_blob(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.proof_blobs.read().ok()?.get(hash).cloned() {
+            return Some(bytes);
+        }
+        // Hot-cache miss: try disk if we have a backing directory.
+        let dir = self.proof_blobs_dir.as_ref()?;
+        let path = dir.join(proof_blob_filename(hash));
+        let bytes = std::fs::read(&path).ok()?;
+        // Hydrate the hot cache so the next lookup is fast.
+        if let Ok(mut store) = self.proof_blobs.write() {
+            store.insert(*hash, bytes.clone());
+        }
+        Some(bytes)
     }
 
     /// Pre-populate the manifest payload exposed to peers via
@@ -1370,6 +1493,8 @@ impl VosNode {
             #[cfg(feature = "storage")]
             replicas: self.crdt_replicas.clone(),
             manifest: self.manifest.clone(),
+            proof_blobs: self.proof_blobs.clone(),
+            proof_blobs_dir: self.proof_blobs_dir.clone(),
         });
         network.set_service(service);
 
@@ -1656,6 +1781,10 @@ impl VosNode {
         let activity = self.last_activity.clone();
         let invoke_routes = self.invoke_routes.clone();
         let agent_names = self.agent_names.clone();
+        let proof_blobs = self.proof_blobs.clone();
+        let proof_blobs_dir = self.proof_blobs_dir.clone();
+        #[cfg(feature = "network")]
+        let shared_network = self.shared_network.clone();
 
         let join = thread::spawn(move || {
             extension_thread(
@@ -1668,6 +1797,10 @@ impl VosNode {
                 agent_names,
                 shutdown,
                 activity,
+                proof_blobs,
+                proof_blobs_dir,
+                #[cfg(feature = "network")]
+                shared_network,
             )
         });
 
@@ -3040,6 +3173,9 @@ fn extension_thread(
     agent_names: AgentNames,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
+    proof_blobs: ProofBlobStore,
+    proof_blobs_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "network")] shared_network: SharedNetwork,
 ) -> AgentResult {
     use crate::extension::ExtensionPlugin;
     use std::collections::VecDeque;
@@ -3122,6 +3258,13 @@ fn extension_thread(
     // Bounded to prevent OOM from a misbehaving sender (see MAX_DEFERRED).
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
 
+    let blob_fetch = BlobFetchCtx {
+        proof_blobs: &proof_blobs,
+        proof_blobs_dir: proof_blobs_dir.as_deref(),
+        #[cfg(feature = "network")]
+        shared_network: &shared_network,
+    };
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -3140,6 +3283,7 @@ fn extension_thread(
                         &outbox,
                         id,
                         &mut deferred,
+                        &blob_fetch,
                     );
                     // Workers don't yield — pack as DONE with no
                     // state so the caller's invoke_raw decodes
@@ -3186,6 +3330,7 @@ fn extension_thread(
             &outbox,
             id,
             &mut deferred,
+            &blob_fetch,
         );
         // Envelope-mode replies don't carry the `[status][state][reply]`
         // wrapper — that's an invoke-channel detail. On the envelope
@@ -3700,6 +3845,16 @@ enum DispatchOutcome {
     Err,
 }
 
+/// Host-side context the extension thread hands to `handle_effect`
+/// — bundles the proof-blob CAS with optional cross-node fan-out
+/// and on-disk persistence.
+struct BlobFetchCtx<'a> {
+    proof_blobs: &'a ProofBlobStore,
+    proof_blobs_dir: Option<&'a std::path::Path>,
+    #[cfg(feature = "network")]
+    shared_network: &'a SharedNetwork,
+}
+
 /// `*mut ()` newtype that implements `Send` so the service-mode
 /// invoke dispatch sidecar can carry the extension's state across
 /// thread boundaries. The pointer aliases the same state the
@@ -3771,6 +3926,7 @@ fn run_service_invoke_sidecar(
     }
 }
 
+
 /// Dispatch a message to an actor-mode extension instance and poll
 /// to completion. Returns the reply bytes on success or a
 /// `POLL_ERR_*` status on a poisoned future (panic, missing future,
@@ -3782,6 +3938,7 @@ fn dispatch_and_poll(
     outbox: &mpsc::Sender<Envelope>,
     extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
+    blob_fetch: &BlobFetchCtx<'_>,
 ) -> DispatchOutcome {
     use crate::extension::{POLL_PENDING, POLL_READY};
 
@@ -3804,7 +3961,8 @@ fn dispatch_and_poll(
             }
             POLL_PENDING => {
                 let effect = instance.pending_effect();
-                let result = handle_effect(&effect, inbox, outbox, extension_id, deferred);
+                let result =
+                    handle_effect(&effect, inbox, outbox, extension_id, deferred, blob_fetch);
                 instance.provide_result(&result);
             }
             err => {
@@ -3822,8 +3980,9 @@ fn handle_effect(
     outbox: &mpsc::Sender<Envelope>,
     extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
+    blob_fetch: &BlobFetchCtx<'_>,
 ) -> Vec<u8> {
-    use crate::effects::{EFFECT_ASK, EFFECT_FETCH};
+    use crate::effects::{EFFECT_ASK, EFFECT_BLOB_GET, EFFECT_FETCH};
 
     if effect.is_empty() {
         return Vec::new();
@@ -3860,12 +4019,173 @@ fn handle_effect(
                 .encode()
             }
         }
+        EFFECT_BLOB_GET => handle_blob_get(rest, blob_fetch),
         other => {
             error!(%extension_id, tag = format!("{other:#04x}"), "extension: unknown effect tag");
             Vec::new()
         }
     }
 }
+
+/// Serve `EFFECT_BLOB_GET`. Payload =
+/// `[hash: 32 bytes][hint_prefix: u16 LE]` (older callers that
+/// predate the hint field still work — missing trailing bytes
+/// decode as `hint_prefix = 0` = no hint). Returns the stored
+/// bytes when the hash is in the local proof-blob store (hot
+/// cache or disk); on miss falls through to a libp2p fan-out
+/// — targeting the hinted peer first when one is supplied, then
+/// every other known peer as a fallback. First peer that has the
+/// blob wins; successful fetches populate both the hot cache AND
+/// disk (when configured) so the next lookup short-circuits.
+/// Empty bytes signal "no peer has it" — the caller surfaces it
+/// as a verification reject.
+fn handle_blob_get(rest: &[u8], blob_fetch: &BlobFetchCtx<'_>) -> Vec<u8> {
+    if rest.len() < 32 {
+        return Vec::new();
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&rest[..32]);
+    let hint_prefix = if rest.len() >= 34 {
+        u16::from_le_bytes([rest[32], rest[33]])
+    } else {
+        0
+    };
+
+    // Hot-cache hit — fast path.
+    if let Some(bytes) = blob_fetch
+        .proof_blobs
+        .read()
+        .ok()
+        .and_then(|store| store.get(&hash).cloned())
+    {
+        return bytes;
+    }
+
+    // Disk fallback — survives restarts.
+    if let Some(dir) = blob_fetch.proof_blobs_dir
+        && let Ok(bytes) = std::fs::read(dir.join(proof_blob_filename(&hash)))
+    {
+        cache_blob(&hash, &bytes, blob_fetch);
+        return bytes;
+    }
+
+    // Local miss — try the hinted peer first if any, then fan
+    // out across the remaining known peers. Both legs share the
+    // same `BLOB_FETCH_PEER_TIMEOUT` budget; the hint just gets
+    // the first slice of it.
+    #[cfg(feature = "network")]
+    {
+        let net = blob_fetch
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if let Some(net) = net {
+            let deadline = Instant::now() + BLOB_FETCH_PEER_TIMEOUT;
+            let hint_peer = if hint_prefix != 0 {
+                net.peer_for_prefix(hint_prefix)
+            } else {
+                None
+            };
+
+            // Hint leg — single targeted request. Short-circuits
+            // the whole call when the hint is right (the common
+            // case in production: bridge knows which peer issued
+            // the voucher).
+            if let Some(peer) = hint_peer {
+                let rx = net.send_fetch_proof_blob(peer, hash);
+                if let Ok(Some(bytes)) = rx.recv_timeout(BLOB_HINT_LEG_TIMEOUT) {
+                    cache_blob(&hash, &bytes, blob_fetch);
+                    return bytes;
+                }
+            }
+
+            // Fan-out leg — race every other connected peer.
+            let peers: Vec<_> = net
+                .connected_peers()
+                .into_iter()
+                .filter(|p| Some(*p) != hint_peer)
+                .collect();
+            if !peers.is_empty() {
+                let mut receivers: Vec<_> = peers
+                    .into_iter()
+                    .map(|peer| net.send_fetch_proof_blob(peer, hash))
+                    .collect();
+                while !receivers.is_empty() {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let remaining = deadline - now;
+                    let poll_slice = remaining.min(Duration::from_millis(50));
+                    let mut hit = None;
+                    let mut still_open: Vec<_> = Vec::with_capacity(receivers.len());
+                    for rx in receivers.drain(..) {
+                        match rx.recv_timeout(poll_slice) {
+                            Ok(Some(bytes)) => {
+                                hit = Some(bytes);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(mpsc::RecvTimeoutError::Timeout) => still_open.push(rx),
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                        }
+                    }
+                    if let Some(bytes) = hit {
+                        cache_blob(&hash, &bytes, blob_fetch);
+                        return bytes;
+                    }
+                    receivers = still_open;
+                }
+            }
+        }
+    }
+
+    // Reference `hint_prefix` so the no-network build path
+    // doesn't trip the `unused_variable` lint.
+    #[cfg(not(feature = "network"))]
+    let _ = hint_prefix;
+
+    Vec::new()
+}
+
+/// Populate hot cache + (when configured) write-through disk on
+/// a successful cross-tier hit. Failures are logged and dropped
+/// — the caller already has the bytes, so the local request
+/// succeeds; only persistence/caching for the next request
+/// degrades.
+fn cache_blob(hash: &[u8; 32], bytes: &[u8], blob_fetch: &BlobFetchCtx<'_>) {
+    if let Ok(mut store) = blob_fetch.proof_blobs.write() {
+        store.insert(*hash, bytes.to_vec());
+    }
+    if let Some(dir) = blob_fetch.proof_blobs_dir {
+        let path = dir.join(proof_blob_filename(hash));
+        if !path.exists()
+            && let Err(e) = std::fs::write(&path, bytes)
+        {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "proof_blobs: disk write-through failed",
+            );
+        }
+    }
+}
+
+/// Total wall-clock budget for the cross-node fan-out path in
+/// `handle_blob_get`. STARK proofs are ~1.4 MiB on LAN today —
+/// half a second is comfortable headroom for a single hop without
+/// extending the federation test's overall runtime noticeably.
+#[cfg(feature = "network")]
+const BLOB_FETCH_PEER_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// Budget for the hint leg specifically — the targeted request to
+/// the peer the caller named. Tight on purpose: when the hint is
+/// wrong (or the hinted peer is offline) we want to fall through
+/// to the fan-out quickly rather than burning the whole
+/// `BLOB_FETCH_PEER_TIMEOUT` on a dead path.
+#[cfg(feature = "network")]
+const BLOB_HINT_LEG_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Perform an HTTP request via ureq. Blocking; runs on the worker thread.
 #[cfg(feature = "http")]
@@ -4505,6 +4825,68 @@ mod tests {
     }
 
     #[test]
+    fn proof_blob_persists_across_restart() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vos_proof_blob_{}_{}", std::process::id(), stamp));
+
+        // Round 1: put a blob with disk backing.
+        let bytes = b"persistence-test-blob".to_vec();
+        let hash = {
+            let node = VosNode::new().with_proof_blobs_dir(&dir);
+            let h = node.put_proof_blob(bytes.clone());
+            assert_eq!(node.get_proof_blob(&h).as_deref(), Some(bytes.as_slice()));
+            h
+        };
+        // The disk file exists with the expected name.
+        let path = dir.join(proof_blob_filename(&hash));
+        assert!(
+            path.exists(),
+            "put must write through to {}",
+            path.display()
+        );
+
+        // Round 2: fresh VosNode against the same dir — hot cache is
+        // empty but get_proof_blob lazy-loads from disk.
+        let node2 = VosNode::new().with_proof_blobs_dir(&dir);
+        // Sanity: a fresh node with no disk dir wouldn't see this blob.
+        let bare = VosNode::new();
+        assert!(bare.get_proof_blob(&hash).is_none());
+        // The disk-backed node does.
+        assert_eq!(
+            node2.get_proof_blob(&hash).as_deref(),
+            Some(bytes.as_slice()),
+            "node restart against same dir must recover blob from disk",
+        );
+        // And the lazy-load populated the hot cache, so a second
+        // get hits the fast path (we can't observe that directly
+        // here, but we can at least assert idempotence).
+        assert_eq!(
+            node2.get_proof_blob(&hash).as_deref(),
+            Some(bytes.as_slice()),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proof_blob_in_memory_only_without_dir() {
+        // No `with_proof_blobs_dir` — hot cache only, no disk side
+        // effects. Pinned so a future change doesn't silently make
+        // the default behaviour write to some implicit path.
+        let node = VosNode::new();
+        let hash = node.put_proof_blob(b"hot-cache-only".to_vec());
+        assert!(node.get_proof_blob(&hash).is_some());
+        // Drop + recreate — fresh node has nothing.
+        drop(node);
+        let node2 = VosNode::new();
+        assert!(node2.get_proof_blob(&hash).is_none());
+    }
+
+    #[test]
     fn node_assigns_global_ids() {
         let node = VosNode::with_prefix(0x0042);
         let id1 = node.alloc_id();
@@ -4950,6 +5332,8 @@ mod tests {
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
             manifest: Arc::new(OnceLock::new()),
+            proof_blobs: Arc::new(RwLock::new(HashMap::new())),
+            proof_blobs_dir: None,
         };
 
         let peer = libp2p::PeerId::random();

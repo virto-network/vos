@@ -105,6 +105,11 @@ clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # pre-built ELF separately and only need the Ref surface from
 # the rlib.
 clerk-bridge = { path = "../actors/clerk-bridge", default-features = false }
+# Host-side prover extension. Tests use ClerkProverRef to drive
+# prove_voucher from the federation flow (cycle A0: producer
+# calls prove_voucher → puts bytes in CAS → ships hash via
+# voucher.proof.bytes).
+clerk-prover-extension = { path = "../examples/extensions/clerk-prover" }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in
 # OsRng-backed signing — fine on host; the actor itself never

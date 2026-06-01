@@ -7124,6 +7124,12 @@ fn clerk_ledger_two_bank_federation() {
             &mut &node_b,
             b"bank-a".to_vec(),
             registrar_a.public.0.to_vec(),
+            // Pass bank A's libp2p prefix so the bridge → prover
+            // dispatch tells the extension's `blob_get` exactly
+            // where to fetch the STARK from. Without the hint the
+            // host would fan out to every connected peer; with it
+            // the producer side gets a single targeted roundtrip.
+            prefix_a as u32,
         ))
         .expect("invoke register_peer"),
         BridgeStatus::Ok,
@@ -7693,17 +7699,18 @@ fn clerk_ledger_two_bank_federation() {
     // bridge dispatches via `ctx.ask`; same trust boundary in
     // effect — the actor still decides whether to accept.
     //
-    // v0 limitation (2026-05-13): the extension now runs the real
-    // `zkpvm_verifier::verify_standalone` path (no more blake2b
-    // placeholder), so the 32-byte placeholder bytes this test
-    // embeds in `voucher.proof.bytes` are rejected (decode fails on
-    // a malformed proof).  All 5h paths therefore exercise the
-    // ProofInvalid branch.  Shipping a REAL ~1.4 MiB STARK proof
-    // through the bridge → extension dispatch would need an object-
-    // store / DA-style hand-off (the proof exceeds the PVM ↔ host
-    // message envelope); cryptographic happy-path coverage lives
-    // in `zkpvm/tests/voucher_check_smoke.rs::prove_verify_voucher
-    // _check_hardcoded` instead.
+    // Cross-MiB proof delivery (2026-05-13): the voucher's
+    // `proof.bytes` carries the 32-byte content address of the
+    // actual ~1.4 MiB STARK in the producer node's proof-blob
+    // store (`VosNode::put_proof_blob`). The extension's
+    // `verify_voucher_proof` uses `ctx.blob_get(hash, hint)` to
+    // fetch those bytes host-side; the bridge → extension
+    // dispatch only ever ships the 32-byte hash, well inside the
+    // PVM actor's 4 KiB input buffer. The federation test has
+    // libp2p attached, so the producer-side stash on bank A is
+    // sufficient: bank B's verifier extension reaches across the
+    // wire (via the `peer_prefix` hint registered with `register_
+    // peer`) to fetch the bytes on demand. No bank-B pre-seed.
 
     // Load clerk-prover-extension's .so. Skip if not built;
     // matches the SKIP pattern used by other actor ELFs above.
@@ -7757,10 +7764,38 @@ fn clerk_ledger_two_bank_federation() {
             state_root_before: voucher_3.state_root_before,
             state_root_after: voucher_3.state_root_after,
         };
-        let proof_v3_bytes = placeholder_proof(&public_bytes(&public_v3));
+        let public_v3_bytes = public_bytes(&public_v3);
+
+        // Happy-path producer wiring: drive the prover extension to
+        // produce a REAL STARK proof, stash it ONLY in bank A's
+        // store (bank A is the producer; bank B's verifier
+        // extension reaches across libp2p via the `peer_prefix`
+        // hint registered above), then ship the 32-byte content
+        // address as the voucher's `proof.bytes`.
+        //
+        // This is the production-shape flow: producer-side stash,
+        // consumer-side cross-node fetch via `EFFECT_BLOB_GET`
+        // fan-out (with the hint going straight to bank A).
+        use clerk_prover_extension::ClerkProverRef;
+        let prover_ref = ClerkProverRef::at(prover_id);
+        let proof_v3_bytes =
+            vos::block_on(prover_ref.prove_voucher(&mut &node_b, public_v3_bytes.clone()))
+                .expect("invoke prove_voucher");
+        assert!(
+            proof_v3_bytes.len() > 32,
+            "real STARK proof must be larger than the 32-byte content address"
+        );
+        let proof_v3_hash = node_a.put_proof_blob(proof_v3_bytes);
+        // Sanity: bank B starts cold. The verifier extension's
+        // `ctx.blob_get` must reach bank A over libp2p to satisfy
+        // the lookup.
+        assert!(
+            node_b.get_proof_blob(&proof_v3_hash).is_none(),
+            "bank B must not have the proof blob locally — cross-node fetch is the load-bearing path here"
+        );
         // Re-seal a fresh envelope and re-sign the voucher with
         // Mode::External so the wire signature covers the proof
-        // bytes (signature mode would carry a stub here).
+        // hash (signature mode would carry a stub here).
         let envelope_v3 = EncryptedEnvelope::seal(value3, &blinding3, &bank_b_ivk_pk)
             .expect("seal envelope v3 external");
         let voucher_v3_external = Voucher::sign(
@@ -7770,19 +7805,20 @@ fn clerk_ledger_two_bank_federation() {
             voucher_3.state_root_after,
             CcProof {
                 mode: CcProofMode::External,
-                bytes: proof_v3_bytes.clone(),
+                bytes: proof_v3_hash.to_vec(),
             },
             &registrar_a.secret,
         );
         let voucher_v3_external_bytes = voucher_v3_external.to_bytes();
 
-        // Placeholder-payload path — bridge dispatches
-        // verify_voucher_proof; the real STARK extension rejects
-        // the 32-byte blake2b placeholder (bincode-deserialize
-        // fails on a non-Proof byte string), so the bridge surfaces
-        // Status::ProofInvalid.  Once an object-store / DA layer
-        // ships proof bytes through a side channel, this path
-        // becomes the happy-path (= bridge admits + dedup advances).
+        // Real-STARK happy path: bridge dispatches
+        // verify_voucher_proof with `proof_hash` = our 32-byte
+        // content address + `peer_prefix` = bank-A hint; the
+        // extension's `ctx.blob_get` fans out via libp2p, the
+        // hint leg hits bank A immediately, and the bytes flow
+        // back over the wire. Then `verify_standalone_with_pcs_
+        // policy` runs against the cached program commitment.
+        // Status::Ok and dedup advances by 1.
         let dedup_before_5h = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
             .expect("redeemed_count pre-5h");
         let reply_external = vos::block_on(bridge_actor.submit_voucher(
@@ -7790,25 +7826,26 @@ fn clerk_ledger_two_bank_federation() {
             voucher_v3_external_bytes.clone(),
             b"bank-a".to_vec(),
         ))
-        .expect("invoke submit_voucher (Mode::External, placeholder proof)");
+        .expect("invoke submit_voucher (Mode::External, real STARK)");
         assert_eq!(
             reply_external.status,
-            BridgeStatus::ProofInvalid,
-            "real STARK extension must reject 32-byte placeholder proof"
+            BridgeStatus::Ok,
+            "real STARK proof + matching CAS bytes must verify and accept"
         );
         let dedup_after_5h = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
             .expect("redeemed_count post-5h");
         assert_eq!(
-            dedup_after_5h, dedup_before_5h,
-            "rejected proof must not advance dedup"
+            dedup_after_5h,
+            dedup_before_5h + 1,
+            "accepted Mode::External voucher must advance dedup count"
         );
 
-        // Adversarial — tamper proof bytes on a FRESH voucher
+        // Adversarial — forged content address on a FRESH voucher
         // (otherwise the dedup catches before the prover dispatch).
-        // We use yet-another fresh transfer to avoid both dedup and
-        // signature-coverage interference: re-sign with the wrong
-        // placeholder, then ALSO re-issue a fresh wire signature so
-        // the bridge reaches the prover dispatch step.
+        // The 32-byte placeholder hash is not in the proof-blob
+        // store, so the extension's `ctx.blob_get` returns None and
+        // verify_voucher_proof short-circuits to 0 → ProofInvalid.
+        // Same security guarantee a forged STARK would get.
         let blinding4 = cipher_clerk::crypto::Blinding([6u8; 32]);
         let value4: u64 = 25;
         let amt4 = Amount::commit(value4, &blinding4);
@@ -7846,9 +7883,11 @@ fn clerk_ledger_two_bank_federation() {
         let root_after_4: [u8; 32] = root_after_4_vec.try_into().expect("32-byte");
         let envelope_v4 =
             EncryptedEnvelope::seal(value4, &blinding4, &bank_b_ivk_pk).expect("seal envelope v4");
-        // Forged proof: bytes for a DIFFERENT public — i.e. the
-        // attacker swapped the proof bytes from a different transfer.
-        // Issuer re-signs the (now-internally-inconsistent) voucher.
+        // Forged content address: a 32-byte hash the attacker
+        // produces from arbitrary domain-separated bytes. With
+        // overwhelming probability it doesn't hit any blob in
+        // the CAS — the extension's `blob_get` returns None
+        // and verify short-circuits to reject.
         let forged_proof_bytes = placeholder_proof(b"some-other-transfer");
         let voucher_v4_forged = Voucher::sign(
             amt4,
@@ -7871,7 +7910,7 @@ fn clerk_ledger_two_bank_federation() {
         assert_eq!(
             reply_forged.status,
             BridgeStatus::ProofInvalid,
-            "bridge must reject Mode::External voucher with proof bytes that don't match public_bytes"
+            "bridge must reject Mode::External voucher whose proof_hash points to no CAS entry"
         );
         // Dedup count unchanged — a rejected proof must not poison
         // the dedup set (same posture as UnknownPeer / VoucherInvalid).

@@ -24,6 +24,11 @@ pub const EFFECT_ASK: u8 = 0x01;
 /// Result: see `FetchResponse::encode`.
 pub const EFFECT_FETCH: u8 = 0x02;
 
+/// Fetch a proof blob from the host's content-addressed store.
+/// Payload: `[hash: 32 bytes]`.
+/// Result: blob bytes when found, empty bytes when missing.
+pub const EFFECT_BLOB_GET: u8 = 0x03;
+
 // ── HTTP types ──────────────────────────────────────────────────────
 
 /// HTTP method as a single byte tag.

@@ -20,11 +20,16 @@
 //!   bytes, writes them into a deterministic flat-mem layout, traces
 //!   with those inputs.
 //!
-//! - `verify_voucher_proof(public_bytes, proof_bytes) -> u8` —
-//!   bincode-deserializes the proof, recomputes the flat-mem
-//!   layout from `public_bytes`, checks `proof.initial_state
-//!   .memory_commitment`, then `zkpvm_verifier::verify_standalone`
-//!   against a baked program commitment.
+//! - `verify_voucher_proof(public_bytes, proof_hash) -> u8` —
+//!   `proof_hash` is the 32-byte content address of the proof bytes
+//!   in the host's proof-blob store. The extension does
+//!   `ctx.blob_get(hash)` to retrieve the bytes (~1.4 MiB STARK
+//!   today), bincode-deserializes, then runs
+//!   `verify_standalone_with_pcs_policy` against the baked program
+//!   commitment. Returning bytes inline through the PVM bridge isn't
+//!   viable — the bridge's 4 KiB input buffer + 64 KiB heap cap that
+//!   path at ~few-KB voucher payloads, so the bridge ships only the
+//!   hash and the extension does the heavy I/O host-side.
 //!
 //! - `program_commitment() -> Vec<u8>` — returns the 32-byte
 //!   program-commitment hash a verifier needs. Read once at startup
@@ -85,17 +90,42 @@ impl ClerkProver {
     }
 
     /// Verify a Mode::External voucher proof against the cached
-    /// program commitment.  `public_bytes` is currently unused — v0
-    /// proofs are bound to the actor's hardcoded witness, not the
-    /// caller's public.  Returns `1` on accept, `0` on reject.
+    /// program commitment. `proof_hash` is the 32-byte content
+    /// address of the actual proof bytes in the host's proof-blob
+    /// store; the extension fetches them via `ctx.blob_get` so the
+    /// bridge dispatch never has to ferry multi-MB bytes through
+    /// the PVM input ABI.
+    ///
+    /// `peer_prefix` is an optional `node_prefix` hint: when
+    /// non-zero, the host tries that specific peer first before
+    /// falling back to fan-out. The bridge knows which peer
+    /// issued the voucher and threads it through here so a
+    /// 100-peer space doesn't pay 100 roundtrips per voucher.
+    ///
+    /// `public_bytes` is currently unused — v0 proofs are bound to
+    /// the actor's hardcoded witness, not the caller's public.
+    /// Returns `1` on accept, `0` on reject (including the
+    /// "proof bytes not in the local CAS / cross-node fetch failed"
+    /// case — which is indistinguishable from "the bytes were
+    /// tampered with" from a security standpoint).
     #[msg]
     async fn verify_voucher_proof(
         &self,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
         public_bytes: Vec<u8>,
-        proof_bytes: Vec<u8>,
+        proof_hash: Vec<u8>,
+        peer_prefix: u32,
     ) -> u8 {
         let _ = public_bytes;
+        if proof_hash.len() != 32 {
+            return 0;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&proof_hash);
+        let hint: u16 = (peer_prefix & 0xFFFF) as u16;
+        let Some(proof_bytes) = ctx.blob_get(hash, hint).await else {
+            return 0;
+        };
         let Ok(proof) = bincode::deserialize::<Proof>(&proof_bytes) else {
             return 0;
         };

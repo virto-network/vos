@@ -730,6 +730,23 @@ pub trait ExtensionCtx<A: Actor> {
     /// implements `IntoFuture`, so awaiting it sends the request
     /// and returns the response.
     fn fetch(&mut self, url: impl Into<alloc::string::String>) -> FetchBuilder<'_, A>;
+
+    /// Fetch a content-addressed proof blob from the host's
+    /// proof-blob store. The host looks the hash up locally; cross-
+    /// node fan-out via libp2p (cycle A2) layers on top without
+    /// changing the call site. Returns `None` when no node known to
+    /// this host has the blob.
+    ///
+    /// `hint_prefix = 0` means "no hint" — the host falls straight
+    /// through to its fan-out across every known peer. A non-zero
+    /// hint asks the host to try that specific peer's `node_prefix`
+    /// first; if the hint peer doesn't have the blob (or isn't
+    /// connected), the fan-out path still runs as a fallback.
+    fn blob_get(
+        &mut self,
+        hash: [u8; 32],
+        hint_prefix: u16,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<Vec<u8>>> + '_>>;
 }
 
 impl<A: Extension> ExtensionCtx<A> for Context<A> {
@@ -749,6 +766,27 @@ impl<A: Extension> ExtensionCtx<A> for Context<A> {
             ctx: self,
             request: crate::effects::FetchRequest::get(url),
         }
+    }
+
+    fn blob_get(
+        &mut self,
+        hash: [u8; 32],
+        hint_prefix: u16,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<Vec<u8>>> + '_>>
+    {
+        // Wire format: `[EFFECT_BLOB_GET][hash: 32 bytes][hint:u16 LE]`.
+        // Host returns the blob bytes; empty bytes signal a miss so
+        // the caller can decide whether to fail open (verify-fail)
+        // or retry via a different path.
+        let mut request = Vec::with_capacity(1 + 32 + 2);
+        request.push(crate::effects::EFFECT_BLOB_GET);
+        request.extend_from_slice(&hash);
+        request.extend_from_slice(&hint_prefix.to_le_bytes());
+        let io = self.host_call(request);
+        alloc::boxed::Box::pin(async move {
+            let bytes = io.await;
+            if bytes.is_empty() { None } else { Some(bytes) }
+        })
     }
 }
 

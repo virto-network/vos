@@ -144,6 +144,14 @@ pub struct PeerEntry {
     /// Peer bank's clerk pubkey — the issuer's `Voucher`
     /// signature is verified against this.
     pub clerk_pubkey: AuthKey,
+    /// Peer's libp2p `node_prefix` (upper 16 bits of a ServiceId).
+    /// Used as a hint when dispatching `verify_voucher_proof` so
+    /// the host's `EFFECT_BLOB_GET` can fetch proof bytes
+    /// directly from the issuing peer rather than fanning out to
+    /// every connected node. `0` means "no hint" — pre-existing
+    /// peers registered before the prefix field landed default
+    /// to this and stay correct (just less efficient).
+    pub node_prefix: u16,
 }
 
 /// Reply envelope for `submit_voucher`. Same shape pattern as
@@ -348,8 +356,19 @@ impl ClerkBridge {
     /// overwritten (the operator is asserting that the peer
     /// rotated its key — there's no separate "rotate" handler in
     /// this slice).
+    ///
+    /// `node_prefix` is the peer's libp2p prefix — passed through
+    /// to the prover extension as a fetch hint so it knows which
+    /// node to ask for proof blobs before fanning out. `0` means
+    /// "unknown" and is the right value for in-process tests
+    /// without a network; the host falls back to broadcast.
     #[msg]
-    async fn register_peer(&mut self, peer_name: Vec<u8>, clerk_pubkey: Vec<u8>) -> Status {
+    async fn register_peer(
+        &mut self,
+        peer_name: Vec<u8>,
+        clerk_pubkey: Vec<u8>,
+        node_prefix: u32,
+    ) -> Status {
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
@@ -362,6 +381,7 @@ impl ClerkBridge {
         let entry = PeerEntry {
             name: peer_name,
             clerk_pubkey: AuthKey(pk_bytes),
+            node_prefix: (node_prefix & 0xFFFF) as u16,
         };
         match self.peers.binary_search_by(|e| e.name.cmp(&entry.name)) {
             Ok(i) => self.peers[i] = entry,
@@ -409,10 +429,11 @@ impl ClerkBridge {
             return reply(Status::NotBootstrapped);
         }
 
-        let peer_clerk_pubkey = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-            Ok(i) => self.peers[i].clerk_pubkey,
-            Err(_) => return reply(Status::UnknownPeer),
-        };
+        let (peer_clerk_pubkey, peer_prefix) =
+            match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+                Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].node_prefix),
+                Err(_) => return reply(Status::UnknownPeer),
+            };
 
         let voucher = match Voucher::from_bytes(&voucher_bytes) {
             Some(v) => v,
@@ -428,7 +449,14 @@ impl ClerkBridge {
         // set; same posture as the UnknownPeer rejection above. The
         // dispatch is a no-op when prover_id == 0 or the voucher's
         // proof is Signature-mode.
-        if dispatch_external_proof(ctx, self.prover_id, &voucher, &peer_clerk_pubkey).await
+        if dispatch_external_proof(
+            ctx,
+            self.prover_id,
+            &voucher,
+            &peer_clerk_pubkey,
+            peer_prefix,
+        )
+        .await
             == Status::ProofInvalid
         {
             return reply(Status::ProofInvalid);
@@ -526,17 +554,25 @@ impl ClerkBridge {
         if self.local_ledger_id == 0 {
             return early_redeem(Status::NotBootstrapped);
         }
-        let peer_clerk_pubkey = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-            Ok(i) => self.peers[i].clerk_pubkey,
-            Err(_) => return early_redeem(Status::UnknownPeer),
-        };
+        let (peer_clerk_pubkey, peer_prefix) =
+            match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+                Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].node_prefix),
+                Err(_) => return early_redeem(Status::UnknownPeer),
+            };
         let Some(voucher) = Voucher::from_bytes(&voucher_bytes) else {
             return early_redeem(Status::VoucherInvalid);
         };
         if voucher.verify_signature(&peer_clerk_pubkey).is_err() {
             return early_redeem(Status::VoucherInvalid);
         }
-        if dispatch_external_proof(ctx, self.prover_id, &voucher, &peer_clerk_pubkey).await
+        if dispatch_external_proof(
+            ctx,
+            self.prover_id,
+            &voucher,
+            &peer_clerk_pubkey,
+            peer_prefix,
+        )
+        .await
             == Status::ProofInvalid
         {
             return early_redeem(Status::ProofInvalid);
@@ -678,6 +714,7 @@ async fn dispatch_external_proof(
     prover_id: u32,
     voucher: &Voucher,
     peer_clerk_pubkey: &AuthKey,
+    peer_prefix: u16,
 ) -> Status {
     if prover_id == 0 {
         return Status::Ok;
@@ -692,9 +729,17 @@ async fn dispatch_external_proof(
         state_root_after: voucher.state_root_after,
     };
     let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
+    // voucher.proof.bytes carries the 32-byte content address of
+    // the actual STARK proof in the producer node's proof-blob
+    // store; the extension fetches the bytes via ctx.blob_get
+    // rather than us trying to ship multi-MB through PVM dispatch.
+    // peer_prefix tells the extension's host where the bytes
+    // are most likely to live so the fetch doesn't have to fan
+    // out to every connected node.
     let msg = vos::value::Msg::new("verify_voucher_proof")
         .with("public_bytes", public_bytes)
-        .with("proof_bytes", voucher.proof.bytes.clone());
+        .with("proof_hash", voucher.proof.bytes.clone())
+        .with("peer_prefix", peer_prefix as u32);
     match ctx.ask(ServiceId(prover_id), &msg).await {
         Ok(value) => {
             if value.as_u8() == Some(1) {
