@@ -55,9 +55,14 @@ build-crdt-counter:
     cd examples/actors/crdt-counter && cargo actor
 
 # Build the space-registry actor — built-in PVM actor that
-# lives under actors/ alongside the workspace crates.
+# lives under actors/ alongside the workspace crates. `cargo actor`
+# is the alias defined in each actor's .cargo/config.toml that
+# invokes `rustc --crate-type bin -Zbuild-std=…` against the
+# riscv64em-javm target spec — produces the executable ELF the
+# host bundles. Plain `cargo build --release` silently builds only
+# the rlib + dropped cdylib, leaving the ELF stale.
 build-registry:
-    cd actors/space-registry && cargo +nightly -Zjson-target-spec build --release
+    cd actors/space-registry && cargo +nightly actor
 
 # Refresh the shipped registry blob at `vosx/blobs/space_registry.elf`.
 # `cargo install vosx` from crates.io reads this file (the dev path
@@ -73,7 +78,22 @@ refresh-bundled-registry: build-registry
 # every member space of a hyperspace runs as the cross-space
 # gateway. Same toolchain as the registry.
 build-bridge:
-    cd actors/space-bridge && cargo +nightly -Zjson-target-spec build --release
+    cd actors/space-bridge && cargo +nightly actor
+
+
+# Build the clerk-ledger actor — per-bank stateful agent
+# wrapping cipher-clerk's confidential double-entry kernel.
+build-clerk-ledger:
+    cd actors/clerk-ledger && cargo +nightly actor
+
+
+# Build the clerk-bridge actor — per-bank cross-clerk voucher
+# ingress agent. Verifies + opens vouchers from peer banks,
+# dedups by transfer triple, returns the recovered opening to
+# the host operator (which then credits the local recipient via
+# clerk-ledger).
+build-clerk-bridge:
+    cd actors/clerk-bridge && cargo +nightly actor
 
 
 # Live cross-node CRDT convergence demo. Spins up two networked

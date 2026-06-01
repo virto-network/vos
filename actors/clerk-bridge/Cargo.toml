@@ -1,0 +1,54 @@
+[workspace]
+
+[package]
+name = "clerk-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin"]
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
+
+# cipher-clerk: the wire types this actor verifies + opens.
+# `viewing-keys` for EncryptedEnvelope::open, `voucher` for the
+# Voucher type, `signing` is implied by both. `default-features =
+# []` keeps the host-only MemLedger / OsRng entrypoints out of the
+# PVM build path.
+#
+# NB: enabling signing on the PVM actor pulls getrandom plumbing,
+# which currently builds for riscv64em-javm because rand_core's
+# OsRng on this target is satisfied by the PVM-side getrandom
+# stub. The signing path inside the actor is gated to verify-only;
+# the issuer-secret signing flow lives off-actor on the host side.
+[dependencies]
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "viewing-keys",
+    "voucher",
+] }
+# clerk-ledger as a Ref-only dep: brings in the typed
+# ClerkLedgerRef + status codes + the rkyv wire types
+# (Opening, etc.) without the bin entry-point glue. The PVM
+# build of clerk-bridge can dispatch typed calls to its
+# local clerk-ledger via the cross-actor mailbox.
+clerk-ledger = { path = "../clerk-ledger", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

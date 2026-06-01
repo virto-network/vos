@@ -47,7 +47,7 @@ log = { version = "0.4", default-features = false }
 # `version` is what crates.io uses when the published vos package
 # resolves them (the git URL is stripped at publish time).
 javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.4", optional = true }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.1", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec9989b5fe221051fb87be6664459a6148e", version = "0.1", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
@@ -96,6 +96,21 @@ space-registry = { path = "../actors/space-registry", default-features = false }
 # Same shape — host tests use the typed SpaceBridgeRef to invoke
 # the bridge actor's where_am_i / forward handlers over libp2p.
 space-bridge = { path = "../actors/space-bridge", default-features = false }
+# Per-bank stateful clerk agent — host tests use ClerkLedgerRef to
+# drive bootstrap / create_account / account against the wire ABI.
+clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
+# Cross-clerk voucher ingress actor. Host tests use ClerkBridgeRef
+# to drive the verify-and-dedup flow. default-features = false
+# keeps the PVM bin glue out of the host link; tests load the
+# pre-built ELF separately and only need the Ref surface from
+# the rlib.
+clerk-bridge = { path = "../actors/clerk-bridge", default-features = false }
+# Host-side cipher-clerk with `signing` so tests can build
+# signed CreateAccount events to push through the ledger. Pulls in
+# OsRng-backed signing — fine on host; the actor itself never
+# links it (the clerk-ledger crate keeps cipher-clerk on
+# default-features = []).
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "voucher", "notes"] }
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"

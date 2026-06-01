@@ -5558,3 +5558,2025 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
     let _ = std::fs::remove_dir_all(&dir_root);
     assert_eq!(panics, 0, "actor panics during bridge test: {panics}");
 }
+
+#[test]
+fn clerk_ledger_bootstrap_and_create_account() {
+    // Single-node smoke test for clerk-ledger's first kernel-touching
+    // surface. Builds a signed cipher-clerk CreateAccount on the host
+    // side, pushes it through the actor's create_account handler, and
+    // pins all five status codes (OK + NOT_BOOTSTRAPPED + WRONG_JOURNAL
+    // + ACCOUNT_EXISTS + SIGNATURE_INVALID).
+    //
+    // Networking isn't exercised here — the cross-space federation
+    // story comes in Phase 4. This pins the actor's wire ABI against
+    // cipher-clerk's rkyv-archived CreateAccount.
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Keypair};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::types::{Account, BalancePair, Layer};
+    use clerk_ledger::{ClerkLedgerRef, Status};
+    use vos::node::{AgentConfig, VosNode};
+
+    let path = format!(
+        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let elf = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-ledger not built (run `just build-clerk-ledger`)");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+
+    let mut node = VosNode::with_prefix(0);
+    let ledger_id = node.register(AgentConfig::new(blob));
+    let ledger = ClerkLedgerRef::at(ledger_id);
+
+    // Per-event timestamps come from the JAM block ts in production;
+    // for the test, just pick a non-zero monotonic seed.
+    let ts: u64 = 1_000_000;
+
+    // Pre-bootstrap: create_account fails with NOT_BOOTSTRAPPED.
+    let pre = vos::block_on(ledger.create_account(&mut &node, Vec::new(), ts))
+        .expect("invoke create_account pre-bootstrap");
+    assert_eq!(pre, Status::NotBootstrapped);
+
+    // Pre-bootstrap: state_root() returns an empty Vec. The
+    // all-zero 32-byte root would be a forgeable anchor for
+    // vouchers, so the actor signals "not ready" with a 0-length
+    // Vec instead.
+    let root_pre =
+        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-bootstrap");
+    assert!(
+        root_pre.is_empty(),
+        "state_root must return empty Vec before bootstrap, got {} bytes",
+        root_pre.len()
+    );
+
+    // Bootstrap with a fresh registrar + journal. The journal `code`
+    // is an opaque user tag — pick 1 for the test.
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let status = vos::block_on(ledger.bootstrap(
+        &mut &node,
+        journal.0.to_vec(),
+        registrar.public.0.to_vec(),
+        1u32,
+    ))
+    .expect("invoke bootstrap");
+    assert_eq!(status, Status::Ok);
+
+    // Post-bootstrap: state_root returns a 32-byte SMT root that
+    // commits to the journal leaf (composite root: empty
+    // accounts_smt + empty transfers_smt + 1-leaf journals_smt).
+    // Pin it as non-zero — voucher signatures anchor here.
+    let root_after_bootstrap =
+        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root post-bootstrap");
+    assert_eq!(
+        root_after_bootstrap.len(),
+        32,
+        "post-bootstrap state_root must be a 32-byte SMT root",
+    );
+    assert_ne!(
+        root_after_bootstrap.as_slice(),
+        &[0u8; 32][..],
+        "post-bootstrap state_root must NOT be the empty-tree root — the journal must contribute"
+    );
+
+    // Build a signed CreateAccount for alice, push it through.
+    let alice_kp = Keypair::generate();
+    let alice = Account::asset(journal, alice_kp.public, Iso4217::USD, BankCode::Checking);
+    let alice_id = alice.id.0;
+    let create_alice = CcCreateAccount::signed(alice.clone(), &registrar.secret);
+    let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_alice)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, bytes.clone(), ts))
+        .expect("invoke create_account");
+    assert_eq!(status, Status::Ok, "first create_account should succeed");
+
+    // Read it back. account() returns Option<Account> directly
+    // (cipher-clerk types embed in the actor's rkyv archive via
+    // the unified rkyv 0.8 crate, so the wire round-trips a typed
+    // Account end-to-end). The kernel stamps `event_ts` on accept
+    // (`event_ts = seed - n + i + 1`; for a single-event batch
+    // event_ts == seed), so the stored account differs from the
+    // submitted one in exactly the timestamp field — assert the
+    // rest is byte-identical and check the timestamp explicitly.
+    let stored = vos::block_on(ledger.account(&mut &node, alice_id.to_vec()))
+        .expect("invoke account")
+        .expect("alice should be on file");
+    assert_eq!(stored.timestamp, ts, "kernel must stamp event_ts on accept");
+    let mut expected = alice.clone();
+    expected.timestamp = ts;
+    assert_eq!(
+        stored, expected,
+        "stored account must equal submitted (modulo kernel-stamped timestamp)",
+    );
+
+    // Root must advance after a state-changing accept. If it didn't,
+    // a voucher signed against root_before == root_after would be a
+    // forgery — pin the property loudly so any regression surfaces.
+    let root_after_alice = vos::block_on(ledger.state_root(&mut &node))
+        .expect("invoke state_root post-create_account");
+    assert_eq!(root_after_alice.len(), 32);
+    assert_ne!(
+        root_after_alice, root_after_bootstrap,
+        "creating alice must advance the SMT root"
+    );
+
+    // Idempotency check: re-submitting the same create returns
+    // ACCOUNT_EXISTS.
+    let status = vos::block_on(ledger.create_account(&mut &node, bytes, ts))
+        .expect("invoke create_account (dup)");
+    assert_eq!(status, Status::IdAlreadyExists);
+
+    // Wrong-journal check: build a CreateAccount whose embedded
+    // account belongs to a DIFFERENT journal.
+    let other_journal = JournalId::random();
+    let bob_kp = Keypair::generate();
+    let bob = Account::asset(
+        other_journal,
+        bob_kp.public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
+    let create_bob = CcCreateAccount::signed(bob, &registrar.secret);
+    let bob_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_bob)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, bob_bytes, ts))
+        .expect("invoke create_account (wrong journal)");
+    assert_eq!(status, Status::WrongJournal);
+
+    // Bad-signature check: sign with the wrong registrar.
+    let imposter = Keypair::generate();
+    let carol = Account::asset(
+        journal,
+        Keypair::generate().public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
+    let create_carol = CcCreateAccount::signed(carol, &imposter.secret);
+    let carol_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_carol)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, carol_bytes, ts))
+        .expect("invoke create_account (bad sig)");
+    assert_eq!(status, Status::SignatureInvalid);
+
+    // Adversarial #1: a CreateAccount whose embedded account has
+    // a non-zero timestamp. signing_payload zeroes the timestamp
+    // before signing, so a registrar's signature on the zeroed
+    // version ALSO verifies against this tampered-timestamp version
+    // — the actor must reject on the kernel invariant.
+    let dave_kp = Keypair::generate();
+    let dave = Account::asset(journal, dave_kp.public, Iso4217::USD, BankCode::Checking);
+    let mut create_dave = CcCreateAccount::signed(dave, &registrar.secret);
+    create_dave.account.timestamp = 12345;
+    let dave_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_dave)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, dave_bytes, ts))
+        .expect("invoke create_account (tampered timestamp)");
+    assert_eq!(
+        status,
+        Status::InvalidAccount,
+        "non-zero timestamp on input must be rejected"
+    );
+
+    // Adversarial #2: a CreateAccount whose embedded account has a
+    // pre-populated balance pair. signing_payload covers balances
+    // so this only goes through if the registrar cooperated (a
+    // malicious registrar). The actor must reject regardless to
+    // preserve cipher-clerk's 'creation cannot mint' invariant.
+    let eve_kp = Keypair::generate();
+    let mut eve = Account::asset(journal, eve_kp.public, Iso4217::USD, BankCode::Checking);
+    // Any non-zero Amount triggers the invariant. The bytes don't
+    // need to decompress to a real Ristretto point — the check is
+    // structural equality against Amount::ZERO.
+    eve.balances[Layer::Settled.as_index()] = BalancePair {
+        dr: Amount([1u8; 32]),
+        cr: Amount::ZERO,
+    };
+    let create_eve = CcCreateAccount::signed(eve, &registrar.secret);
+    let eve_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_eve)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, eve_bytes, ts))
+        .expect("invoke create_account (non-zero balance)");
+    assert_eq!(
+        status,
+        Status::InvalidAccount,
+        "non-zero balance on input must be rejected"
+    );
+
+    // ── Transfer end-to-end ─────────────────────────────────────
+    //
+    // Build a real signed transfer (alice debits 100 to a 'pool'
+    // asset account) plus the matching Pedersen opening, push it
+    // through apply_transfer, assert the kernel accepts it and
+    // both touched accounts' balance commitments updated.
+
+    let pool_kp = Keypair::generate();
+    let pool = Account::asset(journal, pool_kp.public, Iso4217::USD, BankCode::Vault);
+    let pool_id = pool.id.0;
+    let pool_create = CcCreateAccount::signed(pool.clone(), &registrar.secret);
+    let pool_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&pool_create)
+        .expect("rkyv encode")
+        .to_vec();
+    let status = vos::block_on(ledger.create_account(&mut &node, pool_bytes, ts))
+        .expect("invoke create_account pool");
+    assert_eq!(status, Status::Ok);
+
+    // Any 32-byte value < curve order is a valid Blinding. The
+    // test doesn't need cryptographic randomness; a fixed pattern
+    // keeps the assertions deterministic.
+    let blinding = cipher_clerk::crypto::Blinding([1u8; 32]);
+    let amt = Amount::commit(100, &blinding);
+    let signed_transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&alice, cipher_clerk::types::Layer::Settled, amt)
+        .credit(&pool, cipher_clerk::types::Layer::Settled, amt)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+    let transfer_id = signed_transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer)
+        .expect("rkyv encode transfer")
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount: amt,
+        value: 100,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("rkyv encode openings")
+        .to_vec();
+    let transfer_ts = ts + 100;
+    // Capture the pre-transfer state root from the host side so we
+    // can later cross-check the (root_before, root_after) anchor
+    // pair that apply_transfer is supposed to record.
+    let host_observed_root_before =
+        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-transfer");
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        transfer_bytes,
+        openings_bytes,
+        transfer_ts,
+    ))
+    .expect("invoke apply_transfer");
+    assert_eq!(
+        status,
+        Status::Ok,
+        "transfer should land cleanly (got status {status:?})",
+    );
+    let host_observed_root_after =
+        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root post-transfer");
+
+    // Verify the kernel updated alice's Settled debit and pool's
+    // Settled credit by exactly `amt`. (Starting from BalancePair::ZERO,
+    // the Pedersen sum after one entry is the entry's own commit.)
+    let alice_after = vos::block_on(ledger.account(&mut &node, alice_id.to_vec()))
+        .expect("alice account read")
+        .expect("alice exists");
+    let pool_after = vos::block_on(ledger.account(&mut &node, pool_id.to_vec()))
+        .expect("pool account read")
+        .expect("pool exists");
+    let settled = cipher_clerk::types::Layer::Settled.as_index();
+    assert_eq!(
+        alice_after.balances[settled].dr, amt,
+        "alice's Settled debit should equal the transfer amount commit"
+    );
+    assert_eq!(
+        alice_after.balances[settled].cr,
+        Amount::ZERO,
+        "alice's Settled credit should remain zero"
+    );
+    assert_eq!(
+        pool_after.balances[settled].cr, amt,
+        "pool's Settled credit should equal the transfer amount commit"
+    );
+    assert_eq!(
+        pool_after.balances[settled].dr,
+        Amount::ZERO,
+        "pool's Settled debit should remain zero"
+    );
+
+    // Transfer is persisted with the kernel-stamped event_ts.
+    let stored_transfer = vos::block_on(ledger.transfer(&mut &node, transfer_id.to_vec()))
+        .expect("transfer read")
+        .expect("transfer exists");
+    assert_eq!(stored_transfer.id.0, transfer_id);
+    assert_eq!(stored_transfer.timestamp, transfer_ts);
+
+    // Per-transfer state-root anchor: clerk-ledger captured
+    // (root_before, root_after) at the moment the kernel accepted
+    // this transfer. The pair MUST equal what the host observed
+    // by querying state_root just before and just after — that's
+    // the property a downstream voucher builder will rely on
+    // (the bank constructs a voucher anchored to these roots;
+    // the receiving bank checks them against the wire payload).
+    let (root_before, root_after) =
+        vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id.to_vec()))
+            .expect("invoke transfer_state_roots")
+            .expect("recorded for accepted transfer");
+    assert_eq!(
+        root_before.len(),
+        32,
+        "root_before must be a 32-byte SMT root"
+    );
+    assert_eq!(
+        root_after.len(),
+        32,
+        "root_after must be a 32-byte SMT root"
+    );
+    assert_eq!(
+        root_before, host_observed_root_before,
+        "captured root_before must equal host's pre-transfer state_root"
+    );
+    assert_eq!(
+        root_after, host_observed_root_after,
+        "captured root_after must equal host's post-transfer state_root"
+    );
+    assert_ne!(
+        root_before, root_after,
+        "accepting a state-changing transfer must move the SMT root"
+    );
+
+    // Unknown transfer id → None.
+    let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, vec![0u8; 16]))
+        .expect("invoke transfer_state_roots (missing)");
+    assert!(missing.is_none(), "unknown transfer id must yield None");
+
+    // Garbage bytes are rejected by the decode step.
+    let status =
+        vos::block_on(ledger.apply_transfer(&mut &node, vec![0xFFu8; 7], vec![], ts + 200))
+            .expect("invoke apply_transfer (garbage)");
+    assert_eq!(status, Status::BadInput);
+
+    // Replay protection: re-submitting the same transfer returns
+    // Status::IdAlreadyExists (TransferIdAlreadyExists from the kernel).
+    let replay_transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer)
+        .expect("rkyv encode transfer (replay)")
+        .to_vec();
+    let replay_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("rkyv encode openings (replay)")
+        .to_vec();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        replay_transfer_bytes,
+        replay_openings_bytes,
+        transfer_ts + 100,
+    ))
+    .expect("invoke apply_transfer (replay)");
+    assert_eq!(status, Status::IdAlreadyExists);
+
+    // ── Pre-verify gate adversarial cases ───────────────────────
+    //
+    // The actor verifies signatures BEFORE any state-dependent
+    // lookup so a caller can't probe state with junk-signed
+    // transfers. The three cases below pin the state-hiding bucket:
+    // signature-failure, count-mismatch, and account-not-found all
+    // return Status::SignatureInvalid — indistinguishable from each
+    // other.
+
+    // Bad signature on an existing account: alice debits 1 to pool
+    // but the transfer is signed with an imposter key (the imposter
+    // doesn't even need to be on file — the signature is simply
+    // wrong for alice's auth_key, so the verify fails outright).
+    let blinding_b = cipher_clerk::crypto::Blinding([2u8; 32]);
+    let amt_b = Amount::commit(1, &blinding_b);
+    let imposter_kp = Keypair::generate();
+    let bad_sig_transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amt_b)
+        .credit(&pool, Layer::Settled, amt_b)
+        .signed_by(&[&imposter_kp.secret]);
+    let bad_sig_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&bad_sig_transfer)
+        .expect("rkyv encode transfer (bad sig)")
+        .to_vec();
+    let bad_sig_openings = vec![clerk_ledger::Opening {
+        amount: amt_b,
+        value: 1,
+        blinding: blinding_b,
+    }];
+    let bad_sig_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&bad_sig_openings)
+        .expect("rkyv encode openings (bad sig)")
+        .to_vec();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        bad_sig_bytes,
+        bad_sig_openings_bytes,
+        transfer_ts + 200,
+    ))
+    .expect("invoke apply_transfer (bad sig)");
+    assert_eq!(
+        status,
+        Status::SignatureInvalid,
+        "transfer with wrong signer must hit pre-verify gate"
+    );
+
+    // Signature count mismatch: a valid alice→pool transfer but
+    // with the signatures vec emptied out. Distinct debits = 1,
+    // signatures.len() = 0 → Status::SignatureInvalid before any
+    // state-touching code runs.
+    let blinding_c = cipher_clerk::crypto::Blinding([3u8; 32]);
+    let amt_c = Amount::commit(1, &blinding_c);
+    let mut unsigned_transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amt_c)
+        .credit(&pool, Layer::Settled, amt_c)
+        .build_unsigned();
+    unsigned_transfer.signatures.clear();
+    let unsigned_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&unsigned_transfer)
+        .expect("rkyv encode transfer (unsigned)")
+        .to_vec();
+    let unsigned_openings = vec![clerk_ledger::Opening {
+        amount: amt_c,
+        value: 1,
+        blinding: blinding_c,
+    }];
+    let unsigned_openings_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&unsigned_openings)
+            .expect("rkyv encode openings (unsigned)")
+            .to_vec();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        unsigned_bytes,
+        unsigned_openings_bytes,
+        transfer_ts + 300,
+    ))
+    .expect("invoke apply_transfer (count mismatch)");
+    assert_eq!(
+        status,
+        Status::SignatureInvalid,
+        "transfer with sig count != distinct debits must hit pre-verify gate"
+    );
+
+    // Account not found: build a syntactically-valid signed transfer
+    // whose debit account is a fresh ghost that was never registered.
+    // The kernel would normally surface Status::AccountNotFound
+    // (revealing that the account isn't on file); the pre-verify
+    // gate collapses this into Status::SignatureInvalid so a probe
+    // can't distinguish "account doesn't exist" from "signature
+    // doesn't match".
+    let ghost_kp = Keypair::generate();
+    let ghost = Account::asset(journal, ghost_kp.public, Iso4217::USD, BankCode::Checking);
+    let blinding_d = cipher_clerk::crypto::Blinding([4u8; 32]);
+    let amt_d = Amount::commit(1, &blinding_d);
+    let ghost_transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&ghost, Layer::Settled, amt_d)
+        .credit(&pool, Layer::Settled, amt_d)
+        .signed_with(&[(&ghost, &ghost_kp.secret)]);
+    let ghost_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&ghost_transfer)
+        .expect("rkyv encode transfer (ghost)")
+        .to_vec();
+    let ghost_openings = vec![clerk_ledger::Opening {
+        amount: amt_d,
+        value: 1,
+        blinding: blinding_d,
+    }];
+    let ghost_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&ghost_openings)
+        .expect("rkyv encode openings (ghost)")
+        .to_vec();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        ghost_bytes,
+        ghost_openings_bytes,
+        transfer_ts + 400,
+    ))
+    .expect("invoke apply_transfer (ghost debit)");
+    assert_eq!(
+        status,
+        Status::SignatureInvalid,
+        "transfer debiting a non-existent account must hit pre-verify gate, not leak Status::AccountNotFound",
+    );
+
+    // Adversarial #4: structurally-mislabeled pending finalize.
+    // A transfer with `POST_PENDING_TRANSFER` flag set AND
+    // non-empty entries — the kernel rejects such a finalize for
+    // `PendingFinalizationMustHaveNoEntries` (maps to
+    // Status::PendingViolation). We sign with the WRONG keypair
+    // on purpose. The pre-verify gate's flag-based detection
+    // routes this to the finalize path (skipping the entries-based
+    // signature check), and the kernel's first check on the
+    // finalize path is `entries.is_empty()` — which returns
+    // WITHOUT touching state. Result: Status::PendingViolation,
+    // NOT Status::SignatureInvalid.
+    //
+    // This pins the picky-review fix: previously pre-verify used
+    // `pending_id.is_some() && entries.is_empty()`, which let this
+    // exact attack pattern reach state-touching code paths in the
+    // kernel. Flag-based detection closes that.
+    use cipher_clerk::types::TransferFlags;
+    let imposter = Keypair::generate();
+    // `signed_by` puts the supplied secret(s) in the signatures
+    // vec positionally — for our single-debited-account entry,
+    // position[0] is alice's slot. Signing with imposter.secret
+    // produces a "wrong signer" signature in alice's slot, so the
+    // entries-based pre-verify (old behaviour) would have
+    // rejected with Status::SignatureInvalid. The new flag-based
+    // gate skips that check and lets the kernel reject on
+    // entries-non-empty instead.
+    let imposter_pp_transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amt)
+        .credit(&pool, Layer::Settled, amt)
+        .flags(TransferFlags::POST_PENDING_TRANSFER)
+        .signed_by(&[&imposter.secret]);
+    let imposter_pp_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&imposter_pp_transfer)
+        .expect("rkyv encode imposter post-pending")
+        .to_vec();
+    // Openings is an empty Vec — finalize doesn't need any since
+    // entries are supposed to be empty. Encode it as a proper
+    // rkyv archive (empty bytes would fail at the decode step
+    // with Status::BadInput, before we'd reach the kernel path
+    // we're trying to exercise).
+    let empty_openings: Vec<clerk_ledger::Opening> = Vec::new();
+    let empty_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&empty_openings)
+        .expect("rkyv encode empty openings")
+        .to_vec();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        imposter_pp_bytes,
+        empty_openings_bytes,
+        transfer_ts + 500,
+    ))
+    .expect("invoke apply_transfer (post-pending + non-empty entries)");
+    assert_eq!(
+        status,
+        Status::PendingViolation,
+        "flag-based finalize detection must bypass entries-based pre-verify and let the kernel reject on entries-non-empty"
+    );
+
+    let results = node.collect();
+    let panics: u32 = results.iter().map(|r| r.panics).sum();
+    assert_eq!(panics, 0, "actor panics during clerk-ledger test: {panics}");
+}
+
+#[test]
+fn clerk_ledger_two_bank_federation() {
+    // End-to-end federation demo. Two bank spaces (A, B), each
+    // independently running its own confidential ledger, join a
+    // shared hyperspace and discover each other through it. Pins
+    // the plumbing that the cross-bank settlement story will sit
+    // on top of in later phases.
+    //
+    // Each bank space runs:
+    //   - space-registry @ ServiceId::REGISTRY          (CRDT, per-space)
+    //   - space-registry @ ServiceId::HYPERSPACE_REGISTRY (CRDT, shared rep_id)
+    //   - space-bridge   @ derived from "bridge-{a|b}"  (Ephemeral, stateless)
+    //   - clerk-ledger   @ derived from "clerk-{a|b}"   (Local, single-node)
+    //
+    // The hyperspace registry replicates host_mappings between the
+    // two member spaces via gossipsub-CRDT — that's the only thing
+    // wiring the federation together at the protocol level.
+    //
+    // What this test pins:
+    //   1. After convergence, A's hyperspace registry resolves
+    //      "clerk-b" / "bridge-b" to B's ServiceIds, and vice versa.
+    //   2. From node_a, ClerkLedgerRef::at(clerk_b_id).account(bob_id)
+    //      reaches bank B's local clerk-ledger via prefix routing and
+    //      returns Bob's account record — cross-bank read works.
+    //   3. The reverse path (B reading Alice from A) also works.
+    //   4. Per-bank state isolation: bank A's clerk-ledger does NOT
+    //      have Bob (he was only created on B). A non-existent read
+    //      returns None, not a stale cross-bank hit.
+    //   5. Cross-bank voucher round-trip: bank A applies a same-bank
+    //      transfer, queries transfer_state_roots, builds + signs a
+    //      cipher_clerk::voucher::Voucher anchored to those roots
+    //      with an EncryptedEnvelope sealed under bank B's IVK_PK.
+    //      Bank B parses Voucher::from_bytes, verifies signature
+    //      against bank A's clerk pubkey, opens envelope to recover
+    //      (value, blinding), and confirms the amount commitment
+    //      reconstructs. Adversarial: tampered bytes and wrong
+    //      issuer pubkey both fail verification.
+    //   6. Bridge addressing parity: A can also reach B's bridge
+    //      (where_am_i round-trip) — establishes the bridge-mediated
+    //      path that a future cross-bank transfer would ride.
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair, blake2b_256};
+    use cipher_clerk::ids::{ExternalId, JournalId, TransferId};
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::notes::Note;
+    use cipher_clerk::proof::Proof as CcProof;
+    use cipher_clerk::types::{Account, Layer, Transfer};
+    use cipher_clerk::viewing_keys::{EncryptedEnvelope, SpendKey};
+    use cipher_clerk::voucher::{Voucher, VoucherError};
+    use clerk_ledger::{ClerkLedgerRef, Status};
+    use space_bridge::SpaceBridgeRef;
+    use space_registry::SpaceRegistryRef;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    // ── Load ELFs ───────────────────────────────────────────────
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let bridge_path = format!(
+        "{}/../actors/space-bridge/target/riscv64em-javm/release/space_bridge.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let ledger_path = format!(
+        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let bridge_elf = match std::fs::read(&bridge_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-bridge not built (run `just build-bridge`)");
+            return;
+        }
+    };
+    let ledger_elf = match std::fs::read(&ledger_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-ledger not built (run `just build-clerk-ledger`)");
+            return;
+        }
+    };
+    let clerk_bridge_path = format!(
+        "{}/../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let clerk_bridge_elf = match std::fs::read(&clerk_bridge_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-bridge not built (run `just build-clerk-bridge`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile registry");
+    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile bridge");
+    let ledger_blob = grey_transpiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
+    let clerk_bridge_blob =
+        grey_transpiler::link_elf(&clerk_bridge_elf).expect("transpile clerk-bridge");
+
+    // Each test invocation gets isolated redb directories so two
+    // CRDT-persisted REGISTRY replicas don't fight over a shared file.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_clerk_fed_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // Replication IDs. The per-space REGISTRY replicas are
+    // independent (each bank's local catalog); the HYPERSPACE_REGISTRY
+    // replicas share `hs_rep` so they converge across nodes.
+    let mk_id = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    let space_a_rep = mk_id(b"clerk-fed/space-a");
+    let space_b_rep = mk_id(b"clerk-fed/space-b");
+    let hs_rep = mk_id(b"clerk-fed/hyperspace");
+
+    // ── libp2p bring-up ─────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+    });
+
+    // ── ServiceIds derived from federation-visible names ────────
+    let bridge_a_id = ServiceId(space_registry::instance_service_id("bridge-a", prefix_a));
+    let bridge_b_id = ServiceId(space_registry::instance_service_id("bridge-b", prefix_b));
+    let clerk_a_id = ServiceId(space_registry::instance_service_id("clerk-a", prefix_a));
+    let clerk_b_id = ServiceId(space_registry::instance_service_id("clerk-b", prefix_b));
+    // clerk-bridge runs only on bank B in this test — it's the
+    // voucher-INGRESS gateway. Bank A would have its own
+    // clerk-bridge in a real federation for receiving vouchers
+    // back from bank B, but our test only flows A→B.
+    let clerk_bridge_b_id = ServiceId(space_registry::instance_service_id(
+        "clerk-bridge-b",
+        prefix_b,
+    ));
+
+    // ── Node A ──────────────────────────────────────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(space_a_rep),
+        ServiceId::REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(bridge_blob.clone()).with_consistency(Consistency::Ephemeral),
+        bridge_a_id,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(ledger_blob.clone())
+            .with_consistency(Consistency::Local)
+            .persist(&dir_a),
+        clerk_a_id,
+    );
+    node_a.attach_network(net_a);
+
+    // ── Node B ──────────────────────────────────────────────────
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(space_b_rep),
+        ServiceId::REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(bridge_blob).with_consistency(Consistency::Ephemeral),
+        bridge_b_id,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(ledger_blob)
+            .with_consistency(Consistency::Local)
+            .persist(&dir_b),
+        clerk_b_id,
+    );
+    // clerk-bridge on B: holds the bank-B IVK secret + peer-A
+    // clerk pubkey + dedup set. Persisted (Local) so the dedup
+    // state survives across actor restarts.
+    node_b.register_at_id(
+        AgentConfig::new(clerk_bridge_blob)
+            .with_consistency(Consistency::Local)
+            .persist(&dir_b),
+        clerk_bridge_b_id,
+    );
+    node_b.attach_network(net_b);
+
+    // ── Wait for libp2p Hello ───────────────────────────────────
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            if net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .expect("libp2p Hello handshake");
+
+    // ── Publish federation-visible names on both sides ──────────
+    //
+    // Each bank publishes ALL four names ("bridge-a", "bridge-b",
+    // "clerk-a", "clerk-b") in its hyperspace registry view; the
+    // CRDT merge then converges. We do this from BOTH sides so the
+    // test exercises the converging-merge path rather than just
+    // single-writer propagation.
+    let hs_a = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    let hs_b = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    for (name, prefix) in [("bridge-a", prefix_a), ("clerk-a", prefix_a)] {
+        let s = vos::block_on(hs_a.register_remote(&mut &node_a, name.into(), prefix as u32))
+            .expect("register_remote on A");
+        assert_eq!(s, space_registry::STATUS_OK, "A.register_remote {name}");
+    }
+    for (name, prefix) in [("bridge-b", prefix_b), ("clerk-b", prefix_b)] {
+        let s = vos::block_on(hs_b.register_remote(&mut &node_b, name.into(), prefix as u32))
+            .expect("register_remote on B");
+        assert_eq!(s, space_registry::STATUS_OK, "B.register_remote {name}");
+    }
+
+    // CRDT converges via gossipsub. Wait until each side can resolve
+    // the other's clerk name before proceeding.
+    wait_for(
+        || {
+            let from_a =
+                vos::block_on(hs_a.resolve(&mut &node_a, "clerk-b".into(), prefix_a as u64))
+                    .unwrap_or(0);
+            let from_b =
+                vos::block_on(hs_b.resolve(&mut &node_b, "clerk-a".into(), prefix_b as u64))
+                    .unwrap_or(0);
+            if from_a == clerk_b_id.0 && from_b == clerk_a_id.0 {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .expect("hyperspace registry CRDT convergence");
+
+    // ── 1) Federation discovery sanity ──────────────────────────
+    //
+    // Each bank's hyperspace replica resolves every other bank's
+    // bridge and clerk to the expected ServiceIds.
+    for (side, hs, node, peer_clerk, peer_bridge) in [
+        ("A→B", &hs_a, &node_a, clerk_b_id.0, bridge_b_id.0),
+        ("B→A", &hs_b, &node_b, clerk_a_id.0, bridge_a_id.0),
+    ] {
+        let local_prefix = if side == "A→B" { prefix_a } else { prefix_b };
+        let clerk_name = if side == "A→B" {
+            "clerk-b"
+        } else {
+            "clerk-a"
+        };
+        let bridge_name = if side == "A→B" {
+            "bridge-b"
+        } else {
+            "bridge-a"
+        };
+        let got_clerk =
+            vos::block_on(hs.resolve(&mut &*node, clerk_name.into(), local_prefix as u64))
+                .expect("resolve peer clerk");
+        assert_eq!(got_clerk, peer_clerk, "{side} resolve {clerk_name}");
+        let got_bridge =
+            vos::block_on(hs.resolve(&mut &*node, bridge_name.into(), local_prefix as u64))
+                .expect("resolve peer bridge");
+        assert_eq!(got_bridge, peer_bridge, "{side} resolve {bridge_name}");
+    }
+
+    // ── 2) Bootstrap each bank's clerk-ledger ───────────────────
+    //
+    // Each bank gets its own journal id + registrar keypair —
+    // independent confidential ledgers. The same journal_id MUST
+    // NOT be shared, since each bank's accounts are anchored to it.
+    let registrar_a = Keypair::generate();
+    let registrar_b = Keypair::generate();
+    let journal_a = JournalId::random();
+    let journal_b = JournalId::random();
+
+    let ledger_a = ClerkLedgerRef::at(clerk_a_id);
+    let ledger_b = ClerkLedgerRef::at(clerk_b_id);
+    let ts: u64 = 2_000_000;
+    assert_eq!(
+        vos::block_on(ledger_a.bootstrap(
+            &mut &node_a,
+            journal_a.0.to_vec(),
+            registrar_a.public.0.to_vec(),
+            1u32,
+        ))
+        .expect("ledger_a bootstrap"),
+        Status::Ok
+    );
+    assert_eq!(
+        vos::block_on(ledger_b.bootstrap(
+            &mut &node_b,
+            journal_b.0.to_vec(),
+            registrar_b.public.0.to_vec(),
+            1u32,
+        ))
+        .expect("ledger_b bootstrap"),
+        Status::Ok
+    );
+
+    // Alice lives on bank A; Bob lives on bank B. Each is created
+    // through its local clerk-ledger, registrar-signed.
+    let alice_kp = Keypair::generate();
+    let alice = Account::asset(journal_a, alice_kp.public, Iso4217::USD, BankCode::Checking);
+    let alice_id = alice.id.0;
+    let alice_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        alice.clone(),
+        &registrar_a.secret,
+    ))
+    .expect("rkyv encode CreateAccount(alice)")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_a.create_account(&mut &node_a, alice_bytes, ts))
+            .expect("create alice on A"),
+        Status::Ok
+    );
+
+    let bob_kp = Keypair::generate();
+    let bob = Account::asset(journal_b, bob_kp.public, Iso4217::USD, BankCode::Checking);
+    let bob_id = bob.id.0;
+    let bob_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        bob.clone(),
+        &registrar_b.secret,
+    ))
+    .expect("rkyv encode CreateAccount(bob)")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_b.create_account(&mut &node_b, bob_bytes, ts))
+            .expect("create bob on B"),
+        Status::Ok
+    );
+
+    // ── 3) Cross-bank read via typed Ref + prefix routing ───────
+    //
+    // From node_a, invoke ClerkLedgerRef::at(clerk_b_id).account(bob_id).
+    // The ServiceId's top 16 bits = prefix_b, so the mailbox routes
+    // the dispatch to node_b over libp2p. Node_b's local clerk-ledger
+    // handles it and the typed reply rides back. No bridge needed for
+    // this — direct ServiceId addressing is the simpler federation
+    // primitive when the caller already knows the target ServiceId
+    // (e.g., obtained via the hyperspace resolve above).
+    let bob_remote = vos::block_on(ledger_b.account(&mut &node_a, bob_id.to_vec()))
+        .expect("cross-bank account(bob) from A")
+        .expect("bob exists on B");
+    assert_eq!(bob_remote.id.0, bob_id, "bob's id round-trips cross-bank");
+    assert_eq!(
+        bob_remote.journal_id, journal_b,
+        "bob is anchored to bank B's journal"
+    );
+    assert_eq!(
+        bob_remote.auth_key, bob_kp.public,
+        "bob's auth key matches what B registered"
+    );
+
+    // Reverse direction: B reads Alice from A's ledger.
+    let alice_remote = vos::block_on(ledger_a.account(&mut &node_b, alice_id.to_vec()))
+        .expect("cross-bank account(alice) from B")
+        .expect("alice exists on A");
+    assert_eq!(alice_remote.id.0, alice_id);
+    assert_eq!(alice_remote.journal_id, journal_a);
+
+    // ── 4) Per-bank state isolation ─────────────────────────────
+    //
+    // Bob was only created on B. A's local ledger must not have
+    // him — i.e., a cross-bank query for Bob targeting A's ledger
+    // returns None, not a stale hit propagated through some shared
+    // state. (clerk-ledger has Consistency::Local, no replication.)
+    let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id.to_vec()))
+        .expect("local account(bob) on A");
+    assert!(
+        bob_on_a.is_none(),
+        "bob must NOT appear on A — confidential ledger state is per-bank"
+    );
+    let alice_on_b = vos::block_on(ledger_b.account(&mut &node_b, alice_id.to_vec()))
+        .expect("local account(alice) on B");
+    assert!(
+        alice_on_b.is_none(),
+        "alice must NOT appear on B — confidential ledger state is per-bank"
+    );
+
+    // ── 5) Cross-bank voucher round-trip ────────────────────────
+    //
+    // Bank A applies a same-bank transfer (alice → vault_a),
+    // queries transfer_state_roots, builds + signs a Voucher
+    // anchored to those roots with envelope sealed under bank B's
+    // IVK_PK. Bank B verifies the voucher against bank A's clerk
+    // pubkey and opens the envelope to recover the opening.
+    //
+    // This is the wire-level proof that the federation can move
+    // value across bank boundaries: the voucher carries everything
+    // bank B needs to credit Bob equivalent value off a verified
+    // anchor on bank A's state, without bank B trusting bank A
+    // beyond the clerk pubkey and the SMT root anchors.
+
+    // Bank B publishes its incoming-viewing-key pubkey out of band
+    // (in production, via the hyperspace registry or a service
+    // discovery layer; here, just keep it on the host).
+    let bank_b_spend = SpendKey::generate();
+    let bank_b_ivk = bank_b_spend.incoming_viewing_key();
+    let bank_b_ivk_pk = bank_b_ivk.public();
+
+    // Vault account on bank A — the credit side of the transfer
+    // that anchors the voucher. (In a real flow, this would be a
+    // "cross-bank holding" account whose balance reflects what
+    // bank B has been promised.)
+    let vault_kp = Keypair::generate();
+    let vault_a = Account::asset(journal_a, vault_kp.public, Iso4217::USD, BankCode::Vault);
+    let vault_a_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        vault_a.clone(),
+        &registrar_a.secret,
+    ))
+    .expect("rkyv encode CreateAccount(vault_a)")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_a.create_account(&mut &node_a, vault_a_bytes, ts))
+            .expect("create vault_a on A"),
+        Status::Ok,
+    );
+
+    // alice debits 100 to vault_a. Fixed-pattern blinding so the
+    // test stays deterministic; bytes are a known-canonical scalar
+    // (matches what the existing clerk-ledger transfer test uses,
+    // and what EncryptedEnvelope::seal will accept). The value is
+    // what bank B will recover from the sealed envelope.
+    let blinding = cipher_clerk::crypto::Blinding([2u8; 32]);
+    let value: u64 = 100;
+    let amt = Amount::commit(value, &blinding);
+    let signed_transfer: Transfer = Transfer::builder(journal_a)
+        .debit(&alice, Layer::Settled, amt)
+        .credit(&vault_a, Layer::Settled, amt)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+    let transfer_id = signed_transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer)
+        .expect("rkyv encode transfer")
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount: amt,
+        value,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("rkyv encode openings")
+        .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_a.apply_transfer(
+            &mut &node_a,
+            transfer_bytes,
+            openings_bytes,
+            ts + 100,
+        ))
+        .expect("apply_transfer on A"),
+        Status::Ok,
+    );
+
+    // Read back the anchor pair clerk-ledger captured on accept.
+    let (root_before_vec, root_after_vec) =
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id.to_vec()))
+            .expect("invoke transfer_state_roots")
+            .expect("anchor recorded for accepted transfer");
+    let root_before: [u8; 32] = root_before_vec.try_into().expect("32-byte root_before");
+    let root_after: [u8; 32] = root_after_vec.try_into().expect("32-byte root_after");
+
+    // Bank A's caller seals (value, blinding) under bank B's IVK_PK
+    // and constructs the voucher. The "clerk-key" here is bank A's
+    // registrar key — in our demo the registrar identity also acts
+    // as the bank's signing clerk (production deployments would
+    // split these). Mode::Signature proof is the baseline; zkVM
+    // proofs (Mode::External) plug in without changing the wire
+    // shape.
+    let envelope = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
+        .expect("seal envelope under bank B's IVK_PK");
+    let voucher = Voucher::sign(
+        amt,
+        envelope,
+        root_before,
+        root_after,
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let voucher_bytes = voucher.to_bytes();
+
+    // ── Bank B side ────────────────────────────────────────────
+    //
+    // In production, voucher_bytes would ride over a bridge.forward
+    // call to bank B; we skip the bridge here because the existing
+    // bridge tests prove that transport works and the voucher math
+    // is the new thing we're pinning.
+    let received = Voucher::from_bytes(&voucher_bytes).expect("parse voucher bytes");
+    received
+        .verify_against(&registrar_a.public, Some(root_before))
+        .expect("voucher verifies against bank A's clerk pubkey + anchor");
+
+    let (recovered_value, recovered_blinding) = received
+        .envelope
+        .open(&bank_b_ivk)
+        .expect("open envelope with bank B's IVK");
+    assert_eq!(
+        recovered_value, value,
+        "recovered value matches sealed value"
+    );
+    assert_eq!(
+        recovered_blinding, blinding,
+        "recovered blinding matches sealed blinding"
+    );
+    // The Pedersen commitment reconstructs identically — proves the
+    // recipient can now credit Bob the same Amount on its side
+    // without bank A revealing the (value, blinding) to anyone but
+    // bank B.
+    let reconstructed = Amount::commit(recovered_value, &recovered_blinding);
+    assert_eq!(
+        reconstructed, received.amount_commit,
+        "reconstructed Amount commit matches the voucher's amount_commit"
+    );
+
+    // Adversarial #1: tampered voucher bytes. Flip a byte deep
+    // inside the signature region; from_bytes still parses (the
+    // structural shape is intact) but verify_signature fails.
+    let mut tampered = voucher_bytes.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    let parsed_tampered = Voucher::from_bytes(&tampered).expect("structural parse still works");
+    assert_eq!(
+        parsed_tampered.verify_against(&registrar_a.public, None),
+        Err(VoucherError::BadSignature),
+        "tampered signature must fail verification"
+    );
+
+    // Adversarial #2: verifying against bank B's pubkey (which
+    // didn't sign this voucher) must also fail.
+    assert_eq!(
+        received.verify_against(&registrar_b.public, None),
+        Err(VoucherError::BadSignature),
+        "wrong issuer pubkey must fail verification"
+    );
+
+    // Adversarial #3: stale-anchor probe. If bank B previously saw
+    // bank A at a different root (e.g. an earlier voucher's
+    // root_after), passing that as `expected_root_before` to
+    // verify_against must fail — protects against replays of
+    // vouchers from outdated state.
+    let fake_anchor = [0xEEu8; 32];
+    assert_eq!(
+        received.verify_against(&registrar_a.public, Some(fake_anchor)),
+        Err(VoucherError::StateRootMismatch),
+        "wrong root_before anchor must fail with StateRootMismatch"
+    );
+
+    // ── 5b) Bank B credits Bob from the verified voucher ────────
+    //
+    // The voucher's signature + state-root anchoring give bank B
+    // grounds to credit Bob equivalent value on its side. Bank B
+    // builds an "inflow" transfer:
+    //   debit  inflow_b (an asset account representing claims-
+    //          from-other-clerks; goes more-negative on each
+    //          received voucher, mirrors what bank B owes back to
+    //          peer banks if the voucher were ever revoked)
+    //   credit Bob
+    // anchored to the same `(value, blinding)` opening recovered
+    // from the envelope. The Pedersen commit is reused verbatim
+    // from the voucher — this is the L0 "transparent inter-bank"
+    // mode; an L3-shielded mode would re-randomise with a fresh
+    // blinding on bank B's side. Deferred until the notes pool
+    // lands.
+
+    let inflow_kp = Keypair::generate();
+    let inflow_b = Account::asset(journal_b, inflow_kp.public, Iso4217::USD, BankCode::Vault);
+    let inflow_b_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        inflow_b.clone(),
+        &registrar_b.secret,
+    ))
+    .expect("rkyv encode CreateAccount(inflow_b)")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_b.create_account(&mut &node_b, inflow_b_bytes, ts))
+            .expect("create inflow_b on B"),
+        Status::Ok,
+    );
+
+    // Snapshot bank B's state root before the inflow transfer so
+    // we can assert the inflow accept moves the root.
+    let root_b_before_inflow = vos::block_on(ledger_b.state_root(&mut &node_b))
+        .expect("invoke state_root on B pre-inflow");
+
+    // The inflow Amount commit equals the voucher's amount_commit
+    // — same Pedersen point on both sides. The kernel verifies
+    // this end-to-end via the StatefulOracle on bank B reading the
+    // (recovered_value, recovered_blinding) opening recovered from
+    // the envelope.
+    //
+    // Replay protection: external_id is anchored to the underlying
+    // kernel transfer that the voucher refers to, NOT to the
+    // voucher bytes. The triple `(amount_commit, root_before,
+    // root_after)` uniquely identifies which Transfer on bank A
+    // produced the voucher — bank A could re-sign the same payload
+    // with a fresh OsRng nonce (different signature bytes), or
+    // re-seal the envelope under a fresh ephemeral pubkey
+    // (different ciphertext bytes), but those re-issued vouchers
+    // all reference the same underlying transfer and so collapse
+    // to the same external_id on bank B's side.
+    //
+    // Why not signing_payload() or to_bytes()?
+    //   - to_bytes() includes the 64-byte signature, which Schnorr
+    //     randomises per call: trivial issuer-side bypass.
+    //   - signing_payload() includes the envelope ciphertext, which
+    //     embeds a fresh ECDH ephemeral pubkey: also issuer-side
+    //     bypassable by re-sealing the same opening to a fresh
+    //     ephemeral.
+    //   - (amount_commit, root_before, root_after) is the smallest
+    //     tuple that uniquely identifies the kernel-side
+    //     value-transfer promise. Bank A can't produce two
+    //     semantically-distinct vouchers with the same triple
+    //     unless the kernel accepted two state-equivalent
+    //     transfers, which can't happen.
+    //
+    // The kernel's existing `external_id_seen` /
+    // `mark_external_id` machinery does the rest. No new
+    // clerk-ledger state — this rides on the per-journal
+    // idempotency check already in place for arbitrary
+    // operator-supplied uniqueness keys.
+    let voucher_external_id_bytes = blake2b_256(
+        b"clerk-ledger/voucher-redemption/v1",
+        &[
+            &received.amount_commit.0,
+            &received.state_root_before,
+            &received.state_root_after,
+        ],
+    );
+    let voucher_external_id = ExternalId(voucher_external_id_bytes);
+    let inflow_transfer: Transfer = Transfer::builder(journal_b)
+        .debit(&inflow_b, Layer::Settled, received.amount_commit)
+        .credit(&bob, Layer::Settled, received.amount_commit)
+        .external_id(voucher_external_id)
+        .signed_with(&[(&inflow_b, &inflow_kp.secret)]);
+    let inflow_transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_transfer)
+        .expect("rkyv encode inflow transfer")
+        .to_vec();
+    let inflow_openings = vec![clerk_ledger::Opening {
+        amount: received.amount_commit,
+        value: recovered_value,
+        blinding: recovered_blinding,
+    }];
+    let inflow_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_openings)
+        .expect("rkyv encode inflow openings")
+        .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_b.apply_transfer(
+            &mut &node_b,
+            inflow_transfer_bytes,
+            inflow_openings_bytes,
+            ts + 200,
+        ))
+        .expect("apply_transfer (inflow) on B"),
+        Status::Ok,
+        "bank B must accept the inflow transfer with the recovered opening"
+    );
+
+    // Bob's Settled credit balance MUST equal the voucher's
+    // amount_commit — the cross-bank value transfer is now
+    // visible on bank B's books.
+    let bob_after = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+        .expect("read bob on B")
+        .expect("bob exists");
+    let settled = Layer::Settled.as_index();
+    assert_eq!(
+        bob_after.balances[settled].cr, received.amount_commit,
+        "bob's Settled credit must equal the voucher's amount commit"
+    );
+    assert_eq!(
+        bob_after.balances[settled].dr,
+        Amount::ZERO,
+        "bob's Settled debit must remain zero (he only received)"
+    );
+
+    // Bank B's state root must have advanced — the inflow transfer
+    // changed B's local state. A future round-trip can anchor
+    // anti-replay against this new root.
+    let root_b_after_inflow = vos::block_on(ledger_b.state_root(&mut &node_b))
+        .expect("invoke state_root on B post-inflow");
+    assert_ne!(
+        root_b_before_inflow, root_b_after_inflow,
+        "bank B's inflow accept must move its SMT root"
+    );
+
+    // ── 5c) Voucher replay protection ───────────────────────────
+    //
+    // Build a SECOND inflow transfer with a FRESH TransferId but
+    // the SAME external_id (= blake2b_256 of the same voucher
+    // bytes). The kernel's `external_id_seen` check is what catches
+    // the replay — Status::IdAlreadyExists would mean we matched
+    // on TransferId (which we explicitly changed), so the expected
+    // rejection is specifically Status::ExternalIdReused.
+    let replay_inflow: Transfer = Transfer::builder(journal_b)
+        .id(TransferId([0x77u8; 16]))
+        .debit(&inflow_b, Layer::Settled, received.amount_commit)
+        .credit(&bob, Layer::Settled, received.amount_commit)
+        .external_id(voucher_external_id)
+        .signed_with(&[(&inflow_b, &inflow_kp.secret)]);
+    let replay_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&replay_inflow)
+        .expect("rkyv encode replay inflow")
+        .to_vec();
+    let replay_openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_openings)
+        .expect("rkyv encode replay openings")
+        .to_vec();
+    let replay_status = vos::block_on(ledger_b.apply_transfer(
+        &mut &node_b,
+        replay_bytes,
+        replay_openings_bytes,
+        ts + 300,
+    ))
+    .expect("apply_transfer (replay attempt) on B");
+    assert_eq!(
+        replay_status,
+        Status::ExternalIdReused,
+        "second redemption of the same voucher must be rejected via external_id dedup"
+    );
+
+    // After the replay rejection, Bob's balance MUST be unchanged
+    // — a rejected transfer doesn't mutate state. Belt + braces:
+    // catches any future regression that returns the failure
+    // status but still committed.
+    let bob_after_replay = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+        .expect("read bob on B post-replay")
+        .expect("bob exists");
+    assert_eq!(
+        bob_after_replay.balances[settled].cr, received.amount_commit,
+        "rejected replay must not double-credit bob"
+    );
+
+    // Adversarial replay #2: malicious bank A re-signs the SAME
+    // payload with fresh OsRng randomness in the Schnorr nonce,
+    // producing different signature bytes. The to_bytes() encoding
+    // of this voucher differs from the original — and the
+    // signing_payload() is identical, but our dedup key is anchored
+    // to (amount, root_before, root_after) and so survives both
+    // mutations. Bank B sees the same external_id and rejects.
+    let resigned = Voucher::sign(
+        received.amount_commit,
+        received.envelope.clone(),
+        received.state_root_before,
+        received.state_root_after,
+        received.proof.clone(),
+        &registrar_a.secret,
+    );
+    // Sanity: the bytes differ from the original voucher (proves
+    // we actually got fresh randomness).
+    assert_ne!(
+        resigned.to_bytes(),
+        voucher_bytes,
+        "re-signing with fresh OsRng must produce different bytes"
+    );
+    // But the same external_id derives from the underlying triple.
+    let resigned_external_id_bytes = blake2b_256(
+        b"clerk-ledger/voucher-redemption/v1",
+        &[
+            &resigned.amount_commit.0,
+            &resigned.state_root_before,
+            &resigned.state_root_after,
+        ],
+    );
+    assert_eq!(
+        resigned_external_id_bytes, voucher_external_id_bytes,
+        "re-signed voucher must derive the same external_id"
+    );
+    // Attempt redemption with the re-signed voucher's external_id
+    // (which is the same as the original's) on a fresh-id
+    // transfer. The kernel dedups on external_id.
+    let resign_attack_inflow: Transfer = Transfer::builder(journal_b)
+        .id(TransferId([0x88u8; 16]))
+        .debit(&inflow_b, Layer::Settled, received.amount_commit)
+        .credit(&bob, Layer::Settled, received.amount_commit)
+        .external_id(ExternalId(resigned_external_id_bytes))
+        .signed_with(&[(&inflow_b, &inflow_kp.secret)]);
+    let resign_attack_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&resign_attack_inflow)
+            .expect("rkyv encode resign-attack inflow")
+            .to_vec();
+    let resign_attack_openings_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_openings)
+            .expect("rkyv encode resign-attack openings")
+            .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_b.apply_transfer(
+            &mut &node_b,
+            resign_attack_bytes,
+            resign_attack_openings_bytes,
+            ts + 400,
+        ))
+        .expect("apply_transfer (resign attack) on B"),
+        Status::ExternalIdReused,
+        "re-signed voucher with same underlying transfer must hit dedup"
+    );
+
+    // ── 5d) L3 shielded receive — alternative privacy mode ──────
+    //
+    // The L0 inflow above keyed Bob's credit to the SAME Pedersen
+    // commit bank A used. Anyone reading both ledgers sees the
+    // same 32-byte point twice and can correlate. L3 fixes that:
+    // bank B re-randomises with a fresh blinding + rho and inserts
+    // a Note commitment into clerk-ledger-B's notes pool. The new
+    // commitment is bytes-different from bank A's amount_commit
+    // even though the underlying value is identical.
+    //
+    // In a real deployment a recipient picks ONE mode per payment
+    // (L0 transparent OR L3 shielded), not both — running both in
+    // this test shows the contrast side-by-side. Production
+    // wallets would skip the L0 inflow entirely when the
+    // counterparty wants L3.
+    //
+    // The actor never sees the (value, fresh_blinding, owner, rho)
+    // opening: it's computed off-ledger here and only the resulting
+    // Pedersen point is submitted. Bob's wallet would hold the
+    // opening and prove ownership when spending via a future
+    // nullifier-publish path.
+    // Deterministic fresh blinding + rho. The privacy property
+    // we want to demonstrate is only that bank B's commit bytes
+    // DIFFER from bank A's; the bytes don't need to be random for
+    // that, and a fixed pattern keeps the test deterministic.
+    // [3u8; 32] is canonical (same family as the [2u8; 32]
+    // blinding bank A used for the voucher; both are <
+    // group-order scalars).
+    let fresh_blinding =
+        Blinding::from_bytes([3u8; 32]).expect("[3u8; 32] is a canonical Ristretto scalar");
+    let fresh_rho: [u8; 32] = [0x33u8; 32];
+    let bob_note = Note {
+        asset_tag: 1, // matches the journal's "code" tag we bootstrapped with
+        value: recovered_value,
+        owner: bob.auth_key,
+        blinding: fresh_blinding,
+        rho: fresh_rho,
+    };
+    let bob_note_commit: Amount = bob_note
+        .commitment()
+        .expect("Note::commitment must succeed for canonical blinding");
+
+    // Pre-insert: pool is empty on bank B.
+    let pool_size_before = vos::block_on(ledger_b.note_commitment_count(&mut &node_b))
+        .expect("invoke note_commitment_count");
+    assert_eq!(pool_size_before, 0, "notes pool must start empty on B");
+
+    let submit_status =
+        vos::block_on(ledger_b.submit_note_commitment(&mut &node_b, bob_note_commit.0.to_vec()))
+            .expect("invoke submit_note_commitment");
+    assert_eq!(
+        submit_status,
+        Status::Ok,
+        "submit_note_commitment must accept a 32-byte Pedersen point"
+    );
+
+    let pool_size_after = vos::block_on(ledger_b.note_commitment_count(&mut &node_b))
+        .expect("invoke note_commitment_count post-submit");
+    assert_eq!(
+        pool_size_after, 1,
+        "submit must append exactly one commitment to the pool"
+    );
+
+    let stored = vos::block_on(ledger_b.note_commitment_at(&mut &node_b, 0))
+        .expect("invoke note_commitment_at");
+    assert_eq!(
+        stored.as_slice(),
+        &bob_note_commit.0[..],
+        "stored commitment must round-trip byte-for-byte"
+    );
+
+    // The privacy property: bank B's stored commitment is NOT
+    // byte-equal to bank A's voucher amount_commit, even though
+    // both encode the same underlying value (100 USD here). An
+    // observer reading both ledgers can't link the two without
+    // help from one of the banks.
+    assert_ne!(
+        stored.as_slice(),
+        &received.amount_commit.0[..],
+        "L3 commitment MUST differ from bank A's amount_commit — that's the whole point of re-randomisation"
+    );
+
+    // Wrong-length input is rejected loudly. (Lengths other than
+    // 32 are structurally invalid Pedersen points; the actor
+    // checks length, the kernel/verifier would check point
+    // validity in a future zkVM-anchored spend.)
+    let bad_status = vos::block_on(ledger_b.submit_note_commitment(&mut &node_b, vec![0u8; 8]))
+        .expect("invoke submit_note_commitment (short)");
+    assert_eq!(
+        bad_status,
+        clerk_ledger::Status::BadInput,
+        "short commitment bytes must be rejected with Status::BadInput"
+    );
+
+    // ── 5e) Actor-mediated ingress via clerk-bridge ─────────────
+    //
+    // Sections 5a..5d above ran the voucher verify + open
+    // host-side using cipher-clerk's API directly. That tests the
+    // math but doesn't exercise the production-shape path —
+    // production deployments route ingress through a stateful
+    // clerk-bridge actor on the receiving bank's space.
+    // clerk-bridge holds (in replicated actor state):
+    //   - this bank's IVK secret
+    //   - the peer banks' clerk pubkeys (resolved by federation
+    //     name at submit time)
+    //   - a dedup set of voucher transfer-triples
+    //
+    // The host caller just hands the bridge a voucher + peer name
+    // and gets back (status, value, blinding). What the bridge
+    // adds over the host-side path: durable dedup, peer-pubkey
+    // resolution against a named registry, and a single
+    // enforcement point for future admission controls (rate
+    // limits, allow-listing, signed envelopes).
+    //
+    // We deliberately submit the SAME voucher we already verified
+    // host-side in 5a — this section is the actor-mediated
+    // demonstration of the same value flow, not a fresh
+    // ingest path. In production a recipient picks one path per
+    // payment; running both here just contrasts the two ABIs.
+    use clerk_bridge::{ClerkBridgeRef, Status as BridgeStatus};
+    let bridge_actor = ClerkBridgeRef::at(clerk_bridge_b_id);
+
+    // Bootstrap rejects wrong-length input.
+    assert_eq!(
+        vos::block_on(bridge_actor.bootstrap(&mut &node_b, clerk_b_id.0, vec![0u8; 16]))
+            .expect("invoke clerk-bridge bootstrap (short ivk)"),
+        BridgeStatus::BadInput,
+        "ivk_secret with wrong length must be rejected at bootstrap",
+    );
+
+    // Bootstrap rejects non-canonical scalar bytes. `[0xFFu8; 32]`
+    // sets every byte to 0xFF, which is far above the Ristretto
+    // group order (~2^252) — `IncomingViewingKey::from_bytes`
+    // returns None. Without this check, the failure would be
+    // deferred to every submit_voucher call returning a confusing
+    // Status::NotBootstrapped.
+    assert_eq!(
+        vos::block_on(bridge_actor.bootstrap(&mut &node_b, clerk_b_id.0, vec![0xFFu8; 32],))
+            .expect("invoke clerk-bridge bootstrap (non-canonical)"),
+        BridgeStatus::BadInput,
+        "non-canonical ivk_secret must be rejected at bootstrap, not deferred to submit",
+    );
+
+    // Happy path: canonical IVK secret bootstraps successfully.
+    assert_eq!(
+        vos::block_on(bridge_actor.bootstrap(
+            &mut &node_b,
+            clerk_b_id.0,
+            bank_b_ivk.to_bytes().to_vec(),
+        ))
+        .expect("invoke clerk-bridge bootstrap"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.register_peer(
+            &mut &node_b,
+            b"bank-a".to_vec(),
+            registrar_a.public.0.to_vec(),
+        ))
+        .expect("invoke register_peer"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.peer_count(&mut &node_b)).expect("invoke peer_count"),
+        1,
+    );
+
+    // Submit the voucher through the bridge. Expected: Status::Ok,
+    // recovered (value, blinding) matches what the host-side
+    // envelope.open recovered in 5a.
+    let bridge_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        voucher_bytes.clone(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("invoke submit_voucher");
+    assert_eq!(
+        bridge_reply.status,
+        BridgeStatus::Ok,
+        "voucher must verify + open through clerk-bridge"
+    );
+    assert_eq!(bridge_reply.value, recovered_value);
+    assert_eq!(bridge_reply.blinding, recovered_blinding.0.to_vec());
+    assert_eq!(
+        vos::block_on(bridge_actor.redeemed_count(&mut &node_b)).expect("invoke redeemed_count"),
+        1,
+        "bridge must record exactly one redeemed voucher"
+    );
+
+    // Replay through the bridge: same voucher bytes, same peer.
+    // The bridge's dedup set already has the transfer-triple, so
+    // the reply is BridgeStatus::VoucherReplayed with empty
+    // value/blinding. The dedup catches the replay BEFORE opening
+    // the envelope a second time.
+    let replay_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        voucher_bytes.clone(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("invoke submit_voucher (replay)");
+    assert_eq!(replay_reply.status, BridgeStatus::VoucherReplayed);
+    assert_eq!(replay_reply.value, 0);
+    assert!(replay_reply.blinding.is_empty());
+
+    // Unknown peer: submit with a name we never registered.
+    let unknown_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        voucher_bytes.clone(),
+        b"bank-z".to_vec(),
+    ))
+    .expect("invoke submit_voucher (unknown peer)");
+    assert_eq!(unknown_reply.status, BridgeStatus::UnknownPeer);
+    // Critical: a rejection from an unknown peer must NOT add to
+    // the dedup set (otherwise an attacker could pre-poison the
+    // dedup with fake submissions to make legitimate vouchers
+    // fail on replay). Count stays at 1.
+    assert_eq!(
+        vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+            .expect("invoke redeemed_count (post-unknown)"),
+        1,
+        "unknown-peer rejection must not poison the dedup set"
+    );
+
+    // Cross-node invocation: bank A's host reaches bank B's
+    // clerk-bridge directly via prefix routing. clerk_bridge_b_id's
+    // top 16 bits are prefix_b, so calling from `&node_a` routes
+    // the dispatch over libp2p to node_b. Same Ref API as
+    // bank-B-local calls; just a different node passed to the
+    // first arg.
+    //
+    // This pins the federation plumbing for the case where bank A
+    // operator wants to verify bank B's clerk-bridge is reachable
+    // before forwarding a real voucher — and for any future flow
+    // where clerk-bridge is the cross-bank entry point and the
+    // ingress is initiated remotely.
+    let cross_node_replay = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_a,
+        voucher_bytes.clone(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("cross-node submit_voucher from A to bridge-b");
+    // The voucher was already redeemed in step 4 above from the
+    // local-node call, so the dedup catches the cross-node retry.
+    // What this asserts: the cross-node Ref invocation reached
+    // bank B's bridge (the dedup state lives on B's actor), AND
+    // the same status semantics apply regardless of which node
+    // initiated the call.
+    assert_eq!(
+        cross_node_replay.status,
+        BridgeStatus::VoucherReplayed,
+        "cross-node submit_voucher must reach bank B's bridge and see the same dedup state"
+    );
+
+    // ── 5f) Atomic ingress via clerk-bridge.redeem_voucher ──────
+    //
+    // Previous sections demonstrate the building blocks; this
+    // section demonstrates the production-shape atomic flow:
+    // verify + open + dispatch credit + dedup-mark, all in one
+    // bridge handler. The bridge cross-actor-invokes
+    // clerk-ledger.apply_transfer; on Status::Ok from the ledger,
+    // the bridge marks the voucher redeemed atomically. On
+    // ledger rejection, the voucher stays available for retry
+    // with a corrected inflow.
+    //
+    // The voucher used in earlier sections is already in the
+    // bridge's dedup set, so we mint a fresh transfer T2 on
+    // bank A (alice → vault_a 200) to get an unredeemed voucher.
+
+    let blinding2 = cipher_clerk::crypto::Blinding([4u8; 32]);
+    let value2: u64 = 200;
+    let amt2 = Amount::commit(value2, &blinding2);
+    let signed_transfer_2: Transfer = Transfer::builder(journal_a)
+        .debit(&alice, Layer::Settled, amt2)
+        .credit(&vault_a, Layer::Settled, amt2)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+    let transfer_id_2 = signed_transfer_2.id.0;
+    let transfer_bytes_2 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer_2)
+        .expect("rkyv encode transfer 2")
+        .to_vec();
+    let openings_2 = vec![clerk_ledger::Opening {
+        amount: amt2,
+        value: value2,
+        blinding: blinding2,
+    }];
+    let openings_bytes_2 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings_2)
+        .expect("rkyv encode openings 2")
+        .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_a.apply_transfer(
+            &mut &node_a,
+            transfer_bytes_2,
+            openings_bytes_2,
+            ts + 500,
+        ))
+        .expect("apply_transfer T2 on A"),
+        Status::Ok,
+    );
+    let (root_before_2_vec, root_after_2_vec) =
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_2.to_vec()))
+            .expect("invoke transfer_state_roots T2")
+            .expect("anchor recorded for T2");
+    let root_before_2: [u8; 32] = root_before_2_vec.try_into().expect("32-byte root_before_2");
+    let root_after_2: [u8; 32] = root_after_2_vec.try_into().expect("32-byte root_after_2");
+
+    let envelope_2 =
+        EncryptedEnvelope::seal(value2, &blinding2, &bank_b_ivk_pk).expect("seal envelope 2");
+    let voucher_2 = Voucher::sign(
+        amt2,
+        envelope_2,
+        root_before_2,
+        root_after_2,
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let voucher_bytes_2 = voucher_2.to_bytes();
+    let voucher_2_external_id = blake2b_256(
+        b"clerk-bridge/voucher-redemption/v1",
+        &[
+            &voucher_2.amount_commit.0,
+            &voucher_2.state_root_before,
+            &voucher_2.state_root_after,
+        ],
+    );
+
+    // Bank B's host pre-builds the inflow Transfer with the
+    // bridge-enforced external_id link. The credit amount MUST
+    // equal voucher.amount_commit (the bridge checks this).
+    let inflow_2: Transfer = Transfer::builder(journal_b)
+        .debit(&inflow_b, Layer::Settled, amt2)
+        .credit(&bob, Layer::Settled, amt2)
+        .external_id(ExternalId(voucher_2_external_id))
+        .signed_with(&[(&inflow_b, &inflow_kp.secret)]);
+    let inflow_2_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_2)
+        .expect("rkyv encode inflow 2")
+        .to_vec();
+    let inflow_2_openings = vec![clerk_ledger::Opening {
+        amount: amt2,
+        value: value2,
+        blinding: blinding2,
+    }];
+    let inflow_2_openings_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_2_openings)
+            .expect("rkyv encode inflow 2 openings")
+            .to_vec();
+
+    // Snapshot Bob's current Settled.cr commit and the bridge's
+    // dedup count so we can pin the deltas.
+    let bob_before = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+        .expect("read bob pre-redeem")
+        .expect("bob exists");
+    let dedup_before = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+        .expect("invoke redeemed_count (pre-redeem)");
+
+    // Atomic happy path.
+    let redeem_reply = vos::block_on(bridge_actor.redeem_voucher(
+        &mut &node_b,
+        voucher_bytes_2.clone(),
+        b"bank-a".to_vec(),
+        inflow_2_bytes.clone(),
+        inflow_2_openings_bytes.clone(),
+        ts + 600,
+    ))
+    .expect("invoke redeem_voucher");
+    assert_eq!(
+        redeem_reply.status,
+        BridgeStatus::Ok,
+        "redeem_voucher must succeed end-to-end (bridge=OK)"
+    );
+    assert_eq!(
+        redeem_reply.ledger_status,
+        Status::Ok as u8,
+        "ledger must accept the bridge-dispatched inflow (ledger=OK)"
+    );
+    let bob_after_redeem = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+        .expect("read bob post-redeem")
+        .expect("bob exists");
+    assert_ne!(
+        bob_before.balances[settled].cr, bob_after_redeem.balances[settled].cr,
+        "bob's Settled credit must move on redeem_voucher"
+    );
+    let dedup_after = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+        .expect("invoke redeemed_count (post-redeem)");
+    assert_eq!(
+        dedup_after,
+        dedup_before + 1,
+        "bridge must atomically record one new redemption"
+    );
+
+    // Replay through redeem_voucher: bridge dedup catches it
+    // before the ledger is touched a second time.
+    let replay_redeem = vos::block_on(bridge_actor.redeem_voucher(
+        &mut &node_b,
+        voucher_bytes_2.clone(),
+        b"bank-a".to_vec(),
+        inflow_2_bytes.clone(),
+        inflow_2_openings_bytes.clone(),
+        ts + 700,
+    ))
+    .expect("invoke redeem_voucher (replay)");
+    assert_eq!(
+        replay_redeem.status,
+        BridgeStatus::VoucherReplayed,
+        "second redeem of same voucher must hit bridge dedup"
+    );
+
+    // Adversarial: inflow with the WRONG external_id (we build a
+    // fresh voucher V3 just to have an unredeemed voucher to
+    // submit; the inflow's external_id is left at None, which
+    // mismatches the bridge's computed dedup key).
+    let blinding3 = cipher_clerk::crypto::Blinding([5u8; 32]);
+    let value3: u64 = 50;
+    let amt3 = Amount::commit(value3, &blinding3);
+    let signed_transfer_3: Transfer = Transfer::builder(journal_a)
+        .debit(&alice, Layer::Settled, amt3)
+        .credit(&vault_a, Layer::Settled, amt3)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+    let transfer_id_3 = signed_transfer_3.id.0;
+    let transfer_bytes_3 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer_3)
+        .expect("rkyv encode transfer 3")
+        .to_vec();
+    let openings_3 = vec![clerk_ledger::Opening {
+        amount: amt3,
+        value: value3,
+        blinding: blinding3,
+    }];
+    let openings_bytes_3 = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings_3)
+        .expect("rkyv encode openings 3")
+        .to_vec();
+    assert_eq!(
+        vos::block_on(ledger_a.apply_transfer(
+            &mut &node_a,
+            transfer_bytes_3,
+            openings_bytes_3,
+            ts + 800,
+        ))
+        .expect("apply_transfer T3 on A"),
+        Status::Ok,
+    );
+    let (root_before_3_vec, root_after_3_vec) =
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_3.to_vec()))
+            .expect("transfer_state_roots T3")
+            .expect("anchor recorded for T3");
+    let envelope_3 = EncryptedEnvelope::seal(value3, &blinding3, &bank_b_ivk_pk).unwrap();
+    let voucher_3 = Voucher::sign(
+        amt3,
+        envelope_3,
+        root_before_3_vec.try_into().unwrap(),
+        root_after_3_vec.try_into().unwrap(),
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let voucher_3_bytes = voucher_3.to_bytes();
+
+    // Inflow with NO external_id (default None) — bridge must
+    // reject before reaching the ledger.
+    let inflow_3_no_eid: Transfer = Transfer::builder(journal_b)
+        .debit(&inflow_b, Layer::Settled, amt3)
+        .credit(&bob, Layer::Settled, amt3)
+        .signed_with(&[(&inflow_b, &inflow_kp.secret)]);
+    let inflow_3_no_eid_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_3_no_eid)
+        .expect("rkyv encode inflow 3 (no eid)")
+        .to_vec();
+    let inflow_3_openings = vec![clerk_ledger::Opening {
+        amount: amt3,
+        value: value3,
+        blinding: blinding3,
+    }];
+    let inflow_3_openings_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_3_openings)
+            .expect("rkyv encode inflow 3 openings")
+            .to_vec();
+    let dedup_pre_adv = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+        .expect("invoke redeemed_count pre-adversarial");
+    let adv_reply = vos::block_on(bridge_actor.redeem_voucher(
+        &mut &node_b,
+        voucher_3_bytes.clone(),
+        b"bank-a".to_vec(),
+        inflow_3_no_eid_bytes,
+        inflow_3_openings_bytes.clone(),
+        ts + 900,
+    ))
+    .expect("invoke redeem_voucher (no external_id)");
+    assert_eq!(
+        adv_reply.status,
+        BridgeStatus::InflowInconsistent,
+        "inflow with mismatched external_id must hit bridge inconsistency check"
+    );
+    let dedup_post_adv = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+        .expect("invoke redeemed_count post-adversarial");
+    assert_eq!(
+        dedup_post_adv, dedup_pre_adv,
+        "rejected inflow must NOT mark voucher as redeemed — caller can retry with correct inflow"
+    );
+
+    // Adversarial #2: inflow with CORRECT external_id + amount
+    // (bridge accepts) but signed by the WRONG keypair (ledger
+    // rejects on its pre-verify gate). Proves the cross-actor
+    // dispatch reaches the ledger AND the bridge correctly
+    // forwards the rejection without locking the voucher.
+    let voucher_3_external_id = blake2b_256(
+        b"clerk-bridge/voucher-redemption/v1",
+        &[
+            &voucher_3.amount_commit.0,
+            &voucher_3.state_root_before,
+            &voucher_3.state_root_after,
+        ],
+    );
+    // Sign with alice's secret instead of inflow_b's — bridge's
+    // external_id + amount checks pass (those don't care about
+    // sigs), but clerk-ledger's pre-verify gate fails the sig
+    // against inflow_b.auth_key.
+    let inflow_3_wrongsig: Transfer = Transfer::builder(journal_b)
+        .debit(&inflow_b, Layer::Settled, amt3)
+        .credit(&bob, Layer::Settled, amt3)
+        .external_id(ExternalId(voucher_3_external_id))
+        .signed_by(&[&alice_kp.secret]);
+    let inflow_3_wrongsig_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&inflow_3_wrongsig)
+            .expect("rkyv encode inflow 3 (wrong sig)")
+            .to_vec();
+    let ledger_rejected_reply = vos::block_on(bridge_actor.redeem_voucher(
+        &mut &node_b,
+        voucher_3_bytes.clone(),
+        b"bank-a".to_vec(),
+        inflow_3_wrongsig_bytes,
+        inflow_3_openings_bytes.clone(),
+        ts + 1000,
+    ))
+    .expect("invoke redeem_voucher (wrong inflow sig)");
+    assert_eq!(
+        ledger_rejected_reply.status,
+        BridgeStatus::LedgerRejected,
+        "bridge accepts the inflow shape but the ledger rejects on bad signature"
+    );
+    assert_eq!(
+        ledger_rejected_reply.ledger_status,
+        Status::SignatureInvalid as u8,
+        "ledger_status must carry clerk-ledger's Status::SignatureInvalid so the caller can debug"
+    );
+    // Voucher V3 still hasn't been redeemed — bridge dedup
+    // count is unchanged. The caller can rebuild the inflow with
+    // a correct signature and retry.
+    let dedup_after_ledger_reject = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+        .expect("invoke redeemed_count post-ledger-reject");
+    assert_eq!(
+        dedup_after_ledger_reject, dedup_pre_adv,
+        "STATUS_LEDGER_REJECTED must keep voucher available for retry"
+    );
+
+    // Adversarial #3: inflow with the wrong entry SHAPE — empty
+    // entries, correct external_id. The bridge requires exactly
+    // 1 debit + 1 credit; a 0-entry inflow (or anything else)
+    // is rejected as INFLOW_INCONSISTENT before the kernel sees
+    // it. This tightening matters because the kernel's zero-sum
+    // check would let a malicious operator slip extra
+    // self-cancelling entries past us if the bridge only
+    // validated entries[0]'s amount.
+    use cipher_clerk::types::TransferFlags;
+    let zero_entry_inflow = {
+        let mut t = Transfer::default();
+        t.id = TransferId([0xDEu8; 16]);
+        t.journal_id = journal_b;
+        t.correlation_id = t.id;
+        t.flags = TransferFlags::NONE;
+        t.external_id = Some(ExternalId(voucher_3_external_id));
+        // entries left empty
+        // signatures left empty (no debits to sign)
+        t
+    };
+    let zero_entry_inflow_bytes =
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&zero_entry_inflow)
+            .expect("rkyv encode zero-entry inflow")
+            .to_vec();
+    let zero_entry_reply = vos::block_on(bridge_actor.redeem_voucher(
+        &mut &node_b,
+        voucher_3_bytes.clone(),
+        b"bank-a".to_vec(),
+        zero_entry_inflow_bytes,
+        inflow_3_openings_bytes.clone(),
+        ts + 1100,
+    ))
+    .expect("invoke redeem_voucher (zero entries)");
+    assert_eq!(
+        zero_entry_reply.status,
+        BridgeStatus::InflowInconsistent,
+        "inflow with != 2 entries must be rejected at the bridge shape check"
+    );
+
+    // ── 6) Bridge addressing parity ─────────────────────────────
+    //
+    // The bridge is the path a future cross-bank settlement would
+    // ride (the caller forwards a Voucher/SettlementClaim payload
+    // through bridge-b for B's settle agent to process). Verify the
+    // bridge reachability now so the federation plumbing is wired
+    // end-to-end.
+    let bridge_b = SpaceBridgeRef::at(bridge_b_id);
+    let bridge_b_self =
+        vos::block_on(bridge_b.where_am_i(&mut &node_a)).expect("A invokes bridge_b.where_am_i");
+    assert_eq!(
+        bridge_b_self, bridge_b_id.0,
+        "bridge-b's where_am_i must be bridge-b's own id (not A's local bridge shadow)"
+    );
+
+    // ── Cleanup ────────────────────────────────────────────────
+    let results_a = node_a.collect();
+    let results_b = node_b.collect();
+    let panics: u32 = results_a
+        .iter()
+        .chain(results_b.iter())
+        .map(|r| r.panics)
+        .sum();
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during federation test: {panics}");
+}

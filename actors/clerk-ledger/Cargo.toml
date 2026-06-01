@@ -1,0 +1,48 @@
+[workspace]
+
+[package]
+name = "clerk-ledger"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin"]
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
+
+# cipher-clerk: the kernel + types this actor wraps. Pinned to
+# the sibling checkout. `default-features = []` is intentional —
+# we want only the wire types + verification (no host-side
+# Keypair / MemLedger / signing entrypoints), so the actor builds
+# for PVM without dragging in getrandom/OsRng plumbing.
+[dependencies]
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
+
+# Host-only dev-deps. cipher-clerk with `helpers` pulls in MemLedger
+# + signing, which the in-lib unit tests use to pin clerk-ledger's
+# SMT root against the reference implementation. dev-deps don't
+# affect the PVM build (no `cargo actor` step pulls them), so the
+# host feature merge here doesn't drag getrandom into the riscv
+# actor.
+[dev-dependencies]
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", features = ["helpers", "signing"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
