@@ -174,6 +174,7 @@ fn verify_with_options_explicit_components(
         claimed_sums,
         log_sizes: claimed_log_sizes,
         pcs_config: config,
+        initial_state,
         final_state,
         ..
     } = proof;
@@ -220,14 +221,19 @@ fn verify_with_options_explicit_components(
         commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
     }
 
-    // Phase Z0: bind `proof.final_state.registers` into the FS transcript
-    // when the closing chip is in the component set. Mirrors the
-    // prover-side mix in `prove.rs` immediately after the main-trace
-    // commit. Gated on `side_note.closing_chip_active` — the default
-    // `verify` path sees the flag via the prover-mutated side_note, and
-    // chip-isolated `verify_with_explicit_components` only flips it
-    // when the caller's slice includes the closing chip.
+    // Phase Z0: bind `proof.initial_state.registers` and
+    // `proof.final_state.registers` into the FS transcript. Mirrors
+    // the prover-side mix in `prove.rs` immediately after the main-
+    // trace commit. Gated on `side_note.closing_chip_active` — the
+    // default `verify` path sees the flag via the prover-mutated
+    // side_note, and chip-isolated `verify_with_explicit_components`
+    // only flips it when the caller's slice includes the boundary +
+    // closing chip pair. Order MUST match the prover (initial first,
+    // then final).
     if side_note.closing_chip_active {
+        for r in &initial_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
         for r in &final_state.registers {
             verifier_channel.mix_u64(*r);
         }

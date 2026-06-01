@@ -491,15 +491,24 @@ fn prove_impl_with_components(
     tree_builder.commit(prover_channel);
     let main_commit = t.elapsed();
 
-    // Phase Z0: bind `proof.final_state.registers` into the FS transcript
-    // when the closing chip is in the component set. Mirrored by the
-    // verifier from `proof.final_state.registers`; any post-prove
-    // tamper of that field shifts the lookup-element challenges the
-    // verifier draws, so the committed interaction trace no longer
-    // satisfies the constraint system. Skipped for chip-isolated
-    // harnesses that opted out of the closing chip — those proofs
-    // don't expose a load-bearing `final_state.registers` field.
+    // Phase Z0: bind `proof.initial_state.registers` and
+    // `proof.final_state.registers` into the FS transcript. Mirrored
+    // by the verifier; any post-prove tamper of either field shifts
+    // the lookup-element challenges the verifier draws, so the
+    // committed interaction trace no longer satisfies the constraint
+    // system. Both are gated on `closing_chip_active` because the
+    // initial-state binding ships paired with the closing chip in
+    // production (BASE_COMPONENTS includes both the boundary and
+    // closing chips, set together by `prove_impl`). Chip-isolated
+    // harnesses that opted out leave both bindings off, matching
+    // their `component_mask = 0` proof shape.
+    //
+    // Order is initial-then-final, deterministic and stable across
+    // versions. Verifier must mix in the same order.
     if side_note.closing_chip_active {
+        for r in &side_note.initial_regs {
+            prover_channel.mix_u64(*r);
+        }
         for r in &side_note.final_regs {
             prover_channel.mix_u64(*r);
         }
@@ -592,7 +601,19 @@ fn prove_impl_with_components(
         eprintln!("{prof}");
     }
 
-    // Compute segment boundary states
+    // Compute segment boundary states. `initial_state.registers` is
+    // sourced from `side_note.initial_regs` (the same field the
+    // boundary chip's main trace emits from), not `first.regs_before`,
+    // so the proof field and the chip's committed values are equal
+    // by construction. The Z0-init FS-transcript mix relies on this
+    // invariant — if the proof field could diverge from what the chip
+    // committed, the verifier would mix bytes that don't match what
+    // the prover mixed and honest proofs would fail to verify.
+    //
+    // For non-empty traces this is equivalent to `first.regs_before`
+    // because the constraint system already requires
+    // `initial_regs == first.regs_before` (boundary chip producers
+    // balance CpuChip first-step read consumers via the ledger).
     let initial_state = if side_note.steps.is_empty() {
         SegmentState {
             pc: 0,
@@ -602,13 +623,10 @@ fn prove_impl_with_components(
         }
     } else {
         let first = &side_note.steps[0];
-        let mut regs = [0u64; 13];
-        regs[..first.regs_before.len().min(13)]
-            .copy_from_slice(&first.regs_before[..13.min(first.regs_before.len())]);
         SegmentState {
             pc: first.pc,
             timestamp: first.timestamp,
-            registers: regs,
+            registers: side_note.initial_regs,
             memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
         }
     };

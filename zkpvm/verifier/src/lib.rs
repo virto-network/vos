@@ -178,6 +178,7 @@ pub fn verify_standalone_with_options(
         num_components,
         component_mask,
         pcs_config,
+        initial_state,
         final_state,
         ..
     } = proof;
@@ -231,20 +232,21 @@ pub fn verify_standalone_with_options(
         );
     }
 
-    // Phase Z0: bind `proof.final_state.registers` into the FS transcript
-    // when the proof's component_mask indicates RegisterMemoryClosingChip
-    // (BASE_COMPONENTS index 6) is active. Mirrors the prover's mix
-    // immediately after the main-trace commit (see `prove.rs`). Any
-    // post-prove tamper of the metadata field shifts the lookup-element
-    // challenges drawn next, so the committed interaction trace no
-    // longer satisfies the constraint system — verify rejects. The mask
-    // gate avoids breaking chip-isolated proofs that travel through this
-    // function with `component_mask = 0`.
-    const CLOSING_CHIP_BIT: u32 = 1 << 6;
-    if component_mask & CLOSING_CHIP_BIT != 0 {
-        for r in &final_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
+    // Phase Z0: bind `proof.initial_state.registers` and
+    // `proof.final_state.registers` into the FS transcript. The
+    // `component_mask = 0` reject at the top of this function
+    // guarantees we only reach here for production proofs that
+    // included the boundary + closing chip pair, so the mix is
+    // unconditional. Any post-prove tamper of either field shifts
+    // the lookup-element challenges drawn next; the committed
+    // interaction trace then no longer satisfies the constraint
+    // system and verify rejects. Order MUST match the prover (see
+    // `prove.rs`): initial first, then final.
+    for r in &initial_state.registers {
+        verifier_channel.mix_u64(*r);
+    }
+    for r in &final_state.registers {
+        verifier_channel.mix_u64(*r);
     }
 
     let mut lookup_elements = AllLookupElements::default();

@@ -384,6 +384,56 @@ fn final_state_registers_are_stark_bound() {
     );
 }
 
+/// Phase Z0-init load-bearing test: `proof.initial_state.registers`
+/// is STARK-bound, symmetric to `final_state.registers`. The boundary
+/// chip emits per-register tuples at `ts = 0` sourced from
+/// `side_note.initial_regs`, and `prove()` makes the proof field
+/// equal to that source. The FS-transcript mix ties the metadata
+/// field to the verifier's challenge derivation; tampering shifts
+/// lookup elements and breaks constraint satisfaction.
+///
+/// This closes the `verify_chain` gap that Z0 (final-only) left open:
+/// without binding both ends, an attacker could chain a segment N
+/// proof (final_state Z0-bound) to a tampered segment N+1
+/// (initial_state was unbound metadata) and pass the chain check
+/// while segment N+1's actual trace started from arbitrary registers.
+#[test]
+fn initial_state_registers_are_stark_bound() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+    verify_standalone_with_pcs_policy(proof.clone(), prog_hash, &PcsPolicy::MOBILE)
+        .expect("pristine proof must verify");
+
+    // Tamper a single byte of initial-state register 0.
+    let mut tampered = proof.clone();
+    tampered.initial_state.registers[0] ^= 1;
+    let result = verify_standalone_with_pcs_policy(tampered, prog_hash, &PcsPolicy::MOBILE);
+    assert!(
+        result.is_err(),
+        "tamper of initial_state.registers[0] must make verify reject — \
+         got {result:?}; if this passes, Z0-init's binding is decorative \
+         and verify_chain's safety in the initial direction is broken"
+    );
+
+    // Tamper the last register to confirm uniform coverage.
+    let mut tampered_late = proof;
+    let last_idx = tampered_late.initial_state.registers.len() - 1;
+    tampered_late.initial_state.registers[last_idx] ^= 0x80;
+    let result_late =
+        verify_standalone_with_pcs_policy(tampered_late, prog_hash, &PcsPolicy::MOBILE);
+    assert!(
+        result_late.is_err(),
+        "tamper of initial_state.registers[{last_idx}] must also make verify reject — \
+         got {result_late:?}"
+    );
+}
+
 /// Phase Z0 hardening: `verify_standalone` must reject any proof with
 /// `component_mask = 0` at the current `format_version`. The mask-zero
 /// sentinel is the chip-isolated `prove_with_explicit_components` marker,
@@ -419,20 +469,22 @@ fn verify_standalone_rejects_mask_zero() {
     );
 }
 
-/// Phase Z0 scope: registers only. The `pc` and `memory_commitment`
-/// fields on `proof.final_state` are NOT bound by Z0 — they travel as
-/// metadata alongside the proof. This test pins the scope: tampering
-/// either field leaves `verify_standalone` happily accepting the
-/// proof. The day someone wires those fields into the FS transcript
-/// (or a future "Z1" / "Z2" chip closes the program-memory and
-/// memory ledgers analogously), they'll need to update this test
-/// instead of inheriting a silent binding.
+/// Phase Z0 + Z0-init scope: registers only, both ends. The `pc` and
+/// `memory_commitment` fields on `proof.initial_state` and
+/// `proof.final_state` are NOT bound — they travel as metadata
+/// alongside the proof. This test pins the scope: tampering any of
+/// the four leaves `verify_standalone` happily accepting the proof.
+///
+/// The day someone wires these into the FS transcript (or a future
+/// "Z1" / "Z2" chip closes the program-memory and memory ledgers
+/// analogously), they'll need to update this test instead of
+/// inheriting a silent binding.
 ///
 /// If this test starts failing, that's good news — *something* has
 /// taken responsibility for one of these fields. Find out what, and
 /// rewrite this test to reflect the new scope.
 #[test]
-fn final_state_non_register_fields_are_not_bound() {
+fn boundary_non_register_fields_are_not_bound() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
@@ -442,7 +494,7 @@ fn final_state_non_register_fields_are_not_bound() {
 
     use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
 
-    // Tamper pc — Z0 doesn't bind it, so verify should still accept.
+    // Final-state pc — unbound.
     let mut tampered_pc = proof.clone();
     tampered_pc.final_state.pc ^= 0x1000;
     verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).expect(
@@ -450,13 +502,28 @@ fn final_state_non_register_fields_are_not_bound() {
          If this fails, something else is binding pc; update the test or the scope doc.",
     );
 
-    // Tamper memory_commitment — also out of Z0's scope.
-    let mut tampered_mem = proof;
+    // Final-state memory_commitment — unbound.
+    let mut tampered_mem = proof.clone();
     tampered_mem.final_state.memory_commitment[0] ^= 0xff;
     verify_standalone_with_pcs_policy(tampered_mem, prog_hash, &PcsPolicy::MOBILE).expect(
         "Z0 binds registers only — tamper of final_state.memory_commitment must \
          still verify. If this fails, something else is binding it; update the \
          test or the scope doc.",
+    );
+
+    // Initial-state pc — unbound (Z0-init's FS-mix covers only
+    // initial_state.registers).
+    let mut tampered_initial_pc = proof.clone();
+    tampered_initial_pc.initial_state.pc ^= 0x1000;
+    verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
+        .expect("Z0-init binds registers only — tamper of initial_state.pc must still verify.");
+
+    // Initial-state memory_commitment — unbound.
+    let mut tampered_initial_mem = proof;
+    tampered_initial_mem.initial_state.memory_commitment[0] ^= 0xff;
+    verify_standalone_with_pcs_policy(tampered_initial_mem, prog_hash, &PcsPolicy::MOBILE).expect(
+        "Z0-init binds registers only — tamper of initial_state.memory_commitment \
+         must still verify.",
     );
 }
 

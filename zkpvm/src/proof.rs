@@ -31,7 +31,16 @@ use stwo::core::{
 ///       trace's true final register values.  Older proofs cannot
 ///       satisfy the new constraint set; reject at the
 ///       `format_version` gate.
-pub const PROOF_FORMAT_VERSION: u32 = 2;
+///   3 — Phase Z0-init: FS-transcript also mixes
+///       `proof.initial_state.registers` (before the existing
+///       `final_state.registers` mix). The boundary chip already
+///       commits to `initial_regs` in its trace; this binding closes
+///       the matching metadata-field gap on the initial side. Effect:
+///       segment chaining (`verify_chain`) is now safe in both
+///       directions — both `initial_state` and `final_state` of every
+///       segment are STARK-bound. Transcript shape diverges from v2;
+///       v2 proofs cannot verify here and reject at this gate.
+pub const PROOF_FORMAT_VERSION: u32 = 3;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

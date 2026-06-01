@@ -152,6 +152,52 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // trace.  Saves ~10% prove time and ~57% proof size on workloads that don't
 // hash.  Both prover and verifier must agree on inclusion — `active_components`
 // is the single source of truth and is deterministic from `SideNote`.
+/// Indices into [`BASE_COMPONENTS`] for chips referenced by name in
+/// `ChipActivity::is_active` and other bit-position-sensitive sites.
+///
+/// Indexed positions are coupled to the declaration order of
+/// `BASE_COMPONENTS`. If you reorder the array, update these constants
+/// at the same time — the trailing length assertion catches a
+/// shortened array but not a within-bounds reorder. The named
+/// constants double as documentation for which chip each match arm
+/// in `is_active` refers to, so they're kept even for chips that
+/// don't currently appear in a match arm.
+#[cfg(feature = "prover")]
+#[allow(dead_code)]
+pub(crate) mod chip_idx {
+    pub const CPU: usize = 0;
+    pub const BLAKE2B: usize = 1;
+    pub const MEMORY: usize = 2;
+    pub const MEMORY_BOUNDARY: usize = 3;
+    pub const REGISTER_MEMORY: usize = 4;
+    pub const REGISTER_MEMORY_BOUNDARY: usize = 5;
+    pub const REGISTER_MEMORY_CLOSING: usize = 6;
+    pub const PROGRAM_BOUNDARY: usize = 7;
+    pub const PROGRAM_MEMORY: usize = 8;
+    pub const JUMP_TABLE: usize = 9;
+    pub const RANGE_MULTIPLICITY_256: usize = 10;
+    pub const BITWISE_LOOKUP: usize = 11;
+    pub const POWER_OF_TWO: usize = 12;
+    pub const POPCOUNT: usize = 13;
+    pub const BITCOUNT: usize = 14;
+    pub const BYTE_TO_BITS: usize = 15;
+    pub const MUL: usize = 16;
+    pub const BITWISE: usize = 17;
+    pub const COMPARE: usize = 18;
+    pub const DIVREM: usize = 19;
+    pub const RISTRETTO: usize = 20;
+    pub const RISTRETTO_ECALL: usize = 21;
+    pub const RISTRETTO_COMB_TABLE: usize = 22;
+    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 23;
+    pub const RISTRETTO_COMB_ANCHOR: usize = 24;
+    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 25;
+    pub const RISTRETTO_COMB_COMPRESS: usize = 26;
+    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 27;
+    /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
+    /// assertion in `lib.rs` checks this against the actual array length.
+    pub const COUNT: usize = RISTRETTO_COMB_COMPRESS_OUTPUT + 1;
+}
+
 #[cfg(feature = "prover")]
 const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CpuChip,
@@ -183,6 +229,15 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RistrettoCombCompressChip, // R1e-bis Batch 2-3 — OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoCombCompressOutputChip, // R1e-bis Batch 4a — OPTIONAL, gated by activity.ristretto_comb
 ];
+
+#[cfg(feature = "prover")]
+const _: () = {
+    assert!(
+        BASE_COMPONENTS.len() == chip_idx::COUNT,
+        "BASE_COMPONENTS length must match chip_idx::COUNT — chip added or removed without \
+         updating the constants in chip_idx",
+    );
+};
 
 #[cfg(not(feature = "prover"))]
 const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
@@ -366,22 +421,27 @@ struct ChipActivity {
 #[cfg(feature = "prover")]
 impl ChipActivity {
     fn is_active(&self, idx: usize) -> bool {
-        // Indices match `BASE_COMPONENTS`. The Phase Z0 insertion of
-        // RegisterMemoryClosingChip at index 6 shifted every chip at
-        // index >= 6 by +1; this map reflects the new positions.
-        // Always-active chips fall through to the default arm.
+        // Indices are pinned by `chip_idx` (see lib.rs `mod chip_idx`).
+        // Always-active chips fall through to the default arm — only
+        // gated chips (= those that depend on side-note evidence to
+        // contribute a non-zero claimed_sum) need an explicit arm.
         match idx {
-            1 => self.blake2b,
-            9 => self.jump_table,
-            13 => self.popcount,
-            14 => self.bitcount,
-            16 => self.mul,
-            17 => self.bitwise,
-            18 => self.compare,
-            19 => self.divrem,
-            20 => self.ristretto,
-            21 => self.ristretto_ecall,
-            22 | 23 | 24 | 25 | 26 | 27 => self.ristretto_comb,
+            chip_idx::BLAKE2B => self.blake2b,
+            chip_idx::JUMP_TABLE => self.jump_table,
+            chip_idx::POPCOUNT => self.popcount,
+            chip_idx::BITCOUNT => self.bitcount,
+            chip_idx::MUL => self.mul,
+            chip_idx::BITWISE => self.bitwise,
+            chip_idx::COMPARE => self.compare,
+            chip_idx::DIVREM => self.divrem,
+            chip_idx::RISTRETTO => self.ristretto,
+            chip_idx::RISTRETTO_ECALL => self.ristretto_ecall,
+            chip_idx::RISTRETTO_COMB_TABLE
+            | chip_idx::RISTRETTO_FIXED_BASE_CONSUMER
+            | chip_idx::RISTRETTO_COMB_ANCHOR
+            | chip_idx::RISTRETTO_COMB_SCALAR_BOUNDARY
+            | chip_idx::RISTRETTO_COMB_COMPRESS
+            | chip_idx::RISTRETTO_COMB_COMPRESS_OUTPUT => self.ristretto_comb,
             _ => true,
         }
     }
